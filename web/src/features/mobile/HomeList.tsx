@@ -417,7 +417,12 @@ export const HomeList = memo(function HomeList() {
                             className={css.rowBody}
                             data-testid="home-row-body"
                             data-error={row.bodyIsError ? "1" : "0"}
-                            title={row.body}
+                            data-tone={row.bodyTone ?? undefined}
+                            title={
+                              row.bodyDetail && row.bodyDetail !== row.body
+                                ? `${row.body}\n${row.bodyDetail}`
+                                : row.body
+                            }
                           >
                             {row.body}
                           </span>

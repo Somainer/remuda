@@ -12,7 +12,9 @@ import { login } from "./hub-auth";
  *    "echo e2e", a transcript/interaction-only word), native status blocked,
  *    with one usage observation so its remaining-context ring reads 50%;
  *  - an "mhome-exit" session: reports a native session id then exits with a
- *    lastError (MHOME_EXIT_SENTINEL) that owns the row body, resumable.
+ *    lastError (MHOME_EXIT_SENTINEL); c-homeend projects that unknown code to
+ *    a neutral 已结束 body with the raw text kept only in the tooltip,
+ *    resumable.
  *
  * Both live in the default wsp_e2e workspace, so they share one
  * project + git branch group whose blocked count is 1.
@@ -135,11 +137,15 @@ test.describe("390px phone home", () => {
     await expect(blockedRow.getByTestId("context-ring")).toHaveAttribute("data-pct", "50");
     await expect(blockedRow.getByTestId("context-ring-pct")).toHaveText("50%");
 
-    // Error text owns the exited row's body slot, with the full text on title.
+    // c-homeend: an unrecognised exit text is a neutral 已结束, never the raw
+    // wire string in red. The machine sentence survives only in the tooltip
+    // (title: human label first line, raw code second).
     const exitedRow = rows.filter({ hasText: exitedTitle });
     const exitedBody = exitedRow.getByTestId("home-row-body");
-    await expect(exitedBody).toHaveAttribute("data-error", "1");
-    await expect(exitedBody).toHaveText(/MHOME_EXIT_SENTINEL/);
+    await expect(exitedBody).toHaveAttribute("data-error", "0");
+    await expect(exitedBody).toHaveAttribute("data-tone", "ended");
+    await expect(exitedBody).toHaveText(/已结束/);
+    expect(await exitedBody.innerText()).not.toContain("MHOME_EXIT_SENTINEL");
     expect(await exitedBody.getAttribute("title")).toMatch(/MHOME_EXIT_SENTINEL \(429\)/);
     // No usage observation ever landed on that session: null contextPct
     // means neither ring nor number renders (ui-spec §3.3).

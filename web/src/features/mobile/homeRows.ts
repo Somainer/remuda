@@ -1,5 +1,6 @@
 import { formatListTime } from "../../lib/format";
 import { projectStatus } from "../../lib/status";
+import { endReason, type EndTone } from "../../lib/endReason";
 import type { Instance, UiStatus } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import type { Observation } from "../../types/observation";
@@ -14,11 +15,11 @@ import { buildTaskGroups, type TaskListGroup } from "../tasks/taskRows";
  * Pure derivation for the `/m` phone home (ui-spec §4.7 / §2.1, D-038/D-049).
  *
  * It owns no state of its own: `buildSpaces()` groups the instances,
- * `nextStep()` produces the one sentence, `rankQuickFind()` owns the
- * title/project/host search boundary, and the Hub rollup owns the context
- * percentage. This module only decides grouping order, the error-as-body
- * rule and the row shape, so every rule below is unit-testable without a
- * DOM.
+ * `nextStep()` produces the one sentence, `endReason()` owns an ended row's
+ * human label and tone, `rankQuickFind()` owns the title/project/host search
+ * boundary, and the Hub rollup owns the context percentage. This module only
+ * decides grouping order, the live-error body rule and the row shape, so
+ * every rule below is unit-testable without a DOM.
  *
  * UO-3 split the projection in two for the commit probe: `buildHomeRows()`
  * derives the per-instance display row (the part polling can change) and
@@ -56,9 +57,21 @@ export type HomeRow = {
   instance: Instance;
   title: string;
   status: UiStatus;
-  /** The one body sentence: nextStep() verbatim, unless an error owns the slot. */
+  /** The one body sentence: nextStep() verbatim — ended rows speak the shared
+   *  endReason label, never the raw lastError (c-homeend). */
   body: string;
   bodyIsError: boolean;
+  /**
+   * EndTone for an ended row: `"failed"` is the ONLY tone the renderer paints
+   * red; an interruption (Node restart) and an ordinary close stay muted. Null
+   * for every live row (whose red, when any, is still `bodyIsError`).
+   */
+  bodyTone: EndTone | null;
+  /**
+   * Raw machine code behind an ended sentence, for the row tooltip only —
+   * never visible text. Null for a live row or a clean exit.
+   */
+  bodyDetail: string | null;
   /** 0..100 used-context share; null = unknown, and the ring must not render. */
   contextPct: number | null;
   blocked: boolean;
@@ -98,8 +111,10 @@ export type HomeRowsInput = {
 };
 
 /**
- * The error text that owns the row body when the session has one
- * (report §11.3 point 3: Moshi puts the raw error here, not a wire string).
+ * The error text that owns the body slot of a LIVE row when the session has
+ * one (report §11.3 point 3: Moshi puts the raw error here, not a wire
+ * string). Ended rows never use this: endReason() owns their sentence
+ * (c-homeend).
  *
  * `instance.lastError` is the Hub-merged channel (hub store.rs folds native
  * severity=error lifecycle events into it); the journal fallback mirrors the
@@ -140,10 +155,11 @@ export function homeError(instance: Instance, events?: Observation[]): string | 
 }
 
 /**
- * Body-slot decision. Unknown connectivity/lifecycle wins over everything:
- * the row reads 状态待确认 and an error can never turn it into a positive
- * phrase (D-038). On every other status an error replaces the next-step
- * sentence verbatim.
+ * Body-slot decision for a LIVE row. Unknown connectivity/lifecycle wins over
+ * everything: the row reads 状态待确认 and an error can never turn it into a
+ * positive phrase (D-038). On every other live status an error replaces the
+ * next-step sentence verbatim. ENDED rows never reach here: their sentence is
+ * the shared endReason() projection (c-homeend).
  */
 export function homeBody(
   status: UiStatus,
@@ -190,8 +206,16 @@ export function buildHomeRows(
         input.screenOf?.(instance.id),
         input.summaryOf?.(instance.id),
       );
-      const error = homeError(instance, input.eventsOf?.(instance.id));
-      const body = homeBody(status, step, error);
+      // c-homeend: an ended row speaks the shared endReason sentence — the
+      // human label and the red/neutral decision live in one module for every
+      // session surface. The raw lastError never owns the body: it survives
+      // only as `bodyDetail` for the tooltip. Live rows keep the UO-3
+      // error-as-body rule (a journaled API error on a running process).
+      const end = endReason(instance);
+      const ended = end !== null && status !== "unknown" ? end : null;
+      const body = ended
+        ? { text: step.text, isError: false }
+        : homeBody(status, step, homeError(instance, input.eventsOf?.(instance.id)));
       rows.set(instance.id, {
         id: instance.id,
         instance,
@@ -199,6 +223,8 @@ export function buildHomeRows(
         status,
         body: body.text,
         bodyIsError: body.isError,
+        bodyTone: ended?.tone ?? null,
+        bodyDetail: ended?.detail ?? null,
         contextPct: input.rollupOf(instance.id)?.contextPct ?? null,
         blocked: status === "blocked",
         canResume:
@@ -322,7 +348,7 @@ export function homeRowsSignature(
   const rowPart = [...rows.values()]
     .map(
       (row) =>
-        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.contextPct ?? "-"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
+        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.bodyTone ?? "-"}|${row.contextPct ?? "-"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
     )
     .join("\n");
   // Prefs/closed tabs and workspace membership change WHICH instances a space

@@ -34,14 +34,16 @@ pnpm --dir web exec playwright test -c playwright.perf.config.ts \
 
 新增的归因探针（`profileRegion` + `commit:<subtree>` React Profiler 探针，
 `?profile=1` 外零成本）在第二次修前测量里给出了长任务构成。
-6.9 s 区间内的同步纯派生全部亚毫秒：
+6.9 s 区间内的同步纯派生全部亚毫秒（r2 复审后探针已修正：merge 与
+hydrate 也被计入，见 §5.1 第 5 条；修后 store.pollMerge 0.6 ms、
+store.pollHydrate 0.1 ms）：
 
 | 被埋点区域 | 调用数 | 合计 ms | 峰值 ms |
 |---|---|---|---|
 | board.buildModel | 10 | 3.3 | 0.5 |
 | board.buildGroups | 16 | 2.7 | 0.3 |
 | api.mapInstances | 3 | 0.5 | 0.2 |
-| store.pollMerge（merge+emit） | 3 | 0.4 | 0.2 |
+| store.pollMerge（merge+emit；r2 后含 merge，修前只计了 emit） | 3 | 0.4 | 0.2 |
 | board.buildSpaces | 12 | 0.4 | 0.1 |
 | store.hostsMerge | 3 | 0.3 | 0.2 |
 | board.pendingSet | 6 | 0 | 0 |
@@ -60,7 +62,11 @@ React 提交成本（actualDuration，区间内累计）才是账单：
 （stackTop `Board.tsx:549`），但该区域自耗时只有 0.5 ms——与
 inbox-perf-1 相同的归因语义：标签只证明「该区域在任务时间窗内执行过」，
 账单主体是窗口内未埋点的 React 渲染/提交。逐子树的 Profiler 数字证明
-账单是 BoardRail 的 80 行重复提交。
+账单是 BoardRail 的 80 行重复提交。**归因局限（如实说明）**：
+PerformanceObserver 的 longtask 归因不给 JS 调用栈，埋点只覆盖同步区
+域，未覆盖 React 内部；因此单个长任务无法逐毫秒精确切到具体组件，
+「Rail 渲染波是主账单」是「窗口内同步派生合计 <7 ms、Rail 子树
+Profiler 累计 329.5 ms」两条实测边界推出的结论。
 
 ### 1.2 波从哪里来（代码路径可证）
 
@@ -184,6 +190,48 @@ SessionPage 553.7 kB（其 ToolCard 263.8 kB/katex 259 kB 继续按需）。
   task-model-board.hub、task-model-boardui.hub、agent-board 全过。
 - perf 场景 E：`HUB_E2E_PERF=1 ... test:perf -g "E: 80 board tasks"` 通过，
   数字见 §1/§3；A–D 未改驱动路径。
+
+## 5.1 验收复审跟进（b-perffu r2，逐条回归）
+
+1. **相对时间冻结**：安静轮询不 emit + 看板保留旧 view 后，
+   `formatListTime` 的「刚刚/Nm」不再推进。新增共享显示时钟
+   `lib/useNowTick.ts`（30 s，纯 UI，绝不进 store/snapshot）：BoardPage
+   把 nowMs 传入 `buildBoardModel`，只有时间桶真正跨越的卡片
+   `sig` 变化才提交（nowMs 刻意不进卡片 memo 比较）；SessionList 三处
+   时间标签用同一时钟（只动时钟，UO-12 其余不碰）。假定时器回归：
+   `Board.clock.test.tsx`（投影引用恒定、零 store 发射，刚刚→1m）、
+   `SessionList.test.tsx`、`useNowTick.test.ts`。
+2. **嵌套选中不重绘**：rail 行 memo 比较函数改为「本子树内的选中 id」
+   （自身或后代 id 的同一性），选中进入/离开/子树内移动都重绘；
+   `TaskList.selection.test.tsx` 稳定 onSelect 下验证（旧比较函数实测
+   两选中 `['child','other']`）。
+3. **queued effort 不结算**：pending 结算从 effective-record 折叠分支
+   里拆出，按自己的判定独立执行，任一侧变化才 emit。回归：先回放较新
+   effective 再回放 queued configure（onPrepend 升序终态），identical
+   poll 后 pending 清空；旧嵌套逻辑实测卡在 queued。
+4. **chunk 拒绝**：新增 `app/routeBoundary.tsx`，每个 authed 路由在
+   **Shell 之内**包 `LazyRoute`（含 Shell 的 /sessions/new 静幕后景）；
+   React.lazy 会缓存拒绝，重试按 attempt 新建 lazy（真正 re-import）并
+   key 重挂 boundary，另有文档 reload。`sw.src.js`/precaching 未动。
+   单测：首次拒绝→面板→重试加载；持续拒绝→面板常驻、import 多次调用；
+   reload；render-throw。
+5. **探针边界**：`store.pollMerge` 现在把两个 snapshot merge（含
+   structuralEqual）与 emit 一起计时；hydrate 四段另计
+   `store.pollHydrate`。修后重跑场景 E：store.pollMerge 0.6 ms、
+   store.pollHydrate 0.1 ms（变化窗口内各 1 次），同步 store 工作仍
+   全部亚毫秒。
+
+**离线首次访问的现状（不改 precaching 的结论）**：SW 只在 install 时
+precache 文档 shell（`/`、index.html、manifest、图标），**不 precache
+任何 `/assets/*` JS chunk**；静态资源是 cache-first，未访问过的路由
+chunk 在缓存里不存在。所以**完全离线时首次打开一个没去过的路由：
+navigate 能由 shell 回退兜住，但该路由的 JS chunk 取不到，页面落到新
+的路由错误面板，可在恢复网络后重试/reload**；已经访问过的路由
+chunk 已缓存，离线照常打开。是否 precache 路由 chunk 由所有者另行
+决定（本轮按要求未改 sw.src.js）。
+
+复审后本地：`pnpm --dir web test` 190 文件 / 2112 用例全过；
+typecheck/lint 通过。
 
 ## 6 刻意不做
 

@@ -10,32 +10,48 @@ import { login } from "./hub-auth";
  *
  * Gated:
  *  - a 323px keyboard band with a pending card keeps the body >= 40% of the
- *    band (129px) and the card area >= 44px, with the composer in the band;
+ *    band (129px) and the card area >= 44px, with the WHOLE composer (input
+ *    and control bar) inside the band;
  *  - an ended session mounts the EndedBar in the composer's place;
- *  - an idle session page does not commit (commit:SessionPage under
- *    ?profile=1 stays at zero across a quiet window — a count, not a time).
+ *  - (REMUDA_PERF=1) a live idle session page body does not commit
+ *    (commit:SessionPageBody under ?profile=1 stays at zero across a quiet
+ *    window — a count, not a time; descendant commits are logged apart).
  *
  * Evidence (REMUDA_EVIDENCE=1 only): live / idle / ended / ⋯ open / run
- * details open at 1440, 768 and 390, the header at 360 and 320, dark and
- * light, plus the keyboard-open band at 390. Shots go to REMUDA_SHOT_DIR
- * (default test-results/evidence).
+ * details open, dark and light, plus the keyboard-open band (WebKit). Inside
+ * the repo (test-results/evidence) only 390 and 1440 are written; the extra
+ * widths (768, 360, 320) are written only when REMUDA_SHOT_DIR names an
+ * external directory, which then receives every shot.
  */
 
 test.describe.configure({ mode: "serial" });
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const evidence = process.env.REMUDA_EVIDENCE === "1";
-const shotDir = process.env.REMUDA_SHOT_DIR ?? path.join(here, "../../test-results/evidence");
+const externalDir = process.env.REMUDA_SHOT_DIR;
+const shotDir = externalDir ?? path.join(here, "../../test-results/evidence");
+const IN_REPO_WIDTHS = [390, 1440];
 
 const created: string[] = [];
 
-async function shot(page: Page, name: string) {
+async function shot(page: Page, name: string, width: number) {
+  if (!externalDir && !IN_REPO_WIDTHS.includes(width)) return;
   await mkdir(shotDir, { recursive: true });
   await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
 }
 
-/** A fake-node claude session; "exit agent" prompts end on their own. */
-async function createSession(page: Page, prompt: string): Promise<string> {
+/** The transcript has replaced 「加载 snapshot…」. */
+async function transcriptReady(page: Page) {
+  await expect(page.getByTestId("loading-snapshot")).toHaveCount(0, { timeout: 20_000 });
+  await expect(page.getByTestId("transcript")).toBeVisible({ timeout: 20_000 });
+}
+
+/**
+ * A fake-node claude session; "exit agent" prompts end on their own. The id
+ * is registered from the create response at once, so a navigation failure
+ * after the create cannot leak the instance.
+ */
+async function createSession(page: Page, prompt: string, into: string[] = created): Promise<string> {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
   await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
@@ -50,10 +66,18 @@ async function createSession(page: Page, prompt: string): Promise<string> {
   await expect(workspacePicker.locator("option")).not.toHaveCount(0, { timeout: 20_000 });
   await workspacePicker.selectOption("wsp_e2e");
   await page.getByTestId("new-session-prompt").fill(prompt);
+  const creating = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" && new URL(response.url()).pathname === "/v1/instances",
+  );
   await page.getByTestId("new-session-start").click();
-  await page.waitForURL(/\/s\//, { timeout: 20_000 });
-  const id = new URL(page.url()).pathname.split("/")[2]!;
-  created.push(id);
+  const res = await creating;
+  const body = await res.text();
+  expect(res.ok(), `instance create failed: ${res.status()} ${body}`).toBe(true);
+  const id = (JSON.parse(body) as { instance?: { instanceId?: string } }).instance?.instanceId as string;
+  expect(id).toBeTruthy();
+  into.push(id);
+  await expect(page).toHaveURL(new RegExp(`/s/${id}`), { timeout: 20_000 });
   return id;
 }
 
@@ -144,6 +168,7 @@ test.describe("390 phone", () => {
   test("a 323px keyboard band keeps the body >= 40% and the pending-card area >= 44px", async ({ page }) => {
     const id = await createSession(page, "uo6a keyboard band");
     await page.goto(`/s/${id}/structured`);
+    await transcriptReady(page);
     // The fake node parks a new session on a pending approval.
     await expect(page.getByTestId("approval-card")).toBeVisible({ timeout: 20_000 });
     await expect(page.getByTestId("pending-area")).toBeVisible();
@@ -154,21 +179,23 @@ test.describe("390 phone", () => {
 
     const body = await bandBox(page, "session-body");
     const cards = await bandBox(page, "pending-area");
-    const input = await bandBox(page, "composer-input");
+    const composer = await bandBox(page, "composer");
     const bar = await bandBox(page, "composer-bar");
-    expect(body && cards && input && bar, "body, cards and composer mounted").toBeTruthy();
+    expect(body && cards && composer && bar, "body, cards and composer mounted").toBeTruthy();
     console.log(
       `UO6A band=323 body=${Math.round(body!.height)} cards=${Math.round(cards!.height)}` +
-        ` composer-bar=${Math.round(bar!.height)} bar-overflow=${Math.max(0, Math.round(bar!.bottom - bar!.bandBottom))}`,
+        ` composer=${Math.round(composer!.top)}..${Math.round(composer!.bottom)} (${Math.round(composer!.height)})` +
+        ` composer-bar=${Math.round(bar!.height)} band=${Math.round(body!.bandTop)}..${Math.round(body!.bandBottom)}`,
     );
     expect(Math.round(body!.band)).toBe(323);
     expect(body!.height, `body ${body!.height}px`).toBeGreaterThanOrEqual(body!.band * 0.4 - 1);
     expect(cards!.height, `cards ${cards!.height}px`).toBeGreaterThanOrEqual(44);
-    // The text box being typed into stays in the band. The control bar under
-    // it is the compact composer's own row (D-042 budgets it at 56px); its
-    // height is logged above, not asserted here.
-    expect(input!.top).toBeGreaterThanOrEqual(input!.bandTop - 1);
-    expect(input!.bottom).toBeLessThanOrEqual(input!.bandBottom + 1);
+    // The whole composer — input AND control bar — sits inside the band.
+    expect(composer!.top, "composer top in the band").toBeGreaterThanOrEqual(composer!.bandTop - 1);
+    expect(composer!.bottom, "composer bottom in the band").toBeLessThanOrEqual(composer!.bandBottom + 1);
+    expect(bar!.bottom, "control bar bottom in the band").toBeLessThanOrEqual(bar!.bandBottom + 1);
+    // One row: the bar is no taller than its tallest (44px) control.
+    expect(bar!.height, `composer-bar ${bar!.height}px`).toBeLessThanOrEqual(45);
   });
 
   test("an ended session swaps the composer for the EndedBar with Resume", async ({ page }) => {
@@ -181,27 +208,31 @@ test.describe("390 phone", () => {
     await expect(page.getByTestId("composer")).toHaveCount(0);
   });
 
-  test("an idle session page does not commit", async ({ page }) => {
-    // Perf only: an idle page must not commit on a clock. The store's
-    // periodic refresh emits are logged next to the commits so a commit can
-    // be traced to its source.
+  test("a live idle session page body does not commit", async ({ page }) => {
+    // Perf only: an idle page body must not commit on a clock or on the
+    // store's periodic refresh. commit:SessionPageBody is the page function
+    // itself; commit:SessionPage is the Profiler over the whole subtree
+    // (LiveStatusStrip's clock and the like), logged apart. Store emits are
+    // logged next to them so a commit can be traced to its source.
     test.skip(process.env.REMUDA_PERF !== "1", "set REMUDA_PERF=1 for the idle commit probe");
-    const id = await createSession(page, "UO6A_IDLE mhome-exit agent");
+    const id = await createSession(page, "UO6A_IDLE live idle");
     await page.goto(`/s/${id}/structured?profile=1`);
-    await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "exited", {
-      timeout: 20_000,
-    });
-    await expect(page.getByTestId("ended-bar")).toBeVisible();
-    const commitTimes = () =>
-      page.evaluate(() =>
-        (
-          (window as unknown as { __remudaPerf?: { getReport: () => { probes: { kind: string; at: number }[] } } })
-            .__remudaPerf?.getReport().probes ?? []
-        )
-          .filter((probe) => probe.kind === "commit:SessionPage")
-          .map((probe) => Math.round(probe.at)),
+    await transcriptReady(page);
+    await clearApprovals(page, id);
+    await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+    await expect(page.getByTestId("session-page")).not.toHaveAttribute("data-status", "exited");
+    const commitTimes = (kind: string) =>
+      page.evaluate(
+        (k) =>
+          (
+            (window as unknown as { __remudaPerf?: { getReport: () => { probes: { kind: string; at: number }[] } } })
+              .__remudaPerf?.getReport().probes ?? []
+          )
+            .filter((probe) => probe.kind === k)
+            .map((probe) => Math.round(probe.at)),
+        kind,
       );
-    // Let the mount and the first journal/hydration round land first.
+    // Let the approval answer and its journal round land first.
     await page.waitForTimeout(2_000);
     await page.evaluate(async () => {
       const { hubStore } = await import("/src/lib/store.ts");
@@ -214,15 +245,19 @@ test.describe("390 phone", () => {
         emit(patch);
       };
     });
-    const before = (await commitTimes()).length;
+    const bodyBefore = (await commitTimes("commit:SessionPageBody")).length;
+    const treeBefore = (await commitTimes("commit:SessionPage")).length;
     await page.waitForTimeout(3_000);
-    const after = await commitTimes();
+    const body = await commitTimes("commit:SessionPageBody");
+    const tree = await commitTimes("commit:SessionPage");
     const emits = await page.evaluate(() => (window as unknown as { __uo6aEmits: string[] }).__uo6aEmits);
+    await expect(page.getByTestId("session-page")).not.toHaveAttribute("data-status", "exited");
     console.log(
-      `UO6A idle commit:SessionPage window=3s commits=${after.length - before}`,
-      `at=${after.slice(before).join(",")} emits=${emits.join(" ")}`,
+      `UO6A idle live window=3s body-commits=${body.length - bodyBefore} at=${body.slice(bodyBefore).join(",")}` +
+        ` subtree-commits=${tree.length - treeBefore} at=${tree.slice(treeBefore).join(",")}` +
+        ` emits=${emits.length} ${emits.join(" ")}`,
     );
-    expect(after.length - before).toBe(0);
+    expect(body.length - bodyBefore).toBe(0);
   });
 });
 
@@ -240,36 +275,36 @@ async function captureScreens(browser: Browser, width: number, scheme: "dark" | 
   const ids: string[] = [];
   try {
     await login(page);
-    const live = await createSession(page, `uo6a evidence live ${width}`);
-    ids.push(live);
+    const live = await createSession(page, `uo6a evidence live ${width}`, ids);
     await page.goto(`/s/${live}/structured`);
+    await transcriptReady(page);
     await expect(page.getByTestId("approval-card")).toBeVisible({ timeout: 20_000 });
-    await shot(page, `uo6a-live-${width}-${scheme}.png`);
-    if (phone) {
+    await shot(page, `uo6a-live-${width}-${scheme}.png`, width);
+    if (phone && externalDir) {
       for (const narrow of [360, 320]) {
         await page.setViewportSize({ width: narrow, height: 844 });
-        await shot(page, `uo6a-live-${narrow}-${scheme}.png`);
+        await shot(page, `uo6a-live-${narrow}-${scheme}.png`, narrow);
       }
       await page.setViewportSize({ width, height: 844 });
     }
     await page.getByTestId("session-more-open").click();
-    await shot(page, `uo6a-more-open-${width}-${scheme}.png`);
+    await shot(page, `uo6a-more-open-${width}-${scheme}.png`, width);
     await page.getByTestId("run-details-summary").click();
     await expect(page.getByTestId("run-details")).toBeVisible();
-    await shot(page, `uo6a-run-details-${width}-${scheme}.png`);
+    await shot(page, `uo6a-run-details-${width}-${scheme}.png`, width);
     // Run details persist per device; close them again for the next screens.
     await page.getByTestId("session-more-open").click();
     await page.getByTestId("run-details-summary").click();
 
     await clearApprovals(page, live);
     await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
-    await shot(page, `uo6a-idle-${width}-${scheme}.png`);
+    await shot(page, `uo6a-idle-${width}-${scheme}.png`, width);
 
-    const ended = await createSession(page, `UO6A_SHOT mhome-exit agent ${width}`);
-    ids.push(ended);
+    const ended = await createSession(page, `UO6A_SHOT mhome-exit agent ${width}`, ids);
     await page.goto(`/s/${ended}/structured`);
+    await transcriptReady(page);
     await expect(page.getByTestId("ended-bar")).toBeVisible({ timeout: 20_000 });
-    await shot(page, `uo6a-ended-${width}-${scheme}.png`);
+    await shot(page, `uo6a-ended-${width}-${scheme}.png`, width);
   } finally {
     for (const id of ids) await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
     await context.close();
@@ -279,7 +314,9 @@ async function captureScreens(browser: Browser, width: number, scheme: "dark" | 
 test("evidence shots: live / idle / ended / ⋯ / run details", async ({ browser }) => {
   test.skip(!evidence, "set REMUDA_EVIDENCE=1 to capture screenshots");
   test.setTimeout(480_000);
-  for (const width of [1440, 768, 390])
+  // 768 (and 360/320 inside the 390 pass) only reach an external directory.
+  const widths = externalDir ? [1440, 768, 390] : IN_REPO_WIDTHS;
+  for (const width of widths)
     for (const scheme of ["dark", "light"] as const) await captureScreens(browser, width, scheme);
 });
 
@@ -295,23 +332,26 @@ test("evidence shots: keyboard band at 390 (WebKit iPhone)", async ({ playwright
   }
   try {
     for (const scheme of ["dark", "light"] as const) {
+      // The iPhone descriptor (WebKit, touch, DPR 3) at a forced 390x844 so
+      // the shot is the 390 width it is named for.
       const context = await webkit.newContext({
         ...playwright.devices["iPhone 15"],
+        viewport: { width: 390, height: 844 },
         baseURL: test.info().project.use.baseURL,
         colorScheme: scheme,
       });
       const page = await context.newPage();
-      let id = "";
+      const ids: string[] = [];
       try {
         await login(page);
-        id = await createSession(page, "uo6a evidence keyboard");
+        const id = await createSession(page, "uo6a evidence keyboard", ids);
         await page.goto(`/s/${id}/structured`);
+        await transcriptReady(page);
         await expect(page.getByTestId("approval-card")).toBeVisible({ timeout: 20_000 });
-        const { height } = page.viewportSize()!;
-        await raiseKeyboard(page, height - 323);
-        await shot(page, `uo6a-keyboard-390-${scheme}.png`);
+        await raiseKeyboard(page, 844 - 323);
+        await shot(page, `uo6a-keyboard-390-${scheme}.png`, 390);
       } finally {
-        if (id) await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+        for (const id of ids) await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
         await context.close();
       }
     }

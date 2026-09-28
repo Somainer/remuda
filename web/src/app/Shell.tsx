@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
   Boxes,
@@ -30,11 +30,7 @@ import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { QuickFind, QUICKFIND_HINT, openQuickFind } from "../features/search/QuickFind";
 import { useInboxPendingCount } from "../features/mobile/useInboxPendingCount";
 import { projectFilterStore, useProjectFilter, useProjects, type Project } from "../features/tasks/ProjectSwitcher";
-// Lazy: the /sessions index backs the dimmed /sessions/new sheet and must not
-// ride the initial chunk for every other route (c-perffu UO-11).
-const SessionsPage = lazy(() =>
-  import("../pages/SessionsPage").then((m) => ({ default: m.SessionsPage })),
-);
+import { LazyRoute } from "./routeBoundary";
 import { Icon } from "../components/Icon";
 import { InstallBar } from "./InstallBar";
 import { PhoneNav } from "./PhoneNav";
@@ -533,9 +529,11 @@ export function Shell() {
             the header chip's drawer and Jump To keep every switch. */}
         {chrome.tabs ? <SpaceTabs space={workbench.active} tabs={workbench.tabs} prefs={workbench.prefs} instanceId={workbench.instanceId} newHref={workbench.newHref} /> : null}
         {onNew ? (
-          <Suspense fallback={null}>
-            <SessionsPage dimmed />
-          </Suspense>
+          <LazyRoute
+            loader={() => import("../pages/SessionsPage")}
+            named="SessionsPage"
+            componentProps={{ dimmed: true }}
+          />
         ) : null}
         <Outlet />
       </main>

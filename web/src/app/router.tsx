@@ -1,4 +1,3 @@
-import { lazy, Suspense } from "react";
 import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 import { AuthGate } from "./AuthGate";
 import { Shell } from "./Shell";
@@ -6,82 +5,12 @@ import { PhoneShell } from "./PhoneShell";
 // Login stays in the initial chunk: it is the unauthed first paint and must
 // not wait on a route chunk. Every authed surface is a separate chunk
 // (c-perffu UO-11: the eager all-pages bundle made cold navigation parse ~1.5
-// MB of JS in one long task).
+// MB of JS in one long task), wrapped in a LazyRoute boundary (r2: a rejected
+// offline/stale chunk keeps the Shell mounted and offers re-import/reload).
 import { LoginPage } from "../pages/LoginPage";
+import { LazyRoute } from "./routeBoundary";
 import { resolveLanding } from "../lib/mobileRoute";
 import { useWorkbenchViewport } from "../lib/viewport";
-
-const SessionsPage = lazy(() =>
-  import("../pages/SessionsPage").then((m) => ({ default: m.SessionsPage })),
-);
-const NewSessionPage = lazy(() =>
-  import("../pages/NewSessionPage").then((m) => ({ default: m.NewSessionPage })),
-);
-const SessionPage = lazy(() =>
-  import("../pages/SessionPage").then((m) => ({ default: m.SessionPage })),
-);
-const ApprovalsPage = lazy(() =>
-  import("../pages/ApprovalsPage").then((m) => ({ default: m.ApprovalsPage })),
-);
-const HostsPage = lazy(() =>
-  import("../pages/HostsPage").then((m) => ({ default: m.HostsPage })),
-);
-const HostDetailPage = lazy(() =>
-  import("../pages/HostsPage").then((m) => ({ default: m.HostDetailPage })),
-);
-const FleetPage = lazy(() =>
-  import("../pages/FleetPage").then((m) => ({ default: m.FleetPage })),
-);
-const ProjectsPage = lazy(() =>
-  import("../pages/ProjectsPage").then((m) => ({ default: m.ProjectsPage })),
-);
-const ProjectDetailPage = lazy(() =>
-  import("../pages/ProjectsPage").then((m) => ({ default: m.ProjectDetailPage })),
-);
-const ProvidersPage = lazy(() =>
-  import("../pages/ProvidersPage").then((m) => ({ default: m.ProvidersPage })),
-);
-const ProviderDetailPage = lazy(() =>
-  import("../pages/ProvidersPage").then((m) => ({ default: m.ProviderDetailPage })),
-);
-const BotsPage = lazy(() =>
-  import("../pages/BotsPage").then((m) => ({ default: m.BotsPage })),
-);
-const BotDetailPage = lazy(() =>
-  import("../pages/BotsPage").then((m) => ({ default: m.BotDetailPage })),
-);
-const SettingsPage = lazy(() =>
-  import("../pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
-);
-const SubagentView = lazy(() =>
-  import("../features/session/subagent/SubagentView").then((m) => ({ default: m.SubagentView })),
-);
-const Inbox = lazy(() =>
-  import("../features/mobile/Inbox").then((m) => ({ default: m.Inbox })),
-);
-const HomeList = lazy(() =>
-  import("../features/mobile/HomeList").then((m) => ({ default: m.HomeList })),
-);
-const BoardPage = lazy(() =>
-  import("../features/tasks/Board").then((m) => ({ default: m.BoardPage })),
-);
-
-/** Minimal fallback while a route chunk loads; AuthGate owns its own state. */
-function RouteFallback() {
-  return (
-    <p
-      style={{
-        margin: 0,
-        minHeight: "100dvh",
-        padding: "var(--space-5)",
-        background: "var(--bg-canvas)",
-        color: "var(--fg-muted)",
-      }}
-    >
-      加载中…
-    </p>
-  );
-}
 
 /**
  * D-049 viewport redirect layer (ui-spec §1.2 / §4.7). A pathless layout
@@ -119,185 +48,151 @@ export function AppRouter() {
             <Route
               path="/sessions"
               element={
-                <Suspense fallback={<RouteFallback />}>
-                  <SessionsPage />
-                </Suspense>
+                <LazyRoute
+                  loader={() => import("../pages/SessionsPage")}
+                  named="SessionsPage"
+                />
               }
             />
             <Route
               path="/approvals"
               element={
-                <Suspense fallback={<RouteFallback />}>
-                  <ApprovalsPage />
-                </Suspense>
+                <LazyRoute
+                  loader={() => import("../pages/ApprovalsPage")}
+                  named="ApprovalsPage"
+                />
               }
             />
             <Route
               path="/board"
-              element={
-                <Suspense fallback={<RouteFallback />}>
-                  <BoardPage />
-                </Suspense>
-              }
+              element={<LazyRoute loader={() => import("../features/tasks/Board")} named="BoardPage" />}
             />
           </Route>
           <Route
             path="/sessions/new"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <NewSessionPage />
-              </Suspense>
+              <LazyRoute
+                loader={() => import("../pages/NewSessionPage")}
+                named="NewSessionPage"
+              />
             }
           />
           <Route
             path="/s/:instanceId"
-            element={
-              <Suspense fallback={<RouteFallback />}>
-                <SessionPage />
-              </Suspense>
-            }
+            element={<LazyRoute loader={() => import("../pages/SessionPage")} named="SessionPage" />}
           />
           <Route
             path="/s/:instanceId/tty"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <SessionPage view="tty" />
-              </Suspense>
+              <LazyRoute
+                loader={() => import("../pages/SessionPage")}
+                named="SessionPage"
+                componentProps={{ view: "tty" }}
+              />
             }
           />
           <Route
             path="/s/:instanceId/structured"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <SessionPage view="structured" />
-              </Suspense>
+              <LazyRoute
+                loader={() => import("../pages/SessionPage")}
+                named="SessionPage"
+                componentProps={{ view: "structured" }}
+              />
             }
           />
           <Route
             path="/s/:instanceId/files"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <SessionPage view="files" />
-              </Suspense>
+              <LazyRoute
+                loader={() => import("../pages/SessionPage")}
+                named="SessionPage"
+                componentProps={{ view: "files" }}
+              />
             }
           />
           <Route
             path="/s/:instanceId/events"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <SessionPage view="events" />
-              </Suspense>
+              <LazyRoute
+                loader={() => import("../pages/SessionPage")}
+                named="SessionPage"
+                componentProps={{ view: "events" }}
+              />
             }
           />
           <Route
             path="/s/:instanceId/agents/:agentId"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <SubagentView />
-              </Suspense>
+              <LazyRoute
+                loader={() => import("../features/session/subagent/SubagentView")}
+                named="SubagentView"
+              />
             }
           />
           <Route
             path="/hosts"
-            element={
-              <Suspense fallback={<RouteFallback />}>
-                <HostsPage />
-              </Suspense>
-            }
+            element={<LazyRoute loader={() => import("../pages/HostsPage")} named="HostsPage" />}
           />
           <Route
             path="/hosts/:hostId"
-            element={
-              <Suspense fallback={<RouteFallback />}>
-                <HostDetailPage />
-              </Suspense>
-            }
+            element={<LazyRoute loader={() => import("../pages/HostsPage")} named="HostDetailPage" />}
           />
           <Route
             path="/fleet"
-            element={
-              <Suspense fallback={<RouteFallback />}>
-                <FleetPage />
-              </Suspense>
-            }
+            element={<LazyRoute loader={() => import("../pages/FleetPage")} named="FleetPage" />}
           />
           <Route
             path="/projects"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <ProjectsPage />
-              </Suspense>
+              <LazyRoute loader={() => import("../pages/ProjectsPage")} named="ProjectsPage" />
             }
           />
           <Route
             path="/projects/:workspaceId"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <ProjectDetailPage />
-              </Suspense>
+              <LazyRoute loader={() => import("../pages/ProjectsPage")} named="ProjectDetailPage" />
             }
           />
           <Route
             path="/providers"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <ProvidersPage />
-              </Suspense>
+              <LazyRoute loader={() => import("../pages/ProvidersPage")} named="ProvidersPage" />
             }
           />
           <Route
             path="/providers/:profileId"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <ProviderDetailPage />
-              </Suspense>
+              <LazyRoute
+                loader={() => import("../pages/ProvidersPage")}
+                named="ProviderDetailPage"
+              />
             }
           />
           <Route
             path="/bots"
-            element={
-              <Suspense fallback={<RouteFallback />}>
-                <BotsPage />
-              </Suspense>
-            }
+            element={<LazyRoute loader={() => import("../pages/BotsPage")} named="BotsPage" />}
           />
           <Route
             path="/bots/:channelId"
-            element={
-              <Suspense fallback={<RouteFallback />}>
-                <BotDetailPage />
-              </Suspense>
-            }
+            element={<LazyRoute loader={() => import("../pages/BotsPage")} named="BotDetailPage" />}
           />
           <Route
             path="/settings"
             element={
-              <Suspense fallback={<RouteFallback />}>
-                <SettingsPage />
-              </Suspense>
+              <LazyRoute loader={() => import("../pages/SettingsPage")} named="SettingsPage" />
             }
           />
         </Route>
         <Route element={<ViewportGate />}>
-          <Route
-            path="/m"
-            element={<PhoneShell />}
-          >
+          <Route path="/m" element={<PhoneShell />}>
             <Route
               index
-              element={
-                <Suspense fallback={<RouteFallback />}>
-                  <HomeList />
-                </Suspense>
-              }
+              element={<LazyRoute loader={() => import("../features/mobile/HomeList")} named="HomeList" />}
             />
             <Route
               path="inbox"
-              element={
-                <Suspense fallback={<RouteFallback />}>
-                  <Inbox />
-                </Suspense>
-              }
+              element={<LazyRoute loader={() => import("../features/mobile/Inbox")} named="Inbox" />}
             />
             <Route path="*" element={<Navigate to="/m" replace />} />
           </Route>

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Profiler, useEffect, useLayoutEffect, useRef, useState, type ProfilerOnRenderCallback, type ReactNode } from "react";
 import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { StateDot } from "../components/StateDot";
@@ -16,8 +16,7 @@ import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import { Transcript } from "../features/session/Transcript";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
-import { projectTurnDecision } from "../features/session/live/turnDecision";
-import { useNow } from "../features/session/live/useElapsed";
+import { useTurnDecision } from "../features/session/useTurnDecision";
 import { SessionNotifications } from "../features/session/notifications/SessionNotifications";
 import { TaskTrack } from "../features/session/TaskTrack";
 import {
@@ -48,12 +47,34 @@ import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
 import { FilesView } from "../features/files/FilesView";
 import session from "../chrome/sessionPage.module.css";
+import { profilingEnabled, reportProbe } from "../lib/profileFlags";
+import type { Observation } from "../types/generated";
 
-export function SessionPage({
+/** Stable empty list so an unfollowed session does not re-project every render. */
+const NO_EVENTS: Observation[] = [];
+
+const onSessionCommit: ProfilerOnRenderCallback = (_id, _phase, actualDuration) => {
+  reportProbe("commit:SessionPage", { actualDuration });
+};
+
+type SessionPageProps = { view?: "auto" | "structured" | "tty" | "files" | "events" };
+
+/**
+ * The perf probe counts SessionPage commits (an idle page should commit zero
+ * times a second). The Profiler is mounted only under `?profile=1`.
+ */
+export function SessionPage(props: SessionPageProps) {
+  if (!profilingEnabled) return <SessionPageBody {...props} />;
+  return (
+    <Profiler id="SessionPage" onRender={onSessionCommit}>
+      <SessionPageBody {...props} />
+    </Profiler>
+  );
+}
+
+function SessionPageBody({
   view = "auto",
-}: {
-  view?: "auto" | "structured" | "tty" | "files" | "events";
-}) {
+}: SessionPageProps) {
   const { instanceId = "" } = useParams();
   const hub = useHub();
   const annotationPanel = useAnnotationsContext();
@@ -143,21 +164,18 @@ export function SessionPage({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [view, backTo, navigate]);
 
-  const events = hub.events[instanceId] ?? [];
+  const events = hub.events[instanceId] ?? NO_EVENTS;
   const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
   const status = instance ? projectStatus(instance) : "unknown";
   // The turn-end decision folds every channel (hook latch, screen, transcript
   // tail, pending interactions), not the hook latch alone — so a turn whose
   // Stop hook never lands still ends once the screen/pty says idle. It is the
   // one decision the strip and the composer share, which is what lets a held
-  // prompt flush on the same boundary the clock stops on. A 1 Hz tick drives
-  // the hook-freshness judgement (the deciding signal after a turn goes quiet
-  // is elapsed time, not a new event).
-  const liveNow = useNow(true);
-  const turnDecision = useMemo(
-    () => projectTurnDecision(events, instance?.nativeRef, pending.length > 0, liveNow),
-    [events, instance?.nativeRef, pending.length, liveNow],
-  );
+  // prompt flush on the same boundary the clock stops on. The hook-freshness
+  // judgement is time-driven; useTurnDecision re-projects on a clock only
+  // while the turn is open and commits only when the answer changes, so an
+  // idle page does not re-render every second.
+  const turnDecision = useTurnDecision(events, instance?.nativeRef, pending.length > 0);
   // D-028 §6 composer phase. `starting` behaves like idle (one send box);
   // only a live working/blocked turn exposes steer/queue/interrupt. The
   // multi-channel turn decision outranks the instance projection for the

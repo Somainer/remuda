@@ -417,8 +417,15 @@ test("a committed POST whose browser response is lost retries with replayed:true
     route.request().method() === "GET" ? route.abort("failed") : route.continue(),
   );
 
-  await sendMessage(page, "lost response message");
+  await sendMessage(page, "__hold_journal__:8000");
   const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
+  // The fake node acks the first POST but WITHHOLDS its mirrored journal user
+  // observation for 8 s (__hold_journal__): without the hold the journal
+  // confirmation retires the row to done first (the terminal-done guarantee
+  // then correctly skips the replay), so the lost-response retry could never
+  // be observed. The hold makes the re-POST and its replayed:true answer the
+  // deterministic path; the journal replacement is asserted afterwards (the
+  // withheld append lands well inside the 30 s poll).
   await expect(bubble).toBeVisible();
   const commandId = await bubble.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
@@ -443,8 +450,11 @@ test("a committed POST whose browser response is lost retries with replayed:true
       { timeout: 30_000 },
     )
     .toBe(1);
-  // … and one journal message for the id (executed exactly once).
-  await expect.poll(() => hubJournalMessageCount(api, instanceId, commandId!)).toBe(1);
+  // … and one journal message for the id (executed exactly once). The fake
+  // node withholds it behind the __hold_journal__ delay, so allow for that.
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    .toBe(1);
   await expectDelivered(page, commandId);
 });
 

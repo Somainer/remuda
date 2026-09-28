@@ -53,7 +53,7 @@ html[data-keyboard="1"] [data-testid="composer-input"] {
    needs. Tighten both — the composer's own rows keep their 44px hit heights,
    only the wrapper spacing shrinks. */
 html[data-keyboard="1"] [data-testid="session-dock"] {
-  padding: 4px 12px;
+  padding: 4px 0;
   gap: 4px;
 }
 

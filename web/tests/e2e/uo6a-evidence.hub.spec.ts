@@ -261,6 +261,44 @@ test.describe("390 phone", () => {
   });
 });
 
+test.describe("1440 desktop", () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+  });
+
+  /** A dock child's box against the transcript's reading column. */
+  async function columnFit(page: Page, testid: string) {
+    return page.evaluate((id) => {
+      const el = document.querySelector(`[data-testid='${id}']`)!.getBoundingClientRect();
+      const list = document.querySelector("[data-testid='transcript-scroller']")!.getBoundingClientRect();
+      return { width: el.width, centre: el.left + el.width / 2, column: list.left + list.width / 2 };
+    }, testid);
+  }
+
+  test("dock children and the EndedBar follow the centred reading column", async ({ page }) => {
+    // ui-spec §4.2: width min(100% - 2 gutter, --read-measure) = 720 at 1440.
+    const live = await createSession(page, "uo6a column live");
+    await page.goto(`/s/${live}/structured`);
+    await transcriptReady(page);
+    await expect(page.getByTestId("approval-card")).toBeVisible({ timeout: 20_000 });
+    for (const id of ["composer", "pending-area"]) {
+      const fit = await columnFit(page, id);
+      expect(Math.round(fit.width), `${id} width`).toBe(720);
+      expect(Math.abs(fit.centre - fit.column), `${id} centred`).toBeLessThanOrEqual(1);
+    }
+
+    const ended = await createSession(page, "UO6A_COLUMN mhome-exit agent");
+    await page.goto(`/s/${ended}/structured`);
+    await transcriptReady(page);
+    await expect(page.getByTestId("ended-bar")).toBeVisible({ timeout: 20_000 });
+    const fit = await columnFit(page, "ended-bar");
+    expect(Math.round(fit.width), "ended-bar width").toBe(720);
+    expect(Math.abs(fit.centre - fit.column), "ended-bar centred").toBeLessThanOrEqual(1);
+  });
+});
+
 /** Evidence: every screen at one width and scheme. */
 async function captureScreens(browser: Browser, width: number, scheme: "dark" | "light") {
   const phone = width < 768;

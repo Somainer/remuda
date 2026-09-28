@@ -15,7 +15,7 @@ beforeEach(() => {
 /**
  * jsdom has no ResizeObserver and does zero layout; the promotion logic is
  * driven by an observer callback, so install one we can fire by hand and
- * stub scrollWidth/clientWidth per step.
+ * stub the inner-KaTeX intrinsic width and the box clientWidth per step.
  */
 class ResizeObserverMock {
   private callback: ResizeObserverCallback;
@@ -48,9 +48,36 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-const mockWidths = (el: Element, scrollWidth: number, clientWidth: number): void => {
-  Object.defineProperty(el, "scrollWidth", { configurable: true, get: () => scrollWidth });
-  Object.defineProperty(el, "clientWidth", { configurable: true, get: () => clientWidth });
+/**
+ * Stub one physically possible geometry (all real numbers a shrink-to-fit
+ * inline box / its inner KaTeX node / its paragraph parent can have):
+ *  - scrollW: content the box can scroll (or clip), including bearings
+ *  - nodeW:   the inner .katex border-box width
+ *  - clientW: the box's current content width (clamped to the parent when
+ *             the formula is wider, else shrink-to-fit ≈ the formula)
+ *  - parentW: available line width (paragraph content box)
+ */
+const mockGeom = (
+  el: Element,
+  g: { scrollW: number; nodeW: number; clientW: number; parentW: number },
+): void => {
+  Object.defineProperty(el, "scrollWidth", { configurable: true, get: () => g.scrollW });
+  Object.defineProperty(el, "clientWidth", { configurable: true, get: () => g.clientW });
+  const katexEl = el.querySelector(".katex");
+  if (katexEl) {
+    katexEl.getBoundingClientRect = () =>
+      ({
+        width: g.nodeW, x: 0, y: 0, top: 0, left: 0,
+        right: g.nodeW, bottom: 0, height: 0, toJSON() {},
+      }) as DOMRect;
+  }
+  const parent = el.parentElement;
+  if (parent) {
+    Object.defineProperty(parent, "clientWidth", {
+      configurable: true,
+      get: () => g.parentW,
+    });
+  }
 };
 
 describe("MathExpression", () => {
@@ -162,36 +189,78 @@ describe("MathExpression", () => {
     expect(event.clipboardData.setData).not.toHaveBeenCalled();
   });
 
-  it("promotes an inline formula on 1px overflow without a promote/demote loop (c-mathfu 2)", async () => {
-    render(<MathExpression source={"x_1+x_2+x_3+x_4"} display={false} />);
+  it("promotes on 1px clipped ink and never flips at the width boundary (c-mathfu 2/r2)", async () => {
+    render(<MathExpression source={"\\sum_i x_i"} display={false} />);
     const inline = await screen.findByTestId("math-inline");
-    expect(inline.className).not.toMatch(/inlineScroll/);
-    // Exactly one inline formula → one observer; widths are stubbed.
     expect(observers).toHaveLength(1);
-    const fire = (scrollWidth: number, clientWidth: number): void => {
-      mockWidths(inline, scrollWidth, clientWidth);
-      act(() => observers[0]!.trigger());
+    const fire = (g: Parameters<typeof mockGeom>[1]): void => {
+      mockGeom(inline, g);
+      act(() => observers[observers.length - 1]!.trigger());
     };
+    const promoted = (): boolean => inline.className.includes("inlineScroll");
 
-    // 1px of real overflow must already promote: no formula ink clipped.
-    fire(101, 100);
+    // KaTeX bearings make scrollWidth 36 in a 34px shrink-to-fit box: 1-2px
+    // of real ink is clipped, so it must promote even though the formula
+    // fits the 700px column with huge room.
+    expect(promoted()).toBe(false);
+    fire({ scrollW: 36, nodeW: 34, clientW: 34, parentW: 700 });
+    expect(promoted()).toBe(true);
+
+    // While promoted the bearings remain scrollable (scrollW 36 > 34): the
+    // box must NOT demote back to clip, and repeated callbacks settle.
+    fire({ scrollW: 36, nodeW: 34, clientW: 34, parentW: 700 });
+    expect(promoted()).toBe(true);
+    fire({ scrollW: 36, nodeW: 34, clientW: 34, parentW: 700 });
+    expect(promoted()).toBe(true);
+
+    // Boundary band: a clean formula that fills the available width to
+    // within 8px stays promoted (no sub-pixel flip); with 8px real slack
+    // and nothing scrollable it demotes, and does not re-promote.
+    fire({ scrollW: 696, nodeW: 696, clientW: 696, parentW: 700 });
+    expect(promoted()).toBe(true);
+    fire({ scrollW: 693, nodeW: 693, clientW: 693, parentW: 700 });
+    expect(promoted()).toBe(true);
+    fire({ scrollW: 692, nodeW: 692, clientW: 692, parentW: 700 });
+    expect(promoted()).toBe(false);
+    // Same geometry measured from the demoted box stays demoted.
+    fire({ scrollW: 692, nodeW: 692, clientW: 692, parentW: 700 });
+    expect(promoted()).toBe(false);
+  });
+
+  it("demotes when the column widens (narrow -> wide resize) (c-mathfu r2.2)", async () => {
+    render(<MathExpression source={"x_1+...+x_20"} display={false} />);
+    const inline = await screen.findByTestId("math-inline");
+    const fire = (g: Parameters<typeof mockGeom>[1]): void => {
+      mockGeom(inline, g);
+      act(() => observers[observers.length - 1]!.trigger());
+    };
+    // Narrow column: 900px formula clamped to a 180px shrink-to-fit box.
+    fire({ scrollW: 900, nodeW: 900, clientW: 180, parentW: 180 });
     expect(inline.className).toMatch(/inlineScroll/);
-
-    // The demote-side band keeps it promoted across sub-pixel width
-    // changes and repeated RO callbacks — no flip back and forth.
-    for (const clientWidth of [100, 99, 96, 93, 92]) {
-      fire(101, clientWidth);
-      expect(inline.className).toMatch(/inlineScroll/);
-    }
-
-    // Only REAL slack demotes.
-    fire(93, 100); // overflow -7: inside the demote band, stays promoted
-    expect(inline.className).toMatch(/inlineScroll/);
-    fire(92, 100); // overflow -8: demote
+    // Column widens to 1000: promoted box re-lays out shrink-to-fit at
+    // 900, nothing scrollable, 900 <= 1000-8 -> demote.
+    fire({ scrollW: 900, nodeW: 900, clientW: 900, parentW: 1000 });
     expect(inline.className).not.toMatch(/inlineScroll/);
-    // And 1px promotes again.
-    fire(101, 100);
+    // Shrinking the column again re-promotes on real overflow.
+    fire({ scrollW: 900, nodeW: 900, clientW: 180, parentW: 180 });
     expect(inline.className).toMatch(/inlineScroll/);
+  });
+
+  it("demotes when the source gets shorter (long -> short) (c-mathfu r2.2)", async () => {
+    const { rerender } = render(<MathExpression source={"x_1+...+x_20"} display={false} />);
+    const inline = await screen.findByTestId("math-inline");
+    const fire = (g: Parameters<typeof mockGeom>[1]): void => {
+      mockGeom(inline, g);
+      act(() => observers[observers.length - 1]!.trigger());
+    };
+    fire({ scrollW: 900, nodeW: 900, clientW: 180, parentW: 700 });
+    expect(inline.className).toMatch(/inlineScroll/);
+    // Streaming edit replaces the formula with a 40px one: the box
+    // shrink-to-fits, nothing scrolls, it fits the line with slack.
+    rerender(<MathExpression source={"x"} display={false} />);
+    const inline2 = await screen.findByTestId("math-inline");
+    fire({ scrollW: 40, nodeW: 40, clientW: 40, parentW: 700 });
+    expect(inline2.className).not.toMatch(/inlineScroll/);
   });
 
   it("renders a SECOND mounted component after the first import rejects (K)", async () => {

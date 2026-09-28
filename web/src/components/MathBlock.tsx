@@ -62,17 +62,31 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
     if (!renderedInline) return;
     const el = rootRef.current;
     if (!el) return;
-    // `overflow-x: clip` reserves no gutter, so scrollWidth/clientWidth tell
-    // the truth. ANY real overflow promotes — even 1px (KaTeX subscript
-    // bearings really extend a pixel or two past the box; clipping them is
-    // lost ink, and the promoted inline-flex box keeps the text baseline —
-    // see math.module.css). The anti-flip band lives on the DEMOTE side:
-    // sub-pixel rounding between frames must not flip a borderline node
-    // back to clip and re-render forever.
+    // Promotion/demotion compares the formula's INTRINSIC width (inner
+    // KaTeX node, which is flex 0 0 auto while promoted and never wraps)
+    // with both the current box and the AVAILABLE width (the paragraph
+    // content box). scrollWidth alone cannot drive demotion: it is clamped
+    // to clientWidth when content fits, so it is never negative; and the
+    // box is shrink-to-fit, so when the formula fits, clientWidth equals
+    // intrinsic and no negative slack ever appears.
+    //   - clipped box: promote whenever ink is really clipped
+    //     (scrollWidth > clientWidth, even 1-2px KaTeX subscript bearings).
+    //   - promoted box: demote only when NOTHING is scrollable any more AND
+    //     the intrinsic formula fits the available width with 8px slack
+    //     (column widened / source shortened). The scrollable check is what
+    //     keeps a bearing-overflow formula promoted even though it fits the
+    //     column with room: demoting would clip those pixels. The slack is
+    //     the anti-flip band at the column-width boundary.
     const DEMOTE_SLACK = 8;
     const measure = (): void => {
-      const overflow = el.scrollWidth - el.clientWidth;
-      setWide((prev) => (prev ? overflow > -DEMOTE_SLACK : overflow > 0));
+      const katexEl = el.querySelector<HTMLElement>(".katex");
+      const nodeWidth = katexEl ? katexEl.getBoundingClientRect().width : 0;
+      const intrinsic = Math.max(el.scrollWidth, nodeWidth);
+      const available = el.parentElement ? el.parentElement.clientWidth : el.clientWidth;
+      const clipped = el.scrollWidth > el.clientWidth;
+      setWide((prev) =>
+        prev ? clipped || intrinsic > available - DEMOTE_SLACK : clipped,
+      );
     };
     measure();
     // Fonts arriving late and viewport/column resizes change the width.

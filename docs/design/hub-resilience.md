@@ -493,32 +493,62 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   badge，不用通知条数或连接状态冒充审批数，Badging API 不可用就什么都不做。
 * 连接状态只存在于 §5.2 的界面状态条，不进入推送载荷。
 
-### 5.6 离线后 SW 恢复：同源 WebSocket 不受 PNA/LNA 阻断（c-reconnfu item 8 实测，2026-09-28）
+### 5.6 SW 离线恢复后同源 WebSocket 被 LNA 扣下的真正条件：SW 脚本由 DevTools 合成响应交付（c-reconnfu item 8/round2 实测，2026-09-28～29）
 
 * 背景：手机端 PWA 由 service worker 离线缓存兜底——整页在断网时由 SW
   恢复，恢复后连接机自动重连 follow WebSocket（D-055）。担心的是 Chromium
   的 Private/Local Network Access 检查会不会给「SW 离线恢复、客户端地址
   空间未知」的页面永久扣下到 Hub 的 WebSocket（即使网络已恢复）。
-* 结论（当前 Chrome 151 实测，无任何 PNA/LNA 关闭开关）：**生产同源形态不
-  受影响，无需额外恢复逻辑。** Hub 在同一 origin 上既服务 PWA 静态壳
-  （`lib.rs:841` 的 `static_fallback` → `web::static_handler`）也终结
-  `/v1/follow`；对 `127.0.0.1`（loopback，HTTP）、`172.18.0.1`
-  （私网/LAN，HTTP）、`172.18.0.1`（私网/LAN，HTTPS+受信证书）三种 origin
-  做「注册 SW→在线同源源 WS 成功→setOffline 断网（此时 WS 报
-  `ERR_INTERNET_DISCONNECTED`，始终**没有**
-  `ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS`）→断网下整页 reload 由 SW
-  恢复→恢复网络→同源源 WS」实测，恢复后 WS 均 `OPEN`。PNA 不会对一个去往
-  页面自身地址空间的同源 upgrade 生效。
-* 唯一出现 `ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS` 的是 **dev/测试
-  harness 的跨源形态**：页面由 Vite dev server（`:58889`）服务，follow WS
-  经其代理转发到独立的 Hub 端口（`:58880`）——文档与 WS 跨了进程/地址，SW
-  离线恢复后代理 hop 被 PNA 扣下。生产把 PWA 与 WS 放在同一 origin，没有这
-  一跳。该豁免因此只在 `offline-outbox.hub.spec.ts` 里以 describe 级
-  `test.use({ launchOptions: { args: ["--disable-features=…Private/Local…"] }})`
-  作用于那一个 harness 用例，**不**进全局 playwright 配置。
-* 若未来改成「PWA 与 Hub 不同源 / 经独立网关转发 WS」的部署形态，需要重测本
-  条；那时最小恢复是检测到 online 后 upgrade 仍被 PNA 扣下则做一次有守卫的
-  reload（当前无此代码，因为同源不需要）。
+* 第一轮（2026-09-28，Chrome 151，无任何 PNA/LNA 关闭开关）在三种 origin
+  形态（`127.0.0.1` loopback HTTP、`172.18.0.1` 私网 HTTP、私网
+  HTTPS+受信证书）上实测「注册 SW→在线同源 WS 成功→setOffline→断网下
+  整页 reload 由 SW 恢复→恢复网络→同源 WS」均 `OPEN`，断网期间只有
+  `ERR_INTERNET_DISCONNECTED`，从未出现
+  `ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS`——但当时给出的解释
+  （「Vite harness 跨源、经 :58889→:58880 代理一跳被 PNA 扣下，生产同源
+  没有这一跳」）**不成立**：浏览器侧请求在两种形态下都是同源的
+  （`api.ts:711/721` DEV 返回空 base，WS 连 `location.host`；Vite
+  `vite.config.ts:19` 在服务端代转发），「跨源」解释不了为何被拦。
+* 第二轮（2026-09-29，Playwright 1.63 自带 Chromium 1243，探针与原始
+  证据在 `scratch/pna-exp/`）用控制变量法定位了真正差异——**SW 脚本
+  本身的交付方式**，与 Vite/代理跳、离线、SW 缓存全部无关：
+  * 同一台普通同源 HTTP server 服务页面+SW+WS，离线恢复后 WS：
+    服务器真实响应交付 `/sw.js` → `OPEN`；
+  * 仅把 `/sw.js` 改成 Playwright
+    `context.route(...).fulfill(...)` 合成响应交付（连
+    `route.fetch()` 后原样 `fulfill({response})`、或补齐与服务器逐字
+    相同的响应头也一样）→
+    `ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS`，而且**不需要任何
+    离线/恢复过程**：注册后直接连 WS 即被拦，取消路由拦截后已注册的
+    worker 仍然带毒；
+  * 同样的 Vite 代理拓扑（页面 :8097，WS upgrade 经其 proxy 到
+    :8099），SW 脚本改由 Vite 从真实 socket 服务 → 离线恢复后 WS
+    `OPEN`（断网期间只有 `ERR_INTERNET_DISCONNECTED`），直接证伪
+    「代理跳被扣」；
+  * 受控页的同源普通 HTTP fetch 始终 200（请求走 SW fetch handler），
+    只有**绕过 SW 的 WebSocket**（SW 不处理 WS）被拦；unregister 该
+    SW 后新页面 WS 立即 `OPEN`——污染附着在「由合成脚本响应创建的 SW
+    注册」上，随注册消失。
+  * 机制（证据支持的精确表述）：经 DevTools Fetch 域 pause/fulfill 合成
+    的 SW 脚本响应没有真实网络对端地址，Chromium 给该 worker 记录的
+    响应地址空间为未知；受控页面发起的、不经过 SW 的 WebSocket 在 LNA
+    检查中按该未知空间的客户端评估，访问 loopback 即被本地网络访问检查
+    扣下。
+* 对生产的结论：**生产 Hub 同源形态不会命中这一拦截**，因为 SW 脚本由
+  Hub 自己的真实 socket（与 PWA 壳、`/v1/follow` 同源；
+  `lib.rs:841` 的 `static_fallback` → `web::static_handler`）服务，
+    worker 带有真实地址空间；被证实的触发条件（脚本响应由调试器合成）
+    在没有 CDP/Playwright 拦截的生产中不存在。边界：该结论只覆盖这一条
+    触发路径与已测形态；若未来改成「PWA 与 Hub 不同源 / 经独立网关
+    转发 WS / SW 脚本由中间层注入」需要重测。
+* e2e 处置：唯一需要豁免的是用 `route.fulfill` 注入测试 SW 的那个用例。
+  豁免是**文件级** `test.use({ launchOptions: { args: [...] } })`
+  （Playwright 不接受 describe 内的 launchOptions：会强制新建 worker），
+  写在 `offline-outbox.hub.spec.ts` 文件顶部，只作用于该 spec，
+  **不**进 `playwright.hub.config.ts`（该文件必须与 origin/main 逐字节
+  一致）。
+* 若未来出现真实部署形态下 online 后 upgrade 仍被 LNA 扣下，最小恢复是
+  检测到 online 后做一次有守卫的 reload（当前无此代码，因为同源不需要）。
 
 ---
 

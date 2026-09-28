@@ -56,3 +56,42 @@ html[data-keyboard="1"] [data-testid="session-dock"] {
   padding: 4px 12px;
   gap: 4px;
 }
+
+/* UO-6a round 2: the WHOLE composer — text box and control bar — fits in the
+   band under the pending-card area (ui-spec §2). At a 323px band the dock
+   has ~86px for it: a 44px text box, a 4px gap and ONE 32px control row.
+   - The control bar never wraps. Its essential controls (the options
+     trigger, 插队 / 打断 and the primary button) keep their size; the notes
+     (「尚未验证」, the voice hint) shrink to an ellipsis on the same row
+     instead of pushing the buttons onto a second one.
+   - The queued rows collapse into the bar's 「已排队 N」 chip, the one
+     affordance for them while typing; the rows (with their 插队发送 / 撤回)
+     return the moment the keyboard closes. The 已打断 receipt, a turn fact
+     already shown in the transcript, steps aside with them.
+   - Attachment and code-quote chips stay (they are part of the draft) but
+     keep to one scrolling line. */
+html[data-keyboard="1"] [data-testid="composer"] {
+  gap: 4px;
+}
+
+html[data-keyboard="1"] [data-testid="composer-bar"] {
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+html[data-keyboard="1"] [data-testid="composer-bar"] > [data-testid="composer-cap-note"],
+html[data-keyboard="1"] [data-testid="composer-bar"] > [data-testid="composer-voice-hint"] {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+html[data-keyboard="1"] [data-testid="composer-queued-row"],
+html[data-keyboard="1"] [data-testid="composer-interrupted-chip"] {
+  display: none !important;
+}
+
+html[data-keyboard="1"] [data-testid="attachment-chips"],
+html[data-keyboard="1"] [data-testid="code-quote-chips"] {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}

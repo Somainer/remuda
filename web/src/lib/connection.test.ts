@@ -353,4 +353,67 @@ describe("ConnectionMachine", () => {
     clock.advance(RECOVERING_WATCHDOG_MS - 1);
     expect(resume).toHaveBeenCalledTimes(1);
   });
+
+  it("binding gen: a superseded mount's late success never certifies the new binding live", () => {
+    const { machine } = setupTracked();
+    machine.bootstrapLive();
+    // Mount A starts its seed attempt under generation 1.
+    const idA = machine.followAttemptBegin(1);
+    expect(machine.state).toBe("recovering");
+    // Navigate to B: generation 2, B starts its own attempt.
+    machine.noteBinding(2);
+    const idB = machine.followAttemptBegin(2);
+    expect(idB).not.toBe(idA);
+    // A's seed/subscribe succeeds late — ignored, the machine must not claim
+    // live with no certified B socket.
+    machine.followAttemptEnd(true, idA, 1);
+    expect(machine.state).toBe("recovering");
+    // B's own success certifies.
+    machine.followAttemptEnd(true, idB, 2);
+    expect(machine.state).toBe("live");
+  });
+
+  it("binding gen: a superseded mount's late failure never takes the new binding offline", () => {
+    const { clock, machine } = setupTracked();
+    machine.bootstrapLive();
+    const idA = machine.followAttemptBegin(1);
+    machine.noteBinding(2);
+    const idB = machine.followAttemptBegin(2);
+    machine.followAttemptEnd(true, idB, 2);
+    expect(machine.state).toBe("live");
+    // A fails after B certified — B stays live.
+    machine.followAttemptEnd(false, idA, 1);
+    expect(machine.state).toBe("live");
+    clock.advance(1);
+    expect(machine.state).toBe("live");
+  });
+
+  it("followRebindLive: an already-mounted live rebind certifies and retires a superseded attempt", () => {
+    const { clock, machine } = setupTracked();
+    machine.bootstrapLive();
+    machine.followAttemptBegin(1);
+    expect(machine.state).toBe("recovering");
+    // Navigate to an already-mounted session whose socket is OPEN+fresh.
+    machine.noteBinding(2);
+    machine.followRebindLive();
+    expect(machine.state).toBe("live");
+    // The superseded attempt's watchdog is retired: at its deadline nothing
+    // happens (B stays live; the frame watchdog then drives quiet stale).
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(machine.state).not.toBe("offline");
+  });
+
+  it("binding gen: a resume for a superseded binding starts a fresh attempt and reruns resume", () => {
+    const { machine, resume } = setupTracked();
+    machine.bootstrapLive();
+    machine.followAttemptBegin(1);
+    expect(resume).toHaveBeenCalledTimes(0);
+    machine.noteBinding(2);
+    // The non-live mounted rebind kicks the machine like a foreground resume.
+    machine.dispatch({ type: "resume" });
+    expect(resume).toHaveBeenCalledTimes(1);
+    // The old attempt's late failure cannot close B's attempt.
+    machine.followAttemptEnd(false, 1, 1);
+    expect(machine.state).toBe("recovering");
+  });
 });

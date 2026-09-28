@@ -78,6 +78,15 @@ export class ConnectionMachine {
    * fires attempt A, B starts, A resolves late — A must never consume B.
    */
   private resumeAttemptId = 0;
+  /**
+   * Binding generation of the CURRENT session binding and of the attempt in
+   * flight. The store bumps {@link latestBindGen} whenever it binds the
+   * machine to a DIFFERENT journal (navigation A → B): an attempt armed for
+   * an older generation is superseded — its late completion must never
+   * certify/fail the newly bound session.
+   */
+  private latestBindGen = 0;
+  private resumeBindGen = 0;
   private readonly schedule: Scheduler;
   private readonly cancel: ScheduleCancel;
   private readonly random: () => number;
@@ -326,12 +335,36 @@ export class ConnectionMachine {
   }
 
   private beginResume() {
-    if (this.resumeInFlight) return;
+    // Coalesce only an attempt for the CURRENT binding: one armed for a mount
+    // the user navigated away from is superseded and replaced wholesale.
+    if (this.resumeInFlight && this.resumeBindGen === this.latestBindGen) return;
     const attemptId = this.armResumeAttempt();
     void this.deps
       .resume()
       .then(() => this.dispatch({ type: "resumeAttempt", ok: true, attemptId }))
       .catch(() => this.dispatch({ type: "resumeAttempt", ok: false, attemptId }));
+  }
+
+  /**
+   * Store hook: report the generation of the current session binding. The
+   * store bumps it on every bind to a DIFFERENT journal (navigation A → B).
+   * Once advanced, an attempt armed for an older generation is superseded.
+   */
+  noteBinding(gen: number) {
+    this.latestBindGen = gen;
+  }
+
+  /**
+   * The store rebound to an ALREADY-MOUNTED session whose socket is OPEN and
+   * fresh: certify the link against the new binding immediately, closing the
+   * attempt a superseded mount still owned (its watchdog becomes a no-op).
+   */
+  followRebindLive() {
+    this.resumeInFlight = false;
+    this.attempt = 0;
+    this.clearTimers("watchdog", "reconnect");
+    this.setState("live");
+    this.armFrameWatchdog();
   }
 
   /**
@@ -342,26 +375,33 @@ export class ConnectionMachine {
    * {@link followAttemptEnd} exactly as resume() would.
    *
    * Returns the attempt id to report back with. When a resume ALREADY owns the
-   * slot (the reconnect resume retried the mount through follow()), its
-   * watchdog covers the mount and its id is returned — the nested mount's
-   * completion then certifies/fails the enclosing attempt, never arms a
-   * second, competing watchdog.
+   * slot for the SAME binding (the reconnect resume retried the mount through
+   * follow()), its watchdog covers the mount and its id is returned — the
+   * nested mount's completion then certifies/fails the enclosing attempt,
+   * never arms a second, competing watchdog. An in-flight attempt for an
+   * OLDER binding (the user navigated A → B mid-seed) is replaced: B gets a
+   * fresh attempt and A's later end is ignored.
    */
-  followAttemptBegin(): number {
-    if (this.resumeInFlight) return this.resumeAttemptId;
-    this.armResumeAttempt();
-    return this.resumeAttemptId;
+  followAttemptBegin(gen: number = this.latestBindGen): number {
+    if (this.resumeInFlight && gen === this.resumeBindGen) return this.resumeAttemptId;
+    return this.armResumeAttempt(gen);
   }
 
-  /** Report an externally-driven follow mount (see followAttemptBegin). */
-  followAttemptEnd(ok: boolean, attemptId: number) {
+  /**
+   * Report an externally-driven follow mount (see followAttemptBegin). A
+   * completion for a superseded binding is dropped — a late A success must not
+   * certify B, a late A failure must not take B offline.
+   */
+  followAttemptEnd(ok: boolean, attemptId: number, gen: number = this.latestBindGen) {
+    if (gen !== this.latestBindGen) return;
     this.dispatch({ type: "resumeAttempt", ok, attemptId });
   }
 
-  private armResumeAttempt(): number {
-    this.clearTimers("stale", "offline", "probe", "reconnect");
+  private armResumeAttempt(gen: number = this.latestBindGen): number {
+    this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog");
     this.setState("recovering");
     this.resumeInFlight = true;
+    this.resumeBindGen = gen;
     const attemptId = ++this.resumeAttemptId;
     // The resume can never strand us in recovering: the watchdog forces the
     // attempt closed, and the promise also reports success/failure. Both carry

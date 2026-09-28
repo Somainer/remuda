@@ -514,6 +514,48 @@ test("an online send labels the row 等待发送 then 已发送，等待确认/�
   await expectDelivered(page, commandId);
 });
 
+test("a Hub-accepted send shows its delivered label on the still-visible bubble until the journal join", async ({ page }) => {
+  const instanceId = await createSession(page, "label hold seed");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const api = await hubApi(page);
+
+  // The fake node answers the POST immediately but withholds its mirrored
+  // journal user observation (__hold_journal__:<ms>, hub_e2e.rs): the
+  // accepted/delivered phase must be assertable on the STILL-VISIBLE bubble
+  // before the authoritative transcript row replaces it.
+  await sendMessage(page, "__hold_journal__:8000");
+  const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
+  await expect(bubble).toBeVisible();
+  const commandId = await bubble.getAttribute("data-command-id");
+  expect(commandId).toBeTruthy();
+
+  // The POST landed and the Hub committed the command (the row reconciles to
+  // sent — it reached the Hub — never 状态待确认） while the journal
+  // confirmation is held back.
+  await expect(bubble).toContainText("已发送，等待确认", { timeout: 15_000 });
+  await expect(bubble).not.toContainText("状态待确认");
+  await expect
+    .poll(
+      async () =>
+        (await hubCommands(api, instanceId)).filter(
+          (c) => c.operation === "instance.send" && c.id === commandId,
+        ).length,
+      { timeout: 15_000 },
+    )
+    .toBe(1);
+  // The optimistic chip is still on screen: the journal confirmation is held
+  // back, so the authoritative (non-bubble) transcript row has not replaced
+  // it yet (assemble hides the chip the moment the journal node joins).
+  await expect(bubble).toBeVisible();
+
+  // Hold released: the journal user observation joins exactly once and the
+  // bubble is replaced by the transcript row.
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    .toBe(1);
+  await expectDelivered(page, commandId);
+});
+
 /**
  * Test-only service worker: network-first with an offline cache fallback for
  * every same-origin GET EXCEPT the Hub API (/v1), which must always reach the

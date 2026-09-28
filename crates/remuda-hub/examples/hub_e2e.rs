@@ -1396,6 +1396,39 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
+                    // c-reconnfu round 2 item 5: `__hold_journal__:<ms>`
+                    // answers the POST FIRST (the Hub commits/accepts the
+                    // command and the client labels the row delivered) but
+                    // holds back the mirrored journal user observation that
+                    // replaces the optimistic bubble, so the e2e can assert
+                    // the accepted label on the still-visible chip before the
+                    // transcript row takes over.
+                    if let Some(ms) = prompt
+                        .strip_prefix("__hold_journal__:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        append_n = append_command_user(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            prompt,
+                            command_id,
+                        )
+                        .await?;
+                        append_n = append_journal(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "assistant",
+                            &format!("echo: {prompt}"),
+                        )
+                        .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                        continue;
+                    }
                     // c-journalpage bounded-window seeding hook:
                     // `__journal_burst__:<n>` appends n assistant message
                     // events in one batched journal.append frame (plus idle),

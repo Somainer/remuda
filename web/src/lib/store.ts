@@ -1876,10 +1876,12 @@ class HubStore {
         workspaces: registeredHosts.flatMap((host) => (host.workspaces ?? []).map(mapWorkspace)),
         interactions,
       });
-      this.hydrateEffortEffective(instances.items);
-      this.hydrateUsageRollups(instances.items);
-      this.hydrateModels(instances.items);
-      this.hydratePermissionEffective(instances.items);
+      profileRegion("store.pollHydrate", () => {
+        this.hydrateEffortEffective(instances.items);
+        this.hydrateUsageRollups(instances.items);
+        this.hydrateModels(instances.items);
+        this.hydratePermissionEffective(instances.items);
+      });
       this.stopWorkspaceFollow?.();
       this.stopWorkspaceFollow = api.hostWorkspaceSubscribe(
         (snapshot) => this.applyWorkspaceSnapshot(snapshot),
@@ -2142,33 +2144,37 @@ class HubStore {
       // An older in-flight poll that returns a still-pending row must not
       // revert a locally committed review; merge with the same seq/outstanding
       // pin discipline as the instance list.
-      const mergedInteractions = mergeInteractionSnapshots(
-        interactions,
-        this.state.interactions,
-        this.settledInteractions,
-        reqSeq,
-        this.listOutstanding,
-      );
-      const mergedInstances = mergeInstanceSnapshots(
-        instances.items,
-        this.state.instances,
-        this.pinnedCreates,
-        reqSeq,
-        this.listOutstanding,
-      );
       profileRegion("store.pollMerge", () => {
+        // The merges (including the structuralEqual identity checks) are timed
+        // inside this region, not just the emit — the r1 probe boundary wrongly
+        // measured only the latter (c-perffu r2 item 5).
+        const nextInteractions = mergeInteractionSnapshots(
+          interactions,
+          this.state.interactions,
+          this.settledInteractions,
+          reqSeq,
+          this.listOutstanding,
+        );
+        const nextInstances = mergeInstanceSnapshots(
+          instances.items,
+          this.state.instances,
+          this.pinnedCreates,
+          reqSeq,
+          this.listOutstanding,
+        );
         // An unchanged poll preserves every row identity (see the merge
         // functions), so skip the emission — and every consumer render wave —
         // entirely when neither snapshot changed.
         if (
-          !sameArrayIdentity(mergedInstances, this.state.instances) ||
-          !sameArrayIdentity(mergedInteractions, this.state.interactions)
+          !sameArrayIdentity(nextInstances, this.state.instances) ||
+          !sameArrayIdentity(nextInteractions, this.state.interactions)
         ) {
           this.emit({
-            instances: mergedInstances,
-            interactions: mergedInteractions,
+            instances: nextInstances,
+            interactions: nextInteractions,
           });
         }
+        return;
       });
       // A response newer than a pin proves the server has spoken after the
       // create/answer. Combined with the in-flight sweep below (every older
@@ -2183,10 +2189,12 @@ class HubStore {
         const row = interactions.find((candidate) => candidate.id === id);
         if (!row || row.state !== "pending") pin.confirmedByNewer = true;
       }
-      this.hydrateEffortEffective(instances.items);
-      this.hydrateUsageRollups(instances.items);
-      this.hydrateModels(instances.items);
-      this.hydratePermissionEffective(instances.items);
+      profileRegion("store.pollHydrate", () => {
+        this.hydrateEffortEffective(instances.items);
+        this.hydrateUsageRollups(instances.items);
+        this.hydrateModels(instances.items);
+        this.hydratePermissionEffective(instances.items);
+      });
       // NOTE: list-row live phrases are NOT derived here. refresh() fans into
       // every authenticated path (close/cancel/create/resume re-enter it) and
       // must not add journal polling; the mounted SessionList hydrates phrases

@@ -549,23 +549,20 @@ self.addEventListener("fetch", (event) => {
 });
 `;
 
-test.describe("full offline SW restore (PNA/LNA loopback exemption for this harness case)", () => {
-  // The fake Hub is reached on loopback through the dev-server proxy. A page
-  // a service worker restored WHILE OFFLINE boots with an unknown client
-  // IP-address space; Chromium then blocks its WebSocket upgrades to loopback
-  // (ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS) even after connectivity
-  // returns. Scoped to THIS test only — the rest of the suite must run with
-  // the browser's real network checks. (Whether production private-IP
-  // same-origin deployments are affected is tracked in
-  // docs/design/hub-resilience.md §5.)
-  test.use({
-    launchOptions: {
-      args: [
-        "--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessChecks,PrivateNetworkAccessForNavigations,PrivateNetworkAccessForWorkers,PrivateNetworkAccessForWebRTC,BlockInsecureLocalNetworkRequests,LocalNetworkAccessChecks,LocalNetworkAccessChecksForNavigation,LocalNetworkAccessChecksForWebRTC,LocalNetworkAccessChecksForWorkers,LocalNetworkAccessChecksWarningOnly",
-      ],
-    },
-  });
+// The full-offline-SW-restore test needs the loopback PNA/LNA exemption (see the
+// describe below and docs/design/hub-resilience.md §5.6). Playwright only
+// accepts launchOptions at file scope (a describe-level use forces a new
+// worker), so this disables the checks for THIS SPEC FILE only — not the hub
+// config and not the rest of the suite.
+test.use({
+  launchOptions: {
+    args: [
+      "--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessChecks,PrivateNetworkAccessForNavigations,PrivateNetworkAccessForWorkers,PrivateNetworkAccessForWebRTC,BlockInsecureLocalNetworkRequests,LocalNetworkAccessChecks,LocalNetworkAccessChecksForNavigation,LocalNetworkAccessChecksForWebRTC,LocalNetworkAccessChecksForWorkers,LocalNetworkAccessChecksWarningOnly",
+    ],
+  },
+});
 
+test.describe("full offline SW restore (PNA/LNA loopback exemption for this harness case)", () => {
   test("an offline-queued message survives a reload with the browser context STILL offline and sends once after", async ({ page }) => {
     const instanceId = await createSession(page, "full offline reload seed");
     await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });

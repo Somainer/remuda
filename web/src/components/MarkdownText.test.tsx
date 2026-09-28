@@ -323,6 +323,83 @@ describe("math rendering (c-math round 3)", () => {
     expect(container.querySelector("a")?.querySelector('[data-testid="math-inline"]')).toBeTruthy();
   });
 
+  it("bold-wrapped math promotes then demotes on a real paragraph resize (c-mathfu r4)", async () => {
+    // A ResizeObserver that delivers per-target entries (an entry for an
+    // unobserved element is a no-op), so the paragraph-only event below is
+    // a genuine container resize, not a shared callback.
+    const instances: { trigger: (t?: Element) => void; observed: Element[] }[] = [];
+    class ROMock {
+      private cb: ResizeObserverCallback;
+      readonly observed: Element[] = [];
+      constructor(cb: ResizeObserverCallback) {
+        this.cb = cb;
+      }
+      observe(t: Element): void {
+        if (!this.observed.includes(t)) this.observed.push(t);
+      }
+      unobserve(t: Element): void {
+        const i = this.observed.indexOf(t);
+        if (i >= 0) this.observed.splice(i, 1);
+      }
+      disconnect(): void {
+        this.observed.splice(0);
+      }
+      trigger(t?: Element): void {
+        if (t && !this.observed.includes(t)) return;
+        const targets = t ? [t] : [...this.observed];
+        this.cb(
+          targets.map((target) => ({ target })) as ResizeObserverEntry[],
+          this as unknown as ResizeObserver,
+        );
+      }
+    }
+    vi.stubGlobal(
+      "ResizeObserver",
+      class extends ROMock {
+        constructor(cb: ResizeObserverCallback) {
+          super(cb);
+          instances.push(this);
+        }
+      },
+    );
+    try {
+      const { container } = render(<MarkdownText text={"**$x_{1}+x_{2}+x_{3}+x_{4}$**"} />);
+      const inline = await screen.findByTestId("math-inline");
+      expect(inline.closest("strong")).toBeTruthy(); // really bold-wrapped
+      const para = container.querySelector("p")!;
+      const ro = instances[instances.length - 1]!;
+      // The paragraph (nearest block past <strong>) is observed, not the
+      // zero-width bold ancestor.
+      expect(ro.observed).toContain(para);
+      expect(ro.observed).not.toContain(inline.parentElement!);
+
+      const install = (g: { sw: number; nw: number; cw: number; bw: number }): void => {
+        Object.defineProperty(inline, "scrollWidth", { configurable: true, get: () => g.sw });
+        Object.defineProperty(inline, "clientWidth", { configurable: true, get: () => g.cw });
+        const katexEl = inline.querySelector(".katex")!;
+        katexEl.getBoundingClientRect = () =>
+          ({ width: g.nw, x: 0, y: 0, top: 0, left: 0, right: g.nw, bottom: 0, height: 0, toJSON() {} }) as DOMRect;
+        Object.defineProperty(para, "clientWidth", { configurable: true, get: () => g.bw });
+      };
+
+      // Narrow 180px paragraph: the 900px formula promotes.
+      act(() => {
+        install({ sw: 900, nw: 900, cw: 180, bw: 180 });
+        ro.trigger(inline);
+      });
+      expect(inline.className).toMatch(/inlineScroll/);
+      // Paragraph widens to 1000 while the intrinsic formula is unchanged;
+      // the entry is the PARAGRAPH's alone — it demotes.
+      act(() => {
+        install({ sw: 900, nw: 900, cw: 900, bw: 1000 });
+        ro.trigger(para);
+      });
+      expect(inline.className).not.toMatch(/inlineScroll/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("renders an unclosed display tail as an exact-source React text node (G)", async () => {
     const { rerender } = render(<MarkdownText text={"intro \\[a *b* + \\{c\\}"} />);
     await new Promise((r) => setTimeout(r, 0));

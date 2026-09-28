@@ -33,8 +33,14 @@ class ResizeObserverMock {
   disconnect(): void {
     this.observed.splice(0);
   }
-  trigger(): void {
-    this.callback([], this as unknown as ResizeObserver);
+  /** Deliver one entry for `target`; a target that is not observed is a no-op. */
+  trigger(target?: Element): void {
+    if (target && !this.observed.includes(target)) return;
+    const targets = target ? [target] : [...this.observed];
+    this.callback(
+      targets.map((t) => ({ target: t })) as ResizeObserverEntry[],
+      this as unknown as ResizeObserver,
+    );
   }
 }
 let observers: ResizeObserverMock[] = [];
@@ -311,31 +317,52 @@ describe("MathExpression", () => {
     // The immediate parents really are inline boxes of width 0.
     expect(getComputedStyle(inline.parentElement!).display).toBe("inline");
     expect(inline.parentElement!.clientWidth).toBe(0);
-    const fire = (g: Parameters<typeof mockGeom>[1]): void => {
+    const block = screen.getByTestId("para");
+    const ro = (): ResizeObserverMock => observers[observers.length - 1]!;
+    // `fire` installs geometry then delivers an entry for ONE element:
+    // "el" = wrapper measured, "block" = the containing block only.
+    const fire = (which: "el" | "block", g: Parameters<typeof mockGeom>[1]): void => {
       mockGeom(inline, g);
-      act(() => observers[observers.length - 1]!.trigger());
+      act(() => ro().trigger(which === "el" ? inline : block));
     };
+    const promoted = (): boolean => inline.className.includes("inlineScroll");
 
     // Narrow block: promoted even though every ancestor up to <p> is inline.
-    fire({ scrollW: 900, nodeW: 900, clientW: 180, blockW: 180 });
-    expect(inline.className).toMatch(/inlineScroll/);
-    // Block widens a little: wrapper shrink-to-fits to 900 and nothing
-    // scrolls, but 900 > 904-8, so it stays promoted.
-    fire({ scrollW: 900, nodeW: 900, clientW: 900, blockW: 904 });
-    expect(inline.className).toMatch(/inlineScroll/);
-    // Padded block: clientWidth 224 = 200 content + 12px padding each side.
+    fire("el", { scrollW: 900, nodeW: 900, clientW: 180, blockW: 180 });
+    expect(promoted()).toBe(true);
+
+    // Padded block, content width 200 (224 client - 12px padding each side).
     // A 195px formula stays inside the 8px band of the CONTENT width (if
     // padding were not subtracted, 195 <= 224-8 would wrongly demote).
-    fire({ scrollW: 195, nodeW: 195, clientW: 195, blockW: 200, padL: 12, padR: 12 });
-    expect(inline.className).toMatch(/inlineScroll/);
+    fire("el", { scrollW: 195, nodeW: 195, clientW: 195, blockW: 200, padL: 12, padR: 12 });
+    expect(promoted()).toBe(true);
     // With real content-width slack it demotes.
-    fire({ scrollW: 190, nodeW: 190, clientW: 190, blockW: 200, padL: 12, padR: 12 });
-    expect(inline.className).not.toMatch(/inlineScroll/);
+    fire("block", { scrollW: 190, nodeW: 190, clientW: 190, blockW: 200, padL: 12, padR: 12 });
+    expect(promoted()).toBe(false);
 
-    // Long -> short source through the same inline ancestry demotes too.
+    // Intrinsic width stays 900; ONLY the nested container widens
+    // (180 -> 1000). Get promoted again, then deliver the BLOCK's entry
+    // alone — the wrapper geometry is unchanged — and it demotes.
+    fire("el", { scrollW: 900, nodeW: 900, clientW: 180, blockW: 180 });
+    expect(promoted()).toBe(true);
+    fire("block", { scrollW: 900, nodeW: 900, clientW: 900, blockW: 1000 });
+    expect(promoted()).toBe(false);
+
+    // Long -> short source through the same inline ancestry: get back into
+    // the promoted state and prove it is promoted IMMEDIATELY before the
+    // rerender (otherwise the later demote assertion would be vacuous).
+    fire("el", { scrollW: 900, nodeW: 900, clientW: 180, blockW: 180 });
+    expect(promoted()).toBe(true);
+    // The narrow geometry stays installed across the streaming rerender;
+    // the source change replaces only the inner KaTeX node.
     rerender(<Nested expr={"x"} />);
     const inline2 = await screen.findByTestId("math-inline");
-    fire({ scrollW: 40, nodeW: 40, clientW: 40, blockW: 700 });
+    expect(inline2.className).toMatch(/inlineScroll/);
+    // Measuring the now-short formula in the wide block demotes it.
+    act(() => {
+      mockGeom(inline2, { scrollW: 40, nodeW: 40, clientW: 40, blockW: 700 });
+      observers[observers.length - 1]!.trigger(block);
+    });
     expect(inline2.className).not.toMatch(/inlineScroll/);
   });
 
@@ -347,22 +374,31 @@ describe("MathExpression", () => {
     // Both the wrapper and its available-width block are observed.
     expect(ro.observed).toContain(inline);
     expect(ro.observed).toContain(block);
-    const fire = (g: Parameters<typeof mockGeom>[1]): void => {
+    // Deliver a real per-target entry for exactly one observed element.
+    const fire = (which: "el" | "block", g: Parameters<typeof mockGeom>[1]): void => {
       mockGeom(inline, g);
-      act(() => ro.trigger());
+      act(() => ro.trigger(which === "el" ? inline : block));
     };
 
-    // Promotes with 899px available (1px clipped).
-    fire({ scrollW: 900, nodeW: 900, clientW: 899, blockW: 899 });
+    // Promotes with 899px available (1px clipped) — wrapper entry only.
+    fire("el", { scrollW: 900, nodeW: 900, clientW: 899, blockW: 899 });
     expect(inline.className).toMatch(/inlineScroll/);
     // Block widens to 904: wrapper shrink-to-fits to 900 and nothing scrolls,
     // but 900 > 904-8, so it stays promoted (first stage changes the wrapper).
-    fire({ scrollW: 900, nodeW: 900, clientW: 900, blockW: 904 });
+    fire("el", { scrollW: 900, nodeW: 900, clientW: 900, blockW: 904 });
     expect(inline.className).toMatch(/inlineScroll/);
-    // SECOND STAGE changes only the container (wrapper stays 900): the block
-    // observation fires and the 100px slack demotes.
-    fire({ scrollW: 900, nodeW: 900, clientW: 900, blockW: 1000 });
+    // SECOND STAGE changes only the container: the wrapper geometry is
+    // untouched (still 900/900), only the block's clientWidth goes to 1000,
+    // and the entry delivered is the BLOCK's alone. The 100px slack demotes.
+    act(() => {
+      Object.defineProperty(block, "clientWidth", { configurable: true, get: () => 1000 });
+      ro.trigger(block);
+    });
     expect(inline.className).not.toMatch(/inlineScroll/);
+
+    // An entry for an element that is NOT observed must be a no-op (this is
+    // what makes the container observation real, not a shared callback).
+    act(() => ro.trigger(document.createElement("div")));
 
     // Cleanup disconnects both observations.
     unmount();

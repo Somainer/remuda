@@ -493,6 +493,33 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   badge，不用通知条数或连接状态冒充审批数，Badging API 不可用就什么都不做。
 * 连接状态只存在于 §5.2 的界面状态条，不进入推送载荷。
 
+### 5.6 离线后 SW 恢复：同源 WebSocket 不受 PNA/LNA 阻断（c-reconnfu item 8 实测，2026-09-28）
+
+* 背景：手机端 PWA 由 service worker 离线缓存兜底——整页在断网时由 SW
+  恢复，恢复后连接机自动重连 follow WebSocket（D-055）。担心的是 Chromium
+  的 Private/Local Network Access 检查会不会给「SW 离线恢复、客户端地址
+  空间未知」的页面永久扣下到 Hub 的 WebSocket（即使网络已恢复）。
+* 结论（当前 Chrome 151 实测，无任何 PNA/LNA 关闭开关）：**生产同源形态不
+  受影响，无需额外恢复逻辑。** Hub 在同一 origin 上既服务 PWA 静态壳
+  （`lib.rs:841` 的 `static_fallback` → `web::static_handler`）也终结
+  `/v1/follow`；对 `127.0.0.1`（loopback，HTTP）、`172.18.0.1`
+  （私网/LAN，HTTP）、`172.18.0.1`（私网/LAN，HTTPS+受信证书）三种 origin
+  做「注册 SW→在线同源源 WS 成功→setOffline 断网（此时 WS 报
+  `ERR_INTERNET_DISCONNECTED`，始终**没有**
+  `ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS`）→断网下整页 reload 由 SW
+  恢复→恢复网络→同源源 WS」实测，恢复后 WS 均 `OPEN`。PNA 不会对一个去往
+  页面自身地址空间的同源 upgrade 生效。
+* 唯一出现 `ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS` 的是 **dev/测试
+  harness 的跨源形态**：页面由 Vite dev server（`:58889`）服务，follow WS
+  经其代理转发到独立的 Hub 端口（`:58880`）——文档与 WS 跨了进程/地址，SW
+  离线恢复后代理 hop 被 PNA 扣下。生产把 PWA 与 WS 放在同一 origin，没有这
+  一跳。该豁免因此只在 `offline-outbox.hub.spec.ts` 里以 describe 级
+  `test.use({ launchOptions: { args: ["--disable-features=…Private/Local…"] }})`
+  作用于那一个 harness 用例，**不**进全局 playwright 配置。
+* 若未来改成「PWA 与 Hub 不同源 / 经独立网关转发 WS」的部署形态，需要重测本
+  条；那时最小恢复是检测到 online 后 upgrade 仍被 PNA 扣下则做一次有守卫的
+  reload（当前无此代码，因为同源不需要）。
+
 ---
 
 ## 6. 【规格】egress 载荷保护：一条不变量

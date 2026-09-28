@@ -168,45 +168,30 @@ describe("MathExpression", () => {
     expect(inline.className).not.toMatch(/inlineScroll/);
     // Exactly one inline formula → one observer; widths are stubbed.
     expect(observers).toHaveLength(1);
-    // In real layout the auto box's bottom edge sits on the baseline, so its
-    // rect bottom rises by the formula depth (7px here) relative to clip.
-    const bottomFor = (): number => (inline.className.includes("inlineScroll") ? 93 : 100);
-    inline.getBoundingClientRect = () =>
-      ({
-        x: 0, y: 0, left: 0, right: 0, top: 0, width: 0,
-        bottom: bottomFor(), height: bottomFor(), toJSON() {},
-      }) as DOMRect;
     const fire = (scrollWidth: number, clientWidth: number): void => {
       mockWidths(inline, scrollWidth, clientWidth);
       act(() => observers[0]!.trigger());
     };
 
-    // 1px of real overflow must already promote: no formula content clipped.
+    // 1px of real overflow must already promote: no formula ink clipped.
     fire(101, 100);
     expect(inline.className).toMatch(/inlineScroll/);
-    // The 7px baseline sink is compensated exactly (pre-paint layout effect).
-    expect(inline.style.verticalAlign).toBe("-7px");
 
-    // The demote-side band keeps it promoted across gutter-sized width
+    // The demote-side band keeps it promoted across sub-pixel width
     // changes and repeated RO callbacks — no flip back and forth.
-    for (const clientWidth of [99, 96, 93, 92]) {
+    for (const clientWidth of [100, 99, 96, 93, 92]) {
       fire(101, clientWidth);
       expect(inline.className).toMatch(/inlineScroll/);
-      expect(inline.style.verticalAlign).toBe("-7px");
     }
-    fire(101, 100);
-    expect(inline.className).toMatch(/inlineScroll/);
 
-    // Only REAL slack demotes, and the shift is cleared on demote.
+    // Only REAL slack demotes.
     fire(93, 100); // overflow -7: inside the demote band, stays promoted
     expect(inline.className).toMatch(/inlineScroll/);
     fire(92, 100); // overflow -8: demote
     expect(inline.className).not.toMatch(/inlineScroll/);
-    expect(inline.style.verticalAlign).toBe("");
-    // And 1px promotes again with the same compensation.
+    // And 1px promotes again.
     fire(101, 100);
     expect(inline.className).toMatch(/inlineScroll/);
-    expect(inline.style.verticalAlign).toBe("-7px");
   });
 
   it("renders a SECOND mounted component after the first import rejects (K)", async () => {

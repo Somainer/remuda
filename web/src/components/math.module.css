@@ -64,15 +64,17 @@
  * The wrapper is an inline-block so a WIDE formula can scroll inside its own
  * box instead of widening the transcript (max-width 100%, same contract as
  * the placeholder). The default is `overflow-x: clip`, deliberately NOT
- * `auto`: a scroll container computes overflow-y to `auto` too and would
- * clip tall formulas' growth, and even a 1-2px sub-pixel overflow (e.g.
- * $\sum_i x_i$) used to reserve the gutter and grow the line. The component
+ * `auto`: a scrolling inline-block is baseline-aligned by its BOTTOM MARGIN
+ * EDGE (CSS 2.1 §10.3.7) instead of the formula baseline, so promoting
+ * clip -> auto sinks the node by its depth and grows the line. The component
  * measures the rendered node and adds `.inlineScroll` on any REAL overflow
- * (round-4 fix 4, c-mathfu 2: the threshold is > 0, so even 1px of actual
- * content is never clipped). `.inlineScroll` uses an OVERLAY scrollbar that
- * reserves no gutter, so promotion never changes line geometry; the formula
- * stays scrollable via shift-wheel, trackpad and touch. A clipped default is
- * still required so an unpromoted tall formula keeps overflow-y visible.
+ * (round-4 fix 4, c-mathfu 2: threshold > 0, so even 1-2px of actual ink —
+ * e.g. a subscript side bearing — is never clipped). `.inlineScroll` is an
+ * INLINE-FLEX scroll container: a flex box's baseline is its flex item's
+ * baseline, so the formula keeps the text baseline and the line never grows;
+ * its scrollbar is overlay (zero gutter) for the same reason. A clipped
+ * default is still required so an unpromoted tall formula keeps overflow-y
+ * visible.
  */
 .inline {
   display: inline-block;
@@ -91,17 +93,23 @@
 }
 
 .inlineScroll {
+  display: inline-flex;
   overflow-x: auto;
   overflow-y: hidden;
-  /* Overlay, zero-gutter scrollbar: promotion must never reserve bar space
-     (that grew the line by the gutter height), while the formula stays
-     horizontally scrollable. Shift-wheel / trackpad / touch drive it. */
+  /* Overlay, zero-gutter scrollbar: promotion reserves no bar space; the
+     formula stays horizontally scrollable (shift-wheel / trackpad / touch). */
   scrollbar-width: none;
 }
 
 .inlineScroll::-webkit-scrollbar {
   width: 0;
   height: 0;
+}
+
+.inlineScroll :global(.katex) {
+  /* Never shrink the KaTeX item: the box scrolls, the formula does not wrap
+     or compress (its intrinsic width feeds scrollWidth). */
+  flex: 0 0 auto;
 }
 
 /* Exact streaming source of an unclosed display formula: plain text. */

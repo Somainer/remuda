@@ -2260,14 +2260,14 @@ class HubStore {
     return this.state.permissionEffective[instanceId] ?? null;
   }
 
-  async respond(interactionId: Id, answer: InteractionAnswer) {
+  async respond(interactionId: Id, answer: InteractionAnswer, instanceId?: Id) {
     this.emit({ answering: { ...this.state.answering, [interactionId]: true } });
     try {
       // The decision is committed the moment the POST succeeds. Any failure
       // AFTER that (a list/catchup refresh) is a UI-sync problem, not a
       // rejected decision: keep the success path so the card does not flip
       // back to answerable (a second answer would only be Superseded).
-      await api.interactionRespond(interactionId, answer);
+      await api.interactionRespond(interactionId, answer, instanceId);
     } catch (error) {
       // Only a rejected POST returns the card to answerable state and surfaces
       // the error; the draft is preserved for correction.

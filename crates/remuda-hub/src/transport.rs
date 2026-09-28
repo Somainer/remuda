@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, atomic::AtomicU64, atomic::Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -385,6 +385,12 @@ pub(crate) enum FencedCall {
 #[derive(Clone, Default)]
 pub struct ConnectedNodes {
     inner: Arc<Mutex<HashMap<String, NodeSlot>>>,
+    /// c-deadcards round 4: process-wide monotonically increasing connection
+    /// number, assigned once per accepted link and NEVER reused — even after
+    /// the previous entry for a host was removed. A fence therefore stays
+    /// unique across an ordinary disconnect/reconnect (which used to delete
+    /// the per-host slot and restart its counter at 1).
+    next_generation: Arc<AtomicU64>,
 }
 
 impl ConnectedNodes {
@@ -474,18 +480,18 @@ impl ConnectedNodes {
         }
     }
 
-    /// Record a live session. Returns a generation used to retire only this session.
+    /// Record a live session. The returned generation is process-wide unique
+    /// for this link (c-deadcards round 4): it does not reset when the host's
+    /// previous slot is removed, so a dispatch claimed against the old
+    /// connection can never validate against its replacement.
     pub async fn insert(
         &self,
         host_id: String,
         link: Arc<dyn NodeTransport>,
         node_epoch: Option<String>,
     ) -> u64 {
+        let generation = self.next_generation.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         let mut inner = self.inner.lock().await;
-        let generation = inner
-            .get(&host_id)
-            .map(|slot| slot.generation.wrapping_add(1))
-            .unwrap_or(1);
         inner.insert(
             host_id,
             NodeSlot {
@@ -879,5 +885,52 @@ mod fence_tests {
                 .await,
             FencedCall::NotConnected
         ));
+    }
+
+    /// c-deadcards round 4 (item 2): an ORDINARY disconnect (entry removed)
+    /// must not let the next accepted connection reuse a generation number.
+    /// The counter is process-wide monotonic, so a claim bound to the dead
+    /// link can never validate against its replacement.
+    #[tokio::test]
+    async fn generation_is_never_reused_after_an_ordinary_disconnect() {
+        let nodes = ConnectedNodes::default();
+        let host = "hst_fence_reuse";
+        let link = |n: u64| -> Arc<dyn NodeTransport> {
+            Arc::new(ScriptedTransport::new(Some(json!({
+                "jsonrpc": "2.0", "id": n.to_string(), "result": {"ok": true}
+            }))))
+        };
+
+        let gen1 = nodes.insert(host.into(), link(1), Some("E".into())).await;
+        assert_eq!(gen1, 1);
+        // Ordinary disconnect deletes the per-host slot entirely.
+        nodes.remove(host).await;
+        // Reconnect with the SAME epoch. On the old per-host counter this was
+        // generation 1 again; now it must be a fresh, never-reused number.
+        let gen2 = nodes.insert(host.into(), link(2), Some("E".into())).await;
+        assert_ne!(
+            gen1, gen2,
+            "a reconnect must not reuse the dead link's generation"
+        );
+        assert_eq!(gen2, 2, "the counter is process-wide, not per-host");
+        // The old claim stays dead against the replacement.
+        assert!(matches!(
+            nodes
+                .call_fenced(host, Some("E"), gen1, "interaction.answer", json!({}), Duration::from_secs(1))
+                .await,
+            FencedCall::GenerationMismatch {
+                actual_generation: g,
+                ..
+            } if g == gen2
+        ));
+        // A second host's first link also does not restart at 1.
+        let other = nodes
+            .insert(
+                "hst_fence_reuse_other".into(),
+                link(3),
+                Some("E".to_string()),
+            )
+            .await;
+        assert_eq!(other, 3, "generations are global across hosts");
     }
 }

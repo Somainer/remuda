@@ -15,7 +15,7 @@ use remuda_protocol::SettlementOutcome;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1082,6 +1082,9 @@ pub struct JournalAppend {
     pub replayed: bool,
     /// Inclusive instance watermark after this call (may exceed `record.seq` on replay).
     pub durable_seq: i64,
+    /// Interactions this event's projections invalidated (c-deadcards round 4);
+    /// the caller broadcasts them so an open inbox/session learns immediately.
+    pub settlement: Settlement,
 }
 
 /// One bounded [`Store::read_journal`] window with the metadata a caller needs
@@ -1123,26 +1126,32 @@ pub enum DispatchClaim {
         dispatch_epoch: Option<String>,
         dispatch_link_generation: u64,
     },
-    /// The same command is already in flight on this card.
+    /// The identical command is already in flight on this card (round 4:
+    /// distinct from a completed idempotent replay — the answer is still
+    /// being forwarded, so the caller gets in-progress, not success).
     InFlight,
     /// Response may have been lost; the identical command won earlier — replay
     /// the stored acknowledgement.
     IdempotentReplay,
     /// A different command arrived second; carries the winning commandId.
     Conflict { winner: String },
-    /// The interaction/generation is gone — never forward.
-    Dead,
+    /// The generation is gone (invalidated) — never forward; carries the
+    /// settlement broadcast (round 4).
+    Dead { settlement: Settlement },
+    /// The interaction's deadline expired — the distinct 410 (round 4 item 7).
+    Expired,
     /// No durable interaction row.
     Missing,
 }
 
 /// What happened when a claimed but incomplete dispatch is released.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum DispatchRelease {
     /// Same generation still connected: the card returned to `pending`.
     Pending,
-    /// The generation changed/ended meanwhile: the card stayed departed.
-    Settled,
+    /// The generation changed/ended meanwhile: the card stayed departed;
+    /// carries the settlement broadcast.
+    Settled { settlement: Settlement },
 }
 
 struct DispatchRow {
@@ -1151,7 +1160,64 @@ struct DispatchRow {
     host_id: String,
     answer_command_id: Option<String>,
     dispatch_command_id: Option<String>,
+    dispatch_at_ms: Option<i64>,
     lifecycle: String,
+}
+
+/// Link identity + timestamps captured for one dispatch claim.
+pub(crate) struct ClaimContext {
+    epoch: Option<String>,
+    link_generation: u64,
+    now: String,
+    now_ms: i64,
+}
+
+/// Pending-branch of [`Store::claim_interaction_dispatch`]: re-read the
+/// effective generation and either claim the dispatch or settle the card.
+fn dispatch_claim_from_pending(
+    tx: &rusqlite::Transaction<'_>,
+    row: &DispatchRow,
+    interaction_id: &str,
+    command_id: &str,
+    ctx: &ClaimContext,
+) -> Result<DispatchClaim, StoreError> {
+    // Still nominally pending — re-read the EFFECTIVE generation in THIS
+    // transaction. A terminal instance (sweep landed between list and answer)
+    // settles the card; the answer is dead and nothing is forwarded.
+    if TERMINAL_INSTANCE_LIFECYCLES.contains(&row.lifecycle.as_str()) {
+        let settlement =
+            settle_instance_interactions(tx, std::slice::from_ref(&row.instance_id), &ctx.now)?;
+        return Ok(DispatchClaim::Dead { settlement });
+    }
+    let changed = tx.execute(
+        "UPDATE interactions
+            SET state = 'dispatching', dispatch_epoch = ?4,
+                dispatch_link_generation = ?5, dispatch_command_id = ?6,
+                dispatch_at_ms = ?7, updated_at = ?3
+          WHERE id = ?1 AND state = 'pending'",
+        params![
+            interaction_id,
+            row.instance_id,
+            ctx.now,
+            ctx.epoch,
+            ctx.link_generation,
+            command_id,
+            ctx.now_ms
+        ],
+    )?;
+    if changed == 0 {
+        // Lost a concurrent claim race; re-read is overkill for the answer
+        // path — treat as conflict.
+        Ok(DispatchClaim::Conflict {
+            winner: String::new(),
+        })
+    } else {
+        Ok(DispatchClaim::Claimed {
+            host_id: row.host_id.clone(),
+            dispatch_epoch: ctx.epoch.clone(),
+            dispatch_link_generation: ctx.link_generation,
+        })
+    }
 }
 
 /// Pending (or resolved) Interaction mirrored for Hub restart.
@@ -2078,7 +2144,14 @@ impl Store {
     }
 
     /// Hub-owned projection only: never forge a Node journal cursor or native completion.
-    pub async fn expire_lost_hosts(&self, grace_ms: u64) -> Result<usize, StoreError> {
+    ///
+    /// Returns `(ended_instance_count, settlement)` — the settlement carries
+    /// the interactions invalidated so the caller can broadcast them
+    /// (c-deadcards round 4).
+    pub async fn expire_lost_hosts(
+        &self,
+        grace_ms: u64,
+    ) -> Result<(usize, Settlement), StoreError> {
         self.run_named("expire_lost_hosts", move |conn| {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
@@ -2101,7 +2174,7 @@ impl Store {
             // c-deadcards round 3: ONE terminal writer stamps the ended
             // generation (the host's current nodeEpoch) and invalidates the
             // generation's pending cards in the SAME transaction.
-            let changed = settle_terminal_rows(
+            let settlement = settle_terminal_rows(
                 &tx,
                 &lost,
                 "exited",
@@ -2117,7 +2190,7 @@ impl Store {
                 params![&now, serde_json::to_string(&lost).unwrap_or_else(|_| "[]".into())],
             )?;
             tx.commit()?;
-            Ok(changed)
+            Ok((lost.len(), settlement))
         }).await
     }
 
@@ -2957,12 +3030,15 @@ impl Store {
     /// lost — settling it here would kill a create that may yet land. Those
     /// rows have their own, age-bounded reaper:
     /// [`Store::expire_stale_requested`].
+    ///
+    /// Returns `(lost_instance_ids, settlement)` so the caller can broadcast
+    /// the invalidated cards (c-deadcards round 4).
     pub async fn reconcile_reported_instances(
         &self,
         host_id: String,
         reported: Vec<String>,
         reason: String,
-    ) -> Result<Vec<String>, StoreError> {
+    ) -> Result<(Vec<String>, Settlement), StoreError> {
         self.run_named("reconcile_reported_instances", move |conn| {
             // The instance settlement and the interaction invalidation
             // (c-deadcards) commit in ONE transaction: an inbox must never
@@ -2983,9 +3059,10 @@ impl Store {
             let now = now_rfc3339();
             // c-deadcards round 3: shared terminal writer (stamps the ended
             // nodeEpoch + settles cards in one transaction).
-            settle_terminal_rows(&tx, &lost, "exited", "idle", Some(&reason), &now)?;
+            let settlement =
+                settle_terminal_rows(&tx, &lost, "exited", "idle", Some(&reason), &now)?;
             tx.commit()?;
-            Ok(lost)
+            Ok((lost, settlement))
         })
         .await
     }
@@ -2994,11 +3071,11 @@ impl Store {
     ///
     /// A create the Node never acknowledged keeps occupying a placement slot
     /// forever otherwise. Returns `(host_id, instance_id)` for each expiry so
-    /// the caller can publish a diagnostic.
+    /// the caller can publish a diagnostic, plus the card settlement.
     pub async fn expire_stale_requested(
         &self,
         window_ms: u64,
-    ) -> Result<Vec<(String, String)>, StoreError> {
+    ) -> Result<(Vec<(String, String)>, Settlement), StoreError> {
         self.run_named("expire_stale_requested", move |conn| {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
@@ -3014,7 +3091,7 @@ impl Store {
             drop(stmt);
             let stale_ids: Vec<String> = stale.iter().map(|(id, _)| id.clone()).collect();
             // c-deadcards round 3: shared terminal writer.
-            settle_terminal_rows(
+            let settlement = settle_terminal_rows(
                 &tx,
                 &stale_ids,
                 "failed",
@@ -3023,10 +3100,10 @@ impl Store {
                 &now,
             )?;
             tx.commit()?;
-            Ok(stale
-                .into_iter()
-                .map(|(id, host)| (host, id))
-                .collect::<Vec<_>>())
+            Ok((
+                stale.into_iter().map(|(id, host)| (host, id)).collect(),
+                settlement,
+            ))
         })
         .await
     }
@@ -3034,12 +3111,13 @@ impl Store {
     /// Settle a stop/close for an instance the Node does not know.
     ///
     /// Hub projection only: the row moves to `exited` so the slot is released
-    /// and the caller never waits on a receipt that will not arrive.
+    /// and the caller never waits on a receipt that will not arrive. Returns
+    /// `(changed, settlement)`.
     pub async fn settle_instance_exited(
         &self,
         instance_id: String,
         reason: String,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<(bool, Settlement), StoreError> {
         self.run_named("settle_instance_exited", move |conn| {
             // c-deadcards: settle the instance and invalidate its still-pending
             // interactions atomically (explicit stop/kill/delete, or a stop for
@@ -3056,7 +3134,7 @@ impl Store {
                 )
                 .optional()?
                 .is_some();
-            if exists {
+            let settlement = if exists {
                 settle_terminal_rows(
                     &tx,
                     std::slice::from_ref(&instance_id),
@@ -3064,10 +3142,12 @@ impl Store {
                     "idle",
                     Some(&reason),
                     &now,
-                )?;
-            }
+                )?
+            } else {
+                Settlement::default()
+            };
             tx.commit()?;
-            Ok(exists)
+            Ok((exists, settlement))
         })
         .await
     }
@@ -3399,7 +3479,7 @@ impl Store {
         &self,
         instance_id: String,
         last_error: String,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Settlement, StoreError> {
         self.run_named("fail_instance", move |conn| {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
@@ -3415,9 +3495,10 @@ impl Store {
                 params![last_error, &now, &instance_id],
             )?;
             // c-deadcards: a failed launch leaves no answerable card behind.
-            settle_instance_interactions(&tx, std::slice::from_ref(&instance_id), &now)?;
+            let settlement =
+                settle_instance_interactions(&tx, std::slice::from_ref(&instance_id), &now)?;
             tx.commit()?;
-            Ok(())
+            Ok(settlement)
         })
         .await
     }
@@ -4125,12 +4206,57 @@ impl Store {
                     SET state = CASE WHEN state IN ('pending', 'dispatching') THEN 'answer-committed' ELSE state END,
                         answer_command_id = COALESCE(answer_command_id, ?3),
                         dispatch_epoch = NULL, dispatch_command_id = NULL,
-                        dispatch_link_generation = NULL,
+                        dispatch_link_generation = NULL, dispatch_at_ms = NULL,
                         updated_at = ?1
                   WHERE id = ?2 AND state IN ('pending', 'dispatching', 'answer-committed')",
                 params![now_rfc3339(), interaction_id, command_id],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// c-deadcards round 4: from `ids`, return the ones with a terminal Hub
+    /// lifecycle. Used by the live interaction.list merge to project Node-only
+    /// items for ended generations as departed.
+    pub async fn filter_terminal_instances(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<HashSet<String>, StoreError> {
+        self.run_named("filter_terminal_instances", move |conn| {
+            if ids.is_empty() {
+                return Ok(HashSet::new());
+            }
+            let mut stmt = conn.prepare(
+                "SELECT t.value FROM json_each(?1) t
+                 JOIN instances i ON i.id = t.value
+                  WHERE i.lifecycle IN ('exited', 'failed', 'closed')",
+            )?;
+            let rows = stmt.query_map(
+                params![serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())],
+                |r| r.get::<_, String>(0),
+            )?;
+            let mut out = HashSet::new();
+            for row in rows {
+                out.insert(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// c-deadcards round 4: whether one instance row is terminal.
+    pub async fn is_instance_terminal(&self, instance_id: String) -> Result<bool, StoreError> {
+        self.run_named("is_instance_terminal", move |conn| {
+            let lifecycle: String = conn
+                .query_row(
+                    "SELECT lifecycle FROM instances WHERE id = ?1",
+                    params![instance_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or_else(|| "exited".to_string());
+            Ok(TERMINAL_INSTANCE_LIFECYCLES.contains(&lifecycle.as_str()))
         })
         .await
     }
@@ -4152,12 +4278,19 @@ impl Store {
     ) -> Result<DispatchClaim, StoreError> {
         self.run_named("claim_interaction_dispatch", move |conn| {
             let tx = immediate_tx(conn)?;
-            let now = now_rfc3339();
+            let ctx = ClaimContext {
+                epoch: expected_epoch,
+                link_generation: expected_link_generation,
+                now: now_rfc3339(),
+                now_ms: now_millis(),
+            };
+            let now = ctx.now.clone();
+            let now_ms = ctx.now_ms;
             let row = tx
                 .query_row(
                     "SELECT i.state, i.instance_id, i.host_id,
                             i.answer_command_id, i.dispatch_command_id,
-                            i2.lifecycle
+                            i.dispatch_at_ms, i2.lifecycle
                        FROM interactions i
                        JOIN instances i2 ON i2.id = i.instance_id
                       WHERE i.id = ?1",
@@ -4169,7 +4302,8 @@ impl Store {
                             host_id: row.get(2)?,
                             answer_command_id: row.get(3)?,
                             dispatch_command_id: row.get(4)?,
-                            lifecycle: row.get(5)?,
+                            dispatch_at_ms: row.get(5)?,
+                            lifecycle: row.get(6)?,
                         })
                     },
                 )
@@ -4178,8 +4312,29 @@ impl Store {
                 tx.commit()?;
                 return Ok(DispatchClaim::Missing);
             };
+            // c-deadcards round 4: recover an orphaned claim (Hub crashed after
+            // committing the claim but before sending). Same command gets its
+            // in-flight answer back; a different command treats the row as
+            // pending again below.
+            let stale_claim = row.state == "dispatching"
+                && row
+                    .dispatch_at_ms
+                    .is_some_and(|at| now_ms.saturating_sub(at) > DISPATCH_CLAIM_TTL_MS);
+            if stale_claim && row.dispatch_command_id.as_deref() != Some(command_id.as_str()) {
+                tx.execute(
+                    "UPDATE interactions
+                        SET state = 'pending', dispatch_epoch = NULL,
+                            dispatch_command_id = NULL, dispatch_link_generation = NULL,
+                            dispatch_at_ms = NULL, updated_at = ?2
+                      WHERE id = ?1",
+                    params![interaction_id, now],
+                )?;
+            }
             let claim = match row.state.as_str() {
-                "expired" | "invalidated" => DispatchClaim::Dead,
+                "expired" => DispatchClaim::Expired,
+                "invalidated" => DispatchClaim::Dead {
+                    settlement: Settlement::default(),
+                },
                 "answer-committed" | "resolved" => {
                     if row.answer_command_id.as_deref() == Some(command_id.as_str()) {
                         DispatchClaim::IdempotentReplay
@@ -4190,7 +4345,17 @@ impl Store {
                     }
                 }
                 "dispatching" => {
-                    if row.dispatch_command_id.as_deref() == Some(command_id.as_str()) {
+                    if stale_claim
+                        && row.dispatch_command_id.as_deref() != Some(command_id.as_str())
+                    {
+                        // Orphaned someone else's claim: fall through to the
+                        // pending claim logic by synthesizing a pending row.
+                        let row = DispatchRow {
+                            state: "pending".into(),
+                            ..row
+                        };
+                        dispatch_claim_from_pending(&tx, &row, &interaction_id, &command_id, &ctx)?
+                    } else if row.dispatch_command_id.as_deref() == Some(command_id.as_str()) {
                         DispatchClaim::InFlight
                     } else {
                         DispatchClaim::Conflict {
@@ -4198,49 +4363,7 @@ impl Store {
                         }
                     }
                 }
-                _ => {
-                    // Still nominally pending — re-read the EFFECTIVE
-                    // generation in THIS transaction. A terminal instance
-                    // (sweep landed between list and answer) settles the card;
-                    // the answer is dead and nothing is forwarded.
-                    if TERMINAL_INSTANCE_LIFECYCLES.contains(&row.lifecycle.as_str()) {
-                        settle_instance_interactions(
-                            &tx,
-                            std::slice::from_ref(&row.instance_id),
-                            &now,
-                        )?;
-                        DispatchClaim::Dead
-                    } else {
-                        let changed = tx.execute(
-                            "UPDATE interactions
-                                SET state = 'dispatching', dispatch_epoch = ?4,
-                                    dispatch_link_generation = ?5,
-                                    dispatch_command_id = ?6, updated_at = ?3
-                              WHERE id = ?1 AND state = 'pending'",
-                            params![
-                                interaction_id,
-                                row.instance_id,
-                                now,
-                                expected_epoch,
-                                expected_link_generation,
-                                command_id
-                            ],
-                        )?;
-                        if changed == 0 {
-                            // Lost a concurrent claim race; re-read is overkill
-                            // for the answer path — treat as conflict.
-                            DispatchClaim::Conflict {
-                                winner: String::new(),
-                            }
-                        } else {
-                            DispatchClaim::Claimed {
-                                host_id: row.host_id,
-                                dispatch_epoch: expected_epoch,
-                                dispatch_link_generation: expected_link_generation,
-                            }
-                        }
-                    }
-                }
+                _ => dispatch_claim_from_pending(&tx, &row, &interaction_id, &command_id, &ctx)?,
             };
             tx.commit()?;
             Ok(claim)
@@ -4256,6 +4379,17 @@ impl Store {
     /// answers 404 instead of accepting the allow. Serialized against the
     /// settlement transaction via BEGIN IMMEDIATE, so either the allow
     /// demonstrably completed before the end, or it never commits.
+    /// Accept a claimed dispatch's successful RPC result — but ONLY if the
+    /// claim is still live at completion time (c-deadcards round 3). The
+    /// RPC await spans an unbounded window; a host-lost sweep or epoch
+    /// reconciliation landing in that window already invalidated the row
+    /// (settlement matches `dispatching`). Returns false then, and the caller
+    /// answers 404 instead of accepting the allow.
+    ///
+    /// Round 4 item 5: the Node's `interaction.answered` observation can land
+    /// BEFORE this RPC acknowledgement (it carries payload.answerCommandId and
+    /// the apply path already flipped the row to `answer-committed` with our
+    /// commandId). That is SUCCESS, not a false rejection — accept it.
     pub async fn complete_interaction_dispatch(
         &self,
         interaction_id: String,
@@ -4264,12 +4398,14 @@ impl Store {
         self.run_named("complete_interaction_dispatch", move |conn| {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
+            // First: complete the live claim when the generation survived.
             let changed = tx.execute(
                 "UPDATE interactions
                     SET state = 'answer-committed',
                         answer_command_id = dispatch_command_id,
                         dispatch_epoch = NULL, dispatch_command_id = NULL,
-                        dispatch_link_generation = NULL, updated_at = ?3
+                        dispatch_link_generation = NULL, dispatch_at_ms = NULL,
+                        updated_at = ?3
                   WHERE id = ?1 AND dispatch_command_id = ?2
                     AND state = 'dispatching'
                     AND NOT EXISTS (
@@ -4279,8 +4415,33 @@ impl Store {
                     )",
                 params![interaction_id, command_id, now],
             )?;
+            if changed > 0 {
+                tx.commit()?;
+                return Ok(true);
+            }
+            // Race with the answered observation: the row is already committed
+            // by OUR command — the allow genuinely succeeded on the Node.
+            let ours: bool = tx
+                .query_row(
+                    "SELECT 1 FROM interactions
+                      WHERE id = ?1 AND state IN ('answer-committed', 'resolved')
+                        AND answer_command_id = ?2",
+                    params![interaction_id, command_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if ours {
+                tx.execute(
+                    "UPDATE interactions
+                        SET dispatch_epoch = NULL, dispatch_command_id = NULL,
+                            dispatch_link_generation = NULL, dispatch_at_ms = NULL
+                      WHERE id = ?1",
+                    params![interaction_id],
+                )?;
+            }
             tx.commit()?;
-            Ok(changed > 0)
+            Ok(ours)
         })
         .await
     }
@@ -4300,7 +4461,7 @@ impl Store {
             let now = now_rfc3339();
             let info = tx
                 .query_row(
-                    "SELECT i.dispatch_epoch, i2.lifecycle, h.node_epoch
+                    "SELECT i.dispatch_epoch, i2.lifecycle, h.node_epoch, i2.id
                        FROM interactions i
                        JOIN instances i2 ON i2.id = i.instance_id
                        LEFT JOIN hosts h ON h.id = i2.host_id
@@ -4311,40 +4472,47 @@ impl Store {
                             row.get::<_, Option<String>>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     },
                 )
                 .optional()?;
             let outcome = match info {
-                Some((dispatch_epoch, lifecycle, current_epoch))
+                Some((dispatch_epoch, lifecycle, current_epoch, _instance_id))
                     if !TERMINAL_INSTANCE_LIFECYCLES.contains(&lifecycle.as_str())
                         && dispatch_epoch == current_epoch =>
                 {
                     tx.execute(
                         "UPDATE interactions
                             SET state = 'pending', dispatch_epoch = NULL,
-                                dispatch_command_id = NULL,
-                                dispatch_link_generation = NULL, updated_at = ?2
+                                dispatch_command_id = NULL, dispatch_link_generation = NULL,
+                                dispatch_at_ms = NULL, updated_at = ?2
                           WHERE id = ?1 AND state = 'dispatching'
                             AND dispatch_command_id = ?3",
                         params![interaction_id, now, command_id],
                     )?;
                     DispatchRelease::Pending
                 }
-                _ => {
-                    // Generation changed/ended: keep the card departed rather
-                    // than revive it pending for a newer Node to answer.
+                Some((_, _, _, instance_id)) => {
+                    // Generation changed/ended: settle through the shared
+                    // invalidation (stamps the generation-ended payload) and
+                    // report the settlement for broadcast.
+                    let settlement = settle_instance_interactions(
+                        &tx,
+                        std::slice::from_ref(&instance_id),
+                        &now,
+                    )?;
                     tx.execute(
                         "UPDATE interactions
-                            SET state = 'invalidated', blocking = 0,
-                                dispatch_epoch = NULL, dispatch_command_id = NULL,
-                                dispatch_link_generation = NULL, updated_at = ?2
-                          WHERE id = ?1 AND state = 'dispatching'
-                            AND dispatch_command_id = ?3",
-                        params![interaction_id, now, command_id],
+                            SET dispatch_at_ms = NULL
+                          WHERE id = ?1",
+                        params![interaction_id],
                     )?;
-                    DispatchRelease::Settled
+                    DispatchRelease::Settled { settlement }
                 }
+                None => DispatchRelease::Settled {
+                    settlement: Settlement::default(),
+                },
             };
             tx.commit()?;
             Ok(outcome)
@@ -5526,6 +5694,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // claimed against (increments on every reconnect even at the same
     // nodeEpoch) — part of the fence key.
     ensure_column(&conn, "interactions", "dispatch_link_generation", "INTEGER")?;
+    // c-deadcards round 4: unix-millis the claim was made. A claimed row whose
+    // RPC never completed (Hub crash between the claim commit and the send)
+    // expires back to pending after DISPATCH_CLAIM_TTL_MS.
+    ensure_column(&conn, "interactions", "dispatch_at_ms", "INTEGER")?;
 
     // c-deadcards round 3: one-time backfill of NULL winning commandIds on
     // already-committed rows from the Node's interaction.answered journal
@@ -5757,7 +5929,7 @@ fn apply_instance_projection(
     event: &Value,
     seq: i64,
     now: &str,
-) -> Result<(), StoreError> {
+) -> Result<Settlement, StoreError> {
     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
     let payload = event.get("payload").cloned().unwrap_or(Value::Null);
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
@@ -5911,13 +6083,14 @@ fn apply_instance_projection(
                 });
         }
     }
+    let mut settlement = Settlement::default();
     if let Some(candidate) = lifecycle {
         // c-deadcards round 3: TERMINAL IS ABSORBING — route the projection
         // write through the single effective-lifecycle decision. A replayed
         // ready/running for the generation that already ended (same nodeEpoch,
         // older/equal processGeneration) must NOT revive the row.
         let Some(current) = load_instance(conn, instance_id)? else {
-            return Ok(());
+            return Ok(Settlement::default());
         };
         let decision = effective_lifecycle_for_observation(conn, &current, event, Some(candidate))?;
         if decision.absorbed {
@@ -5927,7 +6100,7 @@ fn apply_instance_projection(
                 "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
                 params![seq, now, instance_id],
             )?;
-            return Ok(());
+            return Ok(Settlement::default());
         }
         let observed_pg = parse_process_generation(event);
         if decision.became_terminal {
@@ -5949,7 +6122,11 @@ fn apply_instance_projection(
                     ended_pg
                 ],
             )?;
-            settle_instance_interactions(conn, &[instance_id.to_string()], now)?;
+            settlement.extend(settle_instance_interactions(
+                conn,
+                &[instance_id.to_string()],
+                now,
+            )?);
             // D-027: a terminal instance can never consume a staged
             // attachment again, and the Node drops its own copy at the same
             // point.
@@ -5980,7 +6157,7 @@ fn apply_instance_projection(
             params![seq, now, instance_id],
         )?;
     }
-    Ok(())
+    Ok(settlement)
 }
 
 /// Mirror the native session identity a Node reported onto the instance spec.
@@ -6327,13 +6504,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.expire_lost_hosts(0).await.unwrap(),
+            store.expire_lost_hosts(0).await.unwrap().0,
             0,
             "online hosts never expire"
         );
         store.mark_host_offline(host.clone()).await.unwrap();
         assert_eq!(
-            store.expire_lost_hosts(600_000).await.unwrap(),
+            store.expire_lost_hosts(600_000).await.unwrap().0,
             0,
             "ten minute grace"
         );
@@ -6342,14 +6519,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.expire_lost_hosts(0).await.unwrap(),
+            store.expire_lost_hosts(0).await.unwrap().0,
             0,
             "reconnect clears offline timer"
         );
         store.mark_host_offline(host).await.unwrap();
-        assert_eq!(store.expire_lost_hosts(0).await.unwrap(), 1);
+        assert_eq!(store.expire_lost_hosts(0).await.unwrap().0, 1);
         assert_eq!(
-            store.expire_lost_hosts(0).await.unwrap(),
+            store.expire_lost_hosts(0).await.unwrap().0,
             0,
             "idempotent sweep"
         );
@@ -7812,7 +7989,7 @@ mod tests {
             "placement counts only Node-confirmed instances"
         );
 
-        let expired = store
+        let (expired, _expired_settlement) = store
             .expire_stale_requested(REQUESTED_SLOT_WINDOW_MS)
             .await
             .expect("sweep");
@@ -7977,7 +8154,7 @@ mod tests {
         // in that window says nothing about whether it was lost. Its own
         // age-bounded reaper is what eventually settles it.
         let in_flight = seed_instance(&store, &host).await;
-        let reconciled = store
+        let (reconciled, _reconciled_settlement) = store
             .reconcile_reported_instances(
                 host.clone(),
                 vec![kept.instance_id.clone()],
@@ -7989,6 +8166,10 @@ mod tests {
             reconciled,
             vec![lost.instance_id.clone()],
             "only the acknowledged row the node no longer lists is lost"
+        );
+        assert!(
+            _reconciled_settlement.is_empty(),
+            "no cards seeded in this test"
         );
         let lost = store
             .get_instance(lost.instance_id)
@@ -8042,7 +8223,7 @@ mod tests {
         let kept_int = seed_pending_interaction(&store, &host, &kept.instance_id).await;
         let lost_int = seed_pending_interaction(&store, &host, &lost.instance_id).await;
 
-        let reconciled = store
+        let (reconciled, _reconciled_settlement) = store
             .reconcile_reported_instances(
                 host.clone(),
                 vec![kept.instance_id.clone()],
@@ -8051,6 +8232,13 @@ mod tests {
             .await
             .expect("reconcile");
         assert_eq!(reconciled, vec![lost.instance_id.clone()]);
+        assert!(
+            _reconciled_settlement
+                .interactions
+                .iter()
+                .any(|(_, id)| id == &lost_int),
+            "the lost card is returned for broadcast"
+        );
 
         let (lost_state, lost_reason) = interaction_state_and_reason(&store, &lost_int).await;
         assert_eq!(
@@ -8111,7 +8299,7 @@ mod tests {
             .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into())
             .await
             .expect("second reconcile");
-        assert!(again.is_empty());
+        assert!(again.0.is_empty());
         let (state, _) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "invalidated");
         store.close().await;
@@ -8128,7 +8316,7 @@ mod tests {
         let instance = seed_acknowledged_instance(&store, &host).await;
         let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
 
-        let changed = store
+        let (changed, _) = store
             .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
             .await
             .expect("settle");
@@ -8143,6 +8331,7 @@ mod tests {
                 .settle_instance_exited(instance.instance_id, "deleted-by-operator".into())
                 .await
                 .expect("re-settle")
+                .0
         );
         store.close().await;
     }
@@ -8324,7 +8513,7 @@ mod tests {
             .mark_host_offline(host.clone())
             .await
             .expect("offline");
-        let swept = store.expire_lost_hosts(0).await.expect("sweep");
+        let swept = store.expire_lost_hosts(0).await.expect("sweep").0;
         assert_eq!(swept, 1);
         let ended = store
             .get_instance(instance.instance_id.clone())
@@ -8386,7 +8575,7 @@ mod tests {
                 .claim_interaction_dispatch(replayed_id, "cmd_replay".into(), None, 1)
                 .await
                 .expect("claim"),
-            DispatchClaim::Dead
+            DispatchClaim::Dead { .. }
         ));
         store.close().await;
     }
@@ -8577,7 +8766,7 @@ mod tests {
         let instance = seed_instance(&store, &host).await; // stays `requested`
         backdate_instance(&store, &instance.instance_id, 60).await;
 
-        let expired = store
+        let (expired, _expired_settlement) = store
             .expire_stale_requested(REQUESTED_SLOT_WINDOW_MS)
             .await
             .expect("sweep");
@@ -8615,7 +8804,7 @@ mod tests {
             .mark_host_offline(host.clone())
             .await
             .expect("offline");
-        let swept = store.expire_lost_hosts(0).await.expect("host-lost sweep");
+        let swept = store.expire_lost_hosts(0).await.expect("host-lost sweep").0;
         assert_eq!(swept, 1);
         let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "invalidated");
@@ -8663,12 +8852,14 @@ mod tests {
                 .settle_instance_exited(instance.instance_id.clone(), "node-lost-instance".into())
                 .await
                 .expect("settle")
+                .0
         );
         assert!(
             !store
                 .settle_instance_exited(instance.instance_id.clone(), "node-lost-instance".into())
                 .await
-                .expect("settle again"),
+                .expect("settle again")
+                .0,
             "an already-exited row is not re-settled"
         );
         let row = store
@@ -9514,6 +9705,7 @@ fn append_loaded_event(
             record: existing,
             replayed: true,
             durable_seq: cursor.durable,
+            settlement: Settlement::default(),
         });
     }
     if seq != cursor.expected_next {
@@ -9541,11 +9733,11 @@ fn append_loaded_event(
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![instance_id, seq, event_id, event.to_string(), now],
     )?;
-    apply_instance_projection(conn, instance_id, &event, seq, &now)?;
+    let mut settlement = apply_instance_projection(conn, instance_id, &event, seq, &now)?;
     apply_native_session_projection(conn, instance_id, &event, &now)?;
     apply_command_projection(conn, host_id, instance_id, &event, &now)?;
     apply_interaction_event(conn, host_id, instance_id, &event)?;
-    apply_instance_lifecycle(conn, instance_id, &event)?;
+    settlement.extend(apply_instance_lifecycle(conn, instance_id, &event)?);
     cursor.expected_next = seq + 1;
     cursor.durable = seq;
     cursor.next_hint = Some(seq.saturating_add(1));
@@ -9559,6 +9751,7 @@ fn append_loaded_event(
         },
         replayed: false,
         durable_seq: seq,
+        settlement,
     })
 }
 
@@ -9764,7 +9957,9 @@ fn apply_interaction_event(
         conn.execute(
             "UPDATE interactions
                 SET state = ?1, updated_at = ?2,
-                    answer_command_id = COALESCE(?4, answer_command_id)
+                    answer_command_id = COALESCE(?4, answer_command_id),
+                    dispatch_epoch = NULL, dispatch_command_id = NULL,
+                    dispatch_link_generation = NULL, dispatch_at_ms = NULL
               WHERE id = ?3 AND state IN ('pending', 'dispatching')",
             params![state, now, id, winner],
         )?;
@@ -9777,6 +9972,17 @@ fn knowledge_value(value: Option<&Value>) -> Option<&str> {
     value
         .as_str()
         .or_else(|| value.get("value").and_then(Value::as_str))
+}
+
+/// Claim TTL: a `dispatching` row older than this is an orphaned claim (the
+/// Hub crashed before sending) and may be reclaimed (c-deadcards round 4).
+pub(crate) const DISPATCH_CLAIM_TTL_MS: i64 = 60_000;
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// Terminal interaction states that no longer answer and leave the actionable
@@ -9815,46 +10021,71 @@ pub(crate) fn immediate_tx(conn: &mut Connection) -> rusqlite::Result<rusqlite::
 /// racing the instance end belongs to the generation that ended and must not
 /// complete against a reconnected Node, so the claim is invalidated and its
 /// dispatch columns cleared.
+/// Interactions invalidated by a generation-ending write, captured so callers
+/// can broadcast the observation an open inbox/session listens to
+/// (c-deadcards round 4). Store writes are durable but silent — the live bus
+/// lives on AppState — so every terminal writer returns these to its caller.
+#[derive(Default, Debug, Clone)]
+pub struct Settlement {
+    /// `(instance_id, interaction_id)` pairs that became departed.
+    pub interactions: Vec<(String, String)>,
+}
+
+impl Settlement {
+    pub(crate) fn extend(&mut self, other: Settlement) {
+        self.interactions.extend(other.interactions);
+    }
+
+    /// Whether the write invalidated no interactions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.interactions.is_empty()
+    }
+}
+
 pub(crate) fn settle_instance_interactions(
     conn: &Connection,
     instance_ids: &[String],
     now: &str,
-) -> Result<usize, StoreError> {
+) -> Result<Settlement, StoreError> {
     let live: Vec<&String> = instance_ids.iter().collect();
     if live.is_empty() {
-        return Ok(0);
+        return Ok(Settlement::default());
     }
     let placeholders = vec!["?"; live.len()].join(",");
     let sql = format!(
-        "SELECT id, payload_json FROM interactions
+        "SELECT instance_id, id, payload_json FROM interactions
          WHERE state IN ('pending', 'dispatching') AND instance_id IN ({placeholders})"
     );
     let params: Vec<&dyn rusqlite::types::ToSql> = live
         .iter()
         .map(|id| *id as &dyn rusqlite::types::ToSql)
         .collect();
-    let pending: Vec<(String, String)> = {
+    let pending: Vec<(String, String, String)> = {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let mut settled = 0usize;
-    for (id, payload_json) in pending {
+    let mut settlement = Settlement::default();
+    for (instance_id, id, payload_json) in pending {
         let mut event: Value = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
         invalidate_interaction_payload(&mut event, now);
         let changed = conn.execute(
             "UPDATE interactions
                 SET state = 'invalidated', blocking = 0, payload_json = ?2,
                     dispatch_epoch = NULL, dispatch_command_id = NULL,
-                    dispatch_link_generation = NULL, updated_at = ?3
+                    dispatch_link_generation = NULL, dispatch_at_ms = NULL,
+                    updated_at = ?3
               WHERE id = ?1 AND state IN ('pending', 'dispatching')",
             params![id, event.to_string(), now],
         )?;
-        settled += changed;
+        if changed > 0 {
+            settlement.interactions.push((instance_id, id));
+        }
     }
-    Ok(settled)
+    Ok(settlement)
 }
 
 /// c-deadcards round 2: stamp an `interaction.requested` payload as a
@@ -9938,6 +10169,112 @@ struct EffectiveLifecycle {
     revived: bool,
     /// This write transitions a previously non-terminal row INTO terminal.
     became_terminal: bool,
+}
+
+/// c-deadcards round 4: apply ONE daemon inventory entry through the SAME
+/// absorbing decision as journal projections. A daemon `instances[]` entry
+/// (node.hello / bridge inventory) used to overwrite lifecycle
+/// unconditionally, resurrecting an instance the host-lost sweep ended. Now
+/// an entry only leaves terminal when it carries a newer generation — the
+/// host's current nodeEpoch differing from the stamped ended_epoch, or a
+/// greater processGeneration. Returns the settlement (an entry that
+/// transitions the row INTO terminal settles its pending cards).
+pub(crate) fn apply_daemon_inventory_entry(
+    tx: &rusqlite::Transaction<'_>,
+    host_id: &str,
+    entry: &Value,
+    now: &str,
+) -> Result<Settlement, StoreError> {
+    let Some(id) = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("instanceId").and_then(Value::as_str))
+    else {
+        return Ok(Settlement::default());
+    };
+    let Some(current) = load_instance(tx, id)? else {
+        return Ok(Settlement::default());
+    };
+    if current.host_id != host_id {
+        return Ok(Settlement::default());
+    }
+    let lifecycle = match entry.get("lifecycle").and_then(Value::as_str) {
+        Some("ready" | "running") => "running",
+        Some(
+            value @ ("requested" | "preparing" | "starting" | "closing" | "exited" | "failed"
+            | "unknown" | "reconciling"),
+        ) => value,
+        _ => return Ok(Settlement::default()),
+    };
+    let activity_value = entry.get("activity");
+    let activity = match knowledge_value(activity_value).or_else(|| {
+        activity_value
+            .and_then(|v| v.get("value"))
+            .and_then(Value::as_str)
+    }) {
+        Some("waiting-interaction") => "blocked",
+        Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
+        _ => "unknown",
+    };
+    // The entry's observation carries the generation (daemon entities use
+    // camelCase; tolerate the snake spelling too).
+    let observed = json!({
+        "processGeneration": entry
+            .get("processGeneration")
+            .or_else(|| entry.get("process_generation")),
+    });
+    let decision = effective_lifecycle_for_observation(tx, &current, &observed, Some(lifecycle))?;
+    let mut settlement = Settlement::default();
+    if decision.absorbed {
+        // Same/older generation asserting a live state: the swept row stays
+        // terminal. Only connectivity bookkeeping follows the daemon report.
+        tx.execute(
+            "UPDATE instances SET connectivity = 'connected', updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        return Ok(settlement);
+    }
+    let last_error = entry.get("lastError").and_then(Value::as_str);
+    if decision.became_terminal {
+        let observed_pg = parse_process_generation(&observed);
+        let (ended_epoch, ended_pg) = terminal_generation_values(tx, host_id, observed_pg)?;
+        tx.execute(
+            "UPDATE instances SET lifecycle = ?1, activity = ?2, connectivity = 'connected',
+                    last_error = COALESCE(?3, last_error),
+                    ended_epoch = ?4, ended_process_generation = ?5, updated_at = ?6
+             WHERE id = ?7",
+            params![
+                decision.lifecycle,
+                activity,
+                last_error,
+                ended_epoch,
+                ended_pg,
+                now,
+                id
+            ],
+        )?;
+        settlement.extend(settle_instance_interactions(
+            tx,
+            std::slice::from_ref(&id.to_string()),
+            now,
+        )?);
+    } else if decision.revived {
+        tx.execute(
+            "UPDATE instances SET lifecycle = ?1, activity = ?2, connectivity = 'connected',
+                    ended_epoch = NULL, ended_process_generation = NULL,
+                    last_error = COALESCE(?3, last_error), updated_at = ?4
+             WHERE id = ?5",
+            params![decision.lifecycle, activity, last_error, now, id],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE instances SET lifecycle = ?1, activity = ?2, connectivity = 'connected',
+                    last_error = COALESCE(?3, last_error), updated_at = ?4
+             WHERE id = ?5",
+            params![decision.lifecycle, activity, last_error, now, id],
+        )?;
+    }
+    Ok(settlement)
 }
 
 fn effective_lifecycle_for_observation(
@@ -10060,10 +10397,9 @@ fn settle_terminal_rows(
     activity: &str,
     last_error: Option<&str>,
     now: &str,
-) -> Result<usize, StoreError> {
-    let mut changed = 0usize;
+) -> Result<Settlement, StoreError> {
     for id in ids {
-        changed += tx.execute(
+        tx.execute(
             "UPDATE instances
                 SET lifecycle = ?1, activity = ?2,
                     last_error = COALESCE(?3, last_error),
@@ -10074,8 +10410,7 @@ fn settle_terminal_rows(
             params![lifecycle, activity, last_error, now, id],
         )?;
     }
-    settle_instance_interactions(tx, ids, now)?;
-    Ok(changed)
+    settle_instance_interactions(tx, ids, now)
 }
 
 fn lifecycle_rank(state: &str) -> i32 {
@@ -10215,13 +10550,13 @@ fn apply_instance_lifecycle(
     conn: &Connection,
     instance_id: &str,
     event: &Value,
-) -> Result<(), StoreError> {
+) -> Result<Settlement, StoreError> {
     let (next_life, mut next_act) = derive_instance_state(event);
     if next_life.is_none() && next_act.is_none() {
-        return Ok(());
+        return Ok(Settlement::default());
     }
     let Some(current) = load_instance(conn, instance_id)? else {
-        return Ok(());
+        return Ok(Settlement::default());
     };
     if matches!(event.pointer("/payload/nativeName").and_then(Value::as_str), Some("agent_status" | "session"))
         && conn.query_row(
@@ -10239,7 +10574,7 @@ fn apply_instance_lifecycle(
     // derivation is absorbed rather than reviving the row.
     let decision = effective_lifecycle_for_observation(conn, &current, event, next_life)?;
     if decision.absorbed {
-        return Ok(());
+        return Ok(Settlement::default());
     }
     // A terminal row has no live activity: a late interaction.requested
     // derives activity "blocked", but a dead instance never presents blocked.
@@ -10248,6 +10583,7 @@ fn apply_instance_lifecycle(
         Some(act) if !effective_terminal => act,
         _ => current.activity.as_str(),
     };
+    let mut settlement = Settlement::default();
     if decision.became_terminal {
         let observed_pg = parse_process_generation(event);
         let (ended_epoch, ended_pg) =
@@ -10265,7 +10601,11 @@ fn apply_instance_lifecycle(
                 ended_pg
             ],
         )?;
-        settle_instance_interactions(conn, &[instance_id.to_string()], &now)?;
+        settlement.extend(settle_instance_interactions(
+            conn,
+            &[instance_id.to_string()],
+            &now,
+        )?);
     } else if decision.revived {
         conn.execute(
             "UPDATE instances SET lifecycle = ?1, activity = ?2,
@@ -10279,7 +10619,7 @@ fn apply_instance_lifecycle(
             params![decision.lifecycle, activity, now, instance_id],
         )?;
     }
-    Ok(())
+    Ok(settlement)
 }
 
 fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {

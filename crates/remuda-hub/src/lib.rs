@@ -71,6 +71,7 @@ use axum::http::Uri;
 use axum::response::Response;
 use remuda_driver::FileSecretStore;
 use remuda_push::{OpenOptions, PushService};
+use serde_json::json;
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -86,6 +87,9 @@ pub use config::{
 };
 pub use error::HubError;
 pub use maintenance::migrate;
+/// Interactions invalidated when an instance generation ends (returned by the
+/// terminal settle methods; c-deadcards round 4).
+pub use store::{DispatchClaim, DispatchRelease, Settlement};
 pub use transport::{ConnectedNodes, NodeTransport, StdioTransport, TransportKind, WssTransport};
 
 /// Process-wide Hub state shared by HTTP and WS handlers.
@@ -114,6 +118,35 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// c-deadcards round 4: broadcast the interactions a terminal write
+    /// invalidated, so an open inbox/session following any of those instances
+    /// learns immediately instead of waiting for its next poll. These are
+    /// Hub-side observations (the Hub forges no Node journal seq): the event
+    /// rides the follow bus with the instance's current durable seq, and a
+    /// fresh follower converges against the durable (already-invalidated)
+    /// rows regardless.
+    pub(crate) fn broadcast_settlement(&self, settlement: &crate::store::Settlement) {
+        if settlement.is_empty() {
+            return;
+        }
+        for (instance_id, interaction_id) in &settlement.interactions {
+            self.bus.publish(crate::ws::FollowEvent::json(
+                instance_id.clone(),
+                0,
+                json!({
+                    "kind": "interaction.expired",
+                    "payload": {
+                        "interactionId": interaction_id,
+                        "reasonCode": "generation-ended",
+                        "reason": "generation-ended",
+                        "state": "invalidated",
+                        "hubSettlement": true,
+                    }
+                }),
+            ));
+        }
+    }
+
     /// Raw per-chunk cap for D-048 relay streams, from the D-048 protocol
     /// default (`TransportLimits.apiChunkBytes`, 64 KiB).
     pub(crate) fn config_relay_chunk_bytes(&self) -> usize {
@@ -708,7 +741,8 @@ async fn spawn_inner(
         challenges: passkeys::ChallengeStore::default(),
         gate_ref_swept_at: Arc::new(std::sync::Mutex::new(None)),
     };
-    store.expire_lost_hosts(config.host_lost_grace_ms).await?;
+    let (_, lost_settlement) = store.expire_lost_hosts(config.host_lost_grace_ms).await?;
+    state.broadcast_settlement(&lost_settlement);
     // A Hub restart must not inherit yesterday's unacknowledged creates: they
     // would keep holding placement slots with no Node that can ever settle them.
     expire_stale_requested(&state, config.requested_grace_ms).await;
@@ -742,8 +776,13 @@ async fn spawn_inner(
                     break;
                 }
                 _ = interval.tick() => {
-                    if let Err(err) = reaper_state.store.expire_lost_hosts(config.host_lost_grace_ms).await {
-                        tracing::error!(error = %err, "host-lost sweep failed");
+                    match reaper_state.store.expire_lost_hosts(config.host_lost_grace_ms).await {
+                        Ok((_, settlement)) => {
+                            // c-deadcards round 4: even the background reaper
+                            // announces the cards it invalidates.
+                            reaper_state.broadcast_settlement(&settlement);
+                        }
+                        Err(err) => tracing::error!(error = %err, "host-lost sweep failed"),
                     }
                     expire_stale_requested(&reaper_state, config.requested_grace_ms).await;
                     crate::gatequeue::tick(&reaper_state).await;
@@ -766,13 +805,14 @@ async fn spawn_inner(
 /// Each expiry gets a Hub-authored journal diagnostic so the row explains
 /// itself, and stops counting toward the host's `maxInstances` ceiling.
 async fn expire_stale_requested(state: &AppState, window_ms: u64) {
-    let expired = match state.store.expire_stale_requested(window_ms).await {
-        Ok(expired) => expired,
+    let (expired, settlement) = match state.store.expire_stale_requested(window_ms).await {
+        Ok(outcome) => outcome,
         Err(error) => {
             tracing::error!(%error, "stale-requested sweep failed");
             return;
         }
     };
+    state.broadcast_settlement(&settlement);
     for (host_id, instance_id) in expired {
         tracing::warn!(
             %host_id,

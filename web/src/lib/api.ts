@@ -632,7 +632,11 @@ export type HubApi = {
   instanceConfigure(instanceId: Id, permissionMode: string, extras?: InstanceConfigurePatch): Promise<CommandResult>;
   interactionList(q?: { instanceId?: Id; state?: string }): Promise<Interaction[]>;
   interactionGet(interactionId: Id): Promise<Interaction>;
-  interactionRespond(interactionId: Id, answer: InteractionAnswer): Promise<CommandResult>;
+  interactionRespond(
+    interactionId: Id,
+    answer: InteractionAnswer,
+    instanceId?: Id,
+  ): Promise<CommandResult>;
   hostSshAdd(body: components["schemas"]["SshHostCreate"]): Promise<Host>;
   hostRemove(hostId: Id): Promise<void>;
   hostList(): Promise<Page<Host>>;
@@ -983,7 +987,7 @@ function createMockApi(): HubApi {
       if (!found) throw new Error("INTERACTION_NOT_FOUND");
       return found;
     },
-    async interactionRespond(interactionId, answer) {
+    async interactionRespond(interactionId, answer, _instanceId) {
       return mockRespond(interactionId, answer);
     },
     async hostSshAdd() { throw new Error("演示模式无法连接真实 SSH 主机"); },
@@ -1512,10 +1516,15 @@ function createLiveApi(): HubApi {
       if (!found) throw new Error("INTERACTION_NOT_FOUND");
       return found;
     },
-    async interactionRespond(interactionId, answer) {
+    async interactionRespond(interactionId, answer, instanceId) {
       const result = await rest<HubJson<"/v1/interactions/{id}/answer", "post">>(
         `/v1/interactions/${interactionId}/answer`,
-        { method: "POST", body: JSON.stringify({ answer }) },
+        {
+          method: "POST",
+          body: JSON.stringify(
+            instanceId ? { answer, instanceId } : { answer },
+          ),
+        },
       );
       if (result && typeof result === "object" && "command" in result) {
         const found = await this.interactionGet(interactionId).catch(() => null);

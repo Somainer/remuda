@@ -365,7 +365,12 @@ export function InboxShell({ mode }: { mode: InboxMode }) {
     [workspaceById],
   );
 
-  const respond = useCallback<RespondFn>((item, answer) => hubStore.respond(item.id, answer), []);
+  const respond = useCallback<RespondFn>(
+    // Pass the resolved instance so the Hub can refusal-fence live-only
+    // answers for a generation that already ended (c-deadcards round 4).
+    (item, answer) => hubStore.respond(item.id, answer, item.instanceId),
+    [],
+  );
 
   const setKind = (id: (typeof INBOX_KINDS)[number]) => {
     const next = new URLSearchParams(params);

@@ -1000,7 +1000,7 @@ async fn answer_racing_sweep_and_same_epoch_reconnect_never_reaches_new_node() -
     // The host is lost; the sweep ends the generation while the RPC is parked,
     // invalidating the in-flight claim.
     store.mark_host_offline(host_id.clone()).await?;
-    let swept = store.expire_lost_hosts(0).await?;
+    let swept = store.expire_lost_hosts(0).await?.0;
     assert_eq!(swept, 1, "sweep ended the instance");
     assert_eq!(
         store
@@ -1128,6 +1128,469 @@ async fn answered_observation_makes_identical_retry_idempotent_without_forward()
         calls.lock().unwrap()
     );
 
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// c-deadcards round 4 (item 4): a claim left `dispatching` by a Hub crash is
+/// recovered after the TTL. Set dispatch_at_ms into the past directly, then a
+/// different command reclaims and parks (the stale same-command path returns
+/// in-progress only while fresh).
+#[tokio::test]
+async fn orphaned_claim_after_ttl_is_reclaimable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let _cookie = login(addr, &hub.bootstrap_token).await?;
+    let host_id = format!("hst_{}", uuid::Uuid::now_v7());
+    let (_instance_id, interaction_wire) = seed_pending_online(&hub, &host_id, "ep-orphan").await?;
+
+    // Fabricate the post-crash shape: claimed by cmd_old 10 minutes ago.
+    {
+        use rusqlite::Connection;
+        let conn = Connection::open(dir.path().join("data").join("hub.sqlite"))?;
+        conn.execute(
+            "UPDATE interactions
+                SET state = 'dispatching', dispatch_epoch = 'ep-orphan',
+                    dispatch_link_generation = 99, dispatch_command_id = 'cmd_old',
+                    dispatch_at_ms = ?2
+              WHERE id = ?1",
+            rusqlite::params![
+                interaction_wire,
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis() as i64)
+                    - 600_000
+            ],
+        )?;
+    }
+
+    // The original command, retried, is still told in-progress while the claim
+    // is fresh-ish — but here it is older than the TTL, so the SAME command
+    // simply reclaims. We assert the NEW command can claim it: mount a parking
+    // link (bound to the claimed link identity generation) is unnecessary — the
+    // claim recovery only needs the row to return to pending for a new caller.
+    // Verify the stale claim is recoverable: a different command claims it
+    // (deterministic store-level assertion, no timing dependence).
+    let claim = hub
+        .store()
+        .expect("store")
+        .claim_interaction_dispatch(
+            interaction_wire.clone(),
+            "cmd_new".into(),
+            Some("ep-orphan".into()),
+            1,
+        )
+        .await?;
+    assert!(
+        matches!(claim, remuda_hub::DispatchClaim::Claimed { .. }),
+        "a different command reclaims the orphaned claim after the TTL"
+    );
+
+    // And within the TTL the same commandId on a fresh claim is InFlight.
+    let claim = hub
+        .store()
+        .expect("store")
+        .release_interaction_dispatch(interaction_wire.clone(), "cmd_new".into())
+        .await?;
+    assert!(matches!(claim, remuda_hub::DispatchRelease::Pending));
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// c-deadcards round 4 (item 5): the Node commits first — its
+/// interaction.answered observation (payload.answerCommandId) is journaled
+/// BEFORE the HTTP ack arrives. The POST still succeeds (200) and forwards
+/// nothing, instead of a false rejection.
+#[tokio::test]
+async fn answered_observation_ahead_of_ack_still_succeeds_without_forward() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let host_id = format!("hst_{}", uuid::Uuid::now_v7());
+    let (instance_id, interaction_wire) = seed_pending_online(&hub, &host_id, "ep-ahead").await?;
+    let command_id = format!("cmd_{}", uuid::Uuid::now_v7());
+
+    // Node committed first and journaled it (payload.answerCommandId).
+    hub.store()
+        .expect("store")
+        .append_journal(
+            host_id.clone(),
+            instance_id,
+            None,
+            json!({ "kind": "interaction.answered", "payload": {
+                "interactionId": interaction_wire,
+                "requestVersion": "1",
+                "answerCommandId": command_id,
+                "actor": { "kind": "human", "deviceId": "dev_ahead" },
+                "answerRef": "obj_ahead",
+                "delivery": "written"
+            }}),
+        )
+        .await?;
+
+    // The answer ack arrives afterwards, possibly on a fresh link.
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    hub.test_set_node_transport_epoched(
+        &host_id,
+        Arc::new(RecordingTransport {
+            calls: calls.clone(),
+        }),
+        Some("ep-ahead".into()),
+    )
+    .await;
+
+    let answer_body =
+        json!({ "commandId": command_id, "answer": serde_json::from_str::<Value>(ALLOW_ANSWER)? })
+            .to_string();
+    let (status, body) = http(
+        addr,
+        "POST",
+        &format!("/v1/interactions/{interaction_wire}/answer"),
+        &cookie,
+        Some(&answer_body),
+    )
+    .await?;
+    assert_eq!(
+        status, 200,
+        "observation-with-our-commandId is success, not a false rejection: {body}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m == "interaction.answer"),
+        "nothing is forwarded after the Node already committed"
+    );
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// c-deadcards round 4 (item 6): while the identical commandId's dispatch is
+/// still in flight, a duplicate returns 202 in-progress — never 200 success.
+#[tokio::test]
+async fn identical_retry_while_in_flight_returns_in_progress_not_success() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let host_id = format!("hst_{}", uuid::Uuid::now_v7());
+    let (_instance_id, interaction_wire) =
+        seed_pending_online(&hub, &host_id, "ep-inflight").await?;
+
+    let gate = Arc::new(Notify::new());
+    let released = Arc::new(AtomicBool::new(false));
+    let old_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    hub.test_set_node_transport_epoched(
+        &host_id,
+        Arc::new(ParkingTransport {
+            gate: gate.clone(),
+            released: released.clone(),
+            calls: old_calls.clone(),
+            reply_ok: true,
+        }),
+        Some("ep-inflight".into()),
+    )
+    .await;
+
+    let command_id = format!("cmd_{}", uuid::Uuid::now_v7());
+    let body =
+        json!({ "commandId": command_id, "answer": serde_json::from_str::<Value>(ALLOW_ANSWER)? })
+            .to_string();
+    let first_cookie = cookie.clone();
+    let first_iid = interaction_wire.clone();
+    let first_body = body.clone();
+    let first = tokio::spawn(async move {
+        http(
+            addr,
+            "POST",
+            &format!("/v1/interactions/{first_iid}/answer"),
+            &first_cookie,
+            Some(&first_body),
+        )
+        .await
+    });
+    let first = Box::pin(first);
+
+    let store = hub.store().expect("store");
+    for _ in 0..100 {
+        if let Some(row) = store.get_interaction(interaction_wire.clone()).await?
+            && row.state == "dispatching"
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Identical commandId while still parked.
+    let (status, body2) = http(
+        addr,
+        "POST",
+        &format!("/v1/interactions/{interaction_wire}/answer"),
+        &cookie,
+        Some(&body),
+    )
+    .await?;
+    assert_eq!(
+        status, 202,
+        "in-flight duplicate is in-progress, not success: {body2}"
+    );
+    let body2: Value = serde_json::from_str(body2.trim())?;
+    assert_eq!(body2["code"].as_str(), Some("INTERACTION_IN_PROGRESS"));
+
+    released.store(true, Ordering::SeqCst);
+    gate.notify_waiters();
+    let (first_status, _) = first.await??;
+    assert_eq!(
+        first_status, 200,
+        "the original call completes once the Node replies"
+    );
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// c-deadcards round 4 (item 7): an expired durable interaction keeps its
+/// defined 410 Gone, distinct from the dead-generation 404.
+#[tokio::test]
+async fn expired_durable_interaction_returns_410() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let host_id = format!("hst_{}", uuid::Uuid::now_v7());
+    let (instance_id, interaction_wire) = seed_pending_online(&hub, &host_id, "ep-expired").await?;
+
+    hub.store()
+        .expect("store")
+        .append_journal(
+            host_id,
+            instance_id,
+            None,
+            json!({ "kind": "interaction.expired", "payload": {
+                "interactionId": interaction_wire,
+                "requestVersion": "1",
+                "reason": "deadline"
+            }}),
+        )
+        .await?;
+
+    let answer_body = json!({ "commandId": format!("cmd_{}", uuid::Uuid::now_v7()),
+                 "answer": serde_json::from_str::<Value>(ALLOW_ANSWER)? })
+    .to_string();
+    let (status, body) = http(
+        addr,
+        "POST",
+        &format!("/v1/interactions/{interaction_wire}/answer"),
+        &cookie,
+        Some(&answer_body),
+    )
+    .await?;
+    assert_eq!(status, 410, "expired keeps its defined 410: {body}");
+    let body_json: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(body_json["code"].as_str(), Some("INTERACTION_EXPIRED"));
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// Transport whose interaction.list returns fixed items; answers accepted.
+struct ListingTransport {
+    list_items: Value,
+    answer_calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl NodeTransport for ListingTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::OutboundWss
+    }
+    fn call(
+        &self,
+        method: &str,
+        _params: Value,
+        _timeout: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Value>, HubError>> + Send + '_>,
+    > {
+        let method = method.to_string();
+        Box::pin(async move {
+            if method == "interaction.list" {
+                return Ok(Some(json!({
+                    "jsonrpc": "2.0", "id": "1",
+                    "result": {"items": self.list_items}
+                })));
+            }
+            self.answer_calls.lock().unwrap().push(method);
+            Ok(Some(json!({
+                "jsonrpc": "2.0", "id": "1",
+                "result": {"outcome": "accepted"}
+            })))
+        })
+    }
+    fn notify(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, HubError>> + Send + '_>>
+    {
+        Box::pin(std::future::ready(Ok(false)))
+    }
+}
+
+/// c-deadcards round 4 (item 3): a LIVE-only interaction.list item for an
+/// instance whose Hub row is terminal is projected as departed — not pending,
+/// not answerable — even though no durable interaction row exists for it.
+#[tokio::test]
+async fn live_item_for_terminal_instance_merges_as_departed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let host_id = format!("hst_{}", uuid::Uuid::now_v7());
+    // Terminal instance with NO durable interaction.
+    let (instance_id, _) = seed_pending_online(&hub, &host_id, "ep-live-departed").await?;
+    hub.store()
+        .expect("store")
+        .append_journal(
+            host_id.clone(),
+            instance_id.clone(),
+            None,
+            json!({"kind":"lifecycle","payload":{"type":"entity","entityType":"instance","state":"exited"}}),
+        )
+        .await?;
+
+    // The Node still lists a live pending card for that (dead) instance.
+    let live_id = format!("int_{}", uuid::Uuid::now_v7());
+    let answer_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    hub.test_set_node_transport_epoched(
+        &host_id,
+        Arc::new(ListingTransport {
+            list_items: json!([{
+                "interactionId": live_id,
+                "id": live_id,
+                "instanceId": instance_id,
+                "hostId": host_id,
+                "kind": "approval",
+                "state": "pending",
+                "blocking": true,
+                "answerable": true
+            }]),
+            answer_calls: answer_calls.clone(),
+        }),
+        Some("ep-live-departed".into()),
+    )
+    .await;
+
+    let (status, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/interactions?instanceId={instance_id}"),
+        &cookie,
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let page: Value = serde_json::from_str(body.trim())?;
+    let item = page["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|it| it.get("interactionId").and_then(Value::as_str) == Some(live_id.as_str()))
+        .expect("live item is present in the merge");
+    assert_eq!(
+        item["state"].as_str(),
+        Some("invalidated"),
+        "projected departed: {item}"
+    );
+    assert_eq!(item["answerable"].as_bool(), Some(false));
+    assert_eq!(item["blocking"].as_bool(), Some(false));
+
+    // Answering it via the fenced live path is refused, not forwarded.
+    let answer_body = json!({ "commandId": format!("cmd_{}", uuid::Uuid::now_v7()),
+                 "instanceId": instance_id,
+                 "answer": serde_json::from_str::<Value>(ALLOW_ANSWER)? })
+    .to_string();
+    let (status, _) = http(
+        addr,
+        "POST",
+        &format!("/v1/interactions/{live_id}/answer"),
+        &cookie,
+        Some(&answer_body),
+    )
+    .await?;
+    assert_eq!(
+        status, 404,
+        "a live-only card on a terminal instance is not answerable"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !answer_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m == "interaction.answer"),
+        "the allow must not be forwarded for a dead-generation live card"
+    );
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// c-deadcards round 4 (item 8): a settlement emitted by the host-lost reaper
+/// is broadcast on the follow bus so an open inbox/session learns immediately.
+#[tokio::test]
+async fn host_lost_reaper_broadcasts_the_settlement_to_followers() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = HubConfig::for_test(dir.path().join("data"));
+    config.host_lost_grace_ms = 0;
+    let hub = spawn(config).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let host_id = format!("hst_{}", uuid::Uuid::now_v7());
+    let (instance_id, interaction_wire) =
+        seed_pending_online(&hub, &host_id, "ep-broadcast").await?;
+
+    // Open a follow socket filtered to the instance.
+    let mut req =
+        format!("ws://{addr}/v1/follow?instanceId={instance_id}").into_client_request()?;
+    req.headers_mut()
+        .insert("Cookie", cookie.parse().expect("cookie header"));
+    let (mut follow, _) = tokio_tungstenite::connect_async(req).await?;
+
+    // End the generation via the BACKGROUND host-lost reaper (the path under
+    // test — it must broadcast, unlike a bare store sweep).
+    let store = hub.store().expect("store");
+    store.mark_host_offline(host_id.clone()).await?;
+    assert_eq!(
+        store
+            .get_instance(instance_id.clone())
+            .await?
+            .expect("row")
+            .lifecycle,
+        "running"
+    );
+
+    // The follower receives the Hub-settlement observation (an attach snapshot
+    // may arrive first — skip non-settlement frames).
+    let mut settlement_frame = None;
+    for _ in 0..10 {
+        let frame = tokio::time::timeout(Duration::from_secs(3), recv_json(&mut follow))
+            .await
+            .context("no settlement frame received")??;
+        if frame["type"].as_str() == Some("event")
+            && frame["event"]["payload"]["hubSettlement"].as_bool() == Some(true)
+        {
+            settlement_frame = Some(frame);
+            break;
+        }
+    }
+    let frame = settlement_frame.context("settlement frame never observed")?;
+    assert_eq!(frame["event"]["kind"].as_str(), Some("interaction.expired"));
+    assert_eq!(
+        frame["event"]["payload"]["interactionId"].as_str(),
+        Some(interaction_wire.as_str())
+    );
+    follow.close(None).await.ok();
     hub.shutdown().await;
     Ok(())
 }

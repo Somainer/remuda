@@ -296,6 +296,14 @@ pub struct AnswerBody {
     /// when the caller is a Bot device relaying a card click (design §5.1 #1).
     #[serde(default)]
     acting_open_id: Option<String>,
+    /// c-deadcards round 4 (item 3): the instance the UI resolved this
+    /// interaction to (from the interaction.list merge). Consulted REFUSAL-ONLY
+    /// for live-only (no durable Hub row) answers — when the Hub row for that
+    /// instance is terminal the allow is refused and never broadcast. It can
+    /// never widen authorization: omitting it just falls back to the durable
+    /// claim path, and the Node stays the final first-answer-wins authority.
+    #[serde(default, alias = "instanceId")]
+    instance_id: Option<String>,
 }
 
 /// `GET /v1/interactions` — durable Hub index, merged with live Node RPC.
@@ -391,6 +399,7 @@ pub async fn list_interactions(
         Some(host_id) => vec![host_id.clone()],
         None => state.nodes.host_ids().await,
     };
+    let mut live_rows: Vec<Value> = Vec::new();
     for host_id in hosts {
         match state
             .nodes
@@ -414,8 +423,8 @@ pub async fn list_interactions(
                                     .or_else(|| item.get("id"))
                                     .and_then(Value::as_str)
                                     .unwrap_or("");
-                                if id.is_empty() || seen.insert(id.to_string()) {
-                                    items.push(flatten_interaction(item.clone()));
+                                if !id.is_empty() && seen.insert(id.to_string()) {
+                                    live_rows.push(item.clone());
                                 }
                             }
                         }
@@ -426,6 +435,33 @@ pub async fn list_interactions(
             },
             Ok(None) => {}
             Err(err) => tracing::debug!(error = %err, %host_id, "interaction.list rpc"),
+        }
+    }
+    // c-deadcards round 4 (item 3): live-only items for instances the Hub row
+    // marks terminal are not answerable — project them departed rather than
+    // presenting a ghost pending card the answer path would have to reject.
+    let live_instance_ids: Vec<String> = live_rows
+        .iter()
+        .filter_map(|item| {
+            item.get("instanceId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let terminal_instances = state
+        .store
+        .filter_terminal_instances(live_instance_ids)
+        .await
+        .unwrap_or_default();
+    for item in live_rows {
+        let departed = item
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| terminal_instances.contains(id));
+        if departed {
+            items.push(project_live_item_departed(item));
+        } else {
+            items.push(flatten_interaction(item));
         }
     }
     // D-051: the Agent relaxation is applied to the fully merged page, so the
@@ -602,21 +638,34 @@ pub async fn answer_interaction(
             )
             .await?;
         let (host_id, dispatch_epoch, dispatch_generation) = match claim {
-            // Response lost, or the identical command is already in flight:
-            // replay the same acknowledgement, forward nothing.
-            DispatchClaim::IdempotentReplay | DispatchClaim::InFlight => {
+            // Response lost AFTER completion: the identical command already
+            // won — replay the same acknowledgement, forward nothing.
+            DispatchClaim::IdempotentReplay => {
                 return Ok(Json(json!({
                     "outcome": "idempotent",
                     "interactionId": interaction_id.as_id().as_str(),
                     "commandId": command_id.as_id().as_str(),
                 })));
             }
+            // Round 4 item 6: the identical command is STILL being forwarded.
+            // In-progress, not success — the first call owns the answer.
+            DispatchClaim::InFlight => {
+                return Err(HubError::InProgress {
+                    winner: command_id.as_id().to_string(),
+                });
+            }
             // A different command arrived second: first-answer-wins.
             DispatchClaim::Conflict { winner } => {
                 return Err(HubError::Superseded { winner });
             }
-            // Invalidated/expired/missing: dead generation, no frame.
-            DispatchClaim::Dead | DispatchClaim::Missing => return Err(HubError::NotFound),
+            // Generation gone (invalidated): 404, no frame; announce it.
+            DispatchClaim::Dead { settlement } => {
+                state.broadcast_settlement(&settlement);
+                return Err(HubError::NotFound);
+            }
+            // Deadline passed: the distinct 410.
+            DispatchClaim::Expired => return Err(HubError::Expired),
+            DispatchClaim::Missing => return Err(HubError::NotFound),
             DispatchClaim::Claimed {
                 host_id,
                 dispatch_epoch,
@@ -629,13 +678,17 @@ pub async fn answer_interaction(
         params["dispatchLinkGeneration"] = json!(dispatch_generation);
 
         let release = || async {
-            let _ = state
+            if let Ok(outcome) = state
                 .store
                 .release_interaction_dispatch(
                     interaction_id.as_id().to_string(),
                     command_id.as_id().to_string(),
                 )
-                .await;
+                .await
+                && let crate::store::DispatchRelease::Settled { settlement } = outcome
+            {
+                state.broadcast_settlement(&settlement);
+            }
         };
         match state
             .nodes
@@ -730,6 +783,27 @@ pub async fn answer_interaction(
 
     // ----- Live-only interaction (no durable Hub row): in-memory one-shot
     // approval broker, then fan out to every connected owner Node. -----
+    // c-deadcards round 4 (item 3): a broker grant names its instance; if the
+    // Hub row for that generation is terminal the card is gone.
+    if let Some(owner_instance) = &in_memory_grant_instance
+        && state
+            .store
+            .is_instance_terminal(owner_instance.clone())
+            .await?
+    {
+        return Err(HubError::NotFound);
+    }
+    // Refusal-only gate for the broadcast path: the caller/UI resolved the
+    // live interaction's instance from the merge. A terminal Hub instance
+    // means that generation ended — never broadcast the allow.
+    if let Some(hint_instance) = body.instance_id.as_deref()
+        && state
+            .store
+            .is_instance_terminal(hint_instance.to_string())
+            .await?
+    {
+        return Err(HubError::NotFound);
+    }
     if let Some(result) = state
         .agent_approvals
         .answer(
@@ -764,18 +838,36 @@ pub async fn answer_interaction(
         }
         return Ok(Json(result));
     }
+    // Fenced fan-out (item 3): snapshot every candidate link's identity
+    // BEFORE dispatching. A reconnect between the snapshot and the fenced
+    // call makes the frame a GenerationMismatch — the answer cannot reach a
+    // different generation's Node.
+    use crate::transport::FencedCall;
+    let mut targets: Vec<(String, Option<String>, u64)> = Vec::new();
     for host_id in state.nodes.host_ids().await {
+        if let Some((epoch, generation)) = state.nodes.current_slot(&host_id).await {
+            targets.push((host_id, epoch, generation));
+        }
+    }
+    for (host_id, target_epoch, target_generation) in targets {
         match state
             .nodes
-            .call(
+            .call_fenced(
                 &host_id,
+                target_epoch.as_deref(),
+                target_generation,
                 "interaction.answer",
-                params.clone(),
+                {
+                    let mut p = params.clone();
+                    p["dispatchEpoch"] = json!(target_epoch);
+                    p["dispatchLinkGeneration"] = json!(target_generation);
+                    p
+                },
                 NODE_RPC_TIMEOUT,
             )
             .await
         {
-            Ok(Some(frame)) => match rpc_result(frame) {
+            FencedCall::Sent(Some(frame)) => match rpc_result(frame) {
                 Ok(result) => {
                     state
                         .store
@@ -789,8 +881,11 @@ pub async fn answer_interaction(
                 Err(HubError::NotFound) => {}
                 Err(err) => return Err(err),
             },
-            Ok(None) => {}
-            Err(err) => return Err(err),
+            // No longer the validated link, or nothing writable: do not
+            // deliver — try the other candidates instead.
+            FencedCall::GenerationMismatch { .. }
+            | FencedCall::NotConnected
+            | FencedCall::Sent(None) => {}
         }
     }
 
@@ -1028,6 +1123,27 @@ fn flatten_interaction(mut item: Value) -> Value {
         && let Some(object) = item.as_object_mut()
     {
         object.extend(entity);
+    }
+    item
+}
+
+/// c-deadcards round 4 (item 3): a LIVE-only Node item whose instance the Hub
+/// knows to be terminal is projected as departed in the merge — it is not
+/// answerable and shows exactly what a durable invalidated card shows, so the
+/// queue/badge cannot count it and the UI offers no answer.
+fn project_live_item_departed(mut item: Value) -> Value {
+    item = flatten_interaction(item);
+    if let Some(object) = item.as_object_mut() {
+        object.insert("state".into(), json!("invalidated"));
+        object.insert("blocking".into(), json!(false));
+        object.insert("answerable".into(), json!(false));
+        object.insert(
+            "resolution".into(),
+            json!({
+                "state": "known",
+                "value": { "reason": "generation-ended", "eventIds": [] }
+            }),
+        );
     }
     item
 }

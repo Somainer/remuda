@@ -711,12 +711,13 @@ async fn stop_before_delete(
             );
         }
     }
-    if state
+    let (deleted, delete_settlement) = state
         .store
         .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
         .await
-        .map_err(map_store)?
-    {
+        .map_err(map_store)?;
+    state.broadcast_settlement(&delete_settlement);
+    if deleted {
         state
             .api_relay
             .revoke_instance_egress(state, &instance.instance_id)
@@ -3277,10 +3278,11 @@ pub(crate) async fn forward_if_online(
                     "instance.create" | "instance.resume"
                 ) && let Some(instance_id) = command.instance_id.clone()
                 {
-                    state
+                    let failure_settlement = state
                         .store
                         .fail_instance(instance_id, err.to_string())
                         .await?;
+                    state.broadcast_settlement(&failure_settlement);
                 } else {
                     state
                         .store
@@ -3342,12 +3344,13 @@ async fn settle_stop_for_unknown_instance(
         operation = %command.operation,
         "node does not know this instance; settling the stop as exited"
     );
-    if state
+    let (lost, lost_settlement) = state
         .store
         .settle_instance_exited(instance_id.clone(), "node-lost-instance".into())
         .await
-        .map_err(map_store)?
-    {
+        .map_err(map_store)?;
+    state.broadcast_settlement(&lost_settlement);
+    if lost {
         state
             .api_relay
             .revoke_instance_egress(state, &instance_id)
@@ -3390,10 +3393,11 @@ async fn fail_unaccepted_create(
     if command.operation == "instance.create"
         && let Some(instance_id) = command.instance_id.clone()
     {
-        state
+        let failure_settlement = state
             .store
             .fail_instance(instance_id, message.clone())
             .await?;
+        state.broadcast_settlement(&failure_settlement);
         return Err(HubError::BadRequest(message));
     }
     // An explicit Node error reply is positive evidence the command did not

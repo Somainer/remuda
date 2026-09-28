@@ -336,55 +336,34 @@ impl Store {
     }
 
     /// Reconcile observed state without trusting the Node to advance the Hub's
-    /// durable journal watermark. Replay is still required for every missing seq.
+    /// durable journal watermark. Replay is still required for every missing
+    /// seq.
+    ///
+    /// c-deadcards round 4: every entry goes through the SAME absorbing
+    /// lifecycle decision as journal projections — a daemon inventory entry
+    /// for the generation that already ended cannot resurrect the row.
+    /// Returns the settled interactions for live broadcast.
     pub(crate) async fn reconcile_daemon_instances(
         &self,
         host_id: String,
         instances: Vec<Value>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<crate::store::Settlement, StoreError> {
         self.run_named("reconcile_daemon_instances", move |conn| {
             let tx = crate::store::immediate_tx(conn)?;
-            // c-deadcards: instances a daemon report transitions INTO a
-            // terminal lifecycle have their pending interactions invalidated
-            // in the same transaction.
-            let mut ended: Vec<String> = Vec::new();
+            let now = now_rfc3339();
+            let mut settlement = crate::store::Settlement::default();
             for instance in instances {
-                if instance["hostId"].as_str() != Some(&host_id) { continue; }
-                let Some(id) = instance["id"].as_str().or_else(|| instance["instanceId"].as_str()) else { continue; };
-                let lifecycle = match instance["lifecycle"].as_str() {
-                    Some("ready" | "running") => "running",
-                    Some(value @ ("requested" | "preparing" | "starting" | "closing" | "exited" | "failed" | "unknown" | "reconciling")) => value,
-                    _ => continue,
-                };
-                let activity = instance["activity"].as_str().or_else(|| instance["activity"]["value"].as_str());
-                let activity = match activity {
-                    Some("waiting-interaction") => "blocked",
-                    Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
-                    _ => "unknown",
-                };
-                let was_terminal = tx
-                    .query_row(
-                        "SELECT lifecycle FROM instances WHERE id = ?1 AND host_id = ?2",
-                        params![id, &host_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .map(|previous| matches!(previous.as_str(), "exited" | "failed" | "closed"))
-                    .unwrap_or(true);
-                tx.execute(
-                    "UPDATE instances SET lifecycle = ?3, activity = ?4, connectivity = 'connected',
-                     last_error = ?5, updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
-                    params![id, host_id, lifecycle, activity, instance["lastError"].as_str(), now_rfc3339()],
-                )?;
-                if !was_terminal && matches!(lifecycle, "exited" | "failed" | "closed") {
-                    ended.push(id.to_string());
+                if instance["hostId"].as_str() != Some(&host_id) {
+                    continue;
                 }
-            }
-            if !ended.is_empty() {
-                crate::store::settle_instance_interactions(&tx, &ended, &now_rfc3339())?;
+                let entry_settlement =
+                    crate::store::apply_daemon_inventory_entry(&tx, &host_id, &instance, &now)?;
+                settlement.extend(entry_settlement);
             }
             tx.commit()?;
-            Ok(())
-        }).await
+            Ok(settlement)
+        })
+        .await
     }
 
     async fn retire_managed_host(&self, id: String) -> Result<(), HubError> {
@@ -540,7 +519,7 @@ async fn connect_once(
         &pending,
     )
     .await?;
-    state
+    let daemon_settlement = state
         .store
         .reconcile_daemon_instances(
             managed.id.clone(),
@@ -550,6 +529,7 @@ async fn connect_once(
                 .unwrap_or_default(),
         )
         .await?;
+    state.broadcast_settlement(&daemon_settlement);
     carrier
         .send_json(&crate::error::rpc_ok(
             hello["id"].clone(),
@@ -646,7 +626,7 @@ mod tests {
             .await
             .unwrap();
         store.mark_all_hosts_offline().await.unwrap();
-        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 0);
+        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap().0, 0);
         store
             .run_named(
                 "bridge_loss_grace_begins_only_after_daemon_probe_fails",
@@ -660,13 +640,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 0);
+        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap().0, 0);
         let id = instance.host_id.clone();
         store
             .ssh_daemon_probe(id.clone(), true, None)
             .await
             .unwrap();
-        assert_eq!(store.expire_lost_hosts(0).await.unwrap(), 0);
+        assert_eq!(store.expire_lost_hosts(0).await.unwrap().0, 0);
         let disconnected_id = id.clone();
         store
             .run_named("bridge_loss_grace_begins_only_after_daemon_probe_fails", move |conn| {
@@ -683,7 +663,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.expire_lost_hosts(60_000).await.unwrap(),
+            store.expire_lost_hosts(60_000).await.unwrap().0,
             0,
             "first failed daemon probe must reset the earlier bridge disconnect timestamp"
         );
@@ -703,7 +683,7 @@ mod tests {
             .unwrap();
         store.ssh_daemon_probe(id, false, None).await.unwrap();
         assert_eq!(
-            store.expire_lost_hosts(60_000).await.unwrap(),
+            store.expire_lost_hosts(60_000).await.unwrap().0,
             1,
             "failed retries must not restart grace"
         );
@@ -783,6 +763,162 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(untouched.lifecycle, other.lifecycle);
+        store.close().await;
+    }
+
+    /// c-deadcards round 4 (item 1): a daemon inventory entry cannot
+    /// resurrect an instance the host-lost sweep ended when it is for the SAME
+    /// (nodeEpoch, processGeneration) generation. A newer generation DOES
+    /// revive it.
+    #[tokio::test]
+    async fn daemon_inventory_cannot_resurrect_a_swept_same_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").unwrap();
+        store
+            .insert_managed_host(
+                host.clone(),
+                AddSshHost {
+                    target: "deadcards-daemon-absorb".into(),
+                    label: "deadcards-daemon-absorb".into(),
+                    labels: vec![],
+                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .ssh_status(host.clone(), "online", None)
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "codex".into(),
+                "codex-appserver".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let own_host_id = host.clone();
+        let own_instance_id = instance.instance_id.clone();
+        store
+            .record_node_epoch(host.clone(), Some("ep-da".into()))
+            .await
+            .unwrap();
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                json!({"kind":"lifecycle","processGeneration":"1","payload":{"type":"entity","entityType":"instance","state":"ready"}}),
+            )
+            .await
+            .unwrap();
+        let int_id = store
+            .run_named("seed", {
+                let host = host.clone();
+                let iid = instance.instance_id.clone();
+                move |conn| {
+                    let now = now_rfc3339();
+                    let id = format!("int_{}", uuid::Uuid::now_v7());
+                    conn.execute(
+                        "INSERT INTO interactions
+                            (id, instance_id, host_id, kind, state, blocking,
+                             payload_json, created_at, updated_at)
+                         VALUES (?1,?2,?3,'approval','pending',1,'{}',?4,?4)",
+                        rusqlite::params![id, iid, host, now],
+                    )?;
+                    Ok(id)
+                }
+            })
+            .await
+            .unwrap();
+
+        // The generation ends (journaled exit, same epoch/pg1); the card is
+        // settled in the same write. (Avoid the host-lost sweep here: managed
+        // SSH hosts are excluded from it.)
+        let exited = store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","processGeneration":"1","payload":{"type":"entity","entityType":"instance","state":"exited"}}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            exited
+                .settlement
+                .interactions
+                .iter()
+                .any(|(_, id)| id == &int_id),
+            "the exit settles the pending card"
+        );
+        assert_eq!(
+            store
+                .get_instance(instance.instance_id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            "exited"
+        );
+
+        // The daemon comes back (same epoch) and lists the instance running on
+        // the SAME process generation. Absorption must keep it exited.
+        let settlement = store
+            .reconcile_daemon_instances(
+                host.clone(),
+                vec![json!({
+                    "id": instance.instance_id,
+                    "hostId": host,
+                    "lifecycle": "running",
+                    "processGeneration": "1",
+                    "activity": "idle"
+                })],
+            )
+            .await
+            .unwrap();
+        let still = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still.lifecycle, "exited",
+            "same-generation daemon inventory cannot resurrect a swept instance"
+        );
+        assert!(
+            settlement.is_empty(),
+            "nothing re-settles on an absorbed entry"
+        );
+
+        // A newer process generation revives the row.
+        store
+            .reconcile_daemon_instances(
+                own_host_id.clone(),
+                vec![json!({
+                    "id": own_instance_id,
+                    "hostId": own_host_id,
+                    "lifecycle": "running",
+                    "processGeneration": "2",
+                    "activity": "working"
+                })],
+            )
+            .await
+            .unwrap();
+        let revived = store
+            .get_instance(instance.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            revived.lifecycle, "running",
+            "a newer generation revives the row"
+        );
         store.close().await;
     }
 }

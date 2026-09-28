@@ -498,13 +498,14 @@ pub(crate) async fn handle_node_method(
                 .await?;
             crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
             if params["daemon"] == true {
-                state
+                let daemon_settlement = state
                     .store
                     .reconcile_daemon_instances(
                         host.host_id.clone(),
                         params["instances"].as_array().cloned().unwrap_or_default(),
                     )
                     .await?;
+                state.broadcast_settlement(&daemon_settlement);
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
             // c-deadcards round 3: bind the live transport to the nodeEpoch it
@@ -657,6 +658,10 @@ pub(crate) async fn handle_node_method(
                             instance_terminated = true;
                         }
                     }
+                    // c-deadcards round 4: a terminal event that invalidated
+                    // pending cards announces them even though the settlement
+                    // is Hub-side (no Node journal frame carries it).
+                    state.broadcast_settlement(&appended.settlement);
                     next_seq = Some(appended.record.seq.saturating_add(1));
                     last = Some(appended);
                 }
@@ -991,7 +996,7 @@ async fn reconcile_lost_instances(
                 .map(str::to_string)
         })
         .collect();
-    let lost = state
+    let (lost, settlement) = state
         .store
         .reconcile_reported_instances(
             host_id.to_string(),
@@ -999,6 +1004,7 @@ async fn reconcile_lost_instances(
             NODE_EPOCH_CHANGED.to_string(),
         )
         .await?;
+    state.broadcast_settlement(&settlement);
     for instance_id in lost {
         tracing::warn!(
             %host_id,

@@ -38,6 +38,14 @@ pub enum HubError {
         /// Winning command id.
         winner: String,
     },
+    /// c-deadcards round 4: the identical commandId is still being forwarded
+    /// (dispatch in flight). Not a success and not a conflict — the first call
+    /// owns the answer; the client retries/waits. 202 Accepted.
+    #[error("interaction answer in progress")]
+    InProgress {
+        /// The commandId currently in flight.
+        winner: String,
+    },
     /// No host satisfied placement constraints (D-013).
     #[error("placement unsatisfiable")]
     Unsatisfiable {
@@ -127,6 +135,7 @@ impl HubError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Expired => StatusCode::GONE,
             Self::Superseded { .. } => StatusCode::CONFLICT,
+            Self::InProgress { .. } => StatusCode::ACCEPTED,
             Self::Unsatisfiable { .. } | Self::ProviderNotConfigured { .. } => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
@@ -149,6 +158,7 @@ impl HubError {
             Self::Conflict(_) => "COMMAND_ID_CONFLICT",
             Self::Expired => "INTERACTION_EXPIRED",
             Self::Superseded { .. } => "INTERACTION_SUPERSEDED",
+            Self::InProgress { .. } => "INTERACTION_IN_PROGRESS",
             Self::Unsatisfiable { .. } => "PLACEMENT_UNSATISFIABLE",
             Self::ProviderNotConfigured { .. } => "PROVIDER_NOT_CONFIGURED",
             Self::SupplyDeferred { .. } => "SUPPLY_DEFERRED",
@@ -202,6 +212,11 @@ impl IntoResponse for HubError {
         }
         if let Self::Superseded { winner } = &self
             && !winner.is_empty()
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("winner".into(), json!(winner));
+        }
+        if let Self::InProgress { winner } = &self
             && let Some(obj) = body.as_object_mut()
         {
             obj.insert("winner".into(), json!(winner));

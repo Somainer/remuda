@@ -62,38 +62,58 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
     if (!renderedInline) return;
     const el = rootRef.current;
     if (!el) return;
+
+    // Available width = the nearest containing BLOCK's content box. Inside
+    // inline markdown (`**$x$**`, `*$x$*`, `[$x$](u)`) the immediate parent
+    // is an inline element whose clientWidth is 0, so inline ancestors are
+    // skipped. clientWidth already excludes borders; subtract horizontal
+    // padding for the content width.
+    let container: HTMLElement | null = el.parentElement;
+    while (container && getComputedStyle(container).display === "inline") {
+      container = container.parentElement;
+    }
+    const availableWidth = (): number => {
+      if (!container) return el.clientWidth;
+      const cs = getComputedStyle(container);
+      return (
+        container.clientWidth -
+        (Number.parseFloat(cs.paddingLeft) || 0) -
+        (Number.parseFloat(cs.paddingRight) || 0)
+      );
+    };
+
     // Promotion/demotion compares the formula's INTRINSIC width (inner
-    // KaTeX node, which is flex 0 0 auto while promoted and never wraps)
-    // with both the current box and the AVAILABLE width (the paragraph
-    // content box). scrollWidth alone cannot drive demotion: it is clamped
-    // to clientWidth when content fits, so it is never negative; and the
-    // box is shrink-to-fit, so when the formula fits, clientWidth equals
-    // intrinsic and no negative slack ever appears.
+    // KaTeX node, flex 0 0 auto while promoted, so it never wraps) with the
+    // current box and the available block width. scrollWidth alone cannot
+    // drive demotion: it is clamped to clientWidth when content fits, so it
+    // is never negative, and the box is shrink-to-fit and then matches the
+    // formula.
     //   - clipped box: promote whenever ink is really clipped
-    //     (scrollWidth > clientWidth, even 1-2px KaTeX subscript bearings).
+    //     (scrollWidth > clientWidth, even a 1px KaTeX subscript bearing).
     //   - promoted box: demote only when NOTHING is scrollable any more AND
     //     the intrinsic formula fits the available width with 8px slack
-    //     (column widened / source shortened). The scrollable check is what
-    //     keeps a bearing-overflow formula promoted even though it fits the
-    //     column with room: demoting would clip those pixels. The slack is
-    //     the anti-flip band at the column-width boundary.
+    //     (column widened / source shortened). The scrollable check keeps a
+    //     bearing formula promoted (demoting would clip those pixels); the
+    //     slack is the column-boundary anti-flip band.
     const DEMOTE_SLACK = 8;
     const measure = (): void => {
       const katexEl = el.querySelector<HTMLElement>(".katex");
       const nodeWidth = katexEl ? katexEl.getBoundingClientRect().width : 0;
       const intrinsic = Math.max(el.scrollWidth, nodeWidth);
-      const available = el.parentElement ? el.parentElement.clientWidth : el.clientWidth;
       const clipped = el.scrollWidth > el.clientWidth;
-      setWide((prev) =>
-        prev ? clipped || intrinsic > available - DEMOTE_SLACK : clipped,
-      );
+      setWide((prev) => (prev ? clipped || intrinsic > availableWidth() - DEMOTE_SLACK : clipped));
     };
     measure();
-    // Fonts arriving late and viewport/column resizes change the width.
+    // Fonts arriving late and viewport/column resizes change the widths.
     const Observer = globalThis.ResizeObserver;
     if (!Observer) return;
     const ro = new Observer(measure);
     ro.observe(el);
+    // Once the wrapper fills the clamped box its own width stops changing,
+    // so a later container-only resize (e.g. column 904 -> 1000 px) fires
+    // no callback on `el` and the formula would stay promoted with slack;
+    // observe the available-width block too.
+    if (container) ro.observe(container);
     return () => ro.disconnect();
   }, [renderedInline, source]);
   const attach = useCallback((el: HTMLElement | null) => {

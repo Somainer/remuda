@@ -308,6 +308,21 @@ describe("math rendering (c-math round 3)", () => {
     expect((await screen.findAllByTestId("code-block")).length).toBeGreaterThan(0);
   });
 
+  it("renders math nested inside bold, emphasis and a link (c-mathfu r3.1)", async () => {
+    // The inline wrapper's nearest BLOCK (the paragraph) must provide the
+    // available width; here we just assert these nests render KaTeX at all
+    // and keep their surrounding inline structure.
+    const { container } = render(
+      <MarkdownText text={"**$x^2$** and *$y_1$* and [$z$](https://example.org)"} />,
+    );
+    const inlines = await screen.findAllByTestId("math-inline");
+    expect(inlines).toHaveLength(3);
+    for (const node of inlines) expect(node.querySelector(".katex")).toBeTruthy();
+    expect(container.querySelector("strong")?.querySelector('[data-testid="math-inline"]')).toBeTruthy();
+    expect(container.querySelector("em")?.querySelector('[data-testid="math-inline"]')).toBeTruthy();
+    expect(container.querySelector("a")?.querySelector('[data-testid="math-inline"]')).toBeTruthy();
+  });
+
   it("renders an unclosed display tail as an exact-source React text node (G)", async () => {
     const { rerender } = render(<MarkdownText text={"intro \\[a *b* + \\{c\\}"} />);
     await new Promise((r) => setTimeout(r, 0));

@@ -66,20 +66,6 @@ export default defineConfig({
     {
       name: "chromium",
       use: {
-        // The fake Hub is served on loopback. A page a service worker
-        // restored WHILE OFFLINE boots with an unknown client IP-address
-        // space; Chromium's Private/Local Network Access checks then block
-        // its WebSocket upgrades to loopback even after connectivity returns
-        // (ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS) — a loopback-harness
-        // artifact (a deployed Hub is not a more-private target). Disable the
-        // enforcement (both the pre-124 "PrivateNetwork*" names and the 124+
-        // "LocalNetwork*" rename) so the offline-restore e2e can reopen its
-        // follow after recovery.
-        launchOptions: {
-          args: [
-            "--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessChecks,PrivateNetworkAccessForNavigations,PrivateNetworkAccessForWorkers,PrivateNetworkAccessForWebRTC,BlockInsecureLocalNetworkRequests,LocalNetworkAccessChecks,LocalNetworkAccessChecksForNavigation,LocalNetworkAccessChecksForWebRTC,LocalNetworkAccessChecksForWorkers,LocalNetworkAccessChecksWarningOnly",
-          ],
-        },
         ...devices["Desktop Chrome"],
         // Google Chrome locally; bundled Chromium on CI or when PW_CHANNEL=chromium (hosts without Chrome).
         ...(process.env.CI || process.env.PW_CHANNEL === "chromium" ? {} : { channel: "chrome" as const }),

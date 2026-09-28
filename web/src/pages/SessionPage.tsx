@@ -1,4 +1,15 @@
-import { Profiler, useCallback, useEffect, useLayoutEffect, useRef, useState, type ProfilerOnRenderCallback, type ReactNode } from "react";
+import {
+  Profiler,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ComponentProps,
+  type ProfilerOnRenderCallback,
+  type ReactNode,
+} from "react";
 import { Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { FileText, Info, ListCollapse, MessageSquarePlus, Rows3, ScrollText, Search } from "lucide-react";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
@@ -38,7 +49,7 @@ import { projectCommandStatus } from "../lib/commandStatus";
 import { endReason, NODE_EPOCH_CHANGED } from "../lib/endReason";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
-import { hubStore, useHub } from "../lib/store";
+import { hubStore, type HubState } from "../lib/store";
 import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
@@ -54,6 +65,115 @@ const NO_EVENTS: Observation[] = [];
 const onSessionCommit: ProfilerOnRenderCallback = (_id, _phase, actualDuration) => {
   reportProbe("commit:SessionPage", { actualDuration });
 };
+
+/**
+ * Structural equality over plain wire data (objects, arrays, primitives).
+ * The Hub's 2 s list refresh rebuilds every row even when nothing changed;
+ * this is what lets the page tell a real change from a re-fetched copy.
+ */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    const other = b as unknown[];
+    return a.length === other.length && a.every((item, index) => sameValue(item, other[index]));
+  }
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && sameValue(left[key], right[key]));
+}
+
+/**
+ * Everything the page body reads from the hub, narrowed to this one
+ * instance. The body subscribes to this slice, not the whole snapshot: an
+ * emit that touches another session, the host/workspace lists, or re-fetches
+ * an unchanged row selects an equal slice and the body does not re-render.
+ */
+function selectSession(state: HubState, instanceId: string) {
+  const instance = state.instances.find((i) => i.id === instanceId);
+  const kind = instance?.kind;
+  return {
+    ready: state.ready,
+    connection: state.connection,
+    compact: state.compact,
+    instance,
+    events: state.events[instanceId],
+    journalStatus: state.journalStatus[instanceId],
+    pending: state.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending"),
+    bubbles: state.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled"),
+    // c-steer: Remuda-held queue rows (Enter while busy / while a question is
+    // pending). Posted in order by flushHeld when the wait ends.
+    held: hubStore.heldBubbles(instanceId),
+    title: hubStore.titleOf(instanceId),
+    hostName: instance ? hubStore.hostName(instance.hostId) : "",
+    permissionMode: hubStore.permissionModeOf(instanceId),
+    launchPermissionMode: hubStore.launchPermissionModeOf(instanceId),
+    permissionEffective: hubStore.permissionEffectiveOf(instanceId),
+    permissionPending: hubStore.permissionPendingOf(instanceId),
+    model: hubStore.modelOf(instanceId, kind),
+    models: hubStore.modelListOf(instanceId),
+    modelEffective: hubStore.modelEffectiveOf(instanceId),
+    modelPending: hubStore.modelPendingOf(instanceId),
+    modelCatalog: hubStore.modelCatalogOf(instanceId),
+    effort: hubStore.effortOf(instanceId, kind),
+    effortEffective: hubStore.effortEffectiveOf(instanceId),
+    effortPending: hubStore.effortPendingOf(instanceId),
+    usageRollup: hubStore.usageRollupOf(instanceId),
+  };
+}
+
+type SessionSlice = ReturnType<typeof selectSession>;
+
+function sameSlice(a: SessionSlice, b: SessionSlice): boolean {
+  const keys = Object.keys(a) as (keyof SessionSlice)[];
+  // The journal window is append-only and replaced on change: identity is
+  // the cheap, exact test for it.
+  return keys.every((key) => (key === "events" ? a.events === b.events : sameValue(a[key], b[key])));
+}
+
+function useSessionSlice(instanceId: string): SessionSlice {
+  const cache = useRef<{ instanceId: string; state: HubState; slice: SessionSlice } | null>(null);
+  const getSnapshot = useCallback(() => {
+    const state = hubStore.getSnapshot();
+    const last = cache.current;
+    if (last && last.instanceId === instanceId && last.state === state) return last.slice;
+    const next = selectSession(state, instanceId);
+    const slice = last && last.instanceId === instanceId && sameSlice(last.slice, next) ? last.slice : next;
+    cache.current = { instanceId, state, slice };
+    return slice;
+  }, [instanceId]);
+  return useSyncExternalStore(hubStore.subscribe, getSnapshot, getSnapshot);
+}
+
+/**
+ * The header with its Space drawer. The workbench hook reads the whole
+ * host/workspace/instance lists; it lives here, below the page body, so a
+ * list refresh re-renders the header's space chip and not the page.
+ */
+function WorkbenchSessionHeader(props: Omit<ComponentProps<typeof SessionHeader>, "spaces">) {
+  const workbench = useSpaceWorkbench();
+  return (
+    <SessionHeader
+      {...props}
+      spaces={{
+        spaces: workbench.spaces,
+        active: workbench.active,
+        prefs: workbench.prefs,
+        instanceId: workbench.instanceId,
+        onSelect: workbench.select,
+      }}
+    />
+  );
+}
+
+/** The EndedBar's 「开新会话」 link follows the active Space (same isolation). */
+function WorkbenchEndedBar(props: Omit<ComponentProps<typeof EndedBar>, "newHref">) {
+  const { newHref } = useSpaceWorkbench();
+  return <EndedBar {...props} newHref={newHref} />;
+}
 
 /** RunDetails' own key: the controlled panel persists through the page. */
 const RUN_DETAILS_KEY = "runtime.run-details.open";
@@ -93,13 +213,17 @@ function SessionPageBody({
   view = "auto",
 }: SessionPageProps) {
   const { instanceId = "" } = useParams();
-  const hub = useHub();
+  const hub = useSessionSlice(instanceId);
   const annotationPanel = useAnnotationsContext();
-  const workbench = useSpaceWorkbench();
-  const { newHref } = workbench;
   const navigate = useNavigate();
   const location = useLocation();
   const { mobile, offsetTop } = useWorkbenchViewport();
+  // The page-body commit probe (`?profile=1`). The Profiler around the page
+  // also counts descendant commits (the live strip's clock, the header's
+  // space chip); this one counts only the body re-rendering.
+  useLayoutEffect(() => {
+    if (profilingEnabled) reportProbe("commit:SessionPageBody", {});
+  });
   // ui-spec §2.2: 「文件」 stays on the desktop row only from 1024px up; below
   // that (and on compact) it is a ⋯ item.
   const wide = useWideDesktop();
@@ -124,12 +248,11 @@ function SessionPageBody({
   // session switch; the composer also clears it on the next turn / after 4 s.
   const [interrupted, setInterrupted] = useState(false);
   useEffect(() => setInterrupted(false), [instanceId]);
-  const instance = hub.instances.find((i) => i.id === instanceId) ?? resolveTtyLabInstance(instanceId);
+  const instance = hub.instance ?? resolveTtyLabInstance(instanceId);
   // t-annotations: a session of an archived task is a read-only preview — no
   // badge/entry point and anchor selection raises nothing.
   const sessionTask = useSessionTask(instanceId, (instance as { taskId?: string | null } | undefined)?.taskId);
   const annotationReadonly = sessionTask?.archivedAt != null;
-  const followed = Boolean(hub.events[instanceId] || hub.journalStatus[instanceId]);
   const showTerminal = instance ? canShowTerminal(instance) : false;
   const showStructured = instance ? hasStructuredSignal(instance) : false;
   const remembered = showTerminal || showStructured ? readSessionView(instanceId) : null;
@@ -176,8 +299,8 @@ function SessionPageBody({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [view, backTo, navigate]);
 
-  const events = hub.events[instanceId] ?? NO_EVENTS;
-  const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
+  const events = hub.events ?? NO_EVENTS;
+  const pending = hub.pending;
   // c-endreason: the shared human sentence (「Node 重启，会话已中断」 for a
   // restart), toned — only a failed ending is ever painted red. It reads the
   // durable lifecycle only: the Hub marks an ended row disconnected (a Node
@@ -249,11 +372,9 @@ function SessionPageBody({
       cancelAnimationFrame(second);
     };
   }, [resolvedView]);
-  const journalStatus = hub.journalStatus[instanceId] ?? (followed ? "live" : "live");
-  const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
-  // c-steer: Remuda-held queue rows (Enter while busy / while a question is
-  // pending). Posted in order by flushHeld when the wait ends.
-  const heldBubbles = hubStore.heldBubbles(instanceId);
+  const journalStatus = hub.journalStatus ?? "live";
+  const bubbles = hub.bubbles;
+  const heldBubbles = hub.held;
   // C2: the header label speaks the P0-3 vocabulary while an optimistic
   // bubble is in flight (null commandId + unknown state → 「状态待确认」,
   // never a fake success). With no pending bubble it shows the instance-level
@@ -280,7 +401,7 @@ function SessionPageBody({
   // composer — never held behind this gate until the network returns.
   const snapshotLoading =
     Boolean(instance) &&
-    hub.events[instanceId] === undefined &&
+    hub.events === undefined &&
     bubbles.length === 0 &&
     !isTtyLabFixtureId(instanceId);
 
@@ -308,7 +429,7 @@ function SessionPageBody({
   };
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
   const endedBar = ended ? (
-    <EndedBar
+    <WorkbenchEndedBar
       reason={ended}
       nodeRestarted={nodeRestarted}
       heldCount={heldBubbles.length}
@@ -317,17 +438,17 @@ function SessionPageBody({
       onResume={(mode) => {
         void startResume(mode);
       }}
-      newHref={newHref}
     />
   ) : null;
   const connLabel = journalStatus === "live" ? hub.connection : journalStatus;
-  const title = hubStore.titleOf(instance.id);
+  const title = hub.title;
   const structuredOnly = uiMode(instance) === "structured-only";
   const genericPty = isGenericPty(instance);
   const promoted = isPromoted(instance);
   const binding = promoted ? transcriptBinding(events) : null;
   const activity = instance.activity.state === "known" ? instance.activity.value : instance.activity.state;
-  const hostName = hubStore.hostName(instance.hostId);
+  // A tty-lab fixture is not a hub row, so the slice has no host for it.
+  const hostName = hub.instance ? hub.hostName : hubStore.hostName(instance.hostId);
   const nativeRefShort = nativeShort(instance);
   const showViewExtras = resolvedView === "structured" || resolvedView === "files" || resolvedView === "events";
   const toggleFiles = () => {
@@ -532,7 +653,7 @@ function SessionPageBody({
       data-annotation-readonly={annotationReadonly ? "1" : "0"}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
-      <SessionHeader
+      <WorkbenchSessionHeader
         mobile={mobile}
         title={title}
         taskTitle={sessionTask?.title ?? null}
@@ -553,13 +674,6 @@ function SessionPageBody({
         more={
           <SessionMoreMenu open={moreOpen} onOpenChange={setMoreOpen} sheet={mobile} items={moreItems} />
         }
-        spaces={{
-          spaces: workbench.spaces,
-          active: workbench.active,
-          prefs: workbench.prefs,
-          instanceId: workbench.instanceId,
-          onSelect: workbench.select,
-        }}
       />
       <RunDetails count={diagnostics.length} open={runDetailsOpen} onClose={closeRunDetails}>
         {diagnosticRows}
@@ -592,7 +706,7 @@ function SessionPageBody({
           <FilesView
             hostId={instance.hostId}
             workspaceId={instance.workspaceId}
-            hostLabel={hubStore.hostName(instance.hostId)}
+            hostLabel={hostName}
             onBack={() => {
               if (location.key !== "default") navigate(-1);
               else navigate(backTo, { replace: true });
@@ -758,29 +872,29 @@ function SessionPageBody({
           onFlushHeld={() => hubStore.flushHeld(instance.id)}
           onInterrupt={() => hubStore.cancel(instance.id)}
           permissionMode={
-            genericPty ? ptyYoloChipLabel(instance.kind) : hubStore.permissionModeOf(instance.id)
+            genericPty ? ptyYoloChipLabel(instance.kind) : hub.permissionMode
           }
           launchPermissionMode={
-            genericPty ? undefined : hubStore.launchPermissionModeOf(instance.id)
+            genericPty ? undefined : hub.launchPermissionMode
           }
-          permissionEffective={genericPty ? null : hubStore.permissionEffectiveOf(instance.id)}
-          permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}
+          permissionEffective={genericPty ? null : hub.permissionEffective}
+          permissionPending={genericPty ? null : hub.permissionPending}
           kind={instance.kind}
-          model={hubStore.modelOf(instance.id, instance.kind)}
+          model={hub.model}
           launchModel={instance.model ?? null}
-          models={hubStore.modelListOf(instance.id) ?? undefined}
-          modelEffective={hubStore.modelEffectiveOf(instance.id)?.id ?? null}
-          modelPending={hubStore.modelPendingOf(instance.id)}
-          modelSelectionPath={hubStore.modelEffectiveOf(instance.id)?.selectionPath ?? null}
-          modelCatalog={hubStore.modelCatalogOf(instance.id)}
-          effort={hubStore.effortOf(instance.id, instance.kind)}
-          effortEffective={hubStore.effortEffectiveOf(instance.id)}
-          effortPending={hubStore.effortPendingOf(instance.id)}
+          models={hub.models ?? undefined}
+          modelEffective={hub.modelEffective?.id ?? null}
+          modelPending={hub.modelPending}
+          modelSelectionPath={hub.modelEffective?.selectionPath ?? null}
+          modelCatalog={hub.modelCatalog}
+          effort={hub.effort}
+          effortEffective={hub.effortEffective}
+          effortPending={hub.effortPending}
           contextLabel={(() => {
             const pct = contextPercent(usage, instance.kind);
             return pct == null ? null : `${pct}%`;
           })()}
-          usageRollup={hubStore.usageRollupOf(instance.id)}
+          usageRollup={hub.usageRollup}
           onPermission={
             genericPty || instance.kind !== "claude"
               ? undefined

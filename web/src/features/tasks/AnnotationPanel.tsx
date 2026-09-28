@@ -433,7 +433,14 @@ export function useSessionTask(
           (instanceTaskId ? items.find((t) => t.id === instanceTaskId) : undefined) ??
           items.find((t) => t.placement?.instanceId === instanceId) ??
           null;
-        setTask(match);
+        // Each poll decodes a fresh object; keep the current one when the
+        // ledger row is unchanged so an idle session page does not re-render
+        // every 15 s.
+        setTask((current) =>
+          current === match || (current && match && JSON.stringify(current) === JSON.stringify(match))
+            ? current
+            : match,
+        );
       } catch {
         /* Keep the last known task; the rail stays usable without it. */
       }

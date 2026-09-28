@@ -49,7 +49,7 @@ beforeEach(() => {
   mockViewportState.mobile = false;
   localStorage.clear();
   vi.spyOn(store.hubStore, "follow").mockResolvedValue(undefined);
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [grokInstance],
@@ -142,7 +142,7 @@ it("renders a recorded model_pin_mismatch in run details with both ids verbatim"
       },
     },
   ];
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [grokInstance],
@@ -179,7 +179,7 @@ it("renders a projected model_pin_mismatch through the real API mapper even with
       },
     ],
   } as never);
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [projected],
@@ -242,7 +242,7 @@ it("deduplicates a projected diagnostic and the same launch event still in the w
       },
     },
   ];
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [projected],
@@ -315,7 +315,7 @@ it("the ⋯ item advertises the exact number of fields run details reveals (desk
 
 it("desktop renders provenance and promotion once, inside run details", () => {
   const withMarks = { ...grokInstance, launchedBy: "remuda" as const, mode: "promoted" as const };
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [withMarks],
@@ -342,7 +342,7 @@ it.each([
     launchedBy: "remuda" as const,
     mode: "promoted" as const,
   };
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [withMarks],

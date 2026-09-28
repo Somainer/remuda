@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as store from "../lib/store";
@@ -15,6 +15,16 @@ vi.mock("../lib/viewport", () => ({
 vi.mock("../features/session/live/LiveStatusStrip", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../features/session/live/LiveStatusStrip")>()),
   LiveStatusStrip: () => <div data-testid="live-status-strip" />,
+}));
+
+// The ⋯ menu has no store subscription of its own, so its renders count the
+// page body's renders.
+const menuRenders = vi.hoisted(() => ({ count: 0 }));
+vi.mock("../chrome/SessionMoreMenu", () => ({
+  SessionMoreMenu: () => {
+    menuRenders.count += 1;
+    return null;
+  },
 }));
 
 /** An exited claude-print session: no terminal, resume reported as supported. */
@@ -39,7 +49,7 @@ function renderPage() {
 
 beforeEach(() => {
   vi.spyOn(store.hubStore, "follow").mockResolvedValue(undefined);
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [exited],
@@ -47,6 +57,30 @@ beforeEach(() => {
   });
 });
 afterEach(() => vi.restoreAllMocks());
+
+it("an emit that leaves this session's slice unchanged does not re-render the page body", () => {
+  const snapshot = store.hubStore.getSnapshot();
+  renderPage();
+  const before = menuRenders.count;
+  // The 2 s list refresh: freshly decoded copies of the same row, plus
+  // host/workspace/other-session churn this page does not read.
+  vi.mocked(store.hubStore.getSnapshot).mockReturnValue({
+    ...snapshot,
+    instances: [structuredClone(exited), { ...exited, id: "ins_other" as typeof exited.id }],
+    hosts: [],
+    workspaces: [],
+    events: { [exited.id]: snapshot.events[exited.id]!, ins_other: [] },
+  });
+  act(() => store.hubStore.toast("unrelated"));
+  expect(menuRenders.count).toBe(before);
+  // A real change to this session does re-render it.
+  vi.mocked(store.hubStore.getSnapshot).mockReturnValue({
+    ...snapshot,
+    instances: [{ ...exited, lastError: "native-exit-code-3" }],
+  });
+  act(() => store.hubStore.toast("changed"));
+  expect(menuRenders.count).toBeGreaterThan(before);
+});
 
 it("offers both resume targets on an exited session", () => {
   renderPage();
@@ -92,7 +126,7 @@ it("mounts no live strip beside the ended bar, but keeps it for a live session",
   expect(screen.getByTestId("ended-bar")).toBeInTheDocument();
   expect(screen.queryByTestId("live-status-strip")).toBeNull();
   unmount();
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [{ ...exited, lifecycle: "running" as const, connectivity: "connected" as const }],
@@ -111,7 +145,7 @@ it("keeps the ended bar and resume for a disconnected node-restart row", () => {
     connectivity: "disconnected" as const,
     lastError: "node-epoch-changed",
   };
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [restarted],

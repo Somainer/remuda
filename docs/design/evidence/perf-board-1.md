@@ -233,6 +233,12 @@ chunk 已缓存，离线照常打开。是否 precache 路由 chunk 由所有者
 复审后本地：`pnpm --dir web test` 190 文件 / 2112 用例全过；
 typecheck/lint 通过。
 
+r2 改动后生产包复测（同一 `vite build` + `vite preview` 全新浏览器流程）：
+初始 chunk 318.3 kB（gzip 99.5 kB），冷导航 /sessions、/board、/login
+**仍为 0 个 long task**，loadEventEnd 48/41/40 ms（r1 为 46/42/43）；
+闸门 hub：pwa-shell 1、task-model-board 4、task-model-boardui
+（HUB_E2E_TASK_BIND=1）4 共 9 项全过；mock agent-board 3/3。
+
 ## 6 刻意不做
 
 - 不动轮询间隔、协议、Hub；不加任何 gated e2e 的毫秒阈值。

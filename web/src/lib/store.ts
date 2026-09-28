@@ -3253,12 +3253,30 @@ class HubStore {
     return next;
   }
 
-  async refreshScreen(instanceId: Id) {
-    // Ordering vs catch-up is enforced by the generation guard plus the basis
-    // (computed from BOTH committed screens and observed live events): a
-    // journal frame arriving during the read makes the RPC stale even from a
-    // list poll (item 10). Not chained — chaining a read that the catch-up
-    // itself triggers would deadlock the per-instance chain.
+  async refreshScreen(
+    instanceId: Id,
+    opts: { chained?: boolean } = {},
+  ): Promise<void> {
+    // The 2.5 s list-poll fan-out reads OUTSIDE any user flow: it must not
+    // overtake a journal catch-up/resync already queued on the per-instance
+    // chain, which can carry an unseen HIGHER-seq screen the RPC's start-time
+    // basis could not know about. Run the read behind the same ordered chain.
+    // Chain-internal callers (the post-delivery resync) pass no flag: nesting
+    // chainReconcile inside its own job would self-deadlock.
+    if (opts.chained) {
+      await this.chainReconcile(instanceId, () => this.readAndCommitScreen(instanceId));
+      return;
+    }
+    await this.readAndCommitScreen(instanceId);
+  }
+
+  private async readAndCommitScreen(instanceId: Id): Promise<void> {
+    // Ordering vs catch-up: the list-poll path enters here ON the per-instance
+    // reconcile chain (refreshScreen({chained:true})), so a queued catch-up
+    // carrying an unseen higher-seq screen always applies first; the basis is
+    // captured at execution, once that job is done. The generation guard plus
+    // the basis (from committed screens, screen observations and known events)
+    // additionally covers a live frame arriving during the read itself.
     // Generation guard: a newer read (or the periodic scheduler) superseding
     // this one makes its late resolution a no-op — including its error.
     const gen = (this.screenReadGen.get(instanceId) ?? 0) + 1;
@@ -3376,7 +3394,9 @@ class HubStore {
 
   private async runScreenRead(instanceId: Id) {
     try {
-      await this.refreshScreen(instanceId);
+      // The list-poll fan-out is ordered behind any in-flight journal
+      // reconciliation for this instance.
+      await this.refreshScreen(instanceId, { chained: true });
     } catch (err) {
       if (!isScreenNodeBusy(err)) {
         // An unexpected screen-read failure (5xx/network) must not be

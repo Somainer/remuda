@@ -286,7 +286,10 @@ test("390px: the chips strip folds, Stop and the switch stay reachable, and ever
         "density-toggle",
         "files-toggle",
         "events-toggle",
+        "annotation-add",
       ]);
+      // §2.2 item 7: the one annotation entry point, live for this session.
+      await expect(sheet.getByTestId("annotation-add")).toBeEnabled();
       await expect(sheet.getByTestId("density-toggle")).toBeVisible();
       await expect(sheet.getByTestId("files-toggle")).toBeVisible();
       await expect(sheet.getByTestId("events-toggle")).toBeVisible();
@@ -394,7 +397,9 @@ test("1440px: diagnostics open from ⋯ into a per-device run-details panel whil
     "collapse-all",
     "density-toggle",
     "events-toggle",
+    "annotation-add",
   ]);
+  await expect(popover.getByTestId("annotation-add")).toBeEnabled();
   await popover.getByTestId("run-details-summary").click();
   await expect(popover).toHaveCount(0);
   await expect(page.getByTestId("session-meta")).toBeVisible();

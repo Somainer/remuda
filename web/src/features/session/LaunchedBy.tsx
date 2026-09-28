@@ -32,7 +32,7 @@ export function LaunchedByMark({
           height: 6,
           borderRadius: 999,
           flex: "none",
-          background: isUser ? "var(--paper)" : "var(--line)",
+          background: isUser ? "var(--fg-strong)" : "var(--fg-muted)",
         }}
       />
     );
@@ -43,10 +43,10 @@ export function LaunchedByMark({
       data-launched-by={launchedBy}
       title={title}
       style={{
-        fontFamily: "var(--mono)",
-        fontSize: 10,
-        color: isUser ? "var(--paper)" : "var(--mute)",
-        border: "1px solid var(--line)",
+        fontFamily: "var(--font-mono)",
+        fontSize: 12,
+        color: isUser ? "var(--fg-strong)" : "var(--fg-muted)",
+        border: "1px solid var(--border)",
         borderRadius: 999,
         padding: "0 6px",
         whiteSpace: "nowrap",

@@ -2475,6 +2475,11 @@ impl Engine {
         // non-blocking and must never reopen the turn.
         let idle_notification = self.turn.as_ref().is_some_and(|t| t.spec.idle_notification);
         if idle_notification && self.dialect == Dialect::Claude {
+            let idle_message = self
+                .turn
+                .as_ref()
+                .and_then(|t| t.spec.idle_notification_message.clone())
+                .unwrap_or_else(|| "Claude is waiting for your input".to_owned());
             self.event(
                 "idle_notification",
                 json!({ "notification_type": "idle_prompt" }),
@@ -2483,7 +2488,7 @@ impl Engine {
                 HookEvent::Notification,
                 json!({
                     "notification_type": "idle_prompt",
-                    "message": "Claude is waiting for your input",
+                    "message": idle_message,
                     "level": "info"
                 }),
             );

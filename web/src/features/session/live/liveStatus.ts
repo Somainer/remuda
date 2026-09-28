@@ -11,6 +11,7 @@
  * the TUI's own chrome, never message content.
  */
 import type { Observation } from "../../../types/generated";
+import { nativeLifecycle } from "./payloadGuard";
 
 const TAGS: Record<string, string> = {
   live: "liveStatus",
@@ -42,9 +43,7 @@ export type ScreenLiveStatus = {
 type TurnLifecycle = Extract<Observation, { kind: "lifecycle" }>;
 
 function isStatusEvent(ev: Observation): ev is TurnLifecycle {
-  return (
-    ev.kind === "lifecycle" && ev.payload.type === "native" && ev.payload.nativeName === "live.status"
-  );
+  return nativeLifecycle(ev)?.nativeName === "live.status";
 }
 
 function seqOf(ev: Observation): bigint {
@@ -55,15 +54,38 @@ function seqOf(ev: Observation): bigint {
   }
 }
 
+/**
+ * `relatedIds` is untrusted wire data: it may be missing, a scalar, an array,
+ * or carry non-string tag values (`{phrase: 42}` reached
+ * `phrase.toLowerCase()` and crashed the whole strip). Only a plain record is
+ * consumed; anything else reads as an empty tag bag.
+ */
+function tagRecord(value: unknown): Record<string, unknown> {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return {};
+}
+
+/** A tag only survives as a string; a number/object/null/array tag is dropped. */
+function strTag(tags: Record<string, unknown>, key: string): string | null {
+  const value = tags[key];
+  return typeof value === "string" ? value : null;
+}
+
 export function liveStatus(events: readonly Observation[]): ScreenLiveStatus | null {
   let latest: TurnLifecycle | null = null;
   for (const ev of events) {
     if (!isStatusEvent(ev)) continue;
     if (!latest || seqOf(ev) >= seqOf(latest)) latest = ev;
   }
-  if (!latest || latest.payload.type !== "native") return null;
-  const tags = latest.payload.relatedIds ?? {};
-  const active = tags[TAGS.live] !== "0";
+  if (!latest) return null;
+  const payload = nativeLifecycle(latest);
+  if (!payload) return null;
+  const tags = tagRecord(payload.relatedIds);
+  // A missing/non-string live tag keeps the historical default (active):
+  // only the literal "0" spelling clears the spinner.
+  const active = strTag(tags, TAGS.live) !== "0";
   if (!active) {
     return {
       active: false,
@@ -77,16 +99,17 @@ export function liveStatus(events: readonly Observation[]): ScreenLiveStatus | n
       observedAt: latest.observedAt,
     };
   }
-  const down = tags[TAGS.tokensDown];
+  const down = strTag(tags, TAGS.tokensDown);
+  const downCount = down != null && down.trim() !== "" && Number.isFinite(Number(down)) ? Number(down) : null;
   return {
     active: true,
-    verb: tags[TAGS.verb] ?? null,
-    phrase: tags[TAGS.phrase] ?? null,
-    tokensLabel: tags[TAGS.tokensLabel] ?? null,
-    tokensDown: down != null && Number.isFinite(Number(down)) ? Number(down) : null,
-    elapsedScreen: tags[TAGS.elapsedScreen] ?? null,
-    since: tags[TAGS.since] ?? null,
-    interruptible: tags[TAGS.interruptible] === "1",
+    verb: strTag(tags, TAGS.verb),
+    phrase: strTag(tags, TAGS.phrase),
+    tokensLabel: strTag(tags, TAGS.tokensLabel),
+    tokensDown: downCount,
+    elapsedScreen: strTag(tags, TAGS.elapsedScreen),
+    since: strTag(tags, TAGS.since),
+    interruptible: strTag(tags, TAGS.interruptible) === "1",
     observedAt: latest.observedAt,
   };
 }
@@ -96,8 +119,11 @@ export function liveStatus(events: readonly Observation[]): ScreenLiveStatus | n
  * verb carries no information; `thinking with xhigh effort` / `thought for 9s`
  * do. Mirrors the Rust `is_thinking_phrase` rule.
  */
-export function phraseIsThinking(phrase: string | null | undefined): boolean {
-  if (!phrase) return false;
+export function phraseIsThinking(phrase: unknown): boolean {
+  // Defense in depth: the projection already drops non-string tags, but a
+  // caller with a raw/untrusted phrase (`42.toLowerCase()` crashed the strip)
+  // must never reach a string method.
+  if (typeof phrase !== "string" || phrase.length === 0) return false;
   const lower = phrase.toLowerCase();
   return lower.includes("thinking") || lower.includes("thought");
 }

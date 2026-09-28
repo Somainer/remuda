@@ -85,6 +85,11 @@ pub struct TurnSpec {
     /// once the turn has already ended; it must never raise a phase or a wait.
     #[serde(default)]
     pub idle_notification: bool,
+    /// Override the idle Notification's `message` (defaults to Claude Code's
+    /// stock English idle line). Lets a scenario script a very long message,
+    /// e.g. the 2,000-character CJK toast-clamp case (UO-6b r3).
+    #[serde(default)]
+    pub idle_notification_message: Option<String>,
 }
 
 /// Scripted spinner status line sequence.

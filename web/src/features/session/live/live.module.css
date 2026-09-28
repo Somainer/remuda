@@ -1,55 +1,60 @@
+/* @tokens strict */
 /* Live status strip — status only, never message/tool content (design §2.4).
-   Sits at the top of the session dock. Flex-wrap keeps it one quiet row at
-   1440 px and a wrapped set of chips at 390 px; nothing here may introduce
-   horizontal page scroll. */
+   One fixed 20px row at every width (ui-spec §2.2): nowrap, the phrase
+   yields first, and below 480px the token count and tier leave the row
+   before anything wraps. Nothing here may introduce horizontal page
+   scroll. */
 
 .strip {
   flex: none;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
+  flex-wrap: nowrap;
   gap: 4px 10px;
+  width: 100%;
   min-width: 0;
-  padding: 2px 2px 0;
-  font-size: var(--text-aux);
-  line-height: 1.5;
-  color: var(--paper);
-  font-family: var(--font);
+  height: 20px;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  line-height: 20px;
 }
 
 .phase {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex: none;
   min-width: 0;
   font-weight: 500;
 }
 
 .toolName {
-  color: var(--mute);
+  color: var(--fg-muted);
   font-weight: 400;
   /* A harness tool name is status metadata; clip rather than push the row. */
   max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .liveDot,
 .idleDot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
   flex: none;
 }
 
 .liveDot {
-  background: var(--cold);
+  background: var(--link);
   animation: livePulse 1.4s ease-in-out infinite;
 }
 
 .idleDot {
-  background: var(--mute);
+  background: var(--fg-muted);
 }
 
 @keyframes livePulse {
@@ -62,36 +67,43 @@
   }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .liveDot {
+    animation: none;
+  }
+}
+
 .elapsed,
 .elapsedStale {
-  font-family: var(--mono);
-  font-variant-numeric: tabular-nums;
   flex: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 .elapsed {
-  color: var(--paper);
+  color: var(--fg-body);
 }
 
 /* The anchor channel cannot vouch for freshness: the reading stays on screen
    (it is still "time since the harness spoke") but stops claiming it. */
 .elapsedStale {
-  color: var(--mute);
+  color: var(--fg-muted);
   font-style: italic;
 }
 
-.chip {
+.chip,
+.tierChip {
   flex: none;
-  color: var(--mute);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   padding: 0 6px;
-  font-size: var(--text-label);
-  line-height: 1.6;
+  font-size: var(--text-meta);
+  line-height: 16px;
 }
 
 .phrase {
-  color: var(--mute);
+  color: var(--fg-muted);
   font-style: italic;
   min-width: 0;
   overflow: hidden;
@@ -103,66 +115,72 @@
 
 .verb {
   flex: none;
-  color: var(--paper);
+  color: var(--fg-body);
 }
 
 .tokenCount {
   flex: none;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  color: var(--mute);
+  color: var(--fg-muted);
 }
 
-/* Subtle screen-tier affordance: claude itself takes Esc while the spinner is
-   up. Looks like a chip, acts like a button, stays quiet in the row. */
+/* A quiet text-only interrupt at the row's end (ui-spec §2.2): no chip
+   chrome, no state fill. It exists only because the equivalence check found
+   carriers whose composer control can hide while the screen is interruptible. */
 .interrupt {
   flex: none;
   font: inherit;
-  font-size: var(--text-label);
-  line-height: 1.6;
-  color: var(--mute);
+  font-size: var(--text-meta);
+  line-height: 16px;
+  color: var(--fg-muted);
   background: transparent;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 0 4px;
   cursor: pointer;
 }
 
 .interrupt:hover {
-  color: var(--paper);
-  border-color: var(--dust);
+  color: var(--fg-body);
+  background: var(--bg-hover);
 }
 
-.interrupt:active {
-  color: var(--danger-strong);
-  border-color: var(--danger);
-}
-
-.warnStalled,
-.warnMissing {
+.warnUnknown,
+.warnDanger {
   flex: none;
-  border-radius: var(--radius);
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-radius: var(--radius-sm);
   padding: 0 6px;
-  font-size: var(--text-label);
-  line-height: 1.6;
+  font-size: var(--text-meta);
+  line-height: 16px;
 }
 
-.warnStalled {
-  color: var(--dust);
-  border: 1px solid var(--dust);
+/* Freshness unknown — a quiet channel that went silent or never showed up.
+   Neutral colour and a dashed mark, never a failure (ui-spec §2.2). */
+.warnUnknown {
+  color: var(--unknown-fg);
+  border: 1px dashed var(--unknown-border);
 }
 
-.warnMissing {
-  color: var(--danger-strong);
-  border: 1px solid var(--danger);
+/* A verified carrier failure (probe answered: relay missing / socket
+   refused) is the only health note painted with the danger colour. */
+.warnDanger {
+  color: var(--danger-fg);
+  border: 1px solid var(--danger-border);
 }
 
-@media (max-width: 480px) {
-  .strip {
-    gap: 3px 8px;
-  }
-
+@media (max-width: 479px) {
   .toolName {
     max-width: 120px;
+  }
+
+  /* ui-spec §2.2: under 480px the token count and the tier chip leave the
+     single row first; the phase/elapsed reading always stays. */
+  .tokenCount,
+  .tierChip {
+    display: none;
   }
 }

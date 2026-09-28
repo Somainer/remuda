@@ -1740,14 +1740,17 @@ class HubStore {
     // never POST: the cache/storage still show a deliverable row (the cache
     // updates only after commit), so the next trigger retries under the same
     // commandId. Another owner is excluded by the durable lease, not an
-    // in-memory marker.
+    // in-memory marker. The same transaction that writes preserves a
+    // journal-confirmed done: a stored done also means NO POST (the command
+    // demonstrably executed; the Hub replay path would only be dead traffic).
     const isFreshAttempt = current0.state !== "held";
     try {
-      await box.patch(commandId, {
+      const claimed = await box.patch(commandId, {
         state: "inflight",
         attempts: isFreshAttempt ? current0.attempts + 1 : current0.attempts,
         lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS },
       });
+      if (claimed?.state === "done") return false;
     } catch {
       return false;
     }

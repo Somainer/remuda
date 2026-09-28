@@ -96,3 +96,15 @@
     padding: 10px 14px;
   }
 }
+
+/* ui-spec §2 keyboard band: the body keeps 40% of the visible band and the
+   dock yields instead — its pending-card area is the one child that shrinks
+   (and scrolls), every other dock row keeps its content height. */
+:global(html[data-keyboard="1"]) .pane {
+  min-height: calc(var(--workbench-height, 100dvh) * 0.4);
+}
+
+:global(html[data-keyboard="1"]) .dock {
+  flex: 0 1 auto;
+  min-height: 0;
+}

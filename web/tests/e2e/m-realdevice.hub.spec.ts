@@ -775,10 +775,10 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       const locator = page.getByTestId(testid);
       if ((await locator.count()) > 0) await expect(locator).toBeHidden();
     }
-    await expect(strip).toBeVisible();
-    const stripBox = await strip.boundingBox();
-    expect(stripBox).toBeTruthy();
-    expect(stripBox!.height).toBeLessThanOrEqual(34);
+    // ui-spec §2 keyboard band: the live row folds away too — the header's
+    // title block keeps the status dot and word.
+    await expect(strip).toBeHidden();
+    await expect(page.getByTestId("session-status-label").first()).toBeVisible();
   }
 
   /**

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Observation } from "../../../types/generated";
 import { liveStatus, phraseIsThinking } from "./liveStatus";
 
-function statusEvent(seq: number, tags: Record<string, string>, at = "2026-09-16T10:00:00.000Z"): Observation {
+function statusEvent(seq: number, tags: Record<string, unknown>, at = "2026-09-16T10:00:00.000Z"): Observation {
   return {
     kind: "lifecycle",
     eventId: `ev_${seq}`,
@@ -101,10 +101,57 @@ describe("liveStatus projection", () => {
     expect(status.tokensDown).toBeNull();
   });
 
+  it("drops malformed NESTED tags (numbers, objects, null, arrays, booleans) instead of crashing", () => {
+    // The r3 incident: relatedIds:{liveStatus:"1", phrase:42} flowed a number
+    // into phraseIsThinking -> 42.toLowerCase() and crashed the strip. Every
+    // consumed tag is runtime-validated at the projection boundary.
+    const malformedValues: unknown[] = [42, { nested: true }, null, ["a", "b"], true];
+    const stringTags = ["verb", "phrase", "tokensLabel", "elapsedScreen", "since", "interruptible"];
+    for (const value of malformedValues) {
+      for (const tag of stringTags) {
+        const status = liveStatus([statusEvent(1, { liveStatus: "1", [tag]: value })])!;
+        const label = `${tag}=${JSON.stringify(value)}`;
+        expect(status.active, label).toBe(true);
+        expect(status.verb, label).toBeNull();
+        expect(status.phrase, label).toBeNull();
+        expect(status.tokensLabel, label).toBeNull();
+        expect(status.tokensDown, label).toBeNull();
+        expect(status.elapsedScreen, label).toBeNull();
+        expect(status.since, label).toBeNull();
+        expect(status.interruptible, label).toBe(false);
+      }
+      // A malformed count never coerces (Number([]) === 0, Number([5]) === 5).
+      const count = liveStatus([statusEvent(1, { liveStatus: "1", tokensDown: value })])!;
+      expect(count.tokensDown, `tokensDown=${JSON.stringify(value)}`).toBeNull();
+    }
+  });
+
+  it("treats a malformed relatedIds bag itself as empty, never throws", () => {
+    for (const related of [[], "tags", 42, null, true]) {
+      const ev = statusEvent(1, {});
+      (ev.payload as { relatedIds: unknown }).relatedIds = related;
+      const status = liveStatus([ev])!;
+      expect(status.active, JSON.stringify(related)).toBe(true);
+      expect(status.phrase, JSON.stringify(related)).toBeNull();
+      expect(status.tokensDown, JSON.stringify(related)).toBeNull();
+    }
+  });
+
+  it("a non-string liveStatus tag other than the literal 0 does not clear the spinner", () => {
+    expect(liveStatus([statusEvent(1, { liveStatus: 0 })])!.active).toBe(true);
+    expect(liveStatus([statusEvent(1, { liveStatus: ["0"] })])!.active).toBe(true);
+    expect(liveStatus([statusEvent(1, { liveStatus: "0" })])!.active).toBe(false);
+  });
+
   it("recognises only thinking-class phrases", () => {
     expect(phraseIsThinking("thinking with xhigh effort")).toBe(true);
     expect(phraseIsThinking("thought for 9s")).toBe(true);
     expect(phraseIsThinking("running UserPromptSubmit hook")).toBe(false);
     expect(phraseIsThinking(null)).toBe(false);
+    // Untrusted runtime shapes never reach toLowerCase.
+    expect(phraseIsThinking(42)).toBe(false);
+    expect(phraseIsThinking({ nested: true })).toBe(false);
+    expect(phraseIsThinking(["thinking"])).toBe(false);
+    expect(phraseIsThinking(undefined)).toBe(false);
   });
 });

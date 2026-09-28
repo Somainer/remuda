@@ -1,8 +1,9 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import css from "./ViewSwitch.module.css";
 import { ViewSwitch } from "./ViewSwitch";
+import { RunDetails } from "./RunDetails";
 
 describe("ViewSwitch", () => {
   it("renders one segmented control with two exclusive states", () => {
@@ -55,5 +56,54 @@ describe("ViewSwitch", () => {
     expect(other.className.split(" ")).toContain(css.viewSeg);
     expect(selected.className.split(" ")).toContain(css.viewSegOn);
     expect(other.className.split(" ")).not.toContain(css.viewSegOn);
+  });
+});
+
+describe("RunDetails", () => {
+  afterEach(() => localStorage.removeItem("runtime.run-details.open"));
+
+  it("keeps its self-triggering disclosure when uncontrolled", async () => {
+    const user = userEvent.setup();
+    render(
+      <RunDetails count={3}>
+        <span>diagnostic body</span>
+      </RunDetails>,
+    );
+    const details = screen.getByTestId("run-details") as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+    expect(screen.getByTestId("run-details-summary")).toBeTruthy();
+    await user.click(screen.getByTestId("run-details-summary"));
+    expect(details.open).toBe(true);
+    expect(localStorage.getItem("runtime.run-details.open")).toBe("1");
+  });
+
+  it("is controlled by open and renders no summary trigger", () => {
+    const { rerender } = render(
+      <RunDetails count={3} open={false} onClose={() => {}}>
+        <span>diagnostic body</span>
+      </RunDetails>,
+    );
+    expect((screen.getByTestId("run-details") as HTMLDetailsElement).open).toBe(false);
+    expect(screen.queryByTestId("run-details-summary")).toBeNull();
+
+    rerender(
+      <RunDetails count={3} open={true} onClose={() => {}}>
+        <span>diagnostic body</span>
+      </RunDetails>,
+    );
+    expect((screen.getByTestId("run-details") as HTMLDetailsElement).open).toBe(true);
+    expect(screen.getByTestId("session-meta").textContent).toContain("diagnostic body");
+    expect(screen.queryByTestId("run-details-summary")).toBeNull();
+  });
+
+  it("calls onClose on Escape while controlled-open", () => {
+    const onClose = vi.fn();
+    render(
+      <RunDetails count={3} open={true} onClose={onClose}>
+        <span>body</span>
+      </RunDetails>,
+    );
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });

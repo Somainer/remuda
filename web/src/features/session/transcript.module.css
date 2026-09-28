@@ -371,6 +371,28 @@
   font-family: var(--font-read);
 }
 
+/* UO-6b (allowed one-row exception): thought rows get exactly ONE disclosure
+   marker. The native triangle is hidden and a custom caret is painted via
+   ::before — previously the native marker plus the literal 「▸」 rendered as
+   「▶ ▸ thinking」. The injected-row and compact-fold thought summaries use
+   the same class, so all three stay consistent. */
+.thought > summary {
+  list-style: none;
+}
+
+.thought > summary::-webkit-details-marker {
+  display: none;
+}
+
+.thought > summary::before {
+  content: "▸";
+  margin-right: 4px;
+}
+
+.thought[open] > summary::before {
+  content: "▾";
+}
+
 .opaque {
   font-family: var(--font-mono);
   font-size: var(--text-meta);

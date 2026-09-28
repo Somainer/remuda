@@ -1,9 +1,11 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import type { Observation } from "../../../types/generated";
 import type { NativeRef } from "../../../types/nativeRef";
 import { knowledgeValue } from "../../../types/command";
+import { NODE_EPOCH_CHANGED } from "../../../lib/commandStatus";
 import { formatTokens } from "../../../lib/format";
 import type { ToolCallPayload } from "../../../types/generated";
+import { profilingEnabled, reportProbe } from "../../../lib/profileFlags";
 import {
   expectedTiersFor,
   channelHealth,
@@ -11,6 +13,7 @@ import {
 } from "./channelHealth";
 import { isActivePhase, livePhase, toolAnchors, toolFingerprint, type LivePhaseName } from "./phase";
 import { liveStatus, phraseIsThinking } from "./liveStatus";
+import { entityLifecycle, nativeLifecycle } from "./payloadGuard";
 import { projectTurnDecision, turnStartAnchor } from "./turnDecision";
 import type { TurnDecision } from "./turnEnd";
 import { usageOutputTokens } from "./liveTokens";
@@ -63,14 +66,148 @@ const SILENCE_REASON_COPY: Record<string, string> = {
   "link-stalled": "journal 推送停滞",
 };
 
-function HealthNote({ health, silenceReason }: { health: TierHealth; silenceReason?: string | null }) {
+/**
+ * Silence checks that are VERIFIED failures (a probe actually tried the relay
+ * /socket and it answered negatively). Anything else — plain staleness, a
+ * missing tier, `link-stalled` — is honest "we cannot vouch for freshness",
+ * never painted as a failure (ui-spec §2.2).
+ */
+const VERIFIED_SILENCE_REASONS = new Set(["relay-missing", "socket-refused"]);
+
+/**
+ * The instance lifecycle states that end the session. The wire enum's
+ * terminal spellings are `exited` / `failed`; `killed` is accepted
+ * defensively from a reason-bearing lifecycle record.
+ */
+const SESSION_TERMINAL_STATES = new Set(["exited", "failed", "killed"]);
+
+/** Why the session itself ended, vs. why one turn ended. */
+export type SessionSettleReason = "exited" | "failed" | "killed" | "node-restart";
+
+export type SessionSettlement = {
+  ended: boolean;
+  /** RFC3339-ms of the end record, or `null` when the record carried none. */
+  at: string | null;
+  reason: SessionSettleReason | null;
+};
+
+/**
+ * The instance-row fields the settlement reads. The Hub keeps these durably
+ * even when the bounded journal tail omits the terminal record (a page opened
+ * much later, or the live socket missing one frame).
+ */
+export type SessionSettleInstance = {
+  lifecycle?: string | null;
+  lastError?: string | null;
+  updatedAt?: string | null;
+};
+
+const NOT_SETTLED: SessionSettlement = { ended: false, at: null, reason: null };
+
+/**
+ * Session-level settlement (owner defect UO-6b, 2026-09-25 demo; round 2:
+ * 2026-09-27 — the Hub-detected restart case): the turn machinery only decides
+ * whether one *turn* is open, so an EXITED session whose hook latch and
+ * spinner both froze mid-turn kept painting 「文本生成中」 with a clock that
+ * counted for hours. This fold reads the durable records the two sides write
+ * for those deaths:
+ *
+ *  - the instance entity lifecycle (`exited` / `failed`, journaled by
+ *    `journal_instance_phase` on native exit, explicit close and reclaim);
+ *  - the `node_epoch_changed` diagnostic a loss produces. The name alone is
+ *    the terminal signal: the restarted Node journals it with status known
+ *    `exited` (`reclaim.rs`), while the Hub's `reconcile_lost_instances`
+ *    appends the SAME name via `append_hub_diagnostic` with NO `status` field
+ *    at all (only severity + message). Requiring `status === "exited"` let
+ *    the Hub shape slip through — and `knowledgeValue(undefined)` then threw
+ *    on the missing field, so the strip crashed instead of settling;
+ *  - the instance row itself (`lifecycle` terminal, or `lastError:
+ *    node-epoch-changed`), the Hub's current durable truth when the journal
+ *    tail lags or omits the record on a fresh page load.
+ *
+ * Pure; newest terminal record wins among events, then the row may settle an
+ * otherwise-open session (node-restart outranks a plain exited row). Every
+ * payload is untrusted wire data: a malformed record is skipped, never
+ * allowed to throw the strip.
+ */
+export function sessionSettlement(
+  events: readonly Observation[],
+  instance?: SessionSettleInstance | null,
+): SessionSettlement {
+  let settled: SessionSettlement = NOT_SETTLED;
+  for (const ev of events) {
+    const entity = entityLifecycle(ev);
+    if (entity) {
+      if (entity.entityType === "instance") {
+        const state = entity.state;
+        if (typeof state === "string" && SESSION_TERMINAL_STATES.has(state)) {
+          settled = {
+            ended: true,
+            at: ev.observedAt,
+            reason: state as SessionSettleReason,
+          };
+        }
+      }
+      continue;
+    }
+    // No `status` requirement: the Hub-authored diagnostic carries none.
+    if (nativeLifecycle(ev)?.nativeName === "node_epoch_changed") {
+      settled = { ended: true, at: ev.observedAt, reason: "node-restart" };
+    }
+  }
+  if (instance) {
+    if (instance.lastError === NODE_EPOCH_CHANGED) {
+      settled = {
+        ended: true,
+        at: settled.at ?? (typeof instance.updatedAt === "string" ? instance.updatedAt : null),
+        reason: "node-restart",
+      };
+    } else if (!settled.ended) {
+      const state = instance.lifecycle;
+      if (typeof state === "string" && SESSION_TERMINAL_STATES.has(state)) {
+        settled = {
+          ended: true,
+          at: typeof instance.updatedAt === "string" ? instance.updatedAt : null,
+          reason: state as SessionSettleReason,
+        };
+      }
+    }
+  }
+  return settled;
+}
+
+/**
+ * An explicit `unsupported` interrupt capability (the carrier has no Esc
+ * path) must hide the strip interrupt even while the screen claims
+ * interruptibility — the button has to agree with the composer's control.
+ * Absent and `unknown` stay actionable, mirroring `composerState` (unknown is
+ * an honest caveat, never a silently dead control).
+ */
+function interruptUnsupported(nativeRef: NativeRef | null | undefined): boolean {
+  for (const cap of nativeRef?.capabilities ?? []) {
+    if (cap.name === "interrupt" && cap.state === "unsupported") return true;
+  }
+  return false;
+}
+
+function HealthNote({
+  health,
+  silenceReason,
+}: {
+  health: TierHealth;
+  silenceReason?: string | null;
+}) {
   if (health.reason === "ok" || health.reason === "disabled") return null;
+  // A probe that verified relay/socket failure is a known error; every other
+  // note (stalled, never-materialised, link-stalled) stays neutral unknown.
+  const verified = silenceReason != null && VERIFIED_SILENCE_REASONS.has(silenceReason);
   const detail = silenceReason ? SILENCE_REASON_COPY[silenceReason] : null;
   return (
     <span
-      className={health.reason === "stalled" ? css.warnStalled : css.warnMissing}
+      className={verified ? css.warnDanger : css.warnUnknown}
       data-testid={`live-health-${health.tier}`}
       data-reason={health.reason}
+      data-tone={verified ? "danger" : "unknown"}
       data-silence={silenceReason ?? undefined}
     >
       {health.tier} · {HEALTH_COPY[health.reason]}
@@ -88,9 +225,9 @@ function HealthNote({ health, silenceReason }: { health: TierHealth; silenceReas
 function hookSilenceReason(events: readonly Observation[]): string | null {
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const ev = events[i]!;
-    if (ev.kind !== "lifecycle" || ev.payload.type !== "native") continue;
-    if (ev.payload.nativeName !== "hook.silence") continue;
-    const reason = ev.payload.relatedIds?.reason;
+    const payload = nativeLifecycle(ev);
+    if (!payload || payload.nativeName !== "hook.silence") continue;
+    const reason = payload.relatedIds?.reason;
     if (reason && reason in SILENCE_REASON_COPY) return reason;
   }
   return null;
@@ -121,12 +258,19 @@ function earliestAnchor(a: string | null | undefined, b: string | null | undefin
  */
 export function LiveStatusStrip({
   events,
+  instance,
   nativeRef,
   onInterrupt,
   hasPending = false,
   decision: decisionProp,
 }: {
   events: readonly Observation[];
+  /**
+   * The Hub's current instance row. Its terminal lifecycle / restart
+   * lastError settles the strip even when the bounded journal tail omits the
+   * end record (a page reopened long after the Node restarted).
+   */
+  instance?: SessionSettleInstance | null;
   nativeRef: NativeRef | null | undefined;
   onInterrupt?: () => void;
   /** A real dialog/permission is pending for this instance. */
@@ -139,10 +283,16 @@ export function LiveStatusStrip({
   const status = useMemo(() => liveStatus(events), [events]);
   const usageCount = useMemo(() => usageOutputTokens(events), [events]);
   const anchors = useMemo(() => toolAnchors(events), [events]);
-  // Health is a function of wall time; the 1 Hz clock recomputes staleness,
-  // and a note must be able to appear before the first phase lands.
-  const now = useNow(true);
-  const health = useMemo(
+  // Session-level death outranks every turn channel: once the instance is
+  // exited/failed, the row says so, or the Node restarted (whoever noticed
+  // first — the new Node's reclaim journal OR the Hub's reconcile
+  // diagnostic), the strip settles with the session whatever the hook latch
+  // and spinner froze on, and its clock stops for good (UO-6b owner defect:
+  // an exited session kept the timer growing).
+  const settlement = useMemo(() => sessionSettlement(events, instance), [events, instance]);
+  // The 1 Hz clock runs only while a turn is genuinely live; the settled row
+  // freezes and a hidden page pauses via the rAF loop in useNow.
+  const now = useNow(!settlement.ended && decisionProp?.state !== "ended");  const health = useMemo(
     () => channelHealth(events, expectedTiers, now),
     [events, expectedTiers, now],
   );
@@ -150,11 +300,43 @@ export function LiveStatusStrip({
   // transcript tail, pending interactions); the strip renders it, not the raw
   // hook latch. SessionPage shares the same reducer so the composer's
   // working→idle flush boundary is the exact decision painted here.
-  const decision = useMemo(
+  const projected = useMemo(
     () => decisionProp ?? projectTurnDecision(events, nativeRef, hasPending, now),
     [decisionProp, events, nativeRef, hasPending, now],
   );
+  // A terminal session always renders an ended turn. The channel that decided
+  // the last live turn keeps its credit when one exists. The end anchor is the
+  // turn's OWN end time once the turn had already ended before the session
+  // died: an exit/Node-restart at 12:00 must not overwrite a turn that ended
+  // at 10:01 (the frozen duration would have jumped to time-since-turn-start
+  // measured at the settlement). The settlement timestamp only closes a turn
+  // that was still OPEN when the session ended.
+  const decision: TurnDecision = settlement.ended
+    ? {
+        state: "ended",
+        decidedBy: projected.state === "ended" ? projected.decidedBy : null,
+        endedAt:
+          projected.state === "ended" && projected.endedAt ? projected.endedAt : settlement.at,
+      }
+    : projected;
   const silenceReason = useMemo(() => hookSilenceReason(events), [events]);
+
+  // ?profile=1 instrumentation (perf scenario A): count strip commits and
+  // flush at most one probe per second, only while a turn is live. The
+  // settled row produces no probes — the exited-session timer defect is
+  // observable here as well as in the frozen reading.
+  const commitWindow = useRef(0);
+  useLayoutEffect(() => {
+    if (profilingEnabled) commitWindow.current += 1;
+  });
+  useEffect(() => {
+    if (!profilingEnabled || decision.state === "ended") return;
+    const timer = window.setInterval(() => {
+      reportProbe("commit:LiveStatusStrip", { commits: commitWindow.current });
+      commitWindow.current = 0;
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [decision.state]);
 
   // Feed the running tool cards their anchors. This is the only bridge
   // between the event list and the virtualised transcript rows.
@@ -163,10 +345,26 @@ export function LiveStatusStrip({
   }, [anchors, health]);
   useEffect(() => () => resetToolLive(), []);
 
-  const notes = [...health.values()].filter((item) => item.reason !== "ok" && item.reason !== "disabled");
   const screenActive = status?.active === true;
   const ended = decision.state === "ended";
   const waiting = decision.state === "waiting";
+  // Whether the turn clock keeps running. On an end it stops at `endedAt`; a
+  // genuinely open (working/waiting) turn ticks; `unknown` falls back to the
+  // last raw evidence so the reading stays visible but greys.
+  const rawActive = phase ? isActivePhase(phase.phase) : screenActive;
+  const active = ended ? false : decision.state === "working" || waiting ? true : rawActive;
+  // Health notes speak ONLY to a live turn (UO-6b false-warning fix): hooks
+  // are event-driven and are quiet by nature between turns, while a blocked
+  // dialog parks the hook by definition — so measuring 「通道静默」 on an idle
+  // reopened session or while waiting on a human raised a false alarm even
+  // though the channel was demonstrably working. A note now requires a
+  // working turn, or an `unknown` turn whose raw evidence still looks active
+  // (the genuine D-4 / lost-Stop case). Ended and waiting turns show none.
+  const healthLive =
+    decision.state === "working" || (decision.state === "unknown" && rawActive);
+  const notes = healthLive
+    ? [...health.values()].filter((item) => item.reason !== "ok" && item.reason !== "disabled")
+    : [];
   // The spinner phrase ("thinking with xhigh effort") distinguishes the
   // reasoning wait from a plain prompt-accepted gap, where hooks emit no
   // thinking phase of their own.
@@ -176,16 +374,7 @@ export function LiveStatusStrip({
     screenActive &&
     phraseIsThinking(status?.phrase) &&
     (!phase || phase.phase === "thinking" || phase.phase === "prompt-accepted");
-  // Whether the turn clock keeps running. On an end it stops at `endedAt`; a
-  // genuinely open (working/waiting) turn ticks; `unknown` falls back to the
-  // last raw evidence so the reading stays visible but greys.
-  const rawActive = phase ? isActivePhase(phase.phase) : screenActive;
-  const active = ended ? false : decision.state === "working" || waiting ? true : rawActive;
   // Hooks have no thinking channel for claude: prompt-accepted stays latched
-  // while the model reasons. The screen phrase is the one channel that says
-  // so ("thinking with xhigh effort"), so it promotes the label to 思考中
-  // (and the transcript gets a live thinking row). Every other phase stays
-  // the hook's authoritative word.
   const pseudoPhase: string | null = ended
     ? "turn-ended"
     : waiting
@@ -222,6 +411,15 @@ export function LiveStatusStrip({
     : (pseudoPhase && PHASE_LABEL[pseudoPhase as LivePhaseName]) ||
       SCREEN_LABEL[pseudoPhase ?? "working"] ||
       "工作中";
+  // A session that died on failure names it even when no hook turn-ended with
+  // an outcome landed; a plain exit adds nothing the header does not say.
+  const endedSuffix = !ended
+    ? null
+    : phase?.phase === "turn-ended" && phase.outcome
+      ? ` · ${OUTCOME_LABEL[phase.outcome] ?? phase.outcome}`
+      : settlement.reason === "failed" || settlement.reason === "killed"
+        ? ` · ${OUTCOME_LABEL.failed}`
+        : null;
   const worst = notes[0]?.reason ?? "ok";
 
   // One token count, one source: real usage once it lands, otherwise the
@@ -235,9 +433,13 @@ export function LiveStatusStrip({
   const phrase = ended ? null : status?.phrase ?? phase?.phrase ?? null;
   // Esc belongs only to a turn we know is live. An ended turn and an unknown
   // state (a stale hook latch) never show it; a blocked dialog is owned by the
-  // answer keys.
+  // answer keys; and an explicitly unsupported interrupt capability must agree
+  // with the composer's hidden 打断 control (ui-spec §2.2 equivalence check).
   const canInterrupt =
-    decision.state === "working" && phase?.phase !== "blocked" && (status ? status.interruptible : true);
+    decision.state === "working" &&
+    phase?.phase !== "blocked" &&
+    (status ? status.interruptible : true) &&
+    !interruptUnsupported(nativeRef);
 
   return (
     <div
@@ -246,12 +448,13 @@ export function LiveStatusStrip({
       data-phase={pseudoPhase}
       data-turn={decision.state}
       data-decided-by={ended ? decision.decidedBy : undefined}
+      data-settled={ended && settlement.reason ? settlement.reason : undefined}
       data-health={worst}
     >
       <span className={css.phase} data-testid="live-phase">
         <span className={active ? css.liveDot : css.idleDot} aria-hidden />
         {phaseLabel}
-        {ended && phase?.phase === "turn-ended" && phase.outcome ? ` · ${OUTCOME_LABEL[phase.outcome] ?? phase.outcome}` : null}
+        {endedSuffix}
         {!ended && phase?.toolName ? <span className={css.toolName}>{phase.toolName}</span> : null}
       </span>
       {ended && decision.decidedBy ? (
@@ -289,7 +492,7 @@ export function LiveStatusStrip({
         </span>
       ) : null}
       {!ended && (phase?.tier || screenActive) ? (
-        <span className={css.chip} data-testid="live-tier">
+        <span className={css.tierChip} data-testid="live-tier">
           {phase?.tier ?? "screen"}
           {phase?.provision && phase.provision !== "native" ? ` · ${phase.provision}` : null}
         </span>

@@ -158,12 +158,12 @@ export function TaskSpacePanel({
   }, [load]);
 
   if (state.phase === "loading") {
-    return <p data-testid="taskspace-loading" style={{ padding: 16, color: "var(--mute)" }}>正在加载任务空间…</p>;
+    return <p data-testid="taskspace-loading" style={{ padding: 16, color: "var(--fg-muted)" }}>正在加载任务空间…</p>;
   }
   if (state.phase === "error") {
     return (
       <div data-testid="taskspace-error" style={{ padding: 16 }}>
-        <p style={{ color: "var(--danger-strong)" }}>任务空间加载失败：{state.message}</p>
+        <p style={{ color: "var(--danger-fg)" }}>任务空间加载失败：{state.message}</p>
         <button type="button" onClick={() => void load()}>重试</button>
       </div>
     );

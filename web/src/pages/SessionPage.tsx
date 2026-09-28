@@ -722,6 +722,7 @@ export function SessionPage({
         </div>
         <LiveStatusStrip
           events={events}
+          instance={instance}
           nativeRef={instance.nativeRef}
           hasPending={pending.length > 0}
           decision={turnDecision}

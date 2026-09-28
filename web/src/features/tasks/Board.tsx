@@ -13,6 +13,7 @@ import { boardPath, useProjectFilter, useProjects } from "./ProjectSwitcher";
 import { PageHeader } from "../../components/PageHeader";
 import { profilingEnabled, profileRegion, reportProbe } from "../../lib/profileFlags";
 import { structuralEqual } from "../../lib/structuralEqual";
+import { useNowTick } from "../../lib/useNowTick";
 import { CommitProbe } from "../../components/CommitProbe";
 import {
   BOARD_WORK_COLUMNS,
@@ -109,14 +110,14 @@ function moveErrorMessage(err: unknown): string {
 
 // ── Card ──────────────────────────────────────────────────────────────────
 
-function SessionLine({ session, onNavigate }: { session: CardSession; onNavigate?: () => void }) {
+function SessionLine({ session, nowMs, onNavigate }: { session: CardSession; nowMs: number; onNavigate?: () => void }) {
   return (
     <Link
       className={css.sessionLine}
       to={`/s/${session.id}`}
       data-testid="board-session"
       data-lifecycle={session.lifecycle ?? "unknown"}
-      title={`${session.name || session.id} · ${formatListTime(session.updatedAt)}`}
+      title={`${session.name || session.id} · ${formatListTime(session.updatedAt, nowMs)}`}
       onClick={(event) => {
         event.stopPropagation();
         onNavigate?.();
@@ -124,7 +125,7 @@ function SessionLine({ session, onNavigate }: { session: CardSession; onNavigate
     >
       <HarnessGlyph kind={session.kind ?? "generic"} />
       <span className={css.sessionName}>{session.name || session.id}</span>
-      <span className={css.sessionTime}>{formatListTime(session.updatedAt)}</span>
+      <span className={css.sessionTime}>{formatListTime(session.updatedAt, nowMs)}</span>
     </Link>
   );
 }
@@ -174,6 +175,9 @@ function CardSignal({ card }: { card: BoardCard }) {
 
 type CardProps = {
   card: BoardCard;
+  /** Display clock; deliberately NOT part of the memo comparison — an equal
+   *  card.sig already proves the rendered time bucket is unchanged. */
+  nowMs: number;
   selected: boolean;
   busy: boolean;
   onSelect: (id: string) => void;
@@ -189,7 +193,7 @@ type CardProps = {
  * (`commit:BoardCard`, perf scenario E).
  */
 const BoardCardView = memo(
-  function BoardCardView({ card, selected, busy, onSelect, onArchive, onDragStart, onDragEnd }: CardProps) {
+  function BoardCardView({ card, nowMs, selected, busy, onSelect, onArchive, onDragStart, onDragEnd }: CardProps) {
     // Terminal (done/failed) and archived cards compute zero legal drops, so
     // they are not draggable at all rather than offering a move every column
     // must refuse.
@@ -258,7 +262,9 @@ const BoardCardView = memo(
 
           <div className={css.cardSessions} data-testid="board-card-sessions">
             {shownSessions.length > 0 ? (
-              shownSessions.map((session) => <SessionLine key={session.id} session={session} />)
+              shownSessions.map((session) => (
+                <SessionLine key={session.id} session={session} nowMs={nowMs} />
+              ))
             ) : (
               <p className={css.cardNoSession}>还没有会话</p>
             )}
@@ -312,6 +318,7 @@ function BoardColumnView({
   column,
   label,
   cards,
+  nowMs,
   selectedId,
   draggedCard,
   over,
@@ -327,6 +334,7 @@ function BoardColumnView({
   column: WorkColumn;
   label: string;
   cards: BoardCard[];
+  nowMs: number;
   selectedId: string | null;
   draggedCard: BoardCard | null;
   over: boolean;
@@ -369,6 +377,7 @@ function BoardColumnView({
           <BoardCardView
             key={card.id}
             card={card}
+            nowMs={nowMs}
             selected={selectedId === card.id}
             busy={busyId === card.id}
             onSelect={onSelect}
@@ -414,6 +423,11 @@ export function BoardPage() {
   const switcherProject = useProjectFilter();
   const projectId = params.get("project") ?? switcherProject;
   const { view, reload } = useBoardView(projectId);
+  // Relative-time labels keep advancing on an idle board where every poll
+  // payload is equal (and thus no store emission fires): this display-only
+  // clock is the only re-derivation trigger, and cardSignature means only
+  // cards whose label actually crossed commit.
+  const nowMs = useNowTick();
   // The Shell already loads the project directory once per mount; reuse it
   // for rail group names instead of polling /v1/projects from this surface.
   const { projects } = useProjects();
@@ -481,10 +495,11 @@ export function BoardPage() {
             view,
             instances: hub.instances as readonly CardSession[],
             pendingInstanceIds: pendingByInstance,
+            nowMs,
             query,
           }),
       ),
-    [view, hub.instances, pendingByInstance, query],
+    [view, hub.instances, pendingByInstance, nowMs, query],
   );
 
   const groups = useMemo(
@@ -785,6 +800,7 @@ export function BoardPage() {
                 column={column}
                 label={model.columns.find((entry) => entry.column === column)?.label ?? ""}
                 cards={model.columns.find((entry) => entry.column === column)?.cards ?? []}
+                nowMs={nowMs}
                 selectedId={selectedId}
                 draggedCard={draggedCard}
                 over={overColumn === column}
@@ -815,6 +831,7 @@ export function BoardPage() {
                     <BoardCardView
                       key={card.id}
                       card={card}
+                      nowMs={nowMs}
                       selected={selectedId === card.id}
                       busy={busyId === card.id}
                       onSelect={onSelectCard}

@@ -62,11 +62,14 @@ it("an emit that leaves this session's slice unchanged does not re-render the pa
   const snapshot = store.hubStore.getSnapshot();
   renderPage();
   const before = menuRenders.count;
-  // The 2 s list refresh: freshly decoded copies of the same row, plus
-  // host/workspace/other-session churn this page does not read.
+  // The 2 s list refresh: freshly decoded copies of the same row (with the
+  // decoder's new client-side capability id), plus host/workspace/other-
+  // session churn this page does not read.
+  const redecoded = structuredClone(exited);
+  redecoded.capabilities = { ...redecoded.capabilities, id: "obj_redecoded" as typeof exited.id };
   vi.mocked(store.hubStore.getSnapshot).mockReturnValue({
     ...snapshot,
-    instances: [structuredClone(exited), { ...exited, id: "ins_other" as typeof exited.id }],
+    instances: [redecoded, { ...exited, id: "ins_other" as typeof exited.id }],
     hosts: [],
     workspaces: [],
     events: { [exited.id]: snapshot.events[exited.id]!, ins_other: [] },

@@ -127,11 +127,33 @@ function selectSession(state: HubState, instanceId: string) {
 
 type SessionSlice = ReturnType<typeof selectSession>;
 
+/**
+ * The decoder builds each list row's capability snapshot afresh and stamps
+ * it with a new client-side object id (lib/api.ts decodeInstance →
+ * lib/capabilities.ts printCapabilities `id("obj_")`), so two decodes of an
+ * unchanged row differ only in `capabilities.id`. That id is a local handle,
+ * not a Hub fact, and nothing reads it: compare the rest.
+ */
+function sameInstance(a: SessionSlice["instance"], b: SessionSlice["instance"]): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return sameValue(
+    { ...a, capabilities: { ...a.capabilities, id: null } },
+    { ...b, capabilities: { ...b.capabilities, id: null } },
+  );
+}
+
 function sameSlice(a: SessionSlice, b: SessionSlice): boolean {
   const keys = Object.keys(a) as (keyof SessionSlice)[];
   // The journal window is append-only and replaced on change: identity is
   // the cheap, exact test for it.
-  return keys.every((key) => (key === "events" ? a.events === b.events : sameValue(a[key], b[key])));
+  return keys.every((key) =>
+    key === "events"
+      ? a.events === b.events
+      : key === "instance"
+        ? sameInstance(a.instance, b.instance)
+        : sameValue(a[key], b[key]),
+  );
 }
 
 function useSessionSlice(instanceId: string): SessionSlice {

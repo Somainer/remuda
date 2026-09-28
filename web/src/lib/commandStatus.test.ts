@@ -334,7 +334,8 @@ describe("projectCommandStatus — unknown never renders as success", () => {
 
   it("exactly one row is a success row", () => {
     const keys = Object.keys(COMMAND_STATUS_LABEL) as (keyof typeof COMMAND_STATUS_LABEL)[];
-    expect(keys).toHaveLength(8);
+    // D-055 added pending-offline and send-rejected rows.
+    expect(keys).toHaveLength(10);
     const successes = [
       projectCommandStatus({ command: command("queued", "not-dispatched") }),
       projectCommandStatus({ command: command("accepted", "intent-durable") }),
@@ -344,6 +345,9 @@ describe("projectCommandStatus — unknown never renders as success", () => {
       projectCommandStatus({ interaction: { interaction: interaction({ state: "answer-committed", answer: answeredBy("d"), delivery: "written" }), deviceId: "d" }, host: host() }),
       projectCommandStatus({ turn: { contentStatus: "complete", capabilities: capabilities("supported", "native") } }),
       projectCommandStatus({ deletion: { nodePurge: "node-offline" } }),
+      // D-055 rows are never success rows.
+      projectCommandStatus({ localState: "queued", hasServerCommandId: true, outboxState: "pending", offline: true }),
+      projectCommandStatus({ localState: "unknown", hasServerCommandId: true, outboxState: "rejected" }),
     ].filter((r) => r.success);
     expect(successes.map((r) => r.key)).toEqual(["turn-ended"]);
   });

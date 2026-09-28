@@ -436,6 +436,20 @@ function mapCommand(row: components["schemas"]["CommandRecord"], instanceId: Id)
     state,
     dispatch: row.forwarded ? "transport-written" : "intent-durable",
     resolution,
+    // Preserve the terminal settlement (D-055: a rejected settled command is
+    // a real rejection, not a delivery).
+    ...(row.settlement
+      ? {
+          settlement: {
+            outcome: row.settlement.outcome as
+              | "cancelled"
+              | "completed"
+              | "expired"
+              | "rejected",
+            ...(row.settlement.reason ? { reason: row.settlement.reason } : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -602,6 +616,12 @@ export type HubApi = {
     prompt: string,
     attachments?: AttachmentRef[],
     mode?: PromptMode,
+    /**
+     * D-055 client-generated command id. Present on every attempt of the same
+     * message so Hub/Node dedup makes retries exactly-once; undefined keeps
+     * the legacy server-assigned path (mock / old callers).
+     */
+    commandId?: Id,
   ): Promise<CommandResult>;
   /** D-028 §5.3: interrupt the current turn; the process and session stay alive. */
   instanceCancel(instanceId: Id): Promise<CommandResult>;
@@ -656,6 +676,14 @@ export type HubApi = {
     afterSeq: U64 | null,
     onBatch: (batch: EventsBatch["params"]) => void,
     onGap?: (windowFloor: U64) => void,
+    hooks?: {
+      /** Follow socket opened (including a successful reopen). */
+      onOpen?: () => void;
+      /** Follow socket closed (or errored after the snapshot settled). */
+      onClose?: () => void;
+      /** Any frame (event/control) received — the connection liveness tick. */
+      onFrame?: () => void;
+    },
   ): Promise<{
     subscriptionId: Id;
     journalId: Id;
@@ -665,6 +693,8 @@ export type HubApi = {
     /** False when older rows exist below the snapshot window. */
     reachedAfterSeq: boolean;
     durableSeq: U64;
+    /** WebSocket readyState (1 = OPEN); used to certify the link is live. */
+    getReadyState: () => number;
   }>;
   eventsAck(subscriptionId: Id, journalId: Id, throughSeq: U64): Promise<{ acknowledgedSeq: U64 }>;
   eventsUnsubscribe(subscriptionId: Id): Promise<void>;
@@ -698,6 +728,23 @@ function followUrl(instanceId: Id): string {
 }
 
 /** Authenticated Hub JSON request; shared by the api object and feature code. */
+/**
+ * Client-side timeouts for REST (auto-reconnect §3.1.3): a half-open SSH
+ * forward can hang a fetch forever otherwise. Reads 10 s, writes 15 s. A
+ * caller-supplied signal (e.g. the 65 s doctor probe) still works and aborts
+ * the request when either it or the internal timeout fires.
+ */
+const REST_READ_TIMEOUT_MS = 10_000;
+const REST_WRITE_TIMEOUT_MS = 15_000;
+
+/** Network-layer failure (timeout/offline), retriable by the outbox. */
+export class RestNetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RestNetworkError";
+  }
+}
+
 export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
   const session = readSession();
   const headers = {
@@ -706,13 +753,57 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     ...(session ? { "X-Remuda-Device-Id": session.deviceId } : {}),
     ...(req.headers as Record<string, string> | undefined),
   };
-  const res = await fetch(`${hubBase()}${path}`, {
-    credentials: "include",
-    ...req,
-    headers,
-  });
+  const method = (req.method ?? "GET").toUpperCase();
+  const isWrite = method !== "GET" && method !== "HEAD";
+  const timeoutMs = isWrite ? REST_WRITE_TIMEOUT_MS : REST_READ_TIMEOUT_MS;
+  // A caller-supplied signal owns the timeout (e.g. the 65 s doctor probe);
+  // only attach our own when none was given.
+  const external = req.signal;
+  const controller = new AbortController();
+  // The deadline must cover BOTH receiving headers AND reading the body: a
+  // server that sends headers then stalls mid-body would otherwise leave the
+  // fetch (and any outbox row/Web Lock behind it) pending forever. The timer
+  // is only cleared once the body has been fully consumed (json/text below).
+  const timer = external
+    ? null
+    : setTimeout(
+        () => controller.abort(new DOMException("REST_TIMEOUT", "AbortError")),
+        timeoutMs,
+      );
+  const clearTimer = () => {
+    if (timer) clearTimeout(timer);
+  };
+  external?.addEventListener("abort", () => controller.abort(external.reason), { once: true });
+  let res: Response;
+  try {
+    res = await fetch(`${hubBase()}${path}`, {
+      credentials: "include",
+      ...req,
+      headers,
+      signal: external ?? controller.signal,
+    });
+  } catch (err) {
+    clearTimer();
+    // A half-open link / offline / our own timeout never reached the Hub: a
+    // retriable network error, never a business rejection (the outbox keeps
+    // the same commandId and retries).
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+    }
+    throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+  }
   if (!res.ok) {
-    const text = await res.text();
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (err) {
+      clearTimer();
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw new RestNetworkError(`REST timeout reading error body after ${timeoutMs} ms`);
+      }
+      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+    }
+    clearTimer();
     let code = `HTTP_${res.status}`;
     let message = text || `HTTP ${res.status}`;
     let reasons: string[] = [];
@@ -740,8 +831,20 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     }
     throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
   }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  if (res.status === 204) {
+    clearTimer();
+    return undefined as T;
+  }
+  try {
+    return (await res.json()) as T;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new RestNetworkError(`REST timeout reading body after ${timeoutMs} ms`);
+    }
+    throw err;
+  } finally {
+    clearTimer();
+  }
 }
 
 /** Dummy URLs stand in for a gateway that is not listening. */
@@ -891,9 +994,15 @@ function createMockApi(): HubApi {
         },
       };
     },
-    async instanceSend(instanceId, prompt, _attachments, mode) {
+    async instanceSend(instanceId, prompt, _attachments, mode, commandId) {
       void mode;
-      return mockSend(instanceId, prompt);
+      const result = mockSend(instanceId, prompt);
+      // Echo the client-generated id like the live Hub dedup path would.
+      if (commandId) {
+        result.command.commandId = commandId;
+        result.command.id = commandId;
+      }
+      return result;
     },
     async instanceCancel(instanceId) {
       return mockCancel(instanceId);
@@ -1134,7 +1243,7 @@ function createMockApi(): HubApi {
     },
     hostWorkspaceSubscribe() { return () => undefined; },
     eventsRead: async ({ journalId, afterSeq, beforeSeq, limit }) => mockReadJournal(journalId, afterSeq, beforeSeq, limit),
-    async eventsSubscribe(journalId, _afterSeq, onBatch, _onGap) {
+    async eventsSubscribe(journalId, _afterSeq, onBatch, _onGap, _hooks) {
       const instance = mockDb.instances.find((i) => i.journalId === journalId);
       if (!instance) throw new Error("JOURNAL_NOT_FOUND");
       const subscriptionId = id("sub_");
@@ -1165,6 +1274,7 @@ function createMockApi(): HubApi {
         windowFromSeq: page.windowFromSeq,
         reachedAfterSeq: page.reachedAfterSeq,
         durableSeq: snapshot.asOfSeq,
+        getReadyState: () => 1,
       };
     },
     async eventsAck(_subscriptionId, _journalId, throughSeq) {
@@ -1213,11 +1323,19 @@ function createLiveApi(): HubApi {
     return journals.get(journalId) ?? journalId;
   }
 
-  async function command(instanceId: Id, operation: string, payload: Record<string, unknown> = {}): Promise<CommandResult> {
+  async function command(
+    instanceId: Id,
+    operation: string,
+    payload: Record<string, unknown> = {},
+    commandId?: Id,
+  ): Promise<CommandResult> {
     const req: HubBody<"/v1/instances/{id}/commands", "post"> = {
       operation,
       payload,
     };
+    // D-055: the client-generated id rides every retry unchanged, so Hub/Node
+    // commandId dedup makes the POST exactly-once.
+    if (commandId) req.commandId = commandId;
     const result = await rest<HubJson<"/v1/instances/{id}/commands", "post">>(
       `/v1/instances/${instanceId}/commands`,
       { method: "POST", body: JSON.stringify(req) },
@@ -1359,11 +1477,11 @@ function createLiveApi(): HubApi {
       titles.set(instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
       return { instance, command: mapCommand(created.command, instance.id) };
     },
-    async instanceSend(instanceId, prompt, attachments, mode) {
+    async instanceSend(instanceId, prompt, attachments, mode, commandId) {
       const payload: Record<string, unknown> = { prompt };
       if (attachments?.length) payload.attachments = attachments;
       if (mode && mode !== "new-turn") payload.mode = mode;
-      return command(instanceId, "instance.send", payload);
+      return command(instanceId, "instance.send", payload, commandId);
     },
     async instanceCancel(instanceId) {
       return command(instanceId, "instance.cancel", {});
@@ -1422,6 +1540,12 @@ function createLiveApi(): HubApi {
         body: JSON.stringify(body),
       });
     },
+    /**
+     * `GET /v1/instances/:id/commands/:commandId` (D-055 G2 / Task B): the
+     * bare ledger record, used by the outbox reconciler when a POST ended
+     * unknown/reconciling instead of re-POSTing, and by fleet broadcast's
+     * authoritative read. The optional AbortSignal bounds one read.
+     */
     async instanceCommandStatus(instanceId, commandId, signal) {
       return rest<components["schemas"]["CommandRecord"]>(
         `/v1/instances/${encodeURIComponent(instanceId)}/commands/${encodeURIComponent(commandId)}`,
@@ -1633,9 +1757,14 @@ function createLiveApi(): HubApi {
         reachedAfterSeq,
       };
     },
-    async eventsSubscribe(journalId, afterSeq, onBatch, onGap) {
+    async eventsSubscribe(journalId, afterSeq, onBatch, onGap, hooks) {
       const instanceId = instanceIdOf(journalId);
-      follows.get(journalId)?.close();
+      // Close the previous socket WITHOUT forwarding its close: it is being
+      // intentionally replaced, and its close event arriving after the new
+      // socket opens would make the connection machine bounce offline again
+      // and clear the recovering watchdog (item 11).
+      const previous = follows.get(journalId);
+      if (previous) previous.close();
       const subscriptionId = id("sub_") as Id;
       const ws = new WebSocket(followUrl(instanceId));
       follows.set(journalId, ws);
@@ -1697,11 +1826,21 @@ function createLiveApi(): HubApi {
           flushScheduled = true;
           setTimeout(flushPending, 0);
         };
+        ws.addEventListener("open", () => hooks?.onOpen?.());
         ws.addEventListener("error", () => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
           reject(new Error("FOLLOW_CONNECT_FAILED"));
+        });
+        // A close after the snapshot settled is a drop, not a connect
+        // failure: the connection machine's onClose reopens the socket.
+        // Ignore a close from a socket that this very call replaced (or a
+        // later replacement) so resume never looks like a link failure.
+        ws.addEventListener("close", () => {
+          if (!settled) return; // connect failure handled by the error arm
+          if (follows.get(journalId) !== ws) return; // intentionally replaced
+          hooks?.onClose?.();
         });
         ws.addEventListener("message", (ev) => {
           if (typeof ev.data !== "string") return;
@@ -1711,6 +1850,9 @@ function createLiveApi(): HubApi {
           } catch {
             return;
           }
+          // Every received frame proves liveness, including ticks and
+          // control frames (the connection machine's 15 s clock).
+          hooks?.onFrame?.();
           if (msg.type === "event") {
             const obs = coerceObservation(msg.event ?? msg, journalId, instanceId, msg.seq);
             if (!obs) return;
@@ -1778,6 +1920,7 @@ function createLiveApi(): HubApi {
         windowFromSeq: snapshotMeta.fromSeq,
         reachedAfterSeq: snapshotMeta.reachedAfterSeq,
         durableSeq: asOfSeq,
+        getReadyState: () => ws.readyState,
       };
     },
     async eventsAck(_subscriptionId, _journalId, throughSeq) {

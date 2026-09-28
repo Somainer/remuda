@@ -1339,6 +1339,10 @@ function renderNode(
       ? projectCommandStatus({
           hasServerCommandId: node.local.commandId !== null,
           localState: node.local.state,
+          // D-055: the durable outbox row + live link state decide
+          // 待发送（离线）/ 发送中 / 未送达 instead of the old null-id rule.
+          outboxState: node.local.outboxState,
+          offline: hubStore.connectionState !== "live",
         })
       : null;
     return (
@@ -1370,7 +1374,17 @@ function renderNode(
                 : ` · 排队中 · 第 ${node.holdOrdinal ?? 1} 条 · 回车后送出`}
             </span>
           ) : localRow ? (
-            ` · ${localRow.label}`
+            <>
+              {` · ${localRow.label}`}
+              {/* A rejection carries the Node/Hub's own reason (the outbox
+                  row's lastError): neutral inline text next to 未送达, never a
+                  toast. */}
+              {localRow.key === "send-rejected" && node.local?.outboxError ? (
+                <span className={session.stat} data-testid="send-rejected-reason">
+                  {` · ${node.local.outboxError}`}
+                </span>
+              ) : null}
+            </>
           ) : null}
           {/* Status order the composer and transcript share: a queued
               journal node has not been sent; the local bubble's own wording
@@ -1460,7 +1474,10 @@ function renderNode(
             </button>
           </div>
         ) : null}
-        {node.local?.state === "unknown" ? (
+        {/* D-055: the explicit new-id resend chip exists ONLY for the narrowed
+            unconfirmed set (retry window exhausted / 409 conflict / no durable
+            store). Offline-pending rows auto-deliver and never show this. */}
+        {node.local?.state === "unknown" && node.local.outboxState !== "rejected" ? (
           <button className={ui.chip} onClick={() => void hubStore.send(node.local!.instanceId, node.local!.text)}>
             仍要再送一条？
           </button>

@@ -220,43 +220,89 @@ test("a delayed POST shows 等待发送, never a duplicate, then upgrades in pla
   expect(recorder.count()).toBe(setupActions + 1);
 });
 
-test("a 5xx POST projects 状态待确认 and reload creates no native action or duplicate", async ({ page }) => {
-  const recorder = recordNativeActions(page);
+test("a transient 5xx POST keeps the row waiting and retries with the same commandId exactly once", async ({ page }) => {
   const instanceId = await createReadySession(page, "cid create prompt for fail test");
-  const setupActions = recorder.count();
   const prompt = `cid failed post ${Date.now()}`;
 
+  const seenCommandIds: string[] = [];
+  let failures = 0;
   await page.route("**/v1/instances/*/commands", async (route) => {
-    await route.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: { code: "BAD_GATEWAY", message: "node unreachable" } }) });
+    if (route.request().method() !== "POST") return route.continue();
+    const body = route.request().postDataJSON() as { commandId?: string };
+    if (body.commandId) seenCommandIds.push(body.commandId);
+    // Fail the first attempt (transient gateway error); let the bounded
+    // same-id retry through to the Hub.
+    if (failures < 1) {
+      failures += 1;
+      return route.fulfill({
+        status: 502,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "BAD_GATEWAY", message: "node unreachable" } }),
+      });
+    }
+    return route.continue();
   });
 
   await page.getByTestId("composer-input").fill(prompt);
   await page.keyboard.press("Enter");
 
-  // Bubble and header speak the unconfirmed vocabulary; nothing retries.
-  await expect(page.getByTestId("optimistic-bubble")).toContainText("状态待确认", { timeout: 10_000 });
-  await expect(page.getByTestId("session-status-label")).toContainText("状态待确认");
-  // The single POST attempt is the only command request; nothing retries it.
-  await expect.poll(() => recorder.count()).toBe(setupActions + 1);
-  await page.waitForTimeout(1500);
-  expect(recorder.count()).toBe(setupActions + 1);
+  // D-055: a retryable 5xx does NOT settle the row to 状态待确认 — it stays
+  // waiting (等待发送/发送中) under the SAME commandId.
+  await expect(page.getByTestId("optimistic-bubble")).not.toContainText("状态待确认", {
+    timeout: 5_000,
+  });
 
-  // Reload: the optimistic bubble is client state and is gone; the failed
-  // send is never replayed, and no native action is generated on our behalf.
-  await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
-  await page.reload();
-  await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
-  await page.waitForTimeout(1000);
-  // Reload created no additional native action.
-  expect(recorder.count()).toBe(setupActions + 1);
-  await expect(page.getByTestId("optimistic-bubble")).toHaveCount(0);
-  // The failed POST never reached the Node, so it journaled nothing:
-  // assert against the source of truth rather than the rendered transcript.
-  const journalHasPrompt = await page.evaluate(async (id) => {
-    const body = (await (await fetch(`/v1/instances/${id}/journal`, { credentials: "include" })).json()) as {
-      events?: { payload?: { text?: string } }[];
-    };
-    return (body.events ?? []).some((e) => typeof e.payload?.text === "string" && e.payload.text.includes("cid failed post"));
-  }, instanceId);
-  expect(journalHasPrompt).toBe(false);
+  // Exactly two attempts, both carrying the identical client commandId.
+  await expect
+    .poll(() => seenCommandIds.length, { timeout: 20_000 })
+    .toBe(2);
+  expect(new Set(seenCommandIds).size).toBe(1);
+
+  // The retry committed once: one Hub command row and one journal message.
+  // Browser-side fetch (this spec shares the browser's cookie session; the
+  // independent request fixture does not). A non-200 returns -1 so a failed
+  // read can never poll as an empty == delivered list.
+  const commandId = seenCommandIds[0]!;
+  await expect
+    .poll(
+      () =>
+        page.evaluate(
+          async ({ iid, cid }) => {
+            const r = await fetch(`/v1/instances/${iid}/commands?limit=100`, {
+              credentials: "include",
+            });
+            if (!r.ok) return -1;
+            const body = (await r.json()) as {
+              commands?: { id?: string; commandId?: string; operation?: string }[];
+            };
+            return (body.commands ?? []).filter(
+              (c) => c.operation === "instance.send" && (c.id ?? c.commandId) === cid,
+            ).length;
+          },
+          { iid: instanceId, cid: commandId },
+        ),
+      { timeout: 20_000 },
+    )
+    .toBe(1);
+  await expect
+    .poll(
+      () =>
+        page.evaluate(async ({ iid, cid }) => {
+          const r = await fetch(`/v1/instances/${iid}/journal?limit=2000`, { credentials: "include" });
+          if (!r.ok) return -1;
+          const body = (await r.json()) as {
+            events?: {
+              kind?: string;
+              event?: { kind?: string; payload?: { commandId?: string } };
+              payload?: { commandId?: string };
+            }[];
+          };
+          return (body.events ?? []).filter((raw) => {
+            const e = (raw.event ?? raw) as { kind?: string; payload?: { commandId?: string } };
+            return e.kind === "message" && e.payload?.commandId === cid;
+          }).length;
+        }, { iid: instanceId, cid: commandId }),
+      { timeout: 20_000 },
+    )
+    .toBe(1);
 });

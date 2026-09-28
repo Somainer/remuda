@@ -413,6 +413,13 @@ function assembleMessages(events: Observation[], anchors: Map<TranscriptNode, bi
       // C2: carry the delivering command id so the UI can attribute the
       // node and hide the matching optimistic bubble.
       if (payload.commandId != null) node.commandId = payload.commandId;
+      // D-055: a bubble settled off this journal event carried local-only
+      // attachment thumbnails; the store stamps them onto the payload so they
+      // survive the bubble being filtered out of the optimistic list.
+      const stampedAttachments = (
+        payload as typeof payload & { localAttachments?: LocalBubble["attachments"] }
+      ).localAttachments;
+      if (stampedAttachments?.length) node.localAttachments = stampedAttachments;
       // c-steer: keep the delivery mode of the latest revision (a queued row
       // that completes as a 插队 keeps the 插队 badge).
       if (payload.promptMode != null) node.promptMode = payload.promptMode;
@@ -665,7 +672,6 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
     }
   }
   for (const bubble of bubbles) {
-    if (bubble.state === "settled") continue;
     // C2: a journal node carrying the same commandId is the authoritative
     // copy of this optimistic bubble — the Node joined hook/transcript
     // evidence onto the delivering command. The Node journals its own queued
@@ -675,7 +681,9 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
     // The bubble still owns a fact the journal never echoes back: the local
     // attachment thumbnails (D-027). Carry them onto the joined node in place
     // so the rendered row keeps them instead of dropping them when the
-    // optimistic bubble is hidden.
+    // optimistic bubble is hidden. This runs for settled bubbles too (D-055:
+    // the outbox settles a queued row off the journal event) — the node still
+    // needs the thumbnails.
     if (bubble.commandId) {
       const joinedIndex = nodes.findIndex(
         (node) =>
@@ -695,6 +703,9 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
             localAttachments: joined.localAttachments ?? bubble.attachments,
           };
         }
+        // A settled bubble has no further optimistic UI; a non-settled one is
+        // hidden here as the authoritative journal node now represents it.
+        if (bubble.state === "settled") continue;
         continue;
       }
     } else {

@@ -99,6 +99,7 @@ it("an answer receipt settles the card even when the post-answer refresh fails",
     durableSeq: "1",
     windowFromSeq: null,
     reachedAfterSeq: true,
+    getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_ordering",
@@ -168,6 +169,7 @@ it("a delayed older poll cannot revert a committed review to pending", async () 
     durableSeq: "1",
     windowFromSeq: null,
     reachedAfterSeq: true,
+    getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_ordering2",
@@ -263,6 +265,7 @@ it("a newer empty list plus a late older poll cannot resurrect a committed revie
     durableSeq: "1",
     windowFromSeq: null,
     reachedAfterSeq: true,
+    getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_ordering3",

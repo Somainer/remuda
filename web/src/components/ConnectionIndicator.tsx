@@ -24,7 +24,16 @@ function ConnectionBody({ status }: { status: ConnectionUi | "gap-backfill" | "r
       </span>
     );
   }
-  if (status === "reconnecting" || status === "gap-backfill") {
+  if (status === "stale") {
+    // Grey dot only; no banner copy (hub-resilience §5.2).
+    return (
+      <span className={ui.conn} title="连接不稳">
+        <span className={ui.connOff} />
+        连接不稳
+      </span>
+    );
+  }
+  if (status === "reconnecting" || status === "recovering" || status === "gap-backfill") {
     return (
       <span className={ui.conn}>
         <span className={ui.connDots} aria-hidden>

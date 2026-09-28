@@ -186,6 +186,7 @@ async function setupRealSession(
       durableSeq: "1",
       windowFromSeq: "1",
       reachedAfterSeq: true,
+      getReadyState: () => 1,
       // follow() reconciles this snapshot with the bounded tail; carry the
       // already-mapped instance so the sub is accepted.
       snapshot: {

@@ -2,7 +2,8 @@ import { useSyncExternalStore } from "react";
 
 /** Bounded journal tail the list reads per live instance to project its phrase. */
 const SUMMARY_TAIL = 64;
-import type { Command } from "../types/command";
+import type { Command, CommandSettlementOutcome } from "../types/command";
+import type { components } from "./api.generated";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { Observation } from "../types/observation";
@@ -14,7 +15,6 @@ import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/regist
 import {
   api,
   isScreenNodeBusy,
-  observationText,
   type InstanceCreateSpec,
   type PasskeyAssertionBody,
   type PasskeyAttestationBody,
@@ -62,8 +62,29 @@ import {
   normalizePermissionMode as normalizeKindPermissionMode,
 } from "../features/session/permissions";
 import { doneFromLines, lastLines, latestScreenSnapshot } from "./screen";
+import { ConnectionMachine, type ConnectionState, LIVE_FRAME_MS } from "./connection";
+import {
+  newCommandId,
+  openOutboxStorage,
+  Outbox,
+  withinRetryWindow,
+  LEASE_TTL_MS,
+  isDeliverable as isDeliverableOutbox,
+  type OutboxRecord,
+  type OutboxState,
+} from "./outbox";
+
+/** Bound on per-row flush passes in one flushAllOutbox call. */
+const MAX_FLUSH_PASSES = 100;
+
+/** Bounded reconciliation of a forwarded-but-reconciling command (GET loop). */
+const RECONCILE_GET_DEADLINE_MS = 30_000;
+const RECONCILE_GET_INTERVAL_MS = 1_000;
+/** Bounded backoff for Hub-held (Node offline) same-id re-POSTs. */
+const HELD_RETRY_BASE_MS = 2_000;
+const HELD_RETRY_MAX_MS = 30_000;
 import { liveSummary } from "../features/session/liveSummary";
-import { isUnauthorized } from "./httpError";
+import { HubHttpError, isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
 import { mockGappedTail, mockJournalIds } from "./mock";
@@ -205,7 +226,12 @@ function effortLifecycleStatus(status: unknown):
   return null;
 }
 
-export type ConnectionUi = "live" | "reconnecting" | "offline";
+/**
+ * D-055 four-state link (hub-resilience §5.2). `reconnecting` is retained as
+ * the journal-completeness label used by SessionPage's merged indicator; the
+ * connection machine itself reports live/stale/offline/recovering.
+ */
+export type ConnectionUi = "live" | "stale" | "offline" | "recovering" | "reconnecting";
 export type Toast = { id: string; text: string } | null;
 export type LocalBubble = {
   /**
@@ -225,6 +251,19 @@ export type LocalBubble = {
    */
   commandId: Id | null;
   state: Command["state"] | "unknown";
+  /**
+   * D-055 durable outbox state, present when this bubble is backed by an
+   * outbox row. commandStatus reads it (with the connection state) to show
+   * 待发送（离线）/ 发送中 / 未送达 instead of the old unconfirmed fallback.
+   */
+  outboxState?: OutboxState;
+  /**
+   * The Node/Hub's own reason for a definite rejection (the outbox row's
+   * lastError, e.g. settlement.reason), shown inline next to 未送达 as
+   * neutral text in the row — never a toast. Present only for a rejected
+   * row; other states carry no user-facing reason here.
+   */
+  outboxError?: string;
   createdAt: string;
   /**
    * Thumbnails for images sent with this message (D-027). Held locally
@@ -325,6 +364,8 @@ export type HubState = {
   screens: Record<string, ScreenEntry>;
   /** List-row live phrases projected from each instance's journal tail. */
   summaries: Record<string, string>;
+  /** Number of outbox rows pending/inflight (offline banner). */
+  outboxPending: number;
 };
 
 const initial: HubState = {
@@ -332,7 +373,7 @@ const initial: HubState = {
   authed: false,
   error: null,
   toast: null,
-  connection: "live",
+  connection: "recovering",
   session: readSession(),
   devices: [],
   passkeys: [],
@@ -358,6 +399,8 @@ const initial: HubState = {
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
   answering: {},
   screens: {},
+  /** Outbox rows still awaiting a definite Hub answer (D-055 banner count). */
+  outboxPending: 0,
   summaries: {},
 };
 
@@ -516,6 +559,48 @@ function mergeInteractionSnapshots(
   return merged;
 }
 
+/**
+ * The structural facts the outbox classifier needs, shared by the POST
+ * envelope's rich {@link Command} (its `dispatch` states map to the ledger's
+ * forward flag) and the bare GET CommandRecord (which carries `forwarded`).
+ */
+type CommandLikeForClassify = {
+  state: "queued" | "accepted" | "settled" | string;
+  resolution: "clear" | "unknown" | "reconciling" | string;
+  settlement?: { outcome: CommandSettlementOutcome; reason?: string };
+  forwarded: boolean;
+};
+
+/**
+ * Classify a Hub command record into an outbox outcome.
+ *  - rejected: settled with settlement.outcome rejected (real Node reject).
+ *  - held: queued and never forwarded (Node offline); same-id re-POST later.
+ *  - reconciling: FORWARDED but the Hub has no verdict yet — resolution
+ *    "reconciling" OR "unknown". The Hub records the forward intent BEFORE
+ *    awaiting the Node, so a lost POST can read the row back via GET as
+ *    queued+forwarded+unknown; it is NOT proof of acceptance. Settled by a
+ *    bounded GET (never re-forwarded).
+ *  - sent: accepted/settled-completed or a clear forwarded row; reached the
+ *    Hub/Node, await the journal join (never re-POST).
+ */
+function classifyCommandLike(
+  command: CommandLikeForClassify,
+): "sent" | "held" | "reconciling" | "rejected" {
+  if (command.state === "settled" && command.settlement?.outcome === "rejected") {
+    return "rejected";
+  }
+  if (command.state === "queued" && !command.forwarded) {
+    return "held";
+  }
+  if (
+    command.state === "queued" &&
+    (command.resolution === "reconciling" || command.resolution === "unknown")
+  ) {
+    return "reconciling";
+  }
+  return "sent";
+}
+
 class HubStore {
   private state: HubState = initial;
   private listeners = new Set<Listener>();
@@ -558,6 +643,46 @@ class HubStore {
    * (a newer read already started) never commits.
    */
   private screenReadGen = new Map<Id, number>();
+  /**
+   * D-055 auto-reconnect: one connection machine for the active follow
+   * socket, plus the durable outbox and the instance it is bound to. Both are
+   * created lazily at bootstrap so non-authenticated and unit-test callers
+   * don't touch IndexedDB.
+   */
+  private connection: ConnectionMachine | null = null;
+  private outbox: Outbox | null = null;
+  private outboxDegraded = false;
+  private connectionBoundTo: Id | null = null;
+  private connectionBoundJournal: Id | null = null;
+  private outboxInit: Promise<boolean> | null = null;
+
+  /**
+   * Lazily open the durable outbox (also used outside bootstrap, e.g. a
+   * send that races first mount or unit-test callers). Resolves false when no
+   * storage backend is writable — send then uses the legacy direct path.
+   */
+  private ensureOutbox(): Promise<boolean> {
+    if (this.outbox) return Promise.resolve(true);
+    if (this.outboxInit) return this.outboxInit;
+    this.outboxInit = (async () => {
+      try {
+        const opened = await openOutboxStorage();
+        this.outboxDegraded = opened.degraded;
+        const box = await Outbox.load(opened.storage);
+        this.outbox = box;
+        box.subscribe(() => this.emit({ outboxPending: box.pendingCount() }));
+        this.emit({ outboxPending: box.pendingCount() });
+        if (opened.degraded) this.toast("本机无法可靠保存待发消息（存储不可用）");
+        // Rows left inflight by a closed tab are due immediately.
+        void this.flushAllOutbox();
+        return true;
+      } catch {
+        this.outboxDegraded = true;
+        return false;
+      }
+    })();
+    return this.outboxInit;
+  }
   /** Screen-read scheduler: queue, single-flight set, in-flight counter. */
   private screenQueue: Id[] = [];
   private screenPending = new Set<Id>();
@@ -1013,6 +1138,649 @@ class HubStore {
     this.emit({ compact });
   }
 
+  /**
+   * D-055: create the outbox + connection machine once per authenticated
+   * session, restore unsent rows as optimistic bubbles (survives reload), and
+   * drive the machine from browser reachability events.
+   *
+   * @param offline  when true (bootstrap hello failed with a device session
+   * still present — i.e. the Hub is unreachable on reload) the machine starts
+   * at offline instead of an optimistic live, so cached UI shows an honest
+   * state and the outbox still restores/flushes on recovery.
+   */
+  private async initConnection(offline = false) {
+    if (this.connection) return;
+    await this.ensureOutbox();
+    const box = this.outbox;
+    if (!box) return;
+
+    // Reload: restore unsent rows as bubbles, keyed to their stored instances.
+    const restored = box.unresolved();
+    if (restored.length) {
+      // Offline reload never ran the instance list. Restore the LAST KNOWN
+      // complete instance projection persisted with each row (no fabricated
+      // stubs/casts); SessionPage renders the real shape with its capabilities
+      // and nativeRef intact. The next successful list refresh replaces these.
+      const restoredInstances: Instance[] = [];
+      for (const r of restored) {
+        if (this.state.instances.some((i) => i.id === r.instanceId)) continue;
+        const known =
+          r.instanceSnapshot ?? restoredInstances.find((i) => i.id === r.instanceId);
+        if (known) restoredInstances.push(known);
+      }
+      this.emit({
+        instances: [...this.state.instances, ...restoredInstances],
+        bubbles: [
+          ...restored.map((r) => this.bubbleFromOutbox(r)),
+          ...this.state.bubbles,
+        ],
+      });
+      // A forwarded-but-unresolved row ("reconciling", including a forward
+      // whose response was lost and read back as queued+unknown) is
+      // non-deliverable, so the flush cannot settle it: restart its bounded
+      // GET reconciliation instead of leaving 状态待确认 on the row forever.
+      // Never re-POSTs — the Hub already recorded the forward.
+      for (const r of restored) {
+        if (r.state === "reconciling") this.reconcileReconcilingRow(r.instanceId, r.commandId);
+      }
+    }
+
+    const machine = new ConnectionMachine({
+      resume: () => this.resumeConnection(),
+      probe: () => this.connectionProbe(),
+      isFollowLive: () => this.followSocketLive(),
+      onState: (state) => {
+        this.emit({ connection: state, outboxPending: box.pendingCount() });
+        // A socket-level recovery is also a moment to deliver the queue.
+        if (state === "live") void this.flushAllOutbox();
+      },
+    });
+    this.connection = machine;
+    // A successful REST bootstrap proves reachability, but on the list/new
+    // pages there is no follow socket to watchdog yet: start live WITHOUT a
+    // frame timer. The instant a session's follow socket binds
+    // (openFollowSocket → followBound) the framed-socket deadline takes over,
+    // so an active session whose transcript is frozen can never show 已连接.
+    // A failed bootstrap starts the offline reconnect loop instead.
+    if (offline) machine.setStateOffline();
+    else machine.bootstrapLive();
+
+    if (typeof window !== "undefined") {
+      window.addEventListener("online", this.onConnOnline);
+      window.addEventListener("offline", this.onConnOffline);
+      window.addEventListener("pageshow", this.onConnPageshow);
+      document.addEventListener("visibilitychange", this.onConnVisibility);
+      window.addEventListener("focus", this.onConnFocus);
+      window.addEventListener("pagehide", this.onPageHide);
+      window.addEventListener("beforeunload", this.onPageHide);
+    }
+
+    // Send anything already due (e.g. rows left inflight when the tab closed).
+    void this.flushAllOutbox();
+  }
+
+  private onConnOnline = () => this.connection?.dispatch({ type: "online" });
+  private onConnOffline = () => this.connection?.dispatch({ type: "offline" });
+  private onConnPageshow = (event: PageTransitionEvent) => {
+    // BFCache restore (iOS app switch, Back): the earlier pagehide set the
+    // unload flag, but the page is alive again — clear it so flushes resume.
+    // The flag must never outlive the unload that set it.
+    this.pageIsUnloading = false;
+    if (event.persisted) {
+      this.connection?.dispatch({ type: "resume" });
+      // Resume any rows queued while the page was suspended.
+      void this.flushAllOutbox();
+    }
+  };
+  private onConnVisibility = () => {
+    if (document.visibilityState === "visible") {
+      // Returning from an iOS backgrounding fires visibilitychange without a
+      // persisted pageshow; treat it as the same unload-flag reset.
+      this.pageIsUnloading = false;
+    }
+    this.connection?.setVisibility(document.visibilityState === "visible");
+  };
+  private focusLast = 0;
+  private onConnFocus = () => {
+    // Throttle the catch-all focus trigger to 5 s.
+    const t = Date.now();
+    if (t - this.focusLast < 5_000) return;
+    this.focusLast = t;
+    this.connection?.dispatch({ type: "resume" });
+  };
+
+  /** Link state the UI gates writes on (D-055). Optimistically live until the
+   * connection machine reports otherwise (it only exists post-bootstrap). */
+  get connectionState(): ConnectionState {
+    return (this.connection?.state ?? this.connectionStateOverride ?? "live") as ConnectionState;
+  }
+
+  /**
+   * Interrupt is time-sensitive and non-idempotent across turns. Refused only
+   * when there is no working link (offline) or a resume/catch-up is in flight
+   * (recovering). A live-but-quiet (stale) session can still be interrupted —
+   * the cancel POST itself proves the path works.
+   */
+  get canInterrupt(): boolean {
+    return this.connectionState !== "offline" && this.connectionState !== "recovering";
+  }
+
+  /**
+   * Probe for the CURRENT follow socket's readyState. The subscription object
+   * keeps the live WebSocket; reading through it at every liveness check means
+   * a socket that silently closed without firing our close handler is still
+   * observed (sampling it once after the promise could leave a cached OPEN
+   * forever — the owner's phone coming out of iOS background).
+   */
+  private followGetReadyState: (() => number) | null = null;
+  /** Epoch ms of the last frame (event/tick/snapshot) on the current socket. */
+  private lastFollowFrameAt = 0;
+
+  /**
+   * The follow link is genuinely live only when the socket is OPEN AND a frame
+   * arrived within LIVE_FRAME_MS. This is the ONLY thing that lets a
+   * foreground resume trust a cached "live" instead of reopening.
+   */
+  private followSocketLive(): boolean {
+    if (!this.followGetReadyState || this.followGetReadyState() !== 1) return false;
+    if (!this.lastFollowFrameAt) return false;
+    return Date.now() - this.lastFollowFrameAt <= LIVE_FRAME_MS;
+  }
+
+  /** Test-only: force the follow-live verdict (simulates open + fresh frame). */
+  setFollowLiveForTest(open: boolean, framed: boolean) {
+    this.followGetReadyState = () => (open ? 1 : -1);
+    this.lastFollowFrameAt = framed ? Date.now() : 0;
+  }
+
+  /** Test-only: drive the machine live the way a fresh follow frame would. */
+  frameForTest() {
+    this.setFollowLiveForTest(true, true);
+    this.connection?.dispatch({ type: "frame" });
+  }
+
+  /** Test-only: override the optimistic-live link state without a machine. */
+  setConnectionStateForTest(state: ConnectionState) {
+    this.emit({ connection: state, outboxPending: this.outbox?.pendingCount() ?? 0 });
+    this.connectionStateOverride = state;
+  }
+
+  /** Test-only: drive the pagehide/pageshow lifecycle (BFCache, iOS). */
+  async pageShowForTest(persisted: boolean): Promise<void> {
+    this.onPageHide();
+    this.onConnPageshow({ persisted } as PageTransitionEvent);
+    // Let the resumed flush microtasks run.
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  get pageIsUnloadingForTest(): boolean {
+    return this.pageIsUnloading;
+  }
+  private connectionStateOverride: ConnectionState | null = null;
+  /** True during pagehide/beforeunload: no new outbox POSTs. */
+  private pageIsUnloading = false;
+  /** Auto-clear for a beforeunload prompt the user CANCELS (page stays). */
+  private unloadClearTimer: ReturnType<typeof setTimeout> | null = null;
+  private onPageHide = () => {
+    this.pageIsUnloading = true;
+    // Stop any pending live-retry timer so it cannot POST during teardown.
+    for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
+    this.outboxRetryTimer.clear();
+    // beforeunload can be CANCELLED (the user stays on the page); pagehide
+    // only fires when navigation actually proceeds. A beforeunload that does
+    // not lead to a real unload must not latch delivery off forever: reset
+    // the flag on the next task, unless a genuine pageshow/pagehide sequence
+    // re-asserts it.
+    if (this.unloadClearTimer) clearTimeout(this.unloadClearTimer);
+    this.unloadClearTimer = setTimeout(() => {
+      this.pageIsUnloading = false;
+      this.unloadClearTimer = null;
+    }, 0);
+  };
+
+  get outboxUnavailable(): boolean {
+    return this.outboxDegraded;
+  }
+
+  private async connectionProbe(): Promise<boolean> {
+    const journalId = this.connectionBoundJournal;
+    if (!journalId) return true;
+    try {
+      await api.eventsRead({ journalId, limit: 1 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The machine's resume action. It certifies live ONLY when the follow socket
+   * reopened AND the bounded journal catch-up succeeded — REST reachability
+   * alone is not enough (a dead follow stream with working HTTP otherwise
+   * leaves the transcript frozen under a false live). Outbox delivery runs
+   * first (a POST proves the path) but its outcome never masks a socket
+   * failure: a "held" (host offline) row is a legitimate non-terminal result,
+   * while a follow/catch-up failure throws so the machine stays offline and
+   * retries.
+   */
+  private async resumeConnection() {
+    await this.flushAllOutbox();
+    if (this.connectionBoundTo) {
+      // Throws on socket-open or catch-up failure → machine remains offline
+      // and retries; no toast-swallowing into false live.
+      await this.reopenFollow(this.connectionBoundTo);
+    }
+    await Promise.all([this.refresh().catch(() => undefined), this.refreshHosts().catch(() => undefined)]);
+  }
+
+  /** Reopen the follow socket for an already-mounted instance and resync. */
+  private async reopenFollow(instanceId: Id) {
+    const instance =
+      this.state.instances.find((i) => i.id === instanceId) ?? (await api.instanceGet(instanceId));
+    const client = this.journals.get(instance.journalId);
+    // Chain on any in-flight reconciliation so an older screen/resync job
+    // cannot land after this fresher one; errors propagate to the machine.
+    await this.chainReconcile(instanceId, async () => {
+      if (client) {
+        await this.openFollowSocket(instance, client, client.appliedSeq);
+        await client.resumeAfterReconnect();
+      } else {
+        await this.follow(instanceId);
+      }
+    });
+  }
+
+  /** Foreground trigger used by Shell/PhoneShell (replaces raw catchup). */
+  resumeActive(instanceId: Id | null) {
+    if (instanceId) {
+      this.connectionBoundTo = instanceId;
+      const j = this.state.instances.find((i) => i.id === instanceId)?.journalId;
+      this.connectionBoundJournal = j ?? null;
+    }
+    this.connection?.dispatch({ type: "resume" });
+    if (!this.connection && instanceId) void this.catchup(instanceId);
+  }
+
+  /**
+   * Flush every instance with pending rows. Each ROW is delivered under its own
+   * lock acquisition (rather than one lock for the whole instance) so a steer
+   * of a later row queued while an earlier POST is in flight interleaves at the
+   * lock boundary and promotes that row before it is POSTed. Still a single
+   * deliverer: the cross-tab/durable lock means two flushes never run a row
+   * concurrently.
+   *
+   * `attempted` is the per-FLUSH set of rows that already got a POST: a row
+   * answered "held" (Node offline) must NOT be hammered again on the next pass
+   * of the SAME flush — its bounded retry timer / the next reconnect flush
+   * re-forwards it. Without this set the drain loop would tight-loop a held
+   * row up to MAX_FLUSH_PASSES in one flush. A genuinely new row (or a steer
+   * landing mid-flush) is not in the set and still drains.
+   */
+  private async flushAllOutbox(attempted: Set<Id> = new Set()) {
+    const box = this.outbox;
+    if (!box) return;
+    if (this.pageIsUnloading) return;
+    // Drain passes; each pass acquires the lock, posts at most the FIRST
+    // deliverable unattempted row, and releases — letting queued conversions
+    // interleave.
+    for (let pass = 0; pass < MAX_FLUSH_PASSES; pass += 1) {
+      if (this.pageIsUnloading) return;
+      const instances = [...new Set(box.pending().map((r) => r.instanceId))];
+      let deliveredNew = false;
+      for (const instanceId of instances) {
+        if (this.pageIsUnloading) return;
+        try {
+          const id = await box.withInstanceLock(instanceId, (iid, deliverable) =>
+            this.deliverOneRow(iid, deliverable.filter((r) => !attempted.has(r.commandId))),
+          );
+          if (id) {
+            attempted.add(id);
+            deliveredNew = true;
+          }
+        } catch {
+          // The lease/lock acquisition failed (never a double POST: the row is
+          // inflight with a fresh durable lease). A retry timer / reconnect
+          // re-triggers under the same id; keep draining other instances.
+        }
+      }
+      if (!deliveredNew) break;
+    }
+  }
+
+  /**
+   * Deliver ONE authoritative row (the first fresh one), re-reading its mode
+   * from the box so a just-landed steer promotion takes effect. Runs inside the
+   * single-deliverer lock. Returns the POSTed row's commandId (added to the
+   * flush's attempted set) or null when nothing was POSTed.
+   */
+  private async deliverOneRow(instanceId: Id, deliverable: OutboxRecord[]): Promise<Id | null> {
+    const box = this.outbox;
+    if (!box) return null;
+    const rec = deliverable[0];
+    if (!rec) return null;
+    const fresh = box.get(rec.commandId) ?? rec;
+    if (!isDeliverableOutbox(fresh, Date.now())) return null;
+    const attemptedPost = await this.deliverOutboxRecord(fresh);
+    if (!attemptedPost) return null;
+    // If that drained the instance, run the post-delivery resync/screen chain
+    // exactly once.
+    if (!box.pendingFor(instanceId).length) {
+      await this.chainReconcile(instanceId, async () => {
+        const client = this.journals.get(
+          this.state.instances.find((i) => i.id === instanceId)?.journalId ?? "",
+        );
+        try {
+          await client?.resumeAfterReconnect();
+        } catch {
+          /* machine owns the failure */
+        }
+        const events = this.state.events[instanceId] ?? [];
+        this.settleFromJournal(instanceId, events);
+        try {
+          await this.refreshScreen(instanceId);
+        } catch (err) {
+          if (!isScreenNodeBusy(err)) this.reconcileToast(err, "屏幕同步");
+        }
+      });
+    }
+    return fresh.commandId;
+  }
+
+  /**
+   * Classify a Hub command record into an outbox outcome.
+   *  - rejected: settled with settlement.outcome rejected (real Node reject).
+   *  - held: queued and never forwarded (Node offline); same-id re-POST later.
+   *  - reconciling: FORWARDED to the Node (transport-written / native-
+   *    acknowledged) but the Hub has no verdict yet — resolution "reconciling"
+   *    OR "unknown". The Hub records the forward intent BEFORE awaiting the
+   *    Node, so a lost POST can read the row back via GET as
+   *    queued+forwarded+unknown; it is NOT proof of acceptance. Settled by a
+   *    bounded GET (never re-forwarded).
+   *  - sent: accepted/settled-completed or a clear forwarded row; reached the
+   *    Hub/Node, await the journal join (never re-POST).
+   */
+  private classifyCommandResult(command: Command): "sent" | "held" | "reconciling" | "rejected" {
+    return classifyCommandLike({
+      state: command.state,
+      resolution: command.resolution,
+      settlement: command.settlement,
+      // The POST envelope's rich dispatch states are the mapped form of the
+      // ledger's `forwarded` flag (see api.ts mapCommand).
+      forwarded: command.dispatch === "transport-written" || command.dispatch === "native-acknowledged",
+    });
+  }
+
+  /** Classify the bare GET ledger record (its forward flag is `forwarded`). */
+  private classifyCommandRecord(
+    record: components["schemas"]["CommandRecord"],
+  ): "sent" | "held" | "reconciling" | "rejected" {
+    return classifyCommandLike({
+      state: record.state,
+      resolution: record.resolution,
+      settlement: record.settlement
+        ? {
+            outcome: record.settlement.outcome as CommandSettlementOutcome,
+            ...(record.settlement.reason ? { reason: record.settlement.reason } : {}),
+          }
+        : undefined,
+      forwarded: record.forwarded,
+    });
+  }
+
+  private async reconcileCommandViaGet(
+    instanceId: Id,
+    commandId: Id,
+  ): Promise<"sent" | "held" | "reconciling" | "rejected" | null> {
+    try {
+      const record = await api.instanceCommandStatus(instanceId, commandId);
+      return this.classifyCommandRecord(record);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Bounded reconciliation of a forwarded-but-unresolved row (resolution
+   * "reconciling" or "unknown"): poll the GET endpoint until it is
+   * accepted/settled (→ sent), rejected, or the deadline passes (→ unknown).
+   * NEVER re-POSTs — the Hub already forwarded the command. Runs OUTSIDE the
+   * single-deliverer lock (it can take the whole 30 s deadline and must not
+   * block another row of the instance, e.g. a steer); such a row is
+   * non-deliverable, so no other owner can POST it meanwhile.
+   */
+  private reconcileReconcilingRow(instanceId: Id, commandId: Id): void {
+    // One bounded GET loop per row per page lifetime: a row can be handed here
+    // by both the POST landing and an outbox restore only across a real reload
+    // (different page), but never run two loops concurrently in one page.
+    if (this.reconcilingInFlight.has(commandId)) return;
+    this.reconcilingInFlight.add(commandId);
+    void this.runReconcileReconcilingRow(instanceId, commandId).finally(() => {
+      this.reconcilingInFlight.delete(commandId);
+    });
+  }
+
+  private readonly reconcilingInFlight = new Set<Id>();
+
+  private async runReconcileReconcilingRow(instanceId: Id, commandId: Id): Promise<void> {
+    const deadline = Date.now() + RECONCILE_GET_DEADLINE_MS;
+    for (;;) {
+      // Journal evidence is authoritative acceptance (the Node ran the
+      // command): the live/catch-up settleFromJournal already retired the row
+      // to "done". Stop polling and never downgrade it with a GET verdict.
+      if (this.outbox?.get(commandId)?.state === "done") return;
+      const verdict = await this.reconcileCommandViaGet(instanceId, commandId);
+      if (verdict === "rejected") {
+        const result = await api.instanceCommandStatus(instanceId, commandId).catch(() => null);
+        await this.safePatch(commandId, {
+          state: "rejected",
+          serverState: result?.state,
+          gotResponse: true,
+          lastError: result?.settlement?.reason ?? "rejected by node",
+        });
+        return;
+      }
+      if (verdict === "sent") {
+        await this.safePatch(commandId, { state: "sent", gotResponse: true });
+        return;
+      }
+      if (verdict === "held") {
+        // Host went offline mid-reconcile: fall back to held retry (refund the
+        // attempt and arm the bounded same-id re-POST).
+        await this.safePatch(commandId, {
+          state: "held",
+          gotResponse: true,
+          attempts: this.outbox?.get(commandId)?.attempts ?? 0,
+        });
+        this.scheduleHeldRetry(instanceId);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        await this.safePatch(commandId, { state: "unknown", lastError: "reconciliation deadline" });
+        return;
+      }
+      await new Promise((r) => setTimeout(r, RECONCILE_GET_INTERVAL_MS));
+    }
+  }
+
+  /** Storage-first patch that never throws into the delivery flow. */
+  private async safePatch(commandId: Id, patch: Partial<OutboxRecord>) {
+    try {
+      await this.outbox?.patch(commandId, patch);
+    } catch {
+      /* storage failure: the durable inflight/lease state is the recovery path */
+    }
+    this.syncBubbleFromOutbox(commandId);
+  }
+
+  /**
+   * Deliver ONE authoritative durable row (handed in by the single-deliverer
+   * lock). Claims a durable inflight lease before POSTing; a storage abort on
+   * that claim means no POST and the row stays deliverable. "held" retries do
+   * not spend the attempt budget; a queued-forwarded reconciling row is
+   * settled by GET under a bounded deadline. Returns true when a POST ran.
+   */
+  private async deliverOutboxRecord(current0: OutboxRecord): Promise<boolean> {
+    const box = this.outbox;
+    if (!box) return false;
+    const commandId = current0.commandId;
+    if (!withinRetryWindow(current0)) {
+      await this.safePatch(commandId, { state: "unknown", lastError: "retry window exhausted" });
+      return false;
+    }
+
+    // Claim the durable inflight lease storage-first. If this write aborts,
+    // never POST: the cache/storage still show a deliverable row (the cache
+    // updates only after commit), so the next trigger retries under the same
+    // commandId. Another owner is excluded by the durable lease, not an
+    // in-memory marker.
+    const isFreshAttempt = current0.state !== "held";
+    try {
+      await box.patch(commandId, {
+        state: "inflight",
+        attempts: isFreshAttempt ? current0.attempts + 1 : current0.attempts,
+        lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS },
+      });
+    } catch {
+      return false;
+    }
+    this.syncBubbleFromOutbox(commandId);
+
+    const finish = async (patch: Partial<OutboxRecord>) => {
+      await this.safePatch(commandId, { ...patch, lease: undefined });
+    };
+
+    try {
+      const result = await api.instanceSend(
+        current0.instanceId,
+        current0.prompt,
+        current0.attachments ?? [],
+        current0.mode,
+        commandId,
+      );
+      const classified = this.classifyCommandResult(result.command);
+      if (classified === "rejected") {
+        await finish({
+          state: "rejected",
+          serverState: result.command.state,
+          gotResponse: true,
+          lastError: result.command.settlement?.reason ?? "rejected by node",
+        });
+      } else if (classified === "held") {
+        // Node offline: Hub holds the row; bounded same-id retry, no attempt
+        // spent (the 20-attempt budget must not drain while the host is down).
+        // A host online→online resume (flushAllOutbox) re-POSTs.
+        await finish({
+          state: "held",
+          serverState: result.command.state,
+          gotResponse: true,
+          attempts: current0.attempts,
+        });
+        this.scheduleHeldRetry(current0.instanceId);
+      } else if (classified === "reconciling") {
+        await finish({ state: "reconciling", serverState: result.command.state, gotResponse: true });
+        await this.reconcileReconcilingRow(current0.instanceId, commandId);
+      } else {
+        await finish({ state: "sent", serverState: result.command.state, gotResponse: true });
+      }
+    } catch (err) {
+      const networkFailure =
+        !(err instanceof HubHttpError) || err.status >= 500 || err.status === 503;
+      if (networkFailure) {
+        const reconciled = await this.reconcileCommandViaGet(current0.instanceId, commandId);
+        if (reconciled === "rejected") {
+          await finish({ state: "rejected", gotResponse: true, lastError: "rejected by node" });
+        } else if (reconciled === "sent") {
+          await finish({ state: "sent", gotResponse: true });
+        } else if (reconciled === "held") {
+          await finish({ state: "held", gotResponse: true, attempts: current0.attempts });
+          this.scheduleHeldRetry(current0.instanceId);
+        } else if (reconciled === "reconciling") {
+          await finish({ state: "reconciling", gotResponse: true });
+          await this.reconcileReconcilingRow(current0.instanceId, commandId);
+        } else {
+          // Truly undelivered: keep pending, bounded same-id retry. Same-id
+          // retries are safe in ANY link state (the 20-attempt / 24 h envelope
+          // bounds them), and a reconnect flush also drains the row.
+          await this.safePatch(commandId, { state: "pending", lease: undefined, lastError: String(err) });
+          this.scheduleOutboxRetry(current0.instanceId);
+        }
+      } else if (err instanceof HubHttpError && err.status === 409) {
+        await finish({ state: "unknown", lastError: err.message });
+      } else if (err instanceof HubHttpError) {
+        await finish({ state: "rejected", lastError: err.message });
+      }
+    }
+    this.syncBubbleFromOutbox(commandId);
+    if (!box.pendingFor(current0.instanceId).length) this.clearOutboxRetry(current0.instanceId);
+    return true;
+  }
+
+  private bubbleFromOutbox(r: OutboxRecord): LocalBubble {
+    // Merge onto any live bubble for the same clientRequestId so transient
+    // preview data (blob previewUrl, present only in the live bubble, not
+    // persisted) survives a state sync. On a fresh restore only the persisted
+    // manifest refs are available and the UI links straight to the Hub object.
+    const live = this.state.bubbles.find((b) => b.clientRequestId === r.clientRequestId);
+    const attachments = live?.attachments?.length
+      ? live.attachments
+      : ((r.attachments ?? []) as BubbleAttachment[]);
+    return {
+      clientRequestId: r.clientRequestId,
+      instanceId: r.instanceId,
+      text: r.prompt,
+      // The client-generated id is the wire commandId from the first POST.
+      commandId: r.commandId,
+      held: false,
+      state:
+        r.state === "done"
+          ? "settled"
+          : r.state === "rejected" || r.state === "unknown"
+            ? "unknown"
+            : // pending/inflight = queued; "sent"/"held" already reached the
+              // Hub and render as an accepted (delivered, not 待确认) row.
+              r.state === "pending" || r.state === "inflight"
+              ? "queued"
+              : "accepted",
+      outboxState: r.state,
+      // The rejection reason rides along on the rejected row so 未送达 can
+      // show the Node/Hub's own neutral explanation inline.
+      ...(r.state === "rejected" && r.lastError ? { outboxError: r.lastError } : {}),
+      ...(attachments.length ? { attachments } : {}),
+      promptMode: r.mode ?? "new-turn",
+      createdAt: new Date(r.createdAt).toISOString(),
+    };
+  }
+
+  private syncBubbleFromOutbox(commandId: Id) {
+    const rec = this.outbox?.get(commandId);
+    if (!rec) return;
+    const next = this.bubbleFromOutbox(rec);
+    this.emit({
+      bubbles: this.state.bubbles.map((b) => (b.clientRequestId === rec.clientRequestId ? next : b)),
+    });
+  }
+
+  /**
+   * Mark bubbles settled by commandId journal evidence AND retire their
+   * outbox rows to "done" (a journal message is stronger than a sent/held
+   * Hub row). Used on catch-up/resync batches that aren't the live onEvents.
+   */
+  private settleFromJournal(instanceId: Id, events: Observation[]) {
+    const next = settleBubbles(this.state.bubbles, instanceId, events);
+    if (this.outbox) {
+      for (const ev of events) {
+        if (ev.kind !== "message") continue;
+        const commandId = (ev.payload as { commandId?: Id }).commandId;
+        const rec = commandId ? this.outbox.get(commandId) : null;
+        if (commandId && rec && rec.state !== "done" && rec.state !== "rejected" && rec.state !== "unknown") {
+          void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
+        }
+      }
+    }
+    this.emit({ bubbles: next });
+  }
+
   async bootstrap() {
     const gen = ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
@@ -1044,7 +1812,8 @@ class HubStore {
         ready: true,
         authed: true,
         error: null,
-        connection: "live",
+        // Link state is the connection machine's to publish, not REST's; leave
+        // the current (recovering) value until a follow frame certifies live.
         session: readSession(),
         devices: devices.items,
         passkeys: passkeys.items,
@@ -1062,6 +1831,7 @@ class HubStore {
         (snapshot) => this.applyWorkspaceSnapshot(snapshot),
         () => { void this.refreshHosts().catch(() => undefined); },
       );
+      await this.initConnection();
       this.startPoll();
     } catch (err) {
       if (gen !== this.bootGen) return;
@@ -1069,6 +1839,21 @@ class HubStore {
       if (unauth) {
         clearSession();
         dropDeviceCookie();
+      }
+      // A network failure WITH a device session still on disk is an offline
+      // reload, not a logout: keep the (cached) authed UI, restore the outbox,
+      // and let the connection machine reconnect. Only a real 401 logs out.
+      const hasSession = api.hasDeviceSession();
+      if (!unauth && hasSession) {
+        await this.initConnection(true);
+        this.emit({
+          ready: true,
+          authed: true,
+          session: readSession(),
+          error: null,
+        });
+        this.startPoll();
+        return;
       }
       this.emit({
         ready: true,
@@ -1175,6 +1960,32 @@ class HubStore {
     // it in its finally.
     ++this.bootGen;
     this.pinnedCreates.clear();
+    // Tear down the connection machine and its browser listeners (init
+    // recreates them at the next bootstrap); the durable outbox itself stays.
+    this.connection?.dispose();
+    this.connection = null;
+    this.connectionBoundTo = null;
+    this.connectionBoundJournal = null;
+    for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
+    this.outboxRetryTimer.clear();
+    this.outboxRetryAttempt.clear();
+    for (const [, t] of this.heldRetryTimer) clearTimeout(t);
+    this.heldRetryTimer.clear();
+    this.heldRetryAttempt.clear();
+    if (this.unloadClearTimer) {
+      clearTimeout(this.unloadClearTimer);
+      this.unloadClearTimer = null;
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("online", this.onConnOnline);
+      window.removeEventListener("offline", this.onConnOffline);
+      window.removeEventListener("pageshow", this.onConnPageshow);
+      document.removeEventListener("visibilitychange", this.onConnVisibility);
+      window.removeEventListener("focus", this.onConnFocus);
+      window.removeEventListener("pagehide", this.onPageHide);
+      window.removeEventListener("beforeunload", this.onPageHide);
+      this.pageIsUnloading = false;
+    }
     this.settledInteractions.clear();
     this.emit({
       authed: false,
@@ -1405,13 +2216,26 @@ class HubStore {
 
   async follow(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId) ?? (await api.instanceGet(instanceId));
+    // This mounted session owns the connection machine BEFORE the socket is
+    // opened: if the subscribe fails while the Hub is unreachable (offline
+    // reload), the machine's reconnect resume must still know which instance
+    // to reopen — binding only after a successful open left reloaded sessions
+    // with a delivered row but no follow and no journal join.
+    this.connectionBoundTo = instance.id;
+    this.connectionBoundJournal = instance.journalId;
     if (!this.state.instances.some((i) => i.id === instanceId)) {
       this.emit({ instances: [instance, ...this.state.instances] });
     }
     // Fold projected effective state/catalog the single record carries.
     this.hydrateEffortEffective([instance]);
     this.hydrateModels([instance]);
-    if (this.journals.has(instance.journalId)) return;
+    // Already mounted (SessionPage re-render): rebind the connection machine
+    // to this active follow; a dead socket is reopened by the machine.
+    if (this.journals.has(instance.journalId)) {
+      this.connectionBoundTo = instanceId;
+      this.connectionBoundJournal = instance.journalId;
+      return;
+    }
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
     // Seed from ONE bounded tail window (newest rows win). The old ascending
     // 512-loop sliced the front of the tail, silently dropping everything
@@ -1484,10 +2308,24 @@ class HubStore {
                 seq: screen.seq,
               })
             : null;
+        const settledBubbles = settleBubbles(this.state.bubbles, instanceId, next);
+        // A journal message is stronger evidence than the queued/accepted Hub
+        // row: retire the matching outbox rows so a later reconnect cannot
+        // keep retrying a command that demonstrably executed.
+        if (this.outbox) {
+          for (const ev of next) {
+            if (ev.kind !== "message") continue;
+            const commandId = (ev.payload as { commandId?: Id }).commandId;
+            const rec = commandId ? this.outbox.get(commandId) : null;
+            if (commandId && rec && rec.state !== "done" && rec.state !== "rejected") {
+              void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
+            }
+          }
+        }
         this.emit({
           instances: applyInstanceActivity(this.state.instances, events),
           events: { ...this.state.events, [instanceId]: next },
-          bubbles: settleBubbles(this.state.bubbles, instanceId, next),
+          bubbles: settledBubbles,
           screens: screenPatch ?? this.state.screens,
           summaries,
         });
@@ -1514,20 +2352,14 @@ class HubStore {
         });
       },
       onStatus: (status) => {
-        // A client returning to live means the follow socket caught up again:
-        // clear the coarse global indicator too, so recovery needs no manual
-        // retry (non-live states stay per-session — SessionPage prefers them).
-        this.emit(
-          status === "live"
-            ? {
-                journalStatus: { ...this.state.journalStatus, [instanceId]: status },
-                connection: "live" as const,
-              }
-            : { journalStatus: { ...this.state.journalStatus, [instanceId]: status } },
-        );
+        // Journal completeness is a PER-SESSION concern only; it must never
+        // publish the global connection state (only the connection machine
+        // publishes live, and a journal live read does not prove the follow
+        // socket is open — a frozen transcript could otherwise show 已连接).
+        this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: status } });
       },
       onGap: (from, to) => {
-        void client.fillGap(from, to).then((acked) => {
+        void client.fillGap(from, to, client.currentResumeGen()).then((acked) => {
           if (acked) void api.eventsAck(this.subs.get(instance.journalId) ?? "resume", instance.journalId, acked);
         });
       },
@@ -1548,27 +2380,82 @@ class HubStore {
       // load-earlier anchor and live-batch stale check).
       history: { earliestRetainedSeq: seed.windowFromSeq ?? "1", complete: seed.reachedAfterSeq },
     });
+    await this.openFollowSocket(instance, client, last, {
+      earliestRetainedSeq: seed.windowFromSeq ?? "1",
+      complete: seed.reachedAfterSeq,
+    });
+    // (connectionBoundTo/Journal were bound at the top of follow(), so the
+    // machine owns this session even when this first open failed offline.)
+  }
+
+  /**
+   * Open (or reopen) the follow socket for a mounted journal client. Reused by
+   * the initial follow and by the connection machine's resume; eventsSubscribe
+   * itself closes any prior socket for the journal first.
+   */
+  private async openFollowSocket(
+    instance: Instance,
+    client: JournalClient,
+    afterSeq: U64,
+    /** REST-seed floor for the FIRST subscribe; null on a reopen (keep the client's). */
+    seedFloor: { earliestRetainedSeq: string; complete: boolean } | null = null,
+  ) {
+    // The active session's link claim starts here: the machine requires a
+    // frame within LIVE_FRAME_MS of the socket opening (a silent open must not
+    // keep 已连接 over a frozen transcript). The subscribe snapshot/any event
+    // dispatches {frame} and satisfies it.
+    this.connection?.followBound();
     const sub = await api.eventsSubscribe(
       instance.journalId,
-      last,
+      afterSeq,
       (batch) => {
         const result = client.applyBatch(batch);
-        if (result.acked) void api.eventsAck(batch.subscriptionId, instance.journalId, result.acked);
-        if (result.gap) void client.fillGap(result.gap.from, result.gap.to);
+        if (result.acked) {
+          void api.eventsAck(batch.subscriptionId, instance.journalId, result.acked);
+          // A contiguous live batch that advanced the cursor supersedes any
+          // resume/fill read still in flight (item 9).
+          client.noteSocketCaughtUp();
+        }
+        if (result.gap) void client.fillGap(result.gap.from, result.gap.to, client.currentResumeGen());
       },
       (windowFloor) => void client.fillResyncGap(windowFloor),
+      {
+        onFrame: () => {
+          this.lastFollowFrameAt = Date.now();
+          this.connection?.dispatch({ type: "frame" });
+        },
+        onOpen: () => {
+          // readyState is read live through getReadyState on every liveness
+          // check; onOpen needs no cached copy.
+        },
+        // Genuine remote close of the CURRENT socket (eventsSubscribe ignores
+        // the close of a socket it intentionally replaced — see api.ts).
+        onClose: () => {
+          this.followGetReadyState = null;
+          this.lastFollowFrameAt = 0;
+          this.connection?.dispatch({ type: "close" });
+        },
+      },
     );
     this.subs.set(instance.journalId, sub.subscriptionId);
-    if (Number(sub.snapshot.asOfSeq) >= Number(last)) {
+    // Hold the subscription's OWN live probe, never a sampled copy: a socket
+    // that dies silently (no close callback, e.g. iOS background expiry) must
+    // be seen as non-OPEN at the next liveness check.
+    this.followGetReadyState = sub.getReadyState;
+    // The subscribe SNAPSHOT is the reopen + catch-up certificate: the server
+    // answered over this exact socket. Count it as a frame so a resume
+    // certifies live even for an idle session with no subsequent events.
+    if (sub.getReadyState() === 1) {
+      this.lastFollowFrameAt = Date.now();
+      this.connection?.dispatch({ type: "frame" });
+    }
+    if (Number(sub.snapshot.asOfSeq) >= Number(afterSeq)) {
       // An EMPTY follow snapshot only says "no events past the afterSeq
-      // cursor" — it says nothing about retention below it. Preserve the REST
-      // seed's window floor/completeness instead of letting an empty snapshot
-      // reset the floor to 1 (which would hide load-earlier on a late attach).
-      const seedHistory =
-        sub.windowFromSeq === null
-          ? { earliestRetainedSeq: seed.windowFromSeq ?? "1", complete: seed.reachedAfterSeq }
-          : sub.snapshot.history;
-      client.applySnapshot({ ...sub.snapshot, history: seedHistory });
+      // cursor" — it says nothing about retention below it. Only the first
+      // subscribe (REST seed present) overrides the floor; a reopen keeps the
+      // client's existing window floor.
+      const seedHistory = seedFloor ?? (sub.windowFromSeq === null ? null : sub.snapshot.history);
+      if (seedHistory) client.applySnapshot({ ...sub.snapshot, history: seedHistory });
     }
     const tail = mockGappedTail(instance.journalId);
     if (tail) {
@@ -1577,9 +2464,6 @@ class HubStore {
         if (result.gap) void client.fillGap(result.gap.from, result.gap.to);
       }, 0);
     }
-    // Events landing between the REST seed and the socket open arrive on the
-    // follow snapshot (filtered past `last`) and flow through applyBatch, so no
-    // second tail read is needed.
   }
 
   /** Fetch one window of older history for the transcript's load-earlier row. */
@@ -1602,7 +2486,26 @@ class HubStore {
     this.toast(`${what}失败：${message}（将在下次轮询重试）`);
   }
 
+  /**
+   * Foreground/manual journal catch-up. With D-055 this drives the connection
+   * machine (which owns the real live/stale/offline/recovering state and
+   * reopens the socket); the manual fallback below remains for callers before
+   * the machine initialised (unit tests, degraded mode).
+   */
   async catchup(instanceId: Id) {
+    const instance = this.state.instances.find((i) => i.id === instanceId);
+    if (!instance) return;
+    this.connectionBoundTo = instanceId;
+    this.connectionBoundJournal = instance.journalId;
+    if (this.connection) {
+      // resumeConnection reopens the socket + resyncs + flushes the outbox.
+      this.connection.dispatch({ type: "resume" });
+      return;
+    }
+    await this.catchupManual(instanceId);
+  }
+
+  private async catchupManual(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId);
     if (!instance) return;
     const client = this.journals.get(instance.journalId);
@@ -1616,21 +2519,14 @@ class HubStore {
       return;
     }
     client.markReconnecting();
-    this.emit({ connection: "reconnecting" });
     try {
       await client.resumeAfterReconnect();
     } catch (err) {
-      // resumeAfterReconnect settles the client at readonly-stale itself (and
-      // onStatus mirrors that into journalStatus), so the per-session banner
-      // is truthful 只读 + 重试 instead of a latched 重连. Report the cause.
       this.reconcileToast(err, "会话同步");
     }
-    // Derive the global indicator from the SETTLED client status, never an
-    // unconditional "live": a failed resync stays reconnecting globally until
-    // a later catch-up (the banner 重试 action, send, visibility regain,
-    // steerHeld) succeeds; the client can only be "live" or "readonly-stale"
-    // here, both of which onStatus has already projected per session.
-    this.emit({ connection: client.status === "live" ? "live" : "reconnecting" });
+    // No global connection write here: only the connection machine publishes
+    // link state. This manual path exists solely for the machine-less unit
+    // harness/degraded mode; journalStatus already reflects the outcome.
     try {
       await this.refresh();
     } catch (err) {
@@ -1639,6 +2535,14 @@ class HubStore {
   }
 
   async create(spec: InstanceCreateSpec) {
+    // D-055: create is not idempotent (no client key in the outbox, and the
+    // caller navigates to /:id on success), so it is never queued offline.
+    // Refuse when the link is down/recovering rather than optimistically
+    // creating a row the UI cannot mount.
+    if (this.connectionState === "offline" || this.connectionState === "recovering") {
+      this.toast("当前无法连接 Hub，会话不会在离线时排队，恢复连接后再新建。");
+      throw new Error("create refused while disconnected (D-055)");
+    }
     const result = await api.instanceCreate(spec);
     const createdId = result.instance.id;
     const kind = spec.kind as EffortKind;
@@ -1678,30 +2582,121 @@ class HubStore {
   ): Promise<boolean> {
     // Anchor mapping (D-027 + image anchors): the manifest carries the
     // [Image #n] index in token order; pair it onto the local bubble's
-    // previews so the token renders as an inline thumbnail chip.
+    // previews so the token renders with the attachment.
     const indexOf = new Map(attachments.map((ref) => [ref.objectId, ref.index]));
     const numberedPreviews = previews.map((preview) => {
       const index = indexOf.get(preview.objectId);
       return index ? { ...preview, index } : preview;
     });
     const clientRequestId = id("local_");
+
+    // D-055: generate the wire commandId BEFORE the POST and persist the row
+    // first. Offline steer cannot keep its turn-specific meaning after a
+    // disconnect, so it degrades to an ordinary queued turn.
+    const offline = this.connectionState !== "live";
+    const effectiveMode: PromptMode | undefined = offline && mode === "steer" ? undefined : mode;
+    const persistedMode =
+      effectiveMode && effectiveMode !== "new-turn" ? effectiveMode : undefined;
+
+    const haveOutbox = await this.ensureOutbox();
+    const commandId = haveOutbox ? newCommandId() : null;
+    const createdAtMs = Date.now();
+    const journalIdForRow = this.state.instances.find((i) => i.id === instanceId)?.journalId;
+    // Persist the upload manifest refs (objectId/index/kind/…), never the
+    // blob-only preview urls: the outbox survives reloads and POSTs the
+    // canonical refs. The rendered bubble keeps the local preview urls.
+    const persistableAttachments = attachments.filter(
+      (a): a is AttachmentRef => Boolean(a.objectId),
+    );
+    if (this.outbox && commandId) {
+      // Storage-first: the bubble renders only AFTER the durable commit. A
+      // transaction abort left nothing in the cache/store, so retry the SAME
+      // commandId once; a second abort is an honest failure, never a phantom
+      // bubble or a second id for the intent.
+      const enqueueRecord = {
+        commandId,
+        clientRequestId,
+        instanceId,
+        ...(journalIdForRow ? { journalId: journalIdForRow } : {}),
+        ...(this.state.instances.find((i) => i.id === instanceId)
+          ? { instanceSnapshot: this.state.instances.find((i) => i.id === instanceId) }
+          : {}),
+        prompt,
+        ...(persistableAttachments.length ? { attachments: persistableAttachments } : {}),
+        ...(persistedMode ? { mode: persistedMode } : {}),
+        createdAt: createdAtMs,
+      };
+      try {
+        await this.outbox.enqueue(enqueueRecord);
+      } catch {
+        try {
+          await this.outbox.enqueue(enqueueRecord);
+        } catch {
+          return false;
+        }
+      }
+    }
     const bubble: LocalBubble = {
       clientRequestId,
       instanceId,
       text: prompt,
       ...(numberedPreviews.length ? { attachments: numberedPreviews } : {}),
-      // No server identity yet; the projection below reads this null as
-      // 「等待发送」 while queued and 「状态待确认」 afterwards, never as
-      // delivery. (C2: the local id must never masquerade as a commandId.)
-      commandId: null,
+      // The client-generated id is the commandId from the first POST on;
+      // Hub/Node dedup is what makes same-id retries exactly-once.
+      commandId,
       state: "queued",
-      ...(mode ? { promptMode: mode } : {}),
-      createdAt: now(),
+      outboxState: this.outbox ? "pending" : undefined,
+      ...(effectiveMode ? { promptMode: effectiveMode } : {}),
+      createdAt: new Date(createdAtMs).toISOString(),
     };
     this.emit({ bubbles: this.state.bubbles.concat(bubble) });
+
+    if (!this.outbox || !commandId) {
+      // No durable store (locked-down browser): legacy direct POST, and its
+      // failure is honestly 状态待确认 — never an optimistic retry.
+      return this.sendWithoutOutbox(instanceId, prompt, attachments, effectiveMode, clientRequestId);
+    }
+    if (this.connectionState !== "live") {
+      // The row stays pending; the connection machine flushes it on recovery.
+      // An offline steer degraded to a queued turn must NOT report success:
+      // it has not interrupted anything, so no 已打断 receipt (and annotation
+      // drafts stay until it really lands).
+      return !(mode === "steer");
+    }
+    if (mode === "steer") {
+      // A live steer is an interrupt: the 已打断 receipt must mean the
+      // interrupt was actually accepted, so await the SAME single-deliverer
+      // delivery steerHeld uses instead of resolving before the POST settles.
+      // True only on authoritative acceptance (sent/done); held (host
+      // offline), reconciling, rejected, unknown, or a lock/lease failure
+      // report false even though the durable row keeps retrying.
+      try {
+        await this.outbox.withInstanceLock(instanceId, (iid, rows) =>
+          this.deliverOneRow(iid, rows),
+        );
+      } catch {
+        return false;
+      }
+      this.syncBubbleFromOutbox(commandId);
+      const finalState = this.outbox.get(commandId)?.state;
+      return finalState === "sent" || finalState === "done";
+    }
+    // Online ordinary send: flush now in the background; the POST never
+    // blocks the caller.
+    void this.flushAllOutbox();
+    return true;
+  }
+
+  /** Legacy direct-POST path used only when durable storage is unavailable. */
+  private async sendWithoutOutbox(
+    instanceId: Id,
+    prompt: string,
+    attachments: AttachmentRef[],
+    mode: PromptMode | undefined,
+    clientRequestId: Id,
+  ): Promise<boolean> {
     try {
       const result = await api.instanceSend(instanceId, prompt, attachments, mode);
-      // The ONLY place commandId is assigned: the server response.
       this.emit({
         bubbles: this.state.bubbles.map((b) =>
           b.clientRequestId === clientRequestId
@@ -1709,30 +2704,12 @@ class HubStore {
             : b,
         ),
       });
-      // Settle the bubble from events the live follow socket has already
-      // delivered, then return — the POST landing is what callers await (the
-      // 插队 receipt is raised on this resolution and the gate's steer test
-      // polls the wire then waits 5 s for that chip). The bounded
-      // reconciliation below must not be part of that latency: under gate
-      // load its HTTP chain (journal backfill + refresh + screen read) can
-      // take longer than the 5 s wait, even though the interrupt actually
-      // landed. The live socket and this background catch-up converge the
-      // same state.
       const events = this.state.events[instanceId] ?? [];
-      this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, events) });
-      // catchup owns its own failures (toast + the connection latch always
-      // clears), so it never rejects and the POST resolution stays first.
+      this.settleFromJournal(instanceId, events);
       void this.catchup(instanceId);
-      void this.refreshScreen(instanceId).catch((err) => {
-        // NODE_BUSY is the bulk-read back-pressure the scheduler backs off
-        // on, not a reconciliation failure; anything else is surfaced.
-        if (!isScreenNodeBusy(err)) this.reconcileToast(err, "屏幕同步");
-      });
+      void this.refreshScreen(instanceId).catch(() => undefined);
       return true;
     } catch {
-      // Keep `commandId: null`. The bubble is 「状态待确认」: no command id
-      // to query with, and nothing here re-POSTs. Recovering the send is a
-      // human decision taken from the transcript, not an automatic retry.
       this.emit({
         bubbles: this.state.bubbles.map((b) =>
           b.clientRequestId === clientRequestId ? { ...b, state: "unknown" } : b,
@@ -1742,9 +2719,18 @@ class HubStore {
     }
   }
 
-  retract(bubbleId: Id) {
+  async retract(bubbleId: Id) {
     const bubble = this.state.bubbles.find((b) => b.clientRequestId === bubbleId);
     if (!bubble || bubble.state === "accepted" || bubble.state === "settled") return;
+    // Remove the durable outbox row too if it never left (a queued offline
+    // message cancelled before delivery); an inflight/done row cannot be
+    // unsent, so leave it to its journal outcome.
+    if (bubble.commandId && this.outbox) {
+      const rec = this.outbox.get(bubble.commandId);
+      if (rec && (rec.state === "pending" || rec.state === "rejected" || rec.state === "unknown")) {
+        await this.outbox.remove(bubble.commandId);
+      }
+    }
     this.emit({ bubbles: this.state.bubbles.filter((b) => b.clientRequestId !== bubbleId) });
   }
 
@@ -1797,82 +2783,185 @@ class HubStore {
    * fresh `held && queued` check skips it instead.
    */
   async flushHeld(instanceId: Id) {
+    // Held rows are user-staged prompts; D-055 routes them through the same
+    // durable outbox as normal sends (client commandId, same-id retry). The
+    // COMPLETION of each enqueue is awaited before the network flush starts so
+    // a steer of a later row clicked in the same burst cannot overtake an
+    // earlier row's persistence; the flush chain itself serialises the POSTs
+    // in createdAt order.
+    if (!(await this.ensureOutbox())) return;
     const items = this.heldBubbles(instanceId);
     for (const item of items) {
       const current = this.state.bubbles.find((b) => b.clientRequestId === item.clientRequestId);
       if (!current || !current.held || current.state !== "queued") continue;
-      // Drop the hold marker before the POST so a second transition cannot
-      // double-send the same row.
-      this.emit({
-        bubbles: this.state.bubbles.map((b) =>
-          b.clientRequestId === item.clientRequestId
-            ? { ...b, held: false, promptMode: "new-turn" as const }
-            : b,
-        ),
-      });
+      // A persist abort leaves the row held with its lifetime commandId
+      // already bound; skip it this flush (the next trigger retries the SAME
+      // id) rather than aborting delivery of the remaining held rows.
       try {
-        const result = await api.instanceSend(instanceId, item.text, item.heldRefs ?? []);
-        this.emit({
-          bubbles: this.state.bubbles.map((b) =>
-            b.clientRequestId === item.clientRequestId
-              ? { ...b, state: result.command.state, commandId: result.command.commandId }
-              : b,
-          ),
-        });
+        await this.enqueueBubble(current, { steer: false });
       } catch {
-        this.emit({
-          bubbles: this.state.bubbles.map((b) =>
-            b.clientRequestId === item.clientRequestId ? { ...b, state: "unknown" } : b,
-          ),
-        });
+        /* retried under the same commandId on the next flush */
       }
     }
-    await this.catchup(instanceId);
+    await this.flushAllOutbox();
   }
 
   /**
-   * c-steer 插队发送: take ONE already-held row (see {@link hold}) and send it
-   * NOW as a steer — the Node interrupts the running turn and jumps this
-   * message ahead of the rest of the held queue. The held marker is dropped and
-   * `promptMode` set to steer BEFORE the POST, reusing {@link flushHeld}'s
-   * double-send guard so a transition firing mid-flight cannot re-send it. A
-   * failed POST leaves the row 状态待确认 exactly like flushHeld's catch, never
-   * silently dropped; a second call for the same id finds no held row and is a
-   * no-op. The remaining held rows keep their order and their ordinals.
+   * Persist an (optionally held) optimistic bubble into the outbox and drop
+   * its hold marker. A steer keeps its mode while live; offline it degrades to
+   * a queued turn (the running turn it targeted may be over by recovery).
    *
-   * Resolves `true` only once the steer POST has actually landed (so the UI can
-   * show 已打断 as a receipt rather than an intent); `false` on a no-op or a
-   * failed POST.
+   * Idempotent per clientRequestId: concurrent callers (a turn-end flush and
+   * a steer of the same row) share one in-flight enqueue and therefore one
+   * commandId. If the bubble was already converted (it carries a commandId /
+   * has an outbox row), only the mode is upgraded — never a new id.
    */
-  async steerHeld(instanceId: Id, bubbleId: Id): Promise<boolean> {
-    const item = this.state.bubbles.find(
-      (b) => b.clientRequestId === bubbleId && b.instanceId === instanceId && b.held && b.state === "queued",
-    );
-    if (!item) return false;
+  private enqueueBubble(bubble: LocalBubble, opts: { steer: boolean }): Promise<Id> {
+    const inFlight = this.enqueueInFlight.get(bubble.clientRequestId);
+    if (inFlight) return inFlight;
+    const job = this.doEnqueueBubble(bubble, opts);
+    this.enqueueInFlight.set(bubble.clientRequestId, job);
+    // Swallow the cleanup chain's own rejection: callers receive `job` itself
+    // and own its error; this tail must not surface as an unhandled rejection.
+    void job
+      .catch(() => undefined)
+      .finally(() => this.enqueueInFlight.delete(bubble.clientRequestId));
+    return job;
+  }
+
+  private async doEnqueueBubble(bubble: LocalBubble, opts: { steer: boolean }): Promise<Id> {
+    // Re-read the live bubble: a racing earlier conversion may already have
+    // assigned its commandId and dropped the hold.
+    const live =
+      this.state.bubbles.find((b) => b.clientRequestId === bubble.clientRequestId) ?? bubble;
+    // Already converted once: reuse the existing id. If this call is a steer,
+    // promote the queued row's mode (it cannot jump if it is already inflight).
+    if (live.commandId && !live.held) {
+      if (opts.steer && this.outbox) {
+        const rec = this.outbox.get(live.commandId);
+        if (rec && rec.state === "pending" && rec.mode !== "steer") {
+          const steerMode = this.connectionState === "live" ? "steer" : undefined;
+          await this.outbox.patch(live.commandId, steerMode ? { mode: steerMode } : { mode: "queue" });
+          if (!steerMode) this.toast("离线时插话将改为排队发送，恢复后按普通消息送出");
+          this.emit({
+            bubbles: this.state.bubbles.map((b) =>
+              b.clientRequestId === bubble.clientRequestId
+                ? { ...b, promptMode: (steerMode ?? "new-turn") as PromptMode }
+                : b,
+            ),
+          });
+        }
+      }
+      return live.commandId;
+    }
+
+    // First (and only) commandId for this bubble's lifetime. Bind it to the
+    // bubble BEFORE the first persistence attempt: if that attempt aborts the
+    // row never existed durably, but the retry (a later flushHeld / steerHeld
+    // of the still-held bubble) must carry this SAME id — one user intent,
+    // one commandId, even across transaction aborts.
+    const commandId = live.commandId ?? newCommandId();
+    if (!live.commandId) {
+      this.emit({
+        bubbles: this.state.bubbles.map((b) =>
+          b.clientRequestId === live.clientRequestId ? { ...b, commandId } : b,
+        ),
+      });
+    }
+    const createdAtMs = Date.now();
+    const offline = this.connectionState !== "live";
+    // opts.steer decides the mode (the held row itself carries promptMode
+    // "queue" from hold() and must not win); offline steer degrades.
+    const effectiveMode: PromptMode | undefined = opts.steer
+      ? offline
+        ? undefined
+        : "steer"
+      : live.promptMode;
+    const mode: "queue" | "steer" | undefined = opts.steer ? (offline ? "queue" : "steer") : undefined;
+    if (offline && opts.steer) {
+      this.toast("离线时插话将改为排队发送，恢复后按普通消息送出");
+    }
+    const instanceForRow = this.state.instances.find((i) => i.id === live.instanceId);
+    const journalIdForRow2 = instanceForRow?.journalId;
+    try {
+      await this.outbox?.enqueue({
+        commandId,
+        clientRequestId: live.clientRequestId,
+        instanceId: live.instanceId,
+        ...(journalIdForRow2 ? { journalId: journalIdForRow2 } : {}),
+        ...(instanceForRow ? { instanceSnapshot: instanceForRow } : {}),
+        prompt: live.text,
+        ...(live.heldRefs?.length ? { attachments: live.heldRefs } : {}),
+        ...(mode ? { mode } : {}),
+        createdAt: createdAtMs,
+      });
+    } catch {
+      // Persistence failed (IndexedDB transaction aborted): the row was never
+      // durable and the outbox cache has no entry, but the bubble stays held
+      // (or queued) WITH its bound commandId; the next flush/steer retries the
+      // SAME intent under that id rather than silently minting a second one.
+      throw new Error("failed to persist queued message");
+    }
+    // Synchronously claim the bubble (held dropped, commandId bound) so a
+    // racing second caller after this await sees the conversion.
     this.emit({
       bubbles: this.state.bubbles.map((b) =>
-        b.clientRequestId === bubbleId ? { ...b, held: false, promptMode: "steer" as const } : b,
+        b.clientRequestId === live.clientRequestId
+          ? {
+              ...b,
+              held: false,
+              commandId,
+              outboxState: "pending" as const,
+              promptMode: effectiveMode ?? "new-turn",
+            }
+          : b,
       ),
     });
+    return commandId;
+  }
+
+  /**
+   * c-steer 插队发送: take ONE held row and send it NOW as a steer. The row is
+   * persisted with its client commandId first (D-055); while live the POST is
+   * awaited so the 已打断 receipt still means "the interrupt landed", and a
+   * failure is honest. Offline, it degrades to a queued turn that recovery
+   * flushes. A second call for the same id finds no held row.
+   */
+  async steerHeld(instanceId: Id, bubbleId: Id): Promise<boolean> {
+    const bubble = this.state.bubbles.find(
+      (b) => b.clientRequestId === bubbleId && b.instanceId === instanceId && b.state === "queued",
+    );
+    if (!bubble) return false;
+    if (!(await this.ensureOutbox()) || !this.outbox) return false;
+
+    // enqueueBubble is idempotent: it assigns the single commandId if still
+    // held, or promotes the existing queued row to steer; a racing
+    // flushHeld shares the same id.
+    let commandId: Id | null = null;
     try {
-      const result = await api.instanceSend(instanceId, item.text, item.heldRefs ?? [], "steer");
-      this.emit({
-        bubbles: this.state.bubbles.map((b) =>
-          b.clientRequestId === bubbleId
-            ? { ...b, state: result.command.state, commandId: result.command.commandId }
-            : b,
-        ),
-      });
-      await this.catchup(instanceId);
-      return true;
+      commandId = await this.enqueueBubble(bubble, { steer: true });
     } catch {
-      this.emit({
-        bubbles: this.state.bubbles.map((b) =>
-          b.clientRequestId === bubbleId ? { ...b, state: "unknown" } : b,
-        ),
-      });
       return false;
     }
+    if (!commandId) return false;
+
+    // Offline: the row is queued (and degraded from steer to an ordinary
+    // turn), but nothing was interrupted — report false so the Composer does
+    // not raise the 已打断 receipt; recovery flushes the queued row.
+    if (this.connectionState !== "live") return false;
+    // Deliver the (steer-promoted) row through the single-deliverer lock.
+    try {
+      await this.outbox.withInstanceLock(instanceId, (id, rows) => this.deliverOneRow(id, rows));
+    } catch {
+      // Lock/lease failure: never claim the interrupt (the bounded retry /
+      // reconnect delivers the same id later).
+      return false;
+    }
+    this.syncBubbleFromOutbox(commandId);
+    // Receipt only on AUTHORITATIVE acceptance (sent/done), never while merely
+    // queued/reconciling/offline.
+    const finalState = this.outbox.get(commandId)?.state;
+    return finalState === "done" || finalState === "sent";
   }
 
   async close(instanceId: Id) {
@@ -1880,8 +2969,16 @@ class HubStore {
     await this.refresh();
   }
 
-  /** D-028 §5.3: interrupt the current turn; session and process stay alive. */
-  async cancel(instanceId: Id) {
+  /**
+   * D-028 §5.3: interrupt the current turn; session and process stay alive.
+   * D-055: cancel is time-sensitive and non-idempotent across turns, so it is
+   * never queued offline — the UI gates the button on {@link canInterrupt}.
+   */
+  async cancel(instanceId: Id): Promise<void> {
+    if (!this.canInterrupt) {
+      this.toast("离线时不可打断：恢复连接后再操作");
+      return;
+    }
     await api.instanceCancel(instanceId);
     await this.refresh();
   }
@@ -1922,29 +3019,123 @@ class HubStore {
       // buffer already fresh through this seq (equal basis) is newer, and a
       // frame with a higher committed basis is newer still.
       if (current?.journalSeq != null && BigInt(current.journalSeq) >= BigInt(source.seq)) return null;
-    } else if (
-      // RPC: a journal screen whose seq exceeds the basis this read was fresh
-      // through committed while the read was in flight (or was already there
-      // in a re-attempt); that durable frame wins.
-      current?.journalSeq != null &&
-      source.basis != null &&
-      BigInt(current.journalSeq) > BigInt(source.basis)
-    ) {
-      return null;
+    } else if (current?.journalSeq != null) {
+      // RPC read: ANY committed journal-derived screen outranks it when the
+      // read's basis is null (no screen had been observed when the read
+      // started — a newer journal frame must win), or when the journal seq is
+      // strictly past a non-null basis. A null-basis RPC may never overwrite a
+      // journal screen or reset its seq (an old DONE buffer replacing current
+      // working content).
+      if (source.basis == null || BigInt(current.journalSeq) > BigInt(source.basis)) {
+        return null;
+      }
     }
     const journalSeq = source.kind === "journal" ? source.seq : source.basis;
     return { ...this.state.screens, [instanceId]: { lines, done, journalSeq } };
   }
 
+  /**
+   * Per-instance serial chain for catch-up → screen reconciliation. Send
+   * resolves immediately, but the background work must be ordered so a screen
+   * RPC never overtakes a journal resync that carries unseen screen history
+   * (an older journal screen could otherwise overwrite a newer live buffer).
+   */
+  private reconcileChain = new Map<Id, Promise<unknown>>();
+  /** Per-instance timer for retrying sends that failed transiently while live. */
+  private outboxRetryTimer = new Map<Id, ReturnType<typeof setTimeout>>();
+  private outboxRetryAttempt = new Map<Id, number>();
+  /** Bounded retry timer for Hub-held (host offline) rows; no attempt cost. */
+  private heldRetryTimer = new Map<Id, ReturnType<typeof setTimeout>>();
+  private heldRetryAttempt = new Map<Id, number>();
+  /**
+   * In-flight/outbox-keyed conversion of a held bubble, keyed by
+   * clientRequestId. A held prompt gets exactly ONE commandId for its
+   * lifetime: a turn-end `flushHeld` racing a `steerHeld` of the same row
+   * awaits the SAME enqueue instead of minting a second id (HIGH: two ids for
+   * one user action can't be deduped).
+   */
+  private enqueueInFlight = new Map<Id, Promise<Id>>();
+
+  private scheduleOutboxRetry(instanceId: Id) {
+    if (this.outboxRetryTimer.has(instanceId)) return;
+    const n = this.outboxRetryAttempt.get(instanceId) ?? 0;
+    // Same full-jitter shape as the reconnect backoff, capped at 30 s.
+    const delay = Math.floor(Math.random() * Math.min(30_000, 500 * 2 ** n));
+    this.outboxRetryAttempt.set(instanceId, n + 1);
+    const timer = setTimeout(() => {
+      this.outboxRetryTimer.delete(instanceId);
+      // The timer is armed only by a real enqueue (authenticated UI); a stale
+      // device session answers 401 and the response path handles logout.
+      void this.flushAllOutbox();
+    }, delay);
+    this.outboxRetryTimer.set(instanceId, timer);
+  }
+
+  /**
+   * Bounded retry for a Hub-held row (Node offline). Re-POSTs the SAME id (Task
+   * B forwards an un-forwarded row once the host is back) without spending the
+   * 20-attempt send budget; capped in time by OUTBOX_MAX_AGE_MS.
+   */
+  private scheduleHeldRetry(instanceId: Id) {
+    if (this.heldRetryTimer.has(instanceId)) return;
+    const n = this.heldRetryAttempt.get(instanceId) ?? 0;
+    const delay = Math.min(HELD_RETRY_MAX_MS, HELD_RETRY_BASE_MS * 2 ** n);
+    this.heldRetryAttempt.set(instanceId, n + 1);
+    const timer = setTimeout(() => {
+      this.heldRetryTimer.delete(instanceId);
+      void this.flushAllOutbox();
+    }, delay);
+    this.heldRetryTimer.set(instanceId, timer);
+  }
+
+  private clearOutboxRetry(instanceId: Id) {
+    const t = this.outboxRetryTimer.get(instanceId);
+    if (t) clearTimeout(t);
+    this.outboxRetryTimer.delete(instanceId);
+    this.outboxRetryAttempt.delete(instanceId);
+  }
+
+  private chainReconcile(instanceId: Id, job: () => Promise<unknown>): Promise<unknown> {
+    const prev = this.reconcileChain.get(instanceId) ?? Promise.resolve();
+    const next = prev.then(job, job);
+    this.reconcileChain.set(instanceId, next);
+    void next.finally(() => {
+      if (this.reconcileChain.get(instanceId) === next) this.reconcileChain.delete(instanceId);
+    });
+    return next;
+  }
+
   async refreshScreen(instanceId: Id) {
+    // Ordering vs catch-up is enforced by the generation guard plus the basis
+    // (computed from BOTH committed screens and observed live events): a
+    // journal frame arriving during the read makes the RPC stale even from a
+    // list poll (item 10). Not chained — chaining a read that the catch-up
+    // itself triggers would deadlock the per-instance chain.
     // Generation guard: a newer read (or the periodic scheduler) superseding
     // this one makes its late resolution a no-op — including its error.
     const gen = (this.screenReadGen.get(instanceId) ?? 0) + 1;
     this.screenReadGen.set(instanceId, gen);
-    // Journal screen seq known BEFORE the RPC went out. The live buffer the
-    // RPC returns is at least that new; a journal frame that lands while the
-    // read is in flight is newer than the request, and the read must not win.
-    const journalSeqAtStart = this.state.screens[instanceId]?.journalSeq ?? null;
+    // Basis = the greatest journal seq the browser KNOWS before the RPC,
+    // whether it was committed as a screen entry, carried as a screen
+    // observation, or seen as ANY other event (the carried-review gap: a seed
+    // screen never written to `screens` left the basis null; the list-poll gap:
+    // events known through N with no screen observation left it null too). The
+    // live buffer is fresh through at least this seq, so a delayed journal
+    // screen at/below it — including one delivered by a late gap fill — cannot
+    // roll the buffer back. A journal frame strictly above the basis still wins.
+    const basisSeq = (() => {
+      const committed = this.state.screens[instanceId]?.journalSeq ?? null;
+      const observed = latestScreenSnapshot(this.state.events[instanceId] ?? []).seq;
+      let known: string | null = null;
+      for (const ev of this.state.events[instanceId] ?? []) {
+        if (known === null || BigInt(ev.seq) > BigInt(known)) known = ev.seq;
+      }
+      let basis: string | null = null;
+      for (const candidate of [committed, observed, known]) {
+        if (candidate != null && (basis === null || BigInt(candidate) > BigInt(basis))) basis = candidate;
+      }
+      return basis;
+    })();
     let read: { lines: string[] };
     try {
       read = await api.screenRead(instanceId, 80);
@@ -1970,15 +3161,13 @@ class HubStore {
         { kind: "journal", seq: snapshot.seq },
       );
     } else {
-      // Mid-flight journal frame: screenCommitPatch's basis check needs the
-      // start basis; an RPC whose basis is null while a journal screen now
-      // exists is covered by the explicit change check.
-      const current = this.state.screens[instanceId];
-      if ((current?.journalSeq ?? null) !== journalSeqAtStart) return;
+      // Any journal frame with a seq beyond the RPC's basis that committed
+      // during the flight makes the read stale (screenCommitPatch enforces
+      // it); the next scheduled poll re-reads the current buffer.
       const lines = lastLines(read.lines, 80);
       patch = this.screenCommitPatch(instanceId, lastLines(lines, 3), doneFromLines(read.lines), {
         kind: "rpc",
-        basis: journalSeqAtStart,
+        basis: basisSeq,
       });
     }
     if (patch) this.emit({ screens: patch });
@@ -2438,31 +3627,29 @@ class HubStore {
 function settleBubbles(bubbles: LocalBubble[], instanceId: Id, events: Observation[]): LocalBubble[] {
   return bubbles.map((bubble) => {
     if (bubble.instanceId !== instanceId) return bubble;
-    if (bubble.state === "queued") return bubble;
-    // C2: the Node joins the prompt's hook/transcript evidence onto the
-    // delivering command, so the journal user observation carries the same
-    // commandId. That is the authoritative settlement and works when two
-    // sends have identical text (a text comparison could not tell them
-    // apart).
-    if (bubble.commandId) {
-      const matched = events.some(
-        (ev) =>
-          ev.kind === "message" &&
-          (ev.payload as { commandId?: Id }).commandId === bubble.commandId,
-      );
-      return matched ? { ...bubble, state: "settled" as const } : bubble;
-    }
-    // No server id — pre-C2 producers / the in-browser mock append no
-    // commandId, so keep the old text rule for them. It only settles the
-    // bubble (hide the optimistic copy); it never attributes anything, and a
-    // bubble whose POST returned a server id is never settled on text alone.
-    const matchedByText = events.some(
+    // Settle ONLY by commandId (D-055). Text matching was removed: a held,
+    // not-yet-sent row whose text repeats a prior message (e.g. another
+    // "continue") used to be marked settled by that unrelated history event
+    // and silently dropped before it was ever POSTed. A row without a
+    // commandId (unconverted hold) is never settled here.
+    if (!bubble.commandId) return bubble;
+    const matchedEvent = events.find(
       (ev) =>
         ev.kind === "message" &&
-        observationText(ev) === bubble.text &&
-        (ev.payload as { role?: string }).role === "user",
+        (ev.payload as { commandId?: Id }).commandId === bubble.commandId,
     );
-    return matchedByText ? { ...bubble, state: "settled" as const } : bubble;
+    if (matchedEvent) {
+      // The optimistic bubble is about to be filtered out of the rendered
+      // list. Carry its local-only attachment thumbnails onto the matching
+      // journal event so the assembled (authoritative) node keeps them —
+      // the journal never echoes blob preview urls back.
+      if (bubble.attachments?.length) {
+        (matchedEvent.payload as { localAttachments?: BubbleAttachment[] }).localAttachments ??=
+          bubble.attachments;
+      }
+      return { ...bubble, state: "settled" as const, outboxState: "done" };
+    }
+    return bubble;
   });
 }
 

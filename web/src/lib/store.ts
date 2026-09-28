@@ -1371,22 +1371,36 @@ class HubStore {
   private pageIsUnloading = false;
   /** Auto-clear for a beforeunload prompt the user CANCELS (page stays). */
   private unloadClearTimer: ReturnType<typeof setTimeout> | null = null;
-  private onPageHide = () => {
+  private onPageHide = (event?: Event) => {
     this.pageIsUnloading = true;
     // Stop any pending live-retry timer so it cannot POST during teardown.
     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
     this.outboxRetryTimer.clear();
     for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
     this.leaseWakeupTimer.clear();
+    this.leaseWakeupUntil.clear();
+    // pagehide means navigation really proceeded: nothing may self-reset, and
+    // a BFCache restore re-arms from onConnPageshow. (The browser stops the
+    // page; the point is to not leave a timer that POSTs while it tears down.)
+    if (event?.type === "pagehide") {
+      if (this.unloadClearTimer) {
+        clearTimeout(this.unloadClearTimer);
+        this.unloadClearTimer = null;
+      }
+      return;
+    }
     // beforeunload can be CANCELLED (the user stays on the page); pagehide
     // only fires when navigation actually proceeds. A beforeunload that does
     // not lead to a real unload must not latch delivery off forever: reset
-    // the flag on the next task, unless a genuine pageshow/pagehide sequence
-    // re-asserts it.
+    // the flag on the next task, unless a genuine pagehide lands first. The
+    // lease-expiry wakeups above were cleared too, so a page that stays
+    // RE-ARMS from durable rows (another tab's in-flight lease still needs a
+    // wakeup here when it becomes stealable).
     if (this.unloadClearTimer) clearTimeout(this.unloadClearTimer);
     this.unloadClearTimer = setTimeout(() => {
       this.pageIsUnloading = false;
       this.unloadClearTimer = null;
+      void this.flushAllOutbox();
     }, 0);
   };
 
@@ -2070,6 +2084,7 @@ class HubStore {
     this.heldRetryAttempt.clear();
     for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
     this.leaseWakeupTimer.clear();
+    this.leaseWakeupUntil.clear();
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);
       this.unloadClearTimer = null;
@@ -3238,6 +3253,8 @@ class HubStore {
    * exactly when the row becomes stealable.
    */
   private leaseWakeupTimer = new Map<Id, ReturnType<typeof setTimeout>>();
+  /** Expiry the per-instance wakeup is currently armed for (move-earlier). */
+  private leaseWakeupUntil = new Map<Id, number>();
   /**
    * In-flight/outbox-keyed conversion of a held bubble, keyed by
    * clientRequestId. A held prompt gets exactly ONE commandId for its
@@ -3289,8 +3306,9 @@ class HubStore {
   /**
    * Arm one wakeup per instance at the earliest FOREIGN in-flight lease
    * expiry. Rows with no live foreign lease need nothing (they are
-   * deliverable now or owned by this tab). An already-armed timer is kept only
-   * when it fires no later than the newly seen expiry (never pushed out).
+   * deliverable now or owned by this tab). An already-armed wakeup is moved
+   * EARLIER when a freshly seen foreign lease expires sooner (a second tab's
+   * newer in-flight row can carry a shorter lease); it is never pushed out.
    */
   private scheduleLeaseExpiryWakeup(durable: OutboxRecord[], now: number, owner: Id) {
     const earliest = new Map<Id, number>();
@@ -3301,9 +3319,14 @@ class HubStore {
       if (prev === undefined || r.lease.until < prev) earliest.set(r.instanceId, r.lease.until);
     }
     for (const [instanceId, until] of earliest) {
-      if (this.leaseWakeupTimer.has(instanceId)) continue;
+      const armed = this.leaseWakeupUntil.get(instanceId);
+      if (armed !== undefined && armed <= until) continue;
+      const old = this.leaseWakeupTimer.get(instanceId);
+      if (old) clearTimeout(old);
+      this.leaseWakeupUntil.set(instanceId, until);
       const timer = setTimeout(() => {
         this.leaseWakeupTimer.delete(instanceId);
+        this.leaseWakeupUntil.delete(instanceId);
         void this.flushAllOutbox();
       }, Math.max(0, until - Date.now()));
       this.leaseWakeupTimer.set(instanceId, timer);

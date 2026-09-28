@@ -7,6 +7,7 @@ import {
   contextRingLabel,
   deriveInboxQueue,
   deriveInboxRows,
+  deriveRecentInstances,
   derivePushBanner,
   interactionHeadline,
   interactionRequestText,
@@ -117,6 +118,39 @@ function source(overrides: Partial<InboxSource> = {}): InboxSource {
     ...overrides,
   };
 }
+
+describe("deriveRecentInstances: the shared 进行中 · 最近 projection (c-inboxfu)", () => {
+  it("returns only live rows and honors the independently-supplied blocked set", () => {
+    const s = source({
+      instances: [
+        inst({ id: "ins_blocked", activity: known("waiting-interaction") }),
+        inst({ id: "ins_work", updatedAt: T2 }),
+        inst({ id: "ins_idle", lifecycle: "ready", activity: known("idle"), updatedAt: T1 }),
+        inst({ id: "ins_exited", lifecycle: "exited", updatedAt: T0 }),
+        inst({ id: "ins_starting", lifecycle: "starting", activity: na() }),
+      ],
+    });
+    // The blocked set is owned by the caller (shared queue membership): a
+    // blocked instance passed explicitly is excluded even though the
+    // projection itself sees no interactions.
+    const rows = deriveRecentInstances(
+      s,
+      new Set<Id>(["ins_blocked"]),
+      Date.parse(T2),
+    );
+    expect(rows.map((r) => r.instanceId)).toEqual(["ins_work", "ins_idle"]);
+    expect(rows.map((r) => r.status)).toEqual(["working", "idle"]);
+  });
+
+  it("matches deriveInboxRows recent output for the same instances", () => {
+    const s = source({
+      instances: [inst({ id: "ins_a", updatedAt: T1 }), inst({ id: "ins_b", updatedAt: T2 })],
+    });
+    const direct = deriveRecentInstances(s, new Set(), Date.parse(T2)).map((r) => r.rowId);
+    const viaRows = deriveInboxRows(s).recent.map((r) => r.rowId);
+    expect(direct).toEqual(viaRows);
+  });
+});
 
 describe("deriveInboxRows tiering", () => {
   it("puts pending/answering/paused interactions into 待你处理 and nothing settled", () => {

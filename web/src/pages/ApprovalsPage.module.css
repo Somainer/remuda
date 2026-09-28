@@ -69,8 +69,18 @@
   font-size: var(--text-ui);
 }
 
-/* Third tier: 已离队 (expired / superseded / paused-elsewhere). */
-.departed {
+/* Tier headings: 进行中 · 最近 and 已离队 share one label. */
+.tierLabel {
+  margin: 0;
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+/* Second tier: 进行中 · 最近 (live working/idle instances, the exact
+   deriveRecentInstances rows the compact inbox renders). */
+.recent {
   border-top: 1px solid var(--divider);
   padding-top: var(--space-4);
   margin-top: var(--space-1);
@@ -79,11 +89,66 @@
   gap: var(--space-3);
 }
 
-.departedLabel {
-  color: var(--fg-faint);
-  font-size: var(--text-meta);
+.recentRow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.recentHead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.recentLink {
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
   font-weight: 600;
-  letter-spacing: 0.06em;
+  text-decoration: none;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recentLink:hover {
+  text-decoration: underline;
+}
+
+.recentSpacer {
+  flex: 1;
+}
+
+.recentSubtitle {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recentMeta {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+}
+
+/* Third tier: 已离队 (expired / superseded / paused-elsewhere). */
+.departed {
+  border-top: 1px solid var(--divider);
+  padding-top: var(--space-4);
+  margin-top: var(--space-1);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
 }
 
 .departedRow {

@@ -56,6 +56,16 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
 
   const rootRef = useRef<HTMLElement | null>(null);
   const [wide, setWide] = useState(false);
+  // An inline-block whose overflow computes to auto is baseline-aligned by
+  // its BOTTOM MARGIN EDGE (CSS 2.1 §10.3.7), not the formula baseline:
+  // promoting clip -> auto sinks the node and grows the line by the
+  // formula's depth (subscripts etc., different per formula). Measure the
+  // exact delta for THIS node at promotion and shift it back down; cleared
+  // on demote.
+  const [baselineShiftPx, setBaselineShiftPx] = useState(0);
+  const wideRef = useRef(false);
+  const shiftRef = useRef(0);
+  const clipRectRef = useRef<DOMRect | null>(null);
 
   const renderedInline = engine.status === "ready" && fontsReady && !display;
   useLayoutEffect(() => {
@@ -64,15 +74,19 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
     if (!el) return;
     // `overflow-x: clip` reserves no gutter, so scrollWidth/clientWidth tell
     // the truth. ANY real overflow promotes — even 1px — so a formula can
-    // never lose visible content. (The promoted box uses an overlay
-    // scrollbar, so promotion reserves no gutter and never moves the line;
-    // see math.module.css.) The anti-flip band lives on the DEMOTE side:
-    // sub-pixel rounding between frames must not flip a borderline node
-    // back to clip and re-render forever.
+    // never lose visible content. The anti-flip band lives on the DEMOTE
+    // side: sub-pixel rounding between frames must not flip a borderline
+    // node back to clip and re-render forever.
     const DEMOTE_SLACK = 8;
     const measure = (): void => {
       const overflow = el.scrollWidth - el.clientWidth;
-      setWide((prev) => (prev ? overflow > -DEMOTE_SLACK : overflow > 0));
+      const next = wideRef.current ? overflow > -DEMOTE_SLACK : overflow > 0;
+      if (next === wideRef.current) return;
+      // Capture the CLIP box just before promoting: its bottom edge is the
+      // only reference to the formula's true baseline.
+      if (next) clipRectRef.current = el.getBoundingClientRect();
+      wideRef.current = next;
+      setWide(next);
     };
     measure();
     // Fonts arriving late and viewport/column resizes change the width.
@@ -82,6 +96,27 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
     ro.observe(el);
     return () => ro.disconnect();
   }, [renderedInline, source]);
+
+  // Reproduce the clip-state baseline on the promoted (auto) box. Runs
+  // synchronously before paint, so the compensated position never flashes.
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!renderedInline || !el) return;
+    if (!wide) {
+      if (shiftRef.current !== 0) {
+        shiftRef.current = 0;
+        setBaselineShiftPx(0);
+      }
+      return;
+    }
+    const clipRect = clipRectRef.current;
+    if (!clipRect) return;
+    const dy = clipRect.bottom - el.getBoundingClientRect().bottom;
+    if (Math.abs(dy - shiftRef.current) > 0.05) {
+      shiftRef.current = dy;
+      setBaselineShiftPx(dy);
+    }
+  }, [renderedInline, wide]);
   const attach = useCallback((el: HTMLElement | null) => {
     rootRef.current = el;
   }, []);
@@ -141,6 +176,7 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
         <span
           ref={attach}
           className={`${css.inline}${wide ? ` ${css.inlineScroll}` : ""}`}
+          style={wide && baselineShiftPx !== 0 ? { verticalAlign: `${-baselineShiftPx}px` } : undefined}
           data-testid="math-inline"
           data-state="ready"
           onCopy={onCopy}

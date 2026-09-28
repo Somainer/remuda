@@ -5,6 +5,29 @@ import { expect, test } from "@playwright/test";
 // and a legacy (no-inline-body) plan review points to the session. The
 // answer payload's option/digest/feedback shape and the Node first-answer-wins
 // CAS are covered by the Rust integration tests.
+// c-inboxfu: a display:flex summary loses the native disclosure widget; the
+// card paints its own ▸/▾ marker. This check self-creates a DESKTOP context so
+// it runs unchanged under both the chromium and the mobile-webkit (WebKit)
+// projects — the iPhone project's default 390px page redirects /approvals to
+// /m/inbox, which the describe()'s beforeEach below cannot handle.
+test("a flex summary keeps a visible disclosure marker in both engines", async ({ browser }) => {
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  try {
+    await page.goto("/approvals");
+    await expect(page.getByTestId("approvals-page")).toBeVisible();
+    const row = page.getByTestId("approval-row").filter({ hasText: "实施计划" });
+    const chev = row.locator("details summary span").first();
+    await expect(chev).toBeVisible();
+    const glyph = () => chev.evaluate((el) => getComputedStyle(el, "::before").content);
+    expect(await glyph()).toContain("▸");
+    await row.locator("details summary").click();
+    expect(await glyph()).toContain("▾");
+  } finally {
+    await ctx.close();
+  }
+});
+
 test.describe("plan review card", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/approvals");
@@ -16,7 +39,8 @@ test.describe("plan review card", () => {
     await expect(row).toBeVisible();
     const details = row.locator("details");
     await expect(details).toBeVisible();
-    // Collapsed by default; expand to read the inline plan.
+    // Collapsed by default; expand to read the inline plan. (The disclosure
+    // marker itself is owned by the dedicated marker test below.)
     await expect(row.getByText("先读取 README")).toBeHidden();
     await details.locator("summary").click();
     await expect(row.getByText("先读取 README")).toBeVisible();
@@ -82,6 +106,20 @@ test.describe("plan review card", () => {
     await feedback.fill("再想想");
     await expect(error).toHaveCount(0);
     await expect(row.getByRole("button", { name: "拒绝" })).toBeEnabled();
+  });
+
+  test("the disclosure marker flips with the open state", async ({ page }) => {
+    // c-inboxfu: display:flex summaries lose the native disclosure widget;
+    // the card paints its own ▸/▾ marker. A top-level twin of this test (above
+    // the describe) self-creates a desktop context so it also runs under the
+    // WebKit project; inside the describe a chromium default page suffices.
+    const row = page.getByTestId("approval-row").filter({ hasText: "实施计划" });
+    const chev = row.locator("details summary span").first();
+    await expect(chev).toBeVisible();
+    const glyph = () => chev.evaluate((el) => getComputedStyle(el, "::before").content);
+    expect(await glyph()).toContain("▸");
+    await row.locator("details summary").click();
+    expect(await glyph()).toContain("▾");
   });
 
   test("coarse: the compact 查看计划 disclosure is a full 44px tap target", async ({ browser }) => {

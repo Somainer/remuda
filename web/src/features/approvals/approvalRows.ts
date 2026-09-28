@@ -4,8 +4,10 @@ import {
   type InteractionUiState,
 } from "../../lib/interactionStatus";
 import { formatClock } from "../../lib/format";
-import { deriveInboxQueue } from "../mobile/inboxRows";
+import { deriveInboxQueue, deriveRecentInstances, type InboxInstanceRow } from "../mobile/inboxRows";
+import type { UsageRollup } from "../session/contextUsage";
 import type { Host, Instance, UiStatus } from "../../types/instance";
+import type { Id } from "../../types/wire";
 import type { Interaction } from "../../types/interaction";
 
 /**
@@ -39,6 +41,13 @@ export type ApprovalRow = {
 export type ApprovalRows = {
   /** pending / answering / paused — the actionable queue. */
   queue: ApprovalRow[];
+  /**
+   * 进行中 · 最近: the SAME live-instance projection the compact inbox
+   * renders (deriveRecentInstances, fed by the shared queue membership),
+   * with the desktop host/workspace chips applied. The kind segment never
+   * filters this tier (instance projection, not interaction kind).
+   */
+  recent: InboxInstanceRow[];
   /** expired / superseded — the 已离队 section. Settled rows never appear. */
   departed: ApprovalRow[];
 };
@@ -53,6 +62,14 @@ export type ApprovalSource = {
   workspaceLabel: (workspaceId: string) => string;
   /** Clock injection (c-ghostbadge round 2); defaults to the wall clock. */
   nowMs?: number;
+  /** hub.summaries: live phrases projected from journal tails (recent tier). */
+  phrases?: Record<string, string>;
+  /** hub.usageRollup: Hub-computed context rollups (recent tier ring). */
+  rollups?: Record<string, UsageRollup>;
+  /** Instance title for the recent tier; defaults to an empty title. */
+  titleOf?: (instanceId: Id) => string;
+  /** Host label accessor for the recent tier meta line. */
+  hostName?: (hostId: Id) => string;
 };
 
 export type ApprovalFilters = {
@@ -128,6 +145,10 @@ export function deriveApprovalRows(
     nowMs: source.nowMs,
   });
   const queueIds = new Set(queueMembers.map((member) => member.item.id));
+  // Every instance a 待你处理 row blocks. Built from the unfiltered shared
+  // queue (a host/kind chip hiding the row does not make the instance idle):
+  // the recent tier must never advertise a blocked session as working.
+  const blockedInstanceIds = new Set(queueMembers.map((member) => member.item.instanceId));
 
   const passesFilters = (item: Interaction, instance: Instance | undefined): boolean => {
     if (filters.kind !== "all" && item.kind !== filters.kind) return false;
@@ -197,7 +218,33 @@ export function deriveApprovalRows(
     });
   }
 
-  return { queue, departed };
+  // 进行中 · 最近: the exact projection the compact inbox reads
+  // (deriveRecentInstances — terminal/starting/unknown rows already excluded
+  // there via the endReason-era projectStatus filter), so both surfaces
+  // always agree about which sessions are live. Desktop keeps its
+  // host/workspace chips on this tier; the kind segment does not touch
+  // instance rows. Each row already carries its poll-stable sig.
+  const nowMs = source.nowMs ?? Date.now();
+  const recent = deriveRecentInstances(
+    {
+      instances: source.instances,
+      phrases: source.phrases ?? {},
+      rollups: source.rollups ?? {},
+      titleOf: source.titleOf ?? (() => ""),
+      hostName: source.hostName ?? (() => ""),
+      workspaceLabel: source.workspaceLabel,
+    },
+    blockedInstanceIds,
+    nowMs,
+  ).filter((row) => {
+    if (filters.hostId && row.hostId !== filters.hostId) return false;
+    if (filters.workspaceId && instanceById.get(row.instanceId)?.workspaceId !== filters.workspaceId) {
+      return false;
+    }
+    return true;
+  });
+
+  return { queue, recent, departed };
 }
 
 /* ------------------------------------------------------------------ */

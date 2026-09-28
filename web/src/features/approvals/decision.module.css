@@ -226,10 +226,35 @@
   cursor: pointer;
   display: flex;
   align-items: center;
+  gap: 6px;
   padding: var(--space-2) 0;
   color: var(--fg-muted);
   font-size: var(--text-ui);
   user-select: none;
+  list-style: none;
+}
+
+/* display:flex drops the native disclosure widget; hide whatever marker an
+   engine still paints and draw the ▸/▾ affordance ourselves (same convention
+   as session/runDetails.module.css), so the marker shows in WebKit and
+   Chromium (c-inboxfu). */
+.planSummary::-webkit-details-marker {
+  display: none;
+}
+
+.planChev {
+  display: inline-flex;
+  width: 10px;
+  flex: none;
+  color: var(--fg-muted);
+}
+
+.planChev::before {
+  content: "▸";
+}
+
+.planDetails[open] .planChev::before {
+  content: "▾";
 }
 
 .planBody {

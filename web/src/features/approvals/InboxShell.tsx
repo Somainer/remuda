@@ -158,8 +158,59 @@ function compactView(
 }
 
 /* ------------------------------------------------------------------ */
-/* Desktop-only slim 已离队 row (third tier, no actions).              */
+/* Desktop-only tiers: slim live (进行中 · 最近) and departed rows.     */
 /* ------------------------------------------------------------------ */
+
+const DesktopRecentRow = memo(
+  function DesktopRecentRow({ row }: { row: InboxInstanceRow }) {
+    return (
+      <article
+        className={desktopCss.recentRow}
+        data-testid="approvals-recent-row"
+        data-instance-id={row.instanceId}
+        data-status={row.status}
+      >
+        <div className={desktopCss.recentHead}>
+          <StateDot status={row.status} />
+          <Link to={`/s/${row.instanceId}`} className={desktopCss.recentLink} title={row.title}>
+            {row.title}
+          </Link>
+          <span className={desktopCss.recentSpacer} />
+          <ContextRing pct={row.contextPct} />
+        </div>
+        {row.subtitle ? (
+          <p className={desktopCss.recentSubtitle} title={row.subtitle}>
+            {row.subtitle}
+          </p>
+        ) : null}
+        <div className={desktopCss.recentMeta}>
+          {row.hostLabel} / {row.workspaceLabel || "—"} · {row.harness} · {row.timeLabel}
+        </div>
+      </article>
+    );
+  },
+  (prev, next) => prev.row.sig === next.row.sig,
+);
+
+/**
+ * The desktop 进行中 · 最近 tier, keyed and memoized exactly like the compact
+ * one (a 2 s poll re-derives fresh row objects; the sig comparator skips
+ * unchanged commits). Both routes render rows from the SAME
+ * deriveRecentInstances projection.
+ */
+export function DesktopRecentList({ rows }: { rows: InboxInstanceRow[] }) {
+  if (rows.length === 0) return null;
+  return (
+    <section className={desktopCss.recent} data-testid="approvals-recent">
+      <h2 className={desktopCss.tierLabel} data-testid="approvals-tier-recent">
+        进行中 · 最近 ({rows.length})
+      </h2>
+      {rows.map((row) => (
+        <DesktopRecentRow key={row.instanceId} row={row} />
+      ))}
+    </section>
+  );
+}
 
 export type DepartedView = DecisionView & {
   stateText: string;
@@ -238,7 +289,9 @@ export function DepartedList({
   if (rows.length === 0) return null;
   return (
     <div className={desktopCss.departed} data-testid="inbox-departed">
-      <div className={desktopCss.departedLabel}>已离队</div>
+      <h2 className={desktopCss.tierLabel} data-testid="approvals-tier-departed">
+        已离队
+      </h2>
       {rows.map((row) => {
         const base = desktopView(row, workspaceLabel(row.instance?.workspaceId ?? ""));
         return (
@@ -438,6 +491,10 @@ function DesktopInbox({
             instances: hub.instances,
             hosts: hub.hosts,
             answering: hub.answering,
+            phrases: hub.summaries,
+            rollups: hub.usageRollup,
+            titleOf: (id) => hubStore.titleOf(id),
+            hostName: (id) => hubStore.hostName(id),
             deviceId,
             workspaceLabel,
             nowMs,
@@ -450,6 +507,8 @@ function DesktopInbox({
       hub.instances,
       hub.hosts,
       hub.answering,
+      hub.summaries,
+      hub.usageRollup,
       deviceId,
       workspaceLabel,
       nowMs,
@@ -460,11 +519,40 @@ function DesktopInbox({
     ],
   );
 
-  const { queue, departed } = rows;
+  const { queue, recent, departed } = rows;
   const pendingCount = queue.length;
   const filterKey = `${kind}\u0000${hostFilter}\u0000${workspaceFilter}`;
   const queueLimit = useIncrementalLimit(queue.length, { resetKey: filterKey });
+  const recentLimit = useIncrementalLimit(recent.length, { resetKey: filterKey });
   const departedLimit = useIncrementalLimit(departed.length, { resetKey: filterKey });
+
+  // Deep link (?focus=): the row mounts over rAF slices, so re-run as the
+  // queue/departed limits grow until the target has committed. The target is
+  // always an interaction row (the recent tier is keyed by instance).
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const focusedKey =
+    queue.find((row) => row.focused)?.item.id ??
+    departed.find((row) => row.focused)?.item.id ??
+    null;
+  useEffect(() => {
+    if (!focus || !focusedKey) return;
+    const el = scrollRef.current?.querySelector<HTMLElement>(
+      `[data-interaction-id="${CSS.escape(focus)}"]`,
+    );
+    el?.scrollIntoView({ block: "center", behavior: "auto" });
+  }, [focus, focusedKey, queueLimit, departedLimit]);
+
+  // Project live phrases for every recent instance the tier renders (same
+  // 2.5 s cadence as the compact inbox): refresh() never polls journals.
+  const recentIdKey = recent.map((row) => row.instanceId).join(",");
+  useEffect(() => {
+    const ids = recentIdKey ? recentIdKey.split(",") : [];
+    if (!ids.length) return;
+    const tick = () => void hubStore.hydrateRowSummaries(ids);
+    tick();
+    const timer = window.setInterval(tick, 2500);
+    return () => window.clearInterval(timer);
+  }, [recentIdKey]);
 
   return (
     <div className={desktopCss.page} data-testid="approvals-page">
@@ -477,7 +565,7 @@ function DesktopInbox({
           </span>
         }
       />
-      <div className={desktopCss.body}>
+      <div className={desktopCss.body} ref={scrollRef}>
         <div className={desktopCss.controls}>
           <KindSegment value={kind} onChange={onSetKind} trackClassName={ui.seg} />
           <div className={desktopCss.filters}>
@@ -515,10 +603,15 @@ function DesktopInbox({
               onRespond={respond}
             />
           ))}
+          {recent.length ? (
+            <DesktopRecentList rows={recent.slice(0, recentLimit)} />
+          ) : null}
           {departed.length ? (
             <DepartedList rows={departed.slice(0, departedLimit)} workspaceLabel={workspaceLabel} />
           ) : null}
-          {queue.length + departed.length === 0 ? <p className={desktopCss.empty}>没有待处理交互</p> : null}
+          {queue.length + recent.length + departed.length === 0 ? (
+            <p className={desktopCss.empty}>没有待处理交互</p>
+          ) : null}
         </div>
       </div>
     </div>

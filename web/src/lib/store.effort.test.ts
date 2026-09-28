@@ -354,3 +354,46 @@ it("an older poll projection cannot overwrite a newer live effective or move the
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });
+
+it("an identical poll still settles queued effort left by a historical onPrepend replay (c-perffu r2)", async () => {
+  // End state of an ascending load-earlier (onPrepend) replay: first the
+  // newer remuda effective edge folds (with no push-down in flight yet, it
+  // lands as a terminal-side switch), THEN the configure row journaled after
+  // it is replayed as queued — so pending exists while the effective map
+  // already carries the newer read-back. The next poll returns that SAME
+  // record; pending settlement must run independently of effective-record
+  // equality (r1 had nested it inside the effective fold gate).
+  const ctx = await startFollowing("r2-replay");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+
+  ctx.receive(effortEvent(2, "high", null, "launch"));
+  const newerAt = "2026-09-22T00:03:00Z";
+  ctx.receive({
+    ...effortEvent(3, "xhigh", false, "remuda"),
+    observedAt: newerAt,
+    payload: {
+      effective: { name: "xhigh", ultracode: false, source: "remuda", observedAt: newerAt },
+      raw: "xhigh",
+    },
+  } as unknown as Observation);
+  // The queued configure row, journaled AFTER the effective edge, replayed
+  // last: pending re-appears over the already-newer effective.
+  ctx.receive(configureLifecycle(4, "effort-queued:max", ctx.instance.id));
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // An IDENTICAL durable projection (fresh object, equal content/observedAt).
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: { name: "xhigh", ultracode: false, source: "remuda", observedAt: newerAt },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
+});

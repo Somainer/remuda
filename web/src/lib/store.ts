@@ -749,27 +749,32 @@ class HubStore {
       const view = effectiveFromRecord(instance.effortEffective);
       if (!view) continue;
       const current = next[instance.id];
-      // Fold only on a strictly newer observation, or an equal-timestamp
-      // record whose content actually changed — an identical fold is not an
-      // emission (c-perffu: quiet polls render nothing).
-      if (
+      const foldsEffective =
         !current ||
         view.observedAt > current.observedAt ||
-        (view.observedAt === current.observedAt && !structuralEqual(current, view))
-      ) {
+        (view.observedAt === current.observedAt && !structuralEqual(current, view));
+      // Pending settlement is evaluated INDEPENDENTLY of whether the effective
+      // record itself changes. The live socket may already have folded an
+      // equal effective while a historical queued-effort replay (onPrepend)
+      // still carries pending: an identical poll must then clear pending even
+      // though the effective map does not change.
+      const pending = this.state.effortPending[instance.id];
+      const settlesPending =
+        pending != null &&
+        (!pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt);
+      if (foldsEffective) {
+        // Fold only on a strictly newer observation, or an equal-timestamp
+        // record whose content actually changed — an identical fold is not an
+        // emission (c-perffu: quiet polls render nothing).
         next[instance.id] = view;
         effectiveUpdated = true;
-        const pending = this.state.effortPending[instance.id];
-        if (
-          pending
-          && (!pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt)
-        ) {
-          delete pendingNext[instance.id];
-          pendingSettled = true;
-          // Remember the read-back that settled it so the same edge arriving
-          // later on the live socket is not mistaken for a terminal switch.
-          this.settledEffortPushdown.set(instance.id, view.observedAt);
-        }
+      }
+      if (settlesPending) {
+        delete pendingNext[instance.id];
+        pendingSettled = true;
+        // Remember the read-back that settled it so the same edge arriving
+        // later on the live socket is not mistaken for a terminal switch.
+        this.settledEffortPushdown.set(instance.id, view.observedAt);
       }
     }
     if (effectiveUpdated || pendingSettled) {

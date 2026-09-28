@@ -199,20 +199,22 @@ describe("buildHomeGroups body text", () => {
     expect(groups[0].rows[0].bodyIsError).toBe(false);
   });
 
-  it("puts the instance error text in the body slot on an exited row", () => {
+  it("keeps a live error verbatim in the body of a still-running row", () => {
     const groups = build(
       named([
-        session("ins-failed", {
-          lifecycle: "exited",
+        session("ins-live-error", {
+          lifecycle: "running",
           activity: known("idle"),
           lastError: "API Error: Request rejected (429)",
         }),
       ]),
     );
     const row = groups[0].rows[0];
-    expect(row.status).toBe("exited");
+    expect(row.status).toBe("idle");
     expect(row.body).toBe("API Error: Request rejected (429)");
     expect(row.bodyIsError).toBe(true);
+    expect(row.bodyTone).toBeNull();
+    expect(row.bodyDetail).toBeNull();
   });
 
   it("falls back to the latest native severity=error lifecycle event when lastError is absent", () => {
@@ -267,6 +269,113 @@ describe("buildHomeGroups body text", () => {
     expect(byId.get("ins-exited")?.canResume).toBe(true);
     expect(byId.get("ins-exited-uncap")?.canResume).toBe(false);
     expect(byId.get("ins-exited")?.body).toMatch(/已结束/);
+  });
+});
+
+describe("buildHomeGroups ended rows speak the shared endReason projection (c-homeend)", () => {
+  function endedRow(patch: Partial<Instance>) {
+    const groups = build(
+      named([
+        session("ins-ended", {
+          lifecycle: "exited",
+          activity: known("idle"),
+          ...patch,
+        }),
+      ]),
+    );
+    return groups[0].rows[0]!;
+  }
+
+  it("node-epoch-changed: human interruption sentence, neutral tone, raw code only in detail", () => {
+    const row = endedRow({ lastError: "node-epoch-changed" });
+    expect(row.status).toBe("exited");
+    expect(row.body).toMatch(/^Node 重启，会话已中断/);
+    expect(row.body).not.toContain("node-epoch-changed");
+    expect(row.bodyIsError).toBe(false);
+    expect(row.bodyTone).toBe("interrupted");
+    expect(row.bodyDetail).toBe("node-epoch-changed");
+  });
+
+  it("model-mismatch: failed tone is red, the suffixed wire detail survives verbatim", () => {
+    const raw = "model-mismatch: requested e2e/auto observed e2e/some-other-model";
+    const row = endedRow({ lastError: raw });
+    expect(row.body).toMatch(/^模型与请求不一致，已停止/);
+    expect(row.body).not.toContain("model-mismatch");
+    // The red comes from the end tone, never the legacy error flag.
+    expect(row.bodyIsError).toBe(false);
+    expect(row.bodyTone).toBe("failed");
+    expect(row.bodyDetail).toBe(raw);
+  });
+
+  it("unknown code: neutral 已结束, never red, the raw text survives only as detail", () => {
+    const row = endedRow({ lastError: "mystery-wire-code-42" });
+    expect(row.body).toMatch(/已结束/);
+    expect(row.body).not.toContain("mystery-wire-code-42");
+    expect(row.bodyTone).toBe("ended");
+    expect(row.bodyIsError).toBe(false);
+    expect(row.bodyDetail).toBe("mystery-wire-code-42");
+  });
+
+  it("crash signal: 进程崩溃 sentence with a failed tone from the wire code", () => {
+    const row = endedRow({
+      lifecycle: "failed",
+      lastError: "native-exit-signal-SIGSEGV",
+      exit: known({
+        code: null,
+        signal: "SIGSEGV",
+        observedAt: "2026-09-19T10:00:00.000Z",
+      }),
+    });
+    expect(row.body).toMatch(/^进程崩溃（SIGSEGV）/);
+    expect(row.bodyTone).toBe("failed");
+    expect(row.bodyIsError).toBe(false);
+    expect(row.bodyDetail).toBe("native-exit-signal-SIGSEGV");
+  });
+
+  it("SIGTERM is an external termination, not a crash: interrupted and neutral", () => {
+    const row = endedRow({ lifecycle: "failed", lastError: "native-exit-signal-SIGTERM" });
+    expect(row.body).toMatch(/会话已中断/);
+    expect(row.bodyTone).toBe("interrupted");
+    expect(row.bodyDetail).toBe("native-exit-signal-SIGTERM");
+  });
+
+  it("a clean exit keeps the neutral ended sentence with null tooltip detail", () => {
+    const row = endedRow({ lastError: "" });
+    expect(row.body).toMatch(/已结束/);
+    expect(row.bodyTone).toBe("ended");
+    expect(row.bodyDetail).toBeNull();
+  });
+
+  it("r2: an ended row speaks the end label even while a durable pending question still exists", () => {
+    // The reconcile path (node-epoch-changed) settles lifecycle=exited,
+    // activity=idle while the interaction row outlives the process.
+    const instance = session("ins-restarted", {
+      lifecycle: "exited",
+      activity: known("idle"),
+      lastError: "node-epoch-changed",
+    });
+    const spaces = buildSpaces(workspaces, [instance], defaultSpacePrefs());
+    const pending = {
+      instanceId: "ins-restarted",
+      id: "int-stale-1",
+      state: "pending",
+      request: { kind: "question", title: "配置哪个密钥", fields: [{}] },
+    } as unknown as Interaction;
+    const rows = buildHomeRows({
+      spaces,
+      interactions: [pending],
+      titleOf: () => "restarted title",
+      rollupOf: () => null,
+    });
+    const row = rows.get("ins-restarted")!;
+    expect(row.status).toBe("exited");
+    // The stale question sentence never wins the subtitle of a dead session.
+    expect(row.body).not.toContain("题待回答");
+    expect(row.body).not.toContain("配置哪个密钥");
+    expect(row.body).toMatch(/^Node 重启，会话已中断/);
+    expect(row.bodyTone).toBe("interrupted");
+    expect(row.bodyDetail).toBe("node-epoch-changed");
+    expect(row.canResume).toBe(true);
   });
 });
 
@@ -446,6 +555,34 @@ describe("buildHomeRows / arrangeHomeGroups split (commit:HomeList caching seam)
     const rowsClean = buildHomeRows({ spaces: spaces1, interactions: [interaction("ins-blocked", "int-1")], titleOf, rollupOf: () => null });
     expect(homeRowsSignature(rowsErrored, ["ins-blocked"], spaces2, hostNameOf)).not.toBe(
       homeRowsSignature(rowsClean, ["ins-blocked"], spaces1, hostNameOf),
+    );
+  });
+
+  it("r2: the signature changes when only the ended row's tooltip detail changes (same label/tone)", () => {
+    const titleOf = (instanceId: string) => `${instanceId} title`;
+    const hostNameOf = () => "alpha-host";
+    const derive = (lastError: string) => {
+      // Both carrier codes project to the SAME label/tone
+      // （终端承载中断，会话已中断 / interrupted); only the raw detail differs.
+      const instance = session("ins-ended", {
+        lifecycle: "exited",
+        activity: known("idle"),
+        lastError,
+      });
+      const spaces = buildSpaces(workspaces, [instance], defaultSpacePrefs());
+      const rows = buildHomeRows({ spaces, interactions: [], titleOf, rollupOf: () => null });
+      return {
+        sig: homeRowsSignature(rows, [], spaces, hostNameOf),
+        row: rows.get("ins-ended")!,
+      };
+    };
+    const a = derive("herdr-carrier-lost");
+    const b = derive("carrier-missing");
+    expect(a.row.body).toBe(b.row.body);
+    expect(a.row.bodyTone).toBe(b.row.bodyTone);
+    expect(a.row.bodyDetail).not.toBe(b.row.bodyDetail);
+    expect(a.sig, "a detail-only last_error change must invalidate the cached slice").not.toBe(
+      b.sig,
     );
   });
 });

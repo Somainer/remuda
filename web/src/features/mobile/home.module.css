@@ -173,8 +173,12 @@
 }
 
 /* The row is one flex line: main link + the 恢复 action can never wrap under
-   a long body sentence (it truncates inside .rowText). Only the resume-error
-   note is allowed a second line. */
+   a long body sentence. flex-basis 0 (not auto) matters because .row wraps:
+   line-breaking measures each item's base size, and an auto basis would be
+   the sentence's nowrap max-content — wider than the row — which would push
+   恢复 onto its own line before shrinking ever runs. From a 0 basis the link
+   grows to what is left and the sentence truncates inside .rowText. Only the
+   resume-error note is allowed a second line. */
 .row {
   display: flex;
   flex-wrap: wrap;
@@ -186,7 +190,7 @@
 }
 
 .rowMain {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -232,6 +236,18 @@
 
 .rowBody[data-error="1"] {
   color: var(--danger-fg);
+}
+
+/* c-homeend: ended rows carry the shared EndTone from endReason(). A proven
+   failure is the only ended sentence painted red; a Node restart / external
+   termination and an ordinary close stay the same quiet muted colour. */
+.rowBody[data-tone="failed"] {
+  color: var(--danger-fg);
+}
+
+.rowBody[data-tone="interrupted"],
+.rowBody[data-tone="ended"] {
+  color: var(--fg-muted);
 }
 
 .rowTime {

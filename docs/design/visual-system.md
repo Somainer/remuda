@@ -349,6 +349,7 @@ tokenGuard 断言两条：
 - 选中（`aria-checked`、`aria-selected` 或 `aria-pressed` 为 true）：`--bg-raised` 底，`--fg-strong` 字，外加 `inset 0 0 0 1px var(--border-control)`，字重不变；
 - coarse 下：每项 `min-width: 44px`，`::after { inset: -9px 0 }` 把竖向热区补到 44；热区只向上下扩，相邻项不重叠；
 - ARIA：筛选用 `radiogroup/radio`，视图切换用 `tablist/tab`。
+- 修订（2026-09-28，UO-6a）：会话头的「终端 | 结构」视图切换保留 `radiogroup/radio`。它切换的是路由，不是同页的 tabpanel，没有可供 `aria-controls` 指向的面板；`tablist/tab` 只用于真正带 tabpanel 的切换。
 
 ### 8.3 输入框
 

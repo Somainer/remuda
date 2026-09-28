@@ -61,21 +61,56 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it("desktop keeps host, cost, switch, Stop and the toggles on the main row, with run details folded", () => {
+it("wide desktop keeps host, cost, switch, 文件, Stop and ⋯ on one row, with run details closed", () => {
   renderPage();
 
-  const details = screen.getByTestId("run-details");
-  expect(details).not.toHaveAttribute("open");
-  expect(screen.getByTestId("session-host")).toBeVisible();
-  expect(screen.getByTestId("session-cost")).toBeVisible();
-  expect(screen.getByTestId("view-switch")).toBeVisible();
-  expect(screen.getByRole("button", { name: "Stop" })).toBeVisible();
-  expect(screen.getByTestId("density-toggle")).toBeVisible();
-  expect(screen.getByTestId("files-toggle")).toBeVisible();
-  expect(screen.getByTestId("events-toggle")).toBeVisible();
-  expect(screen.queryByTestId("session-more-open")).toBeNull();
-  // The diagnostic row is the disclosure body, not a second visible row.
-  expect(screen.getByTestId("session-meta")).not.toBeVisible();
+  const header = screen.getByRole("banner");
+  expect(header).toHaveAttribute("data-layout", "desktop");
+  expect(within(header).getByTestId("session-host")).toBeVisible();
+  expect(within(header).getByTestId("session-cost")).toBeVisible();
+  expect(within(header).getByTestId("view-switch")).toBeVisible();
+  expect(within(header).getByTestId("files-toggle")).toBeVisible();
+  expect(within(header).getByRole("button", { name: "Stop" })).toBeVisible();
+  expect(within(header).getByTestId("session-more-open")).toBeVisible();
+  // Density and raw events live in ⋯ only (D-053).
+  expect(screen.queryByTestId("density-toggle")).toBeNull();
+  expect(screen.queryByTestId("events-toggle")).toBeNull();
+  // Run details takes no row until ⋯ opens it.
+  expect(screen.getByTestId("run-details")).not.toBeVisible();
+});
+
+it("desktop ⋯ lists the §2.2 items in order and never the switch, 文件 or Stop", () => {
+  renderPage();
+  fireEvent.click(screen.getByTestId("session-more-open"));
+
+  const menu = within(screen.getByTestId("session-more-popover")).getByRole("menu");
+  const ids = Array.from(menu.querySelectorAll("[role^='menuitem']")).map((item) =>
+    item.getAttribute("data-testid"),
+  );
+  expect(ids[0]).toBe("run-details-summary");
+  expect(ids).toContain("density-toggle");
+  expect(ids.at(-1)).toBe("events-toggle");
+  expect(ids).not.toContain("files-toggle");
+  expect(within(menu).queryByTestId("view-switch")).toBeNull();
+  expect(within(menu).queryByRole("button", { name: "Stop" })).toBeNull();
+
+  fireEvent.keyDown(menu, { key: "Escape" });
+  expect(screen.queryByTestId("session-more-popover")).toBeNull();
+  expect(screen.getByTestId("session-more-open")).toHaveFocus();
+});
+
+it("768–1023 moves 文件 into ⋯ and keeps the title", () => {
+  stubMatchMedia(() => false);
+  renderPage();
+
+  const header = screen.getByRole("banner");
+  expect(header).toHaveAttribute("data-layout", "desktop");
+  expect(within(header).getByRole("heading", { level: 1 })).toBeVisible();
+  expect(within(header).queryByTestId("files-toggle")).toBeNull();
+
+  fireEvent.click(screen.getByTestId("session-more-open"));
+  fireEvent.click(within(screen.getByTestId("session-more-popover")).getByTestId("files-toggle"));
+  expect(screen.getByTestId("files-route")).toBeInTheDocument();
 });
 
 it("renders a recorded model_pin_mismatch in run details with both ids verbatim", () => {
@@ -217,19 +252,23 @@ it("deduplicates a projected diagnostic and the same launch event still in the w
   expect(screen.getAllByTestId("run-details-model-pin")).toHaveLength(1);
 });
 
-it("mobile folds the chips strip into one header chip and moves the toggles into the ⋯ sheet", () => {
+it("compact is one row: 返回, the title block, switch, Stop and ⋯, with the toggles in the sheet", () => {
   mockViewportState.mobile = true;
-  stubMatchMedia((query) => query.includes("640"));
+  stubMatchMedia(() => false);
   renderPage();
 
-  // The full strip's space-chip buttons are gone; the one current-space chip
-  // opens the same drawer.
+  const header = screen.getByRole("banner");
+  expect(header).toHaveAttribute("data-layout", "compact");
+  // No chip strip: exactly one Space name, inside the title block that opens
+  // the drawer.
   expect(screen.queryAllByTestId("space-chip")).toHaveLength(0);
-  expect(screen.getByTestId("spaces-drawer-open")).toBeVisible();
+  expect(within(header).getAllByTestId("spaces-chips")).toHaveLength(1);
+  expect(screen.getByTestId("spaces-drawer-open")).toContainElement(screen.getByTestId("spaces-chips"));
 
   // The segmented switch and Stop are permanent main-row citizens.
-  expect(screen.getByTestId("view-switch")).toBeVisible();
-  expect(screen.getByRole("button", { name: "Stop" })).toBeVisible();
+  expect(within(header).getByRole("link", { name: "返回" })).toBeVisible();
+  expect(within(header).getByTestId("view-switch")).toBeVisible();
+  expect(within(header).getByRole("button", { name: "Stop" })).toBeVisible();
   expect(screen.queryByTestId("session-host")).toBeNull();
   expect(screen.queryByTestId("density-toggle")).toBeNull();
   expect(screen.queryByTestId("files-toggle")).toBeNull();
@@ -237,9 +276,9 @@ it("mobile folds the chips strip into one header chip and moves the toggles into
 
   fireEvent.click(screen.getByTestId("session-more-open"));
   const sheet = screen.getByTestId("session-more-sheet");
-  expect(within(sheet).getByTestId("density-toggle")).toHaveAttribute("role", "menuitem");
-  expect(within(sheet).getByTestId("files-toggle")).toHaveAttribute("role", "menuitem");
-  expect(within(sheet).getByTestId("events-toggle")).toHaveAttribute("role", "menuitem");
+  expect(within(sheet).getByTestId("density-toggle")).toHaveAttribute("role", "menuitemcheckbox");
+  expect(within(sheet).getByTestId("files-toggle")).toHaveAttribute("role", "menuitemcheckbox");
+  expect(within(sheet).getByTestId("events-toggle")).toHaveAttribute("role", "menuitemcheckbox");
   // The switch and Stop must never be reachable only through the menu.
   expect(within(sheet).queryByTestId("view-switch")).toBeNull();
   expect(within(sheet).queryByRole("button", { name: "Stop" })).toBeNull();
@@ -248,20 +287,15 @@ it("mobile folds the chips strip into one header chip and moves the toggles into
   expect(screen.getByTestId("files-route")).toBeInTheDocument();
 });
 
-it("a compact-but-wide (767px, no touch) window keeps the toggles inline", () => {
-  mockViewportState.mobile = true;
-  stubMatchMedia(() => false);
-  renderPage();
-
-  expect(screen.queryByTestId("session-more-open")).toBeNull();
-  expect(screen.getByTestId("density-toggle")).toBeVisible();
-  expect(screen.getByTestId("files-toggle")).toBeVisible();
-  expect(screen.getByTestId("events-toggle")).toBeVisible();
-});
-
-it("the collapsed trigger advertises the exact number of fields it reveals (desktop and compact)", () => {
-  const advertised = () =>
-    Number(screen.getByTestId("run-details-summary").textContent?.match(/(\d+) 项运行信息/)?.[1]);
+it("the ⋯ item advertises the exact number of fields run details reveals (desktop and compact)", () => {
+  const advertised = () => {
+    fireEvent.click(screen.getByTestId("session-more-open"));
+    const count = Number(
+      screen.getByTestId("run-details-summary").textContent?.match(/运行详情 · (\d+) 项/)?.[1],
+    );
+    fireEvent.click(screen.getByTestId("session-more-open"));
+    return count;
+  };
   // The meta body alternates field · separator, so fields = (children+1)/2.
   const renderedFields = () =>
     (screen.getByTestId("session-meta").children.length + 1) / 2;
@@ -271,7 +305,7 @@ it("the collapsed trigger advertises the exact number of fields it reveals (desk
   let result = renderPage();
   expect(advertised()).toBe(renderedFields());
 
-  // Compact: host + cost move into the disclosure, so the honest count rises.
+  // Compact: host + cost move into the panel, so the honest count rises.
   result.unmount();
   mockViewportState.mobile = true;
   stubMatchMedia(() => true);
@@ -279,13 +313,28 @@ it("the collapsed trigger advertises the exact number of fields it reveals (desk
   expect(advertised()).toBe(renderedFields());
 });
 
+it("desktop renders provenance and promotion once, inside run details", () => {
+  const withMarks = { ...grokInstance, launchedBy: "remuda" as const, mode: "promoted" as const };
+  vi.spyOn(store, "useHub").mockReturnValue({
+    ...store.hubStore.getSnapshot(),
+    ready: true,
+    instances: [withMarks],
+    events: { [withMarks.id]: [] },
+  });
+  renderPage();
+
+  const details = screen.getByTestId("run-details");
+  expect(screen.getAllByTestId("launched-by")).toHaveLength(1);
+  expect(screen.getAllByTestId("promoted-badge")).toHaveLength(1);
+  expect(details).toContainElement(screen.getByTestId("launched-by"));
+  expect(details).toContainElement(screen.getByTestId("promoted-badge"));
+});
+
 it.each([
-  // Crowded phone (390px): every layout query matches.
-  ["crowded phone", () => true],
-  // Coarse-pointer compact-but-wide (e.g. 900×600): the workbench compact
-  // query matches but the 640px crowded one does not — mobile is true,
-  // crowded is false, and the badges must still render once in the
-  // disclosure rather than twice.
+  // Phone (390px): every layout query matches.
+  ["phone", () => true],
+  // Coarse-pointer compact-but-wide (e.g. 900×600): compact layout, but not
+  // every width query matches — the badges must still render exactly once.
   ["coarse compact-but-wide", (query: string) => !query.includes("640")],
 ])("compact (%s) renders provenance and promotion exactly once, inside the disclosure", (_label, matchesFor) => {
   const withMarks = {
@@ -314,11 +363,15 @@ it.each([
   result.unmount();
 });
 
-it("remembers the run-details open state on this device across remounts", async () => {
+it("run details opens from ⋯ and remembers its state on this device across remounts", async () => {
+  const openFromMenu = () => {
+    fireEvent.click(screen.getByTestId("session-more-open"));
+    fireEvent.click(screen.getByTestId("run-details-summary"));
+  };
   const result = renderPage();
-  expect(screen.getByTestId("run-details")).not.toHaveAttribute("open");
+  expect(screen.getByTestId("run-details")).not.toBeVisible();
 
-  fireEvent.click(screen.getByTestId("run-details-summary"));
+  openFromMenu();
   await waitFor(() => expect(screen.getByTestId("run-details")).toHaveAttribute("open"));
   expect(screen.getByTestId("session-meta")).toBeVisible();
   expect(localStorage.getItem("runtime.run-details.open")).toBe("1");
@@ -326,8 +379,12 @@ it("remembers the run-details open state on this device across remounts", async 
   result.unmount();
   renderPage();
   expect(screen.getByTestId("run-details")).toHaveAttribute("open");
+  fireEvent.click(screen.getByTestId("session-more-open"));
+  expect(screen.getByTestId("run-details-summary")).toHaveAttribute("aria-checked", "true");
+  fireEvent.click(screen.getByTestId("session-more-open"));
 
-  fireEvent.click(screen.getByTestId("run-details-summary"));
-  await waitFor(() => expect(screen.getByTestId("run-details")).not.toHaveAttribute("open"));
+  // The panel heading folds it back too.
+  fireEvent.click(screen.getByTestId("run-details-heading"));
+  await waitFor(() => expect(screen.getByTestId("run-details")).not.toBeVisible());
   expect(localStorage.getItem("runtime.run-details.open")).toBe("0");
 });

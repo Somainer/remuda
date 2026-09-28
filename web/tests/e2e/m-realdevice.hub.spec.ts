@@ -908,7 +908,8 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
   }
 
   async function assertChromeReturns(page: Page, installRequired: boolean) {
-    await expect(page.getByTestId("run-details")).toBeVisible();
+    // 运行详情 is a ⋯ item now (D-053); the header's ⋯ is the chrome that returns.
+    await expect(page.getByTestId("session-more-open")).toBeVisible();
     await expect(page.getByTestId("resume-row")).toBeVisible();
     if (installRequired)
       await expect(page.getByTestId("install-bar")).toBeVisible();
@@ -958,7 +959,7 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       // Trigger exists → missing chrome here is a real failure.
       await expect(sessionPage).toHaveAttribute("data-status", "exited");
       await expect(page.getByTestId("resume-row")).toBeVisible();
-      await expect(page.getByTestId("run-details")).toBeVisible();
+      await expect(page.getByTestId("session-more-open")).toBeVisible();
       const strip = page.getByTestId("live-status-strip");
       await expect(strip).toBeVisible();
       // UO-6b: an EXITED session settles the strip — the final fixture event

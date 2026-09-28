@@ -7,18 +7,19 @@
   color: var(--paper);
 }
 
-/* Crowded phones: the two resume buttons cannot share the main row, so the
-   exited session gets a dedicated second header row instead of wrapped,
-   overlapping buttons. */
+/* The exited session's resume entry, one row under the header. */
 .resumeRow {
-  display: none;
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--space-2) 20px;
+  border-bottom: 1px solid var(--border);
 }
 
-.menuBtn {
-  width: 100%;
-  height: 44px;
-  min-height: 44px;
-  justify-content: flex-start;
+.resumeGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 /* The exited-but-not-resumable fallback link: never wraps the crowded row. */
@@ -122,92 +123,15 @@
     gap: 10px;
   }
 
-  @media (max-width: 640px) {
-    .resumeRow {
-      display: flex;
-      justify-content: flex-end;
-    }
-
-    .resumeRow button {
-      min-height: 44px;
-    }
+  .resumeRow {
+    padding: var(--space-2) var(--space-3);
   }
-}
 
-/* UO-4 mechanical split: re-exported class stubs so existing importers
+  .resumeGroup {
+    flex: 1;
+  }
 
-   keep a single `css` binding. Empty rules emit no CSS; the composed
-
-   class carries the original declarations. */
-
-.back {
-  composes: back from "./sessionHeader.module.css";
-}
-
-.costChip {
-  composes: costChip from "./sessionHeader.module.css";
-}
-
-.headBadges {
-  composes: headBadges from "./sessionHeader.module.css";
-}
-
-.headBtn {
-  composes: headBtn from "./sessionHeader.module.css";
-}
-
-.headBtnOn {
-  composes: headBtnOn from "./sessionHeader.module.css";
-}
-
-.headBtnActive {
-  composes: headBtnActive from "./sessionHeader.module.css";
-}
-
-.headRow {
-  composes: headRow from "./sessionHeader.module.css";
-}
-
-.headSpaceChip {
-  composes: headSpaceChip from "./sessionHeader.module.css";
-}
-
-.header {
-  composes: header from "./sessionHeader.module.css";
-}
-
-.hostChip {
-  composes: hostChip from "./sessionHeader.module.css";
-}
-
-.metaHost {
-  composes: metaHost from "./sessionHeader.module.css";
-}
-
-.moreBtn {
-  composes: moreBtn from "./sessionHeader.module.css";
-}
-
-.moreMenu {
-  composes: moreMenu from "./sessionHeader.module.css";
-}
-
-.spacer {
-  composes: spacer from "./sessionHeader.module.css";
-}
-
-.status {
-  composes: status from "./sessionHeader.module.css";
-}
-
-.statusWord {
-  composes: statusWord from "./sessionHeader.module.css";
-}
-
-.stopBtn {
-  composes: stopBtn from "./sessionHeader.module.css";
-}
-
-.title {
-  composes: title from "./sessionHeader.module.css";
+  .resumeGroup > button {
+    flex: 1;
+  }
 }

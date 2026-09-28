@@ -704,3 +704,23 @@
     min-height: var(--touch);
   }
 }
+
+/* Any coarse pointer (a portrait tablet included) gets the 44px strip, tab and
+   × reach: hit areas follow the pointer, never the viewport width (§3.4). */
+@media (pointer: coarse) {
+  .tabBar {
+    height: var(--touch);
+  }
+
+  .tabSelect {
+    min-height: var(--touch);
+  }
+
+  .tabClose {
+    width: var(--touch);
+  }
+
+  .newTab {
+    min-width: var(--touch);
+  }
+}

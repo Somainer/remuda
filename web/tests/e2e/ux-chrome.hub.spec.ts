@@ -5,14 +5,15 @@ import { fileURLToPath } from "node:url";
 import { login } from "./hub-auth";
 
 /**
- * c-sessionchrome (P0-1 / P0-5, D-040): compact session chrome and the
- * per-device 运行详情 disclosure.
+ * c-sessionchrome (P0-1 / P0-5, D-040, D-053): compact session chrome and the
+ * per-device 运行详情 panel.
  *
- * Geometry is the contract: at 390 the full spaces strip folds into one
- * current-space chip, the secondary toggles move into ⋯ (never the view
- * switch, never Stop), and every main-row control owns its 44px hot-zone
- * corners with no overlaps (D-039). At 1440 the diagnostics sit behind a
- * collapsed disclosure while host + cost + switch + Stop keep the main row.
+ * Geometry is the contract: the header is one row (52px at 390, 48px at
+ * 1440). At 390 the full spaces strip folds into the title block's Space
+ * name, the secondary toggles move into ⋯ (never the view switch, never
+ * Stop), and every main-row control owns its 44px hot-zone corners with no
+ * overlaps (D-039). At 1440 the diagnostics open from ⋯ while host + cost +
+ * switch + 文件 + Stop keep the row.
  *
  * A default Claude session on the fake Node launches on shell-pty, so it has
  * the 终端 / 结构 ViewSwitch.
@@ -219,7 +220,13 @@ async function markHeader(page: Page) {
   await mark(page.getByTestId("view-switch-structured"), "seg-struct");
   await mark(page.getByRole("button", { name: "Stop" }), "stop");
   await mark(page.getByTestId("session-more-open"), "more");
-  await mark(page.getByTestId("run-details-summary"), "details");
+}
+
+/** The ⋯ menu's items, in order, by testid. */
+async function menuIds(menu: Locator): Promise<(string | null)[]> {
+  return menu
+    .locator("[role^='menuitem']")
+    .evaluateAll((items) => items.map((item) => item.getAttribute("data-testid")));
 }
 
 test("390px: the chips strip folds, Stop and the switch stay reachable, and every hot zone is disjoint", async ({
@@ -263,14 +270,23 @@ test("390px: the chips strip folds, Stop and the switch stay reachable, and ever
       await page.getByRole("button", { name: "关闭空间面板" }).click();
       await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
 
-      // Compact / 文件 / 原始事件 move into ⋯; the switch and Stop do not.
+      // 运行详情 / Compact / 文件 / 原始事件 move into ⋯; the switch and Stop
+      // do not (ui-spec §2.2 order).
+      await expect(page.getByTestId("run-details")).toBeHidden();
       await expect(page.getByTestId("density-toggle")).toHaveCount(0);
       await expect(page.getByTestId("files-toggle")).toHaveCount(0);
       await expect(page.getByTestId("events-toggle")).toHaveCount(0);
       await page.getByTestId("session-more-open").click();
       const sheet = page.getByTestId("session-more-sheet");
       await expect(sheet).toBeVisible();
-      await expect(sheet.getByRole("menuitem")).toHaveCount(3);
+      expect(await menuIds(sheet)).toEqual([
+        "run-details-summary",
+        "transcript-search-open",
+        "collapse-all",
+        "density-toggle",
+        "files-toggle",
+        "events-toggle",
+      ]);
       await expect(sheet.getByTestId("density-toggle")).toBeVisible();
       await expect(sheet.getByTestId("files-toggle")).toBeVisible();
       await expect(sheet.getByTestId("events-toggle")).toBeVisible();
@@ -288,6 +304,10 @@ test("390px: the chips strip folds, Stop and the switch stay reachable, and ever
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth);
       expect(overflow).toBeLessThanOrEqual(390);
 
+      // One row, 52px (D-053).
+      const headerBox = await page.locator("[data-testid='session-page'] > header").boundingBox();
+      expect(headerBox!.height).toBeCloseTo(52, 0);
+
       // Geometry: each reachable control owns its 44px corners and the zones
       // never overlap (corner ownership proves the D-039 borders). Hit areas
       // follow pointer: coarse (visual-system.md §6.2), so only the touch
@@ -299,7 +319,6 @@ test("390px: the chips strip folds, Stop and the switch stay reachable, and ever
         await assertHotTarget(page, page.getByTestId("view-switch-structured"), "seg-struct", 390, 844);
         await assertHotTarget(page, page.getByRole("button", { name: "Stop" }), "stop", 390, 844);
         await assertHotTarget(page, page.getByTestId("session-more-open"), "more", 390, 844);
-        await assertHotTarget(page, page.getByTestId("run-details-summary"), "details", 390, 844);
       }
 
       // The fold gave the transcript at least 56px of vertical space.
@@ -322,12 +341,15 @@ test("390px: the chips strip folds, Stop and the switch stay reachable, and ever
   }
 });
 
-test("1440px: diagnostics hide behind a collapsed per-device disclosure while host/cost/switch/Stop keep the main row", async ({
+test("1440px: diagnostics open from ⋯ into a per-device run-details panel while host/cost/switch/文件/Stop keep the one row", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   const instanceId = await createClaudeSession(page);
   await clearApprovals(page, instanceId);
+
+  const header = page.locator("[data-testid='session-page'] > header");
+  expect((await header.boundingBox())!.height).toBeCloseTo(48, 0);
 
   // Main-row citizens, all inside the viewport.
   const vw = 1440;
@@ -335,10 +357,9 @@ test("1440px: diagnostics hide behind a collapsed per-device disclosure while ho
     ["host", page.getByTestId("session-host")],
     ["cost", page.getByTestId("session-cost")],
     ["switch", page.getByTestId("view-switch")],
-    ["stop", page.getByRole("button", { name: "Stop" })],
-    ["density", page.getByTestId("density-toggle")],
     ["files", page.getByTestId("files-toggle")],
-    ["events", page.getByTestId("events-toggle")],
+    ["stop", page.getByRole("button", { name: "Stop" })],
+    ["more", page.getByTestId("session-more-open")],
   ] as const) {
     const box = await target.boundingBox();
     expect(box, `${name} renders`).toBeTruthy();
@@ -351,10 +372,12 @@ test("1440px: diagnostics hide behind a collapsed per-device disclosure while ho
     ).toBe(name);
     console.log(`CHROME-1440 ${name} ${Math.round(box!.width)}x${Math.round(box!.height)} at x=${Math.round(box!.x)}`);
   }
-  expect(await page.getByTestId("session-more-open").count()).toBe(0);
+  // Density and raw events are ⋯-only (D-053).
+  await expect(page.getByTestId("density-toggle")).toHaveCount(0);
+  await expect(page.getByTestId("events-toggle")).toHaveCount(0);
   await expect(page.getByTestId("session-host")).not.toHaveText("");
 
-  // The disclosure exists, starts collapsed, and the diagnostics are hidden.
+  // The panel exists, starts closed, and the diagnostics are hidden.
   const details = page.getByTestId("run-details");
   await expect(details).toHaveCount(1);
   expect(await details.evaluate((el) => (el as HTMLDetailsElement).open)).toBe(false);
@@ -362,8 +385,18 @@ test("1440px: diagnostics hide behind a collapsed per-device disclosure while ho
   await expect(page.getByTestId("session-driver")).toBeHidden();
   await shot(page, "ux2026-chrome-1-1440.png");
 
-  // One fold reveals seq / connectivity / driver.
-  await page.getByTestId("run-details-summary").click();
+  // ⋯ → 运行详情 reveals seq / connectivity / driver.
+  await page.getByTestId("session-more-open").click();
+  const popover = page.getByTestId("session-more-popover");
+  expect(await menuIds(popover)).toEqual([
+    "run-details-summary",
+    "transcript-search-open",
+    "collapse-all",
+    "density-toggle",
+    "events-toggle",
+  ]);
+  await popover.getByTestId("run-details-summary").click();
+  await expect(popover).toHaveCount(0);
   await expect(page.getByTestId("session-meta")).toBeVisible();
   await expect(page.getByTestId("session-driver")).toContainText(/pty|print/);
   const meta = page.getByTestId("session-meta");

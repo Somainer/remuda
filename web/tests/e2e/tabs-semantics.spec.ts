@@ -393,13 +393,14 @@ test.describe("phone", () => {
     await space(page, "x-codexdrv").click();
     await expect(drawer).toHaveCount(0);
 
-    // The compact session route (/s/:id) keeps the single header chip that
-    // opens this same drawer; it still renders no strip.
+    // The compact session route (/s/:id) keeps the single Space name, inside
+    // the header title block that opens this same drawer; no strip.
     await expect(page.getByTestId("space-tabs")).toHaveCount(0);
     await expect(page.getByTestId("space-chip")).toHaveCount(0);
     const headerChips = page.locator("header").getByTestId("spaces-chips");
     await expect(headerChips).toHaveCount(1);
-    await expect(headerChips.getByTestId("spaces-drawer-open")).toBeVisible();
+    await expect(page.getByTestId("spaces-drawer-open").getByTestId("spaces-chips")).toHaveCount(1);
+    await expect(page.getByTestId("spaces-drawer-open")).toBeVisible();
 
     const dimensions = await page.evaluate(() => ({
       width: window.innerWidth,

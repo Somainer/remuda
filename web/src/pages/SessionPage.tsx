@@ -1,9 +1,10 @@
-import { Profiler, useEffect, useLayoutEffect, useRef, useState, type ProfilerOnRenderCallback, type ReactNode } from "react";
+import { Profiler, useCallback, useEffect, useLayoutEffect, useRef, useState, type ProfilerOnRenderCallback, type ReactNode } from "react";
 import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
+import { FileText, Info, ListCollapse, Rows3, ScrollText, Search } from "lucide-react";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
-import { StateDot } from "../components/StateDot";
 import { Button } from "../components/Button";
-import { Sheet } from "../components/Sheet";
+import { SessionHeader, useWideDesktop } from "../chrome/SessionHeader";
+import { SessionMoreMenu, type MoreMenuItem } from "../chrome/SessionMoreMenu";
 import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { ElicitationCard } from "../features/approvals/ElicitationCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
@@ -14,7 +15,7 @@ import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
-import { Transcript } from "../features/session/Transcript";
+import { Transcript, type TranscriptHandle } from "../features/session/Transcript";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
 import { useTurnDecision } from "../features/session/useTurnDecision";
 import { SessionNotifications } from "../features/session/notifications/SessionNotifications";
@@ -32,7 +33,6 @@ import { assembleTranscript, collectTasks, compactTranscript } from "../features
 import { readDismissedWorkflows } from "../features/session/workflowDismiss";
 import { canShowTerminal, hasStructuredSignal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
 import { ScreenView } from "../features/session/ScreenView";
-import { ViewSwitch } from "../features/session/ViewSwitch";
 import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode, UI_STATUS_LABEL } from "../lib/status";
 import { apiRouteClause, apiRouteKind, routeDownMessage } from "../lib/apiRoute";
 import { projectCommandStatus } from "../lib/commandStatus";
@@ -43,7 +43,6 @@ import { hubStore, useHub } from "../lib/store";
 import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
-import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
 import { FilesView } from "../features/files/FilesView";
 import session from "../chrome/sessionPage.module.css";
@@ -56,6 +55,25 @@ const NO_EVENTS: Observation[] = [];
 const onSessionCommit: ProfilerOnRenderCallback = (_id, _phase, actualDuration) => {
   reportProbe("commit:SessionPage", { actualDuration });
 };
+
+/** RunDetails' own key: the controlled panel persists through the page. */
+const RUN_DETAILS_KEY = "runtime.run-details.open";
+
+function readRunDetailsOpen(): boolean {
+  try {
+    return localStorage.getItem(RUN_DETAILS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeRunDetailsOpen(open: boolean): void {
+  try {
+    localStorage.setItem(RUN_DETAILS_KEY, open ? "1" : "0");
+  } catch {
+    /* storage unavailable: state just does not persist */
+  }
+}
 
 type SessionPageProps = { view?: "auto" | "structured" | "tty" | "files" | "events" };
 
@@ -79,30 +97,25 @@ function SessionPageBody({
   const hub = useHub();
   const annotationPanel = useAnnotationsContext();
   const workbench = useSpaceWorkbench();
-  const { active: space, newHref } = workbench;
+  const { newHref } = workbench;
   const navigate = useNavigate();
   const location = useLocation();
   const { mobile, offsetTop } = useWorkbenchViewport();
-  // D-040 phone fold: below this width the header cannot hold every control
-  // without pushing Stop past the viewport edge, so Compact / 文件 / 原始事件
-  // move into the ⋯ sheet. Width-keyed (not coarsePointer) so a narrow
-  // window without touch keeps the same layout — folding is a layout question.
-  // 767px deliberately stays inline: the whole row fits there and the touch
-  // contract probes that exact width.
-  const [crowded, setCrowded] = useState(false);
-  useEffect(() => {
-    if (!mobile || typeof window.matchMedia !== "function") {
-      setCrowded(false);
-      return;
-    }
-    const media = window.matchMedia("(max-width: 640px)");
-    const update = () => setCrowded(media.matches);
-    update();
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  }, [mobile]);
+  // ui-spec §2.2: 「文件」 stays on the desktop row only from 1024px up; below
+  // that (and on compact) it is a ⋯ item.
+  const wide = useWideDesktop();
   const [moreOpen, setMoreOpen] = useState(false);
-  const moreRef = useRef<HTMLButtonElement | null>(null);
+  // D-040 (3) / D-053: run details is folded by default and its open state is
+  // remembered on this device; the ⋯ item is its only trigger.
+  const [runDetailsOpen, setRunDetailsOpen] = useState(readRunDetailsOpen);
+  const toggleRunDetails = useCallback((open: boolean) => {
+    setRunDetailsOpen(open);
+    writeRunDetailsOpen(open);
+  }, []);
+  const closeRunDetails = useCallback(() => toggleRunDetails(false), [toggleRunDetails]);
+  const transcriptRef = useRef<TranscriptHandle | null>(null);
+  const openTranscriptSearch = useCallback(() => transcriptRef.current?.openSearch(), []);
+  const collapseTranscript = useCallback(() => transcriptRef.current?.collapseAll(), []);
   const [sendingIds, setSendingIds] = useState<string[]>([]);
   const sending = sendingIds.includes(instanceId);
   const setSending = (value: boolean) => setSendingIds((ids) => value ? [...new Set([...ids, instanceId])] : ids.filter((id) => id !== instanceId));
@@ -291,7 +304,6 @@ function SessionPageBody({
   };
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
   const connLabel = journalStatus === "live" ? hub.connection : journalStatus;
-  const workspace = space?.name;
   const title = hubStore.titleOf(instance.id);
   const structuredOnly = uiMode(instance) === "structured-only";
   const genericPty = isGenericPty(instance);
@@ -301,58 +313,14 @@ function SessionPageBody({
   const hostName = hubStore.hostName(instance.hostId);
   const nativeRefShort = nativeShort(instance);
   const showViewExtras = resolvedView === "structured" || resolvedView === "files" || resolvedView === "events";
-  const closeMore = () => setMoreOpen(false);
-  const renderDensity = (menu: boolean) => (
-    <button
-      key="density"
-      type="button"
-      role={menu ? "menuitem" : undefined}
-      className={`${session.headBtn} ${hub.compact ? session.headBtnOn : ""} ${menu ? session.menuBtn : ""}`}
-      data-testid="density-toggle"
-      data-mode={hub.compact ? "compact" : "full"}
-      onClick={() => {
-        hubStore.setCompact(!hub.compact);
-        if (menu) closeMore();
-      }}
-    >
-      {hub.compact ? "Compact" : "Full"}
-    </button>
-  );
-  const renderFiles = (menu: boolean) => (
-    <button
-      key="files"
-      type="button"
-      role={menu ? "menuitem" : undefined}
-      className={`${resolvedView === "files" ? session.headBtnActive : session.headBtn} ${menu ? session.menuBtn : ""}`}
-      data-testid="files-toggle"
-      aria-pressed={resolvedView === "files"}
-      onClick={() => {
-        if (resolvedView === "files") navigate(backTo);
-        else openFiles();
-        if (menu) closeMore();
-      }}
-    >
-      文件
-    </button>
-  );
-  const renderEvents = (menu: boolean) => (
-    <button
-      key="events"
-      type="button"
-      role={menu ? "menuitem" : undefined}
-      className={`${resolvedView === "events" ? session.headBtnActive : session.headBtn} ${menu ? session.menuBtn : ""}`}
-      data-testid="events-toggle"
-      aria-pressed={resolvedView === "events"}
-      onClick={() => {
-        navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`);
-        if (menu) closeMore();
-      }}
-    >
-      原始事件
-    </button>
-  );
+  const toggleFiles = () => {
+    if (resolvedView === "files") navigate(backTo);
+    else openFiles();
+  };
+  const transcriptMounted = resolvedView === "structured" && !snapshotLoading && !genericPty;
+  const filesInline = wide && !mobile && showViewExtras;
   const resumeControl = canResume ? (
-    <span className={session.headRow} data-testid="resume-control">
+    <span className={session.resumeGroup} data-testid="resume-control">
       {/* D-026: resume continues the same native session on a NEW
           instance, so both targets navigate away from this one. */}
       <Button
@@ -364,9 +332,8 @@ function SessionPageBody({
       >
         继续（结构化）
       </Button>
-      <button
-        type="button"
-        className={session.headBtn}
+      <Button
+        variant="default"
         data-testid="resume-terminal"
         disabled={resuming}
         onClick={() => {
@@ -374,22 +341,19 @@ function SessionPageBody({
         }}
       >
         在终端中继续
-      </button>
+      </Button>
     </span>
   ) : (
     <Link to={newHref} className={session.inheritLink}>开新会话继承 cwd</Link>
   );
-  // Two resume buttons cannot share the crowded 390px main row without
-  // wrapping over the disclosure; on phones they take their own header row.
-  const resumeOnOwnRow = status === "exited" && crowded && canResume;
 
-  // The 运行详情 fields as one array: the summary advertises exactly the
-  // number of items it can reveal (ui-spec §2.2), so the count is derived,
+  // The 运行详情 fields as one array: the ⋯ item advertises exactly the
+  // number of items the panel reveals (ui-spec §2.2), so the count is derived,
   // never hand-maintained. host/cost keep the desktop main row; on compact
-  // (and coarse-pointer compact, which also sets `mobile` above 640px) the
-  // disclosure is their only home — provenance and promotion move here too.
+  // (and coarse-pointer compact) the panel is their only home (D-049).
+  // Provenance and promotion live here on every width (D-053).
   const diagnostics: ReactNode[] = [];
-  if (mobile) diagnostics.push(<span key="host" className={session.metaHost}>{hostName}</span>);
+  if (mobile) diagnostics.push(<span key="host" data-testid="run-details-host">{hostName}</span>);
   diagnostics.push(
     <span key="driver" data-testid="session-driver">
       {promoted ? `${instance.driver} · promoted` : instance.driver}
@@ -422,16 +386,16 @@ function SessionPageBody({
   if (structuredOnly && !showTerminal) {
     diagnostics.push(<span key="structured-only">structured-only — 无终端 tab</span>);
   }
-  if (mobile && promoted) {
+  if (promoted) {
     diagnostics.push(
-      <span key="promoted" className={session.status} data-testid="promoted-badge" title={
+      <span key="promoted" data-testid="promoted-badge" title={
         instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
       }>
         {instance.kind} · promoted
       </span>,
     );
   }
-  if (mobile && instance.launchedBy) {
+  if (instance.launchedBy) {
     diagnostics.push(<LaunchedByMark key="launched-by" launchedBy={instance.launchedBy} />);
   }
   diagnostics.push(<ConnectionIndicator key="connection" status={connLabel} />);
@@ -479,6 +443,66 @@ function SessionPageBody({
     index === 0 ? [node] : [<span key={`sep-${index}`} className={session.dotSep}>·</span>, node],
   );
 
+  // The ⋯ menu, in the fixed ui-spec §2.2 order. The view switch and Stop are
+  // never here (D-040 (2)).
+  const moreItems: MoreMenuItem[] = [
+    {
+      key: "run-details",
+      testId: "run-details-summary",
+      label: `运行详情 · ${diagnostics.length} 项`,
+      icon: Info,
+      checked: runDetailsOpen,
+      onSelect: () => toggleRunDetails(!runDetailsOpen),
+    },
+  ];
+  if (transcriptMounted) {
+    moreItems.push(
+      {
+        key: "search",
+        testId: "transcript-search-open",
+        label: "搜索正文",
+        icon: Search,
+        onSelect: openTranscriptSearch,
+      },
+      {
+        key: "collapse",
+        testId: "collapse-all",
+        label: "全部折叠",
+        icon: ListCollapse,
+        onSelect: collapseTranscript,
+      },
+    );
+  }
+  moreItems.push({
+    key: "density",
+    testId: "density-toggle",
+    label: "紧凑工具卡",
+    icon: Rows3,
+    checked: hub.compact,
+    data: { "data-mode": hub.compact ? "compact" : "full" },
+    onSelect: () => hubStore.setCompact(!hub.compact),
+  });
+  if (showViewExtras && !filesInline) {
+    moreItems.push({
+      key: "files",
+      testId: "files-toggle",
+      label: "文件",
+      icon: FileText,
+      checked: resolvedView === "files",
+      onSelect: toggleFiles,
+    });
+  }
+  if (showViewExtras) {
+    moreItems.push({
+      key: "events",
+      testId: "events-toggle",
+      label: "原始事件",
+      icon: ScrollText,
+      checked: resolvedView === "events",
+      onSelect: () => navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`),
+    });
+  }
+
   return (
     <div
       className={session.page}
@@ -498,135 +522,43 @@ function SessionPageBody({
       data-annotation-readonly={annotationReadonly ? "1" : "0"}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
-      <header className={session.header}>
-        <div className={session.headRow}>
-          {mobile ? (
-            <Link className={session.back} to="/sessions" aria-label="返回">
-              ←
-            </Link>
-          ) : null}
-          {/* D-040: on compact /s/:id* the whole chips strip folds into this
-              one current-space chip; it opens the unchanged spaces drawer. */}
-          {mobile ? (
-            <span className={session.headSpaceChip}>
-              <SpacesMobile
-                variant="chip"
-                spaces={workbench.spaces}
-                active={workbench.active}
-                prefs={workbench.prefs}
-                instanceId={workbench.instanceId}
-                onSelect={workbench.select}
-              />
-            </span>
-          ) : null}
-          {/* The chip already names the space, so the mobile title does not
-              repeat the "space / " prefix. */}
-          <h1 className={session.title} title={workspace ? `${workspace} / ${title}` : title}>
-            {workspace && !mobile ? `${workspace} / ${title}` : title}
-          </h1>
-          <span
-            className={session.status}
-            data-testid="session-status-label"
-            title={statusLabel}
-          >
-            <StateDot status={status} />
-            {/* At crowded phone widths only the dot shows; the word stays in
-                the DOM (tests, screen readers) and in the title tooltip. */}
-            <span className={session.statusWord}>{statusLabel}</span>
-          </span>
-          {/* Provenance and promotion badges ride the desktop main row; on
-              compact (including the coarse-pointer compact clause) they are
-              rendered once, inside the 运行详情 disclosure. */}
-          {!mobile ? (
-            <span className={session.headBadges}>
-              {promoted ? (
-                <span className={session.status} data-testid="promoted-badge" title={
-                  instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
-                }>
-                  {instance.kind} · promoted
-                </span>
-              ) : null}
-              <LaunchedByMark launchedBy={instance.launchedBy} />
-            </span>
-          ) : null}
-          {!mobile ? (
-            <>
-              <span className={session.hostChip} data-testid="session-host" title={`主机 ${hostName}`}>
-                {hostName}
-              </span>
-              <span className={session.costChip} data-testid="session-cost">
-                {cost}
-              </span>
-            </>
-          ) : null}
-          <span className={session.spacer} />
-          {showTerminal ? (
-            <ViewSwitch
-              value={resolvedView === "tty" ? "tty" : "structured"}
-              onChange={(next) => navigate(`/s/${instance.id}/${next}`)}
-            />
-          ) : null}
-          {crowded ? null : renderDensity(false)}
-          {crowded || !showViewExtras ? null : (
-            <>
-              {/* 文件/原始事件 stay inline whenever the row fits; only the
-                  crowded phone fold moves them into ⋯ (D-040). */}
-              {renderFiles(false)}
-              {renderEvents(false)}
-            </>
-          )}
-          {status === "exited" && !resumeOnOwnRow ? resumeControl : null}
-          {status !== "exited" ? (
-            <button
-              type="button"
-              className={session.stopBtn}
-              aria-label="Stop"
-              onClick={() => {
+      <SessionHeader
+        mobile={mobile}
+        title={title}
+        taskTitle={sessionTask?.title ?? null}
+        status={status}
+        statusLabel={statusLabel}
+        hostName={hostName}
+        cost={cost}
+        view={showTerminal ? (resolvedView === "tty" ? "tty" : "structured") : null}
+        onView={(next) => navigate(`/s/${instance.id}/${next}`)}
+        files={filesInline ? { active: resolvedView === "files", onToggle: toggleFiles } : null}
+        onStop={
+          status === "exited"
+            ? null
+            : () => {
                 void hubStore.close(instance.id);
-              }}
-            >
-              {mobile ? "■" : "■ 停止"}
-            </button>
-          ) : null}
-          {crowded ? (
-            <>
-              {/* The view switch and Stop are permanent main-row citizens;
-                  this ⋯ only ever holds Compact / 文件 / 原始事件. */}
-              <button
-                type="button"
-                className={session.moreBtn}
-                data-testid="session-more-open"
-                aria-label="更多会话操作"
-                aria-haspopup="menu"
-                aria-expanded={moreOpen}
-                ref={moreRef}
-                onClick={() => setMoreOpen((value) => !value)}
-              >
-                ⋯
-              </button>
-              <Sheet
-                open={moreOpen}
-                onClose={closeMore}
-                variant="sheet"
-                testId="session-more-sheet"
-                returnFocusRef={moreRef}
-              >
-                <div className={session.moreMenu} role="menu" aria-label="会话操作">
-                  {renderDensity(true)}
-                  {showViewExtras ? renderFiles(true) : null}
-                  {showViewExtras ? renderEvents(true) : null}
-                </div>
-              </Sheet>
-            </>
-          ) : null}
+              }
+        }
+        more={
+          <SessionMoreMenu open={moreOpen} onOpenChange={setMoreOpen} sheet={mobile} items={moreItems} />
+        }
+        spaces={{
+          spaces: workbench.spaces,
+          active: workbench.active,
+          prefs: workbench.prefs,
+          instanceId: workbench.instanceId,
+          onSelect: workbench.select,
+        }}
+      />
+      <RunDetails count={diagnostics.length} open={runDetailsOpen} onClose={closeRunDetails}>
+        {diagnosticRows}
+      </RunDetails>
+      {status === "exited" ? (
+        <div className={session.resumeRow} data-testid="resume-row">
+          {resumeControl}
         </div>
-        {resumeOnOwnRow ? (
-          <div className={session.resumeRow} data-testid="resume-row">
-            {resumeControl}
-          </div>
-        ) : null}
-        <RunDetails count={diagnostics.length}>{diagnosticRows}</RunDetails>
-      </header>
+      ) : null}
       {nodeRestarted ? (
         <div
           className={session.nodeRestart}
@@ -697,6 +629,7 @@ function SessionPageBody({
           <ScreenView instance={instance} events={events} />
         ) : (
           <Transcript
+            ref={transcriptRef}
             events={events}
             bubbles={bubbles}
             compact={hub.compact}

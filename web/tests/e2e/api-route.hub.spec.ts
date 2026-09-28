@@ -185,8 +185,9 @@ test("a via session shows its echoed proxy route, then api-route-down when the p
     // Before the drop there is no error banner and no reroute clause.
     await expect(page.getByTestId("session-api-route-down")).toHaveCount(0);
 
-    // The clause lives inside the collapsed run-details disclosure; open it
-    // for the evidence shot.
+    // The clause lives inside the run-details panel, opened from the header
+    // ⋯ (D-053); open it for the evidence shot.
+    await page.getByTestId("session-more-open").click();
     await page.getByTestId("run-details-summary").click();
     await expect(clause).toBeVisible();
     await shot(page, "api-route-strip.png");

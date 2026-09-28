@@ -4,6 +4,13 @@ function row(page: import("@playwright/test").Page, text: string) {
   return page.getByTestId("session-row").filter({ hasText: text }).first();
 }
 
+/** 运行详情 opens from the header ⋯ menu (D-053). */
+async function openRunDetails(page: import("@playwright/test").Page) {
+  await page.getByTestId("session-more-open").click();
+  await page.getByTestId("run-details-summary").click();
+  await expect(page.getByTestId("session-meta")).toBeVisible();
+}
+
 test.describe("structured session M0-13", () => {
   test("session list pins pending and projects status", async ({ page }) => {
     await page.goto("/sessions");
@@ -159,11 +166,10 @@ test.describe("session chrome: view switch, locked harness, files route", () => 
     await files.click();
     await expect(page).toHaveURL(/\/files$/);
     await expect(page.getByTestId("files-pane")).toBeVisible();
-    // The session header survives the route. The diagnostic meta row now
-    // lives one fold below the main row (D-040); expand it to check.
+    // The session header survives the route. The diagnostic meta row lives
+    // in 运行详情, opened from ⋯ (D-053); open it to check.
     await expect(page.getByTestId("session-page")).toBeVisible();
-    await page.getByTestId("run-details-summary").click();
-    await expect(page.getByTestId("session-meta")).toBeVisible();
+    await openRunDetails(page);
     await expect(page.getByTestId("files-toggle")).toHaveAttribute("aria-pressed", "true");
 
     // 1: the in-page back affordance.
@@ -201,8 +207,7 @@ test.describe("session chrome: view switch, locked harness, files route", () => 
     await page.goto(`/s/${id}/files`);
     await expect(page.getByTestId("session-page")).toBeVisible();
     await expect(page.getByTestId("files-pane")).toBeVisible();
-    await page.getByTestId("run-details-summary").click();
-    await expect(page.getByTestId("session-meta")).toBeVisible();
+    await openRunDetails(page);
     await expect(page.getByTestId("files-back")).toBeVisible();
     await page.getByTestId("files-back").click();
     await expect(page).toHaveURL(new RegExp(`/s/${id}/structured$`));
@@ -217,8 +222,7 @@ test("the files route still has a back affordance at phone width", async ({ page
   const id = new URL(page.url()).pathname.split("/")[2];
   await page.goto(`/s/${id}/files`);
   await expect(page.getByTestId("files-pane")).toBeVisible();
-  await page.getByTestId("run-details-summary").click();
-  await expect(page.getByTestId("session-meta")).toBeVisible();
+  await openRunDetails(page);
   const back = page.getByTestId("files-back");
   await expect(back).toBeVisible();
   const box = await back.boundingBox();

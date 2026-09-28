@@ -1,4 +1,4 @@
-import { expect, request as apiRequest, test, type APIRequestContext, type Page } from "@playwright/test";
+import { expect, request as apiRequest, test, type APIRequestContext, type Browser, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
 
 /**
@@ -188,10 +188,69 @@ test.beforeEach(async ({ page }) => {
   await login(page);
 });
 
-test.afterAll(async ({ request }) => {
-  for (const id of created) {
-    await request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+/** Lifecycles that no longer hold a host placement slot. */
+const TERMINAL_LIFECYCLES = new Set(["exited", "failed"]);
+
+/**
+ * Delete every instance this spec created, through a FRESH authenticated
+ * browser context: the driving contexts may still be emulated-offline or have
+ * Hub routes installed (the lost-response test leaves its command routes in
+ * place), and Playwright's standalone `request` fixture carries NO device
+ * cookie (auth is the httpOnly remuda_device cookie), so a delete issued from
+ * it 401s and — when swallowed — leaks every session onto the shared gate
+ * hub until its 8 live-instance cap makes later specs' creates 422.
+ *
+ * Every DELETE is response-checked (2xx/404 only), and a final GET
+ * /v1/instances must show none of the created ids still in a live lifecycle.
+ */
+async function deleteCreatedInstances(browser: Browser) {
+  // Copy, do NOT splice up front: ids leave the shared list only AFTER the
+  // response checks and the live-slot verification pass, so a failed cleanup
+  // leaves them for the other hook to retry.
+  const ids = [...created];
+  if (!ids.length) return;
+  const cleanup = await browser.newPage();
+  try {
+    await login(cleanup, "e2e-offline-outbox");
+    for (const id of ids) {
+      const res = await cleanup.request.delete(`/v1/instances/${id}?force=1`);
+      expect([200, 202, 204, 404], `DELETE instance ${id} -> HTTP ${res.status()}`).toContain(
+        res.status(),
+      );
+    }
+    // The fake node settles the stop asynchronously: poll until none of our
+    // ids still holds a placement slot (absent rows pass — DELETE won).
+    await expect
+      .poll(
+        async () => {
+          const res = await cleanup.request.get("/v1/instances");
+          expect(res.status(), `GET instances -> HTTP ${res.status()}`).toBe(200);
+          const body = (await res.json()) as {
+            items?: { instanceId?: string; lifecycle?: string }[];
+          };
+          return (body.items ?? [])
+            .filter((it) => ids.includes(it.instanceId ?? ""))
+            .filter((it) => !TERMINAL_LIFECYCLES.has(it.lifecycle ?? ""))
+            .map((it) => it.instanceId);
+        },
+        { timeout: 30_000 },
+      )
+      .toEqual([]);
+    created.splice(0, created.length, ...created.filter((id) => !ids.includes(id)));
+  } finally {
+    await cleanup.close();
   }
+}
+
+// Clean up after EACH test so the three instances never pile up within the
+// run, and again in afterAll as a safety net when an afterEach could not run
+// its own cleanup (it only ever sees ids left behind).
+test.afterEach(async ({ browser }) => {
+  await deleteCreatedInstances(browser);
+});
+
+test.afterAll(async ({ browser }) => {
+  await deleteCreatedInstances(browser);
 });
 
 /**

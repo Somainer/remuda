@@ -209,12 +209,19 @@ export function buildHomeRows(
       // c-homeend: an ended row speaks the shared endReason sentence — the
       // human label and the red/neutral decision live in one module for every
       // session surface. The raw lastError never owns the body: it survives
-      // only as `bodyDetail` for the tooltip. Live rows keep the UO-3
+      // only as `bodyDetail` for the tooltip. The sentence is built from the
+      // label ITSELF, not nextStep()'s text: that projection puts a durable
+      // pending interaction ahead of its end-reason branch, so a restarted
+      // session whose approval/question outlived the process would otherwise
+      // keep showing the stale question. Live rows keep the UO-3
       // error-as-body rule (a journaled API error on a running process).
+      const canResume =
+        status === "exited" &&
+        instance.capabilities.capabilities.resume?.state === "supported";
       const end = endReason(instance);
       const ended = end !== null && status !== "unknown" ? end : null;
       const body = ended
-        ? { text: step.text, isError: false }
+        ? { text: canResume ? `${ended.label} · 可恢复` : ended.label, isError: false }
         : homeBody(status, step, homeError(instance, input.eventsOf?.(instance.id)));
       rows.set(instance.id, {
         id: instance.id,
@@ -227,9 +234,7 @@ export function buildHomeRows(
         bodyDetail: ended?.detail ?? null,
         contextPct: input.rollupOf(instance.id)?.contextPct ?? null,
         blocked: status === "blocked",
-        canResume:
-          status === "exited" &&
-          instance.capabilities.capabilities.resume?.state === "supported",
+        canResume,
         timeLabel: formatListTime(instance.updatedAt, nowMs),
         updatedAt: instance.updatedAt,
       });
@@ -334,10 +339,13 @@ export function buildHomeGroups(input: HomeRowsInput): HomeGroup[] {
 
 /**
  * Stable signature over everything that can change a derived row's pixels
- * (plus the pending-instance set). When two Hub snapshots sign the same, the
- * phone list keeps the previous `buildHomeRows()` result and React bails out —
- * the inbox badge changing alone (the same one pending interaction, more
- * interactions arriving for an already-blocked session) never commits it.
+ * (plus the pending-instance set) — and the end-reason tooltip detail, which
+ * is not a pixel but must refresh when a terminal row's last_error changes
+ * behind an unchanged label (c-homeend r2). When two Hub snapshots sign the
+ * same, the phone list keeps the previous `buildHomeRows()` result and React
+ * bails out — the inbox badge changing alone (the same one pending
+ * interaction, more interactions arriving for an already-blocked session)
+ * never commits it.
  */
 export function homeRowsSignature(
   rows: ReadonlyMap<string, HomeRow>,
@@ -348,7 +356,7 @@ export function homeRowsSignature(
   const rowPart = [...rows.values()]
     .map(
       (row) =>
-        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.bodyTone ?? "-"}|${row.contextPct ?? "-"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
+        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.bodyTone ?? "-"}|${row.bodyDetail ?? "-"}|${row.contextPct ?? "-"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
     )
     .join("\n");
   // Prefs/closed tabs and workspace membership change WHICH instances a space

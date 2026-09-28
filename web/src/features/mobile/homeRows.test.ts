@@ -345,6 +345,38 @@ describe("buildHomeGroups ended rows speak the shared endReason projection (c-ho
     expect(row.bodyTone).toBe("ended");
     expect(row.bodyDetail).toBeNull();
   });
+
+  it("r2: an ended row speaks the end label even while a durable pending question still exists", () => {
+    // The reconcile path (node-epoch-changed) settles lifecycle=exited,
+    // activity=idle while the interaction row outlives the process.
+    const instance = session("ins-restarted", {
+      lifecycle: "exited",
+      activity: known("idle"),
+      lastError: "node-epoch-changed",
+    });
+    const spaces = buildSpaces(workspaces, [instance], defaultSpacePrefs());
+    const pending = {
+      instanceId: "ins-restarted",
+      id: "int-stale-1",
+      state: "pending",
+      request: { kind: "question", title: "配置哪个密钥", fields: [{}] },
+    } as unknown as Interaction;
+    const rows = buildHomeRows({
+      spaces,
+      interactions: [pending],
+      titleOf: () => "restarted title",
+      rollupOf: () => null,
+    });
+    const row = rows.get("ins-restarted")!;
+    expect(row.status).toBe("exited");
+    // The stale question sentence never wins the subtitle of a dead session.
+    expect(row.body).not.toContain("题待回答");
+    expect(row.body).not.toContain("配置哪个密钥");
+    expect(row.body).toMatch(/^Node 重启，会话已中断/);
+    expect(row.bodyTone).toBe("interrupted");
+    expect(row.bodyDetail).toBe("node-epoch-changed");
+    expect(row.canResume).toBe(true);
+  });
 });
 
 describe("buildHomeGroups context ring", () => {
@@ -523,6 +555,34 @@ describe("buildHomeRows / arrangeHomeGroups split (commit:HomeList caching seam)
     const rowsClean = buildHomeRows({ spaces: spaces1, interactions: [interaction("ins-blocked", "int-1")], titleOf, rollupOf: () => null });
     expect(homeRowsSignature(rowsErrored, ["ins-blocked"], spaces2, hostNameOf)).not.toBe(
       homeRowsSignature(rowsClean, ["ins-blocked"], spaces1, hostNameOf),
+    );
+  });
+
+  it("r2: the signature changes when only the ended row's tooltip detail changes (same label/tone)", () => {
+    const titleOf = (instanceId: string) => `${instanceId} title`;
+    const hostNameOf = () => "alpha-host";
+    const derive = (lastError: string) => {
+      // Both carrier codes project to the SAME label/tone
+      // （终端承载中断，会话已中断 / interrupted); only the raw detail differs.
+      const instance = session("ins-ended", {
+        lifecycle: "exited",
+        activity: known("idle"),
+        lastError,
+      });
+      const spaces = buildSpaces(workspaces, [instance], defaultSpacePrefs());
+      const rows = buildHomeRows({ spaces, interactions: [], titleOf, rollupOf: () => null });
+      return {
+        sig: homeRowsSignature(rows, [], spaces, hostNameOf),
+        row: rows.get("ins-ended")!,
+      };
+    };
+    const a = derive("herdr-carrier-lost");
+    const b = derive("carrier-missing");
+    expect(a.row.body).toBe(b.row.body);
+    expect(a.row.bodyTone).toBe(b.row.bodyTone);
+    expect(a.row.bodyDetail).not.toBe(b.row.bodyDetail);
+    expect(a.sig, "a detail-only last_error change must invalidate the cached slice").not.toBe(
+      b.sig,
     );
   });
 });

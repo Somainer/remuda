@@ -1272,9 +1272,15 @@ class HubStore {
    * observed (sampling it once after the promise could leave a cached OPEN
    * forever — the owner's phone coming out of iOS background).
    */
-  private followGetReadyState: (() => number) | null = null;
-  /** Epoch ms of the last frame (event/tick/snapshot) on the current socket. */
-  private lastFollowFrameAt = 0;
+  /**
+   * Live socket probes and last-frame times, keyed by journalId. A session the
+   * user navigated AWAY from keeps its socket open (its events still hydrate
+   * the list), so liveness is scoped to the CURRENTLY BOUND journal only: an
+   * inactive session's frames must never certify the active session's link,
+   * and its close must never take the active session offline.
+   */
+  private followReadyState = new Map<Id, () => number>();
+  private followFrameAt = new Map<Id, number>();
 
   /**
    * The follow link is genuinely live only when the socket is OPEN AND a frame
@@ -1282,15 +1288,22 @@ class HubStore {
    * foreground resume trust a cached "live" instead of reopening.
    */
   private followSocketLive(): boolean {
-    if (!this.followGetReadyState || this.followGetReadyState() !== 1) return false;
-    if (!this.lastFollowFrameAt) return false;
-    return Date.now() - this.lastFollowFrameAt <= LIVE_FRAME_MS;
+    const journalId = this.connectionBoundJournal;
+    if (!journalId) return false;
+    const getReadyState = this.followReadyState.get(journalId);
+    if (!getReadyState || getReadyState() !== 1) return false;
+    const lastFrameAt = this.followFrameAt.get(journalId) ?? 0;
+    if (!lastFrameAt) return false;
+    return Date.now() - lastFrameAt <= LIVE_FRAME_MS;
   }
 
   /** Test-only: force the follow-live verdict (simulates open + fresh frame). */
   setFollowLiveForTest(open: boolean, framed: boolean) {
-    this.followGetReadyState = () => (open ? 1 : -1);
-    this.lastFollowFrameAt = framed ? Date.now() : 0;
+    const journalId = this.connectionBoundJournal ?? "test_journal";
+    if (open) this.followReadyState.set(journalId, () => 1);
+    else this.followReadyState.delete(journalId);
+    if (framed) this.followFrameAt.set(journalId, Date.now());
+    else this.followFrameAt.delete(journalId);
   }
 
   /** Test-only: drive the machine live the way a fresh follow frame would. */
@@ -1966,6 +1979,8 @@ class HubStore {
     this.connection = null;
     this.connectionBoundTo = null;
     this.connectionBoundJournal = null;
+    this.followReadyState.clear();
+    this.followFrameAt.clear();
     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
     this.outboxRetryTimer.clear();
     this.outboxRetryAttempt.clear();
@@ -2229,11 +2244,17 @@ class HubStore {
     // Fold projected effective state/catalog the single record carries.
     this.hydrateEffortEffective([instance]);
     this.hydrateModels([instance]);
-    // Already mounted (SessionPage re-render): rebind the connection machine
-    // to this active follow; a dead socket is reopened by the machine.
+    // Already mounted (SessionPage re-render / navigation back to a session
+    // whose socket stayed open): rebind the connection machine to THIS
+    // follow. The global state was previously driven by the socket the user
+    // just left; revalidate the re-bound one immediately — certify live when
+    // its socket is OPEN+fresh, otherwise arm the bind deadline so a dead
+    // socket is reopened rather than inherited as a false live.
     if (this.journals.has(instance.journalId)) {
       this.connectionBoundTo = instanceId;
       this.connectionBoundJournal = instance.journalId;
+      if (this.followSocketLive()) this.connection?.dispatch({ type: "frame" });
+      else this.connection?.followBound();
       return;
     }
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
@@ -2421,19 +2442,28 @@ class HubStore {
       (windowFloor) => void client.fillResyncGap(windowFloor),
       {
         onFrame: () => {
-          this.lastFollowFrameAt = Date.now();
-          this.connection?.dispatch({ type: "frame" });
+          // Record the frame on its OWN journal; only the currently bound
+          // session's frames drive the global machine. A socket left streaming
+          // for a session the user navigated away from must not certify the
+          // active session's link.
+          this.followFrameAt.set(instance.journalId, Date.now());
+          if (this.connectionBoundJournal === instance.journalId) {
+            this.connection?.dispatch({ type: "frame" });
+          }
         },
         onOpen: () => {
           // readyState is read live through getReadyState on every liveness
           // check; onOpen needs no cached copy.
         },
         // Genuine remote close of the CURRENT socket (eventsSubscribe ignores
-        // the close of a socket it intentionally replaced — see api.ts).
+        // the close of a socket it intentionally replaced — see api.ts). Only
+        // the bound session's close is a global link event.
         onClose: () => {
-          this.followGetReadyState = null;
-          this.lastFollowFrameAt = 0;
-          this.connection?.dispatch({ type: "close" });
+          this.followReadyState.delete(instance.journalId);
+          this.followFrameAt.delete(instance.journalId);
+          if (this.connectionBoundJournal === instance.journalId) {
+            this.connection?.dispatch({ type: "close" });
+          }
         },
       },
     );
@@ -2441,13 +2471,15 @@ class HubStore {
     // Hold the subscription's OWN live probe, never a sampled copy: a socket
     // that dies silently (no close callback, e.g. iOS background expiry) must
     // be seen as non-OPEN at the next liveness check.
-    this.followGetReadyState = sub.getReadyState;
+    this.followReadyState.set(instance.journalId, sub.getReadyState);
     // The subscribe SNAPSHOT is the reopen + catch-up certificate: the server
     // answered over this exact socket. Count it as a frame so a resume
     // certifies live even for an idle session with no subsequent events.
     if (sub.getReadyState() === 1) {
-      this.lastFollowFrameAt = Date.now();
-      this.connection?.dispatch({ type: "frame" });
+      this.followFrameAt.set(instance.journalId, Date.now());
+      if (this.connectionBoundJournal === instance.journalId) {
+        this.connection?.dispatch({ type: "frame" });
+      }
     }
     if (Number(sub.snapshot.asOfSeq) >= Number(afterSeq)) {
       // An EMPTY follow snapshot only says "no events past the afterSeq

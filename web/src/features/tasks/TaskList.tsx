@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { rest } from "../../lib/api";
 import type { components } from "../../lib/api.generated";
@@ -6,6 +6,7 @@ import { fetchChanges } from "../files/filesApi";
 import type { Task } from "../../types/generated";
 import {
   taskNextStep,
+  taskRowSignature,
   type TaskListGroup,
   type TaskRow,
 } from "./taskRows";
@@ -208,17 +209,18 @@ export function TaskGroups({
   );
 }
 
-function TaskRowView({
-  row,
-  variant,
-  selectedId,
-  onSelect,
-}: {
-  row: TaskRow;
-  variant: "desktop" | "phone";
-  selectedId: string | null;
-  onSelect?: (task: Task) => void;
-}) {
+const TaskRowView = memo(
+  function TaskRowView({
+    row,
+    variant,
+    selectedId,
+    onSelect,
+  }: {
+    row: TaskRow;
+    variant: "desktop" | "phone";
+    selectedId: string | null;
+    onSelect?: (task: Task) => void;
+  }) {
   const step = taskNextStep(row);
   const className = `${css.row} ${
     variant === "desktop" && selectedId === row.id ? css.rowSelected : ""
@@ -316,4 +318,13 @@ function TaskRowView({
       ))}
     </>
   );
-}
+  },
+  // Compare THIS row's own painted state: a selection change commits only the
+  // deselected and selected rows, not the whole rail. The signature is
+  // recursive, so a changed child always flips its parent's comparison.
+  (prev, next) =>
+    taskRowSignature(prev.row) === taskRowSignature(next.row) &&
+    prev.variant === next.variant &&
+    (prev.selectedId === prev.row.id) === (next.selectedId === next.row.id) &&
+    prev.onSelect === next.onSelect,
+);

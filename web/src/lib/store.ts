@@ -1,4 +1,6 @@
 import { useSyncExternalStore } from "react";
+import { profileRegion } from "./profileFlags";
+import { structuralEqual } from "./structuralEqual";
 
 /** Bounded journal tail the list reads per live instance to project its phrase. */
 const SUMMARY_TAIL = 64;
@@ -453,6 +455,22 @@ function applyInstanceActivity(instances: Instance[], events: Observation[]): In
  * unresolved — including a newer response that lands while an older one is
  * still pending.
  */
+/**
+ * True when the merge produced no element changes (same length, every row
+ * still reference-identical at the same index). Pair with the identity
+ * preservation inside the merge functions: an unchanged poll parses fresh
+ * JSON objects but the merge maps each one back onto the prior row, so this
+ * check lets the caller reuse the previous ARRAY reference and skip the
+ * store emission entirely (c-perffu: a quiet 2 s poll must not re-render).
+ */
+function sameArrayIdentity<T>(next: readonly T[], prev: readonly T[]): boolean {
+  if (next.length !== prev.length) return false;
+  for (let i = 0; i < next.length; i += 1) {
+    if (next[i] !== prev[i]) return false;
+  }
+  return true;
+}
+
 function mergeInstanceSnapshots(
   incoming: Instance[],
   current: Instance[],
@@ -463,7 +481,11 @@ function mergeInstanceSnapshots(
   const previous = new Map(current.map((instance) => [instance.id, instance]));
   const merged = incoming.map((instance) => {
     const newer = previous.get(instance.id);
-    return newer && BigInt(newer.durableSeq) > BigInt(instance.durableSeq) ? newer : instance;
+    if (newer && BigInt(newer.durableSeq) > BigInt(instance.durableSeq)) return newer;
+    // Equal content from a fresh JSON parse: keep the prior object identity so
+    // an unchanged poll is a no-op for every memoized consumer.
+    if (newer && structuralEqual(newer, instance)) return newer;
+    return instance;
   });
   if (!pins?.size) return merged;
   const seen = new Set(merged.map((instance) => instance.id));
@@ -472,9 +494,7 @@ function mergeInstanceSnapshots(
     const optimistic = previous.get(id);
     if (!optimistic) continue;
     // This response (in `outstanding`), or an even older request still
-    // pending, may predate the create: keep the optimistic row. A response
-    // that started strictly after the create AND has no older in-flight
-    // sibling is authoritative.
+    // pending, may predate the create: keep the optimistic row.
     if (Array.from(outstanding ?? [reqSeq]).some((seq) => seq <= pin.seq)) {
       merged.unshift(optimistic);
     }
@@ -539,7 +559,8 @@ function mergeInteractionSnapshots(
       merged.push(prior);
       continue;
     }
-    merged.push(row);
+    // Unchanged row from a fresh JSON parse: preserve the prior identity.
+    merged.push(prior && structuralEqual(prior, row) ? prior : row);
   }
   if (settled.size) {
     // Tombstone retention: the committed id is missing from this page. A
@@ -728,7 +749,14 @@ class HubStore {
       const view = effectiveFromRecord(instance.effortEffective);
       if (!view) continue;
       const current = next[instance.id];
-      if (!current || view.observedAt >= current.observedAt) {
+      // Fold only on a strictly newer observation, or an equal-timestamp
+      // record whose content actually changed — an identical fold is not an
+      // emission (c-perffu: quiet polls render nothing).
+      if (
+        !current ||
+        view.observedAt > current.observedAt ||
+        (view.observedAt === current.observedAt && !structuralEqual(current, view))
+      ) {
         next[instance.id] = view;
         effectiveUpdated = true;
         const pending = this.state.effortPending[instance.id];
@@ -763,7 +791,13 @@ class HubStore {
       const rollup = instance.usageRollup;
       if (!rollup) continue;
       const current = next[instance.id];
-      if (!current || rollup.turns >= current.turns) {
+      // Equal turn count with equal content is not a change; the server
+      // rebuilds the rollup object on every read.
+      if (
+        !current ||
+        rollup.turns > current.turns ||
+        (rollup.turns === current.turns && !structuralEqual(current, rollup))
+      ) {
         next[instance.id] = rollup;
         updated = true;
       }
@@ -781,15 +815,26 @@ class HubStore {
       const view = modelFromRecord(instance.modelEffective);
       if (view) {
         const current = effectiveNext[instance.id];
-        if (!current || view.observedAt >= current.observedAt) {
+        if (
+          !current ||
+          view.observedAt > current.observedAt ||
+          (view.observedAt === current.observedAt && !structuralEqual(current, view))
+        ) {
           effectiveNext[instance.id] = view;
           effUpdated = true;
         }
       }
       const catalog = catalogFromRecord(instance.modelCatalog);
       if (catalog) {
-        catalogNext[instance.id] = catalog;
-        catUpdated = true;
+        // The catalog payload is rebuilt server-side per read; fold it only
+        // when the content actually differs.
+        if (
+          catalogNext[instance.id] === undefined ||
+          !structuralEqual(catalogNext[instance.id], catalog)
+        ) {
+          catalogNext[instance.id] = catalog;
+          catUpdated = true;
+        }
       }
     }
     if (effUpdated || catUpdated) {
@@ -897,7 +942,11 @@ class HubStore {
       const view = effectivePermissionFromRecord(instance.permissionEffective);
       if (!view) continue;
       const current = next[instance.id];
-      if (!current || view.observedAt >= current.observedAt) {
+      if (
+        !current ||
+        view.observedAt > current.observedAt ||
+        (view.observedAt === current.observedAt && !structuralEqual(current, view))
+      ) {
         next[instance.id] = view;
         updated = true;
       }
@@ -2024,8 +2073,29 @@ class HubStore {
 
   async refreshHosts() {
     const page = await api.hostList();
-    const hosts = mergeHostWorkspaces(page.items, this.state.hosts);
-    this.emit({ hosts, workspaces: hosts.flatMap((host) => (host.workspaces ?? []).map(mapWorkspace)) });
+    profileRegion("store.hostsMerge", () => {
+      const hosts = mergeHostWorkspaces(page.items, this.state.hosts);
+      if (sameArrayIdentity(hosts, this.state.hosts)) return;
+      // mapWorkspace rebuilds every row object; reuse the prior mapped
+      // workspace when content is equal so buildSpaces inputs stay stable.
+      const prior = new Map(this.state.workspaces.map((w) => [`${w.hostId}|${w.id}`, w]));
+      let changed = false;
+      const workspaces = hosts.flatMap((host) =>
+        (host.workspaces ?? []).map((row) => {
+          const mapped = mapWorkspace(row);
+          const old = prior.get(`${mapped.hostId}|${mapped.id}`);
+          if (!old) {
+            changed = true;
+          } else if (!structuralEqual(old, mapped)) {
+            changed = true;
+            return mapped;
+          }
+          return old ?? mapped;
+        }),
+      );
+      changed ||= workspaces.length !== this.state.workspaces.length;
+      this.emit(changed ? { hosts, workspaces } : { hosts });
+    });
   }
 
   private applyWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
@@ -2074,15 +2144,26 @@ class HubStore {
         reqSeq,
         this.listOutstanding,
       );
-      this.emit({
-        instances: mergeInstanceSnapshots(
-          instances.items,
-          this.state.instances,
-          this.pinnedCreates,
-          reqSeq,
-          this.listOutstanding,
-        ),
-        interactions: mergedInteractions,
+      const mergedInstances = mergeInstanceSnapshots(
+        instances.items,
+        this.state.instances,
+        this.pinnedCreates,
+        reqSeq,
+        this.listOutstanding,
+      );
+      profileRegion("store.pollMerge", () => {
+        // An unchanged poll preserves every row identity (see the merge
+        // functions), so skip the emission — and every consumer render wave —
+        // entirely when neither snapshot changed.
+        if (
+          !sameArrayIdentity(mergedInstances, this.state.instances) ||
+          !sameArrayIdentity(mergedInteractions, this.state.interactions)
+        ) {
+          this.emit({
+            instances: mergedInstances,
+            interactions: mergedInteractions,
+          });
+        }
       });
       // A response newer than a pin proves the server has spoken after the
       // create/answer. Combined with the in-flight sweep below (every older

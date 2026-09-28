@@ -1,4 +1,5 @@
 import type { Command, CommandResult, Page } from "../types/command";
+import { profileRegion } from "./profileFlags";
 import type { Host, HostCli, Instance, TuiMode } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
@@ -1428,7 +1429,9 @@ function createLiveApi(): HubApi {
       const page = await rest<HubJson<"/v1/instances", "get">>(
         `/v1/instances${q?.hostId ? `?hostId=${encodeURIComponent(q.hostId)}` : ""}`,
       );
-      const items = page.items.map((row) => remember(mapInstance(row), instanceTitle(row)));
+      const items = profileRegion("api.mapInstances", () =>
+        page.items.map((row) => remember(mapInstance(row), instanceTitle(row))),
+      );
       return { items, nextCursor: page.nextCursor ?? null };
     },
     async instanceGet(instanceId) {

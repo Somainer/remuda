@@ -11,7 +11,9 @@ import { buildTaskGroups, taskCardSignal } from "./taskRows";
 import { TaskDetailPanel } from "./TaskDetailPanel";
 import { boardPath, useProjectFilter, useProjects } from "./ProjectSwitcher";
 import { PageHeader } from "../../components/PageHeader";
-import { profilingEnabled, reportProbe } from "../../lib/profileFlags";
+import { profilingEnabled, profileRegion, reportProbe } from "../../lib/profileFlags";
+import { structuralEqual } from "../../lib/structuralEqual";
+import { CommitProbe } from "../../components/CommitProbe";
 import {
   BOARD_WORK_COLUMNS,
   buildBoardModel,
@@ -57,13 +59,20 @@ function useBoardView(projectId: string | null): {
   const [view, setView] = useState<BoardView | null>(null);
   const path = boardPath(projectId);
 
+  // The projection is rebuilt server-side on every poll. Keep the previous
+  // object when the JSON content is equal: an unchanged 5 s tick must not
+  // rebuild the model or re-render the board (c-perffu).
+  const setIfChanged = useCallback((next: BoardView) => {
+    setView((prev) => (prev && structuralEqual(prev, next) ? prev : next));
+  }, []);
+
   const reload = useCallback(async () => {
     try {
-      setView(await fetchBoard(path));
+      setIfChanged(await fetchBoard(path));
     } catch {
       /* Keep the last good projection; AuthGate handles 401. */
     }
-  }, [path]);
+  }, [path, setIfChanged]);
 
   useEffect(() => {
     let cancelled = false;
@@ -71,7 +80,7 @@ function useBoardView(projectId: string | null): {
     const tick = async () => {
       try {
         const next = await fetchBoard(path);
-        if (!cancelled) setView(next);
+        if (!cancelled) setIfChanged(next);
       } catch {
         /* Stale projection stays on screen while the fetch fails. */
       }
@@ -82,7 +91,7 @@ function useBoardView(projectId: string | null): {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [path]);
+  }, [path, setIfChanged]);
 
   return { view, reload };
 }
@@ -443,7 +452,7 @@ export function BoardPage() {
   );
 
   const spaces = useMemo(
-    () => buildSpaces(hub.workspaces, hub.instances, prefs),
+    () => profileRegion("board.buildSpaces", () => buildSpaces(hub.workspaces, hub.instances, prefs)),
     [hub.workspaces, hub.instances, prefs],
   );
   const { branchOf } = useLiveBranches(spaces);
@@ -451,36 +460,48 @@ export function BoardPage() {
   // One Set per hub snapshot, shared by the board model and nothing else.
   const pendingByInstance = useMemo(
     () =>
-      new Set(
-        hub.interactions
-          .filter((interaction) => interaction.state === "pending")
-          .map((interaction) => interaction.instanceId),
+      profileRegion(
+        "board.pendingSet",
+        () =>
+          new Set(
+            hub.interactions
+              .filter((interaction) => interaction.state === "pending")
+              .map((interaction) => interaction.instanceId),
+          ),
       ),
     [hub.interactions],
   );
 
   const model = useMemo(
     () =>
-      buildBoardModel({
-        view,
-        instances: hub.instances as readonly CardSession[],
-        pendingInstanceIds: pendingByInstance,
-        query,
-      }),
+      profileRegion(
+        "board.buildModel",
+        () =>
+          buildBoardModel({
+            view,
+            instances: hub.instances as readonly CardSession[],
+            pendingInstanceIds: pendingByInstance,
+            query,
+          }),
+      ),
     [view, hub.instances, pendingByInstance, query],
   );
 
   const groups = useMemo(
     () =>
-      buildTaskGroups({
-        tasks: items,
-        instances: hub.instances,
-        interactions: hub.interactions,
-        spaces,
-        projectName,
-        branchOfSpace: branchOf,
-        query,
-      }),
+      profileRegion(
+        "board.buildGroups",
+        () =>
+          buildTaskGroups({
+            tasks: items,
+            instances: hub.instances,
+            interactions: hub.interactions,
+            spaces,
+            projectName,
+            branchOfSpace: branchOf,
+            query,
+          }),
+      ),
     [items, hub.instances, hub.interactions, spaces, projectName, branchOf, query],
   );
 
@@ -665,6 +686,7 @@ export function BoardPage() {
   const scopeTitle = projectId ? (projectName(projectId) ?? projectId) : "全局";
 
   return (
+    <CommitProbe name="BoardPage">
     <div className={css.page} data-testid="board-page" onKeyDown={onPageKeyDown}>
       {indexOpen ? (
         <div
@@ -699,12 +721,14 @@ export function BoardPage() {
             aria-label="搜索看板任务"
           />
         </div>
-        <TaskGroups
-          groups={groups}
-          variant="desktop"
-          selectedId={selectedId}
-          onSelect={onSelectRail}
-        />
+        <CommitProbe name="BoardRail">
+          <TaskGroups
+            groups={groups}
+            variant="desktop"
+            selectedId={selectedId}
+            onSelect={onSelectRail}
+          />
+        </CommitProbe>
       </aside>
 
       <main className={css.boardMain}>
@@ -753,7 +777,8 @@ export function BoardPage() {
             </p>
           ) : null}
 
-          <div className={css.columns} data-testid="board-columns">
+          <CommitProbe name="BoardColumns">
+            <div className={css.columns} data-testid="board-columns">
             {BOARD_WORK_COLUMNS.map((column) => (
               <BoardColumnView
                 key={column}
@@ -773,7 +798,8 @@ export function BoardPage() {
                 onColumnDrop={onColumnDrop}
               />
             ))}
-          </div>
+            </div>
+          </CommitProbe>
 
           {showArchived ? (
             <section className={css.archiveFold} data-testid="board-archive-fold">
@@ -839,5 +865,6 @@ export function BoardPage() {
         ) : null}
       </main>
     </div>
+    </CommitProbe>
   );
 }

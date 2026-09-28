@@ -260,6 +260,34 @@ export function taskNextStep(row: Pick<TaskRow, "needsHuman" | "blocked" | "task
 }
 
 /**
+ * Signature of every value a task-list row paints (c-perffu): the SE key,
+ * title, depth/child counts, the next-step phrase inputs, the session count
+ * and 打开 link target, and — recursively — the same signature for each
+ * child in order. A rebuilt `TaskRow` object with an equal signature paints
+ * pixel-identical output, so the memoized row component skips its commit on
+ * poll-driven re-derivations. A change ANYWHERE in the subtree flips the
+ * parent signature, so skipping a parent can never mask a changed child.
+ */
+export function taskRowSignature(row: TaskRow): string {
+  const parts = [
+    row.id,
+    row.displayKey,
+    row.task.title,
+    row.task.state,
+    row.task.blockedReason ?? "",
+    String(row.depth),
+    String(row.childCount),
+    String(row.sessionCount),
+    row.primarySessionId ?? "",
+    row.needsHuman ? "1" : "0",
+    row.blocked ? "1" : "0",
+    taskNextStep(row),
+    row.children.map((child) => taskRowSignature(child)).join(","),
+  ];
+  return parts.join("");
+}
+
+/**
  * The one signal line on a board card (ui-spec §2.9). The first established
  * condition wins, in this exact order:
  *

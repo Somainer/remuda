@@ -86,7 +86,10 @@ pub use config::{
 };
 pub use error::HubError;
 pub use maintenance::migrate;
-pub use transport::{ConnectedNodes, NodeTransport, StdioTransport, TransportKind, WssTransport};
+pub use transport::{
+    CallGate, ConnectedNodes, GatedTransport, NodeTransport, StdioTransport, TransportKind,
+    WssTransport,
+};
 
 /// Process-wide Hub state shared by HTTP and WS handlers.
 #[derive(Clone)]
@@ -326,6 +329,8 @@ pub mod store_test_support {
             forwarded: true,
             settlement_outcome: Some("rejected".into()),
             settlement_reason: Some("node rejected the send".into()),
+            settlement_http_status: None,
+            settlement_http_body: None,
             settlement: Some(CommandSettlement {
                 outcome: "rejected".into(),
                 reason: Some("node rejected the send".into()),
@@ -461,6 +466,38 @@ impl RunningHub {
         transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
     ) {
         self.state.nodes.insert(host_id.to_owned(), transport).await;
+    }
+
+    /// Test helper: block every Node-registry lookup (`kind_of`, `call`,
+    /// `insert`) until `release` is sent (or dropped). Returns only once the
+    /// lock is actually held, so a command POST parked afterwards is
+    /// deterministically in its pre-forward-attempt window.
+    #[doc(hidden)]
+    pub async fn test_hold_node_lookups(&self, release: tokio::sync::oneshot::Receiver<()>) {
+        let (acquired, on_acquired) = tokio::sync::oneshot::channel();
+        let nodes = self.state.nodes.clone();
+        tokio::spawn(async move {
+            nodes.test_hold_lock_until(release, acquired).await;
+        });
+        on_acquired.await.expect("node-lock holder started");
+    }
+
+    /// Test helper: mount a synthetic Node whose every RPC blocks until the
+    /// returned [`CallGate`](crate::CallGate) is opened, then answers
+    /// `Ok(None)` (frame never queued). Lets a test hold a forward attempt in
+    /// its mark-intent → rollback window while observing command GETs.
+    #[doc(hidden)]
+    pub async fn test_set_node_gated(&self, host_id: &str) -> crate::transport::CallGate {
+        use std::sync::Arc as StdArc;
+        let gate = crate::transport::CallGate::new();
+        self.state
+            .nodes
+            .insert(
+                host_id.to_owned(),
+                StdArc::new(crate::transport::GatedTransport::new(gate.clone())),
+            )
+            .await;
+        gate
     }
 
     /// Test helper: drop the live Node session for `host_id` (host goes offline).

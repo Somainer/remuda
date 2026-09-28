@@ -106,6 +106,17 @@ pub enum HubError {
     /// Internal invariant.
     #[error("{0}")]
     Internal(String),
+    /// A non-replayable command's already-persisted terminal outcome, replayed
+    /// verbatim (D-055 round 2): the Hub must answer the retry with the exact
+    /// HTTP status and JSON body the first attempt produced instead of
+    /// inventing a fresh `replayed:true` success.
+    #[error("stored command outcome {status}")]
+    StoredOutcome {
+        /// The status the original attempt answered with.
+        status: u16,
+        /// The exact JSON body the original attempt answered with.
+        body: serde_json::Value,
+    },
 }
 
 impl HubError {
@@ -136,7 +147,20 @@ impl HubError {
             Self::NodeBusy { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::ApiViaRefusal { code, .. } => StatusCode::from_u16(code.status()).unwrap(),
             Self::Store(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::StoredOutcome { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            }
         }
+    }
+
+    /// The HTTP status and JSON body this error renders — the pair a
+    /// non-replayable command persists with its terminal outcome so a replay
+    /// can reproduce the original answer byte-for-byte.
+    pub(crate) fn status_code_and_body(&self) -> (u16, serde_json::Value) {
+        if let Self::StoredOutcome { status, body } = self {
+            return (*status, body.clone());
+        }
+        (self.status().as_u16(), self.response_body())
     }
 
     fn code(&self) -> &'static str {
@@ -160,13 +184,15 @@ impl HubError {
             // `-unreachable`), not a SCREAMING_SNAKE hub code.
             Self::ApiViaRefusal { code, .. } => code.as_str(),
             Self::Store(_) | Self::Internal(_) => "INTERNAL",
+            // A replayed stored outcome keeps the body's own code; this arm is
+            // only reached by internal callers that never render it directly.
+            Self::StoredOutcome { .. } => "STORED_OUTCOME",
         }
     }
-}
 
-impl IntoResponse for HubError {
-    fn into_response(self) -> Response {
-        let status = self.status();
+    /// The JSON body paired with [`Self::status`] (see
+    /// [`Self::status_code_and_body`]).
+    fn response_body(&self) -> serde_json::Value {
         let mut body = json!({
             "error": self.to_string(),
             "code": self.code(),
@@ -217,6 +243,18 @@ impl IntoResponse for HubError {
             obj.insert("retryAfterMs".into(), json!(retry_after_ms));
             obj.insert("retryable".into(), json!(true));
         }
+        body
+    }
+}
+
+impl IntoResponse for HubError {
+    fn into_response(self) -> Response {
+        if let Self::StoredOutcome { status, body } = &self {
+            let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return (status, Json(body.clone())).into_response();
+        }
+        let status = self.status();
+        let body = self.response_body();
         (status, Json(body)).into_response()
     }
 }

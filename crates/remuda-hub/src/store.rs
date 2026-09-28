@@ -583,6 +583,12 @@ pub struct InstanceRecord {
     pub journal_id: String,
     /// Durable seq as decimal string.
     pub durable_seq: String,
+    /// How many Hub-side `instance.configure` spec merges this instance has
+    /// committed (D-055 round 2, item 4). The authoritative merge count for
+    /// concurrency tests: response/Node-frame counts cannot see a merge that
+    /// raced ahead of a failed or replayed forward. Starts at 0 for create.
+    #[serde(default)]
+    pub configure_seq: i64,
     /// Create-time.
     pub created_at: String,
     /// Update-time.
@@ -988,6 +994,16 @@ pub struct CommandRecord {
     /// `settlement.reason`. Internal ledger column, never a top-level field.
     #[serde(skip)]
     pub settlement_reason: Option<String>,
+    /// HTTP status the first attempt answered with, persisted for a
+    /// non-replayable command (D-055 round 2) so a replay reproduces the
+    /// original outcome instead of a do-nothing success. NULL when the first
+    /// attempt answered 200 (its row IS the outcome) or for older rows.
+    #[serde(skip)]
+    pub settlement_http_status: Option<i64>,
+    /// Exact JSON body the first attempt answered with, paired with
+    /// [`Self::settlement_http_status`]. Internal ledger column.
+    #[serde(skip)]
+    pub settlement_http_body: Option<String>,
     /// Protocol §2.5 settlement projection, present only once settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<CommandSettlement>,
@@ -3419,8 +3435,12 @@ impl Store {
                 object.insert("permissionMode".into(), json!(mode));
             }
             let now = now_rfc3339();
+            // The spec merge and the authoritative merge counter commit in one
+            // UPDATE (D-055 round 2, item 4).
             conn.execute(
-                "UPDATE instances SET spec_json = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE instances
+                 SET spec_json = ?1, updated_at = ?2, configure_seq = configure_seq + 1
+                 WHERE id = ?3",
                 params![Value::Object(object).to_string(), now, instance_id],
             )?;
             load_instance(conn, &instance_id)?
@@ -3747,7 +3767,8 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                         payload_json, idempotency_key, created_at, updated_at,
-                        settlement_outcome, settlement_reason
+                        settlement_outcome, settlement_reason,
+                        settlement_http_status, settlement_http_body
                  FROM commands
                  WHERE instance_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -3780,14 +3801,31 @@ impl Store {
         command_id: String,
         reason: String,
     ) -> Result<Option<CommandRecord>, StoreError> {
-        self.run_named("reject_command", move |conn| {
+        self.reject_command_outcome(command_id, reason, None, None)
+            .await
+    }
+
+    /// [`Self::reject_command`] variant that also persists the exact HTTP
+    /// status and JSON body the first attempt answered with (D-055 round 2).
+    /// A replay of the command returns that pair verbatim, so a pre-dispatch
+    /// or post-forward refusal can never become a replayed success.
+    pub async fn reject_command_outcome(
+        &self,
+        command_id: String,
+        reason: String,
+        http_status: Option<i64>,
+        http_body: Option<String>,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        self.run_named("reject_command_outcome", move |conn| {
             let now = now_rfc3339();
             let changed = conn.execute(
                 "UPDATE commands
                  SET state = 'settled', resolution = 'clear',
-                     settlement_outcome = 'rejected', settlement_reason = ?1, updated_at = ?2
-                 WHERE id = ?3 AND state = 'queued'",
-                params![reason, now, command_id],
+                     settlement_outcome = 'rejected', settlement_reason = ?1,
+                     settlement_http_status = ?2, settlement_http_body = ?3,
+                     updated_at = ?4
+                 WHERE id = ?5 AND state = 'queued'",
+                params![reason, http_status, http_body, now, command_id],
             )?;
             if changed == 0 {
                 return Ok(None);
@@ -4889,7 +4927,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             spec_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            last_error TEXT
+            last_error TEXT,
+            configure_seq INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS commands (
             id TEXT PRIMARY KEY,
@@ -4904,7 +4943,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             settlement_outcome TEXT,
-            settlement_reason TEXT
+            settlement_reason TEXT,
+            settlement_http_status INTEGER,
+            settlement_http_body TEXT
         );
         CREATE TABLE IF NOT EXISTS journal (
             instance_id TEXT NOT NULL,
@@ -5099,6 +5140,13 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
     ensure_column(&conn, "instances", "task_id", "TEXT")?;
+    // D-055 round 2: authoritative count of committed configure spec merges.
+    ensure_column(
+        &conn,
+        "instances",
+        "configure_seq",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
     ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
@@ -5123,6 +5171,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // settlement; they are NULL until the row settles.
     ensure_column(&conn, "commands", "settlement_outcome", "TEXT")?;
     ensure_column(&conn, "commands", "settlement_reason", "TEXT")?;
+    // D-055 round 2: a non-replayable command replays its first attempt's
+    // exact HTTP status and body; NULL for 200 rows and pre-round-2 data.
+    ensure_column(&conn, "commands", "settlement_http_status", "INTEGER")?;
+    ensure_column(&conn, "commands", "settlement_http_body", "TEXT")?;
     // One-time cleanup of the round-2 shape: a failed delivery was briefly a
     // fourth `state='failed'` value held in a `reason` column. Fold any rows an
     // older build persisted into the §2.5 form (`settled` + a `rejected`
@@ -8072,7 +8124,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
                 mode, promoted_at, launched_by,
-                role, scope_json, grants_json, task_id, api_route_json
+                role, scope_json, grants_json, task_id, api_route_json, configure_seq
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -8248,6 +8300,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                     .map(str::to_string),
                 journal_id: row.get(9)?,
                 durable_seq: durable.to_string(),
+                configure_seq: row.get(23)?,
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
                 last_error: row.get(14)?,
@@ -8393,7 +8446,8 @@ fn load_command(conn: &Connection, id: &str) -> Result<Option<CommandRecord>, St
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                 payload_json, idempotency_key, created_at, updated_at,
-                settlement_outcome, settlement_reason
+                settlement_outcome, settlement_reason,
+                settlement_http_status, settlement_http_body
          FROM commands WHERE id = ?1",
         params![id],
         command_from_row,
@@ -8406,7 +8460,8 @@ fn load_command_by_key(conn: &Connection, key: &str) -> Result<Option<CommandRec
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                 payload_json, idempotency_key, created_at, updated_at,
-                settlement_outcome, settlement_reason
+                settlement_outcome, settlement_reason,
+                settlement_http_status, settlement_http_body
          FROM commands WHERE idempotency_key = ?1",
         params![key],
         command_from_row,
@@ -8703,6 +8758,8 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
     let forwarded: i64 = row.get(6)?;
     let settlement_outcome: Option<String> = row.get(11)?;
     let settlement_reason: Option<String> = row.get(12)?;
+    let settlement_http_status: Option<i64> = row.get(13)?;
+    let settlement_http_body: Option<String> = row.get(14)?;
     Ok(CommandRecord {
         command_id: row.get(0)?,
         instance_id: row.get(1)?,
@@ -8717,6 +8774,8 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
         ),
         settlement_outcome,
         settlement_reason,
+        settlement_http_status,
+        settlement_http_body,
         payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
         idempotency_key: row.get(8)?,
         created_at: row.get(9)?,

@@ -447,3 +447,184 @@ test("a committed POST whose browser response is lost retries with replayed:true
   await expect.poll(() => hubJournalMessageCount(api, instanceId, commandId!)).toBe(1);
   await expectDelivered(page, commandId);
 });
+
+test("an online send labels the row 等待发送 then 已发送，等待确认/已受理 as it delivers", async ({ page }) => {
+  const instanceId = await createSession(page, "label progression seed");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const api = await hubApi(page);
+
+  // Hold this instance's single-deliverer Web Lock from inside the page: with
+  // no flush possible the queued bubble must sit at its honest online label
+  // (等待发送 — NOT 待发送（离线）, the link is live the whole time).
+  await page.evaluate((iid) => {
+    const w = window as unknown as {
+      __releaseLock?: () => void;
+    };
+    const lock = new Promise<void>((resolve) => {
+      w.__releaseLock = resolve;
+    });
+    void navigator.locks.request(`remuda-outbox-${iid}`, () => lock);
+  }, instanceId);
+
+  // Once the flush acquires the lock it reaches the POST; park that so the
+  // in-flight label is observable too.
+  const commandsPattern = /\/v1\/instances\/[^/]+\/commands$/;
+  let releasePost: (() => void) | null = null;
+  const postGate = new Promise<void>((resolve) => {
+    releasePost = resolve;
+  });
+  await page.context().route(commandsPattern, async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    await postGate;
+    const res = await route.fetch();
+    return route.fulfill({ response: res });
+  });
+
+  await sendMessage(page, "watch the labels");
+  const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
+  await expect(bubble).toBeVisible();
+  const commandId = await bubble.getAttribute("data-command-id");
+  expect(commandId).toBeTruthy();
+
+  // Queued behind the lock, link live: 等待发送, never the offline wording.
+  await expect(bubble).toContainText("等待发送");
+  await expect(bubble).not.toContainText("离线");
+
+  // Release the lock: the flush takes it and the parked POST shows the row
+  // reached the Hub (in-flight), never 状态待确认.
+  await page.evaluate(() => (window as unknown as { __releaseLock?: () => void }).__releaseLock?.());
+  await expect(bubble).toContainText("已发送，等待确认", { timeout: 15_000 });
+  await expect(bubble).not.toContainText("状态待确认");
+
+  // Release the POST: the command runs once and the journal join replaces
+  // the chip with the authoritative row (已受理 on the way).
+  releasePost?.();
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    .toBe(1);
+  await expect
+    .poll(
+      async () =>
+        (await hubCommands(api, instanceId)).filter(
+          (c) => c.operation === "instance.send" && c.id === commandId,
+        ).length,
+      { timeout: 30_000 },
+    )
+    .toBe(1);
+  await expectDelivered(page, commandId);
+});
+
+/**
+ * Test-only service worker: network-first with an offline cache fallback for
+ * every same-origin GET EXCEPT the Hub API (/v1), which must always reach the
+ * network so an offline bootstrap fails honestly. Registered explicitly from
+ * the test (the app registers its SW only in PROD builds) so a FULL emulated
+ * offline navigation — context.setOffline(true) still in effect across the
+ * reload — can serve the dev-server shell from the cache.
+ */
+const OFFLINE_SHELL_SW = `
+const CACHE = "e2e-offline-shell-v1";
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith("/v1/")) return;
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    try {
+      const res = await fetch(req);
+      if (res && res.ok && res.type === "basic") {
+        cache.put(req, res.clone()).catch(() => {});
+      }
+      return res;
+    } catch (err) {
+      const hit = await cache.match(req, { ignoreSearch: true });
+      if (hit) return hit;
+      throw err;
+    }
+  })());
+});
+`;
+
+test("an offline-queued message survives a reload with the browser context STILL offline and sends once after", async ({ page }) => {
+  const instanceId = await createSession(page, "full offline reload seed");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const api = await hubApi(page);
+
+  // Install the offline-shell worker and let it take control.
+  await page.context().route("**/e2e-offline-sw.js", (route) =>
+    route.fulfill({ contentType: "application/javascript; charset=utf-8", body: OFFLINE_SHELL_SW }),
+  );
+  await page.evaluate(async () => {
+    await navigator.serviceWorker.register("/e2e-offline-sw.js", { updateViaCache: "none" });
+    await navigator.serviceWorker.ready;
+    if (!navigator.serviceWorker.controller) {
+      await new Promise((resolve) =>
+        navigator.serviceWorker.addEventListener("controllerchange", resolve, { once: true }),
+      );
+    }
+  });
+
+  // One more ONLINE navigation so the controlled page primes the shell cache.
+  await page.goto(page.url());
+  await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+
+  // Go fully offline at the BROWSER CONTEXT level (not a Hub-only route): the
+  // next reload happens with emulation still in effect. The cached shell must
+  // boot while every Hub call and the follow upgrade genuinely fail.
+  await page.context().setOffline(true);
+  await expect(page.getByTestId("journal-banner")).toHaveAttribute("data-state", "offline");
+
+  await sendMessage(page, "offline across a full offline reload");
+  const queued = page.locator('[data-testid="optimistic-bubble"]');
+  await expect(queued).toHaveCount(1);
+  const commandId = await queued.getAttribute("data-command-id");
+  expect(commandId).toBeTruthy();
+  await expect(queued.first()).toContainText("待发送（离线）");
+  // The independent API client is outside the browser context: nothing sent.
+  expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
+
+  // Reload WHILE context offline: the service worker serves the document and
+  // the whole module shell; the restored app boots from durable state.
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
+  const restored = page.locator(`[data-testid="optimistic-bubble"][data-command-id="${commandId}"]`);
+  await expect(restored).toBeVisible();
+  expect(restored).toContainText("offline across a full offline reload");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  await expect(restored).toContainText("待发送（离线）");
+  // Still nothing at the Hub through the offline reload.
+  expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
+
+  // Lift emulation. The test launch disables Chromium's PNA loopback block
+  // (a loopback-harness artifact; see playwright.hub.config.ts), so the
+  // restored page reconnects its follow socket directly: an online event plus
+  // a foreground resume kick the machine out of its offline backoff.
+  await page.context().setOffline(false);
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event("online"));
+    window.dispatchEvent(new Event("focus"));
+  });
+  await expect
+    .poll(
+      async () =>
+        (await hubCommands(api, instanceId)).filter(
+          (c) => c.operation === "instance.send" && c.id === commandId,
+        ).length,
+      { timeout: 60_000 },
+    )
+    .toBe(1);
+  await expect.poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 }).toBe(1);
+  // The link banner must clear too. A page the SW restored offline keeps a
+  // network context that blocks its follow WebSocket even after emulation
+  // lifts (see launch args), so a fresh NETWORK navigation is required; the
+  // app's own restart logic lands on the session route, then the fully-online
+  // boot certifies live and hides the banner.
+  // The link banner clears after the brief 已恢复 notice (1.5 s).
+  await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
+  await expectDelivered(page, commandId);
+});

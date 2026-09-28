@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { JournalBanner } from "./JournalBanner";
 import { hubStore } from "../../lib/store";
@@ -47,5 +47,47 @@ describe("JournalBanner", () => {
     rerender(<JournalBanner status="live" />);
     // Stale is intentionally quiet (grey dot only, no banner).
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("shows 已恢复 once after an offline spell and removes it 1.5 s later", () => {
+    vi.useFakeTimers();
+    act(() => setConnection("offline"));
+    render(<JournalBanner status="live" />);
+    act(() => setConnection("recovering"));
+    act(() => setConnection("live"));
+    expect(screen.getByTestId("journal-banner")).toHaveAttribute("data-state", "restored");
+
+    act(() => {
+      vi.advanceTimersByTime(1500);
+    });
+    expect(screen.queryByTestId("journal-banner")).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("does not show 已恢复 for a quiet-session stale→live watchdog flap", () => {
+    vi.useFakeTimers();
+    // The socket's only frame on a quiet session is its open snapshot; the
+    // frame watchdog then flaps stale → reopen → live every window. That must
+    // never (re)arm the recovery notice.
+    render(<JournalBanner status="live" />);
+    for (let i = 0; i < 3; i += 1) {
+      setConnection("stale");
+      act(() => {
+        vi.advanceTimersByTime(15_000);
+      });
+      setConnection("recovering");
+      setConnection("live");
+      expect(screen.queryByTestId("journal-banner")).toBeNull();
+    }
+    vi.useRealTimers();
+  });
+
+  it("hides a showing 已恢复 notice immediately when the link drops again", () => {
+    act(() => setConnection("offline"));
+    render(<JournalBanner status="live" />);
+    act(() => setConnection("live"));
+    expect(screen.getByTestId("journal-banner")).toHaveAttribute("data-state", "restored");
+    act(() => setConnection("offline"));
+    expect(screen.getByTestId("journal-banner")).toHaveAttribute("data-state", "offline");
   });
 });

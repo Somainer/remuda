@@ -30,19 +30,26 @@ export function JournalBanner({
   const pendingCount = useHub().outboxPending;
   const shown = effectiveStatus(status, connection);
 
-  // Brief 「已恢复」 notice when the link returns live after a non-live spell
-  // (offline/recovering/stale), ~1.5 s (D-055 §3.3 UI copy).
+  // Brief 「已恢复」 notice when the link returns live after an OFFLINE spell
+  // (offline → recovering → live), ~1.5 s (D-055 §3.3 UI copy). A mere
+  // stale→live re-certification must NOT (re)arm it: a quiet session whose
+  // only frame is its open snapshot flaps through stale every frame-watchdog
+  // window, and re-arming the notice on each flap left it stuck forever.
+  // `sawOffline` latches an actual offline state since the last live spell
+  // (a stale watchdog flap does not latch); the timer clears the notice, and
+  // the render gate (`shown === "live"`) hides it the instant the link drops.
   const [restored, setRestored] = useState(false);
-  const prev = useRef(connection);
+  const sawOffline = useRef(false);
   useEffect(() => {
-    const wasDown = prev.current === "offline" || prev.current === "recovering" || prev.current === "stale";
-    if (wasDown && connection === "live") {
-      setRestored(true);
-      const t = setTimeout(() => setRestored(false), 1500);
-      prev.current = connection;
-      return () => clearTimeout(t);
+    if (connection === "offline") {
+      sawOffline.current = true;
+      return;
     }
-    prev.current = connection;
+    if (connection !== "live" || !sawOffline.current) return;
+    sawOffline.current = false;
+    setRestored(true);
+    const t = setTimeout(() => setRestored(false), 1500);
+    return () => clearTimeout(t);
   }, [connection]);
 
   if (restored && shown === "live") {

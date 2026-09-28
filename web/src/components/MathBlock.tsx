@@ -64,11 +64,11 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
     if (!el) return;
     // `overflow-x: clip` reserves no gutter, so scrollWidth/clientWidth tell
     // the truth. ANY real overflow promotes — even 1px — so a formula can
-    // never lose visible content. The anti-flip band lives on the DEMOTE
-    // side: once promoted we only demote with DEMOTE_SLACK px of slack,
-    // because the scroll box's own gutter shrinks clientWidth and a
-    // borderline node would otherwise flip back and forth and re-render
-    // forever.
+    // never lose visible content. (The promoted box uses an overlay
+    // scrollbar, so promotion reserves no gutter and never moves the line;
+    // see math.module.css.) The anti-flip band lives on the DEMOTE side:
+    // sub-pixel rounding between frames must not flip a borderline node
+    // back to clip and re-render forever.
     const DEMOTE_SLACK = 8;
     const measure = (): void => {
       const overflow = el.scrollWidth - el.clientWidth;

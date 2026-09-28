@@ -2564,11 +2564,42 @@ class HubStore {
     this.connectionBoundTo = instanceId;
     this.connectionBoundJournal = instance.journalId;
     if (this.connection) {
+      const client = this.journals.get(instance.journalId);
+      // The 只读 banner Retry (and foreground catch-up) must heal a journal
+      // whose backfill failed even when the follow socket is OPEN and freshly
+      // framed: in that state the machine trusts the link and its resume is a
+      // no-op, so without this forced REST catch-up the Retry button did
+      // nothing. A non-live link is handed to the machine, whose resume
+      // reopens the socket AND runs resumeAfterReconnect.
+      if (client && client.status !== "live" && this.followSocketLive()) {
+        await this.forceJournalCatchup(instanceId, client);
+        return;
+      }
       // resumeConnection reopens the socket + resyncs + flushes the outbox.
       this.connection.dispatch({ type: "resume" });
       return;
     }
     await this.catchupManual(instanceId);
+  }
+
+  /**
+   * Force a bounded REST catch-up/backfill for an incomplete journal
+   * (readonly-stale/gap-backfill) over an otherwise healthy socket. Runs on
+   * the per-instance reconcile chain; a failed read leaves the journal at its
+   * retryable status (the banner keeps its Retry action), never a false live.
+   */
+  private async forceJournalCatchup(instanceId: Id, client: JournalClient) {
+    client.markReconnecting();
+    try {
+      await this.chainReconcile(instanceId, () => client.resumeAfterReconnect());
+    } catch (err) {
+      this.reconcileToast(err, "会话同步");
+    }
+    try {
+      await this.refresh();
+    } catch (err) {
+      this.reconcileToast(err, "会话列表刷新");
+    }
   }
 
   private async catchupManual(instanceId: Id) {

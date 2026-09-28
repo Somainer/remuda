@@ -79,3 +79,27 @@ it("replaces the composer with the ended bar and keeps the queued count visible"
   expect(screen.queryByTestId("composer")).toBeNull();
   expect(screen.getByTestId("resume-control")).toBeInTheDocument();
 });
+
+it("keeps the ended bar and resume for a disconnected node-restart row", () => {
+  // The Hub marks a row ended by a Node restart disconnected as well; the
+  // ended surface follows the durable lifecycle, not connectivity.
+  const restarted = {
+    ...exited,
+    connectivity: "disconnected" as const,
+    lastError: "node-epoch-changed",
+  };
+  vi.spyOn(store, "useHub").mockReturnValue({
+    ...store.hubStore.getSnapshot(),
+    ready: true,
+    instances: [restarted],
+    events: { [exited.id]: [] },
+  });
+  renderPage();
+  expect(screen.getByTestId("ended-bar")).toBeInTheDocument();
+  expect(screen.getByTestId("node-restart-banner")).toHaveTextContent("Node 重启");
+  expect(screen.getByTestId("node-restart-resume")).toBeEnabled();
+  expect(screen.queryByTestId("composer")).toBeNull();
+  expect(screen.queryByTestId("composer-input")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+  expect(screen.getByTestId("session-page")).toHaveAttribute("data-status", "exited");
+});

@@ -35,7 +35,7 @@ import { ScreenView } from "../features/session/ScreenView";
 import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode, UI_STATUS_LABEL } from "../lib/status";
 import { apiRouteClause, apiRouteKind, routeDownMessage } from "../lib/apiRoute";
 import { projectCommandStatus } from "../lib/commandStatus";
-import { endReason } from "../lib/endReason";
+import { endReason, NODE_EPOCH_CHANGED } from "../lib/endReason";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
 import { hubStore, useHub } from "../lib/store";
@@ -178,7 +178,15 @@ function SessionPageBody({
 
   const events = hub.events[instanceId] ?? NO_EVENTS;
   const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
-  const status = instance ? projectStatus(instance) : "unknown";
+  // c-endreason: the shared human sentence (「Node 重启，会话已中断」 for a
+  // restart), toned — only a failed ending is ever painted red. It reads the
+  // durable lifecycle only: the Hub marks an ended row disconnected (a Node
+  // restart does exactly that), and projectStatus answers "unknown" for any
+  // disconnected row before it looks at the lifecycle. An ended session must
+  // keep its EndedBar and Resume, and must never mount a live Composer, while
+  // its host is away.
+  const ended = instance ? endReason(instance) : null;
+  const status = ended ? "exited" : instance ? projectStatus(instance) : "unknown";
   // The turn-end decision folds every channel (hook latch, screen, transcript
   // tail, pending interactions), not the hook latch alone — so a turn whose
   // Stop hook never lands still ends once the screen/pty says idle. It is the
@@ -207,10 +215,7 @@ function SessionPageBody({
     composerPhase =
       status === "blocked" ? "blocked" : status === "working" ? "working" : "idle";
   }
-  const nodeRestarted = instance?.lastError === "node-epoch-changed";
-  // c-endreason: the shared human sentence (「Node 重启，会话已中断」 for a
-  // restart), toned — only a failed ending is ever painted red.
-  const ended = status === "exited" && instance ? endReason(instance) : null;
+  const nodeRestarted = instance?.lastError === NODE_EPOCH_CHANGED;
   const resolvedView = view === "auto" ? baseView : view;
   // Terminal segments offer no annotations; archived-task sessions are a
   // read-only preview (plan task-model task 9 acceptance 3).

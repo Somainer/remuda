@@ -70,3 +70,12 @@ it("stays on the exited transcript when resume fails", async () => {
   await waitFor(() => expect(resume).toHaveBeenCalled());
   expect(screen.getByTestId("session-page")).toBeInTheDocument();
 });
+
+it("replaces the composer with the ended bar and keeps the queued count visible", () => {
+  vi.spyOn(store.hubStore, "heldBubbles").mockReturnValue([{}, {}] as never);
+  renderPage();
+  expect(screen.getByTestId("ended-bar")).toHaveTextContent("会话已结束");
+  expect(screen.getByTestId("ended-held-note")).toHaveTextContent("有 2 条排队消息未送出");
+  expect(screen.queryByTestId("composer")).toBeNull();
+  expect(screen.getByTestId("resume-control")).toBeInTheDocument();
+});

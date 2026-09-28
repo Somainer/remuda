@@ -7,66 +7,41 @@
  * wire and no queue structure (D-042 untouched).
  */
 
-/* Zero-height anchor at the top of the session dock; the bar floats above
-   the dock edge (over the transcript) so it consumes no flow height and the
-   session body keeps its measured viewport share. */
-.floatLayer {
-  position: relative;
-  height: 0;
-  z-index: 6;
-  pointer-events: none;
-}
-
-.annotationBar {
-  position: absolute;
-  right: 18px;
-  bottom: calc(100% + 6px);
-  display: inline-flex;
+/* The dock's 批注行 (ui-spec §2.2 item 5): a quiet 24px row in the dock's own
+   flow, only while drafts exist. The entry point is the ⋯ menu's 加批注. */
+.badgeRow {
+  display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-  pointer-events: auto;
+  height: 24px;
+  min-width: 0;
 }
 
 .badge {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  min-height: 26px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-2);
-  color: var(--paper);
+  gap: 0;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
   font-family: var(--font);
-  font-size: var(--text-aux);
+  font-size: var(--text-meta);
+  white-space: nowrap;
   cursor: pointer;
 }
 
+.badge:hover,
 .badge[data-active="1"] {
-  border-color: var(--dust);
-  color: var(--dust);
-}
-
-.badge[data-disabled="1"] {
-  color: var(--mute);
-  cursor: not-allowed;
-  border-color: var(--line);
+  color: var(--fg-strong);
 }
 
 .badgeCount {
-  font-family: var(--mono);
-  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 .spacer {
   flex: 1 1 auto;
-}
-
-.readonlyTag {
-  font-size: var(--text-aux);
-  color: var(--mute);
 }
 
 .panel {

@@ -166,26 +166,29 @@ export function AnnotationBadge({
   if (count === 0) return null;
 
   const open = panel?.instanceId === instanceId;
-  // Read-only (archived) sessions may still OPEN the panel to review or
-  // remove drafts created before the read-only state resolved; the badge is
-  // only inert when there is nothing to open.
+  // The dock's 批注行 (ui-spec §2.2 item 5): one 24px quiet row, only while
+  // drafts exist. Read-only (archived) sessions may still OPEN the panel to
+  // review or remove drafts created before the read-only state resolved; the
+  // row is only absent when there is nothing to open.
   return (
-    <button
-      type="button"
-      className={css.badge}
-      data-testid="annotation-badge"
-      data-active={open ? "1" : "0"}
-      data-readonly={readonly ? "1" : "0"}
-      aria-expanded={open}
-      title={readonly ? "只读预览：仅可查看或撤回已有批注" : "查看随下一次发送投递的批注"}
-      onClick={() => (open ? closePanel() : openPanel(instanceId, "card"))}
-    >
-      <span aria-hidden="true">批注</span>
-      <span className={css.badgeCount} data-testid="annotation-badge-count">
-        {count}
-      </span>
-      <span>本次发送带 {count} 条批注</span>
-    </button>
+    <div className={css.badgeRow} data-testid="annotation-badge-row">
+      <button
+        type="button"
+        className={css.badge}
+        data-testid="annotation-badge"
+        data-active={open ? "1" : "0"}
+        data-readonly={readonly ? "1" : "0"}
+        aria-expanded={open}
+        title={readonly ? "只读预览：仅可查看或撤回已有批注" : "查看随下一次发送投递的批注"}
+        onClick={() => (open ? closePanel() : openPanel(instanceId, "card"))}
+      >
+        本次发送带{" "}
+        <span className={css.badgeCount} data-testid="annotation-badge-count">
+          {count}
+        </span>{" "}
+        条批注
+      </button>
+    </div>
   );
 }
 

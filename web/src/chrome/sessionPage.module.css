@@ -7,52 +7,6 @@
   color: var(--paper);
 }
 
-/* The exited session's resume entry, one row under the header. */
-.resumeRow {
-  flex: none;
-  display: flex;
-  justify-content: flex-end;
-  padding: var(--space-2) 20px;
-  border-bottom: 1px solid var(--border);
-}
-
-.resumeGroup {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-}
-
-/* The exited-but-not-resumable fallback link: never wraps the crowded row. */
-.inheritLink {
-  flex: none;
-  white-space: nowrap;
-  font-size: var(--text-aux);
-  color: var(--mute);
-}
-
-/* A Node restart is an interruption, not a failure (c-endreason): the text is
-   neutral and so is the chrome — ordinary surface tokens, never the danger
-   role. Resume stays; routeDown below keeps the red because that IS an error. */
-.nodeRestart {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 10px 14px;
-  margin: 8px 0;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-surface);
-  color: var(--paper);
-  font-size: 13px;
-}
-
-.nodeRestartNote {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
-}
-
 /* D-047 §B.5: the proxy host went away mid-session. An error, not a reroute:
    the route clause above still names the via route that is now down. */
 .routeDown {
@@ -97,7 +51,26 @@
   padding: 12px 18px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 6px;
+}
+
+/* §2.2 dock item 1: under pressure the pending cards give way first and
+   scroll inside their own area. */
+.pendingArea {
+  flex: 0 1 auto;
+  min-height: 44px;
+  max-height: calc(var(--workbench-height, 100dvh) * 0.45);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* tty / raw events: no dock, only the ended session's resume surface. */
+.endedDock {
+  flex: none;
+  padding: 12px 18px;
+  border-top: 1px solid var(--line);
 }
 
 .keys {
@@ -118,20 +91,8 @@
 }
 
 @media (max-width: 767px) {
-  .dock {
+  .dock,
+  .endedDock {
     padding: 10px 14px;
-    gap: 10px;
-  }
-
-  .resumeRow {
-    padding: var(--space-2) var(--space-3);
-  }
-
-  .resumeGroup {
-    flex: 1;
-  }
-
-  .resumeGroup > button {
-    flex: 1;
   }
 }

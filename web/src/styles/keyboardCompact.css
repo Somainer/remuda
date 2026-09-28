@@ -15,9 +15,8 @@
 
 html[data-keyboard="1"] [data-testid="install-bar"],
 html[data-keyboard="1"] [data-testid="update-bar"],
-html[data-keyboard="1"] [data-testid="resume-row"],
 html[data-keyboard="1"] [data-testid="run-details"],
-html[data-keyboard="1"] [data-testid="annotation-dock"],
+html[data-keyboard="1"] [data-testid="annotation-badge-row"],
 html[data-keyboard="1"] [data-testid="task-track"],
 html[data-keyboard="1"] [data-testid="session-notifications"],
 /* c-mfix round 3: an open transcript search and the gap banner sit ABOVE the

@@ -1,8 +1,8 @@
 import { Profiler, useCallback, useEffect, useLayoutEffect, useRef, useState, type ProfilerOnRenderCallback, type ReactNode } from "react";
-import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
-import { FileText, Info, ListCollapse, Rows3, ScrollText, Search } from "lucide-react";
+import { Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
+import { FileText, Info, ListCollapse, MessageSquarePlus, Rows3, ScrollText, Search } from "lucide-react";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
-import { Button } from "../components/Button";
+import { EndedBar } from "../chrome/EndedBar";
 import { SessionHeader, useWideDesktop } from "../chrome/SessionHeader";
 import { SessionMoreMenu, type MoreMenuItem } from "../chrome/SessionMoreMenu";
 import { ApprovalCard } from "../features/approvals/ApprovalCard";
@@ -27,7 +27,6 @@ import {
   useSessionTask,
 } from "../features/tasks/AnnotationPanel";
 import { composeWithAnnotations } from "../features/tasks/annotations";
-import annCss from "../features/tasks/annotation.module.css";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
 import { readDismissedWorkflows } from "../features/session/workflowDismiss";
@@ -209,9 +208,9 @@ function SessionPageBody({
       status === "blocked" ? "blocked" : status === "working" ? "working" : "idle";
   }
   const nodeRestarted = instance?.lastError === "node-epoch-changed";
-  // c-endreason: the shared human sentence (「Node 重启，会话已中断」),
-  // neutral — the session was interrupted by the restart, never failed.
-  const nodeRestartEnd = nodeRestarted && instance ? endReason(instance) : null;
+  // c-endreason: the shared human sentence (「Node 重启，会话已中断」 for a
+  // restart), toned — only a failed ending is ever painted red.
+  const ended = status === "exited" && instance ? endReason(instance) : null;
   const resolvedView = view === "auto" ? baseView : view;
   // Terminal segments offer no annotations; archived-task sessions are a
   // read-only preview (plan task-model task 9 acceptance 3).
@@ -303,6 +302,19 @@ function SessionPageBody({
     }
   };
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
+  const endedBar = ended ? (
+    <EndedBar
+      reason={ended}
+      nodeRestarted={nodeRestarted}
+      heldCount={heldBubbles.length}
+      canResume={canResume}
+      resuming={resuming}
+      onResume={(mode) => {
+        void startResume(mode);
+      }}
+      newHref={newHref}
+    />
+  ) : null;
   const connLabel = journalStatus === "live" ? hub.connection : journalStatus;
   const title = hubStore.titleOf(instance.id);
   const structuredOnly = uiMode(instance) === "structured-only";
@@ -319,33 +331,6 @@ function SessionPageBody({
   };
   const transcriptMounted = resolvedView === "structured" && !snapshotLoading && !genericPty;
   const filesInline = wide && !mobile && showViewExtras;
-  const resumeControl = canResume ? (
-    <span className={session.resumeGroup} data-testid="resume-control">
-      {/* D-026: resume continues the same native session on a NEW
-          instance, so both targets navigate away from this one. */}
-      <Button
-        variant="primary"
-        disabled={resuming}
-        onClick={() => {
-          void startResume("structured");
-        }}
-      >
-        继续（结构化）
-      </Button>
-      <Button
-        variant="default"
-        data-testid="resume-terminal"
-        disabled={resuming}
-        onClick={() => {
-          void startResume("terminal");
-        }}
-      >
-        在终端中继续
-      </Button>
-    </span>
-  ) : (
-    <Link to={newHref} className={session.inheritLink}>开新会话继承 cwd</Link>
-  );
 
   // The 运行详情 fields as one array: the ⋯ item advertises exactly the
   // number of items the panel reveals (ui-spec §2.2), so the count is derived,
@@ -502,6 +487,26 @@ function SessionPageBody({
       onSelect: () => navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`),
     });
   }
+  // §2.2 item 7: the only annotation entry point. An archived task's session
+  // is a read-only preview, so the item stays visible but inert; terminal
+  // segments offer no annotations at all.
+  if (annotationReadonly && resolvedView !== "tty" && resolvedView !== "events") {
+    moreItems.push({
+      key: "annotate",
+      testId: "annotation-readonly-tag",
+      label: "只读预览 · 不可批注",
+      icon: MessageSquarePlus,
+      disabled: true,
+    });
+  } else if (annotationAllowed) {
+    moreItems.push({
+      key: "annotate",
+      testId: "annotation-add",
+      label: "加批注",
+      icon: MessageSquarePlus,
+      onSelect: () => annotationPanel.openPanel(instance.id, "card", null),
+    });
+  }
 
   return (
     <div
@@ -554,31 +559,6 @@ function SessionPageBody({
       <RunDetails count={diagnostics.length} open={runDetailsOpen} onClose={closeRunDetails}>
         {diagnosticRows}
       </RunDetails>
-      {status === "exited" ? (
-        <div className={session.resumeRow} data-testid="resume-row">
-          {resumeControl}
-        </div>
-      ) : null}
-      {nodeRestarted ? (
-        <div
-          className={session.nodeRestart}
-          data-testid="node-restart-banner"
-          title={nodeRestartEnd?.detail ?? undefined}
-        >
-          <span>{nodeRestartEnd?.label ?? "Node 重启，会话已中断"}</span>
-          <Button
-            variant="primary"
-            disabled={resuming || !canResume}
-            data-testid="node-restart-resume"
-            onClick={() => {
-              void startResume("structured");
-            }}
-          >
-            Resume
-          </Button>
-          {!canResume ? <span className={session.nodeRestartNote}>该会话没有可续接的 transcript</span> : null}
-        </div>
-      ) : null}
       {routeDown ? (
         <div className={session.routeDown} role="alert" data-testid="session-api-route-down">
           <span className={session.routeDownTitle}>
@@ -647,30 +627,51 @@ function SessionPageBody({
           />
         )}
       </div>
-      {resolvedView === "tty" || resolvedView === "events" ? null : <div className={session.dock} data-testid="session-dock">
-        {/* Zero-flow floating chip row anchored at the dock top: it rests
-            just above the composer (over the transcript edge) and never
-            shrinks the session body's measured viewport share — visible
-            whether the in-flow panel is open or not. */}
-        <div className={annCss.floatLayer}>
-          <div data-testid="annotation-dock" className={annCss.annotationBar}>
-            <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
-            {annotationAllowed ? (
-              <button
-                type="button"
-                className={annCss.badge}
-                data-testid="annotation-add"
-                onClick={() => annotationPanel.openPanel(instance.id, "card", null)}
-              >
-                ＋ 加批注
-              </button>
-            ) : annotationReadonly ? (
-              <span className={annCss.readonlyTag} data-testid="annotation-readonly-tag">
-                只读预览 · 不可批注
-              </span>
-            ) : null}
+      {resolvedView === "tty" || resolvedView === "events" ? (
+        // Terminal segments and raw events carry no dock, but an ended session
+        // still offers its one resume entry under the pane.
+        endedBar ? <div className={session.endedDock}>{endedBar}</div> : null
+      ) : <div className={session.dock} data-testid="session-dock">
+        {/* §2.2 dock order: pending cards → notifications → live row →
+            批注行 → TaskTrack → Composer / EndedBar. */}
+        {pending.length > 0 ? (
+          <div className={session.pendingArea} data-testid="pending-area">
+            {pending.map((item) =>
+              item.kind === "question" ? (
+                <QuestionForm
+                  key={item.id}
+                  interaction={item}
+                  busy={sending}
+                  onRespond={(answer) => {
+                    setSending(true);
+                    void hubStore.respond(item.id, answer).finally(() => setSending(false));
+                  }}
+                />
+              ) : item.kind === "elicitation" ? (
+                <ElicitationCard
+                  key={item.id}
+                  interaction={item}
+                  busy={sending}
+                  onRespond={(answer) => {
+                    setSending(true);
+                    void hubStore.respond(item.id, answer).finally(() => setSending(false));
+                  }}
+                />
+              ) : (
+                <ApprovalCard
+                  key={item.id}
+                  interaction={item}
+                  busy={sending}
+                  onRespond={(answer) => {
+                    setSending(true);
+                    void hubStore.respond(item.id, answer).finally(() => setSending(false));
+                  }}
+                />
+              ),
+            )}
           </div>
-        </div>
+        ) : null}
+        <SessionNotifications key={`notes-${instance.id}`} instanceId={instance.id} events={events} />
         <LiveStatusStrip
           events={events}
           instance={instance}
@@ -679,41 +680,8 @@ function SessionPageBody({
           decision={turnDecision}
           onInterrupt={() => hubStore.cancel(instance.id)}
         />
-        <SessionNotifications key={`notes-${instance.id}`} instanceId={instance.id} events={events} />
+        <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
         <TaskTrack tasks={tasks} />
-        {pending.map((item) =>
-          item.kind === "question" ? (
-            <QuestionForm
-              key={item.id}
-              interaction={item}
-              busy={sending}
-              onRespond={(answer) => {
-                setSending(true);
-                void hubStore.respond(item.id, answer).finally(() => setSending(false));
-              }}
-            />
-          ) : item.kind === "elicitation" ? (
-            <ElicitationCard
-              key={item.id}
-              interaction={item}
-              busy={sending}
-              onRespond={(answer) => {
-                setSending(true);
-                void hubStore.respond(item.id, answer).finally(() => setSending(false));
-              }}
-            />
-          ) : (
-            <ApprovalCard
-              key={item.id}
-              interaction={item}
-              busy={sending}
-              onRespond={(answer) => {
-                setSending(true);
-                void hubStore.respond(item.id, answer).finally(() => setSending(false));
-              }}
-            />
-          ),
-        )}
         {genericPty ? (
           <div className={session.keys} data-testid="keys-row">
             {(["enter", "esc", "ctrl+c"] as const).map((key) => (
@@ -738,7 +706,9 @@ function SessionPageBody({
           taskTitle={sessionTask?.title ?? null}
           readonly={annotationReadonly}
         />
-        <Composer
+        {/* An ended session mounts no Composer: the EndedBar is its one
+            surface (and the one resume entry). */}
+        {endedBar ?? <Composer
           key={instance.id}
           instanceId={instance.id}
           mobile={mobile}
@@ -854,7 +824,7 @@ function SessionPageBody({
               setSending(false);
             }
           }}
-        />
+        />}
       </div>}
     </div>
   );

@@ -89,7 +89,7 @@ it("desktop ⋯ lists the §2.2 items in order and never the switch, 文件 or S
   );
   expect(ids[0]).toBe("run-details-summary");
   expect(ids).toContain("density-toggle");
-  expect(ids.at(-1)).toBe("events-toggle");
+  expect(ids.slice(-2)).toEqual(["events-toggle", "annotation-add"]);
   expect(ids).not.toContain("files-toggle");
   expect(within(menu).queryByTestId("view-switch")).toBeNull();
   expect(within(menu).queryByRole("button", { name: "Stop" })).toBeNull();

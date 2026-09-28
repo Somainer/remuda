@@ -665,7 +665,7 @@
   }
 
   .tabBar {
-    height: var(--touch);
+    height: calc(var(--touch) + 1px);
   }
 
   .tab {
@@ -706,10 +706,12 @@
 }
 
 /* Any coarse pointer (a portrait tablet included) gets the 44px strip, tab and
-   × reach: hit areas follow the pointer, never the viewport width (§3.4). */
+   × reach: hit areas follow the pointer, never the viewport width (§3.4).
+   The strip is border-box with a 1px bottom rule, so it is 44px + 1px tall:
+   the tabs and ＋ inside it get the full 44px of content height. */
 @media (pointer: coarse) {
   .tabBar {
-    height: var(--touch);
+    height: calc(var(--touch) + 1px);
   }
 
   .tabSelect {

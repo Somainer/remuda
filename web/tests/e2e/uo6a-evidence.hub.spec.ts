@@ -299,6 +299,42 @@ test.describe("1440 desktop", () => {
   });
 });
 
+test("a coarse-pointer 1024x1366 tablet gives the tab strip's controls 44px of content height", async ({
+  browser,
+}) => {
+  // The strip is border-box with a 1px bottom rule: a 44px strip left its
+  // tabs and ＋ at 43px (§3.4 touch reach).
+  const context = await browser.newContext({
+    baseURL: test.info().project.use.baseURL,
+    viewport: { width: 1024, height: 1366 },
+    hasTouch: true,
+    isMobile: false,
+  });
+  const page = await context.newPage();
+  const ids: string[] = [];
+  try {
+    await login(page);
+    expect(await page.evaluate(() => matchMedia("(pointer: coarse)").matches)).toBe(true);
+    const id = await createSession(page, "uo6a tablet strip", ids);
+    await page.goto(`/s/${id}/structured`);
+    await transcriptReady(page);
+    const newTab = page.getByRole("link", { name: "新建 agent" });
+    const tab = page.getByTestId("session-tab").first();
+    await expect(newTab).toBeVisible({ timeout: 20_000 });
+    await expect(tab).toBeVisible();
+    for (const [name, control] of [
+      ["new tab", newTab],
+      ["tab", tab],
+    ] as const) {
+      const box = await control.boundingBox();
+      expect(box!.height, `${name} height`).toBeGreaterThanOrEqual(44);
+    }
+  } finally {
+    for (const id of ids) await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    await context.close();
+  }
+});
+
 /** Evidence: every screen at one width and scheme. */
 async function captureScreens(browser: Browser, width: number, scheme: "dark" | "light") {
   const phone = width < 768;

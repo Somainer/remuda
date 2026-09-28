@@ -10,6 +10,13 @@ vi.mock("../lib/viewport", () => ({
   composing: () => false,
 }));
 
+// The page decides whether the strip is MOUNTED; what the strip draws for a
+// given journal is LiveStatusStrip.test's concern.
+vi.mock("../features/session/live/LiveStatusStrip", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../features/session/live/LiveStatusStrip")>()),
+  LiveStatusStrip: () => <div data-testid="live-status-strip" />,
+}));
+
 /** An exited claude-print session: no terminal, resume reported as supported. */
 const exited = {
   ...mockDb.instances[0],
@@ -78,6 +85,22 @@ it("replaces the composer with the ended bar and keeps the queued count visible"
   expect(screen.getByTestId("ended-held-note")).toHaveTextContent("有 2 条排队消息未送出");
   expect(screen.queryByTestId("composer")).toBeNull();
   expect(screen.getByTestId("resume-control")).toBeInTheDocument();
+});
+
+it("mounts no live strip beside the ended bar, but keeps it for a live session", () => {
+  const { unmount } = renderPage();
+  expect(screen.getByTestId("ended-bar")).toBeInTheDocument();
+  expect(screen.queryByTestId("live-status-strip")).toBeNull();
+  unmount();
+  vi.spyOn(store, "useHub").mockReturnValue({
+    ...store.hubStore.getSnapshot(),
+    ready: true,
+    instances: [{ ...exited, lifecycle: "running" as const, connectivity: "connected" as const }],
+    events: { [exited.id]: [] },
+  });
+  renderPage();
+  expect(screen.queryByTestId("ended-bar")).toBeNull();
+  expect(screen.getByTestId("live-status-strip")).toBeInTheDocument();
 });
 
 it("keeps the ended bar and resume for a disconnected node-restart row", () => {

@@ -759,14 +759,12 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
   }
 
   /** Non-essential chrome mounted before the keyboard must be display:none after. */
-  async function assertChromeCollapsed(
-    page: Page,
-    strip: ReturnType<Page["locator"]>,
-  ) {
+  async function assertChromeCollapsed(page: Page) {
     for (const testid of [
       "install-bar",
       "update-bar",
       "run-details",
+      "live-status-strip",
       "annotation-badge-row",
       "task-track",
       "session-notifications",
@@ -775,9 +773,9 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       const locator = page.getByTestId(testid);
       if ((await locator.count()) > 0) await expect(locator).toBeHidden();
     }
-    // ui-spec §2 keyboard band: the live row folds away too — the header's
-    // title block keeps the status dot and word.
-    await expect(strip).toBeHidden();
+    // ui-spec §2 keyboard band: the live row folds away too (an ended
+    // session never mounts it) — the header's title block keeps the status
+    // dot and word.
     await expect(page.getByTestId("session-status-label").first()).toBeVisible();
   }
 
@@ -975,12 +973,10 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       // UO-6a: an ended session mounts the EndedBar in the composer's place.
       await expect(page.getByTestId("composer-input")).toHaveCount(0);
       await expect(page.getByTestId("session-more-open")).toBeVisible();
-      const strip = page.getByTestId("live-status-strip");
-      await expect(strip).toBeVisible();
-      // UO-6b: an EXITED session settles the strip — the final fixture event
-      // is the entity("exited") record, so the stale tool-started latch and
-      // its stall note no longer survive on a session that has ended.
-      await expect(strip).toHaveAttribute("data-phase", "turn-ended");
+      // UO-6a round 2: an ended SESSION says so once, in the EndedBar — the
+      // live strip (and its 「回合结束」, with any stale tool latch or stall
+      // note) is not mounted at all.
+      await expect(page.getByTestId("live-status-strip")).toHaveCount(0);
       await expect(page.getByTestId("live-health-hook")).toHaveCount(0);
       // The undismissed install offer the acceptance runs on iOS/WebKit must
       // show; on engines that never surface an offer the whole case skips
@@ -1007,7 +1003,7 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       await raiseKeyboardIosExact(page, kb);
       const band = await currentBand(page, height, kb);
 
-      await assertChromeCollapsed(page, strip);
+      await assertChromeCollapsed(page);
       await assertEndedBarInBand(page, band);
       // The combo fixture deliberately overflows the band: the pin must hold
       // the exact latest (running AskUserQuestion) row at the bottom edge.

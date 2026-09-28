@@ -677,15 +677,19 @@ function SessionPageBody({
           </div>
         ) : null}
         <SessionNotifications key={`notes-${instance.id}`} instanceId={instance.id} events={events} />
-        <LiveStatusStrip
-          events={events}
-          instance={instance}
-          nativeRef={instance.nativeRef}
-          hasPending={pending.length > 0}
-          decision={turnDecision}
-          onInterrupt={() => hubStore.cancel(instance.id)}
-        />
-        <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
+        {/* An ended SESSION says so once, in the EndedBar; the strip's
+            「回合结束」 would repeat it. An ended TURN of a live session keeps
+            the strip. */}
+        {endedBar ? null : (
+          <LiveStatusStrip
+            events={events}
+            instance={instance}
+            nativeRef={instance.nativeRef}
+            hasPending={pending.length > 0}
+            decision={turnDecision}
+            onInterrupt={() => hubStore.cancel(instance.id)}
+          />
+        )}        <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
         <TaskTrack tasks={tasks} />
         {genericPty ? (
           <div className={session.keys} data-testid="keys-row">

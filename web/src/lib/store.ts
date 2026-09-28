@@ -86,7 +86,7 @@ const HELD_RETRY_MAX_MS = 30_000;
 import { liveSummary } from "../features/session/liveSummary";
 import { HubHttpError, isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
-import { id, now } from "./ids";
+import { id, localId, now } from "./ids";
 import { mockGappedTail, mockJournalIds } from "./mock";
 import { readDeviceSettings } from "../features/settings/prefs";
 import {
@@ -2637,7 +2637,7 @@ class HubStore {
       const index = indexOf.get(preview.objectId);
       return index ? { ...preview, index } : preview;
     });
-    const clientRequestId = id("local_");
+    const clientRequestId = localId();
 
     // D-055: generate the wire commandId BEFORE the POST and persist the row
     // first. Offline steer cannot keep its turn-specific meaning after a
@@ -2795,7 +2795,7 @@ class HubStore {
     refs: AttachmentRef[] = [],
     previews: BubbleAttachment[] = [],
   ): Id {
-    const clientRequestId = id("local_");
+    const clientRequestId = localId();
     const bubble: LocalBubble = {
       clientRequestId,
       instanceId,

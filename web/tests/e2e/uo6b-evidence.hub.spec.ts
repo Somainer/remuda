@@ -17,6 +17,17 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
+import { endReason, NODE_EPOCH_CHANGED } from "../../src/lib/endReason";
+
+/**
+ * The restart banner paints the shared endReason label (c-endreason made the
+ * Node-restart tone neutral: 会话已中断, not 已结束). Derive the expectation
+ * from the same helper so the spec tracks future copy changes.
+ */
+const nodeRestartLabel = endReason({
+  lifecycle: "exited",
+  lastError: NODE_EPOCH_CHANGED,
+})!.label;
 
 /**
  * UO-6b session-page leaf components — owner-demo regressions, rendered by
@@ -210,7 +221,7 @@ test("UO-6b r2: a HUB-detected Node restart settles the live strip and shows Res
   expect(await elapsed.textContent(), "the settled clock kept growing").toBe(frozen);
 
   // The instance row the Hub reconciled drives the banner + Resume.
-  await expect(page.getByTestId("node-restart-banner")).toContainText("Node 重启，会话已结束", {
+  await expect(page.getByTestId("node-restart-banner")).toContainText(nodeRestartLabel, {
     timeout: 20_000,
   });
   await expect(page.getByTestId("node-restart-resume")).toBeEnabled();

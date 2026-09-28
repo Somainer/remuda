@@ -300,4 +300,57 @@ describe("ConnectionMachine", () => {
     clock.advance(1);
     expect(machine.state).toBe("stale");
   });
+
+  it("followAttempt: an initial journal seed is recovering immediately; failure goes offline and retries", () => {
+    const { clock, machine, resume } = setupTracked();
+    machine.bootstrapLive();
+    const id = machine.followAttemptBegin();
+    expect(machine.state).toBe("recovering");
+
+    // The seed fails: offline + reconnect clock armed (no false live).
+    machine.followAttemptEnd(false, id);
+    expect(machine.state).toBe("offline");
+    // armResumeAttempt bumped the attempt to 1: backoff is 500 ms.
+    clock.advance(500);
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("followAttempt: success certifies live and clears the watchdog", () => {
+    const { clock, machine } = setupTracked();
+    machine.bootstrapLive();
+    const id = machine.followAttemptBegin();
+    expect(machine.state).toBe("recovering");
+    machine.followAttemptEnd(true, id);
+    expect(machine.state).toBe("live");
+    // Past the watchdog window: the (cleared) external-attempt watchdog never
+    // fires; with no further frame the ordinary frame watchdog drives stale.
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(machine.state).toBe("stale");
+  });
+
+  it("followAttempt: a hung seed is forced offline by the watchdog", () => {
+    const { clock, machine } = setupTracked();
+    machine.bootstrapLive();
+    const id = machine.followAttemptBegin();
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(machine.state).toBe("offline");
+    // A late seed completion must not certify live.
+    machine.followAttemptEnd(true, id);
+    expect(machine.state).toBe("offline");
+  });
+
+  it("followAttempt: nested in a resume shares its slot and id, never double-watchdogs", () => {
+    const { clock, machine, resume } = setupTracked();
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    const nestedId = machine.followAttemptBegin();
+    // Same slot: the nested mount reports the enclosing attempt's outcome.
+    machine.followAttemptEnd(true, nestedId);
+    expect(machine.state).toBe("live");
+    // No second resume from a competing watchdog during the recovery window.
+    clock.advance(RECOVERING_WATCHDOG_MS - 1);
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
 });

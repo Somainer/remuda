@@ -327,6 +327,38 @@ export class ConnectionMachine {
 
   private beginResume() {
     if (this.resumeInFlight) return;
+    const attemptId = this.armResumeAttempt();
+    void this.deps
+      .resume()
+      .then(() => this.dispatch({ type: "resumeAttempt", ok: true, attemptId }))
+      .catch(() => this.dispatch({ type: "resumeAttempt", ok: false, attemptId }));
+  }
+
+  /**
+   * Arm the recovering slot + watchdog WITHOUT running the resume action. The
+   * INITIAL follow mount (REST journal seed + first subscribe) runs outside
+   * resume() but must not leave the machine claiming live with no timer while
+   * its seed read is pending: the caller reports the outcome with
+   * {@link followAttemptEnd} exactly as resume() would.
+   *
+   * Returns the attempt id to report back with. When a resume ALREADY owns the
+   * slot (the reconnect resume retried the mount through follow()), its
+   * watchdog covers the mount and its id is returned — the nested mount's
+   * completion then certifies/fails the enclosing attempt, never arms a
+   * second, competing watchdog.
+   */
+  followAttemptBegin(): number {
+    if (this.resumeInFlight) return this.resumeAttemptId;
+    this.armResumeAttempt();
+    return this.resumeAttemptId;
+  }
+
+  /** Report an externally-driven follow mount (see followAttemptBegin). */
+  followAttemptEnd(ok: boolean, attemptId: number) {
+    this.dispatch({ type: "resumeAttempt", ok, attemptId });
+  }
+
+  private armResumeAttempt(): number {
     this.clearTimers("stale", "offline", "probe", "reconnect");
     this.setState("recovering");
     this.resumeInFlight = true;
@@ -345,10 +377,7 @@ export class ConnectionMachine {
       }, RECOVERING_WATCHDOG_MS),
     );
     this.attempt += 1;
-    void this.deps
-      .resume()
-      .then(() => this.dispatch({ type: "resumeAttempt", ok: true, attemptId }))
-      .catch(() => this.dispatch({ type: "resumeAttempt", ok: false, attemptId }));
+    return attemptId;
   }
 
   dispose() {

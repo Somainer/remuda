@@ -1677,24 +1677,33 @@ class HubStore {
 
   /**
    * Reconciliation-write gate: journal evidence ("done") is terminal and can
-   * land while a GET is in flight or while the deadline fires. Never let the
-   * bounded GET loop overwrite it with sent/held/rejected/unknown. Returns
-   * false when the write was skipped because the row is already done.
+   * land while a GET is in flight, while the deadline fires, or in another
+   * tab. The authoritative check lives INSIDE the patch transaction
+   * ({@link Outbox.patch} re-reads the stored row): a cached non-done read
+   * can still lose to a done whose write is in flight. Returns false when the
+   * stored row was already done and the patch was dropped — the caller must
+   * stop (no held retry, no POST) in that case.
    */
   private async reconcilePatch(commandId: Id, patch: Partial<OutboxRecord>): Promise<boolean> {
     if (this.outbox?.get(commandId)?.state === "done") return false;
-    await this.safePatch(commandId, patch);
+    const rec = await this.safePatch(commandId, patch);
+    // null = storage error or a row removed concurrently: the pre-tx behavior
+    // (caller may retry on its own envelope) is unchanged; only a ROW that the
+    // transaction read back as terminal done proves the patch was preserved.
+    if (rec && rec.state === "done" && patch.state !== "done") return false;
     return true;
   }
 
   /** Storage-first patch that never throws into the delivery flow. */
-  private async safePatch(commandId: Id, patch: Partial<OutboxRecord>) {
+  private async safePatch(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null> {
     try {
-      await this.outbox?.patch(commandId, patch);
+      return (await this.outbox?.patch(commandId, patch)) ?? null;
     } catch {
       /* storage failure: the durable inflight/lease state is the recovery path */
+      return null;
+    } finally {
+      this.syncBubbleFromOutbox(commandId);
     }
-    this.syncBubbleFromOutbox(commandId);
   }
 
   /**

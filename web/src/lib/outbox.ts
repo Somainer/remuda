@@ -160,6 +160,15 @@ export interface OutboxStorage {
    * run the deliverer (a double POST). A storage failure rejects.
    */
   acquireLease(key: Id, rec: OutboxRecord, now: number): Promise<boolean>;
+  /**
+   * Merge a patch into one row atomically INSIDE one readwrite transaction:
+   * the stored row is read and the merged record written in the SAME
+   * transaction, so a terminal `done` committed by a journal callback whose
+   * write is still in flight (or by another tab) can never be overwritten
+   * with a full stale record built from an older cache read. A stored `done`
+   * row is preserved verbatim and returned; a missing row resolves null.
+   */
+  mergeUnlessDone(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null>;
 }
 
 /** Lease lifetime for a delivery; a crashed owner's lease steals after this. */
@@ -277,6 +286,38 @@ class IdbOutboxStorage implements OutboxStorage {
       t.onerror = () => reject(t.error ?? getReq.error);
     });
   }
+
+  /**
+   * Terminal preservation in ONE readwrite transaction (same serialization as
+   * {@link acquireLease}): the get and the put share `t`, so IndexedDB runs
+   * this read against every earlier readwrite tx on the store in creation
+   * order — a `done` written by a journal callback whose transaction is still
+   * open (or by another tab) is already visible here. The done row is
+   * returned without a put; anything else is merged and written. Resolves
+   * only on transaction commit, the same durability contract as {@link put}.
+   */
+  async mergeUnlessDone(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null> {
+    return await new Promise<OutboxRecord | null>((resolve, reject) => {
+      const t = this.db.transaction(IDB_STORE, "readwrite");
+      const store = t.objectStore(IDB_STORE);
+      let merged: OutboxRecord | null = null;
+      const getReq = store.get(commandId);
+      getReq.onsuccess = () => {
+        const existing = getReq.result as OutboxRecord | undefined;
+        if (!existing) return; // missing: resolve null on complete
+        if (existing.state === "done") {
+          merged = existing; // terminal: no put issued
+          return;
+        }
+        merged = { ...existing, ...patch };
+        store.put(merged);
+      };
+      getReq.onerror = () => reject(getReq.error);
+      t.oncomplete = () => resolve(merged);
+      t.onabort = () => reject(t.error ?? getReq.error ?? new Error("IndexedDB merge transaction aborted"));
+      t.onerror = () => reject(t.error ?? getReq.error);
+    });
+  }
 }
 
 class LocalStorageOutboxStorage implements OutboxStorage {
@@ -324,6 +365,21 @@ class LocalStorageOutboxStorage implements OutboxStorage {
     }
     this.write([...recs.filter((r) => r.commandId !== key), rec]);
     return true;
+  }
+
+  /**
+   * Synchronous read-check-write turn — atomic within the supported
+   * single-tab degraded case (two same-tab callers cannot interleave); the
+   * cross-tab guarantee is the IndexedDB transaction in the primary store.
+   */
+  async mergeUnlessDone(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null> {
+    const recs = this.read();
+    const existing = recs.find((r) => r.commandId === commandId);
+    if (!existing) return null;
+    if (existing.state === "done") return existing;
+    const merged = { ...existing, ...patch };
+    this.write([...recs.filter((r) => r.commandId !== commandId), merged]);
+    return merged;
   }
 }
 
@@ -447,20 +503,21 @@ export class Outbox {
   }
 
   /**
-   * Storage-first state write: cache + emit after commit; on abort the cache is
-   * untouched and the rejection propagates (the caller must not act as if the
-   * write applied — e.g. it must keep the inflight marker).
+   * Storage-first state write with an ATOMIC terminal guarantee: the stored
+   * row is re-read inside the same readwrite transaction that writes it, so a
+   * `done` committed by a journal callback sharing the connection (its write
+   * can still be in flight) or by another tab is never downgraded to
+   * sent/held/rejected/unknown by a full record built from a stale cache
+   * read. The cache is updated from the AUTHORITATIVE stored row (which may
+   * be the preserved done) only after the transaction commits; on abort
+   * nothing is cached and the rejection propagates.
    */
   async patch(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null> {
-    const cur =
-      this.cache.get(commandId) ??
-      (await this.storage.all()).find((r) => r.commandId === commandId);
-    if (!cur) return null;
-    const next = { ...cur, ...patch };
-    await this.storage.put(next);
-    this.cache.set(commandId, next);
+    const stored = await this.storage.mergeUnlessDone(commandId, patch);
+    if (!stored) return null;
+    this.cache.set(commandId, stored);
     this.emit();
-    return next;
+    return stored;
   }
 
   async remove(commandId: Id) {

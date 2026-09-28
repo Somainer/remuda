@@ -120,11 +120,14 @@ test("进行中 · 最近 tier lists the answered (now idle) instance", async ({
 });
 
 test("?focus= scrolls a deep-linked row into the desktop viewport", async ({ page }) => {
-  // 16 pending cards on ONE instance (inbox-focus sentinel): the target sorts
-  // below the 12-rows-per-frame first slice AND below the 720px fold, so a
-  // highlight-only implementation leaves it off-screen.
+  // 16 pending cards on ONE instance (inbox-focus sentinel). The desktop
+  // queue keeps the store's order (it does NOT sort byRecency the way the
+  // compact tier does), so the target must be chosen by the order the page
+  // ACTUALLY renders — a card past the 12-rows-per-frame first slice that is
+  // already below the 720px fold — never by guessing an id ordering.
   const instanceId = await createSession(page, "inbox-focus:16");
 
+  // All 16 cards reach interaction.list.
   await expect
     .poll(
       async () =>
@@ -135,39 +138,73 @@ test("?focus= scrolls a deep-linked row into the desktop viewport", async ({ pag
     )
     .toBe(16);
 
-  // The row the UI sorts LAST globally (newest-first, id tiebreak) is the
-  // deepest deep link; recompute over ALL pending rows exactly like
-  // inboxRows.byRecency so leftovers from sibling specs cannot fool the rank.
-  const allPending = (await listInteractions(page)).filter((item) => item.state === "pending");
-  const asc = [...allPending].sort((a, b) => {
-    const ta = Date.parse(a.updatedAt || a.createdAt || "");
-    const tb = Date.parse(b.updatedAt || b.createdAt || "");
-    if (ta !== tb) return ta - tb;
-    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-  });
-  const target = asc[0]!.id;
-  expect(target).toBeTruthy();
+  // On the UNFOCUSED page, read pending rows in DOM render order (queue
+  // cards carry data-state pending/answering/paused; 已离队 rows render after
+  // the other tiers and are excluded). The 打开会话 link identifies the
+  // owning instance.
+  await page.goto("/approvals");
+  await expect(page.getByTestId("approvals-page")).toBeVisible();
 
+  type DomRow = { id: string | null; instance: string | null };
+  const readDomRows = async (): Promise<DomRow[]> =>
+    page.evaluate(() =>
+      Array.from(document.querySelectorAll<HTMLElement>('[data-testid="approval-row"]'))
+        .filter((el) => {
+          const state = el.getAttribute("data-state");
+          return state === "pending" || state === "answering" || state === "paused";
+        })
+        .map((el) => ({
+          id: el.getAttribute("data-interaction-id"),
+          instance: el.querySelector<HTMLAnchorElement>('a[href^="/s/"]')?.pathname.slice(3) ?? null,
+        })),
+    );
+
+  // Progressive mount ends with at least 13 pending rows (our 16 guarantee
+  // this even with zero leftovers from sibling specs).
+  let rows: DomRow[] = [];
+  await expect
+    .poll(async () => ((rows = await readDomRows()).length), {
+      timeout: 20_000,
+      message: "first slice plus the next mounted",
+    })
+    .toBeGreaterThanOrEqual(13);
+
+  // DOM index 12 = the first row past the 12-card first slice. It must be one
+  // of THIS instance's cards (the sentinel's 16 are the newest rows in the
+  // shared store, appended together, so they tail the pending list).
+  const globalIndex = new Map(rows.map((row, index) => [row.id, index]));
+  const ownDeep = rows.find(
+    (row) => row.instance === instanceId && (globalIndex.get(row.id) ?? -1) >= 12,
+  );
+  expect(ownDeep, "an own card sits past the first progressive slice").toBeTruthy();
+  const target = ownDeep!.id!;
+
+  // Before the deep link that row is rendered but BELOW the fold: a
+  // highlight-only implementation would leave the test passing only if the
+  // target were visible, so prove it is not.
+  const targetRow = page.locator(`[data-interaction-id="${target}"]`);
+  await expect(targetRow).toHaveAttribute("data-state", "pending");
+  const before = await targetRow.boundingBox();
+  expect(before, "deep row rendered").toBeTruthy();
+  expect(before!.y, "the unlinked target starts below the fold").toBeGreaterThanOrEqual(VIEWPORT_H);
+
+  // Deep link: the ring is set and the focus effect re-runs as every tier's
+  // rAF slices grow, scrolling the border box INSIDE the viewport. The
+  // in-viewport predicate is a retrying poll (not a single bounding-box
+  // read), so late slices cannot fool it.
   await page.goto(`/approvals?focus=${target}`);
   const focused = page.locator(`[data-interaction-id="${target}"]`);
   await expect(focused).toHaveAttribute("data-focus", "true", { timeout: 20_000 });
-
-  // Highlight alone is not enough: the focus effect re-runs as the rAF slices
-  // grow and must scroll the row's border box inside the 720px viewport.
   await expect
     .poll(
       async () => {
         const box = await focused.boundingBox();
-        if (!box) return null;
-        return { y: box.y, bottom: box.y + box.height };
+        if (!box) return false;
+        return box.y >= 0 && box.y + box.height <= VIEWPORT_H;
       },
-      { timeout: 10_000 },
+      { timeout: 10_000, message: "deep-linked row scrolled inside the viewport" },
     )
-    .toMatchObject({ y: expect.any(Number), bottom: expect.any(Number) });
-  const box = await focused.boundingBox();
-  expect(box, "focused row rendered").toBeTruthy();
-  expect(box!.y).toBeGreaterThanOrEqual(0);
-  expect(box!.y + box!.height).toBeLessThanOrEqual(VIEWPORT_H);
+    .toBe(true);
 
   // Without the focus query the ring is gone (and no scroll is requested).
   await page.goto("/approvals");

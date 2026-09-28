@@ -27,6 +27,7 @@ import {
   type ApprovalRow,
 } from "./approvalRows";
 import { DecisionCard, type DecisionView, type InboxMode } from "./ApprovalCard";
+import { useInboxFocusScroll } from "./useInboxFocusScroll";
 import {
   contextRingLabel,
   deriveInboxRows,
@@ -198,12 +199,14 @@ const DesktopRecentRow = memo(
  * unchanged commits). Both routes render rows from the SAME
  * deriveRecentInstances projection.
  */
-export function DesktopRecentList({ rows }: { rows: InboxInstanceRow[] }) {
-  if (rows.length === 0) return null;
+export function DesktopRecentList({ rows, total }: { rows: InboxInstanceRow[]; total: number }) {
+  if (total === 0) return null;
   return (
     <section className={desktopCss.recent} data-testid="approvals-recent">
       <h2 className={desktopCss.tierLabel} data-testid="approvals-tier-recent">
-        进行中 · 最近 ({rows.length})
+        {/* The full tier total, like compact: the list progressively mounts
+            but the count must not read 12 / 24 while slices arrive. */}
+        进行中 · 最近 ({total})
       </h2>
       {rows.map((row) => (
         <DesktopRecentRow key={row.instanceId} row={row} />
@@ -526,21 +529,15 @@ function DesktopInbox({
   const recentLimit = useIncrementalLimit(recent.length, { resetKey: filterKey });
   const departedLimit = useIncrementalLimit(departed.length, { resetKey: filterKey });
 
-  // Deep link (?focus=): the row mounts over rAF slices, so re-run as the
-  // queue/departed limits grow until the target has committed. The target is
-  // always an interaction row (the recent tier is keyed by instance).
+  // Deep link (?focus=): the row mounts over rAF slices across ALL tiers —
+  // the recent tier renders above 已离队, so every tier's limit participates
+  // (c-inboxfu round 2).
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const focusedKey =
     queue.find((row) => row.focused)?.item.id ??
     departed.find((row) => row.focused)?.item.id ??
     null;
-  useEffect(() => {
-    if (!focus || !focusedKey) return;
-    const el = scrollRef.current?.querySelector<HTMLElement>(
-      `[data-interaction-id="${CSS.escape(focus)}"]`,
-    );
-    el?.scrollIntoView({ block: "center", behavior: "auto" });
-  }, [focus, focusedKey, queueLimit, departedLimit]);
+  useInboxFocusScroll(focus, focusedKey, scrollRef, [queueLimit, recentLimit, departedLimit]);
 
   // Project live phrases for every recent instance the tier renders (same
   // 2.5 s cadence as the compact inbox): refresh() never polls journals.
@@ -604,7 +601,7 @@ function DesktopInbox({
             />
           ))}
           {recent.length ? (
-            <DesktopRecentList rows={recent.slice(0, recentLimit)} />
+            <DesktopRecentList rows={recent.slice(0, recentLimit)} total={recent.length} />
           ) : null}
           {departed.length ? (
             <DepartedList rows={departed.slice(0, departedLimit)} workspaceLabel={workspaceLabel} />
@@ -713,16 +710,10 @@ function CompactInbox({
   const pendingLimit = useIncrementalLimit(rows.pending.length, { resetKey: kind });
   const recentLimit = useIncrementalLimit(rows.recent.length, { resetKey: kind });
 
-  // Deep link (?focus=): the row mounts over rAF slices, so re-run as the
-  // pending limit grows until the element is in the viewport.
+  // Deep link (?focus=): compact targets are always 待你处理 rows, which
+  // render above 进行中 · 最近, so only the pending slice can shift them.
   const focusedKey = rows.pending.find((row) => row.focused)?.interactionId ?? null;
-  useEffect(() => {
-    if (!focus || !focusedKey) return;
-    const el = scrollRef.current?.querySelector<HTMLElement>(
-      `[data-interaction-id="${CSS.escape(focus)}"]`,
-    );
-    el?.scrollIntoView({ block: "center", behavior: "auto" });
-  }, [focus, focusedKey, pendingLimit]);
+  useInboxFocusScroll(focus, focusedKey, scrollRef, [pendingLimit]);
 
   const banner: PushBannerState = dismissed ? { show: false } : derivePushBanner(push);
   const enablePush = async () => {

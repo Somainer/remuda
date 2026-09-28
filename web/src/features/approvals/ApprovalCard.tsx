@@ -252,7 +252,14 @@ export const DecisionCard = memo(function DecisionCard({
       {review ? (
         typeof review.plan === "string" && review.plan.length > 0 ? (
           <details className={css.planDetails}>
-            <summary className={css.planSummary}>查看计划（{review.plan.length} 字）</summary>
+            <summary className={css.planSummary}>
+              {/* c-inboxfu: the summary is display:flex, which drops the
+                  native disclosure widget in some engines; paint the marker
+                  ourselves (same ▸/▾ convention as runDetails) so the
+                  affordance is visible in WebKit and Chromium. */}
+              <span className={css.planChev} aria-hidden="true" />
+              查看计划（{review.plan.length} 字）
+            </summary>
             <pre className={css.planBody}>{review.plan}</pre>
           </details>
         ) : (

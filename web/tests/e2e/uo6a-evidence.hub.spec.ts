@@ -40,10 +40,11 @@ async function shot(page: Page, name: string, width: number) {
   await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
 }
 
-/** The transcript has replaced 「加载 snapshot…」. */
+/** The transcript has replaced 「加载 snapshot…」 and drawn its first row. */
 async function transcriptReady(page: Page) {
   await expect(page.getByTestId("loading-snapshot")).toHaveCount(0, { timeout: 20_000 });
   await expect(page.getByTestId("transcript")).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByTestId("transcript-row").first()).toBeVisible({ timeout: 20_000 });
 }
 
 /**
@@ -289,7 +290,7 @@ test.describe("1440 desktop", () => {
       expect(Math.abs(fit.centre - fit.column), `${id} centred`).toBeLessThanOrEqual(1);
     }
 
-    const ended = await createSession(page, "UO6A_COLUMN mhome-exit agent");
+    const ended = await createSession(page, "mfix-chrome-combo");
     await page.goto(`/s/${ended}/structured`);
     await transcriptReady(page);
     await expect(page.getByTestId("ended-bar")).toBeVisible({ timeout: 20_000 });
@@ -374,7 +375,9 @@ async function captureScreens(browser: Browser, width: number, scheme: "dark" | 
     await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
     await shot(page, `uo6a-idle-${width}-${scheme}.png`, width);
 
-    const ended = await createSession(page, `UO6A_SHOT mhome-exit agent ${width}`, ids);
+    // The combo fixture (exact prompt) journals a turn and then exits: an
+    // ended session WITH a transcript to show.
+    const ended = await createSession(page, "mfix-chrome-combo", ids);
     await page.goto(`/s/${ended}/structured`);
     await transcriptReady(page);
     await expect(page.getByTestId("ended-bar")).toBeVisible({ timeout: 20_000 });
@@ -399,8 +402,10 @@ test("evidence shots: keyboard band at 390 (WebKit iPhone)", async ({ playwright
   test.setTimeout(180_000);
   let webkit: Browser;
   try {
-    webkit = await playwright.webkit.launch();
-  } catch {
+    // The hub config pins chromium to the "chrome" channel; WebKit has none.
+    webkit = await playwright.webkit.launch({ channel: undefined });
+  } catch (error) {
+    console.log(`UO6A webkit launch failed: ${String(error).slice(0, 400)}`);
     test.skip(true, "WebKit is not installed here");
     return;
   }

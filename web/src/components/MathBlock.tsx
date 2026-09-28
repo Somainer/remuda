@@ -63,12 +63,16 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
     const el = rootRef.current;
     if (!el) return;
     // `overflow-x: clip` reserves no gutter, so scrollWidth/clientWidth tell
-    // the truth: promote to a scroll box only for a genuinely over-wide
-    // formula. The ON/OFF thresholds differ by more than the scrollbar gutter
-    // width, which itself shrinks clientWidth — without that gap a borderline
-    // node would flip back and forth and re-render forever.
+    // the truth. ANY real overflow promotes — even 1px — so a formula can
+    // never lose visible content. The anti-flip band lives on the DEMOTE
+    // side: once promoted we only demote with DEMOTE_SLACK px of slack,
+    // because the scroll box's own gutter shrinks clientWidth and a
+    // borderline node would otherwise flip back and forth and re-render
+    // forever.
+    const DEMOTE_SLACK = 8;
     const measure = (): void => {
-      setWide((prev) => (prev ? el.scrollWidth > el.clientWidth : el.scrollWidth > el.clientWidth + 8));
+      const overflow = el.scrollWidth - el.clientWidth;
+      setWide((prev) => (prev ? overflow > -DEMOTE_SLACK : overflow > 0));
     };
     measure();
     // Fonts arriving late and viewport/column resizes change the width.

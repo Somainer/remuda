@@ -1,5 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MathExpression } from "./MathBlock";
 import {
   __setMathImporterForTest,
@@ -10,6 +11,47 @@ import {
 beforeEach(() => {
   resetMathEngineForTest();
 });
+
+/**
+ * jsdom has no ResizeObserver and does zero layout; the promotion logic is
+ * driven by an observer callback, so install one we can fire by hand and
+ * stub scrollWidth/clientWidth per step.
+ */
+class ResizeObserverMock {
+  private callback: ResizeObserverCallback;
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
+  }
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+  trigger(): void {
+    this.callback([], this as unknown as ResizeObserver);
+  }
+}
+let observers: ResizeObserverMock[] = [];
+
+beforeEach(() => {
+  observers = [];
+  vi.stubGlobal(
+    "ResizeObserver",
+    class extends ResizeObserverMock {
+      constructor(callback: ResizeObserverCallback) {
+        super(callback);
+        observers.push(this);
+      }
+    },
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+const mockWidths = (el: Element, scrollWidth: number, clientWidth: number): void => {
+  Object.defineProperty(el, "scrollWidth", { configurable: true, get: () => scrollWidth });
+  Object.defineProperty(el, "clientWidth", { configurable: true, get: () => clientWidth });
+};
 
 describe("MathExpression", () => {
   it("shows the TeX source as a neutral placeholder, then KaTeX output for inline math", async () => {
@@ -118,6 +160,42 @@ describe("MathExpression", () => {
 
     expect(event.defaultPrevented).toBe(false);
     expect(event.clipboardData.setData).not.toHaveBeenCalled();
+  });
+
+  it("promotes an inline formula on 1px overflow without a promote/demote loop (c-mathfu 2)", async () => {
+    render(<MathExpression source={"x_1+x_2+x_3+x_4"} display={false} />);
+    const inline = await screen.findByTestId("math-inline");
+    expect(inline.className).not.toMatch(/inlineScroll/);
+    // Exactly one inline formula → one observer; widths are stubbed.
+    expect(observers).toHaveLength(1);
+    const fire = (scrollWidth: number, clientWidth: number): void => {
+      mockWidths(inline, scrollWidth, clientWidth);
+      act(() => observers[0]!.trigger());
+    };
+
+    // 1px of real overflow must already promote: no formula content clipped.
+    fire(101, 100);
+    expect(inline.className).toMatch(/inlineScroll/);
+
+    // The scroll box now reserves its gutter; emulate clientWidth shrinking
+    // by up to the gutter (overflow as large as the old 8px promote edge).
+    // The demote-side band keeps it promoted — no flip back and forth.
+    for (const clientWidth of [99, 96, 93, 92]) {
+      fire(101, clientWidth);
+      expect(inline.className).toMatch(/inlineScroll/);
+    }
+    // Repeated RO callbacks with the same widths settle (no render loop).
+    fire(101, 100);
+    expect(inline.className).toMatch(/inlineScroll/);
+
+    // Only REAL slack demotes: content shorter by more than the band.
+    fire(93, 100); // overflow -7: inside the demote band, stays promoted
+    expect(inline.className).toMatch(/inlineScroll/);
+    fire(92, 100); // overflow -8: demote
+    expect(inline.className).not.toMatch(/inlineScroll/);
+    // And 1px promotes again.
+    fire(101, 100);
+    expect(inline.className).toMatch(/inlineScroll/);
   });
 
   it("renders a SECOND mounted component after the first import rejects (K)", async () => {

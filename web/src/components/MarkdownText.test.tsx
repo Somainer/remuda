@@ -323,6 +323,45 @@ describe("math rendering (c-math round 3)", () => {
     expect(lit2.textContent).toBe("$$\n\\sigma(z)");
   });
 
+  it("renders a rejected \\[ opener as fully inert text, never a link/image (c-mathfu r2.1)", async () => {
+    // `\[` + link syntax across a blank line: the opener is rejected (no
+    // closer in its paragraph) and BOTH delimiter chars are escaped, so the
+    // bracket cannot open an inline link/reference/image; later bold renders.
+    const { container } = render(
+      <MarkdownText text={"\\[label](/docs/page)\n\n**bold**"} />,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector("p")!.textContent).toBe("\\[label](/docs/page)");
+    expect(container.querySelector("strong")!.textContent).toBe("bold");
+    expect(screen.queryByTestId("math-literal")).toBeNull();
+
+    // The reviewer's https fixture: the bracket link must not form. The bare
+    // URL may still get GFM's GENERIC autolink (as in any message), but no
+    // anchor may carry the link text, and visible text is exact.
+    const https = render(
+      <MarkdownText text={"\\[label](https://example.org)\n\n**bold**"} />,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect(https.container.textContent).toContain("\\[label](https://example.org)");
+    expect([...https.container.querySelectorAll("a")].some((a) => a.textContent === "label")).toBe(
+      false,
+    );
+    https.unmount();
+
+    // Reference-style opener and image opener are inert too.
+    const ref = render(<MarkdownText text={"\\[label][ref]\n\n**bold2**"} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ref.container.querySelector("a")).toBeNull();
+    ref.unmount();
+    const img = render(<MarkdownText text={"!\\[alt](https://example.org/x.png)\n\nx"} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(img.container.querySelector("img")).toBeNull();
+    expect([...img.container.querySelectorAll("a")].some((a) => a.textContent === "alt")).toBe(
+      false,
+    );
+  });
+
   it("kills only the broken $$ opener, then later $$ and $ render (E)", async () => {
     render(<MarkdownText text={"$$\n\nx\n\n$$y$$\n\n$z$"} />);
     expect(await screen.findByTestId("math-display")).toBeTruthy();

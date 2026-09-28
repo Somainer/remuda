@@ -30,7 +30,7 @@ describe("prepareMath: accepted math is passed through", () => {
     // rest of the message keeps rendering (no literal tail).
     const src = "\\[\n\nx\n\\]";
     expect(T(src)).toBeNull();
-    expect(M(src)).toBe("\\\\[\n\nx\n\\]");
+    expect(M(src)).toBe("\\\\\\[\n\nx\n\\]");
   });
 
   it("keeps inline \\( … \\) single-line even with a closer later (round-4 fix 2)", () => {
@@ -94,7 +94,7 @@ describe("prepareMath: code is parser-owned (A)", () => {
     // ordinary markdown text — the message is NOT swallowed into a tail.
     const src = "\\[\n```\n$x$\n```\n\\]";
     expect(prepareMath(src).literalTail).toBeNull();
-    expect(M(src)).toBe("\\\\[\n```\n$x$\n```\n\\]");
+    expect(M(src)).toBe("\\\\\\[\n```\n$x$\n```\n\\]");
   });
 
   it("masks indented code nested in block quotes/list continuations (round-4 fix 3)", () => {
@@ -107,7 +107,7 @@ describe("prepareMath: code is parser-owned (A)", () => {
   it("does not pair a multi-line \\[ across a fenced block that interrupts the paragraph", () => {
     const src = "\\[\n```\n$x$\n```\n\\] tail";
     expect(T(src)).toBeNull();
-    expect(M(src)).toBe("\\\\[\n```\n$x$\n```\n\\] tail");
+    expect(M(src)).toBe("\\\\\\[\n```\n$x$\n```\n\\] tail");
   });
 });
 
@@ -131,14 +131,14 @@ describe("prepareMath: rejected display opener keeps later markdown (c-mathfu 1)
     expect(T(src)).toBeNull();
     const out = M(src);
     // Only the opener was made literal (exact `\[` source); bold survives.
-    expect(out).toBe("\\\\[ x\n\n**bold**\n\n\\]");
+    expect(out).toBe("\\\\\\[ x\n\n**bold**\n\n\\]");
   });
 
   it("renders lists, code blocks and later math past the rejected opener", () => {
     const src = "\\[ x\n\n- **item**\n\n```\ncode\n```\n\n$y$";
     const out = M(src);
     expect(T(src)).toBeNull();
-    expect(out.startsWith("\\\\[ x\n\n")).toBe(true);
+    expect(out.startsWith("\\\\\\[ x\n\n")).toBe(true);
     expect(out).toContain("- **item**");
     expect(out).toContain("```\ncode\n```");
     expect(out).toContain("$y$");
@@ -146,8 +146,18 @@ describe("prepareMath: rejected display opener keeps later markdown (c-mathfu 1)
 
   it("keeps each rejected opener literal when several fail in one paragraph", () => {
     const src = "\\[a \\[b\n\n**bold**";
-    expect(M(src)).toBe("\\\\[a \\\\[b\n\n**bold**");
+    expect(M(src)).toBe("\\\\\\[a \\\\\\[" + "b\n\n**bold**");
     expect(T(src)).toBeNull();
+  });
+
+  it("fully inert opener: no link/reference/image can start at the escaped bracket", () => {
+    expect(M("\\[label](https://example.org)\n\n**bold**")).toBe(
+      "\\\\\\[label](https://example.org)\n\n**bold**",
+    );
+    expect(M("\\[label][ref]\n\nx")).toBe("\\\\\\[label][ref]\n\nx");
+    expect(M("!\\[alt](https://example.org/x.png)\n\nx")).toBe(
+      "!\\\\\\[alt](https://example.org/x.png)\n\nx",
+    );
   });
 
   it("still takes the literal tail when the rejected opener reaches EOF", () => {

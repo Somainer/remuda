@@ -347,11 +347,13 @@ export function prepareMath(input: string): PreparedMath {
       continue;
     }
     if (rejectedDisplayAt.has(i)) {
-      // Keep the rejected opener as EXACT visible source: `\\` escapes the
-      // backslash (renders `\`) and `[` renders literally; remark-math never
-      // sees a bracket opener, and rendering resumes on the next char.
+      // Keep the rejected opener as EXACT visible source and fully inert:
+      // `\\` renders a literal backslash and `\[` a literal bracket. Both
+      // must be escaped — escaping only the backslash leaves a live `[`,
+      // which turns `\[label](url)` into a real link. Rendering resumes on
+      // the next char.
       flushVerbatim(i);
-      segments.push("\\\\[");
+      segments.push("\\\\\\[");
       i += 2;
       segStart = i;
       continue;

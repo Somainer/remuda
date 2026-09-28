@@ -82,7 +82,11 @@ function writeRows(...rows: OutboxRecord[]) {
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify(rows));
 }
 
-it("a cancelled beforeunload re-arms a cleared lease-expiry wakeup when the page stays", async () => {
+it("a cancelled beforeunload re-arms a cleared lease-expiry wakeup without flushing", async () => {
+  // beforeunload disarms the timers; a CANCELLED prompt fires no pagehide,
+  // the page stays, and the self-reset re-latches delivery and re-arms the
+  // lease wakeups READ-ONLY (it never flushes itself: in a real reload the
+  // task runs before pagehide inside teardown).
   vi.useFakeTimers();
   try {
     const { api, hubStore } = await fresh();
@@ -105,14 +109,15 @@ it("a cancelled beforeunload re-arms a cleared lease-expiry wakeup when the page
     await internal.flushAllOutbox();
     expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
 
-    // User triggers navigation but CANCELS the prompt: beforeunload clears
-    // every wakeup, the page stays, the self-reset task must re-arm.
+    // User triggers navigation but CANCELS the prompt: beforeunload disarms;
+    // the reset task then re-arms the wakeup from durable rows.
     window.dispatchEvent(new Event("beforeunload"));
     expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
     await vi.advanceTimersByTimeAsync(0);
-    await Promise.resolve();
-    await Promise.resolve();
+    expect(hubStore.pageIsUnloadingForTest).toBe(false);
     expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+    // The self-reset re-armed only: the foreign lease is live, so no POST.
+    expect(send).not.toHaveBeenCalled();
 
     // The re-armed wakeup still fires at lease expiry and steals the row.
     await vi.advanceTimersByTimeAsync(9_999);
@@ -126,22 +131,27 @@ it("a cancelled beforeunload re-arms a cleared lease-expiry wakeup when the page
   }
 });
 
-it("a genuine pagehide does not self-reset the unload flag nor re-arm the wakeup", async () => {
+it("a genuine reload: the beforeunload self-reset task never flushes and pagehide disarms", async () => {
+  // Chromium runs beforeunload's setTimeout(0) ~0.1 ms BEFORE pagehide: the
+  // self-reset must clear only the flag, never flush (an inflight lease
+  // written during teardown would strand the reloaded document 30 s).
   vi.useFakeTimers();
   try {
     const { api, hubStore } = await fresh();
     await boot(api, hubStore);
     const internal = internalOf(hubStore);
+    const flushSpy = vi.spyOn(internal, "flushAllOutbox");
 
     writeRows(foreignInflightRow(Date.now() + 10_000));
     await internal.flushAllOutbox();
+    flushSpy.mockClear();
     expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
 
-    // Real navigation: pagehide must not schedule the beforeunload self-reset
-    // (which would un-latch delivery and re-arm in a tearing-down page).
-    const flushSpy = vi.spyOn(internal, "flushAllOutbox");
+    // Real navigation ordering: beforeunload's reset task runs first …
+    window.dispatchEvent(new Event("beforeunload"));
+    await vi.advanceTimersByTimeAsync(0);
+    // … then pagehide disarms every timer; the reset task never flushed.
     window.dispatchEvent(new Event("pagehide"));
-    expect(hubStore.pageIsUnloadingForTest).toBe(true);
     expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
     await vi.advanceTimersByTimeAsync(11_000);
     expect(flushSpy).not.toHaveBeenCalled();

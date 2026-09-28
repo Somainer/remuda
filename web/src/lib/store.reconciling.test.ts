@@ -344,6 +344,95 @@ it("ROUND5-1: a live steer whose forward is only unknown does not raise 已打�
   expect(vi.mocked(api.instanceSend)).toHaveBeenCalledTimes(1);
 });
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+it("a journal-confirmed done row is never downgraded by a GET verdict landing during the read", async () => {
+  const { api, hubStore } = await fresh();
+  stubFollow(api);
+  vi.spyOn(api, "instanceSend").mockImplementation(
+    (async (_iid: string, _p: string, _r?: unknown[], _m?: string, commandId?: string) => ({
+      relatedCommandIds: [],
+      command: reconciling(commandId!),
+    })) as Api["instanceSend"],
+  );
+  // The first reconciliation GET hangs; it eventually reports acceptance.
+  const firstGet = deferred<Awaited<ReturnType<Api["instanceCommandStatus"]>>>();
+  let gets = 0;
+  vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+    (async (_iid: string, commandId: string) => {
+      gets += 1;
+      if (gets === 1) return firstGet.promise;
+      return raw(base(commandId, "accepted"));
+    }) as Api["instanceCommandStatus"],
+  );
+  hubStore.setConnectionStateForTest("live");
+  await hubStore.send(INSTANCE, "journal wins the race");
+
+  // Wait until the first GET is actually in flight, then the follow socket
+  // retires the row to done on journal evidence WHILE the GET is pending.
+  const bubble = hubStore.getSnapshot().bubbles[0]!;
+  await vi.waitFor(() => expect(gets).toBe(1));
+  const internal = hubStore as unknown as {
+    outbox: { patch: (id: string, p: { state: string; serverState?: string }) => Promise<void> };
+  };
+  await internal.outbox.patch(bubble.commandId!, { state: "done", serverState: "journal-settled" });
+
+  // The hung GET now answers "accepted" (verdict: sent). Done must survive.
+  firstGet.resolve(raw(base(bubble.commandId!, "accepted")));
+  // Give the loop's continuation a tick to make the wrong write.
+  await new Promise((r) => setTimeout(r, 20));
+
+  const durable = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{ state: string }>;
+  expect(durable[0]?.state).toBe("done");
+});
+
+it("a row journal-confirmed done during a hung GET is not downgraded to unknown at the deadline", async () => {
+  vi.useFakeTimers();
+  const { api, hubStore } = await fresh();
+  stubFollow(api);
+  vi.spyOn(api, "instanceSend").mockImplementation(
+    (async (_iid: string, _p: string, _r?: unknown[], _m?: string, commandId?: string) => ({
+      relatedCommandIds: [],
+      command: reconciling(commandId!),
+    })) as Api["instanceSend"],
+  );
+  // The GET stays pending past the 30 s deadline, then answers "reconciling":
+  // without the pre-write recheck the loop would settle the row unknown.
+  const hungGet = deferred<Awaited<ReturnType<Api["instanceCommandStatus"]>>>();
+  const status = vi.spyOn(api, "instanceCommandStatus").mockReturnValue(hungGet.promise);
+  hubStore.setConnectionStateForTest("live");
+  await hubStore.send(INSTANCE, "journal beats the deadline");
+
+  // Let delivery land and the bounded loop enter its first (hung) GET.
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(status).toHaveBeenCalledTimes(1);
+
+  const bubble = hubStore.getSnapshot().bubbles[0]!;
+  // Journal evidence retires the row while the GET is in flight...
+  const internal = hubStore as unknown as {
+    outbox: { patch: (id: string, p: { state: string; serverState?: string }) => Promise<void> };
+  };
+  await internal.outbox.patch(bubble.commandId!, { state: "done", serverState: "journal-settled" });
+  // ...the deadline passes...
+  for (let i = 0; i < 35; i += 1) {
+    await vi.advanceTimersByTimeAsync(1_000);
+  }
+  // ...and the stale verdict finally arrives.
+  hungGet.resolve(raw(reconciling(bubble.commandId!)));
+  for (let i = 0; i < 10; i += 1) {
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  const durableAfter = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{ state: string }>;
+  expect(durableAfter[0]?.state).toBe("done");
+  vi.useRealTimers();
+});
+
 it("ROUND5-1: a restored reconciling row restarts its bounded GET loop after reload (no re-POST)", async () => {
   const { api, hubStore } = await fresh();
   vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);

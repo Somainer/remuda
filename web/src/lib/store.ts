@@ -1583,37 +1583,54 @@ class HubStore {
       // to "done". Stop polling and never downgrade it with a GET verdict.
       if (this.outbox?.get(commandId)?.state === "done") return;
       const verdict = await this.reconcileCommandViaGet(instanceId, commandId);
+      // The follow frame may have retired the row to done WHILE this GET was
+      // in flight (the top-of-loop check cannot see that): re-read before
+      // every write so a late sent/held/unknown verdict never downgrades done.
       if (verdict === "rejected") {
         const result = await api.instanceCommandStatus(instanceId, commandId).catch(() => null);
-        await this.safePatch(commandId, {
+        if (!(await this.reconcilePatch(commandId, {
           state: "rejected",
           serverState: result?.state,
           gotResponse: true,
           lastError: result?.settlement?.reason ?? "rejected by node",
-        });
+        }))) {
+          return;
+        }
         return;
       }
       if (verdict === "sent") {
-        await this.safePatch(commandId, { state: "sent", gotResponse: true });
+        await this.reconcilePatch(commandId, { state: "sent", gotResponse: true });
         return;
       }
       if (verdict === "held") {
         // Host went offline mid-reconcile: fall back to held retry (refund the
         // attempt and arm the bounded same-id re-POST).
-        await this.safePatch(commandId, {
+        const wrote = await this.reconcilePatch(commandId, {
           state: "held",
           gotResponse: true,
           attempts: this.outbox?.get(commandId)?.attempts ?? 0,
         });
-        this.scheduleHeldRetry(instanceId);
+        if (wrote) this.scheduleHeldRetry(instanceId);
         return;
       }
       if (Date.now() >= deadline) {
-        await this.safePatch(commandId, { state: "unknown", lastError: "reconciliation deadline" });
+        await this.reconcilePatch(commandId, { state: "unknown", lastError: "reconciliation deadline" });
         return;
       }
       await new Promise((r) => setTimeout(r, RECONCILE_GET_INTERVAL_MS));
     }
+  }
+
+  /**
+   * Reconciliation-write gate: journal evidence ("done") is terminal and can
+   * land while a GET is in flight or while the deadline fires. Never let the
+   * bounded GET loop overwrite it with sent/held/rejected/unknown. Returns
+   * false when the write was skipped because the row is already done.
+   */
+  private async reconcilePatch(commandId: Id, patch: Partial<OutboxRecord>): Promise<boolean> {
+    if (this.outbox?.get(commandId)?.state === "done") return false;
+    await this.safePatch(commandId, patch);
+    return true;
   }
 
   /** Storage-first patch that never throws into the delivery flow. */

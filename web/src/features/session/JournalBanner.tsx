@@ -38,6 +38,9 @@ export function JournalBanner({
   // `sawOffline` latches an actual offline state since the last live spell
   // (a stale watchdog flap does not latch); the timer clears the notice, and
   // the render gate (`shown === "live"`) hides it the instant the link drops.
+  // Leaving live within the window (a new mount goes recovering) also clears
+  // `restored` in the cleanup: the timer is gone, so leaving the notice set
+  // would let it latch permanently when the link returns live.
   const [restored, setRestored] = useState(false);
   const sawOffline = useRef(false);
   useEffect(() => {
@@ -49,7 +52,10 @@ export function JournalBanner({
     sawOffline.current = false;
     setRestored(true);
     const t = setTimeout(() => setRestored(false), 1500);
-    return () => clearTimeout(t);
+    return () => {
+      clearTimeout(t);
+      setRestored(false);
+    };
   }, [connection]);
 
   if (restored && shown === "live") {

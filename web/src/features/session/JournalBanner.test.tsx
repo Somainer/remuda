@@ -90,4 +90,39 @@ describe("JournalBanner", () => {
     act(() => setConnection("offline"));
     expect(screen.getByTestId("journal-banner")).toHaveAttribute("data-state", "offline");
   });
+
+  it("does not latch 已恢复 when a new mount leaves live within the 1.5 s window", () => {
+    vi.useFakeTimers();
+    act(() => setConnection("offline"));
+    render(<JournalBanner status="live" />);
+    act(() => setConnection("live"));
+    expect(screen.getByTestId("journal-banner")).toHaveAttribute("data-state", "restored");
+
+    // 500 ms in (timer still pending) a new mount goes recovering: the cleanup
+    // kills the timer and must clear the notice instead of leaving it latched.
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    act(() => setConnection("recovering"));
+    expect(screen.getByTestId("journal-banner")).toHaveAttribute("data-state", "recovering");
+
+    // The link returns live WITHOUT another offline spell: no re-arm, and the
+    // old notice must not reappear latched — the banner is quiet for good.
+    act(() => setConnection("live"));
+    expect(screen.queryByTestId("journal-banner")).toBeNull();
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(screen.queryByTestId("journal-banner")).toBeNull();
+
+    // A genuine new offline spell still re-arms the notice exactly once.
+    act(() => setConnection("offline"));
+    act(() => setConnection("live"));
+    expect(screen.getByTestId("journal-banner")).toHaveAttribute("data-state", "restored");
+    act(() => {
+      vi.advanceTimersByTime(1500);
+    });
+    expect(screen.queryByTestId("journal-banner")).toBeNull();
+    vi.useRealTimers();
+  });
 });

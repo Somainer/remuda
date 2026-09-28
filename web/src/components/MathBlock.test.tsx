@@ -201,6 +201,25 @@ describe("MathExpression", () => {
     expect(event.clipboardData.setData).not.toHaveBeenCalled();
   });
 
+  it("promotes on exactly 1px of clipped ink and stays stable (c-mathfu r3.3)", async () => {
+    render(<MathExpression source={"\\sum_i x_i"} display={false} />);
+    const inline = await screen.findByTestId("math-inline");
+    const fire = (g: Parameters<typeof mockGeom>[1]): void => {
+      mockGeom(inline, g);
+      act(() => observers[observers.length - 1]!.trigger());
+    };
+    const promoted = (): boolean => inline.className.includes("inlineScroll");
+    expect(promoted()).toBe(false);
+    // Exactly one pixel of real ink beyond the shrink-to-fit box.
+    fire({ scrollW: 35, nodeW: 34, clientW: 34, blockW: 700 });
+    expect(promoted()).toBe(true);
+    // Repeated measurements with the same 1px geometry must stay promoted.
+    fire({ scrollW: 35, nodeW: 34, clientW: 34, blockW: 700 });
+    expect(promoted()).toBe(true);
+    fire({ scrollW: 35, nodeW: 34, clientW: 34, blockW: 700 });
+    expect(promoted()).toBe(true);
+  });
+
   it("promotes on 2px KaTeX bearings and never flips at the block-width boundary (c-mathfu 2/r2)", async () => {
     render(<MathExpression source={"\\sum_i x_i"} display={false} />);
     const inline = await screen.findByTestId("math-inline");

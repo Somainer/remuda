@@ -11,6 +11,7 @@ import {
   installedCli,
   isStaleOffline,
   useHostViews,
+  useStaleCutoffTick,
   type HostView,
 } from "../features/hosts";
 import { fromHub, type ProviderProfile } from "../features/providers";
@@ -60,10 +61,13 @@ export function HostsPage() {
   useHostPolling();
   const hub = useHub();
   const hosts = useHostViews(hub.hosts, hub.instances);
+  // Wake up exactly when the next offline host crosses into the stale group;
+  // equal quiet polls emit nothing, so the cutoff timer is what re-groups.
+  const nowMs = useStaleCutoffTick(hub.hosts);
   const [adding, setAdding] = useState(false);
   const [showStale, setShowStale] = useState(false);
-  const stale = hosts.filter((h) => isStaleOffline(h));
-  const visible = showStale ? hosts : hosts.filter((h) => !isStaleOffline(h));
+  const stale = hosts.filter((h) => isStaleOffline(h, nowMs));
+  const visible = showStale ? hosts : hosts.filter((h) => !isStaleOffline(h, nowMs));
   const online = hosts.filter((h) => h.online).length;
 
   return (
@@ -105,7 +109,7 @@ export function HostsPage() {
           </div>
           <div className={css.list}>
             {visible.map((host) => {
-              const staleHost = isStaleOffline(host);
+              const staleHost = isStaleOffline(host, nowMs);
               const dotClass = host.online
                 ? css.dotOn
                 : staleHost

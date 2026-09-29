@@ -129,3 +129,44 @@ it("wakes up at a crashed tab's lease expiry and then delivers the inflight row"
   vi.useRealTimers();
   hubStore.logout();
 });
+
+it("a row another tab retracts before the inflight claim commits is never POSTed", async () => {
+  // c-reconnfu round 3 item 3: the durable claim (box.patch →
+  // mergeUnlessDone) resolves null when another tab's retract deleted the
+  // row in the claim's window. The old code only checked for a preserved
+  // `done`; a null claim still fell through to instanceSend — a POST for a
+  // command the user retracted.
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore);
+
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([row({ commandId: "cmd_retracted_first" })]));
+  const send = vi
+    .spyOn(api, "instanceSend")
+    .mockResolvedValue({
+      relatedCommandIds: [],
+      command: {
+        commandId: "cmd_retracted_first",
+        id: "cmd_retracted_first",
+        state: "accepted",
+        revision: "1",
+        dispatch: "native-acknowledged",
+        resolution: "clear",
+      } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
+    });
+
+  // Model the cross-tab retract landing INSIDE the claim window: the
+  // deliverer already read the row as deliverable; right when the inflight
+  // lease claim's merge transaction runs, the durable row is gone, so the
+  // REAL merge resolves null (missing row), exactly like the IDB backend.
+  const box = (hubStore as unknown as { outbox: import("./outbox").Outbox }).outbox;
+  const realPatch = box.patch.bind(box);
+  vi.spyOn(box, "patch").mockImplementation(async (id, patch) => {
+    if (patch.state === "inflight") await box.remove(id);
+    return realPatch(id, patch);
+  });
+
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  await new Promise((r) => setTimeout(r, 10));
+  expect(send).not.toHaveBeenCalled();
+  hubStore.logout();
+});

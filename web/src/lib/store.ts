@@ -1807,7 +1807,13 @@ class HubStore {
         attempts: isFreshAttempt ? current0.attempts + 1 : current0.attempts,
         lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS },
       });
-      if (claimed?.state === "done") return false;
+      // A null claim means the row vanished inside the claim transaction
+      // (another tab's retract deleted it — mergeUnlessDone resolves null
+      // for a missing row): there is nothing to POST. Also refuse a claim
+      // that did not come back with THIS tab's lease owner (a foreign
+      // live lease must never be POSTed under).
+      if (!claimed || claimed.lease?.owner !== box.ownerId) return false;
+      if (claimed.state === "done") return false;
     } catch {
       return false;
     }

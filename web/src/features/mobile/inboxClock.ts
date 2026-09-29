@@ -33,15 +33,47 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 let armed: readonly Interaction[] = [];
 let clockNow: number = Date.now();
 
+/**
+ * Independent DISPLAY tick for relative time labels (c-perffu r3). Equal
+ * quiet polls no longer emit store notifications and the deadline timer
+ * arms only when a known deadline exists, so without this tick 「刚刚/Nm」
+ * froze on an idle inbox. 15 s is finer than the 45 s 刚刚→1m boundary and
+ * the subsequent 60 s minute buckets, so every label boundary is observed
+ * (a 30 s cadence could skip 1m). It lives only while a clock subscriber
+ * (badge/inbox rows) is mounted; deadline invalidation below is unchanged.
+ */
+const DISPLAY_TICK_MS = 15_000;
+let displayTimer: ReturnType<typeof setInterval> | null = null;
+
+function startDisplayClock(): void {
+  if (displayTimer !== null) return;
+  displayTimer = setInterval(() => {
+    clockNow = Date.now();
+    emit();
+  }, DISPLAY_TICK_MS);
+}
+
+function stopDisplayClockIfIdle(): void {
+  if (listeners.size === 0 && displayTimer !== null) {
+    clearInterval(displayTimer);
+    displayTimer = null;
+  }
+}
+
 function emit(): void {
   for (const listener of [...listeners]) listener();
 }
 
-/** Subscribe to deadline-crossing ticks. Returns the unsubscribe handle. */
+/**
+ * Subscribe to deadline-crossing ticks AND the independent display tick.
+ * Returns the unsubscribe handle.
+ */
 export function subscribeInboxClock(listener: () => void): () => void {
   listeners.add(listener);
+  startDisplayClock();
   return () => {
     listeners.delete(listener);
+    stopDisplayClockIfIdle();
   };
 }
 
@@ -59,6 +91,10 @@ export function __resetInboxClockForTest(at: number = Date.now()): void {
   if (timer !== null) {
     clearTimeout(timer);
     timer = null;
+  }
+  if (displayTimer !== null) {
+    clearInterval(displayTimer);
+    displayTimer = null;
   }
   armed = [];
   listeners.clear();

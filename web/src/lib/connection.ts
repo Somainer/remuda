@@ -368,6 +368,20 @@ export class ConnectionMachine {
   }
 
   /**
+   * Live hand-off from a mount whose SEED LOST to an already-mounted journal,
+   * scoped to the mount's captured binding generation and attempt id. Certifies
+   * only when the call still names the CURRENT binding AND its exact in-flight
+   * attempt: a deferred duplicate seed from an obsolete navigation (rapid
+   * A → B → A → B) must not retire the newest mount's attempt and watchdog
+   * (whose later failure would then be ignored, leaving a false live).
+   */
+  followAttemptLive(attemptId: number, gen: number) {
+    if (gen !== this.latestBindGen) return;
+    if (!this.resumeInFlight || this.resumeAttemptId !== attemptId) return;
+    this.followRebindLive();
+  }
+
+  /**
    * Arm the recovering slot + watchdog WITHOUT running the resume action. The
    * INITIAL follow mount (REST journal seed + first subscribe) runs outside
    * resume() but must not leave the machine claiming live with no timer while

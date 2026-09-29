@@ -1324,13 +1324,20 @@ class HubStore {
 
   /**
    * Hand-off from a mount whose seed LOST to another mount of the same
-   * journal that is already loading: only an OPEN fresh socket may certify
-   * (retiring the attempt this mount shares with the winner). A silent socket
-   * is left to the WINNING mount's own attempt/watchdog — kicking a resume
-   * here would open a second socket under the winner and abort its backfill.
+   * journal that is already loading, SCOPED to the captured (journal,
+   * binding generation, attempt): only an OPEN fresh socket on the STILL-BOUND
+   * journal may certify, and only the exact attempt this mount armed (or
+   * shared with the winner). A deferred duplicate seed from an obsolete
+   * navigation (rapid A → B → A → B) whose journal is no longer bound, or
+   * whose attempt was superseded, is a no-op: it must not retire the
+   * winning mount's attempt/watchdog, and a silent socket is left to the
+   * winner's own attempt.
    */
-  private handOffMountedConnection() {
-    if (this.connection && this.followSocketLive()) this.connection.followRebindLive();
+  private handOffMountedConnection(journalId: Id, gen: number, attemptId: number | undefined) {
+    if (!this.connection || attemptId === undefined) return;
+    if (this.connectionBoundJournal !== journalId) return;
+    if (!this.followSocketLive()) return;
+    this.connection.followAttemptLive(attemptId, gen);
   }
 
   /**
@@ -2423,7 +2430,10 @@ class HubStore {
       // slot): hand off a live socket or leave its own attempt/watchdog to
       // close, but never end this mount's attempt against it.
       if (this.journals.has(instance.journalId)) {
-        this.handOffMountedConnection();
+        // Scoped to THIS mount's captured binding/attempt: a deferred
+        // duplicate seed from an obsolete navigation must not retire the
+        // winning mount's attempt.
+        this.handOffMountedConnection(instance.journalId, bindGen, attemptId);
         return;
       }
       const history = seed.events;

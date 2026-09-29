@@ -190,3 +190,134 @@ it("rebinding to an already-mounted live session certifies it and retires the pr
 
   hubStore.logout();
 });
+
+/**
+ * c-reconnfu round 3 item 2: the seed-lost handoff must be SCOPED to the
+ * captured (journal, binding generation, attempt). Rapid A → B → A → B issues a
+ * DEFERRED DUPLICATE seed per journal (the second follow() of a journal whose
+ * first seed is still pending starts a second eventsRead). When the duplicate A seed
+ * resolves after B's stale first mount already opened a live B socket, the
+ * journals.has(A) early return used to hand off unconditionally:
+ * followRebindLive() certified live and retired the CURRENT (B) attempt +
+ * watchdog — so the duplicate B seed's later rejection was dropped by the
+ * machine and the connection stayed live.
+ */
+async function setupPerCallSeeds() {
+  const { api, hubStore } = await fresh();
+  const queues: Record<string, DeferredSeed[]> = {
+    [JOURNAL_A]: [],
+    [JOURNAL_B]: [],
+  };
+  const hooks = new Map<string, Hooks>();
+  const subscribed: string[] = [];
+  const nextSeed = (j: string): DeferredSeed => {
+    const d = deferred<Seed>();
+    queues[j].push(d);
+    return d;
+  };
+
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<
+    ReturnType<Api["passkeyList"]>
+  >);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      { id: INSTANCE_A, journalId: JOURNAL_A, revision: "0", durableSeq: "0", lifecycle: "running" },
+      { id: INSTANCE_B, journalId: JOURNAL_B, revision: "0", durableSeq: "0", lifecycle: "running" },
+    ] as never,
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "eventsRead").mockImplementation((async (args?: { journalId?: string }) => {
+    const j = args?.journalId ?? "";
+    const d = queues[j] ? nextSeed(j) : deferred<Seed>();
+    return d.promise;
+  }) as Api["eventsRead"]);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async (journalId: string, _afterSeq: unknown, _onBatch: unknown, _onGap: unknown, h?: Hooks) => {
+      subscribed.push(journalId);
+      if (h) hooks.set(journalId, h);
+      return {
+        subscriptionId: `sub_${journalId}`,
+        journalId,
+        durableSeq: "0",
+        windowFromSeq: null,
+        reachedAfterSeq: true,
+        getReadyState: () => 1,
+        snapshot: {
+          projectionVersion: "v1",
+          projectionEpoch: `epoch_${journalId}`,
+          asOfSeq: "0",
+          instance: {} as never,
+          runs: [],
+          commands: [],
+          pendingInteractions: [],
+          nodes: [],
+          history: { earliestRetainedSeq: "0", complete: true },
+        },
+      };
+    }) as Api["eventsSubscribe"],
+  );
+
+  await hubStore.bootstrap();
+  return {
+    api,
+    hubStore,
+    seedCall: (j: string, i: number) => {
+      const d = queues[j]?.[i];
+      if (!d) throw new Error(`seed ${j}[${i}] not queued (have ${queues[j]?.length ?? 0})`);
+      return d;
+    },
+    waitQueued: (j: string, n: number) =>
+      vi.waitFor(() => expect(queues[j]?.length).toBeGreaterThanOrEqual(n)),
+    waitSubscribed: (j: string) => vi.waitFor(() => expect(subscribed).toContain(j)),
+  };
+}
+
+it("an obsolete duplicate seed's scoped handoff never retires the live mount's attempt (B's late failure drives offline)", async () => {
+  const { hubStore, seedCall, waitQueued, waitSubscribed } = await setupPerCallSeeds();
+
+  // Rapid A → B → A → B: every follow queues its own seed read.
+  const mountA1 = hubStore.follow(INSTANCE_A);
+  await waitQueued(JOURNAL_A, 1);
+  const mountB1 = hubStore.follow(INSTANCE_B);
+  await waitQueued(JOURNAL_B, 1);
+  const mountA2 = hubStore.follow(INSTANCE_A);
+  await waitQueued(JOURNAL_A, 2);
+  const mountB2 = hubStore.follow(INSTANCE_B);
+  await waitQueued(JOURNAL_B, 2);
+
+  // A's first seed mounts A (its stale attempt end is dropped by gen).
+  seedCall(JOURNAL_A, 0).resolve(seedPage);
+  await waitSubscribed(JOURNAL_A);
+  // B's first seed mounts B with a live socket: its snapshot frame certifies the
+  // CURRENT B binding (same journal as B's in-flight second attempt).
+  seedCall(JOURNAL_B, 0).resolve(seedPage);
+  await waitSubscribed(JOURNAL_B);
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"));
+
+  // The deferred DUPLICATE A seed now resolves and hits the
+  // journals.has(A) early return. A scoped handoff must do nothing (A is an
+  // obsolete binding); B's second attempt/watchdog stay armed.
+  seedCall(JOURNAL_A, 1).resolve(seedPage);
+  await mountA1.catch(() => undefined);
+  await mountA2.catch(() => undefined);
+  await new Promise((r) => setTimeout(r, 10));
+
+  // B's duplicate seed (the CURRENT mount's catch-up) rejects: its failure must
+  // not have been retired by A's handoff — the machine goes offline.
+  seedCall(JOURNAL_B, 1).reject(new Error("JOURNAL_B_DUP_SEED_FAILED"));
+  await expect(mountB2).rejects.toThrow("JOURNAL_B_DUP_SEED_FAILED");
+  await expect(mountB1).resolves.toBeUndefined();
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("offline"));
+
+  hubStore.logout();
+});

@@ -296,6 +296,83 @@ function byRecency(a: { createdAt: string; rowId: string }, b: { createdAt: stri
 }
 
 /**
+ * The inputs the 进行中 · 最近 tier needs. A strict subset of
+ * {@link InboxSource}: the queue membership call (deriveInboxQueue) supplies
+ * the blocked-instance set, so this projection needs no interactions.
+ */
+export type InboxRecentSource = Pick<
+  InboxSource,
+  "instances" | "phrases" | "rollups" | "titleOf" | "hostName" | "workspaceLabel"
+>;
+
+/**
+ * Project the 进行中 · 最近 tier: live working/idle instances, newest activity
+ * first, minus instances already represented by a 待你处理 row.
+ *
+ * THE single projection both inbox routes read — the compact inbox calls it
+ * from deriveInboxRows, and the desktop /approvals recent tier calls it from
+ * deriveApprovalRows (ui-spec §2.5 / D-052: one shared derivation, the two
+ * surfaces keep only their own tiers and filters).
+ *
+ * Ended sessions are filtered here, not by the callers: terminal lifecycles
+ * (exited/failed/closing) project UiStatus "exited" and own their sentence
+ * through the shared endReason() projection on home/session surfaces — a
+ * finished session can never sit under a 进行中 heading, and starting/unknown
+ * rows are not 最近 either.
+ */
+export function deriveRecentInstances(
+  source: InboxRecentSource,
+  blockedInstanceIds: ReadonlySet<Id>,
+  nowMs: number,
+): InboxInstanceRow[] {
+  const recent: InboxInstanceRow[] = [];
+  for (const instance of source.instances) {
+    if (blockedInstanceIds.has(instance.id)) continue;
+    const status = projectStatus(instance);
+    if (status === "exited" || !RECENT_STATUSES.has(status)) continue;
+    const hostLabel = source.hostName(instance.hostId);
+    const workspaceLabel = source.workspaceLabel(instance.workspaceId);
+    const title = source.titleOf(instance.id) || "会话";
+    const subtitle = latestEventText(instance, source.phrases[instance.id]);
+    const timeLabel = formatListTime(instance.updatedAt, nowMs);
+    const contextPct = contextPctOf(instance, source.rollups);
+    const row: InboxInstanceRow = {
+      rowType: "instance",
+      rowId: instance.id,
+      instanceId: instance.id,
+      hostId: instance.hostId,
+      title,
+      subtitle,
+      hostLabel,
+      workspaceLabel,
+      harness: instance.kind,
+      timeLabel,
+      contextPct,
+      status,
+      updatedAt: instance.updatedAt,
+      sig: JSON.stringify({
+        t: "n",
+        n: [
+          instance.connectivity,
+          instance.lifecycle,
+          instance.activity,
+          instance.kind,
+          instance.lastError,
+          instance.usageRollup,
+          instance.updatedAt,
+          instance.exit,
+        ],
+        // contextPct also reads source.rollups (a separate store slice).
+        v: [hostLabel, workspaceLabel, title, subtitle, timeLabel, contextPct, status],
+      }),
+    };
+    recent.push(row);
+  }
+  recent.sort((a, b) => byRecency({ createdAt: a.updatedAt, rowId: a.rowId }, { createdAt: b.updatedAt, rowId: b.rowId }));
+  return recent;
+}
+
+/**
  * Project the two tiers. Pure: the component passes store state plus its
  * accessors, and `opts.kind` / `opts.focus` mirror the /approvals URL query.
  * The kind segment filters the interaction tier exactly as /approvals does;
@@ -393,54 +470,7 @@ export function deriveInboxRows(
   }
   pending.sort(byRecency);
 
-  const recent: InboxInstanceRow[] = [];
-  for (const instance of source.instances) {
-    if (blockedInstanceIds.has(instance.id)) continue;
-    const status = projectStatus(instance);
-    // Two tiers only: terminal rows (exited/failed/closing) are filtered out
-    // outright — a session that is no longer running can never sit under a
-    // 进行中 heading, and the compact inbox has no ended section (ui-spec
-    // §4.7). Live working/idle rows fill the tier.
-    if (status === "exited" || !RECENT_STATUSES.has(status)) continue;
-    const hostLabel = source.hostName(instance.hostId);
-    const workspaceLabel = source.workspaceLabel(instance.workspaceId);
-    const title = source.titleOf(instance.id) || "会话";
-    const subtitle = latestEventText(instance, source.phrases[instance.id]);
-    const timeLabel = formatListTime(instance.updatedAt, nowMs);
-    const contextPct = contextPctOf(instance, source.rollups);
-    const row: InboxInstanceRow = {
-      rowType: "instance",
-      rowId: instance.id,
-      instanceId: instance.id,
-      hostId: instance.hostId,
-      title,
-      subtitle,
-      hostLabel,
-      workspaceLabel,
-      harness: instance.kind,
-      timeLabel,
-      contextPct,
-      status,
-      updatedAt: instance.updatedAt,
-      sig: JSON.stringify({
-        t: "n",
-        n: [
-          instance.connectivity,
-          instance.lifecycle,
-          instance.activity,
-          instance.kind,
-          instance.lastError,
-          instance.usageRollup,
-          instance.updatedAt,
-          instance.exit,
-        ],
-        // contextPct also reads source.rollups (a separate store slice).
-        v: [hostLabel, workspaceLabel, title, subtitle, timeLabel, contextPct, status],
-      }),
-    };
-    recent.push(row);
-  }
-  recent.sort((a, b) => byRecency({ createdAt: a.updatedAt, rowId: a.rowId }, { createdAt: b.updatedAt, rowId: b.rowId }));
+  const recent = deriveRecentInstances(source, blockedInstanceIds, nowMs);
 
   return { pending, recent };
 }

@@ -1211,6 +1211,40 @@ async fn fake_node(
                         append_n = append_uo6b_epoch_live(&mut ws, &instance_id, append_n).await?;
                         continue;
                     }
+                    // c-inboxfu: `inbox-focus:<n>` parks n pending approval
+                    // cards on THIS one instance (distinct descriptions), so
+                    // the desktop /approvals deep-link test can target a row
+                    // past the progressive-mount first slice without spending
+                    // the fake host's maxInstances slots on n sessions.
+                    if let Some(count) = prompt
+                        .strip_prefix("inbox-focus:")
+                        .and_then(|tail| tail.parse::<u64>().ok())
+                    {
+                        {
+                            let mut guard = pending.lock().await;
+                            for i in 0..count.max(1) {
+                                let iid = InteractionId::new();
+                                let mut card =
+                                    fake_approval(&instance_id, host, iid.as_id().as_str());
+                                card["request"]["description"] =
+                                    json!(format!("inbox focus card {i}"));
+                                guard.insert(iid.as_id().as_str().to_string(), card);
+                            }
+                        }
+                        let command_id = params.get("commandId").and_then(Value::as_str);
+                        append_n = append_command_user(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            prompt,
+                            command_id,
+                        )
+                        .await?;
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
+                            .await?;
+                        send_rpc_ok(&mut ws, id, create_result(spec, &instance_id)).await?;
+                        continue;
+                    }
                     let interaction_id = InteractionId::new();
                     // c-nextstep list-row phrase: a create prompt with the
                     // `workflow card <scenario> row-phrase` form raises NO

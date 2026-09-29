@@ -371,6 +371,73 @@ describe("deriveApprovalRows joins and order", () => {
   });
 });
 
+describe("deriveApprovalRows recent tier (进行中 · 最近, c-inboxfu)", () => {
+  function recentSource(
+    instances: Instance[],
+    interactions: Interaction[] = [],
+  ): ApprovalSource {
+    return {
+      ...source(interactions, instances),
+      phrases: {},
+      rollups: {},
+      titleOf: (id) => `title ${id}`,
+      hostName: (id) => `host ${id}`,
+    };
+  }
+
+  it("lists live working/idle instances from the shared projection", () => {
+    const working = inst({ id: "ins_work", lifecycle: "running", activity: known("working"), updatedAt: T1 });
+    const idle = inst({ id: "ins_idle", lifecycle: "ready", activity: known("idle") });
+    const { recent } = deriveApprovalRows(recentSource([idle, working]), FILTERS);
+    expect(recent.map((row) => row.instanceId).sort()).toEqual(["ins_idle", "ins_work"]);
+    expect(recent[0]!.title).toBeTruthy();
+  });
+
+  it("excludes blocked (queue) instances, terminal lifecycles and starting rows", () => {
+    const blocked = inst({ id: "ins_blocked", activity: known("waiting-interaction") });
+    const exited = inst({ id: "ins_exited", lifecycle: "exited" });
+    const failed = inst({ id: "ins_failed", lifecycle: "failed" });
+    const closing = inst({ id: "ins_closing", lifecycle: "closing" });
+    const starting = inst({ id: "ins_starting", lifecycle: "starting", activity: unknownKnowledge("starting") });
+    const working = inst({ id: "ins_work" });
+    const approvalItem = approval({ id: "itx_1", instanceId: "ins_blocked" });
+    const { recent } = deriveApprovalRows(
+      recentSource([blocked, exited, failed, closing, starting, working], [approvalItem]),
+      FILTERS,
+    );
+    expect(recent.map((row) => row.instanceId)).toEqual(["ins_work"]);
+  });
+
+  it("newest activity first (same byRecency ordering as the compact tier)", () => {
+    const older = inst({ id: "ins_old", updatedAt: "2026-09-20T10:00:00.000Z" });
+    const newer = inst({ id: "ins_new", updatedAt: "2026-09-20T12:00:00.000Z" });
+    const { recent } = deriveApprovalRows(recentSource([older, newer]), FILTERS);
+    expect(recent.map((row) => row.instanceId)).toEqual(["ins_new", "ins_old"]);
+  });
+
+  it("applies host and workspace chips but never the kind segment", () => {
+    const onOtherHost = inst({ id: "ins_other", hostId: "hst_2" });
+    const onOtherWs = inst({ id: "ins_ws", workspaceId: "wsp_2" });
+    const mine = inst({ id: "ins_mine" });
+    const s = recentSource([onOtherHost, onOtherWs, mine]);
+    s.hosts = [host({ id: "hst_1" }), host({ id: "hst_2" })];
+
+    expect(
+      deriveApprovalRows(s, { ...FILTERS, hostId: "hst_1" }).recent.map((r) => r.instanceId),
+    ).toEqual(["ins_ws", "ins_mine"]);
+    expect(
+      deriveApprovalRows(s, { ...FILTERS, workspaceId: "wsp_2" }).recent.map((r) => r.instanceId),
+    ).toEqual(["ins_ws"]);
+    // Kind filters interactions only; an instance tier never disappears under
+    // ?kind=question (the compact tier behaves identically).
+    expect(
+      deriveApprovalRows(s, { ...FILTERS, kind: "question" })
+        .recent.map((r) => r.instanceId)
+        .sort(),
+    ).toEqual(["ins_mine", "ins_other", "ins_ws"]);
+  });
+});
+
 describe("decision card presentational helpers", () => {
   it("labels every known carrier and maps unsupported to 未知", () => {
     expect(Object.keys(CARRIER_LABEL).sort()).toEqual(

@@ -304,7 +304,7 @@ async fn model_pin_mismatch_is_served_on_public_instance_json() -> Result<()> {
         "kind": "claude",
         "driver": "claude-print",
         "delegation": "none",
-        "model": "model_hub/es1_orange_o50[1m]",
+        "model": "acme_hub/model_x_o50[1m]",
         "prompt": "pin probe"
     })
     .to_string();
@@ -341,8 +341,8 @@ async fn model_pin_mismatch_is_served_on_public_instance_json() -> Result<()> {
                 "dataRef": null,
                 "relatedIds": {
                     "reason": "model-mismatch",
-                    "requested": "model_hub/es1_orange_o50[1m]",
-                    "observed": "model_hub/es1_orange_o48[1m]"
+                    "requested": "acme_hub/model_x_o50[1m]",
+                    "observed": "acme_hub/model_x_o48[1m]"
                 }
             }
         })
@@ -384,11 +384,11 @@ async fn model_pin_mismatch_is_served_on_public_instance_json() -> Result<()> {
     assert_eq!(records.len(), 1);
     assert_eq!(
         records[0]["requested"].as_str(),
-        Some("model_hub/es1_orange_o50[1m]")
+        Some("acme_hub/model_x_o50[1m]")
     );
     assert_eq!(
         records[0]["observed"].as_str(),
-        Some("model_hub/es1_orange_o48[1m]")
+        Some("acme_hub/model_x_o48[1m]")
     );
     assert_eq!(
         records[0]["observedAt"].as_str(),

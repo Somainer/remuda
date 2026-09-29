@@ -21,8 +21,8 @@ use serde_json::{Value, json};
 /// A synthetic host id, in the shape a gateway catalog actually lists (a
 /// namespaced id with a `[1m]` context variant), so the assertions exercise the
 /// suffix handling rather than a bare alias.
-const HOST_MODEL: &str = "model_hub/es1_orange_o48[1m]";
-const PIN: &str = "model_hub/es1_orange_o50[1m]";
+const HOST_MODEL: &str = "acme_hub/model_x_o48[1m]";
+const PIN: &str = "acme_hub/model_x_o50[1m]";
 
 /// Seed a fake user settings home the way a launching user's `~/.claude` looks:
 /// a `model` key plus provider env, including the model-naming variables that
@@ -34,7 +34,7 @@ fn seed_user_home(dir: &std::path::Path) -> Value {
         "env": {
             "ANTHROPIC_MODEL": HOST_MODEL,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": HOST_MODEL,
-            "ANTHROPIC_SMALL_FAST_MODEL": "model_hub/es1_orange_o47",
+            "ANTHROPIC_SMALL_FAST_MODEL": "acme_hub/model_x_o47",
             "CLAUDE_CODE_SUBAGENT_MODEL": HOST_MODEL,
             // Endpoint + credential: the host keeps these under `none`.
             "ANTHROPIC_BASE_URL": "https://host-gateway.example/v1",

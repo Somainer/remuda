@@ -331,7 +331,7 @@ async fn scoped_home_lists_gateway_models_in_model_picker() {
 
     // Discovery is a network round trip; poll the rendered grid for the
     // gateway model id from the user's settings (ANTHROPIC_*_MODEL).
-    let gateway_model = "model_hub";
+    let gateway_model = "acme_hub";
     let mut saw = false;
     let mut last_screen = String::new();
     while start.elapsed() < Duration::from_secs(60) {

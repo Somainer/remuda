@@ -25,7 +25,7 @@ machine names — the remote is its registry label `devbox-sg`).
 | Remote host | `hst_01a0a896-c963-74c2-bedd-14da447ff68c`, label `devbox-sg`, carrier **ssh-stdio**, `latencyClass: remote`, `maxInstances: 8`, portBlocks `57000-57999` / `58400-58999`, disk budget 200 GB |
 | Workspace | `wsp_01a0aa57-7bc7-76ef-83f6-d4b941c985d2`, role `build` |
 | Gate lane | `sg-lane1` on the same remote host (project `revision 7` after `remuda project set --gate`) |
-| Provider profile | `pvp_01a0adb4-1b89-7139-8331-ab2ca822c32a` — `"devbox-sg native"`, `kind: native`, `scope: host:hst_01a0a896…`, `defaultModel: ark/seed-evolving[1m]`, models = the host's own gateway ids (`ark/seed-evolving[1m]`, `model_hub/es1_orange_o50[1m]`) — **no stored secret** |
+| Provider profile | `pvp_01a0adb4-1b89-7139-8331-ab2ca822c32a` — `"devbox-sg native"`, `kind: native`, `scope: host:hst_01a0a896…`, `defaultModel: ark/model-y[1m]`, models = the host's own gateway ids (`ark/model-y[1m]`, `acme_hub/model_x_o50[1m]`) — **no stored secret** |
 | Node binary | built from `main` `4ae9cda0` (`c-dispatchfix`), re-enrolled with a single-use Hub enroll token; the demo Hub on the same commit |
 | Worker | `wkr_01a0b025-d121-76a1-99cd-aaaf73542284` `readme2`, instance `ins_01a0b025-d01c-73da-bfb5-c30370bdc6ff` |
 | Gate job | `gjb_01a0b030-70a4-71aa-b324-88cab07cb2dc` |
@@ -60,7 +60,7 @@ failed runs had left the branch behind (retire keeps branches, see §4 gap 3):
 
 ```text
 ### 2026-09-18 00:12:36 remuda dispatch readme-status --driver shell-pty \
-        --model ark/seed-evolving[1m] (native profile; demo+node on 4ae9cda0)
+        --model ark/model-y[1m] (native profile; demo+node on 4ae9cda0)
 Error: hub HTTP 400: {"error":"invalid request: worker branch
 wt/readme-status/b-readme-status-md-3 already exists; refusing to provision a
 second worktree","code":"BAD_REQUEST"}
@@ -75,9 +75,9 @@ inlined):
 
 ```text
 ### 2026-09-18 00:14:22 remuda dispatch readme2 --driver shell-pty \
-        --model ark/seed-evolving[1m] (native profile; demo+node on 4ae9cda0)
+        --model ark/model-y[1m] (native profile; demo+node on 4ae9cda0)
 {'id': 'wkr_01a0b025-d121-76a1-99cd-aaaf73542284', 'name': 'readme2',
- 'model': 'ark/seed-evolving[1m]',
+ 'model': 'ark/model-y[1m]',
  'providerProfileId': 'pvp_01a0adb4-1b89-7139-8331-ab2ca822c32a',
  'driver': 'shell-pty', 'branch': 'wt/readme2/b-readme-status-md',
  'portBlock': '57000-57009', 'state': {'state': 'working'}}
@@ -97,7 +97,7 @@ substitution happened.
 
 ```text
 ### 2026-09-18 00:15:41 instance ins_01a0b025-d01c-73da-bfb5-c30370bdc6ff after 75s
- driver shell-pty | model ark/seed-evolving[1m] | lifecycle running
+ driver shell-pty | model ark/model-y[1m] | lifecycle running
  | delegation none | nativeSessionId ins_01a0b025-d…
 screen tail: ──────────────────────────────────────────────────────────────
  Accessing workspace:

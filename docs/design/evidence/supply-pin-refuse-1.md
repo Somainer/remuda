@@ -9,17 +9,17 @@ Design: `docs/design/coordinator-hierarchy.md` §4.3 (pin semantics), §4.4 step
 On 2026-09-17 a coordinator ran
 
 ```
-remuda dispatch --model ark/seed-evolving[1m]
+remuda dispatch --model ark/model-y[1m]
 ```
 
-against a Hub whose provider catalog lists `passthrough/ark/seed-evolving`
+against a Hub whose provider catalog lists `passthrough/ark/model-y`
 (and not the pinned id). The dispatch **succeeded**: `supply.rs` marked no
 candidate `pinned` when the pin matched nothing, and the ranker launched the
 list head (`claude-fable-5.1` in the incident). A pin is a hard constraint;
 the request must fail instead of substituting.
 
 This evidence replays the exact shape with synthetic ids
-(`synth/seed-evolving[1m]` vs the listed `passthrough/synth/seed-evolving`).
+(`synth/model-y[1m]` vs the listed `passthrough/synth/model-y`).
 
 ## Setup (identical for both runs)
 
@@ -34,7 +34,7 @@ This evidence replays the exact shape with synthetic ids
   "name": "synth-passthrough",
   "kind": "gateway",
   "models": [
-    {"id": "passthrough/synth/seed-evolving", "family": "synth",
+    {"id": "passthrough/synth/model-y", "family": "synth",
      "role": "workhorse", "priority": 20,
      "fallback": ["passthrough/synth/seed-legacy"]},
     {"id": "passthrough/synth/seed-legacy", "family": "synth",
@@ -48,7 +48,7 @@ This evidence replays the exact shape with synthetic ids
 
 ## 1. Before: unknown pin is silently substituted
 
-### 1a. `remuda profile probe --pin-model synth/seed-evolving[1m]` — exit 0, 200 OK
+### 1a. `remuda profile probe --pin-model synth/model-y[1m]` — exit 0, 200 OK
 
 The dry-run "succeeds" and answers a model the caller never asked for:
 
@@ -56,13 +56,13 @@ The dry-run "succeeds" and answers a model the caller never asked for:
 {
   "chosen": {
     "profileId": "pvp_…",
-    "modelId": "passthrough/synth/seed-evolving",
+    "modelId": "passthrough/synth/model-y",
     "family": "synth",
     "hostId": "hst_…",
     "fallback": ["passthrough/synth/seed-legacy"]
   },
   "ranked": [
-    {"profileId": "pvp_…", "modelId": "passthrough/synth/seed-evolving",
+    {"profileId": "pvp_…", "modelId": "passthrough/synth/model-y",
      "priority": 20, "state": "available"},
     {"profileId": "pvp_…", "modelId": "passthrough/synth/seed-legacy",
      "priority": 10, "state": "available"}
@@ -74,19 +74,19 @@ The dry-run "succeeds" and answers a model the caller never asked for:
 }
 ```
 
-### 1b. `remuda dispatch … --model 'synth/seed-evolving[1m]'` — exit 0
+### 1b. `remuda dispatch … --model 'synth/model-y[1m]'` — exit 0
 
 ```
-$ remuda dispatch --project prj_… --brief brief.md --model 'synth/seed-evolving[1m]'; echo "exit=$?"
+$ remuda dispatch --project prj_… --brief brief.md --model 'synth/model-y[1m]'; echo "exit=$?"
 exit=0
 {
   "worker": {
     "name": "w01a0",
-    "model": "passthrough/synth/seed-evolving",
+    "model": "passthrough/synth/model-y",
     "providerProfileId": "pvp_…",
     "state": { "state": "working" },
     "supplyDecision": {
-      "chosen": { "modelId": "passthrough/synth/seed-evolving", … },
+      "chosen": { "modelId": "passthrough/synth/model-y", … },
       "rejected": [],
       "reasons": ["priority 20 wins; 100% window headroom"]
     },
@@ -96,8 +96,8 @@ exit=0
 ```
 
 Raw HTTP shows the same: `POST /v1/workers/dispatch` with
-`"model":"synth/seed-evolving[1m]"` → **HTTP 200**, response worker
-`rawpin` with `model: passthrough/synth/seed-evolving`, state `working`.
+`"model":"synth/model-y[1m]"` → **HTTP 200**, response worker
+`rawpin` with `model: passthrough/synth/model-y`, state `working`.
 
 The fake Node was told to provision and launch — the substitution had real
 side effects:
@@ -109,9 +109,9 @@ side effects:
   instance.send
   (… one triple per dispatch, three in total)
 ── roster:
-  w01a0    model= passthrough/synth/seed-evolving
-  rawpin   model= passthrough/synth/seed-evolving
-  knownpin model= passthrough/synth/seed-evolving
+  w01a0    model= passthrough/synth/model-y
+  rawpin   model= passthrough/synth/model-y
+  knownpin model= passthrough/synth/model-y
 ```
 
 This is the incident: a pin the operator forbade substitutions for produced
@@ -119,33 +119,33 @@ a running worker on the ranker's favourite.
 
 ## 2. After: unknown pin is a hard 409 refusal
 
-### 2a. `remuda profile probe --pin-model synth/seed-evolving[1m]` — exit 1
+### 2a. `remuda profile probe --pin-model synth/model-y[1m]` — exit 1
 
 ```
-$ remuda profile probe --pin-model 'synth/seed-evolving[1m]'; echo "exit=$?"
+$ remuda profile probe --pin-model 'synth/model-y[1m]'; echo "exit=$?"
 Error: hub HTTP 409: pin refused: no listed model/supply matches the pin
-  - pinned model "synth/seed-evolving[1m]" is not listed by any provider profile — a pin is a hard constraint; dispatch refused, never substituted
-  - did you mean "passthrough/synth/seed-evolving"?
+  - pinned model "synth/model-y[1m]" is not listed by any provider profile — a pin is a hard constraint; dispatch refused, never substituted
+  - did you mean "passthrough/synth/model-y"?
   - did you mean "passthrough/synth/seed-legacy"?
 exit=1
 ```
 
-### 2b. `remuda dispatch … --model 'synth/seed-evolving[1m]'` — exit 1
+### 2b. `remuda dispatch … --model 'synth/model-y[1m]'` — exit 1
 
 Same stderr, exit code 1, no stdout. Raw HTTP:
 
 ```
 $ curl -s -w '\nHTTP_STATUS:%{http_code}\n' -X POST …/v1/workers/dispatch \
     -H 'content-type: application/json' \
-    -d '{"projectId":"prj_…","brief":"…","model":"synth/seed-evolving[1m]"}'
+    -d '{"projectId":"prj_…","brief":"…","model":"synth/model-y[1m]"}'
 {"error":"pin refused: no listed model/supply matches the pin",
  "code":"PIN_REFUSED",
- "pin":{"harness":"claude","model":"synth/seed-evolving[1m]"},
+ "pin":{"harness":"claude","model":"synth/model-y[1m]"},
  "reasons":[
-   "pinned model \"synth/seed-evolving[1m]\" is not listed by any provider profile — a pin is a hard constraint; dispatch refused, never substituted",
-   "did you mean \"passthrough/synth/seed-evolving\"?",
+   "pinned model \"synth/model-y[1m]\" is not listed by any provider profile — a pin is a hard constraint; dispatch refused, never substituted",
+   "did you mean \"passthrough/synth/model-y\"?",
    "did you mean \"passthrough/synth/seed-legacy\"?"],
- "suggestions":["passthrough/synth/seed-evolving",
+ "suggestions":["passthrough/synth/model-y",
                 "passthrough/synth/seed-legacy"]}
 HTTP_STATUS:409
 ```
@@ -161,7 +161,7 @@ allocation, and the Node `worker.provision` call.
 
 ```
 ── roster:
-  knownpin model= passthrough/synth/seed-evolving
+  knownpin model= passthrough/synth/model-y
   warnpin  model= passthrough/synth/seed-legacy
 ── node RPC methods called by the Hub:
   worker.provision      ← known pin (step 3)
@@ -179,17 +179,17 @@ RPCs**.
 
 ```
 $ remuda dispatch … --name knownpin \
-    --model passthrough/synth/seed-evolving; echo "exit=$?"
+    --model passthrough/synth/model-y; echo "exit=$?"
 exit=0
 ```
 
-Worker `knownpin` launches on `passthrough/synth/seed-evolving`; its
+Worker `knownpin` launches on `passthrough/synth/model-y`; its
 `warnings` list is empty (`[]`) — the pin matches the project workhorse.
 
 ## 4. After: pin ≠ project workhorse is a warning, not a refusal
 
 With the project's `modelRoles.workhorse` set to
-`passthrough/synth/seed-evolving`, pinning the other listed model still
+`passthrough/synth/model-y`, pinning the other listed model still
 dispatches (the pin wins), carrying one informational warning:
 
 ```
@@ -201,7 +201,7 @@ exit=0
 "model": "passthrough/synth/seed-legacy",
 "warnings": [
   "pinned model \"passthrough/synth/seed-legacy\" differs from the project \
-workhorse \"passthrough/synth/seed-evolving\"; honoring the pin (informational)"
+workhorse \"passthrough/synth/model-y\"; honoring the pin (informational)"
 ]
 ```
 
@@ -209,17 +209,17 @@ workhorse \"passthrough/synth/seed-evolving\"; honoring the pin (informational)"
 
 | Command | before | after |
 | --- | --- | --- |
-| `profile probe --pin-model synth/seed-evolving[1m]` | 0 | 1 |
-| `dispatch --model synth/seed-evolving[1m]` | 0 | 1 |
-| `dispatch --model passthrough/synth/seed-evolving` (listed) | 0 | 0 |
+| `profile probe --pin-model synth/model-y[1m]` | 0 | 1 |
+| `dispatch --model synth/model-y[1m]` | 0 | 1 |
+| `dispatch --model passthrough/synth/model-y` (listed) | 0 | 0 |
 | `dispatch --model passthrough/synth/seed-legacy` (listed, ≠ workhorse) | 0 | 0 + warning |
 
 ## Suggestion ranking
 
 Suggestions are the five closest *enabled listed* ids, scored on:
-listed id ending in the pin (`ark/seed-evolving` →
-`passthrough/ark/seed-evolving`), shared `/`-path tails, qualifier-insensitive
-equal tail (`seed-evolving[1m]` ≈ `seed-evolving`), shared name tokens, and a
+listed id ending in the pin (`ark/model-y` →
+`passthrough/ark/model-y`), shared `/`-path tails, qualifier-insensitive
+equal tail (`model-y[1m]` ≈ `model-y`), shared name tokens, and a
 small Levenshtein tiebreaker. Unit-covered in
 `crates/remuda-hub/src/supply.rs`:
 

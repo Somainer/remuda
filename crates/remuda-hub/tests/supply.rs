@@ -731,7 +731,7 @@ async fn unknown_pin_refused_on_resolve_and_known_pin_honored() -> Result<()> {
         "baseUrl": "http://127.0.0.1:1",
         "authToken": "sk-synth-pin-secret-dddd",
         "models": [
-            {"id": "passthrough/synth/seed-evolving", "family": "synth",
+            {"id": "passthrough/synth/model-y", "family": "synth",
              "role": "workhorse", "priority": 20},
             {"id": "passthrough/synth/seed-legacy", "family": "synth",
              "role": "workhorse", "priority": 10}
@@ -751,7 +751,7 @@ async fn unknown_pin_refused_on_resolve_and_known_pin_honored() -> Result<()> {
     // Unknown pin: the dry-run must refuse (409), the same hard refusal
     // dispatch returns — never a 200 with a substituted chosen model.
     let probe = json!({
-        "taskSpec": { "pin": { "model": "synth/seed-evolving[1m]" } }
+        "taskSpec": { "pin": { "model": "synth/model-y[1m]" } }
     })
     .to_string();
     let (status, body) = http(
@@ -765,9 +765,9 @@ async fn unknown_pin_refused_on_resolve_and_known_pin_honored() -> Result<()> {
     assert_eq!(status, 409, "expected PIN_REFUSED, got {status} {body}");
     let error: Value = serde_json::from_str(body.trim())?;
     assert_eq!(error["code"], "PIN_REFUSED");
-    assert_eq!(error["pin"]["model"], "synth/seed-evolving[1m]");
+    assert_eq!(error["pin"]["model"], "synth/model-y[1m]");
     let suggestions = error["suggestions"].as_array().unwrap();
-    assert_eq!(suggestions[0], "passthrough/synth/seed-evolving");
+    assert_eq!(suggestions[0], "passthrough/synth/model-y");
     assert!(suggestions.len() <= 5);
     assert!(
         error["reasons"]
@@ -780,7 +780,7 @@ async fn unknown_pin_refused_on_resolve_and_known_pin_honored() -> Result<()> {
 
     // Known pin: 200 and the pinned model is chosen.
     let probe = json!({
-        "taskSpec": { "pin": { "model": "passthrough/synth/seed-evolving" } }
+        "taskSpec": { "pin": { "model": "passthrough/synth/model-y" } }
     })
     .to_string();
     let (status, body) = http(
@@ -793,10 +793,7 @@ async fn unknown_pin_refused_on_resolve_and_known_pin_honored() -> Result<()> {
     .await?;
     assert_eq!(status, 200, "{body}");
     let decision: Value = serde_json::from_str(body.trim())?;
-    assert_eq!(
-        decision["chosen"]["modelId"],
-        "passthrough/synth/seed-evolving"
-    );
+    assert_eq!(decision["chosen"]["modelId"], "passthrough/synth/model-y");
     assert!(decision["deferred"] == false);
     assert!(decision.get("pinRefusal").is_none());
     hub.shutdown().await;

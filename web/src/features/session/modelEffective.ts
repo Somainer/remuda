@@ -4,7 +4,7 @@
  * Read-back side: the resolved model id from the `/model` stdout verdict or
  * `message.model`, plus the discovered catalog the picker renders. The UI
  * always renders/selects from the *observed* id — a typed alias can resolve to
- * a different concrete gateway id (e.g. `sonnet` → `model_hub/es1_orange_o48`).
+ * a different concrete gateway id (e.g. `sonnet` → `acme_hub/model_x_o48`).
  */
 
 /** Sources the protocol attributes an effective model to. */

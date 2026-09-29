@@ -368,7 +368,7 @@ pub struct ChosenSupply {
 /// A hard pin matched no eligible candidate. Admission **refuses**: a pin is
 /// a hard constraint (coordinator-hierarchy.md §4.3), never a preference the
 /// ranker may silently substitute. The 2026-09-17 incident dispatched on
-/// `ark/seed-evolving[1m]` — an id no profile listed — and the ranker launched
+/// `ark/model-y[1m]` — an id no profile listed — and the ranker launched
 /// the list head instead of failing.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -846,7 +846,7 @@ fn rank_cmp(a: &Evaluated, b: &Evaluated, input: &SolveInput<'_>) -> std::cmp::O
 // ── hard-pin refusal (§4.3) ────────────────────────────────────────────────
 
 /// Split a lowered model id into comparison tokens, e.g.
-/// `passthrough/ark/seed-evolving[1m]` → `{passthrough, ark, seed, evolving, 1m}`.
+/// `passthrough/ark/model-y[1m]` → `{passthrough, ark, model, y, 1m}`.
 /// Caller passes an already-lowercased id (see [`suggestion_score`]).
 fn pin_tokens(lowered: &str) -> HashSet<&str> {
     lowered
@@ -855,8 +855,8 @@ fn pin_tokens(lowered: &str) -> HashSet<&str> {
         .collect()
 }
 
-/// Drop bracket/colon qualifiers from a path segment so `seed-evolving[1m]`
-/// and `seed-evolving` compare as the same model tail.
+/// Drop bracket/colon qualifiers from a path segment so `model-y[1m]`
+/// and `model-y` compare as the same model tail.
 fn loose_tail(segment: &str) -> &str {
     segment.split(['[', ':']).next().unwrap_or(segment)
 }
@@ -865,7 +865,7 @@ fn loose_tail(segment: &str) -> &str {
 /// means no shared structure (the id is not offered as a suggestion).
 ///
 /// Signals, strongest first: exact id; listed id ending in the pin
-/// (`ark/seed-evolving` → `passthrough/ark/seed-evolving`); shared `/`
+/// (`ark/model-y` → `passthrough/ark/model-y`); shared `/`
 /// segments from the tail; qualifier-insensitive equal tail; shared
 /// family/name tokens; small Levenshtein term only to break near-ties.
 fn suggestion_score(wanted: &str, listed: &str) -> i64 {
@@ -2125,8 +2125,8 @@ mod tests {
             "passthrough",
             remuda_protocol::SupplyProfile::default(),
             vec![
-                model("passthrough/ark/seed-evolving", "ark", "workhorse", 20),
-                model("passthrough/ark/seed-legacy", "ark", "workhorse", 10),
+                model("passthrough/ark/model-y", "ark", "workhorse", 20),
+                model("passthrough/ark/model-legacy", "ark", "workhorse", 10),
                 model("gw/totally-unrelated[1m]", "other", "workhorse", 5),
             ],
         )];
@@ -2136,7 +2136,7 @@ mod tests {
         let decision = solve(input(
             &profiles,
             &hosts,
-            &model_pin("ark/seed-evolving[1m]"),
+            &model_pin("ark/model-y[1m]"),
             &InFlight::default(),
         ));
         let refusal = decision.pin_refusal.as_ref().expect("hard refusal");
@@ -2145,11 +2145,11 @@ mod tests {
             !decision.deferred,
             "a refusal is not a retry-later deferral"
         );
-        assert_eq!(refusal.suggestions[0], "passthrough/ark/seed-evolving");
+        assert_eq!(refusal.suggestions[0], "passthrough/ark/model-y");
         assert!(
             refusal
                 .suggestions
-                .contains(&"passthrough/ark/seed-legacy".to_string()),
+                .contains(&"passthrough/ark/model-legacy".to_string()),
             "{refusal:?}"
         );
         // The merely `1m`-tag-sharing unrelated id ranks below same-family ids.
@@ -2167,18 +2167,18 @@ mod tests {
             refusal
                 .reasons
                 .iter()
-                .any(|r| r.contains("did you mean \"passthrough/ark/seed-evolving\""))
+                .any(|r| r.contains("did you mean \"passthrough/ark/model-y\""))
         );
 
         // Exact suffix shape (no [1m] tag) is the strongest possible hint.
         let decision = solve(input(
             &profiles,
             &hosts,
-            &model_pin("ark/seed-evolving"),
+            &model_pin("ark/model-y"),
             &InFlight::default(),
         ));
         let refusal = decision.pin_refusal.as_ref().unwrap();
-        assert_eq!(refusal.suggestions[0], "passthrough/ark/seed-evolving");
+        assert_eq!(refusal.suggestions[0], "passthrough/ark/model-y");
     }
 
     #[test]
@@ -2196,7 +2196,7 @@ mod tests {
         let decision = solve(input(
             &profiles,
             &hosts,
-            &model_pin("ark/seed-evolving[1m]"),
+            &model_pin("ark/model-y[1m]"),
             &InFlight::default(),
         ));
         let refusal = decision.pin_refusal.as_ref().unwrap();
@@ -2242,7 +2242,7 @@ mod tests {
             "passthrough",
             remuda_protocol::SupplyProfile::default(),
             vec![
-                model("passthrough/ark/seed-evolving", "ark", "workhorse", 5),
+                model("passthrough/ark/model-y", "ark", "workhorse", 5),
                 model("claude-fable-5.1", "fable", "frontier", 99),
             ],
         )];
@@ -2250,12 +2250,12 @@ mod tests {
         let decision = solve(input(
             &profiles,
             &hosts,
-            &model_pin("passthrough/ark/seed-evolving"),
+            &model_pin("passthrough/ark/model-y"),
             &InFlight::default(),
         ));
         assert!(decision.pin_refusal.is_none());
         let chosen = decision.chosen.expect("the pin is listed, it wins");
-        assert_eq!(chosen.model_id, "passthrough/ark/seed-evolving");
+        assert_eq!(chosen.model_id, "passthrough/ark/model-y");
         assert_eq!(chosen.profile_id, "pvp_passthrough");
         // The higher-priority fable row must NOT replace the pin.
         assert_eq!(decision.ranked.len(), 1);

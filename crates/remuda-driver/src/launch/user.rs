@@ -609,7 +609,7 @@ mod tests {
     /// model env trio that outranks a settings `model` key inside Claude.
     fn host_settings() -> Value {
         json!({
-            "model": "ark/seed-evolving[1m]",
+            "model": "ark/model-y[1m]",
             "theme": "dark",
             "statusLine": {"type": "command", "command": "echo host"},
             "permissions": {"allow": ["Read", "Bash(git diff:*)"], "deny": ["Read(./.env)"]},
@@ -618,7 +618,7 @@ mod tests {
             "env": {
                 "ANTHROPIC_BASE_URL": "https://host-native.example/api",
                 "ANTHROPIC_AUTH_TOKEN": "host-token-placeholder",
-                "ANTHROPIC_MODEL": "ark/seed-evolving[1m]",
+                "ANTHROPIC_MODEL": "ark/model-y[1m]",
                 "ANTHROPIC_DEFAULT_OPUS_MODEL": "ark/host-opus",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "ark/host-sonnet",
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "ark/host-haiku",
@@ -633,7 +633,7 @@ mod tests {
     /// What the Hub delivers for delegation gateway (profile Doubao AI).
     fn hub_overlay() -> Value {
         json!({
-            "model": "passthrough/ark/seed-evolving",
+            "model": "passthrough/ark/model-y",
             "env": {
                 "ANTHROPIC_BASE_URL": "https://gateway.example/v1",
                 "ANTHROPIC_AUTH_TOKEN": "hub-token-placeholder",
@@ -665,7 +665,7 @@ mod tests {
             "the host's token must not be what authenticates"
         );
         assert_eq!(
-            merged["model"], "passthrough/ark/seed-evolving",
+            merged["model"], "passthrough/ark/model-y",
             "the requested model wins; for shell-pty this key is the only channel"
         );
         assert_eq!(
@@ -698,7 +698,7 @@ mod tests {
             "the host endpoint leaked: {rendered}"
         );
         assert!(
-            !rendered.contains("ark/seed-evolving[1m]"),
+            !rendered.contains("ark/model-y[1m]"),
             "the host model leaked: {rendered}"
         );
         assert!(!rendered.contains("ark/host-"), "a host model leaked");

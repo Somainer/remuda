@@ -84,8 +84,8 @@ const HOST_GATEWAY_URL: &str = "https://host-gateway.example/v1";
 /// A credential the host user's own settings would carry in a real deployment.
 const HOST_TOKEN: &str = "sk-fake-host-0003";
 const OVERLAY_MODEL: &str = "passthrough/auto";
-const PINNED_MODEL: &str = "model_hub/es1_orange_o50[1m]";
-const HOST_MODEL: &str = "model_hub/host_default";
+const PINNED_MODEL: &str = "acme_hub/model_x_o50[1m]";
+const HOST_MODEL: &str = "acme_hub/host_default";
 
 /// Build the exact overlay the Node writes on W for a `via` launch: gateway
 /// delegation, but the URL is the per-instance loopback listener and the secret

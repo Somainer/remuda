@@ -6,7 +6,7 @@ one of those dialogs is on screen.
 
 Observed by the owner (2026-09-18 00:15, demo on main `4ae9cda0`): a worker
 dispatched with `remuda dispatch --driver shell-pty --model
-ark/seed-evolving[1m]` (native profile, delegation none) to the ssh-stdio Node
+ark/model-y[1m]` (native profile, delegation none) to the ssh-stdio Node
 launched, but its fresh scoped config dir produced **two** Claude first-run
 dialogs that parked it until the coordinator answered them by hand:
 
@@ -71,7 +71,7 @@ folded in through `crates/remuda-hub/src/worker_watch.rs`).
 
 Two `remuda dev` stacks on isolated scratch, both native carrier
 (`REMUDA_PTY_CARRIER=native REMUDA_PTY_EMULATOR=1 REMUDA_PTY_HOOKS=1`), the real
-Claude 2.1.274 binary via a gateway provider profile (`ark/seed-evolving[1m]`),
+Claude 2.1.274 binary via a gateway provider profile (`ark/model-y[1m]`),
 a real git repo registered as the workspace. The brief:
 
 ```

@@ -495,7 +495,7 @@ async fn unknown_model_pin_refuses_nonzero_with_message() -> Result<()> {
                 "baseUrl": "http://127.0.0.1:1",
                 "authToken": "sk-cli-synth-secret-eeee",
                 "models": [
-                    {"id": "passthrough/synth/seed-evolving", "family": "synth",
+                    {"id": "passthrough/synth/model-y", "family": "synth",
                      "role": "workhorse", "priority": 20}
                 ]
             }),
@@ -520,7 +520,7 @@ async fn unknown_model_pin_refuses_nonzero_with_message() -> Result<()> {
             "--brief",
             brief.to_str().unwrap(),
             "--model",
-            "synth/seed-evolving[1m]",
+            "synth/model-y[1m]",
         ],
         &hub,
     );
@@ -528,25 +528,22 @@ async fn unknown_model_pin_refuses_nonzero_with_message() -> Result<()> {
     assert_ne!(output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("pin refused"), "{stderr}");
-    assert!(stderr.contains("synth/seed-evolving[1m]"), "{stderr}");
+    assert!(stderr.contains("synth/model-y[1m]"), "{stderr}");
     assert!(stderr.contains("never substituted"), "{stderr}");
     assert!(
-        stderr.contains("passthrough/synth/seed-evolving"),
+        stderr.contains("passthrough/synth/model-y"),
         "stderr must carry the suggestion: {stderr}"
     );
 
     // `profile probe` shows the same refusal (non-zero), not a 200 dry-run.
     let output = run(
-        &["profile", "probe", "--pin-model", "synth/seed-evolving[1m]"],
+        &["profile", "probe", "--pin-model", "synth/model-y[1m]"],
         &hub,
     );
     assert!(!output.status.success(), "probe must refuse the pin");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("pin refused"), "{stderr}");
-    assert!(
-        stderr.contains("passthrough/synth/seed-evolving"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("passthrough/synth/model-y"), "{stderr}");
     Ok(())
 }
 

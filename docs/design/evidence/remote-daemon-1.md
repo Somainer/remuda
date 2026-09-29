@@ -19,7 +19,7 @@ is pending; this report does not claim a real one-shot WSS enrollment against it
 - Browser: Orca embedded browser, logged in to this isolated Hub. Added the SSH
   host with label `remote-daemon-acceptance`, then created `kind=claude`,
   `driver=claude-print` instances from the new-session form. The model was
-  `model_hub/es1_orange_o50[1m]`, with a configured USD 0.30 budget.
+  `acme_hub/model_x_o50[1m]`, with a configured USD 0.30 budget.
 - Remote writes were restricted to the managed `/tmp/remuda-ssh-<host-id>` tree,
   `/tmp/remuda-c-daemon-acceptance`, and the installed user service unit.
   Gateway environment/model settings were copied only within the remote into

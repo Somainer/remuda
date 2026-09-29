@@ -322,7 +322,7 @@ declaration, different resolved model.
 | Poll N agents for the first `DONE`/`BLOCKED` | `poll-all.sh` | `remuda instance wait --until 'line:(?m)^DONE'` with the bullet-tolerant matcher — **but there is no multi-instance wait**; the script's "first among N" has no equivalent |
 | Per-lane remote gate with lock dirs, CAS onto main, retry when main moved | `rgate3.sh`, `remote-gate.sh` | `remuda merge <branch> --gate` does isolated-merge + shared gate + CAS + push (exit 3 = lost CAS). **No lane/queue serialization** — the lock dirs are pure T2 scheduling and have no product equivalent |
 | Choose which of two lanes / which host a branch is gated on | `rgate3.sh` `$LANE` → `<remote-host>` | **GAP** |
-| Pick `es1_orange_o50[1m]` vs `<gateway-model-B>[1m]` vs `claude-opus-5[1m]` per worker | bash `case` | **GAP** — this is the model-profiling feature, in its entirety |
+| Pick `model_x_o50[1m]` vs `<gateway-model-B>[1m]` vs `claude-opus-5[1m]` per worker | bash `case` | **GAP** — this is the model-profiling feature, in its entirety |
 
 ---
 

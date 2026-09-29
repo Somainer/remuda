@@ -303,7 +303,7 @@ provider: relay-anthropic          # or: openai/codex, xai/grok, google/gemini, 
 ```
 
 Facts this schema must be able to express, all of which bit today:
-- **Per-model, not per-provider, availability**: `es1_orange_o50` was 429 while `<gateway-model-B>`
+- **Per-model, not per-provider, availability**: `model_x_o50` was 429 while `<gateway-model-B>`
   on the same gateway was fine; conversely `seed` probes sometimes 503 while opus is up.
 - **Preference order changes by owner decree**, mid-project: `grok > codex > claude-relay > agy`
   (09-12) → "开发任务改用 claude-relay Opus(1M) + seed" (09-13) → "codex 额度已恢复，也可以用"

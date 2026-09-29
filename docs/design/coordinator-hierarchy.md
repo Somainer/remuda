@@ -283,7 +283,7 @@ command = "./scripts/ci/gate.sh"
   "price": { "usdPerMTokIn": …, "cacheWrite1h": …, "revision": 1, "status": "Provisional" } }
 ```
 
-`family` 与 `id` 必须分开：限流按 family 分桶，而 `es1_orange_o50` 与 `<gateway-model-B>` 在同一网关下是两个桶——这正是 09-14 事故的形状。
+`family` 与 `id` 必须分开：限流按 family 分桶，而 `model_x_o50` 与 `<gateway-model-B>` 在同一网关下是两个桶——这正是 09-14 事故的形状。
 
 **Supply（用户声明 + 观测合并），挂在 `ProviderProfile` 上**
 

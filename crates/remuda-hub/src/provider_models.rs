@@ -451,7 +451,7 @@ mod tests {
         let openai = tag_surface(
             normalize_catalog(
                 r#"{"object":"list","data":[
-                    {"id":"passthrough/ark/seed-evolving"},
+                    {"id":"passthrough/ark/model-y"},
                     {"id":"cursor/gpt-5"},
                     {"id":"claude-opus-5"}
                 ]}"#,
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(
             merged.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec![
-                "passthrough/ark/seed-evolving",
+                "passthrough/ark/model-y",
                 "cursor/gpt-5",
                 "claude-opus-5",
                 "claude-haiku-4-5",

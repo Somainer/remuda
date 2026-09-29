@@ -8,7 +8,7 @@
 //!   boot  scoped CLAUDE_CONFIG_DIR (onboarding pre-seeded, gateway env inherited)
 //!   base  prompt (baseline assistant record → message.model)
 //!   A     /model sonnet              confirm → prompt   (alias verdict + resolved model)
-//!   B     /model model_hub/es1_orange_o50  confirm → prompt (gateway id verdict)
+//!   B     /model acme_hub/model_x_o50  confirm → prompt (gateway id verdict)
 //!   C     /model bogus-xyz                            (error shape)
 //!   D     /model haiku  ESC                           (dismiss: kept verdict?)
 //!   E     /model (bare)                               (picker entries = real list)
@@ -517,7 +517,7 @@ async fn main() {
     Probe::sleep_ms(1_500).await;
 
     // B: gateway id + confirm + prompt.
-    probe.submit("/model model_hub/es1_orange_o50").await;
+    probe.submit("/model acme_hub/model_x_o50").await;
     let b_start = probe.t0.elapsed().as_millis();
     let confirmed = probe.await_dialog("b").await;
     probe.mark("b:dialog-confirmed", &confirmed.to_string());

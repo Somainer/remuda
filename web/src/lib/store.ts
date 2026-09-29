@@ -1310,13 +1310,27 @@ class HubStore {
    * Rebind to a journal ANOTHER mount already finished loading (navigation
    * back, or a racing same-journal mount whose seed won): its OPEN fresh
    * socket certifies live immediately and closes an attempt a superseded
-   * mount still owned; a dead socket starts a fresh recovery for THIS binding
-   * instead of inheriting the previous mount's watchdog.
+   * mount still owned. A silent/dead socket keeps the OLD bind-deadline
+   * dance (followBound): an immediate resume would reopen the socket while a
+   * REST gap-backfill is still running and could strand gap-backfill (the
+   * bumped resume generation aborts fillGap) — the deadline reuses the live
+   * frame/probe evidence instead.
    */
   private rebindMountedConnection() {
     if (!this.connection) return;
     if (this.followSocketLive()) this.connection.followRebindLive();
-    else this.connection.dispatch({ type: "resume" });
+    else this.connection.followBound();
+  }
+
+  /**
+   * Hand-off from a mount whose seed LOST to another mount of the same
+   * journal that is already loading: only an OPEN fresh socket may certify
+   * (retiring the attempt this mount shares with the winner). A silent socket
+   * is left to the WINNING mount's own attempt/watchdog — kicking a resume
+   * here would open a second socket under the winner and abort its backfill.
+   */
+  private handOffMountedConnection() {
+    if (this.connection && this.followSocketLive()) this.connection.followRebindLive();
   }
 
   /**
@@ -2405,10 +2419,11 @@ class HubStore {
       // demand via JournalClient.loadEarlier.
       const seed = await api.eventsRead({ journalId: instance.journalId, limit: 2000 });
       // Another mount may finish loading this journal while this read is
-      // pending. It now owns the bound attempt for THIS journal — hand its
-      // mounted socket the machine slot instead of dropping the attempt.
+      // pending. It now owns the attempt (same binding generation, shared
+      // slot): hand off a live socket or leave its own attempt/watchdog to
+      // close, but never end this mount's attempt against it.
       if (this.journals.has(instance.journalId)) {
-        this.rebindMountedConnection();
+        this.handOffMountedConnection();
         return;
       }
       const history = seed.events;

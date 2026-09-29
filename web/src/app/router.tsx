@@ -5,10 +5,31 @@ import { PhoneShell } from "./PhoneShell";
 // Login stays in the initial chunk: it is the unauthed first paint and must
 // not wait on a route chunk. Every authed surface is a separate chunk
 // (c-perffu UO-11: the eager all-pages bundle made cold navigation parse ~1.5
-// MB of JS in one long task), wrapped in a LazyRoute boundary (r2: a rejected
-// offline/stale chunk keeps the Shell mounted and offers re-import/reload).
+// MB of JS in one long task), wrapped in a per-page LazyRoute boundary (r2:
+// rejected offline/stale chunk keeps the Shell mounted with re-import/
+// reload; r3: each page is its OWN component type so sibling navigation
+// unmounts the old page instead of re-rendering it).
 import { LoginPage } from "../pages/LoginPage";
-import { LazyRoute } from "./routeBoundary";
+import {
+  ApprovalsRoute,
+  BoardRoute,
+  BotDetailRoute,
+  BotsRoute,
+  FleetRoute,
+  HomeListRoute,
+  HostDetailRoute,
+  HostsRoute,
+  InboxRoute,
+  NewSessionRoute,
+  ProjectDetailRoute,
+  ProjectsRoute,
+  ProviderDetailRoute,
+  ProvidersRoute,
+  SessionRoute,
+  SessionsRoute,
+  SettingsRoute,
+  SubagentRoute,
+} from "./lazyRoutes";
 import { resolveLanding } from "../lib/mobileRoute";
 import { useWorkbenchViewport } from "../lib/viewport";
 
@@ -45,155 +66,35 @@ export function AppRouter() {
         <Route element={<Shell />}>
           <Route path="/" element={<RootLanding />} />
           <Route element={<ViewportGate />}>
-            <Route
-              path="/sessions"
-              element={
-                <LazyRoute
-                  loader={() => import("../pages/SessionsPage")}
-                  named="SessionsPage"
-                />
-              }
-            />
-            <Route
-              path="/approvals"
-              element={
-                <LazyRoute
-                  loader={() => import("../pages/ApprovalsPage")}
-                  named="ApprovalsPage"
-                />
-              }
-            />
-            <Route
-              path="/board"
-              element={<LazyRoute loader={() => import("../features/tasks/Board")} named="BoardPage" />}
-            />
+            <Route path="/sessions" element={<SessionsRoute />} />
+            <Route path="/approvals" element={<ApprovalsRoute />} />
+            <Route path="/board" element={<BoardRoute />} />
           </Route>
-          <Route
-            path="/sessions/new"
-            element={
-              <LazyRoute
-                loader={() => import("../pages/NewSessionPage")}
-                named="NewSessionPage"
-              />
-            }
-          />
-          <Route
-            path="/s/:instanceId"
-            element={<LazyRoute loader={() => import("../pages/SessionPage")} named="SessionPage" />}
-          />
-          <Route
-            path="/s/:instanceId/tty"
-            element={
-              <LazyRoute
-                loader={() => import("../pages/SessionPage")}
-                named="SessionPage"
-                componentProps={{ view: "tty" }}
-              />
-            }
-          />
+          <Route path="/sessions/new" element={<NewSessionRoute />} />
+          <Route path="/s/:instanceId" element={<SessionRoute />} />
+          <Route path="/s/:instanceId/tty" element={<SessionRoute view="tty" />} />
           <Route
             path="/s/:instanceId/structured"
-            element={
-              <LazyRoute
-                loader={() => import("../pages/SessionPage")}
-                named="SessionPage"
-                componentProps={{ view: "structured" }}
-              />
-            }
+            element={<SessionRoute view="structured" />}
           />
-          <Route
-            path="/s/:instanceId/files"
-            element={
-              <LazyRoute
-                loader={() => import("../pages/SessionPage")}
-                named="SessionPage"
-                componentProps={{ view: "files" }}
-              />
-            }
-          />
-          <Route
-            path="/s/:instanceId/events"
-            element={
-              <LazyRoute
-                loader={() => import("../pages/SessionPage")}
-                named="SessionPage"
-                componentProps={{ view: "events" }}
-              />
-            }
-          />
-          <Route
-            path="/s/:instanceId/agents/:agentId"
-            element={
-              <LazyRoute
-                loader={() => import("../features/session/subagent/SubagentView")}
-                named="SubagentView"
-              />
-            }
-          />
-          <Route
-            path="/hosts"
-            element={<LazyRoute loader={() => import("../pages/HostsPage")} named="HostsPage" />}
-          />
-          <Route
-            path="/hosts/:hostId"
-            element={<LazyRoute loader={() => import("../pages/HostsPage")} named="HostDetailPage" />}
-          />
-          <Route
-            path="/fleet"
-            element={<LazyRoute loader={() => import("../pages/FleetPage")} named="FleetPage" />}
-          />
-          <Route
-            path="/projects"
-            element={
-              <LazyRoute loader={() => import("../pages/ProjectsPage")} named="ProjectsPage" />
-            }
-          />
-          <Route
-            path="/projects/:workspaceId"
-            element={
-              <LazyRoute loader={() => import("../pages/ProjectsPage")} named="ProjectDetailPage" />
-            }
-          />
-          <Route
-            path="/providers"
-            element={
-              <LazyRoute loader={() => import("../pages/ProvidersPage")} named="ProvidersPage" />
-            }
-          />
-          <Route
-            path="/providers/:profileId"
-            element={
-              <LazyRoute
-                loader={() => import("../pages/ProvidersPage")}
-                named="ProviderDetailPage"
-              />
-            }
-          />
-          <Route
-            path="/bots"
-            element={<LazyRoute loader={() => import("../pages/BotsPage")} named="BotsPage" />}
-          />
-          <Route
-            path="/bots/:channelId"
-            element={<LazyRoute loader={() => import("../pages/BotsPage")} named="BotDetailPage" />}
-          />
-          <Route
-            path="/settings"
-            element={
-              <LazyRoute loader={() => import("../pages/SettingsPage")} named="SettingsPage" />
-            }
-          />
+          <Route path="/s/:instanceId/files" element={<SessionRoute view="files" />} />
+          <Route path="/s/:instanceId/events" element={<SessionRoute view="events" />} />
+          <Route path="/s/:instanceId/agents/:agentId" element={<SubagentRoute />} />
+          <Route path="/hosts" element={<HostsRoute />} />
+          <Route path="/hosts/:hostId" element={<HostDetailRoute />} />
+          <Route path="/fleet" element={<FleetRoute />} />
+          <Route path="/projects" element={<ProjectsRoute />} />
+          <Route path="/projects/:workspaceId" element={<ProjectDetailRoute />} />
+          <Route path="/providers" element={<ProvidersRoute />} />
+          <Route path="/providers/:profileId" element={<ProviderDetailRoute />} />
+          <Route path="/bots" element={<BotsRoute />} />
+          <Route path="/bots/:channelId" element={<BotDetailRoute />} />
+          <Route path="/settings" element={<SettingsRoute />} />
         </Route>
         <Route element={<ViewportGate />}>
           <Route path="/m" element={<PhoneShell />}>
-            <Route
-              index
-              element={<LazyRoute loader={() => import("../features/mobile/HomeList")} named="HomeList" />}
-            />
-            <Route
-              path="inbox"
-              element={<LazyRoute loader={() => import("../features/mobile/Inbox")} named="Inbox" />}
-            />
+            <Route index element={<HomeListRoute />} />
+            <Route path="inbox" element={<InboxRoute />} />
             <Route path="*" element={<Navigate to="/m" replace />} />
           </Route>
         </Route>

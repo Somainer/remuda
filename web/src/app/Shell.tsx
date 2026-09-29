@@ -30,7 +30,7 @@ import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { QuickFind, QUICKFIND_HINT, openQuickFind } from "../features/search/QuickFind";
 import { useInboxPendingCount } from "../features/mobile/useInboxPendingCount";
 import { projectFilterStore, useProjectFilter, useProjects, type Project } from "../features/tasks/ProjectSwitcher";
-import { LazyRoute } from "./routeBoundary";
+import { SessionsRoute } from "./lazyRoutes";
 import { Icon } from "../components/Icon";
 import { InstallBar } from "./InstallBar";
 import { PhoneNav } from "./PhoneNav";
@@ -528,13 +528,7 @@ export function Shell() {
             column instead. D-049: compact /s/:id* renders no strip either —
             the header chip's drawer and Jump To keep every switch. */}
         {chrome.tabs ? <SpaceTabs space={workbench.active} tabs={workbench.tabs} prefs={workbench.prefs} instanceId={workbench.instanceId} newHref={workbench.newHref} /> : null}
-        {onNew ? (
-          <LazyRoute
-            loader={() => import("../pages/SessionsPage")}
-            named="SessionsPage"
-            componentProps={{ dimmed: true }}
-          />
-        ) : null}
+        {onNew ? <SessionsRoute dimmed /> : null}
         <Outlet />
       </main>
       {/* D-049: compact /s/:id* renders no app bottom bar — that route's

@@ -397,3 +397,90 @@ it("an identical poll still settles queued effort left by a historical onPrepend
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
 });
+
+it("loadEarlier onPrepend replay leaves queued effort that an identical poll then settles (c-perffu r3-4)", async () => {
+  // Drives the REAL path: REST seed floor above the old events ->
+  // hubStore.loadEarlier() -> journal older page -> onPrepend (not a live
+  // ctx.receive batch, which bypassed prepend in the r2 test).
+  const id = "ins_effort_prepend";
+  const journalId = `obj_effort_prepend`;
+  const instance: Instance = {
+    ...mockDb.instances[0],
+    id,
+    journalId,
+    kind: "claude",
+    effortName: null,
+    effortIndex: null,
+    effortUltracode: null,
+    activity: { state: "known", value: "idle" },
+  } as Instance;
+  vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_j, _a, onBatch) => {
+    void onBatch;
+    return subscription(instance);
+  });
+
+  const seedEvents = [
+    // Ascending tail window with floor seq 5: the read-back already shows the
+    // newer remuda level...
+    { ...effortEvent(5, "xhigh", false, "remuda") },
+    // ...and the configure row journaled AFTER it re-queued our push-down.
+    configureLifecycle(6, "effort-queued:max", id),
+  ];
+  const olderEvents = [
+    // Load-earlier page: the older launch level; monotonic guard must keep
+    // the newer effective, and this path (onPrepend) still replays the queue.
+    { ...effortEvent(1, "high", null, "launch") },
+  ];
+
+  vi.spyOn(api, "eventsRead").mockImplementation(async (args) => {
+    if (args && "beforeSeq" in args && args.beforeSeq !== undefined) {
+      return {
+        events: olderEvents,
+        durableSeq: "6",
+        windowFromSeq: "1",
+        reachedAfterSeq: true,
+        getReadyState: () => 1,
+      } as unknown as History;
+    }
+    return {
+      events: seedEvents,
+      durableSeq: "6",
+      windowFromSeq: "5",
+      reachedAfterSeq: true,
+      getReadyState: () => 1,
+    } as unknown as History;
+  });
+
+  await hubStore.follow(id);
+  expect(hubStore.effortEffectiveOf(id)?.name).toBe("xhigh");
+  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
+  expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
+
+  // Real load-earlier: older page arrives via journal onPrepend.
+  const floor = await hubStore.loadEarlier(id);
+  expect(floor).toBe("1");
+  // The older launch edge never rolls effective back; pending is still queued.
+  expect(hubStore.effortEffectiveOf(id)?.name).toBe("xhigh");
+  expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
+
+  // An IDENTICAL durable projection then settles the queued push-down.
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      {
+        ...instance,
+        effortEffective: {
+          name: "xhigh",
+          ultracode: false,
+          source: "remuda",
+          observedAt: "2026-09-16T00:05:00Z",
+        },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(id)).toBeNull();
+  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
+});

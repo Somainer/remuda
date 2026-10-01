@@ -245,9 +245,26 @@ async fn real_claude_through_native_shell_pty() {
 /// overlay seeds the user's effective ~/.claude settings (env + model +
 /// modelSettings, discovery flag included), so opening `/model` lists the
 /// gateway models. The token rides the 0600 instance file, never argv.
+///
+/// The expected id (or a distinguishing prefix) is supplied in
+/// `REMUDA_LIVE_GATEWAY_MODEL`; the test skips with a message when it is
+/// unset, rather than grepping for a hard-coded (possibly nonexistent) id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live: scoped native home must list the user's gateway models in /model"]
 async fn scoped_home_lists_gateway_models_in_model_picker() {
+    // The picker lists the user's real gateway ids; there is no safe default
+    // to grep for. Name the expected id (or a distinguishing prefix) via the
+    // environment, and skip cleanly when it is not provided.
+    let gateway_model = match std::env::var("REMUDA_LIVE_GATEWAY_MODEL") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_owned(),
+        _ => {
+            eprintln!(
+                "skip: set REMUDA_LIVE_GATEWAY_MODEL to the gateway model id (or prefix) \
+                 expected to appear in /model"
+            );
+            return;
+        }
+    };
     let owned_dir;
     let root: PathBuf = match std::env::var("REMUDA_NATIVE_LIVE_ROOT") {
         Ok(path) => {
@@ -330,14 +347,14 @@ async fn scoped_home_lists_gateway_models_in_model_picker() {
     pty.write_bytes(b"/model\r").await.expect("type /model");
 
     // Discovery is a network round trip; poll the rendered grid for the
-    // gateway model id from the user's settings (ANTHROPIC_*_MODEL).
-    let gateway_model = "acme_hub";
+    // gateway model id/prefix the caller said to expect (REMUDA_LIVE_GATEWAY_MODEL,
+    // sourced from the user's settings' ANTHROPIC_*_MODEL).
     let mut saw = false;
     let mut last_screen = String::new();
     while start.elapsed() < Duration::from_secs(60) {
         tokio::time::sleep(Duration::from_millis(500)).await;
         last_screen = screen_text(&driver).await;
-        if last_screen.contains(gateway_model) {
+        if last_screen.contains(gateway_model.as_str()) {
             saw = true;
             break;
         }

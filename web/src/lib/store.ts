@@ -691,6 +691,10 @@ class HubStore {
   private screenBackoffUntil = new Map<Id, number>();
   private screenBackoffTimers = new Map<Id, ReturnType<typeof setTimeout>>();
   private stopWorkspaceFollow: (() => void) | null = null;
+  /** c-cardsettle: global Hub settlement socket (instances ending → cards drop). */
+  private stopSettlementFollow: (() => void) | null = null;
+  /** Trailing coalescer so a burst of settlement notices triggers one refresh. */
+  private settlementRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -1831,6 +1835,18 @@ class HubStore {
         (snapshot) => this.applyWorkspaceSnapshot(snapshot),
         () => { void this.refreshHosts().catch(() => undefined); },
       );
+      // c-cardsettle: the Hub invalidates a session's pending card in the same
+      // transaction that ends the instance. Its settlement notice makes every
+      // mounted inbox/badge drop the card immediately via one trailing-coalesced
+      // interaction refresh; missed notices converge on the next 2 s poll.
+      this.stopSettlementFollow?.();
+      this.stopSettlementFollow = api.settlementSubscribe(() => {
+        if (this.settlementRefreshTimer) clearTimeout(this.settlementRefreshTimer);
+        this.settlementRefreshTimer = setTimeout(() => {
+          this.settlementRefreshTimer = null;
+          void this.refresh().catch(() => undefined);
+        }, 300);
+      });
       await this.initConnection();
       this.startPoll();
     } catch (err) {
@@ -1949,6 +1965,12 @@ class HubStore {
     api.disconnect();
     this.stopWorkspaceFollow?.();
     this.stopWorkspaceFollow = null;
+    this.stopSettlementFollow?.();
+    this.stopSettlementFollow = null;
+    if (this.settlementRefreshTimer) {
+      clearTimeout(this.settlementRefreshTimer);
+      this.settlementRefreshTimer = null;
+    }
     // Invalidate this auth epoch: a list fetch already in flight (the 2 s
     // poll may be awaiting when the user logs out) must be dropped wholesale
     // when it resolves — neither replace the wiped instance list with the old

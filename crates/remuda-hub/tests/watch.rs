@@ -602,7 +602,8 @@ async fn gone_carries_the_settled_rows_own_reason() {
             .unwrap()
             .to_string()
     };
-    ctx.hub
+    let (_, _settlement) = ctx
+        .hub
         .store()
         .expect("store")
         .settle_instance_exited(instance_id.clone(), "node-epoch-changed".into())

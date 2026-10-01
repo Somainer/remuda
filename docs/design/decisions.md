@@ -1245,3 +1245,30 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 **不做什么**：不新增错误码或状态机取值（409 复用 `COMMAND_ID_CONFLICT`，消息区分在飞/排队）；不引入 configure 转发队列；不改 Node 侧 commandId+digest 去重；web 无代码改动（outbox 本来只重放 send）。
 
 **依据**：`crates/remuda-hub/src/http.rs`（`post_command`、`replay_existing_command`、`settled_command_row`、`get_instance_command`）；`crates/remuda-hub/src/store.rs`（`queue_command` 串行 writer、`reject_command`、`patch_instance_configure`）。
+
+---
+
+## c-cardsettle（c-deadcards 拆分 · A 部分）：session 终态同一事务结清 pending 卡
+
+| 日期 | 2026-10-01 |
+|---|---|
+| 状态 | adopted |
+| 相关 | protocol.md §2.6（同日加注）；ui-spec.md §2.5（同日加注）；分支 wt/c-cardsettle/b-cardsettle-md；c-deadcards 的 answer fence 等留待后续独立 ADR（B 部分） |
+
+**背景**：一个已结束的 session，其审批/提问卡可能永远留在 pending：inbox 一直显示可操作、角标永远不归零。c-deadcards 全量方案（wt/c-deadcards/b-deadcards-md）在实现终态结清的同时还带入了 answer fence、claim-before-dispatch、generation/epoch fence、Node 侧拒绝、winner 回填等机制，复审成本高。owner 决定先把「终态同一事务结清」这一小块独立落地（option A），其余 fencing 机制另行设计（B 部分）。
+
+**决策**：
+
+1. **同一事务。** 每条让 instance 进入终态的写入路径，都在同一个 `BEGIN IMMEDIATE` 事务里把该实例仍 `pending` 的 durable interaction 置为终态：`reconcile_reported_instances`（node-epoch-changed / 重启 reconcile）、`settle_instance_exited`（显式 kill/close/delete、Node 报未知实例的 stop）、`fail_instance`（launch 被 Node 拒绝）、`expire_stale_requested`（create 永不被 ack；该行从未 journal 过卡，防御性结清）、`expire_lost_hosts`（host-lost 到期）、journal 投影里的终态（entity exited/failed 与只被原生投影识别的 native exit / severity=error，经同一个「按 EFFECTIVE 生命周期转移只结清一次」的 guard）、`reconcile_daemon_instances`（daemon inventory 报告终态）。读-改-写一律 `BEGIN IMMEDIATE`，避免 deferred tx 拿 SHARED 后升级 EXCLUSIVE 与读池连接 SQLITE_BUSY 死锁；`append_journal` 委托 `append_journal_batch`，使 instance 写入与卡结清在一个事务提交。
+2. **复用既有终态表示，不新增状态/ reason /迁移。** durable 行 `state='invalidated'`、`blocking=0`，内嵌 entity 带 `resolution.state=known`、`resolution.value.reason=generation-ended`、`answerable=false`——即 protocol §2.6 既有的 `pending → invalidated（generation 结束）` 边与既有 reason 枚举。结清幂等：UPDATE 自带 `state='pending'` 守卫，重复终态写入返回空 `Settlement`，不重复处理。
+3. **结算后广播，但不是 journal。** 终态方法返回 `Settlement`（被结清的 `(instanceId, interactionId)` 对）；`AppState::broadcast_settlement` 在事务提交后把每对发到 `/v1/follow` 总线，帧类型是**无 seq 的 `settlement` 控制帧**（`{type:"settlement", instanceId, interactionId, state:"invalidated", reason:"generation-ended"}`），不是 `interaction.expired` observation、不携带 journal seq——Hub 不伪造 journal 位置，follower 不会把任何 journal 标 stale/duplicate（这是 r4 实现踩过的回归）。web 用一个全局 follow 连接收到后做一次 trailing-coalesce 的 interaction 刷新，已挂载的收件箱/会话在一次刷新内原地掉卡、角标归零，无需 reload；错过通知由下一次 2 s 轮询与重载自愈（读的是 durable 已 invalidated 行）。后台 host-lost reaper、启动清扫、epoch/daemon reconcile、显式 stop、launch 失败路径全部广播。
+4. **收件箱 feed 与角标分离。** `GET /v1/interactions` 改为返回全部 pending 加最近 24h（`DEPARTED_INTERACTION_RETENTION_SECS`）的 `expired`/`invalidated` 行，供「已离队」在轮询/重载后展示；严格 pending 的角标/推送计数继续走 `list_interactions(pending_only=true)`，终态行永不计入待处理。桌面把 `invalidated + resolution.reason=generation-ended` 的行渲染进「已离队」，文案「进程已结束，未作用于新进程」，区别于「已在其它设备处理」；compact 无第三档，不渲染。
+5. **迟到回答只走既有状态校验，不新增 fence。** `answer_interaction` 在 in-memory CAS 与任何 Node RPC 之前，对 durable 行的当前状态做既有判定：`invalidated`/未知 → 404（NOT_FOUND），`expired` → 410（GONE），`answer-committed`/`resolved` → 409（SUPERSEDED）。死世代绝不 500、绝不静默成功、绝不向可能仍存在的 hook 转发 `interaction.answer`（即不会放行 allow）。
+
+**明确不做（B 部分，后续独立 ADR）**：answer fence、dispatch 前 claim（pending→dispatching）、ingestion 层 generation fence（终态后重放的 interaction.requested 仍按普通路径入库）、(nodeEpoch, processGeneration) / link generation fence、Node 侧拒绝、answer winner（commandId）回填与同命令重试幂等、dispatching 在飞行的结清。本 ADR 只保证「已结束 session 的卡不再永远 pending」与「迟到回答得到既有非 pending 错误」。
+
+**不引入数据库迁移**：`interactions.state` 本就有 `invalidated` 取值，payload 是既有 entity JSON，无需新列。
+
+**测试**：`crates/remuda-hub/src/store.rs` 每个终态路径一个 store 测试（epoch reconcile + 幂等 + 返回 Settlement、settle_instance_exited、journaled exit、native 终态投影、expire_stale_requested 无卡不变量、host-lost、fail_instance），`ssh_hosts.rs` 一个 daemon inventory 终态测试，均断言 instance 变更与卡结清同时生效；集成测试 `crates/remuda-hub/tests/cardsettle.rs`（实例被 Node 报未知而 stop → 卡 invalidated → 迟到回答 404 且无 interaction.answer 转发）；hub e2e `web/tests/e2e/cardsettle.hub.spec.ts`（需 `HUB_E2E_CARDSETTLE=1` 的 fake-node `cardsettle-live` 哨兵：inbox 与 badge 一次刷新内掉卡、无需 reload，迟到回答 404，桌面进「已离队」；无触发时整文件 self-skip）。
+
+**依据**：`crates/remuda-hub/src/store.rs`（`settle_instance_interactions`、`invalidate_interaction_payload`、`settle_on_terminal_transition`、`immediate_tx`、`Settlement`、各终态方法、`list_inbox_interactions`、`append_journal_batch`）；`crates/remuda-hub/src/ws.rs`（`FollowEvent::settlement`、follow 会话的 settlement 控制帧、journal append/epoch reconcile 后广播）；`crates/remuda-hub/src/lib.rs`（`AppState::broadcast_settlement`、reaper/启动清扫）；`crates/remuda-hub/src/http.rs`（delete/stop、NODE_BUSY/launch 失败路径广播）；`crates/remuda-hub/src/interactions.rs`（inbox feed、迟到回答状态判定）；`crates/remuda-hub/src/ssh_hosts.rs`（daemon inventory 同一事务结清）；`web/src/features/approvals/followSettlements.ts`、`web/src/lib/store.ts`、`web/src/lib/interactionStatus.ts`、`web/src/features/approvals/InboxShell.tsx`。

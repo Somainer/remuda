@@ -50,6 +50,12 @@ pub struct FollowEvent {
     pub event: Value,
     /// Binary `tty.frame` envelope when this is TTY output.
     pub binary: Option<Vec<u8>>,
+    /// c-cardsettle: a Hub-side settlement notice (an interaction invalidated
+    /// because its instance ended). This is NOT a journal observation: the Hub
+    /// forges no Node journal seq, it carries no journal position, and it is
+    /// delivered as a `settlement` control frame so followers can never insert
+    /// it into a journal or mark a journal stale/duplicate.
+    pub hub_settlement: bool,
 }
 
 impl FollowEvent {
@@ -61,6 +67,25 @@ impl FollowEvent {
             seq,
             event,
             binary: None,
+            hub_settlement: false,
+        }
+    }
+
+    /// c-cardsettle: Hub settlement notice for one invalidated interaction.
+    /// No journal seq (`seq` is 0 and never serialised for settlement frames).
+    #[must_use]
+    pub fn settlement(instance_id: impl Into<String>, interaction_id: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            seq: 0,
+            event: json!({
+                "type": "settlement",
+                "interactionId": interaction_id.into(),
+                "state": "invalidated",
+                "reason": "generation-ended",
+            }),
+            binary: None,
+            hub_settlement: true,
         }
     }
 }
@@ -498,13 +523,14 @@ pub(crate) async fn handle_node_method(
                 .await?;
             crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
             if params["daemon"] == true {
-                state
+                let settlement = state
                     .store
                     .reconcile_daemon_instances(
                         host.host_id.clone(),
                         params["instances"].as_array().cloned().unwrap_or_default(),
                     )
                     .await?;
+                state.broadcast_settlement(&settlement);
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
             let generation = state
@@ -642,6 +668,10 @@ pub(crate) async fn handle_node_method(
                 for appended in appended_chunk {
                     if !appended.replayed {
                         publish_journal(&state.bus, &appended.record);
+                        // c-cardsettle: cards this terminal journal event
+                        // invalidated commit with the append; tell followers
+                        // immediately (a seq-less settlement control frame).
+                        state.broadcast_settlement(&appended.settlement);
                         crate::alerts::observe(state, &appended.record);
                         crate::usage_store::observe_journal(state, &appended.record).await;
                         crate::supply::observe_journal_text(state, &appended.record).await;
@@ -764,6 +794,7 @@ pub(crate) async fn handle_node_method(
                             seq: 0,
                             event: json!({ "type": "tty.frame", "params": params }),
                             binary: Some(frame),
+                            hub_settlement: false,
                         });
                     }
                 } else {
@@ -983,7 +1014,7 @@ async fn reconcile_lost_instances(
                 .map(str::to_string)
         })
         .collect();
-    let lost = state
+    let (lost, settlement) = state
         .store
         .reconcile_reported_instances(
             host_id.to_string(),
@@ -991,6 +1022,9 @@ async fn reconcile_lost_instances(
             NODE_EPOCH_CHANGED.to_string(),
         )
         .await?;
+    // c-cardsettle: announce the invalidated cards the same transaction
+    // produced, so an open inbox/session drops them without waiting a poll.
+    state.broadcast_settlement(&settlement);
     for instance_id in lost {
         tracing::warn!(
             %host_id,
@@ -1151,6 +1185,7 @@ fn handle_tty_binary(state: &AppState, host_id: &str, bytes: &[u8]) {
             "payloadLength": payload.len(),
         }),
         binary: Some(bytes.to_vec()),
+        hub_settlement: false,
     });
 }
 
@@ -1370,6 +1405,34 @@ async fn follow_session(
                                 continue;
                             }
                             if !want_tty && event.event["type"] == "tty.mode" {
+                                continue;
+                            }
+                            // c-cardsettle: a Hub settlement is a CONTROL frame,
+                            // not a journal observation. It carries no seq: it
+                            // can never be inserted into a journal or make a
+                            // follower mark its journal stale/duplicate. Clients
+                            // refresh the interaction list instead of cursoring.
+                            if event.hub_settlement {
+                                let send = FollowMsg::Text(json!({
+                                    "type": "settlement",
+                                    "instanceId": event.instance_id,
+                                    "interactionId": event.event["interactionId"],
+                                    "state": event.event["state"],
+                                    "reason": event.event["reason"],
+                                }).to_string());
+                                match out_tx.try_send(send) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        // Backpressure must not drop a settlement
+                                        // silently: the resync snapshot carries
+                                        // the durable (already-invalidated) rows.
+                                        if resync_after_gap(&state, &out_tx, &instance_ids, want_tty).await.is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                }
                                 continue;
                             }
                             let send = if want_tty && let Some(binary) = event.binary {

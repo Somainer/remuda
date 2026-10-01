@@ -7,6 +7,7 @@ import type { PromptMode } from "../types/generated";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import { mapWorkspace } from "../features/workspaces/registry";
 import { followWorkspaces } from "../features/workspaces/follow";
+import { followSettlements } from "../features/approvals/followSettlements";
 import type {
   ProviderCreate,
   ProviderDiscoverBody,
@@ -662,6 +663,13 @@ export type HubApi = {
   workspaceRegister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceId?: string; workspaceRevision?: number }>;
   workspaceUnregister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceRevision?: number }>;
   hostWorkspaceSubscribe(onSnapshot: (snapshot: WorkspaceSnapshot) => void, refresh: () => void): () => void;
+  /**
+   * Global Hub settlement notices (c-cardsettle): an instance ended and the
+   * Hub invalidated its pending card(s) in the same transaction. The callback
+   * fires once per notice; callers trailing-coalesce their own refresh.
+   * Returns a stop function.
+   */
+  settlementSubscribe(onSettlement: () => void): () => void;
   providerList(q?: { hostId?: string }): Promise<{ items: HubProviderRow[]; nextCursor?: string | null }>;
   providerGet(id: string): Promise<HubProviderRow>;
   providerCreate(body: ProviderCreate): Promise<HubProviderRow>;
@@ -1242,6 +1250,7 @@ function createMockApi(): HubApi {
       return this.workspaceList(hostId);
     },
     hostWorkspaceSubscribe() { return () => undefined; },
+    settlementSubscribe() { return () => undefined; },
     eventsRead: async ({ journalId, afterSeq, beforeSeq, limit }) => mockReadJournal(journalId, afterSeq, beforeSeq, limit),
     async eventsSubscribe(journalId, _afterSeq, onBatch, _onGap, _hooks) {
       const instance = mockDb.instances.find((i) => i.journalId === journalId);
@@ -1735,6 +1744,9 @@ function createLiveApi(): HubApi {
     },
     hostWorkspaceSubscribe(onSnapshot, refresh) {
       return followWorkspaces(wsUrl("/v1/follow"), onSnapshot, refresh);
+    },
+    settlementSubscribe(onSettlement) {
+      return followSettlements(wsUrl("/v1/follow"), onSettlement);
     },
     eventsRead: async (args) => {
       const instanceId = instanceIdOf(args.journalId);

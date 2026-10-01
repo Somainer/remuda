@@ -337,36 +337,69 @@ impl Store {
 
     /// Reconcile observed state without trusting the Node to advance the Hub's
     /// durable journal watermark. Replay is still required for every missing seq.
+    ///
+    /// Returns the [`Settlement`] of pending cards belonging to instances this
+    /// inventory report transitions INTO a terminal lifecycle (c-cardsettle);
+    /// they are invalidated in the same transaction.
     pub(crate) async fn reconcile_daemon_instances(
         &self,
         host_id: String,
         instances: Vec<Value>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<crate::store::Settlement, StoreError> {
         self.run_named("reconcile_daemon_instances", move |conn| {
-            let tx = conn.transaction()?;
+            let tx = crate::store::immediate_tx(conn)?;
+            let now = now_rfc3339();
+            // Instances this report moves INTO a terminal lifecycle; their
+            // pending interactions settle with the UPDATE (c-cardsettle).
+            let mut ended: Vec<String> = Vec::new();
             for instance in instances {
-                if instance["hostId"].as_str() != Some(&host_id) { continue; }
-                let Some(id) = instance["id"].as_str().or_else(|| instance["instanceId"].as_str()) else { continue; };
+                if instance["hostId"].as_str() != Some(&host_id) {
+                    continue;
+                }
+                let Some(id) = instance["id"]
+                    .as_str()
+                    .or_else(|| instance["instanceId"].as_str())
+                else {
+                    continue;
+                };
                 let lifecycle = match instance["lifecycle"].as_str() {
                     Some("ready" | "running") => "running",
-                    Some(value @ ("requested" | "preparing" | "starting" | "closing" | "exited" | "failed" | "unknown" | "reconciling")) => value,
+                    Some(
+                        value @ ("requested" | "preparing" | "starting" | "closing" | "exited"
+                        | "failed" | "unknown" | "reconciling"),
+                    ) => value,
                     _ => continue,
                 };
-                let activity = instance["activity"].as_str().or_else(|| instance["activity"]["value"].as_str());
+                let activity = instance["activity"]
+                    .as_str()
+                    .or_else(|| instance["activity"]["value"].as_str());
                 let activity = match activity {
                     Some("waiting-interaction") => "blocked",
                     Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
                     _ => "unknown",
                 };
+                let was_terminal = tx
+                    .query_row(
+                        "SELECT lifecycle FROM instances WHERE id = ?1 AND host_id = ?2",
+                        params![id, &host_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map(|previous| matches!(previous.as_str(), "exited" | "failed" | "closed"))
+                    .unwrap_or(true);
                 tx.execute(
                     "UPDATE instances SET lifecycle = ?3, activity = ?4, connectivity = 'connected',
                      last_error = ?5, updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
-                    params![id, host_id, lifecycle, activity, instance["lastError"].as_str(), now_rfc3339()],
+                    params![id, host_id, lifecycle, activity, instance["lastError"].as_str(), &now],
                 )?;
+                if !was_terminal && matches!(lifecycle, "exited" | "failed" | "closed") {
+                    ended.push(id.to_string());
+                }
             }
+            let settlement = crate::store::settle_instance_interactions(&tx, &ended, &now)?;
             tx.commit()?;
-            Ok(())
-        }).await
+            Ok(settlement)
+        })
+        .await
     }
 
     async fn retire_managed_host(&self, id: String) -> Result<(), HubError> {
@@ -522,7 +555,7 @@ async fn connect_once(
         &pending,
     )
     .await?;
-    state
+    let settlement = state
         .store
         .reconcile_daemon_instances(
             managed.id.clone(),
@@ -532,6 +565,7 @@ async fn connect_once(
                 .unwrap_or_default(),
         )
         .await?;
+    state.broadcast_settlement(&settlement);
     carrier
         .send_json(&crate::error::rpc_ok(
             hello["id"].clone(),
@@ -628,7 +662,7 @@ mod tests {
             .await
             .unwrap();
         store.mark_all_hosts_offline().await.unwrap();
-        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 0);
+        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap().0, 0);
         store
             .run_named(
                 "bridge_loss_grace_begins_only_after_daemon_probe_fails",
@@ -642,13 +676,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 0);
+        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap().0, 0);
         let id = instance.host_id.clone();
         store
             .ssh_daemon_probe(id.clone(), true, None)
             .await
             .unwrap();
-        assert_eq!(store.expire_lost_hosts(0).await.unwrap(), 0);
+        assert_eq!(store.expire_lost_hosts(0).await.unwrap().0, 0);
         let disconnected_id = id.clone();
         store
             .run_named("bridge_loss_grace_begins_only_after_daemon_probe_fails", move |conn| {
@@ -665,7 +699,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.expire_lost_hosts(60_000).await.unwrap(),
+            store.expire_lost_hosts(60_000).await.unwrap().0,
             0,
             "first failed daemon probe must reset the earlier bridge disconnect timestamp"
         );
@@ -685,7 +719,7 @@ mod tests {
             .unwrap();
         store.ssh_daemon_probe(id, false, None).await.unwrap();
         assert_eq!(
-            store.expire_lost_hosts(60_000).await.unwrap(),
+            store.expire_lost_hosts(60_000).await.unwrap().0,
             1,
             "failed retries must not restart grace"
         );
@@ -765,6 +799,103 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(untouched.lifecycle, other.lifecycle);
+        store.close().await;
+    }
+
+    /// c-cardsettle: a daemon inventory report that moves a live instance to a
+    /// terminal lifecycle invalidates its still-pending interaction in the SAME
+    /// transaction, and returns the pair for broadcast.
+    #[tokio::test]
+    async fn daemon_inventory_terminal_report_settles_pending_interactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .insert_managed_host(
+                host.clone(),
+                AddSshHost {
+                    target: "cardsettle-daemon".into(),
+                    label: "cardsettle-daemon".into(),
+                    labels: vec![],
+                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .ssh_status(host.clone(), "online", None)
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "codex".into(),
+                "codex-appserver".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+            )
+            .await
+            .unwrap();
+        let interaction_id = new_id("int").unwrap();
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": interaction_id,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "carrier": "harness-hook",
+                            "deadline": { "state": "unknown" },
+                            "resolution": { "state": "unknown" },
+                            "request": {"kind": "approval", "title": "Bash", "options": []}
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let settlement = store
+            .reconcile_daemon_instances(
+                host.clone(),
+                vec![json!({
+                    "id": instance.instance_id,
+                    "hostId": host,
+                    "lifecycle": "exited",
+                    "activity": "idle"
+                })],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            settlement.interactions,
+            vec![(instance.instance_id.clone(), interaction_id.clone())]
+        );
+        let row = store
+            .get_interaction(interaction_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "invalidated");
+        assert!(!row.blocking);
         store.close().await;
     }
 }

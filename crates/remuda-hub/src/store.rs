@@ -1098,6 +1098,10 @@ pub struct JournalAppend {
     pub replayed: bool,
     /// Inclusive instance watermark after this call (may exceed `record.seq` on replay).
     pub durable_seq: i64,
+    /// c-cardsettle: pending interactions this append invalidated because the
+    /// event moved the instance into a terminal lifecycle. Empty on replay.
+    /// Callers broadcast it AFTER the transaction committed.
+    pub settlement: Settlement,
 }
 
 /// One bounded [`Store::read_journal`] window with the metadata a caller needs
@@ -1307,6 +1311,34 @@ impl InteractionRecord {
             object.insert("interaction".into(), entity.clone());
         }
         item
+    }
+}
+
+/// Outcome of a write that moved instance(s) into a terminal lifecycle
+/// (c-cardsettle): the still-pending interactions invalidated IN THAT SAME
+/// TRANSACTION, as `(instance_id, interaction_id)` pairs.
+///
+/// The store never depends on [`crate::AppState`]; callers take this back and
+/// publish it on the follow bus so every open inbox/session drops the card
+/// immediately instead of waiting for its next poll. Idempotent writes settle
+/// nothing and yield an empty settlement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settlement {
+    /// `(instance_id, interaction_id)` pairs settled to `invalidated`.
+    pub interactions: Vec<(String, String)>,
+}
+
+impl Settlement {
+    /// No settled pairs — callers skip the broadcast.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.interactions.is_empty()
+    }
+
+    /// Fold another settlement into this one (e.g. per-event settlements of one
+    /// journal chunk).
+    pub fn merge(&mut self, other: Settlement) {
+        self.interactions.extend(other.interactions);
     }
 }
 
@@ -2049,9 +2081,36 @@ impl Store {
     }
 
     /// Hub-owned projection only: never forge a Node journal cursor or native completion.
-    pub async fn expire_lost_hosts(&self, grace_ms: u64) -> Result<usize, StoreError> {
+    ///
+    /// Returns the number of instances swept plus the [`Settlement`] of the
+    /// pending cards invalidated in the SAME transaction (c-cardsettle).
+    pub async fn expire_lost_hosts(
+        &self,
+        grace_ms: u64,
+    ) -> Result<(usize, Settlement), StoreError> {
         self.run_named("expire_lost_hosts", move |conn| {
-            let changed = conn.execute(
+            // BEGIN IMMEDIATE: this is a read-then-write job; a deferred tx
+            // would take a SHARED lock on the SELECT and deadlock upgrading to
+            // EXCLUSIVE against a pooled reader (see `immediate_tx`).
+            let tx = immediate_tx(conn)?;
+            let now = now_rfc3339();
+            let grace = grace_ms.min(i64::MAX as u64) as i64;
+            // Find the rows this sweep is about to end so their pending
+            // interactions are invalidated in the SAME transaction
+            // (c-cardsettle).
+            let lost: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM instances
+                     WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
+                        SELECT id FROM hosts WHERE state != 'online' AND
+                        (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
+                        (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
+                     )",
+                )?;
+                let rows = stmt.query_map(params![&now, grace], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let changed = tx.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                     connectivity = 'disconnected', last_error = 'host-lost', updated_at = ?1
                  WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
@@ -2059,9 +2118,11 @@ impl Store {
                     (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
                     (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
                  )",
-                params![now_rfc3339(), grace_ms.min(i64::MAX as u64) as i64],
+                params![&now, grace],
             )?;
-            Ok(changed)
+            let settlement = settle_instance_interactions(&tx, &lost, &now)?;
+            tx.commit()?;
+            Ok((changed, settlement))
         }).await
     }
 
@@ -2906,9 +2967,13 @@ impl Store {
         host_id: String,
         reported: Vec<String>,
         reason: String,
-    ) -> Result<Vec<String>, StoreError> {
+    ) -> Result<(Vec<String>, Settlement), StoreError> {
         self.run_named("reconcile_reported_instances", move |conn| {
-            let mut stmt = conn.prepare(
+            // The instance settlement and the interaction invalidation
+            // (c-cardsettle) commit in ONE transaction: an inbox must never
+            // observe an exited instance whose card is still actionable.
+            let tx = immediate_tx(conn)?;
+            let mut stmt = tx.prepare(
                 "SELECT id FROM instances
                  WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed', 'requested')",
             )?;
@@ -2922,13 +2987,16 @@ impl Store {
                 .collect();
             let now = now_rfc3339();
             for id in &lost {
-                conn.execute(
+                tx.execute(
                     "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                         last_error = ?1, updated_at = ?2 WHERE id = ?3",
                     params![&reason, &now, id],
                 )?;
             }
-            Ok(lost)
+            // A generation that ended owns no still-answerable request.
+            let settlement = settle_instance_interactions(&tx, &lost, &now)?;
+            tx.commit()?;
+            Ok((lost, settlement))
         })
         .await
     }
@@ -2938,14 +3006,19 @@ impl Store {
     /// A create the Node never acknowledged keeps occupying a placement slot
     /// forever otherwise. Returns `(host_id, instance_id)` for each expiry so
     /// the caller can publish a diagnostic.
+    /// A create the Node never acknowledged keeps occupying a placement slot
+    /// forever otherwise. Returns `(host_id, instance_id)` for each expiry so
+    /// the caller can publish a diagnostic, plus the [`Settlement`] (c-cardsettle:
+    /// such a row never journaled a card, so it is normally empty).
     pub async fn expire_stale_requested(
         &self,
         window_ms: u64,
-    ) -> Result<Vec<(String, String)>, StoreError> {
+    ) -> Result<(Vec<(String, String)>, Settlement), StoreError> {
         self.run_named("expire_stale_requested", move |conn| {
+            let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             let window = window_ms.min(i64::MAX as u64) as i64;
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT id, host_id FROM instances
                  WHERE lifecycle = 'requested' AND durable_seq = 0 AND
                     (julianday(?1) - julianday(created_at)) * 86400000 >= ?2",
@@ -2954,18 +3027,26 @@ impl Store {
                 .query_map(params![&now, window], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<Result<_, _>>()?;
             drop(stmt);
-            for (id, _) in &stale {
-                conn.execute(
+            let stale_ids: Vec<String> = stale.iter().map(|(id, _)| id.clone()).collect();
+            for id in &stale_ids {
+                tx.execute(
                     "UPDATE instances SET lifecycle = 'failed', activity = 'idle',
                         last_error = 'create-never-acknowledged', updated_at = ?1
                      WHERE id = ?2 AND lifecycle = 'requested'",
                     params![&now, id],
                 )?;
             }
-            Ok(stale
-                .into_iter()
-                .map(|(id, host)| (host, id))
-                .collect::<Vec<_>>())
+            // c-cardsettle: a create that never ran owns no answerable card;
+            // the settle is defensive (the invariant is asserted by a test).
+            let settlement = settle_instance_interactions(&tx, &stale_ids, &now)?;
+            tx.commit()?;
+            Ok((
+                stale
+                    .into_iter()
+                    .map(|(id, host)| (host, id))
+                    .collect::<Vec<_>>(),
+                settlement,
+            ))
         })
         .await
     }
@@ -2973,20 +3054,31 @@ impl Store {
     /// Settle a stop/close for an instance the Node does not know.
     ///
     /// Hub projection only: the row moves to `exited` so the slot is released
-    /// and the caller never waits on a receipt that will not arrive.
+    /// and the caller never waits on a receipt that will not arrive. Returns
+    /// whether THIS call made the row terminal plus the [`Settlement`] of the
+    /// cards invalidated in that same change (c-cardsettle: explicit
+    /// stop/kill/delete, or a stop for an instance the Node no longer knows).
     pub async fn settle_instance_exited(
         &self,
         instance_id: String,
         reason: String,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<(bool, Settlement), StoreError> {
         self.run_named("settle_instance_exited", move |conn| {
-            let changed = conn.execute(
+            let tx = immediate_tx(conn)?;
+            let now = now_rfc3339();
+            let changed = tx.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                     last_error = ?1, updated_at = ?2
                  WHERE id = ?3 AND lifecycle NOT IN ('exited', 'failed')",
-                params![reason, now_rfc3339(), instance_id],
+                params![reason, &now, &instance_id],
             )?;
-            Ok(changed > 0)
+            let mut settlement = Settlement::default();
+            if changed > 0 {
+                settlement =
+                    settle_instance_interactions(&tx, std::slice::from_ref(&instance_id), &now)?;
+            }
+            tx.commit()?;
+            Ok((changed > 0, settlement))
         })
         .await
     }
@@ -3314,19 +3406,27 @@ impl Store {
     }
 
     /// Mark a create that the Node rejected so it does not occupy a slot.
+    ///
+    /// Returns the [`Settlement`] of any pending cards invalidated in the same
+    /// change (c-cardsettle: a failed launch leaves no answerable card).
     pub async fn fail_instance(
         &self,
         instance_id: String,
         last_error: String,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Settlement, StoreError> {
         self.run_named("fail_instance", move |conn| {
-            conn.execute(
+            let tx = immediate_tx(conn)?;
+            let now = now_rfc3339();
+            tx.execute(
                 "UPDATE instances
                  SET lifecycle = 'failed', last_error = ?1, updated_at = ?2
                  WHERE id = ?3",
-                params![last_error, now_rfc3339(), instance_id],
+                params![last_error, &now, &instance_id],
             )?;
-            Ok(())
+            let settlement =
+                settle_instance_interactions(&tx, std::slice::from_ref(&instance_id), &now)?;
+            tx.commit()?;
+            Ok(settlement)
         })
         .await
     }
@@ -3836,6 +3936,14 @@ impl Store {
     }
 
     /// Append a mirrored event. `seq` None assigns durableSeq+1.
+    /// Append a mirrored event. `seq` None assigns durableSeq+1.
+    ///
+    /// c-cardsettle: this is the single-event case of
+    /// [`Store::append_journal_batch`] and delegates to it, so the instance
+    /// terminal UPDATE and the interaction settlement inside
+    /// `append_loaded_event` commit as ONE transaction — the old auto-commit
+    /// path could durably write one while failing the other, leaving an exited
+    /// instance with a still-actionable card.
     pub async fn append_journal(
         &self,
         host_id: String,
@@ -3843,17 +3951,10 @@ impl Store {
         seq: Option<i64>,
         event: Value,
     ) -> Result<JournalAppend, StoreError> {
-        self.run_named("append_journal", move |conn| {
-            let inst = load_instance(conn, &instance_id)?
-                .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
-            if inst.host_id != host_id {
-                return Err(StoreError::Id("instance belongs to another host".into()));
-            }
-            let durable = inst.durable_seq.parse::<i64>().unwrap_or(0);
-            let mut cursor = AppendCursor::new(durable, seq);
-            append_loaded_event(conn, &host_id, &instance_id, &mut cursor, event)
-        })
-        .await
+        let mut out = self
+            .append_journal_batch(host_id, instance_id, seq, vec![event])
+            .await?;
+        Ok(out.pop().expect("one input event yields one append result"))
     }
 
     /// Append one chunk of a frame's events in a single writer job /
@@ -3877,7 +3978,10 @@ impl Store {
         events: Vec<Value>,
     ) -> Result<Vec<JournalAppend>, StoreError> {
         self.run_named("append_journal_batch", move |conn| {
-            let tx = conn.transaction()?;
+            // BEGIN IMMEDIATE: the append reads the instance row and journal
+            // cursor and then writes; a deferred tx would take SHARED first and
+            // deadlock upgrading to EXCLUSIVE against a pooled reader.
+            let tx = immediate_tx(conn)?;
             let inst = load_instance(&tx, &instance_id)?
                 .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
             if inst.host_id != host_id {
@@ -3960,6 +4064,58 @@ impl Store {
                 .iter()
                 .map(|s| s as &dyn rusqlite::types::ToSql)
                 .collect();
+            let rows = stmt.query_map(params_refs.as_slice(), interaction_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// How long a non-pending interaction stays visible in the operator
+    /// inbox's departed/ended presentation after it settled (c-cardsettle).
+    /// Pending rows are returned regardless of age; this bounds only the
+    /// terminal history a poll carries (rows are also deleted with their
+    /// instance).
+    pub const DEPARTED_INTERACTION_RETENTION_SECS: i64 = 24 * 60 * 60;
+
+    /// Inbox feed: every actionable `pending` interaction PLUS recently
+    /// settled ended/expired rows so the UI can render its 已离队/departed
+    /// presentation after a reload or poll (c-cardsettle). The pure pending
+    /// badge counters keep using [`Self::list_interactions`] with
+    /// `pending_only=true`; terminal rows never count as actionable.
+    pub async fn list_inbox_interactions(
+        &self,
+        host_id: Option<String>,
+        instance_id: Option<String>,
+        kind: Option<String>,
+    ) -> Result<Vec<InteractionRecord>, StoreError> {
+        self.read("list_inbox_interactions", move |conn| {
+            let mut sql = String::from(
+                "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at
+                 FROM interactions
+                 WHERE (state = 'pending'
+                        OR (state IN ('expired', 'invalidated')
+                            AND (julianday('now') - julianday(updated_at)) * 86400 <= ?1))",
+            );
+            let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(
+                Self::DEPARTED_INTERACTION_RETENTION_SECS,
+            )];
+            if let Some(host_id) = &host_id {
+                sql.push_str(" AND host_id = ?");
+                args.push(Box::new(host_id.clone()));
+            }
+            if let Some(instance_id) = &instance_id {
+                sql.push_str(" AND instance_id = ?");
+                args.push(Box::new(instance_id.clone()));
+            }
+            if let Some(kind) = &kind {
+                sql.push_str(" AND kind = ?");
+                args.push(Box::new(kind.clone()));
+            }
+            sql.push_str(" ORDER BY created_at");
+            let mut stmt = conn.prepare(&sql)?;
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                args.iter().map(|b| b.as_ref()).collect();
             let rows = stmt.query_map(params_refs.as_slice(), interaction_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(StoreError::from)
@@ -5353,6 +5509,7 @@ fn apply_instance_projection(
     event: &Value,
     seq: i64,
     now: &str,
+    settlement: &mut Settlement,
 ) -> Result<(), StoreError> {
     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
     let payload = event.get("payload").cloned().unwrap_or(Value::Null);
@@ -5508,11 +5665,33 @@ fn apply_instance_projection(
         }
     }
     if let Some(lifecycle) = lifecycle {
+        // c-cardsettle: capture the EFFECTIVE lifecycle before this write so
+        // the settlement guard fires on the transition itself. This
+        // projection recognises native terminals (nativeName "exit", severity
+        // "error", prose failed statuses) that `apply_instance_lifecycle`'s
+        // derivation does not — without the guard those used to write
+        // lifecycle='failed' here while leaving the generation's pending cards
+        // untouched.
+        let previous_lifecycle: Option<String> = conn
+            .query_row(
+                "SELECT lifecycle FROM instances WHERE id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         conn.execute(
             "UPDATE instances SET durable_seq = ?1, lifecycle = ?2,
                     last_error = COALESCE(?3, last_error), updated_at = ?4
              WHERE id = ?5",
             params![seq, lifecycle, last_error, now, instance_id],
+        )?;
+        settle_on_terminal_transition(
+            conn,
+            instance_id,
+            previous_lifecycle.as_deref(),
+            Some(lifecycle),
+            now,
+            settlement,
         )?;
         // D-027: a terminal instance can never consume a staged attachment
         // again, and the Node drops its own copy at the same point.
@@ -5875,13 +6054,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.expire_lost_hosts(0).await.unwrap(),
+            store.expire_lost_hosts(0).await.unwrap().0,
             0,
             "online hosts never expire"
         );
         store.mark_host_offline(host.clone()).await.unwrap();
         assert_eq!(
-            store.expire_lost_hosts(600_000).await.unwrap(),
+            store.expire_lost_hosts(600_000).await.unwrap().0,
             0,
             "ten minute grace"
         );
@@ -5890,14 +6069,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.expire_lost_hosts(0).await.unwrap(),
+            store.expire_lost_hosts(0).await.unwrap().0,
             0,
             "reconnect clears offline timer"
         );
         store.mark_host_offline(host).await.unwrap();
-        assert_eq!(store.expire_lost_hosts(0).await.unwrap(), 1);
+        assert_eq!(store.expire_lost_hosts(0).await.unwrap().0, 1);
         assert_eq!(
-            store.expire_lost_hosts(0).await.unwrap(),
+            store.expire_lost_hosts(0).await.unwrap().0,
             0,
             "idempotent sweep"
         );
@@ -7141,6 +7320,70 @@ mod tests {
             .expect("row")
     }
 
+    /// c-cardsettle: journal a `pending` approval interaction for an instance
+    /// (the durable row the inbox/badge read). Returns the interaction id.
+    async fn seed_pending_interaction(store: &Store, host_id: &str, instance_id: &str) -> String {
+        let id = new_id("int").expect("interaction id");
+        store
+            .append_journal(
+                host_id.to_owned(),
+                instance_id.to_owned(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": id,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "carrier": "harness-hook",
+                            "deadline": { "state": "unknown" },
+                            "resolution": { "state": "unknown" },
+                            "request": {
+                                "kind": "approval",
+                                "title": "Bash",
+                                "description": "echo e2e",
+                                "options": [],
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("journal interaction.requested");
+        let rows = store
+            .list_interactions(None, Some(instance_id.to_owned()), None, false)
+            .await
+            .expect("list");
+        assert!(rows.iter().any(|r| r.interaction_id == id));
+        id
+    }
+
+    /// Read the durable state + resolution reason of one interaction.
+    async fn interaction_state_and_reason(
+        store: &Store,
+        interaction_id: &str,
+    ) -> (String, Option<String>) {
+        let row = store
+            .get_interaction(interaction_id.to_owned())
+            .await
+            .expect("get")
+            .expect("interaction row");
+        let reason = row
+            .payload
+            .pointer("/payload/interaction/resolution/value/reason")
+            .or_else(|| {
+                row.payload
+                    .pointer("/payload/entity/resolution/value/reason")
+            })
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        (row.state, reason)
+    }
+
     /// D-047: the instance projection carries the *observed* route, so it must
     /// not be derived from the spec's *requested* route.
     ///
@@ -7297,7 +7540,7 @@ mod tests {
             "placement counts only Node-confirmed instances"
         );
 
-        let expired = store
+        let (expired, _settlement) = store
             .expire_stale_requested(REQUESTED_SLOT_WINDOW_MS)
             .await
             .expect("sweep");
@@ -7462,7 +7705,7 @@ mod tests {
         // in that window says nothing about whether it was lost. Its own
         // age-bounded reaper is what eventually settles it.
         let in_flight = seed_instance(&store, &host).await;
-        let reconciled = store
+        let (reconciled, _settlement) = store
             .reconcile_reported_instances(
                 host.clone(),
                 vec![kept.instance_id.clone()],
@@ -7503,6 +7746,359 @@ mod tests {
         store.close().await;
     }
 
+    // ----- c-cardsettle: settle a session's pending cards when it ends -----
+
+    /// c-cardsettle (Node epoch change / restart reconcile): the lost
+    /// instance's still-pending interaction is invalidated with
+    /// `resolution.reason = generation-ended`; the survivor's card stays
+    /// pending — and this commits with the instance UPDATE.
+    #[tokio::test]
+    async fn epoch_reconcile_invalidates_pending_interactions_of_lost_instances() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-node").await;
+        store
+            .record_node_epoch(host.clone(), Some("epoch_a".into()))
+            .await
+            .expect("first epoch");
+        store
+            .record_node_epoch(host.clone(), Some("epoch_b".into()))
+            .await
+            .expect("restart epoch");
+
+        let kept = seed_acknowledged_instance(&store, &host).await;
+        let lost = seed_acknowledged_instance(&store, &host).await;
+        let kept_int = seed_pending_interaction(&store, &host, &kept.instance_id).await;
+        let lost_int = seed_pending_interaction(&store, &host, &lost.instance_id).await;
+
+        let (reconciled, settlement) = store
+            .reconcile_reported_instances(
+                host.clone(),
+                vec![kept.instance_id.clone()],
+                "node-epoch-changed".into(),
+            )
+            .await
+            .expect("reconcile");
+        assert_eq!(reconciled, vec![lost.instance_id.clone()]);
+        // The settlement returned to callers names exactly the lost card.
+        assert_eq!(
+            settlement.interactions,
+            vec![(lost.instance_id.clone(), lost_int.clone())]
+        );
+
+        // The instance change and the card settlement are one committed fact.
+        let lost_row = store
+            .get_instance(lost.instance_id.clone())
+            .await
+            .expect("get instance")
+            .expect("row");
+        assert_eq!(lost_row.lifecycle, "exited");
+        let (lost_state, lost_reason) = interaction_state_and_reason(&store, &lost_int).await;
+        assert_eq!(
+            lost_state, "invalidated",
+            "lost instance's card is invalidated"
+        );
+        assert_eq!(
+            lost_reason.as_deref(),
+            Some("generation-ended"),
+            "protocol terminal for a generation that ended"
+        );
+        let (kept_state, _) = interaction_state_and_reason(&store, &kept_int).await;
+        assert_eq!(kept_state, "pending", "the survivor's card stays pending");
+
+        // The invalidated row leaves the actionable query but stays in the
+        // inbox feed (recently departed).
+        let pending: Vec<_> = store
+            .list_interactions(None, None, None, true)
+            .await
+            .expect("pending only")
+            .into_iter()
+            .map(|r| r.interaction_id)
+            .collect();
+        assert!(!pending.contains(&lost_int));
+        assert!(pending.contains(&kept_int));
+        let inbox: Vec<_> = store
+            .list_inbox_interactions(None, None, None)
+            .await
+            .expect("inbox feed")
+            .into_iter()
+            .map(|r| r.interaction_id)
+            .collect();
+        assert!(
+            inbox.contains(&lost_int),
+            "departed row still feeds the inbox"
+        );
+        store.close().await;
+    }
+
+    /// c-cardsettle: reconcile is idempotent — a second reconcile touches
+    /// neither the already-terminal instance nor the settled card, and no
+    /// settlement is returned.
+    #[tokio::test]
+    async fn epoch_reconcile_settling_interactions_is_idempotent() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-idem").await;
+        let lost = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &lost.instance_id).await;
+
+        let (lost_first, first) = store
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into())
+            .await
+            .expect("first reconcile");
+        assert_eq!(lost_first, vec![lost.instance_id.clone()]);
+        assert_eq!(first.interactions.len(), 1);
+        // Second reconcile: the instance is already exited, returns no new lost
+        // rows, no settlement, and does not error on the terminal interaction.
+        let (again, second) = store
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into())
+            .await
+            .expect("second reconcile");
+        assert!(again.is_empty());
+        assert!(second.is_empty(), "no card is settled twice");
+        let (state, _) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        store.close().await;
+    }
+
+    /// c-cardsettle (explicit kill / delete / node-lost stop):
+    /// settle_instance_exited invalidates pending interactions in the same
+    /// change and returns them for broadcast.
+    #[tokio::test]
+    async fn settle_instance_exited_invalidates_its_pending_interactions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-stop").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        let (changed, settlement) = store
+            .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
+            .await
+            .expect("settle");
+        assert!(changed);
+        assert_eq!(
+            settlement.interactions,
+            vec![(instance.instance_id.clone(), int_id.clone())]
+        );
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+
+        // A second settle changes nothing and settles nothing.
+        let (changed_again, settlement_again) = store
+            .settle_instance_exited(instance.instance_id, "deleted-by-operator".into())
+            .await
+            .expect("re-settle");
+        assert!(!changed_again);
+        assert!(settlement_again.is_empty());
+        store.close().await;
+    }
+
+    /// c-cardsettle (journaled exit event): the lifecycle that moves a running
+    /// instance to exited invalidates pending interactions on the same journal
+    /// connection; the returned append carries the settlement for broadcast.
+    #[tokio::test]
+    async fn journaled_exit_lifecycle_invalidates_pending_interactions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-exit").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        let appended = store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{"type":"entity","entityType":"instance","state":"exited"}}),
+            )
+            .await
+            .expect("append exit");
+        assert_eq!(
+            appended.settlement.interactions,
+            vec![(instance.instance_id.clone(), int_id.clone())],
+            "the journal append reports the cards it settled"
+        );
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+
+        // A non-terminal status later cannot un-invalidate (a dead generation
+        // stays dead), and it settles nothing further.
+        let stray = store
+            .append_journal(
+                host,
+                instance.instance_id,
+                None,
+                json!({"kind":"lifecycle","payload":{"type":"native","nativeName":"agent_status","status":{"state":"known","value":"working"}}}),
+            )
+            .await
+            .expect("append stray status");
+        assert!(stray.settlement.is_empty());
+        let (state, _) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(
+            state, "invalidated",
+            "a stray status never revives the card"
+        );
+        store.close().await;
+    }
+
+    /// c-cardsettle (native terminal projection): a NATIVE terminal event
+    /// (nativeName "exit", severity "error") writes lifecycle=failed through
+    /// apply_instance_projection even though the derived lifecycle does not
+    /// name it; the pending card must settle on that effective transition.
+    #[tokio::test]
+    async fn native_terminal_projection_invalidates_pending_interactions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-native-fail").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","nativeName":"exit","severity":"error",
+                    "relatedIds":{"lastError":"boom"}
+                }}),
+            )
+            .await
+            .expect("append native exit");
+
+        let row = store
+            .get_instance(instance.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.lifecycle, "failed",
+            "the native projection fails the instance"
+        );
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated", "native terminal ends the generation");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
+    /// c-cardsettle (never-acknowledged create): a `requested` instance never
+    /// journaled a card (journaling interaction.requested transitions it to
+    /// running), so the reaper finds no pending interactions — the defensive
+    /// in-transaction settle has nothing to do and the instance still fails.
+    #[tokio::test]
+    async fn expire_stale_requested_has_no_pending_interactions_and_fails() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-stale").await;
+        let instance = seed_instance(&store, &host).await; // stays `requested`
+        backdate_instance(&store, &instance.instance_id, 60).await;
+
+        let (expired, settlement) = store
+            .expire_stale_requested(REQUESTED_SLOT_WINDOW_MS)
+            .await
+            .expect("sweep");
+        assert_eq!(expired, vec![(host.clone(), instance.instance_id.clone())]);
+        assert!(
+            settlement.is_empty(),
+            "a never-launched instance never raised a card"
+        );
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "failed");
+        assert!(
+            store
+                .list_interactions(None, Some(instance.instance_id.clone()), None, false)
+                .await
+                .expect("list")
+                .is_empty(),
+            "a never-launched instance never raised a card"
+        );
+        store.close().await;
+    }
+
+    /// c-cardsettle (host-lost sweep): expire_lost_hosts settles the instances
+    /// of an unreachable host and invalidates their still-pending interactions
+    /// in the same transaction.
+    #[tokio::test]
+    async fn expire_lost_hosts_invalidates_pending_interactions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-hostlost").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        store
+            .mark_host_offline(host.clone())
+            .await
+            .expect("offline");
+        let (swept, settlement) = store.expire_lost_hosts(0).await.expect("host-lost sweep");
+        assert_eq!(swept, 1);
+        assert_eq!(
+            settlement.interactions,
+            vec![(instance.instance_id.clone(), int_id.clone())]
+        );
+        let row = store
+            .get_instance(instance.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
+    /// c-cardsettle (launch rejected): fail_instance invalidates any pending
+    /// interaction on the row it moves to failed.
+    #[tokio::test]
+    async fn fail_instance_invalidates_its_pending_interactions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-fail").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        let settlement = store
+            .fail_instance(instance.instance_id.clone(), "node rejected launch".into())
+            .await
+            .expect("fail");
+        assert_eq!(
+            settlement.interactions,
+            vec![(instance.instance_id.clone(), int_id.clone())]
+        );
+        let row = store
+            .get_instance(instance.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "failed");
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
     /// A stop the Node cannot honour settles instead of hanging forever.
     #[tokio::test]
     async fn settling_an_unknown_instance_releases_its_slot_once() {
@@ -7517,12 +8113,14 @@ mod tests {
                 .settle_instance_exited(instance.instance_id.clone(), "node-lost-instance".into())
                 .await
                 .expect("settle")
+                .0
         );
         assert!(
             !store
                 .settle_instance_exited(instance.instance_id.clone(), "node-lost-instance".into())
                 .await
-                .expect("settle again"),
+                .expect("settle again")
+                .0,
             "an already-exited row is not re-settled"
         );
         let row = store
@@ -8369,6 +8967,7 @@ fn append_loaded_event(
             record: existing,
             replayed: true,
             durable_seq: cursor.durable,
+            settlement: Settlement::default(),
         });
     }
     if seq != cursor.expected_next {
@@ -8396,11 +8995,15 @@ fn append_loaded_event(
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![instance_id, seq, event_id, event.to_string(), now],
     )?;
-    apply_instance_projection(conn, instance_id, &event, seq, &now)?;
+    // Cards this event's terminal transition invalidates settle in the SAME
+    // transaction; callers broadcast the returned settlement after commit
+    // (c-cardsettle).
+    let mut settlement = Settlement::default();
+    apply_instance_projection(conn, instance_id, &event, seq, &now, &mut settlement)?;
     apply_native_session_projection(conn, instance_id, &event, &now)?;
     apply_command_projection(conn, host_id, instance_id, &event, &now)?;
     apply_interaction_event(conn, host_id, instance_id, &event)?;
-    apply_instance_lifecycle(conn, instance_id, &event)?;
+    apply_instance_lifecycle(conn, instance_id, &event, &mut settlement)?;
     cursor.expected_next = seq + 1;
     cursor.durable = seq;
     cursor.next_hint = Some(seq.saturating_add(1));
@@ -8414,6 +9017,7 @@ fn append_loaded_event(
         },
         replayed: false,
         durable_seq: seq,
+        settlement,
     })
 }
 
@@ -8587,6 +9191,136 @@ fn knowledge_value(value: Option<&Value>) -> Option<&str> {
         .or_else(|| value.get("value").and_then(Value::as_str))
 }
 
+/// Terminal interaction states that no longer answer and leave the actionable
+/// queue.
+const TERMINAL_INSTANCE_LIFECYCLES: &[&str] = &["exited", "failed", "closed"];
+
+/// Open a write transaction that takes the RESERVED lock immediately
+/// (`BEGIN IMMEDIATE`). A read-then-write job MUST use this rather than a
+/// deferred transaction: a deferred tx first acquires a SHARED lock on its
+/// SELECT and then has to upgrade to EXCLUSIVE at commit, which deadlocks with
+/// SQLITE_BUSY if a pooled reader still holds SHARED (busy_timeout cannot
+/// resolve that upgrade). IMMEDIATE waits on the busy timeout instead.
+pub(crate) fn immediate_tx(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
+/// c-cardsettle: invalidate every still-`pending` interaction owned by
+/// `instance_ids` when those instances settle into a terminal lifecycle
+/// (Node epoch change / restart reconcile, explicit kill/delete, exit
+/// lifecycle event, host-lost sweep, failed launch).
+///
+/// Uses the protocol's existing terminal representation for a generation that
+/// ended (docs/design/protocol.md §2.6 state machine:
+/// `pending -> invalidated: 原生撤销或 generation 结束`): the durable state
+/// becomes `invalidated`, `blocking` clears, and the embedded entity carries
+/// `resolution.reason = generation-ended`. Runs on the CALLER's
+/// connection/transaction, so the instance UPDATE and the interaction
+/// settlement commit atomically — the inbox can never observe an exited
+/// instance with a still-actionable card.
+///
+/// Returns the settled pairs. Idempotent: rows already in a non-pending state
+/// (answered/resolved/expired/invalidated) are untouched, and a second
+/// settlement after an instance is already terminal yields nothing.
+pub(crate) fn settle_instance_interactions(
+    conn: &Connection,
+    instance_ids: &[String],
+    now: &str,
+) -> Result<Settlement, StoreError> {
+    if instance_ids.is_empty() {
+        return Ok(Settlement::default());
+    }
+    let placeholders = vec!["?"; instance_ids.len()].join(",");
+    let sql = format!(
+        "SELECT id, instance_id, payload_json FROM interactions
+         WHERE state = 'pending' AND instance_id IN ({placeholders})"
+    );
+    let params: Vec<&dyn rusqlite::types::ToSql> = instance_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let pending: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut settlement = Settlement::default();
+    for (id, owner_instance_id, payload_json) in pending {
+        let mut event: Value = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
+        invalidate_interaction_payload(&mut event, now);
+        let changed = conn.execute(
+            "UPDATE interactions
+                SET state = 'invalidated', blocking = 0, payload_json = ?2, updated_at = ?3
+              WHERE id = ?1 AND state = 'pending'",
+            params![id, event.to_string(), now],
+        )?;
+        if changed > 0 {
+            settlement.interactions.push((owner_instance_id, id));
+        }
+    }
+    Ok(settlement)
+}
+
+/// Stamp an `interaction.requested` payload as a generation-ended
+/// invalidation (c-cardsettle). The durable payload is the original journal
+/// event; the full entity sits at /payload/entity (lifecycle shape) or
+/// /payload/interaction (interaction.requested shape) — whichever exists gets
+/// the same terminal markers the list projection reads. No new protocol state
+/// or reason is introduced: §2.6 already defines `pending -> invalidated` for
+/// a generation that ended with `resolution.reason = generation-ended`.
+pub(crate) fn invalidate_interaction_payload(event: &mut Value, now: &str) {
+    for pointer in ["/payload/entity", "/payload/interaction"] {
+        if let Some(entity) = event.pointer_mut(pointer).and_then(Value::as_object_mut) {
+            entity.insert("state".into(), json!("invalidated"));
+            entity.insert("blocking".into(), json!(false));
+            entity.insert("answerable".into(), json!(false));
+            entity.insert(
+                "resolution".into(),
+                json!({
+                    "state": "known",
+                    "value": {
+                        "reason": "generation-ended",
+                        "eventIds": [],
+                    },
+                }),
+            );
+            entity.insert("updatedAt".into(), json!(now));
+        }
+    }
+}
+
+/// Settle pending interactions exactly once — on the transition in which the
+/// EFFECTIVE stored lifecycle first becomes terminal. Both lifecycle writers
+/// (the native/entity projection in `apply_instance_projection` and the
+/// derived write in `apply_instance_lifecycle`) route through this, so a
+/// native `exit` / severity-error that only one derivation recognises still
+/// ends the generation: one terminal transition, one settle. No-op when the
+/// row was already terminal (the transition's own writer did the settlement)
+/// or stays non-terminal.
+fn settle_on_terminal_transition(
+    conn: &Connection,
+    instance_id: &str,
+    previous: Option<&str>,
+    next: Option<&str>,
+    now: &str,
+    settlement: &mut Settlement,
+) -> Result<(), StoreError> {
+    if let Some(next) = next
+        && TERMINAL_INSTANCE_LIFECYCLES.contains(&next)
+        && !previous.is_some_and(|p| TERMINAL_INSTANCE_LIFECYCLES.contains(&p))
+    {
+        let ids = [instance_id.to_string()];
+        settlement.merge(settle_instance_interactions(conn, &ids, now)?);
+    }
+    Ok(())
+}
+
 fn lifecycle_rank(state: &str) -> i32 {
     match state {
         "requested" => 0,
@@ -8724,6 +9458,7 @@ fn apply_instance_lifecycle(
     conn: &Connection,
     instance_id: &str,
     event: &Value,
+    settlement: &mut Settlement,
 ) -> Result<(), StoreError> {
     let (next_life, mut next_act) = derive_instance_state(event);
     if next_life.is_none() && next_act.is_none() {
@@ -8749,6 +9484,19 @@ fn apply_instance_lifecycle(
     conn.execute(
         "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
         params![lifecycle, activity, now, instance_id],
+    )?;
+    // c-cardsettle: settle through the SAME transition guard the projection
+    // write uses. `current` was read AFTER apply_instance_projection (it runs
+    // earlier in this append), so a terminal the projection already wrote and
+    // settled is a no-op here; a terminal only THIS derivation recognises
+    // still settles its generation now.
+    settle_on_terminal_transition(
+        conn,
+        instance_id,
+        Some(current.lifecycle.as_str()),
+        Some(lifecycle),
+        &now,
+        settlement,
     )?;
     Ok(())
 }

@@ -336,13 +336,16 @@ pub async fn list_interactions(
             return Err(HubError::Forbidden);
         }
     }
+    // c-cardsettle: the inbox feed carries every actionable pending row plus
+    // recently ended/expired rows (24h) for the 已离队 presentation after a
+    // poll or reload; strictly-pending badge counters use list_interactions
+    // (pending_only=true) elsewhere, so terminal rows never count as pending.
     let mut items: Vec<Value> = state
         .store
-        .list_interactions(
+        .list_inbox_interactions(
             query.host_id.clone(),
             query.instance_id.clone(),
             query.kind.clone(),
-            true,
         )
         .await?
         .into_iter()
@@ -547,6 +550,26 @@ pub async fn answer_interaction(
     } else {
         None
     };
+    // c-cardsettle: a late answer to a DURABLE card whose generation ended is
+    // rejected BEFORE the in-memory CAS and BEFORE any Node RPC — so a settled
+    // generation is never a 500, a silent success, or an `interaction.answer`
+    // (hence an allow) forwarded to a hook that may still exist. Only the two
+    // states that can NEVER answer again short-circuit here:
+    //  * invalidated (settled here with generation-ended) / a row the owning
+    //    instance no longer vouches for -> 404, the entity does not exist;
+    //  * expired by its deadline -> 410.
+    // `answer-committed`/`resolved` deliberately fall through to the Node fan-
+    // out: the Node's own CAS keeps the established semantics — the SAME
+    // commandId replays to 200 {outcome:'idempotent'}, a competing command
+    // gets 409 (INTERACTION_SUPERSEDED). Distinguishing the two Hub-side would
+    // need winner backfill, which is the later fencing ADR (c-deadcards part B).
+    if let Some(stored) = &stored {
+        match stored.state.as_str() {
+            "expired" => return Err(HubError::Expired),
+            "invalidated" => return Err(HubError::NotFound),
+            _ => {}
+        }
+    }
     if let Some(result) = state
         .agent_approvals
         .answer(

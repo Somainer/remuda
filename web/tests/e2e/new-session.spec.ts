@@ -114,13 +114,13 @@ test.describe("new session sheet (mock-backed)", () => {
     await expect(page.getByTestId("new-session-delegation-none")).toBeVisible();
     await page.getByTestId("new-session-perm-bypassPermissions").click();
     await expect(page.getByTestId("new-session-yolo-hint")).toBeVisible();
-    await prompt.fill("查 bolt TaskManager spill");
+    await prompt.fill("查 devbox TaskManager spill");
     await expect(page.getByTestId("new-session-start")).toBeEnabled();
     await page.getByTestId("new-session-start").click();
     await expect(page).toHaveURL(/\/s\//);
     await expect(page.getByTestId("session-page")).toBeVisible();
     await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "starting");
-    await expect(page.getByTestId("session-page").getByTestId("message")).toContainText("查 bolt TaskManager spill");
+    await expect(page.getByTestId("session-page").getByTestId("message")).toContainText("查 devbox TaskManager spill");
   });
 
   test("kind terminal uses shell-pty and opens the terminal tab", async ({ page }) => {

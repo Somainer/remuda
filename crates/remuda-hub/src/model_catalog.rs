@@ -9,7 +9,7 @@
 //! Discipline mirrors `remuda-driver`'s price table: static data with an
 //! explicit [`CATALOG_REVISION`] and a [`CapabilityStatus`] provenance mark.
 //! Gateway models the table cannot know (`<gateway-model-A>[1m]`, family
-//! `es1`) fall back to the per-profile declared `family`/`role` fields; an
+//! `model_x`) fall back to the per-profile declared `family`/`role` fields; an
 //! unknown id is not an admission error on its own.
 
 use remuda_driver::usage::prices::{self, PriceStatus};

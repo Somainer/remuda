@@ -7,7 +7,7 @@ decision: [D-034](../decisions.md). Builds on
 
 Context: the fixture `tty_endpoint_emits_protocol_v1_binary_fixture`
 (`crates/remuda-node/tests/local_api.rs`) failed **deterministically** on lane
-`sg-lane1` for every branch verified there — three runs, two branches, one of
+`lane1` for every branch verified there — three runs, two branches, one of
 them unrelated to any TTY code — while the same test passed in the coordinator
 ssh-driven gate on the same remote host for every branch. The panic was
 `expected binary TTY frame` after the test's 4s deadline (exit 101 after

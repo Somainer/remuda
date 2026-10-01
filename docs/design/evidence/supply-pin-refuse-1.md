@@ -36,8 +36,8 @@ This evidence replays the exact shape with synthetic ids
   "models": [
     {"id": "passthrough/synth/model-y", "family": "synth",
      "role": "workhorse", "priority": 20,
-     "fallback": ["passthrough/synth/seed-legacy"]},
-    {"id": "passthrough/synth/seed-legacy", "family": "synth",
+     "fallback": ["passthrough/synth/legacy-model"]},
+    {"id": "passthrough/synth/legacy-model", "family": "synth",
      "role": "workhorse", "priority": 10}
   ]
 }
@@ -59,12 +59,12 @@ The dry-run "succeeds" and answers a model the caller never asked for:
     "modelId": "passthrough/synth/model-y",
     "family": "synth",
     "hostId": "hst_…",
-    "fallback": ["passthrough/synth/seed-legacy"]
+    "fallback": ["passthrough/synth/legacy-model"]
   },
   "ranked": [
     {"profileId": "pvp_…", "modelId": "passthrough/synth/model-y",
      "priority": 20, "state": "available"},
-    {"profileId": "pvp_…", "modelId": "passthrough/synth/seed-legacy",
+    {"profileId": "pvp_…", "modelId": "passthrough/synth/legacy-model",
      "priority": 10, "state": "available"}
   ],
   "rejected": [],
@@ -126,7 +126,7 @@ $ remuda profile probe --pin-model 'synth/model-y[1m]'; echo "exit=$?"
 Error: hub HTTP 409: pin refused: no listed model/supply matches the pin
   - pinned model "synth/model-y[1m]" is not listed by any provider profile — a pin is a hard constraint; dispatch refused, never substituted
   - did you mean "passthrough/synth/model-y"?
-  - did you mean "passthrough/synth/seed-legacy"?
+  - did you mean "passthrough/synth/legacy-model"?
 exit=1
 ```
 
@@ -144,9 +144,9 @@ $ curl -s -w '\nHTTP_STATUS:%{http_code}\n' -X POST …/v1/workers/dispatch \
  "reasons":[
    "pinned model \"synth/model-y[1m]\" is not listed by any provider profile — a pin is a hard constraint; dispatch refused, never substituted",
    "did you mean \"passthrough/synth/model-y\"?",
-   "did you mean \"passthrough/synth/seed-legacy\"?"],
+   "did you mean \"passthrough/synth/legacy-model\"?"],
  "suggestions":["passthrough/synth/model-y",
-                "passthrough/synth/seed-legacy"]}
+                "passthrough/synth/legacy-model"]}
 HTTP_STATUS:409
 ```
 
@@ -162,7 +162,7 @@ allocation, and the Node `worker.provision` call.
 ```
 ── roster:
   knownpin model= passthrough/synth/model-y
-  warnpin  model= passthrough/synth/seed-legacy
+  warnpin  model= passthrough/synth/legacy-model
 ── node RPC methods called by the Hub:
   worker.provision      ← known pin (step 3)
   instance.create
@@ -193,14 +193,14 @@ With the project's `modelRoles.workhorse` set to
 dispatches (the pin wins), carrying one informational warning:
 
 ```
-$ remuda dispatch … --name warnpin --model passthrough/synth/seed-legacy; echo "exit=$?"
+$ remuda dispatch … --name warnpin --model passthrough/synth/legacy-model; echo "exit=$?"
 exit=0
 ```
 
 ```json
-"model": "passthrough/synth/seed-legacy",
+"model": "passthrough/synth/legacy-model",
 "warnings": [
-  "pinned model \"passthrough/synth/seed-legacy\" differs from the project \
+  "pinned model \"passthrough/synth/legacy-model\" differs from the project \
 workhorse \"passthrough/synth/model-y\"; honoring the pin (informational)"
 ]
 ```
@@ -212,7 +212,7 @@ workhorse \"passthrough/synth/model-y\"; honoring the pin (informational)"
 | `profile probe --pin-model synth/model-y[1m]` | 0 | 1 |
 | `dispatch --model synth/model-y[1m]` | 0 | 1 |
 | `dispatch --model passthrough/synth/model-y` (listed) | 0 | 0 |
-| `dispatch --model passthrough/synth/seed-legacy` (listed, ≠ workhorse) | 0 | 0 + warning |
+| `dispatch --model passthrough/synth/legacy-model` (listed, ≠ workhorse) | 0 | 0 + warning |
 
 ## Suggestion ranking
 

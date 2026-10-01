@@ -99,7 +99,7 @@ function session(id: string, patch: Partial<Instance> = {}): Instance {
 }
 
 /** The Space the list is pinned to in most of these cases. */
-const spaceA = { id: "space-a", name: "sfe-root", hostId: "host-a", workspaceId: "wsp-a" };
+const spaceA = { id: "space-a", name: "demo-root", hostId: "host-a", workspaceId: "wsp-a" };
 
 function renderList(search = "", options: { instances?: Instance[]; space?: typeof spaceA } = {}) {
   return render(
@@ -107,7 +107,7 @@ function renderList(search = "", options: { instances?: Instance[]; space?: type
       <SessionList
         variant="full"
         instances={options.instances ?? hub.instances}
-        title="sfe-root"
+        title="demo-root"
         space={"space" in options ? options.space : spaceA}
       />
     </MemoryRouter>,
@@ -117,7 +117,7 @@ function renderList(search = "", options: { instances?: Instance[]; space?: type
 beforeEach(() => {
   mobileViewport = false;
   hub.hosts = [host("host-a", "alpha"), host("host-b", "beta")];
-  hub.workspaces = [workspace("wsp-a", "host-a", "sfe-root", "/home/dev/sfe-root")];
+  hub.workspaces = [workspace("wsp-a", "host-a", "demo-root", "/home/dev/demo-root")];
   hub.instances = [session("ins_a"), session("ins_b", { activity: known("waiting-interaction") })];
   hub.interactions = [];
   hub.screens = {};
@@ -268,7 +268,7 @@ describe("SessionList scope and conditions", () => {
 });
 
 /** Space id the real buildSpaces() derives for the fixture host/workspace. */
-const derivedSpace = { id: '["host-a","wsp-a"]', name: "sfe-root", hostId: "host-a", workspaceId: "wsp-a" };
+const derivedSpace = { id: '["host-a","wsp-a"]', name: "demo-root", hostId: "host-a", workspaceId: "wsp-a" };
 
 describe("SessionList model label", () => {
   afterEach(() => {
@@ -348,7 +348,7 @@ describe("SessionList model label", () => {
 function renderKeyList() {
   return render(
     <MemoryRouter initialEntries={["/sessions"]}>
-      <SessionList variant="full" instances={hub.instances} title="sfe-root" space={derivedSpace} />
+      <SessionList variant="full" instances={hub.instances} title="demo-root" space={derivedSpace} />
     </MemoryRouter>,
   );
 }
@@ -417,7 +417,7 @@ describe("SessionList rows: next step, wire disclosure and overflow sheet", () =
     const summaryTip = wireToggle.getAttribute("title") ?? "";
     expect(summaryTip).toContain("ready");
     expect(summaryTip).toContain("connected");
-    expect(summaryTip).toContain("alpha/sfe-root");
+    expect(summaryTip).toContain("alpha/demo-root");
     // Relative timestamp (mock timestamps are "now"-ish, so formatListTime
     // yields either "刚刚" or a clock string).
     expect(summaryTip).toMatch(/刚刚|^\d{1,2}:\d{2}$/m);

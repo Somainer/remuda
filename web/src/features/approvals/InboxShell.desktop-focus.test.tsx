@@ -119,10 +119,10 @@ function buildHub(): void {
     {
       id: WORKSPACE_ID as Workspace["id"],
       hostId: HOST_ID as Workspace["hostId"],
-      label: "sfe-root",
-      rootPath: "/srv/sfe-root",
+      label: "demo-root",
+      rootPath: "/srv/demo-root",
       writePolicy: "workspace-write",
-      canonicalRoot: known("/srv/sfe-root"),
+      canonicalRoot: known("/srv/demo-root"),
     } as Workspace,
   ];
   // The expired card's own instance is ended: it anchors the 已离队 row but

@@ -161,8 +161,8 @@ describe("bot channel default project reference", () => {
       // reference renders verbatim (BotsPage prints defaultProject as text).
       expect(projectLabel(channel.defaultProject, [])).toBe(channel.defaultProject);
     }
-    const listed = project("sfe-root", "Sense Front End");
-    expect(projectLabel("sfe-root", [listed])).toBe("Sense Front End");
+    const listed = project("demo-root", "Sense Front End");
+    expect(projectLabel("demo-root", [listed])).toBe("Sense Front End");
   });
 });
 

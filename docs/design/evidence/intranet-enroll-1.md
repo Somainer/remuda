@@ -15,7 +15,7 @@ isolation fix below. The Hub upgrade used pinned main
 `9dd7ec7b59cd43ea325c2bbe2404210ffe31ff2c`.
 
 The existing local demo was not stopped or modified. No Node installation or
-native CLI installation was performed on `<sg-host>` or `<bolt-host>`.
+native CLI installation was performed on `<sg-host>` or `<devbox-host>`.
 
 ## Initial API pairing and compatibility blocker
 
@@ -239,13 +239,13 @@ and restarted only the new Mac launchd daemon at 08:22:03 UTC. It was online by
 All earlier acceptance instances were stopped before this binary replacement.
 This later binary upgrade is separate from the same-PID WSS replay proof above.
 
-## SG / bolt Node installation plan — not executed
+## SG / devbox Node installation plan — not executed
 
 With the Hub prerequisite now satisfied, inspect each target's actual OS/architecture,
 user-service availability, writable workspace, native CLI inventory, provider
 login/configuration and any existing Remuda/Herdr services. The previously
 inspected SG host is Debian 10 x86_64; do not assume the public Ubuntu installer
-applies. Confirm `<bolt-host>` independently before selecting its binary.
+applies. Confirm `<devbox-host>` independently before selecting its binary.
 
 Install a compatible static Linux binary and Herdr/native CLIs only in a separately
 authorized rollout. Use the operator user's dedicated private Node data directory,

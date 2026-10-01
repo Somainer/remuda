@@ -312,9 +312,9 @@ command = "./scripts/ci/gate.sh"
   },
   "models": [                            // 扩 provider_models.rs:22 的 ProviderModel（全部可选字段）
     { "id": "<gateway-model-A>[1m]", "enabled": true, "contextWindow": 1048576,
-      "family": "es1", "role": "workhorse", "priority": 20,
+      "family": "model_x", "role": "workhorse", "priority": 20,
       "concurrencyMax": 4, "fallback": ["<gateway-model-B>[1m]"],
-      "windows": [ { "id": "model", "appliesTo": ["es1"], "usedPercent": 100,
+      "windows": [ { "id": "model", "appliesTo": ["model_x"], "usedPercent": 100,
                      "resetsAt": null, "source": "observed" } ] },
     { "id": "<gateway-model-B>[1m]", "family": "seed", "role": "workhorse", "priority": 18 },
     { "id": "claude-opus-5[1m]", "family": "opus", "role": "frontier", "priority": 15 }
@@ -387,18 +387,18 @@ worker（三家 harness 的结构化文件 tail）
 
 **与在飞工作的关系**：`r-p6-adapters` 正在接三家 driver 的 usage tail。本设计**不碰** `crates/remuda-driver/src/usage/*` 与 adapter 文件，只在 Hub 侧建消费端（批次 3），并在 r-p6-adapters 合入后自动有数据。
 
-### 4.6 09-14 的 es1 429 事故，自动化后长什么样
+### 4.6 09-14 的 model_x 429 事故，自动化后长什么样
 
 事实（playbook §3.11）：`<gateway-model-A>` 对每个请求回 HTTP 429 `{"error_code":-2001}`；**同一网关上的 `<gateway-model-B>` 一直好使**；人工处置是对每个在跑 worker 敲 `esc esc` → `/model <gateway-model-B>[1m]` → `enter`（确认「conversation is cached for the current model」）→「continue where you left off」。
 
 | 阶段 | 自动化行为 |
 |---|---|
-| **Detect** | 三路任一命中即置位：① worker journal 的 `rate_limit_event` diagnostic（今天到 `claude_print.rs:764` 为止就没了）；② 屏幕文本匹配器命中 `Request rejected (429)`；③ `remuda profile probe` 的 1-token 探针（今天是 `gateway-ok.py`）返回 429。Hub 将 `models[es1].windows[model]` 置 `usedPercent=100, source=observed, appliesTo=["es1"]`，supply `state=degraded`，`cooldownUntil = resetsAt ?? now+60s`（指数退避）。**因为窗口是 family 级而非 `appliesTo:["*"]`，`ordinaryUsageAllowed` 不置 false。** |
-| **Decide** | 调度器对受影响的 8 个 in-flight task 重跑 §4.4 过滤。判定树：窗口 `appliesTo` 是账号级 → 全部 **park until `resetsAt`**（默认策略，对应 Claude Code 自己的 `autoContinueAtUsageLimit`）；窗口是 family 级且同 profile 存在 `state=available` 的兄弟（`<gateway-model-B>`，`priority` 次高，且在 `models[es1].fallback` 里）→ 对 **running** 的 worker 走 `switch-model`（省下 clean slate），对 **queued/deferred** 的只换候选，**不重发 brief**。 |
+| **Detect** | 三路任一命中即置位：① worker journal 的 `rate_limit_event` diagnostic（今天到 `claude_print.rs:764` 为止就没了）；② 屏幕文本匹配器命中 `Request rejected (429)`；③ `remuda profile probe` 的 1-token 探针（今天是 `gateway-ok.py`）返回 429。Hub 将 `models[model_x].windows[model]` 置 `usedPercent=100, source=observed, appliesTo=["model_x"]`，supply `state=degraded`，`cooldownUntil = resetsAt ?? now+60s`（指数退避）。**因为窗口是 family 级而非 `appliesTo:["*"]`，`ordinaryUsageAllowed` 不置 false。** |
+| **Decide** | 调度器对受影响的 8 个 in-flight task 重跑 §4.4 过滤。判定树：窗口 `appliesTo` 是账号级 → 全部 **park until `resetsAt`**（默认策略，对应 Claude Code 自己的 `autoContinueAtUsageLimit`）；窗口是 family 级且同 profile 存在 `state=available` 的兄弟（`<gateway-model-B>`，`priority` 次高，且在 `models[model_x].fallback` 里）→ 对 **running** 的 worker 走 `switch-model`（省下 clean slate），对 **queued/deferred** 的只换候选，**不重发 brief**。 |
 | **Act** | `remuda worker switch-model <name> --to <gateway-model-B>[1m]`：按 harness recipe 执行确认舞（claude：`esc`×2 打断重试循环 → prompt `/model …` → `enter` 吃掉缓存确认 → prompt「continue where you left off」）。recipe 落在 `crates/remuda-rules/` 的新文件里，不散在 105 份 brief。若无兄弟可用 → task 进 `parked(until=resetsAt)`，`remuda dispatch --defer-until supply-ok` 的守候由产品持有（今天是 `spawn-d028-p1.sh` 一个占着终端的 3 小时轮询）。 |
-| **Audit** | 每个被切换/park 的 worker 追加一行 `placement` ledger（`reasons[]` 含「es1 window 100% observed at T」、`rejected[]` 含被跳过的供给及原因）；`audit_log`（`crates/remuda-hub/src/store.rs:2970`）记 `supply.cooldown` / `worker.switch-model`；bot 发**一张**「供给事故」卡片（不是 8 张）：受影响 worker 数、切前切后、预计恢复时刻、是否需要 owner 决策。 |
+| **Audit** | 每个被切换/park 的 worker 追加一行 `placement` ledger（`reasons[]` 含「model_x window 100% observed at T」、`rejected[]` 含被跳过的供给及原因）；`audit_log`（`crates/remuda-hub/src/store.rs:2970`）记 `supply.cooldown` / `worker.switch-model`；bot 发**一张**「供给事故」卡片（不是 8 张）：受影响 worker 数、切前切后、预计恢复时刻、是否需要 owner 决策。 |
 
-**分歧裁决（§1.3 分歧 4）— 撞限后怎么办。** playbook 记录的是「在跑的 worker 上活切模型」；prior-art 主张「默认 park 到 `resetsAt`，fallback 是迁移」。**prior-art 的默认赢**（park 是 default），**playbook 的活切作为显式合法路径保留**，且**只在窗口是 family 级时合法**——因为 Anthropic 文档白纸黑字：session/weekly 限额跨模型共享，`/model` 换不掉；Opus/Sonnet 家族限额才换得掉。09-14 的 es1 事故恰好是 family 级，所以当时的手工处置是对的，而把它写成无条件规则会在 account 级限额下一头撞墙。
+**分歧裁决（§1.3 分歧 4）— 撞限后怎么办。** playbook 记录的是「在跑的 worker 上活切模型」；prior-art 主张「默认 park 到 `resetsAt`，fallback 是迁移」。**prior-art 的默认赢**（park 是 default），**playbook 的活切作为显式合法路径保留**，且**只在窗口是 family 级时合法**——因为 Anthropic 文档白纸黑字：session/weekly 限额跨模型共享，`/model` 换不掉；Opus/Sonnet 家族限额才换得掉。09-14 的 model_x 事故恰好是 family 级，所以当时的手工处置是对的，而把它写成无条件规则会在 account 级限额下一头撞墙。
 
 ---
 
@@ -494,7 +494,7 @@ owner 消息 → SessionKey（feishu:{chat_id}:{thread_id||root_id||main}，inbo
 | 6 | **多用户/共享主机** | 09-14：几十个孤儿 `fake-herdr server` 以 93% CPU 跑了 12 小时；`/tmp` 95%，`target-gate` 71 GB；一个 worker 的清理极可能杀掉了承载另外 8 个 worker 的 carrier | ① 资源块（ports/targetDir/scratch/e2e lock/browser endpoint）由产品**分配**并在 retire 回收（含 `rm -rf target-<name>`，且必须报告回收字节数）；② `hostcap` 作为 dispatch 前置；③ 进程安全变沙箱 denylist（禁裸 `pkill herdr`）而不是 105 份 brief 里的一句话；④ 共享资源一把 advisory lock 由 `gate` 分配 |
 | 7 | **T2 自己动手改代码** | Claude Code teams 已记录「lead 开始自己实现」 | CrewAI 原则：coordinator 只持有 dispatch/gate 工具，不持有编辑工具（§2.1/§2.2 的工具面按 role 在 Hub 侧收紧，不靠自律） |
 | 8 | **DONE 谎报 / 状态滞后** | Claude Code teams：「teammate 有时不标完成，阻塞依赖」 | 不变量 I1：**DONE 是声明不是 gate**。依赖解锁看的是 `land` 的 sha，不是 worker 的状态位 |
-| 9 | **供给判断在部分信息下失误** | es1 429 与 seed 503 交替，探针本身间歇失败 | `ordinaryUsageAllowed` 不从百分比/重置时间推断（Codex 契约原话）；529 类不冷却；无候选时 `deferred` 而非降级；三次以上反复 → escalate |
+| 9 | **供给判断在部分信息下失误** | model_x 429 与 seed 503 交替，探针本身间歇失败 | `ordinaryUsageAllowed` 不从百分比/重置时间推断（Codex 契约原话）；529 类不冷却；无候选时 `deferred` 而非降级；三次以上反复 → escalate |
 | 10 | **CAS 滑落** | 09-14：coordinator 用 `update-ref` 推进本地 main，**抹掉了 gate 已合的一次 merge**，只有被拒的 push 暴露出来 | `land` 内置 `git merge-base --is-ancestor` + CAS，退出码 `BaseMoved`；不存在手工 `update-ref` 路径 |
 | 11 | **协议/热文件冲突** | `native-pty-first.md` §13 的冲突规避规则：协议变更由单一 owner 一次性纯增量落地 | 批次 1 独占全部 protocol/store/openapi 增量，其余批次只 rebase 一次；每个文件唯一 owner（§8 矩阵） |
 

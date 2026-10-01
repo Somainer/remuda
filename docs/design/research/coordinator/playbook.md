@@ -157,7 +157,7 @@ protocol        "last line of your final reply exactly DONE <sha> or BLOCKED <re
 |---|---|
 | **Decision inputs** | task class (mechanical fix / design-heavy / evidence spike / web-e2e / rebase) · supply (see §4) · host capability (the remote has 64 cores but Ubuntu 20.04: no Chromium install, OpenSSL 1.1.1, no push creds) · current host load and `/tmp` usage · whether the task needs the owner's live demo, the real `claude` binary, or macOS |
 | **Tool calls today** | `python3 gateway-ok.py <model>` (1-token `/v1/messages` probe), `ssh <remote-host> uptime/df`, `herdr agent list`, knowledge of what each host has |
-| **Scripted** | the *mechanics* of each placement (a flavor arg: `es1 → <gateway-model-A>[1m]`, `seed → <gateway-model-B>[1m]`, `opus → claude-opus-5[1m]`); the deferral loop in `spawn-d028-p1.sh` (probe every 90 s for up to 3 h, then spawn or give up) |
+| **Scripted** | the *mechanics* of each placement (a flavor arg: `model_x → <gateway-model-A>[1m]`, `seed → <gateway-model-B>[1m]`, `opus → claude-opus-5[1m]`); the deferral loop in `spawn-d028-p1.sh` (probe every 90 s for up to 3 h, then spawn or give up) |
 | **Judged** | the mapping task-class → harness+model, and the concurrency ceiling ("keep ≤4 remote workers building at once" was learned, not configured) |
 | **Failure modes** | load 126/64 cores with 5 workers + a gate building → e2e timeouts across the board; `/tmp` at 95 % because per-worker `target-<name>` is 5–35 GB and `target-gate` reached 71 GB; placement that ignores a host's missing toolchain (Playwright/Chromium, OpenSSL 3) fails minutes later inside the worker instead of at dispatch |
 

@@ -304,9 +304,9 @@ fn relay_profile_with_two_models() -> Value {
         "defaultGateway": true,
         "supply": { "priority": 20, "concurrency": { "max": 2 } },
         "models": [
-            { "id": "gw/es1[1m]", "family": "es1", "role": "workhorse",
-              "priority": 20, "fallback": ["gw/seed[1m]"] },
-            { "id": "gw/seed[1m]", "family": "seed", "role": "workhorse",
+            { "id": "gw/model_x[1m]", "family": "model_x", "role": "workhorse",
+              "priority": 20, "fallback": ["gw/model-y[1m]"] },
+            { "id": "gw/model-y[1m]", "family": "seed", "role": "workhorse",
               "priority": 18 }
         ]
     })
@@ -365,7 +365,7 @@ async fn textual_429_via_fake_node_cools_family_and_529_does_not() -> Result<()>
     let host_id = HostId::new();
     let host = host_id.as_id().to_string();
     let node = enroll_fake_node(&hub, &host, 8).await?;
-    let instance_id = seed_live_instance(&hub, &node, &host, profile_id, "gw/es1[1m]").await?;
+    let instance_id = seed_live_instance(&hub, &node, &host, profile_id, "gw/model_x[1m]").await?;
 
     // The exact 09-14 text: Request rejected (429) {"error_code":-2001}.
     let append = json!({
@@ -396,7 +396,7 @@ async fn textual_429_via_fake_node_cools_family_and_529_does_not() -> Result<()>
         .iter()
         .find(|w| w["id"] == "model")
         .context("model window after 429")?;
-    assert_eq!(model_window["appliesTo"][0], "es1");
+    assert_eq!(model_window["appliesTo"][0], "model_x");
     assert_eq!(model_window["usedPercent"], 100.0);
     assert_eq!(model_window["source"], "observed");
     assert!(model_window["cooldownUntil"].as_i64().is_some());
@@ -461,13 +461,13 @@ async fn family_window_admits_sibling_account_window_parks_all() -> Result<()> {
     let relay = create_relay(hub.addr, &cookie).await?;
     let profile_id = relay["id"].as_str().unwrap();
 
-    // Structured family window (es1 full). Sibling seed must still win.
+    // Structured family window (model_x full). Sibling seed must still win.
     let structured = json!({
         "type": "structured",
         "windows": [
             {
                 "id": "model",
-                "appliesTo": ["es1"],
+                "appliesTo": ["model_x"],
                 "windowDurationMins": 300,
                 "usedPercent": 100,
                 "resetsAt": 9_999_999_999_i64
@@ -497,7 +497,7 @@ async fn family_window_admits_sibling_account_window_parks_all() -> Result<()> {
     assert_eq!(status, 200, "{body}");
     let decision: Value = serde_json::from_str(body.trim())?;
     assert_eq!(decision["chosen"]["profileId"], profile_id);
-    assert_eq!(decision["chosen"]["modelId"], "gw/seed[1m]");
+    assert_eq!(decision["chosen"]["modelId"], "gw/model-y[1m]");
     assert_eq!(decision["chosen"]["family"], "seed");
     assert!(decision["deferred"] == false);
     assert!(
@@ -505,13 +505,13 @@ async fn family_window_admits_sibling_account_window_parks_all() -> Result<()> {
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r["modelId"] == "gw/es1[1m]"
+            .any(|r| r["modelId"] == "gw/model_x[1m]"
                 && r["reasons"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .any(|x| x.as_str().unwrap_or_default().contains("cooling"))),
-        "es1 rejected with a cooling reason: {}",
+        "model_x rejected with a cooling reason: {}",
         decision["rejected"]
     );
 
@@ -568,8 +568,8 @@ async fn account_concurrency_max_enforced_across_two_fake_hosts() -> Result<()> 
     let profile_id = relay["id"].as_str().unwrap();
 
     // Two live uses split across the two hosts meet concurrency.max=2.
-    seed_live_instance(&hub, &n1, &h1, profile_id, "gw/es1[1m]").await?;
-    seed_live_instance(&hub, &n2, &h2, profile_id, "gw/seed[1m]").await?;
+    seed_live_instance(&hub, &n1, &h1, profile_id, "gw/model_x[1m]").await?;
+    seed_live_instance(&hub, &n2, &h2, profile_id, "gw/model-y[1m]").await?;
 
     let probe = json!({ "taskSpec": { "class": "implement" } }).to_string();
     let (_, body) = http(
@@ -733,7 +733,7 @@ async fn unknown_pin_refused_on_resolve_and_known_pin_honored() -> Result<()> {
         "models": [
             {"id": "passthrough/synth/model-y", "family": "synth",
              "role": "workhorse", "priority": 20},
-            {"id": "passthrough/synth/seed-legacy", "family": "synth",
+            {"id": "passthrough/synth/legacy-model", "family": "synth",
              "role": "workhorse", "priority": 10}
         ]
     })
@@ -808,7 +808,7 @@ async fn usage_events_flow_through_journal_into_aggregation() -> Result<()> {
     let node = enroll_fake_node(&hub, &host, 8).await?;
     let relay = create_relay(hub.addr, &cookie).await?;
     let profile_id = relay["id"].as_str().unwrap();
-    let instance_id = seed_live_instance(&hub, &node, &host, profile_id, "gw/es1[1m]").await?;
+    let instance_id = seed_live_instance(&hub, &node, &host, profile_id, "gw/model_x[1m]").await?;
 
     let usage = json!({
         "instanceId": instance_id,
@@ -865,13 +865,13 @@ async fn usage_events_flow_through_journal_into_aggregation() -> Result<()> {
     )
     .await?;
     let usage: Value = serde_json::from_str(body.trim())?;
-    let es1 = usage["models"]
+    let model_x = usage["models"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|m| m["model"] == "gw/es1[1m]")
-        .context("es1 usage row")?;
-    assert_eq!(es1["budgetStatus"], "stop"); // 0.03 >= 0.02 * 1.15
+        .find(|m| m["model"] == "gw/model_x[1m]")
+        .context("model_x usage row")?;
+    assert_eq!(model_x["budgetStatus"], "stop"); // 0.03 >= 0.02 * 1.15
     hub.shutdown().await;
     Ok(())
 }

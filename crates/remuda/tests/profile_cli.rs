@@ -85,9 +85,9 @@ async fn profile_declare_event_and_probe_dry_run_against_hub() -> Result<()> {
         "name": "cli-native",
         "kind": "native",
         "models": [
-            {"id":"gw/es1[1m]","family":"es1","role":"workhorse","priority":20,
-             "fallback":["gw/seed[1m]"]},
-            {"id":"gw/seed[1m]","family":"seed","role":"workhorse","priority":18}
+            {"id":"gw/model_x[1m]","family":"model_x","role":"workhorse","priority":20,
+             "fallback":["gw/model-y[1m]"]},
+            {"id":"gw/model-y[1m]","family":"seed","role":"workhorse","priority":18}
         ]
     });
     let client = remuda_hub_client::HubClient::new(&base, Some(token.clone()), None)?;
@@ -157,7 +157,7 @@ async fn profile_declare_event_and_probe_dry_run_against_hub() -> Result<()> {
     let shown: Value = serde_json::from_slice(&out.stdout)?;
     assert_eq!(shown["supply"]["priority"], 20);
 
-    // 4. report the 09-14 text: es1 429
+    // 4. report the 09-14 text: model_x 429
     let out = run(&[
         "profile",
         "event",
@@ -165,7 +165,7 @@ async fn profile_declare_event_and_probe_dry_run_against_hub() -> Result<()> {
         "--type",
         "textual",
         "--model",
-        "gw/es1[1m]",
+        "gw/model_x[1m]",
         "--text",
         "Request rejected (429) {\"error_code\":-2001}",
         "--hub",
@@ -184,8 +184,8 @@ async fn profile_declare_event_and_probe_dry_run_against_hub() -> Result<()> {
     assert!(
         windows
             .iter()
-            .any(|w| w["appliesTo"][0] == "es1" && w["cooldownUntil"].is_number()),
-        "es1 family window cooling: {after}"
+            .any(|w| w["appliesTo"][0] == "model_x" && w["cooldownUntil"].is_number()),
+        "model_x family window cooling: {after}"
     );
 
     // 5. a 529 leaves that family window in place and adds no new cooldown
@@ -213,7 +213,7 @@ async fn profile_declare_event_and_probe_dry_run_against_hub() -> Result<()> {
     );
     assert_eq!(after529["supply"]["state"], "degraded");
 
-    // 6. probe dry-run: es1 cooled, seed sibling wins, deferred=false
+    // 6. probe dry-run: model_x cooled, seed sibling wins, deferred=false
     let out = run(&[
         "profile",
         "probe",
@@ -230,11 +230,11 @@ async fn profile_declare_event_and_probe_dry_run_against_hub() -> Result<()> {
         String::from_utf8_lossy(&out.stderr)
     );
     let decision: Value = serde_json::from_slice(&out.stdout)?;
-    assert_eq!(decision["chosen"]["modelId"], "gw/seed[1m]");
+    assert_eq!(decision["chosen"]["modelId"], "gw/model-y[1m]");
     assert_eq!(decision["chosen"]["family"], "seed");
     assert_eq!(decision["deferred"], false);
     assert!(decision["rejected"].as_array().unwrap().iter().any(|r| {
-        r["modelId"] == "gw/es1[1m]"
+        r["modelId"] == "gw/model_x[1m]"
             && r["reasons"]
                 .as_array()
                 .unwrap()

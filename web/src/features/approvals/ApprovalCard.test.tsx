@@ -163,8 +163,8 @@ function viewFor(item: Interaction, over: Partial<DecisionView> = {}): DecisionV
     uiState: "pending",
     focused: false,
     timeLabel: "12:04",
-    hostLabel: "bolt",
-    workspaceLabel: "sfe-root",
+    hostLabel: "devbox",
+    workspaceLabel: "demo-root",
     instanceKind: "claude",
     ...over,
   };

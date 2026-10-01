@@ -98,14 +98,14 @@ describe("sessionFilters URL round-trip", () => {
 });
 
 describe("scope derivation", () => {
-  const space = { name: "sfe-root", hostId: "h1", workspaceId: "w1" };
+  const space = { name: "demo-root", hostId: "h1", workspaceId: "w1" };
 
   it("pins to the Space and names its host, so same-name directories stay distinct", () => {
     const scope = describeScope(conditions(), space, hostName);
     expect(scope.kind).toBe("space");
     expect(scope.hostId).toBe("h1");
     expect(scope.label).toContain("当前 Space 固定范围");
-    expect(scope.label).toContain("sfe-root");
+    expect(scope.label).toContain("demo-root");
     expect(scope.label).toContain("alpha");
   });
 
@@ -129,7 +129,7 @@ describe("scope derivation", () => {
 });
 
 describe("Space switch pruning", () => {
-  const space = { name: "sfe-root", hostId: "h1", workspaceId: "w1" };
+  const space = { name: "demo-root", hostId: "h1", workspaceId: "w1" };
 
   it("drops host and directory conditions that the new fixed Space cannot honour", () => {
     const before = conditions({ q: "spill", status: ["blocked"], host: ["h2"], workspace: ["w9"] });
@@ -169,8 +169,8 @@ describe("Space switch pruning", () => {
 
 describe("matching", () => {
   const workspaces = [
-    workspace("w1", "h1", "sfe-root", "/home/dev/projects/sfe-root"),
-    workspace("w2", "h2", "sfe-root", "/srv/build/sfe-root"),
+    workspace("w1", "h1", "demo-root", "/home/dev/projects/demo-root"),
+    workspace("w2", "h2", "demo-root", "/srv/build/demo-root"),
   ];
   const rows = [
     instance({ id: "ins_a", hostId: "h1", workspaceId: "w1", native: "sess-aaa" }),
@@ -190,9 +190,9 @@ describe("matching", () => {
   });
 
   it("keeps same-name directories on different hosts separable by host condition", () => {
-    const both = applyFilters(rows, conditions({ q: "sfe-root", scope: "all" }), statusOf, context);
+    const both = applyFilters(rows, conditions({ q: "demo-root", scope: "all" }), statusOf, context);
     expect(both).toHaveLength(2);
-    const one = applyFilters(rows, conditions({ q: "sfe-root", host: ["h2"], scope: "all" }), statusOf, context);
+    const one = applyFilters(rows, conditions({ q: "demo-root", host: ["h2"], scope: "all" }), statusOf, context);
     expect(one.map((row) => row.id)).toEqual(["ins_b"]);
   });
 
@@ -205,7 +205,7 @@ describe("matching", () => {
 describe("selected chips", () => {
   const names = {
     hostName,
-    workspaceLabel: (id: string) => (id === "w1" || id === "w2" ? "sfe-root" : "valhalla"),
+    workspaceLabel: (id: string) => (id === "w1" || id === "w2" ? "demo-root" : "valhalla"),
     workspaceAmbiguous: (id: string) => id === "w1" || id === "w2",
     workspaceHost: (id: string) => (id === "w1" ? "alpha" : "beta"),
   };
@@ -220,7 +220,7 @@ describe("selected chips", () => {
 
   it("qualifies a directory chip with its host when the name is shared", () => {
     const [shared] = selectedChips(conditions({ workspace: ["w1"], scope: "all" }), names);
-    expect(shared.label).toBe("目录：sfe-root · alpha");
+    expect(shared.label).toBe("目录：demo-root · alpha");
     const [unique] = selectedChips(conditions({ workspace: ["w9"], scope: "all" }), names);
     expect(unique.label).toBe("目录：valhalla");
   });

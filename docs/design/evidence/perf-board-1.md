@@ -296,6 +296,31 @@ m-ghostbadge 1、m-push 3、uo3-evidence 5 共 29 项 + uo13-evidence
 （REMUDA_EVIDENCE=1，覆盖 /hosts、主机详情、/fleet、/projects 导航）
 8 项全过；mock agent-board 3/3；perf 场景 E 与生产冷导航复测见下。
 
+## 5.3 第三轮复审跟进（b-perffu r4）
+
+1. **[high] 过期判定定时器边界**：旧实现恰好在 `lastSeenAt+30min`
+   唤醒，而 isStaleOffline 是严格 `>`，主机永远不会变过期；effect 只
+   依赖 `[hosts]`，首次触发后不会为下一台重排；statusText /
+   mobileSummary 没传 nowMs，行文案可能与分组不一致。修复：唤醒时刻
+   `max(Date.now(), cutoff+1)`（严格越过），effect 依赖加入 nowMs 且
+   只挑 `cutoff > nowMs` 的下一个未来截止——单个定时器链式推进、
+   数据变化/卸载清理；页面所有 isStaleOffline 调用共用同一 nowMs。
+   回归：两台离线主机（+30s/+120s 截止）相等轮询下，跨每个边界断言
+   真实 isStaleOffline 分类与组成员关系，另验证恰好在 cutoff 瞬间仍
+   fresh；旧 hook 4 例中 3 例失败。
+2. **[low] onPrepend 测试 vacuous**：重写——follow 种子只含最新
+   effective（floor seq5），queued lifecycle（seq4）只存在于 load-
+   earlier 旧页；断言 loadEarlier 前无 pending、旧页请求
+   `beforeSeq === "4"`、onPrepend 后 queued、identical poll 后清空。
+   删除 onPrepend 的 effort 回放实测失败（expected undefined to be
+   true），不再 vacuous。
+
+检查：typecheck/lint 通过；unit 191 文件 / 2136 用例；
+闸门 hub（gate-e2e.lock 内）：uo13-evidence 不设 REMUDA_EVIDENCE 时
+**8 skipped**（runner 现按未设置/已设置严格转发，不再默认塞真值），
+REMUDA_EVIDENCE=1 时 8 passed（实测 /hosts→主机详情→/fleet→
+/projects 导航与渲染，截图是重生成的已回滚不提交）。
+
 ## 6 刻意不做
 
 - 不动轮询间隔、协议、Hub；不加任何 gated e2e 的毫秒阈值。

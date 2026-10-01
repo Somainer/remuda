@@ -14,7 +14,8 @@ import type { Id } from "../types/wire";
  * - pending: not yet given an answer (a transient network failure returns here).
  * - inflight: this tab holds the delivery lease and a POST is running.
  * - sent: the POST was accepted/forwarded with a CLEAR resolution; awaiting
- *   the journal join. Never re-POSTed; restored; projected 已送达.
+ *   the journal join. Never re-POSTed; restored; the bubble projects 已受理
+ *   (distinct from inflight's 已发送，等待确认 — a clear answer is in hand).
  * - reconciling: accepted/forwarded but resolution "reconciling"; a bounded
  *   GET (not a re-forward) decides accepted/rejected/unknown.
  * - held: Hub holds the row but the Node is offline / never forwarded; bounded

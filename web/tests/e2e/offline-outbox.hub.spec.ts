@@ -490,7 +490,7 @@ test("an online send labels the row 等待发送 then 已发送，等待确认/�
     return route.fulfill({ response: res });
   });
 
-  await sendMessage(page, "watch the labels");
+  await sendMessage(page, "__hold_journal__:8000");
   const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
   await expect(bubble).toBeVisible();
   const commandId = await bubble.getAttribute("data-command-id");
@@ -501,25 +501,36 @@ test("an online send labels the row 等待发送 then 已发送，等待确认/�
   await expect(bubble).not.toContainText("离线");
 
   // Release the lock: the flush takes it and the parked POST shows the row
-  // reached the Hub (in-flight), never 状态待确认.
+  // is in flight with NO answer yet — 已发送，等待确认， never 状态待确认.
   await page.evaluate(() => (window as unknown as { __releaseLock?: () => void }).__releaseLock?.());
   await expect(bubble).toContainText("已发送，等待确认", { timeout: 15_000 });
+  await expect(bubble).not.toContainText("已受理");
   await expect(bubble).not.toContainText("状态待确认");
 
-  // Release the POST: the command runs once and the journal join replaces
-  // the chip with the authoritative row (已受理 on the way).
+  // Release the POST. The fake node answers immediately but withholds the
+  // mirrored journal user observation for 8 s (__hold_journal__,
+  // hub_e2e.rs): once the browser has processed the accepted response the
+  // STILL-VISIBLE bubble must carry the distinct accepted/delivered label
+  // 已受理 — proving the answer landed, unlike inflight's
+  // 已发送，等待确认 — and exactly one Hub command row is committed.
   releasePost?.();
-  await expect
-    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
-    .toBe(1);
+  await expect(bubble).toContainText("已受理", { timeout: 15_000 });
+  await expect(bubble).not.toContainText("已发送，等待确认");
+  await expect(bubble).toBeVisible();
   await expect
     .poll(
       async () =>
         (await hubCommands(api, instanceId)).filter(
           (c) => c.operation === "instance.send" && c.id === commandId,
         ).length,
-      { timeout: 30_000 },
+      { timeout: 15_000 },
     )
+    .toBe(1);
+
+  // The hold lapses: the journal user observation joins exactly once and the
+  // bubble is replaced by the authoritative transcript row.
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
     .toBe(1);
   await expectDelivered(page, commandId);
 });
@@ -539,10 +550,12 @@ test("a Hub-accepted send shows its delivered label on the still-visible bubble 
   const commandId = await bubble.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
 
-  // The POST landed and the Hub committed the command (the row reconciles to
-  // sent — it reached the Hub — never 状态待确认） while the journal
-  // confirmation is held back.
-  await expect(bubble).toContainText("已发送，等待确认", { timeout: 15_000 });
+  // The POST landed with a CLEAR answer and the Hub committed the command
+  // (the outbox row settles to "sent"), while the journal confirmation is
+  // held back. The still-visible bubble shows the accepted/delivered label
+  // 已受理 — DISTINCT from inflight's 已发送，等待确认 — never 状态待确认.
+  await expect(bubble).toContainText("已受理", { timeout: 15_000 });
+  await expect(bubble).not.toContainText("已发送，等待确认");
   await expect(bubble).not.toContainText("状态待确认");
   await expect
     .poll(

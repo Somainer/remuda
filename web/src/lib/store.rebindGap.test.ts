@@ -45,7 +45,7 @@ it("navigating back to a gap-backfilling session keeps its socket and lets the f
 
   const hooks = new Map<string, Hooks>();
   const subscribed: string[] = [];
-  let releaseGapRead: (() => void) | null = null;
+  let releaseGapRead: () => void = () => {};
   let gapReadPending = false;
   let afterSeqOneCalls = 0;
 
@@ -176,7 +176,7 @@ it("navigating back to a gap-backfilling session keeps its socket and lets the f
 
   // 5. The held fill completes: the missing range is applied IN ORDER and the
   // per-session status ends live only now (never live over the hole).
-  releaseGapRead?.();
+  releaseGapRead();
   await vi.waitFor(() =>
     expect(hubStore.getSnapshot().journalStatus[INSTANCE_A]).toBe("live"),
   );

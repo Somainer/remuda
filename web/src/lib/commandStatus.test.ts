@@ -4,6 +4,7 @@ import type { Connectivity, Host, Lifecycle } from "../types/instance";
 import type { Interaction } from "../types/interaction";
 import type { Capability, CapabilityProvision, CapabilitySnapshot } from "../types/nativeRef";
 import { known, unknownKnowledge, type Id } from "../types/wire";
+import type { OutboxState } from "./outbox";
 import { printCapabilities } from "./capabilities";
 import {
   acceptedLabel,
@@ -363,6 +364,46 @@ describe("projectCommandStatus — unknown never renders as success", () => {
     for (const row of rows) {
       expect(row.actions.join(",")).not.toMatch(/resend|retry|重发/);
     }
+  });
+});
+
+describe("D-055 durable outbox rows", () => {
+  const bubble = (outboxState: OutboxState) =>
+    projectCommandStatus({ localState: "queued", hasServerCommandId: true, outboxState });
+
+  it("an unanswered in-flight POST reads 已发送，等待确认 (in-flight tone)", () => {
+    expect(bubble("inflight")).toMatchObject({
+      key: "sent-awaiting-ack",
+      label: "已发送，等待确认",
+      tone: "in-flight",
+      success: false,
+    });
+  });
+
+  it("a reconciling forwarded row reads 已发送，等待确认 (the bounded GET is confirming it)", () => {
+    expect(bubble("reconciling")).toMatchObject({ key: "sent-awaiting-ack", success: false });
+  });
+
+  it("a POST with a CLEAR accepted answer (outbox sent) reads the DISTINCT accepted label 已受理", () => {
+    // c-reconnfu round 3 item 5: inflight and sent must not share one label —
+    // inflight has no response; "sent" has the Hub's clear answer in hand.
+    const row = bubble("sent");
+    expect(row).toMatchObject({ key: "accepted", label: "已受理", success: false });
+    expect(row.key).not.toBe("sent-awaiting-ack");
+    expect(row.label).not.toBe("已发送，等待确认");
+  });
+
+  it("a journal-confirmed done row reads 已受理 too (its bubble is settled/hidden)", () => {
+    expect(bubble("done")).toMatchObject({ key: "accepted", success: false });
+  });
+
+  it("held/pending/rejected/unknown rows keep their own wording", () => {
+    expect(bubble("held").key).toBe("awaiting-send");
+    expect(projectCommandStatus({ localState: "queued", hasServerCommandId: true, outboxState: "pending", offline: true }).key).toBe(
+      "pending-offline",
+    );
+    expect(bubble("rejected").key).toBe("send-rejected");
+    expect(bubble("unknown").key).toBe("unconfirmed");
   });
 });
 

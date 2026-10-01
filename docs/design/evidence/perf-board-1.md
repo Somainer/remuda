@@ -239,6 +239,63 @@ r2 改动后生产包复测（同一 `vite build` + `vite preview` 全新浏览�
 闸门 hub：pwa-shell 1、task-model-board 4、task-model-boardui
 （HUB_E2E_TASK_BIND=1）4 共 9 项全过；mock agent-board 3/3。
 
+## 5.2 第二轮复审跟进（b-perffu r3，逐条回归）
+
+1. **[high] LazyRoute 破坏兄弟路由导航（codex r3）**：r2 的
+   `<LazyRoute>` 是所有路由共用的同一组件类型，且 lazy 只按
+   `[attempt]` 记忆，React 在兄弟路由间复用同一实例——
+   `/hosts→/hosts/:id`、`/hosts→/fleet`、`/sessions→/board`、
+   `/m→/m/inbox` 改了 URL 仍渲染旧页面，失败页也残留。修复：
+   `createLazyRoute()` 在模块级为每个页面建**独立组件类型**
+   （`app/lazyRoutes.ts`，router 与 Shell 共用、避免循环依赖），
+   导航即卸载旧页；重试仍按 attempt 新建 lazy（真 re-import）并 key
+   重挂 boundary。路由级 MemoryRouter 回归：两个成功兄弟路由各自渲染
+   （双向）、/hosts 列表↔详情、失败路由导航到有效路由后失败面板卸载。
+2. **[medium] 收件箱相对时间冻结**：`inboxClock` 原来只在 store
+   通知或已知 deadline 到期时推进，无 deadline 时不排任何定时器。
+   新增**独立显示滴答**（订阅者生命周期内 15 s；15 s 细于 45 s
+   刚刚→1m 边界，不会漏跨越）；deadline 失效逻辑、等数据抑制原样
+   保留。假定时器回归：无 sync、无 deadline、零 store 通知下时钟仍
+   过 45 s，退订后停表；deadline 仍在 5 s 先触发。
+3. **[low] 离线主机不进入过期分组**：`isStaleOffline` 只在渲染时算，
+   安静 hosts 轮询又不 emit。新增 `useStaleCutoffTick`：只对未过期的
+   离线主机，在最近的 `lastSeenAt + 30min` 排一个定时器，跨点后
+   重渲染分组；在线/连接中/ssh/已过期/从未心跳均不排；相等引用的
+   轮询保留定时器。假定时器回归覆盖 30 min 跨越、最近截止、无需定时
+   器、相等数据下定时器存活。
+4. **[medium] onPrepend 真实路径测试**：r2 的回放用例走的是
+   ctx.receive 实时批，没经过 load-earlier。新用例：follow 种子
+   floor=seq5，`hubStore.loadEarlier()` 经 JournalClient 拉旧页 →
+   `onPrepend`（旧 launch 不回退 effective，queued 保留），随后
+   identical effective 的 refresh() 清空 pending。
+
+### r3 后复测数字（2026-10-01，同机/同命令）
+
+- 场景 E：**0 long task、0/min、TBT 0**（同 r2）；80 卡初始挂载
+  23.5 ms（峰值 1.1 ms）；变化单波 BoardRail 4.8 ms、BoardColumns
+  3.6 ms；安静 tick 卡片提交 0、变化卡恰好 1。
+- 安静 7 s 窗口的子树提交：`{"commit:Shell": 1}`——新增的 15 s 收件箱
+  显示时钟在窗口内恰好走了一格，Shell 因角标队列重算提交一次，
+  **BoardPage/BoardRail/BoardColumns/BoardCard 均为 0**（Outlet 子页面
+  不随 Shell 重渲）。这是修复「时间冻结」的预期代价（全站每 15 s 一次
+  纯 Shell 轻量提交，无任何 >50 ms 任务）；deadline 定向失效与相等
+  数据抑制不变。
+- 同步区域仍亚毫秒：store.pollMerge 0.5 ms、store.pollHydrate 0.1 ms、
+  board.buildModel 1.0 ms（2 次）。
+- 生产包冷导航（r3，317.6 kB index）：/sessions、/board、/login
+  **全部 0 long task**，loadEventEnd 45/40/42 ms。（首次跑 /board 曾
+  出现单次 55 ms，复测三条路由均 0，判定为一次性调度噪声；当次场景 E
+  是端口占用导致的 harness 启动失败，非产品问题，加了启动前端口清理
+  后通过。）
+
+复审后本地：typecheck/lint 通过（无新增 error；warning 仅多一条同
+类 only-export-components）；`pnpm --dir web test` 191 文件 /
+2122 用例。闸门 hub（gate-e2e.lock 内）：pwa-shell 1、
+task-model-board 4、task-model-boardui 4、m-inbox 7、m-shell 4、
+m-ghostbadge 1、m-push 3、uo3-evidence 5 共 29 项 + uo13-evidence
+（REMUDA_EVIDENCE=1，覆盖 /hosts、主机详情、/fleet、/projects 导航）
+8 项全过；mock agent-board 3/3；perf 场景 E 与生产冷导航复测见下。
+
 ## 6 刻意不做
 
 - 不动轮询间隔、协议、Hub；不加任何 gated e2e 的毫秒阈值。

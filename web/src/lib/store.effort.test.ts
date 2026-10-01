@@ -398,12 +398,14 @@ it("an identical poll still settles queued effort left by a historical onPrepend
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
 });
 
-it("loadEarlier onPrepend replay leaves queued effort that an identical poll then settles (c-perffu r3-4)", async () => {
-  // Drives the REAL path: REST seed floor above the old events ->
-  // hubStore.loadEarlier() -> journal older page -> onPrepend (not a live
-  // ctx.receive batch, which bypassed prepend in the r2 test).
+it("loadEarlier onPrepend replay leaves queued effort that an identical poll then settles (c-perffu r4-2)", async () => {
+  // Drives the REAL path and ONLY that path: the follow seed carries just
+  // the latest effective observation (floor seq 5); the queued configure
+  // lifecycle exists ONLY in the older load-earlier page. The earlier r3
+  // version of this test put the queued row in the seed, so it passed with
+  // onPrepend's effort replay deleted.
   const id = "ins_effort_prepend";
-  const journalId = `obj_effort_prepend`;
+  const journalId = "obj_effort_prepend";
   const instance: Instance = {
     ...mockDb.instances[0],
     id,
@@ -423,23 +425,24 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   });
 
   const seedEvents = [
-    // Ascending tail window with floor seq 5: the read-back already shows the
-    // newer remuda level...
+    // The bounded tail window: only the newer remuda read-back. No queued row.
     { ...effortEvent(5, "xhigh", false, "remuda") },
-    // ...and the configure row journaled AFTER it re-queued our push-down.
-    configureLifecycle(6, "effort-queued:max", id),
   ];
   const olderEvents = [
-    // Load-earlier page: the older launch level; monotonic guard must keep
-    // the newer effective, and this path (onPrepend) still replays the queue.
+    // The older launch level (monotonic guard must not roll effective back)…
     { ...effortEvent(1, "high", null, "launch") },
+    // …and the historical queued configure row, journaled after it. This is
+    // the ONLY source of the queued state in this test.
+    configureLifecycle(4, "effort-queued:max", id),
   ];
+  const olderRequests: unknown[] = [];
 
   vi.spyOn(api, "eventsRead").mockImplementation(async (args) => {
     if (args && "beforeSeq" in args && args.beforeSeq !== undefined) {
+      olderRequests.push(args);
       return {
         events: olderEvents,
-        durableSeq: "6",
+        durableSeq: "5",
         windowFromSeq: "1",
         reachedAfterSeq: true,
         getReadyState: () => 1,
@@ -447,7 +450,8 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
     }
     return {
       events: seedEvents,
-      durableSeq: "6",
+      durableSeq: "5",
+      // Loaded floor is seq 5, strictly above the older rows.
       windowFromSeq: "5",
       reachedAfterSeq: true,
       getReadyState: () => 1,
@@ -455,15 +459,20 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   });
 
   await hubStore.follow(id);
-  expect(hubStore.effortEffectiveOf(id)?.name).toBe("xhigh");
   expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
-  expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
+  // The queued lifecycle has not been replayed yet.
+  expect(hubStore.effortPendingOf(id)).toBeNull();
 
-  // Real load-earlier: older page arrives via journal onPrepend.
+  // Real load-earlier: floor 5 -> beforeSeq must be "4".
   const floor = await hubStore.loadEarlier(id);
   expect(floor).toBe("1");
-  // The older launch edge never rolls effective back; pending is still queued.
+  expect(olderRequests).toHaveLength(1);
+  expect((olderRequests[0] as { beforeSeq?: string }).beforeSeq).toBe("4");
+
+  // The older launch edge never rolls effective back; the replayed queued
+  // lifecycle now marks the push-down as queued via onPrepend.
   expect(hubStore.effortEffectiveOf(id)?.name).toBe("xhigh");
+  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
   expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
 
   // An IDENTICAL durable projection then settles the queued push-down.

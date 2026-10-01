@@ -141,7 +141,37 @@ it("a superseded mount's late success never certifies the still-pending mount li
   hubStore.logout();
 });
 
-it("a superseded mount's late failure never takes the newly bound session offline", async () => {
+it("a superseded mount's failure while the new mount is still pending leaves it recovering", async () => {
+  // c-reconnfu round 3 item 7: the old ordering finished B BEFORE rejecting
+  // A, so the gen guard never had to protect a still-pending B. The honest
+  // race is: A fails WHILE B's seed is still in flight — B must stay
+  // recovering (A's failure is dropped), and only B's own later completion
+  // drives the machine to live.
+  const { hubStore, seeds, waitSubscribed } = await setup();
+
+  const mountA = hubStore.follow(INSTANCE_A);
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("recovering"));
+  const mountB = hubStore.follow(INSTANCE_B);
+  expect(hubStore.connectionState).toBe("recovering");
+
+  // A fails while B is STILL pending: B must not be taken offline — it stays
+  // recovering under its own attempt.
+  seeds(JOURNAL_A).reject(new Error("JOURNAL_A_SEED_FAILED"));
+  await expect(mountA).rejects.toThrow("JOURNAL_A_SEED_FAILED");
+  expect(hubStore.connectionState).toBe("recovering");
+  // A never opened a socket (its seed rejected first); B's is still pending.
+  expect(hubStore.connectionState).not.toBe("offline");
+
+  // Only B's own outcome drives the machine: B completes and certifies live.
+  seeds(JOURNAL_B).resolve(seedPage);
+  await waitSubscribed(JOURNAL_B);
+  await mountB;
+  expect(hubStore.connectionState).toBe("live");
+
+  hubStore.logout();
+});
+
+it("a superseded mount's late failure after B is already live never takes it offline", async () => {
   const { hubStore, seeds, waitSubscribed } = await setup();
 
   const mountA = hubStore.follow(INSTANCE_A);

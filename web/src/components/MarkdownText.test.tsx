@@ -308,6 +308,98 @@ describe("math rendering (c-math round 3)", () => {
     expect((await screen.findAllByTestId("code-block")).length).toBeGreaterThan(0);
   });
 
+  it("renders math nested inside bold, emphasis and a link (c-mathfu r3.1)", async () => {
+    // The inline wrapper's nearest BLOCK (the paragraph) must provide the
+    // available width; here we just assert these nests render KaTeX at all
+    // and keep their surrounding inline structure.
+    const { container } = render(
+      <MarkdownText text={"**$x^2$** and *$y_1$* and [$z$](https://example.org)"} />,
+    );
+    const inlines = await screen.findAllByTestId("math-inline");
+    expect(inlines).toHaveLength(3);
+    for (const node of inlines) expect(node.querySelector(".katex")).toBeTruthy();
+    expect(container.querySelector("strong")?.querySelector('[data-testid="math-inline"]')).toBeTruthy();
+    expect(container.querySelector("em")?.querySelector('[data-testid="math-inline"]')).toBeTruthy();
+    expect(container.querySelector("a")?.querySelector('[data-testid="math-inline"]')).toBeTruthy();
+  });
+
+  it("bold-wrapped math promotes then demotes on a real paragraph resize (c-mathfu r4)", async () => {
+    // A ResizeObserver that delivers per-target entries (an entry for an
+    // unobserved element is a no-op), so the paragraph-only event below is
+    // a genuine container resize, not a shared callback.
+    const instances: { trigger: (t?: Element) => void; observed: Element[] }[] = [];
+    class ROMock {
+      private cb: ResizeObserverCallback;
+      readonly observed: Element[] = [];
+      constructor(cb: ResizeObserverCallback) {
+        this.cb = cb;
+      }
+      observe(t: Element): void {
+        if (!this.observed.includes(t)) this.observed.push(t);
+      }
+      unobserve(t: Element): void {
+        const i = this.observed.indexOf(t);
+        if (i >= 0) this.observed.splice(i, 1);
+      }
+      disconnect(): void {
+        this.observed.splice(0);
+      }
+      trigger(t?: Element): void {
+        if (t && !this.observed.includes(t)) return;
+        const targets = t ? [t] : [...this.observed];
+        this.cb(
+          targets.map((target) => ({ target })) as ResizeObserverEntry[],
+          this as unknown as ResizeObserver,
+        );
+      }
+    }
+    vi.stubGlobal(
+      "ResizeObserver",
+      class extends ROMock {
+        constructor(cb: ResizeObserverCallback) {
+          super(cb);
+          instances.push(this);
+        }
+      },
+    );
+    try {
+      const { container } = render(<MarkdownText text={"**$x_{1}+x_{2}+x_{3}+x_{4}$**"} />);
+      const inline = await screen.findByTestId("math-inline");
+      expect(inline.closest("strong")).toBeTruthy(); // really bold-wrapped
+      const para = container.querySelector("p")!;
+      const ro = instances[instances.length - 1]!;
+      // The paragraph (nearest block past <strong>) is observed, not the
+      // zero-width bold ancestor.
+      expect(ro.observed).toContain(para);
+      expect(ro.observed).not.toContain(inline.parentElement!);
+
+      const install = (g: { sw: number; nw: number; cw: number; bw: number }): void => {
+        Object.defineProperty(inline, "scrollWidth", { configurable: true, get: () => g.sw });
+        Object.defineProperty(inline, "clientWidth", { configurable: true, get: () => g.cw });
+        const katexEl = inline.querySelector(".katex")!;
+        katexEl.getBoundingClientRect = () =>
+          ({ width: g.nw, x: 0, y: 0, top: 0, left: 0, right: g.nw, bottom: 0, height: 0, toJSON() {} }) as DOMRect;
+        Object.defineProperty(para, "clientWidth", { configurable: true, get: () => g.bw });
+      };
+
+      // Narrow 180px paragraph: the 900px formula promotes.
+      act(() => {
+        install({ sw: 900, nw: 900, cw: 180, bw: 180 });
+        ro.trigger(inline);
+      });
+      expect(inline.className).toMatch(/inlineScroll/);
+      // Paragraph widens to 1000 while the intrinsic formula is unchanged;
+      // the entry is the PARAGRAPH's alone — it demotes.
+      act(() => {
+        install({ sw: 900, nw: 900, cw: 900, bw: 1000 });
+        ro.trigger(para);
+      });
+      expect(inline.className).not.toMatch(/inlineScroll/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("renders an unclosed display tail as an exact-source React text node (G)", async () => {
     const { rerender } = render(<MarkdownText text={"intro \\[a *b* + \\{c\\}"} />);
     await new Promise((r) => setTimeout(r, 0));
@@ -321,6 +413,45 @@ describe("math rendering (c-math round 3)", () => {
     expect(screen.queryByTestId("math-display")).toBeNull();
     const lit2 = await screen.findByTestId("math-literal");
     expect(lit2.textContent).toBe("$$\n\\sigma(z)");
+  });
+
+  it("renders a rejected \\[ opener as fully inert text, never a link/image (c-mathfu r2.1)", async () => {
+    // `\[` + link syntax across a blank line: the opener is rejected (no
+    // closer in its paragraph) and BOTH delimiter chars are escaped, so the
+    // bracket cannot open an inline link/reference/image; later bold renders.
+    const { container } = render(
+      <MarkdownText text={"\\[label](/docs/page)\n\n**bold**"} />,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector("p")!.textContent).toBe("\\[label](/docs/page)");
+    expect(container.querySelector("strong")!.textContent).toBe("bold");
+    expect(screen.queryByTestId("math-literal")).toBeNull();
+
+    // The reviewer's https fixture: the bracket link must not form. The bare
+    // URL may still get GFM's GENERIC autolink (as in any message), but no
+    // anchor may carry the link text, and visible text is exact.
+    const https = render(
+      <MarkdownText text={"\\[label](https://example.org)\n\n**bold**"} />,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect(https.container.textContent).toContain("\\[label](https://example.org)");
+    expect([...https.container.querySelectorAll("a")].some((a) => a.textContent === "label")).toBe(
+      false,
+    );
+    https.unmount();
+
+    // Reference-style opener and image opener are inert too.
+    const ref = render(<MarkdownText text={"\\[label][ref]\n\n**bold2**"} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ref.container.querySelector("a")).toBeNull();
+    ref.unmount();
+    const img = render(<MarkdownText text={"!\\[alt](https://example.org/x.png)\n\nx"} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(img.container.querySelector("img")).toBeNull();
+    expect([...img.container.querySelectorAll("a")].some((a) => a.textContent === "alt")).toBe(
+      false,
+    );
   });
 
   it("kills only the broken $$ opener, then later $$ and $ render (E)", async () => {

@@ -19,10 +19,17 @@
  *  - Every unescaped `$` that is not a delimiter of an ACCEPTED pair is
  *    emitted as `\$`, so remark-math can never pair differently from this
  *    scanner.
- *  - A genuinely unclosed DISPLAY opener (a trailing `$$` run with no later
- *    run, or an unclosed `\[`) is returned as `literalTail`, which
- *    MarkdownText renders as a plain React text node — exact source, never
- *    fed back through markdown.
+ *  - A genuinely unclosed DISPLAY opener whose closer search reaches the END
+ *    of the source (a trailing `$$` run with no later run, or an unclosed
+ *    `\[` with nothing after its paragraph) is returned as `literalTail`,
+ *    which MarkdownText renders as a plain React text node — exact source,
+ *    never fed back through markdown. That is the streaming case: a closer
+ *    may still arrive with the next append, so the half-formula must not be
+ *    half-parsed. A `\[` rejected earlier — its paragraph ends on a blank
+ *    line or is interrupted by a fenced block BEFORE EOF — is not a
+ *    streaming half-formula: only the two-char opener is emitted literal
+ *    (`\\[`, rendered exactly as `\[`) and the scan keeps rendering after
+ *    it, so later paragraphs/lists/code never lose markdown.
  *
  * Single-$ acceptance follows pandoc's mathInline grammar: the FIRST later
  * unescaped `$` within the same paragraph decides — accepted only when it is
@@ -105,11 +112,17 @@ function paragraphOfFn(s: string): (i: number) => number {
   };
 }
 
+interface UnclosedDisplay {
+  index: number;
+  /** True when the closer search ran to EOF (the streaming tail case). */
+  eof: boolean;
+}
+
 interface Collected {
   singles: Single[];
   runs: Run[];
   brackets: Bracket[];
-  unclosedDisplay: number;
+  unclosed: UnclosedDisplay[];
 }
 
 /** Single forward walk outside code. */
@@ -118,7 +131,7 @@ function collect(s: string, code: Uint8Array, blocks: OffsetRange[]): Collected 
   const singles: Single[] = [];
   const runs: Run[] = [];
   const brackets: Bracket[] = [];
-  let unclosedDisplay = -1;
+  const unclosed: UnclosedDisplay[] = [];
   let line = 0;
   let parenScan = 0;
   let bracketScan = 0;
@@ -178,7 +191,10 @@ function collect(s: string, code: Uint8Array, blocks: OffsetRange[]): Collected 
       // an unclosed `\(`/`\[` never rescans the tail (design B).
       if (display) bracketScan = limit;
       else parenScan = limit;
-      if (display && unclosedDisplay === -1) unclosedDisplay = i;
+      // EOF-reaching failure = streaming half-formula (literal tail). A
+      // failure capped by a blank line / fenced block = rejected opener:
+      // only `\[` goes literal, rendering resumes after it.
+      if (display) unclosed.push({ index: i, eof: limit === n });
       continue;
     }
 
@@ -195,7 +211,7 @@ function collect(s: string, code: Uint8Array, blocks: OffsetRange[]): Collected 
       }
     }
   }
-  return { singles, runs, brackets, unclosedDisplay };
+  return { singles, runs, brackets, unclosed };
 }
 
 /**
@@ -252,7 +268,7 @@ export function prepareMath(input: string): PreparedMath {
   const ranges = codeRanges(input);
   const code = codeMask(input, ranges);
   const blocks = ranges.filter((range) => range.block);
-  const { singles, runs, brackets, unclosedDisplay } = collect(input, code, blocks);
+  const { singles, runs, brackets, unclosed } = collect(input, code, blocks);
   // Paragraph ids are only needed for single-$ pairing; skip the extra pass on
   // messages without one.
   if (singles.length > 0) {
@@ -266,9 +282,23 @@ export function prepareMath(input: string): PreparedMath {
   for (const b of brackets) bracketByFrom.set(b.from, b);
   const runAt = new Map<number, Run>();
   for (const r of runs) runAt.set(r.index, r);
+  // Openers whose range ends before EOF (blank line / fenced block) are merely
+  // rejected: render the two delimiter chars literal and continue with the
+  // rest of the message.
+  const rejectedDisplayAt = new Set<number>();
+  let eofDisplay = -1;
+  for (const u of unclosed) {
+    if (u.eof) {
+      if (eofDisplay === -1 || u.index < eofDisplay) eofDisplay = u.index;
+    } else {
+      rejectedDisplayAt.add(u.index);
+    }
+  }
 
+  // Only an opener whose closer search reaches EOF starts the streaming
+  // literal tail (alongside a final unpaired `$$` run).
   const tailStart =
-    runTail === -1 ? unclosedDisplay : Math.min(runTail, unclosedDisplay === -1 ? runTail : unclosedDisplay);
+    runTail === -1 ? eofDisplay : Math.min(runTail, eofDisplay === -1 ? runTail : eofDisplay);
   const limit = tailStart === -1 ? input.length : tailStart;
 
   // Fast path: no accepted math, no code/HTML, no tail — the only edit is
@@ -277,6 +307,7 @@ export function prepareMath(input: string): PreparedMath {
   // line). Backslash escapes (incl. `\$`) are consumed verbatim.
   if (
     brackets.length === 0 &&
+    rejectedDisplayAt.size === 0 &&
     acceptedSingles.size === 0 &&
     acceptedRuns.size === 0 &&
     ranges.length === 0 &&
@@ -312,6 +343,18 @@ export function prepareMath(input: string): PreparedMath {
       const body = token(input.slice(bracket.bodyFrom, bracket.bodyTo));
       segments.push(bracket.display ? `$$${body}$$` : `$${body}$`);
       i = bracket.to;
+      segStart = i;
+      continue;
+    }
+    if (rejectedDisplayAt.has(i)) {
+      // Keep the rejected opener as EXACT visible source and fully inert:
+      // `\\` renders a literal backslash and `\[` a literal bracket. Both
+      // must be escaped — escaping only the backslash leaves a live `[`,
+      // which turns `\[label](url)` into a real link. Rendering resumes on
+      // the next char.
+      flushVerbatim(i);
+      segments.push("\\\\\\[");
+      i += 2;
       segStart = i;
       continue;
     }

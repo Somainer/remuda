@@ -1458,7 +1458,10 @@ class HubStore {
     const now = Date.now();
     const durable = await box.refreshDurable().catch(() => null);
     if (!durable || this.pageIsUnloading) return;
-    this.scheduleLeaseExpiryWakeup(durable, now, box.ownerId);
+    // The prompt may have sat open PAST the foreign lease deadline: include
+    // overdue leases so an immediate guarded wakeup delivers the stealable
+    // row (the normal flush path skips them — it delivers them itself).
+    this.scheduleLeaseExpiryWakeup(durable, now, box.ownerId, true);
   }
 
   get outboxUnavailable(): boolean {
@@ -3376,15 +3379,29 @@ class HubStore {
   /**
    * Arm one wakeup per instance at the earliest FOREIGN in-flight lease
    * expiry. Rows with no live foreign lease need nothing (they are
-   * deliverable now or owned by this tab). An already-armed wakeup is moved
-   * EARLIER when a freshly seen foreign lease expires sooner (a second tab's
-   * newer in-flight row can carry a shorter lease); it is never pushed out.
+   * deliverable now or owned by this tab). An already-OVERDUE foreign lease
+   * is skipped on the normal flush path (that same flush pass is about to
+   * deliver the stealable row; arming an immediate timer would race the
+   * delivery and chain further immediate flushes on a "held" answer). The
+   * read-only cancelled-beforeunload re-arm passes includeOverdue: the
+   * prompt can sit open past the deadline, and without an immediate arm the
+   * stealable row would stay stranded. The immediate delivery is guarded
+   * (a real pagehide clears the timer; flush checks the unload flag).
+   * An already-armed wakeup is moved EARLIER when a freshly seen foreign
+   * lease expires sooner (a second tab's newer in-flight row can carry a
+   * shorter lease); it is never pushed out.
    */
-  private scheduleLeaseExpiryWakeup(durable: OutboxRecord[], now: number, owner: Id) {
+  private scheduleLeaseExpiryWakeup(
+    durable: OutboxRecord[],
+    now: number,
+    owner: Id,
+    includeOverdue = false,
+  ) {
     const earliest = new Map<Id, number>();
     for (const r of durable) {
       if (r.state !== "inflight" || !r.lease) continue;
-      if (r.lease.owner === owner || r.lease.until <= now) continue;
+      if (r.lease.owner === owner) continue;
+      if (!includeOverdue && r.lease.until <= now) continue;
       const prev = earliest.get(r.instanceId);
       if (prev === undefined || r.lease.until < prev) earliest.set(r.instanceId, r.lease.until);
     }

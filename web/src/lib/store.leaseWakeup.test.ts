@@ -16,8 +16,11 @@ async function fresh(): Promise<{ api: Api; hubStore: Store }> {
 type Internal = {
   ensureOutbox: () => Promise<boolean>;
   flushAllOutbox: () => Promise<void>;
+  rearmLeaseWakeups: () => Promise<void>;
   leaseWakeupTimer: Map<string, unknown>;
   leaseWakeupUntil: Map<string, number>;
+  unloadClearTimer: ReturnType<typeof setTimeout> | null;
+  pageIsUnloading: boolean;
   outbox: { ownerId: string };
 };
 
@@ -197,6 +200,102 @@ it("an armed lease wakeup is moved earlier when a sooner foreign lease appears",
     expect(vi.mocked(api.instanceSend)).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(vi.mocked(api.instanceSend)).toHaveBeenCalledTimes(1);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+/**
+ * Block the beforeunload self-reset like a native dialog does and sit past the
+ * 10 s foreign-lease deadline with the page still "unloading". Returns the
+ * armed test handles at the overdue moment; the caller plays the user's
+ * decision (cancel → self-reset, or a real pagehide).
+ */
+async function overduePromptBlocked(): Promise<{
+  api: Api;
+  hubStore: Store;
+  internal: Internal;
+  send: ReturnType<typeof vi.fn>;
+}> {
+  const { api, hubStore } = await fresh();
+  await boot(api, hubStore);
+  const internal = internalOf(hubStore);
+  const send = vi.spyOn(api, "instanceSend").mockResolvedValue({
+    relatedCommandIds: [],
+    command: {
+      commandId: "cmd_foreign_inflight",
+      id: "cmd_foreign_inflight",
+      state: "queued",
+      dispatch: "not-dispatched",
+      resolution: "clear",
+    } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
+  });
+
+  writeRows(foreignInflightRow(Date.now() + 10_000));
+  await internal.flushAllOutbox();
+  expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+
+  // beforeunload disarms the wakeup and queues the self-reset; hold the reset
+  // out of the fake queue (the native dialog blocks the event loop).
+  window.dispatchEvent(new Event("beforeunload"));
+  const blockedReset = internal.unloadClearTimer;
+  expect(blockedReset).toBeTruthy();
+  clearTimeout(blockedReset!);
+  internal.unloadClearTimer = null;
+  expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
+
+  // The prompt stays open PAST the lease deadline: nothing armed, no delivery.
+  await vi.advanceTimersByTimeAsync(10_001);
+  expect(send).not.toHaveBeenCalled();
+  expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
+  expect(hubStore.pageIsUnloadingForTest).toBe(true);
+  return { api, hubStore, internal, send };
+}
+
+it("a cancelled prompt with an ALREADY-EXPIRED foreign lease schedules an immediate guarded delivery", async () => {
+  // c-reconnfu round 3 item 4: the scheduler filtered expired leases out of
+  // the cancelled-prompt re-arm, so a lease that went overdue while the
+  // beforeunload prompt was open stranded its stealable row forever. The
+  // read-only re-arm now includes overdue leases as immediate wakeups.
+  vi.useFakeTimers();
+  try {
+    const { hubStore, internal, send } = await overduePromptBlocked();
+
+    // The user CANCELS: the self-reset body runs (the setTimeout(0) task the
+    // dialog held), clears the flag and re-arms read-only. The overdue lease
+    // arms an IMMEDIATE wakeup — the old filter armed nothing.
+    internal.pageIsUnloading = false;
+    await internal.rearmLeaseWakeups();
+    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+
+    // The immediate wakeup delivers the stealable row once.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("a real pagehide after the overdue re-arm cancels the immediate delivery", async () => {
+  // The overdue wakeup must stay guarded: if the navigation actually
+  // proceeds (the prompt allowed it) the immediate timer is disarmed with
+  // every other timer and must never POST into teardown.
+  vi.useFakeTimers();
+  try {
+    const { hubStore, internal, send } = await overduePromptBlocked();
+
+    internal.pageIsUnloading = false;
+    await internal.rearmLeaseWakeups();
+    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+
+    window.dispatchEvent(new Event("pagehide"));
+    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(send).not.toHaveBeenCalled();
 
     hubStore.logout();
   } finally {

@@ -1430,18 +1430,23 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    // c-reconnfu round 2 item 5: `__hold_journal__:<ms>`
-                    // answers the POST FIRST (the Hub commits/accepts the
-                    // command and the client labels the row delivered) but
-                    // holds back the mirrored journal user observation that
-                    // replaces the optimistic bubble, so the e2e can assert
-                    // the accepted label on the still-visible chip before the
-                    // transcript row takes over.
+                    // c-reconnfu round 2 item 5 / round 3 item 5:
+                    // `__hold_journal__:<ms>` answers the POST FIRST with a
+                    // DURABLE acceptance (accepted:true — http.rs node_accepted
+                    // then marks the command state=accepted/resolution=clear, so
+                    // the client outbox row settles to "sent" and the chip reads
+                    // 已受理) but holds back the mirrored journal user
+                    // observation that replaces the optimistic bubble, so the
+                    // e2e can assert the distinct accepted/delivered label on
+                    // the still-visible chip before the transcript row takes
+                    // over. A bare {ok:true} is NOT a durable accept: the Hub
+                    // leaves the row queued/reconciling and the label stays
+                    // 已发送，等待确认， which cannot prove acceptance.
                     if let Some(ms) = prompt
                         .strip_prefix("__hold_journal__:")
                         .and_then(|s| s.parse::<u64>().ok())
                     {
-                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        send_rpc_ok(&mut ws, id, json!({ "accepted": true })).await?;
                         tokio::time::sleep(Duration::from_millis(ms)).await;
                         append_n = append_command_user(
                             &mut ws,

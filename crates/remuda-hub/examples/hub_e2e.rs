@@ -879,7 +879,12 @@ async fn fake_node(
             // c-reconnfu round 5: a __gate_journal__ append whose release
             // gate the spec just opened. Runs on the read loop (single
             // writer) after the parked poller task observed the gate file.
+            // c-reconnfu round 6: once the append has been journaled it
+            // writes the per-command ACK file the spec's teardown waits
+            // on, so no fixed sleep decides whether the parked append
+            // landed before instance deletion.
             Some((gate_instance, gate_command, gate_prompt)) = journal_gate_rx.recv() => {
+                let gate_cid = gate_command.clone().unwrap_or_default();
                 append_n = append_command_user(
                     &mut ws,
                     &gate_instance,
@@ -898,6 +903,13 @@ async fn fake_node(
                 .await?;
                 append_n =
                     append_native_status(&mut ws, &gate_instance, append_n, "idle").await?;
+                // Every append drained its ack frame, so the Hub has the
+                // user observation; tell the spec it is safe to delete.
+                let ack = std::env::temp_dir().join(format!(
+                    "remuda-e2e-journal-ack-{}-{gate_cid}",
+                    addr.port()
+                ));
+                let _ = std::fs::write(&ack, "journaled\n");
             }
             Some((closed_instance, closed_iid, terminal_answers)) = close_rx.recv() => {
                 let Some(card) = pending.lock().await.remove(&closed_iid) else {
@@ -1461,23 +1473,34 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    // c-reconnfu round 4 item 2 / round 5 item 1:
+                    // c-reconnfu round 4 item 2 / round 5 item 1 / round 6:
                     // `__gate_journal__` answers the POST with a durable
                     // acceptance IMMEDIATELY and parks the mirrored journal
-                    // appends OFF this read loop: a spawned task polls the
-                    // spec-controlled release file
+                    // appends OFF this read loop: a spawned task polls
+                    // the spec-controlled release file
                     // (std::env::temp_dir() /
                     // remuda-e2e-journal-release-<hub port>-<commandId>)
-                    // without touching the socket, and only on release sends
-                    // the append work back via journal_gate_tx (single
-                    // writer). A failed assertion before the spec releases
-                    // therefore cannot block instance.close/purge or later
-                    // specs' RPCs; on the 60 s timeout nothing is appended.
+                    // without touching the socket, and only on release
+                    // sends the append work back via journal_gate_tx
+                    // (single writer), which journals the frames and writes
+                    // an ACK file (...-ack-...). A cancel file
+                    // (...-cancel-...) ACKs WITHOUT appending. This gives
+                    // teardown a bounded, provably-correct handshake —
+                    // no fixed sleep can lose the release, and a failed
+                    // assertion before release never blocks
+                    // instance.close/purge or later specs' RPCs. On the
+                    // 60 s fixture timeout with neither file, the poller
+                    // stops and writes nothing (the spec fails loudly).
                     if prompt == "__gate_journal__" {
                         send_rpc_ok(&mut ws, id, json!({ "accepted": true })).await?;
                         if let Some(cid) = command_id {
-                            let gate = std::env::temp_dir()
+                            let tmp = std::env::temp_dir();
+                            let gate = tmp
                                 .join(format!("remuda-e2e-journal-release-{}-{cid}", addr.port()));
+                            let cancel = tmp
+                                .join(format!("remuda-e2e-journal-cancel-{}-{cid}", addr.port()));
+                            let ack =
+                                tmp.join(format!("remuda-e2e-journal-ack-{}-{cid}", addr.port()));
                             let gate_tx = journal_gate_tx.clone();
                             let gate_instance = instance_id.clone();
                             let gate_prompt = prompt.to_string();
@@ -1486,18 +1509,38 @@ async fn fake_node(
                                 let step = Duration::from_millis(100);
                                 let max = Duration::from_secs(60);
                                 let mut waited = Duration::ZERO;
-                                while !gate.exists() && waited < max {
+                                // None = fixture timeout (write nothing;
+                                // the spec fails loudly), Some(true) =
+                                // released (journal it), Some(false) =
+                                // cancelled (ACK without append).
+                                let mut decision: Option<bool> = None;
+                                while waited < max {
+                                    if cancel.exists() {
+                                        let _ = std::fs::remove_file(&cancel);
+                                        decision = Some(false);
+                                        break;
+                                    }
+                                    if gate.exists() {
+                                        let _ = std::fs::remove_file(&gate);
+                                        decision = Some(true);
+                                        break;
+                                    }
                                     tokio::time::sleep(step).await;
                                     waited += step;
                                 }
-                                // Timeout: leave no journal append behind.
-                                if !gate.exists() {
-                                    return;
+                                match decision {
+                                    Some(true) => {
+                                        // The read loop appends and
+                                        // writes the ACK itself.
+                                        let _ = gate_tx
+                                            .send((gate_instance, Some(gate_cid), gate_prompt))
+                                            .await;
+                                    }
+                                    Some(false) => {
+                                        let _ = std::fs::write(&ack, "cancelled\n");
+                                    }
+                                    None => {}
                                 }
-                                let _ = std::fs::remove_file(&gate);
-                                let _ = gate_tx
-                                    .send((gate_instance, Some(gate_cid), gate_prompt))
-                                    .await;
                             });
                         }
                         continue;

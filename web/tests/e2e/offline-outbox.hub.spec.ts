@@ -27,63 +27,114 @@ test.describe.configure({ mode: "serial" });
 const created: string[] = [];
 
 /**
- * Test-controlled journal release (c-reconnfu round 4 item 2, hardened
- * round 5 items 1–2): the fake node's `__gate_journal__` fixture
- * accepts the POST immediately but parks its mirrored journal observation
- * OFF the node RPC loop until this gate file appears — replacing the
- * autonomous 8 s sleep of `__hold_journal__` with a deterministic
- * trigger the spec owns. File name is hub-port + commandId scoped so
- * specs on parallel hubs never cross.
+ * Test-controlled journal release (c-reconnfu rounds 4–6): the fake
+ * node's `__gate_journal__` fixture accepts the POST immediately but
+ * parks its mirrored journal observation OFF the node RPC loop until
+ * the spec creates the release file — replacing the autonomous 8 s
+ * sleep of `__hold_journal__` with a deterministic handshake.
+ *
+ * Handshake (files in os.tmpdir(), scoped by hub port + commandId
+ * so parallel hubs never cross):
+ *   ...-release-<port>-<cid>  spec writes → node appends, then writes
+ *   ...-cancel-<port>-<cid>   spec writes → node ACKs without appending
+ *   ...-ack-<port>-<cid>      node writes once the parked append is
+ *                              journaled ("journaled") or the gate is
+ *                              cancelled ("cancelled").
+ * Registration is kept until the node ACKs, so a failure immediately
+ * after release still has a provable teardown — no fixed sleeps.
  *
  * The port is derived from the SAME effective Hub URL
  * playwright.hub.config.ts resolves (VITE_HUB_URL wins, then
- * HUB_E2E_LISTEN, then the 58880 default): reading HUB_E2E_LISTEN
- * alone would name the wrong file when VITE_HUB_URL points elsewhere.
+ * HUB_E2E_LISTEN, then the 58880 default).
  */
 const effectiveHubUrl =
   process.env.VITE_HUB_URL ?? `http://${process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880"}`;
 const hubPort = new URL(effectiveHubUrl).port;
-const journalGatePrefix = `remuda-e2e-journal-release-${hubPort}-`;
+const journalReleasePrefix = `remuda-e2e-journal-release-${hubPort}-`;
+const journalCancelPrefix = `remuda-e2e-journal-cancel-${hubPort}-`;
+const journalAckPrefix = `remuda-e2e-journal-ack-${hubPort}-`;
 
-/** Registered as soon as a gated commandId is known, removed on release. */
+/** Stays registered until the node writes the ACK file. */
 const pendingJournalGates = new Set<string>();
-function journalGatePath(commandId: string): string {
-  return path.join(os.tmpdir(), `${journalGatePrefix}${commandId}`);
+function journalReleasePath(commandId: string): string {
+  return path.join(os.tmpdir(), `${journalReleasePrefix}${commandId}`);
 }
-/** Register the gate immediately after the commandId is minted/observed. */
+function journalCancelPath(commandId: string): string {
+  return path.join(os.tmpdir(), `${journalCancelPrefix}${commandId}`);
+}
+function journalAckPath(commandId: string): string {
+  return path.join(os.tmpdir(), `${journalAckPrefix}${commandId}`);
+}
+/** Register the gate the moment its commandId is known. */
 function registerJournalGate(commandId: string): void {
   pendingJournalGates.add(commandId);
 }
-/** Spec-driven happy-path release; the node consumes and removes the file. */
-async function releaseJournal(commandId: string): Promise<void> {
-  await writeFile(journalGatePath(commandId), "release\n");
-  pendingJournalGates.delete(commandId);
+async function journalGateFileExists(file: string): Promise<boolean> {
+  // access/stat adds an import; readdir is already used by the sweep.
+  const entries = await readdir(os.tmpdir()).catch(() => [] as string[]);
+  return entries.includes(path.basename(file));
 }
 /**
- * Release EVERY gate still pending when the test body ends — including a
- * body that failed an assertion before it could call releaseJournal().
- * Without this the fake node's (off-loop) poller would park the append
- * for up to 60 s and linger into later specs. After writing the release,
- * wait one poll interval with slack so the parked appends land BEFORE
- * the instances are deleted; the sweep then removes every gate file on
- * this hub port (released or not).
+ * Bounded wait for the node's ACK. The node's poller ticks every
+ * 100 ms and the append round-trip is local, so this is generous
+ * without resorting to a blind sleep.
+ */
+async function awaitJournalAck(commandId: string, timeoutMs = 20_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await journalGateFileExists(journalAckPath(commandId))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return journalGateFileExists(journalAckPath(commandId));
+}
+/** Spec-driven happy-path release; registration is kept until ACK. */
+async function releaseJournal(commandId: string): Promise<void> {
+  await writeFile(journalReleasePath(commandId), "release\n");
+}
+/**
+ * Release EVERY gate still registered when the test body ends —
+ * including a body that failed before calling releaseJournal(), or one
+ * that released and failed before the node ACKed. Each gate is
+ * released (if not already), then awaited with a bounded poll on the
+ * node's ACK file: the parked append must land BEFORE instances are
+ * * deleted. On timeout the gate is cancelled and teardown fails
+ * loudly (a swallowed stall would leak a 60 s poller into later
+ * specs). All gate files are swept afterwards.
  */
 async function teardownJournalGates(): Promise<void> {
-  const pending = [...pendingJournalGates];
-  await Promise.all(
-    pending.map((commandId) =>
-      writeFile(journalGatePath(commandId), "teardown-release\n").catch(() => undefined),
-    ),
-  );
-  if (pending.length > 0) await new Promise((resolve) => setTimeout(resolve, 500));
+  const stuck: string[] = [];
+  for (const commandId of pendingJournalGates) {
+    let acked = await journalGateFileExists(journalAckPath(commandId));
+    if (!acked) {
+      // Release unless the node already observed a release (happy path
+      // that crashed before ACK); either way, then wait for ACK.
+      await writeFile(journalReleasePath(commandId), "teardown-release\n").catch(() => undefined);
+      acked = await awaitJournalAck(commandId);
+      if (!acked) {
+        // Tell the poller to ACK without appending so it cannot
+        // linger; still report the stall as a test failure.
+        await writeFile(journalCancelPath(commandId), "teardown-cancel\n").catch(() => undefined);
+        await awaitJournalAck(commandId, 2_000);
+        stuck.push(commandId);
+      }
+    }
+  }
   pendingJournalGates.clear();
   await sweepJournalGateFiles();
+  if (stuck.length > 0) {
+    throw new Error(`journal gate never ACKed by the fake node: ${stuck.join(", ")}`);
+  }
 }
 async function sweepJournalGateFiles(): Promise<void> {
-  const entries = await readdir(os.tmpdir()).catch(() => []);
+  const entries = await readdir(os.tmpdir()).catch(() => [] as string[]);
   await Promise.all(
     entries
-      .filter((entry) => entry.startsWith(journalGatePrefix))
+      .filter(
+        (entry) =>
+          entry.startsWith(journalReleasePrefix) ||
+          entry.startsWith(journalCancelPrefix) ||
+          entry.startsWith(journalAckPrefix),
+      )
       .map((entry) => rm(path.join(os.tmpdir(), entry), { force: true }).catch(() => undefined)),
   );
 }
@@ -567,7 +618,7 @@ test("an online send labels the row 等待发送 then 已发送，等待确认/�
   // Drop any stale gate from a crashed earlier worker, then register
   // THIS commandId the moment it is known so a failure below still
   // releases the gate in afterEach.
-  await rm(journalGatePath(commandId!), { force: true });
+  await rm(journalReleasePath(commandId!), { force: true });
   registerJournalGate(commandId!);
 
   // Queued behind the lock, link live: 等待发送, never the offline wording.
@@ -607,9 +658,12 @@ test("an online send labels the row 等待发送 then 已发送，等待确认/�
     .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 2_000 })
     .toBe(0);
 
-  // Release the journal: the user observation joins exactly once and the
-  // bubble is replaced by the authoritative transcript row.
+  // Release the journal and WAIT FOR THE NODE ACK (append journaled),
+  // then assert the observation joined exactly once and the bubble was
+  // replaced by the authoritative transcript row.
   await releaseJournal(commandId!);
+  expect(await awaitJournalAck(commandId!)).toBe(true);
+  pendingJournalGates.delete(commandId!);
   await expect
     .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
     .toBe(1);
@@ -634,7 +688,7 @@ test("a Hub-accepted send shows its delivered label on the still-visible bubble 
   // Drop any stale gate from a crashed earlier worker, then register
   // THIS commandId the moment it is known: an assertion failing below
   // still releases the gate in afterEach.
-  await rm(journalGatePath(commandId!), { force: true });
+  await rm(journalReleasePath(commandId!), { force: true });
   registerJournalGate(commandId!);
 
   // The POST landed with a CLEAR answer and the Hub committed the command
@@ -662,67 +716,82 @@ test("a Hub-accepted send shows its delivered label on the still-visible bubble 
     .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 2_000 })
     .toBe(0);
 
-  // Only NOW release the journal: the user observation joins exactly once
-  // and the bubble is replaced by the transcript row.
+  // Only NOW release the journal, wait for the node ACK (append
+  // journaled), then assert the observation joined exactly once and
+  // the bubble was replaced by the transcript row.
   await releaseJournal(commandId!);
+  expect(await awaitJournalAck(commandId!)).toBe(true);
+  pendingJournalGates.delete(commandId!);
   await expect
     .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
     .toBe(1);
   await expectDelivered(page, commandId);
 });
 
-test("a parked journal gate never blocks the node RPC loop and teardown releases it", async ({ page }) => {
-  // c-reconnfu round 5 items 1–2 regression. The fake node parks the
-  // __gate_journal__ append OFF its shared RPC read loop, so while A is
-  // parked:
-  //   1. a normal send on a DIFFERENT instance B must still be answered
-  //      and journaled immediately (the parked A must not stall the single
-  //      fake-node read loop / every later RPC), and
-  //   2. ending the test WITHOUT releasing A must not leave A blocked:
-  //      afterEach's teardownJournalGates() creates the release file and
-  //      the parked append lands, so A can be deleted promptly (not after
-  //      the fixture's 60 s poll timeout).
+test("a parked journal gate never blocks the node RPC loop and teardown ACKs a released-but-unacked gate", async ({ page }) => {
+  // c-reconnfu round 5/6 regression. The fake node parks the
+  // __gate_journal__ append OFF its shared RPC read loop and
+  // handshakes with an ACK file once it is journaled, so:
+  //   1. while A is parked, a normal send on a DIFFERENT instance B
+  //      is still answered and journaled immediately (the parked A must
+  //      not stall the single fake-node read loop / later RPCs);
+  //   2. a body that releases A but FAILS IMMEDIATELY (before the node
+  //      ACK lands) still has a provable teardown: registration is
+  //      kept until the node ACKs, teardown awaits it (bounded, no
+  //      fixed sleep), and the append lands before instance deletion.
   const instanceA = await createSession(page, "gate parked A");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
 
-  // A parks its journal (registered on send; deliberately NOT released by
-  // the test body).
+  // A parks its journal; register it and do NOT await anything here.
   await sendMessage(page, "__gate_journal__");
   const bubbleA = page.locator('[data-testid="optimistic-bubble"]').first();
   const commandA = await bubbleA.getAttribute("data-command-id");
   expect(commandA).toBeTruthy();
-  await rm(journalGatePath(commandA!), { force: true });
+  await rm(journalReleasePath(commandA!), { force: true });
+  await rm(journalAckPath(commandA!), { force: true });
   registerJournalGate(commandA!);
   expect(pendingJournalGates.has(commandA!)).toBe(true);
   await expect(bubbleA).toContainText("已受理", { timeout: 15_000 });
 
-  // B is an independent instance; an ordinary send must flow through the
-  // node RPC loop RIGHT NOW despite A being parked.
+  // B is an independent instance; an ordinary send must flow through
+  // the node RPC loop RIGHT NOW despite A being parked. Read B's
+  // commandId from the Hub command record (c-reconnfu r6 item 2): the
+  // ungated bubble may already have been journal-replaced before we
+  // read its attribute.
   const instanceB = await createSession(page, "gate normal B");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   const apiB = await hubApi(page);
   await sendMessage(page, "unblocked normal B");
-  const bubbleB = page.locator('[data-testid="optimistic-bubble"]').first();
-  const commandB = await bubbleB.getAttribute("data-command-id");
-  expect(commandB).toBeTruthy();
+  const commandB = await expect
+    .poll(
+      async () =>
+        (await hubCommands(apiB, instanceB)).find((c) => c.operation === "instance.send")?.id ??
+        null,
+      { timeout: 15_000 },
+    )
+    .then((id) => {
+      expect(id).toBeTruthy();
+      return id as string;
+    });
   // B's node observation joins promptly (well inside one 60 s gate
   // timeout): the parked A did not block B's RPC + journal append.
   await expect
-    .poll(() => hubJournalMessageCount(apiB, instanceB, commandB!), { timeout: 15_000 })
+    .poll(() => hubJournalMessageCount(apiB, instanceB, commandB), { timeout: 15_000 })
     .toBe(1);
   await expectDelivered(page, commandB);
 
-  // Simulate the test body ending while A is still pending: teardown
-  // releases the gate. The parked append then lands (single observation),
-  // so the afterEach instance delete is not forced to wait out the
-  // 60 s node poll.
+  // Simulate a body failure IMMEDIATELY AFTER release: trigger the
+  // release but do NOT wait for the node ACK, then run teardown.
+  // The registration is still present; teardown must await the node's
+  // bounded ACK instead of assuming a fixed sleep.
   expect(pendingJournalGates.has(commandA!)).toBe(true);
+  await releaseJournal(commandA!);
   await teardownJournalGates();
   expect(pendingJournalGates.has(commandA!)).toBe(false);
+  // The node wrote the ACK and A's parked append landed exactly once.
+  expect(await journalGateFileExists(journalAckPath(commandA!))).toBe(false); // swept
   const apiA = await hubApi(page);
-  await expect
-    .poll(() => hubJournalMessageCount(apiA, instanceA, commandA!), { timeout: 15_000 })
-    .toBe(1);
+  expect(await hubJournalMessageCount(apiA, instanceA, commandA!)).toBe(1);
 });
 
 /**

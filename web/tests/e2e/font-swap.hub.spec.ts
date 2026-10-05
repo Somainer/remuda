@@ -11,18 +11,21 @@ import { login } from "./hub-auth";
  * after the restore must not move the row the reader was on, and a pinned
  * transcript must stay pinned.
  *
- * Every woff2 response is held for 800ms, so the swap reliably lands after
- * the first rows render. Fake Node only: `__journal_burst__:<n>` appends n
- * assistant rows in one journal append. The long-journal case writes more
- * than the Hub's tail window first, so the restore runs on a bounded replay.
+ * Where the swap lands relative to the restore is CONTROLLED AT THE NETWORK
+ * LAYER, never by a timer: one arm holds every woff2 response and releases it
+ * only after the restored anchor has stopped moving (a genuinely late swap),
+ * the other holds the journal seed — the only source of rows on a fresh
+ * mount — and loads the font before any rows exist (a genuinely early swap).
+ * The owner requirement holds in both: the saved reading position survives.
+ * Fake Node only: `__journal_burst__:<n>` appends n assistant rows in one
+ * journal append. The long-journal case writes more than the Hub's tail
+ * window first, so the restore runs on a bounded replay.
  */
 
 test.describe.configure({ mode: "serial" });
 
 test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
 
-/** Hold on every woff2 response; FONT_SWAP_DELAY_MS overrides it. */
-const FONT_DELAY_MS = Number(process.env.FONT_SWAP_DELAY_MS ?? 800);
 /** Sub-pixel rounding plus one line of scroll-anchoring slack. */
 const DRIFT_PX = 4;
 /** Enough sans rows below the code block to park it near the top and scroll. */
@@ -42,12 +45,36 @@ test.afterEach(async ({ page }) => {
   }
 });
 
-async function delayFonts(page: Page): Promise<void> {
-  if (FONT_DELAY_MS <= 0) return;
-  await page.route(/\.woff2(?:\?|$)/, async (route) => {
-    await new Promise((resolve) => setTimeout(resolve, FONT_DELAY_MS));
+/**
+ * Intercept every request `pick` matches and hold it at the network layer
+ * until `release()` — arrival ORDER is controlled by the test instead of
+ * guessed from a delay. Requests arriving after the release continue at once.
+ * `waitArrival()` resolves once a request is actually parked in the gate, so
+ * an arm can prove its precondition (the font has not loaded / the seed has
+ * not returned) rather than assuming it from elapsed time.
+ */
+async function gateRoute(
+  page: Page,
+  pick: RegExp | ((url: URL) => boolean),
+): Promise<{ waitArrival: () => Promise<void>; release: () => void }> {
+  let markArrival: (() => void) | null = null;
+  const arrival = new Promise<void>((resolve) => {
+    markArrival = resolve;
+  });
+  let open: (() => void) | null = null;
+  const released = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  await page.route(pick, async (route) => {
+    markArrival?.();
+    markArrival = null;
+    await released;
     await route.continue();
   });
+  return {
+    waitArrival: () => arrival,
+    release: () => open?.(),
+  };
 }
 
 async function command(page: Page, instanceId: string, prompt: string): Promise<void> {
@@ -210,6 +237,29 @@ async function rowOffset(scroller: Locator, n: number): Promise<number | null> {
   }, n);
 }
 
+/**
+ * The restore has quiesced: the anchor row's scroller-relative offset is the
+ * same across two animation frames. This is the synchronisation point for a
+ * font released strictly AFTER the restore — an event, not a guessed delay.
+ */
+async function waitAnchorStable(page: Page, scroller: Locator, anchor: number): Promise<number> {
+  await expect
+    .poll(
+      async () => {
+        const first = await rowOffset(scroller, anchor);
+        await page.evaluate(
+          () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))),
+        );
+        const next = await rowOffset(scroller, anchor);
+        if (first === null || next === null) return "missing";
+        return Math.abs(first - next) <= 1 ? `stable:${next}` : "moving";
+      },
+      { timeout: 10_000, message: "the restored anchor never settled while the font was held" },
+    )
+    .toMatch(/^stable:/);
+  return (await rowOffset(scroller, anchor))!;
+}
+
 /** Rendered rows never overlap once the new metrics are measured. */
 async function assertRowsStacked(scroller: Locator): Promise<void> {
   const overlaps = await scroller.evaluate((el) => {
@@ -241,10 +291,15 @@ async function afterSwap(page: Page): Promise<void> {
 
 /**
  * Save a reading position just below the code block, leave, then restore it
- * twice: once with the font cached (the no-swap control) and once with the
- * woff2 held so the swap lands after the restore.
+ * twice: once with the font cached (the no-swap control) and once on a fresh
+ * document where the swap's landing point is network-gated — strictly after
+ * the restored anchor settles ("late"), or before any rows exist ("first").
  */
-async function savedPositionSurvivesSwap(page: Page, longBurst: number): Promise<void> {
+async function savedPositionSurvivesSwap(
+  page: Page,
+  longBurst: number,
+  order: "late" | "first",
+): Promise<void> {
   await page.setViewportSize({ width: 1440, height: 900 });
   const instanceId = await seedSession(page, longBurst);
 
@@ -336,68 +391,119 @@ async function savedPositionSurvivesSwap(page: Page, longBurst: number): Promise
   const controlInput = await consumed();
   const viewport = await scroller.evaluate((el) => el.clientHeight);
 
-  // Fresh document with the woff2 held (routing also bypasses the HTTP
-  // cache): rows restore on the fallback monospace, the swap lands after.
-  await delayFonts(page);
-  await page.goto("/sessions");
-  await expect(page.getByTestId("session-list")).toBeVisible();
-  const leftByControl = await page.evaluate((key) => localStorage.getItem(key), readingKey);
-  await reinstate();
-  await page.goto(`/s/${instanceId}`);
-  await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
-  const swappedBeforeRestore = await monoLoaded(page);
-  const beforeSwap = (await rowOffset(scroller, anchor))!;
-  await afterSwap(page);
-  const settled = (await rowOffset(scroller, anchor))!;
-  const swapInput = await consumed();
+  // The gated arm: a fresh document (routing also bypasses the HTTP cache)
+  // where the swap is forced to land at one exact point relative to the
+  // restore. Both arms restore from the byte-identical saved record.
+  let leftByControl: string | null = null;
+  let beforeSwap: number | null = null;
+  let settled: number;
+  if (order === "late") {
+    // Hold every woff2 at the network layer; rows restore on the fallback
+    // monospace. Release only once the restored anchor has stopped moving,
+    // so the swap lands strictly after the restore by construction.
+    const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/);
+    await page.goto("/sessions");
+    await expect(page.getByTestId("session-list")).toBeVisible();
+    leftByControl = await page.evaluate((key) => localStorage.getItem(key), readingKey);
+    await reinstate();
+    await page.goto(`/s/${instanceId}`);
+    await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
+    await fontGate.waitArrival();
+    expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
+    beforeSwap = await waitAnchorStable(page, scroller, anchor);
+    fontGate.release();
+    await afterSwap(page);
+    settled = (await rowOffset(scroller, anchor))!;
+  } else {
+    // The swap lands BEFORE the restore. Rows only exist once the REST seed
+    // returns (the follow socket is opened after the seed), so hold that one
+    // request, load the web font explicitly while nothing is rendered, prove
+    // no rows exist, and only then release the seed.
+    // A passthrough woff2 route bypasses the HTTP cache the control arm
+    // populated, so this is a genuine fetch, not a cached no-op.
+    await page.route(/\.woff2(?:\?|$)/, async (route) => route.continue());
+    const journalGate = await gateRoute(
+      page,
+      (url) => url.pathname === `/v1/instances/${instanceId}/journal`,
+    );
+    await page.goto("/sessions");
+    await expect(page.getByTestId("session-list")).toBeVisible();
+    await reinstate();
+    await page.goto(`/s/${instanceId}`);
+    await journalGate.waitArrival();
+    await expect(scroller.getByTestId("transcript-row")).toHaveCount(0);
+    await page.evaluate(async () => {
+      await Promise.all([
+        document.fonts.load('400 13px "IBM Plex Mono"'),
+        document.fonts.load('500 13px "IBM Plex Mono"'),
+      ]);
+    });
+    await expect.poll(() => monoLoaded(page), { timeout: 10_000 }).toBe(true);
+    journalGate.release();
+    await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
+    await afterSwap(page);
+    settled = (await rowOffset(scroller, anchor))!;
+  }
+  const armInput = await consumed();
 
   // Both arms restore from the byte-identical record the first visit saved.
   expect(controlInput, "the control arm restored from the original saved record").toBe(original);
-  expect(swapInput, "the swap arm restored from the original saved record").toBe(original);
+  expect(armInput, "the gated arm restored from the original saved record").toBe(original);
 
   // `saved` vs `control` is the restore's own precision with no font change
   // at all (Transcript places never-measured rows by its row estimate), a
   // baseline gap reported separately. What this spec owns is that the swap
-  // adds nothing on top: the swapped restore is no further from the saved
-  // position than the no-swap restore, and nothing moves when the font lands.
-  const measured = `longBurst=${longBurst} saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} swappedBeforeRestore=${swappedBeforeRestore} input=${original} leftByControl=${leftByControl}`;
+  // adds nothing on top: the gated restore is no further from the saved
+  // position than the no-swap restore, and (in the late arm) nothing moves
+  // at the moment the font lands.
+  const measured = `order=${order} longBurst=${longBurst} saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} input=${original} leftByControl=${leftByControl}`;
   test.info().annotations.push({ type: "font-swap", description: measured });
   console.log(`FONTSWAP ${measured}`);
-  if (FONT_DELAY_MS > 0) {
-    expect(swappedBeforeRestore, `the delayed font arrived before the restore (${measured})`).toBe(false);
-  }
   // The restore brings the saved row back on screen.
   expect(control, `the saved row restores inside the viewport (${measured})`).toBeGreaterThanOrEqual(0);
   expect(control, `the saved row restores inside the viewport (${measured})`).toBeLessThan(viewport);
   expect(
     Math.abs(settled - saved!),
-    `a late swap moved the restore further from the saved position than the no-swap control (${measured})`,
+    `the swap moved the restore further from the saved position than the no-swap control (${measured})`,
   ).toBeLessThanOrEqual(Math.abs(control - saved!) + DRIFT_PX);
-  expect(Math.abs(settled - beforeSwap), `row drifted when the web font swapped in (${measured})`).toBeLessThanOrEqual(
-    DRIFT_PX,
-  );
+  if (beforeSwap !== null) {
+    expect(
+      Math.abs(settled - beforeSwap),
+      `row drifted when the web font swapped in (${measured})`,
+    ).toBeLessThanOrEqual(DRIFT_PX);
+  }
   await assertRowsStacked(scroller);
 }
 
 test("a saved reading position survives a late monospace swap", async ({ page }) => {
   test.setTimeout(120_000);
-  await savedPositionSurvivesSwap(page, 0);
+  await savedPositionSurvivesSwap(page, 0, "late");
+});
+
+test("a saved reading position survives a monospace swap that lands first", async ({ page }) => {
+  test.setTimeout(120_000);
+  await savedPositionSurvivesSwap(page, 0, "first");
 });
 
 test("a saved position in a bounded long journal survives a late monospace swap", async ({ page }) => {
   test.setTimeout(240_000);
-  await savedPositionSurvivesSwap(page, LONG_BURST);
+  await savedPositionSurvivesSwap(page, LONG_BURST, "late");
 });
 
 test("a pinned transcript stays pinned through a late monospace swap", async ({ page }) => {
   test.setTimeout(120_000);
   await page.setViewportSize({ width: 390, height: 844 });
   const instanceId = await seedSession(page);
-  await delayFonts(page);
+  // Gate the woff2 instead of delaying it: the rows render on the fallback
+  // face and stay pinned, then the swap is released at a known point.
+  const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/);
 
   await page.goto(`/s/${instanceId}`);
   const scroller = page.getByTestId("transcript-scroller");
   await loaded(page);
+  await fontGate.waitArrival();
+  expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
+  fontGate.release();
   await afterSwap(page);
   await scroller.evaluate((el) => {
     el.scrollTop = el.scrollHeight;

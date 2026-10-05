@@ -23,26 +23,28 @@ function deferred<T>() {
 }
 
 /**
- * c-reconnfu gate-flake regression: a queued row's post-delivery housekeeping
- * (resumeAfterReconnect + a /screen read) is chained on the per-instance
- * reconcile chain, and the connection resume's follow reopen serialises on
- * that SAME chain. When the flush was awaited FIRST, a /screen read stalled by
- * a saturated Node (gate load: REST timeout, NODE_BUSY backoff) parked the
- * socket reopen for tens of seconds AFTER the row had committed — the link sat
- * in recovering and the journal banner never cleared. The resume must reopen
- * the follow independently of the flush tail; the subscribe snapshot alone
- * certifies the link.
+ * c-reconnfu gate-flake regression: a Node-bound /screen read stalled by a
+ * saturated Node (gate load: REST timeout, NODE_BUSY back-off) must not park
+ * the follow reopen. The screen read is started THROUGH THE REAL STORE PATH
+ * (the list scheduler → refreshScreen({chained})), confirmed in flight, and
+ * left unresolved; only then is the follow socket closed and recovery kicked.
+ * The second subscription AND the live state MUST both arrive while the screen
+ * RPC is still parked — the screen result is never released first.
+ *
+ * With the old shared chain (the screen read chained on chainReconcile, which
+ * reopenFollow also joins), the reopen job queues behind the parked read and
+ * the second subscription is never opened, so this test fails there.
  */
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it("resume reopens the follow socket without waiting on the flush's post-delivery screen read", async () => {
+it("recovery reopens the follow and certifies live while a real screen read is parked", async () => {
   const { api, hubStore } = await fresh();
   let networkUp = true;
-  // The Node's screen RPC is saturated for the whole test.
+  // The Node's screen RPC is saturated for the whole recovery.
   const screenParked = deferred<{ lines: string[] }>();
-  vi.spyOn(api, "screenRead").mockReturnValue(screenParked.promise);
+  const screenRead = vi.spyOn(api, "screenRead").mockReturnValue(screenParked.promise);
 
   vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
   vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
@@ -60,15 +62,14 @@ it("resume reopens the follow socket without waiting on the flush's post-deliver
     nextCursor: null,
   });
   vi.spyOn(api, "interactionList").mockResolvedValue([]);
-  const eventsRead = vi
-    .spyOn(api, "eventsRead")
-    .mockImplementation(() =>
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    () =>
       networkUp
         ? Promise.resolve({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true })
         : Promise.reject(new Error("NETWORK_DOWN")),
-    ) as unknown as Api["eventsRead"];
+  ) as unknown as Api["eventsRead"];
 
-  // First subscribe is the live mount; the resume must open a SECOND one.
+  // First subscribe is the live mount; the recovery must open a SECOND one.
   let firstOnClose: (() => void) | undefined;
   let socketReady = 1;
   const subscribe = vi.spyOn(api, "eventsSubscribe").mockImplementation(
@@ -97,61 +98,38 @@ it("resume reopens the follow socket without waiting on the flush's post-deliver
     }) as Api["eventsSubscribe"],
   );
 
-  vi.spyOn(api, "instanceSend").mockImplementation(
-    (async (
-      _iid: string,
-      _prompt: string,
-      _attachments: unknown[],
-      _mode: string,
-      commandId: string,
-    ) => {
-      if (!networkUp) throw new Error("NETWORK_DOWN");
-      return {
-        relatedCommandIds: [],
-        command: {
-          commandId,
-          id: commandId,
-          revision: "1",
-          createdAt: "2026-10-05T00:00:00.000Z",
-          updatedAt: "2026-10-05T00:00:00.000Z",
-          state: "completed",
-          resolution: "completed",
-        },
-      };
-    }) as unknown as Api["instanceSend"],
-  );
-  // A lost-POST reconciliation while red must fail (row stays queued).
-  vi.spyOn(api, "instanceCommandStatus").mockRejectedValue(new Error("NETWORK_DOWN"));
-
   await hubStore.bootstrap();
   await hubStore.follow(INSTANCE);
   await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1));
   await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"));
 
-  // The socket dies (no frames in flight) and every Hub call fails: machine
-  // goes offline and its reconnect retries stay red.
+  // Start a screen read through the REAL scheduler path and wait until the
+  // Node RPC is actually in flight — then leave it unresolved for the rest of
+  // the recovery.
+  hubStore.refreshScreens([INSTANCE]);
+  await vi.waitFor(() => expect(screenRead).toHaveBeenCalledTimes(1));
+
+  // The follow socket dies and every Hub call fails: the machine goes offline
+  // and its reconnect retries stay red.
   networkUp = false;
   socketReady = 3;
   firstOnClose!();
   await vi.waitFor(() => expect(["offline", "recovering"]).toContain(hubStore.connectionState));
   await vi.waitFor(() => expect(hubStore.connectionState).toBe("offline"), { timeout: 5_000 });
 
-  // A message queued while the link is down durably parks.
-  await hubStore.send(INSTANCE, "recover behind a stalled screen read");
-
   // Hub is reachable again (REST + follow green); the NODE's screen read is
-  // still parked for the entire test. A foreground resume kicks recovery.
+  // STILL parked. A foreground resume kicks recovery.
   networkUp = true;
   socketReady = 1;
   hubStore.resumeActive(INSTANCE);
 
-  // The follow reopen certifies the link without ever waiting on the flush
-  // tail's chained /screen read (which never settles here). Pre-fix the reopen
-  // was queued behind it, so the socket stayed at one subscription and the
-  // machine never returned to live.
+  // The second subscription must open and the link must certify live while the
+  // screen RPC is parked — the screen result is released only afterwards. With
+  // the old shared chain the reopen queued behind the parked read, so no
+  // second subscription ever happened and this wait failed.
   await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(2), { timeout: 5_000 });
   await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"), { timeout: 5_000 });
-  expect(eventsRead).toHaveBeenCalled();
+  expect(screenRead).toHaveBeenCalledTimes(1);
 
   hubStore.logout();
   screenParked.resolve({ lines: [] });

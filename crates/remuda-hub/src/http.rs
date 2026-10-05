@@ -2090,26 +2090,35 @@ async fn resume_lineage(
     // of the post-spawn install in `placement::spawn_on_host`).
     crate::placement::install_route_egress(state, &successor, &spec).await;
     let now = crate::config::now_rfc3339();
-    journal_resume_link(
-        state,
-        &fenced.host_id,
-        &fenced.instance_id,
-        "resumed-into",
-        &successor.instance_id,
-        successor.native_session_id.as_deref().unwrap_or_default(),
-        &now,
-    )
-    .await;
-    journal_resume_link(
-        state,
-        &successor.host_id,
-        &successor.instance_id,
-        "resumed-from",
-        &fenced.instance_id,
-        successor.native_session_id.as_deref().unwrap_or_default(),
-        &now,
-    )
-    .await;
+    // The resume links describe native-transcript continuity; a successor
+    // relaunched fresh from the origin spec (no chapter ever reported a
+    // session) has no transcript id to link.
+    if let Some(session_id) = spec
+        .get("resumeSessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        journal_resume_link(
+            state,
+            &fenced.host_id,
+            &fenced.instance_id,
+            "resumed-into",
+            &successor.instance_id,
+            session_id,
+            &now,
+        )
+        .await;
+        journal_resume_link(
+            state,
+            &successor.host_id,
+            &successor.instance_id,
+            "resumed-from",
+            &fenced.instance_id,
+            session_id,
+            &now,
+        )
+        .await;
+    }
     Ok(Json(json!({
         "instance": successor,
         "command": command,

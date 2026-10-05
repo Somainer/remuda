@@ -153,6 +153,10 @@ async function answerStatus(
 }
 
 test.describe("390px cardsettle: pending card drops when its session ends", () => {
+  /** Inbound settlement frames captured from BEFORE login, when the store's
+   * global follow socket is opened at bootstrap. */
+  let settlementFrames: string[];
+
   test.use({
     viewport: { width: 390, height: 844 },
     hasTouch: true,
@@ -160,6 +164,16 @@ test.describe("390px cardsettle: pending card drops when its session ends", () =
   });
 
   test.beforeEach(async ({ page }) => {
+    settlementFrames = [];
+    // Register before login: the settlement follow socket is created at
+    // bootstrap, so a listener added afterwards would miss it.
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", ({ payload }) => {
+        if (typeof payload === "string" && payload.includes('"type":"settlement"')) {
+          settlementFrames.push(payload);
+        }
+      });
+    });
     await login(page);
   });
 
@@ -174,6 +188,22 @@ test.describe("390px cardsettle: pending card drops when its session ends", () =
   }) => {
     const instanceId = await createSession(page, "cardsettle-live sentinel");
     const interactionId = await pendingInteractionId(page, instanceId);
+    // r2 item 8: prove the drop is driven by the settlement FRAME, not the 2 s
+    // poll. Once THIS card's settlement frame arrives, it must be gone within
+    // LESS than one poll interval (2000 ms): the trailing coalesce (300 ms)
+    // plus one interaction fetch is well under that; a poll-driven drop could
+    // not be.
+    const waitForSettlementFrame = async () => {
+      await expect
+        .poll(
+          () =>
+            settlementFrames.some((text) =>
+              text.includes(`"interactionId":"${interactionId}"`),
+            ),
+          { timeout: 20_000 },
+        )
+        .toBe(true);
+    };
 
     // Live 1/1 before the end (unknown deadline — only the Hub can retire it).
     await page.goto("/m");
@@ -191,19 +221,26 @@ test.describe("390px cardsettle: pending card drops when its session ends", () =
     await expect
       .poll(() => instanceLifecycle(page, instanceId), { timeout: 20_000 })
       .toBe("exited");
-    await expect
-      .poll(() => interactionState(page, interactionId), { timeout: 20_000 })
-      .toBe("invalidated");
 
-    // The card leaves the queue and the badge agrees with NO reload: the page
-    // stays on /m/inbox; the Hub settlement notice (or the next poll) drives
-    // one interaction refresh, dropping the durable invalidated row in place.
+    // The settlement control frame must arrive…
+    await waitForSettlementFrame();
+    // …and the card/badge drop within less than one 2000 ms poll interval —
+    // this cannot be the periodic poll, it is the frame-driven refresh.
+    const frameAt = Date.now();
     await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)", {
-      timeout: 15_000,
+      timeout: 1_500,
     });
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toHaveCount(0);
     await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
+    expect(Date.now() - frameAt, "drop within one poll interval, from the frame").toBeLessThan(
+      2_000,
+    );
     await shot(page, "cardsettle-mobile-settled.png");
+
+    // The durable row really is invalidated (checked after the UI assertion).
+    await expect
+      .poll(() => interactionState(page, interactionId), { timeout: 20_000 })
+      .toBe("invalidated");
 
     // In-shell client navigation keeps the same shell mounted; badge stays 0.
     await page.getByTestId("phone-nav-home").click();

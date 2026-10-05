@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import { login } from "./hub-auth";
 
 /**
@@ -46,9 +46,28 @@ test.afterEach(async ({ page }) => {
 });
 
 /**
+ * The request belongs to the `/s/<id>` document this gate is about: same
+ * main frame, frame URL already on the session route. Requests of a document
+ * the browser is leaving (the `/sessions` hop) are never parked, so a later
+ * goto cannot cancel a parked request out from under the gate.
+ */
+function belongsToSessionDocument(route: Route): boolean {
+  const frame = route.request().frame();
+  if (frame !== frame.page().mainFrame()) return false;
+  return new URL(frame.url()).pathname.startsWith("/s/");
+}
+
+/**
  * Intercept every request `pick` matches and hold it at the network layer
  * until `release()` — arrival ORDER is controlled by the test instead of
  * guessed from a delay. Requests arriving after the release continue at once.
+ *
+ * The gate only ever parks requests of the CURRENT `/s/<id>` document (see
+ * belongsToSessionDocument): install it immediately before the session goto,
+ * after the `/sessions` hop, or a request parked on the old document gets
+ * cancelled by the goto and `continue()` would reject on the happy path.
+ * Cancelled requests are tolerated anyway (a navigation abort races release).
+ *
  * `waitArrival()` resolves once a request is actually parked in the gate, so
  * an arm can prove its precondition (the font has not loaded / the seed has
  * not returned) rather than assuming it from elapsed time.
@@ -56,7 +75,7 @@ test.afterEach(async ({ page }) => {
 async function gateRoute(
   page: Page,
   pick: RegExp | ((url: URL) => boolean),
-): Promise<{ waitArrival: () => Promise<void>; release: () => void }> {
+): Promise<{ waitArrival: () => Promise<void>; release: () => void; dispose: () => Promise<void> }> {
   let markArrival: (() => void) | null = null;
   const arrival = new Promise<void>((resolve) => {
     markArrival = resolve;
@@ -65,15 +84,27 @@ async function gateRoute(
   const released = new Promise<void>((resolve) => {
     open = resolve;
   });
-  await page.route(pick, async (route) => {
+  const handler = async (route: Route) => {
+    // Anything outside the gated session document (the /sessions page being
+    // left, a subframe) flows straight through and never parks.
+    if (!belongsToSessionDocument(route)) return route.continue();
     markArrival?.();
     markArrival = null;
     await released;
-    await route.continue();
-  });
+    // The goto that owned this request may have navigated away while it was
+    // parked; continuing a disposed route rejects — that is expected, not a
+    // test failure.
+    try {
+      await route.continue();
+    } catch {
+      // Request was aborted by navigation.
+    }
+  };
+  await page.route(pick, handler);
   return {
     waitArrival: () => arrival,
     release: () => open?.(),
+    dispose: () => page.unroute(pick, handler),
   };
 }
 
@@ -400,12 +431,14 @@ async function savedPositionSurvivesSwap(
   if (order === "late") {
     // Hold every woff2 at the network layer; rows restore on the fallback
     // monospace. Release only once the restored anchor has stopped moving,
-    // so the swap lands strictly after the restore by construction.
-    const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/);
+    // so the swap lands strictly after the restore by construction. The
+    // gate is installed only now — AFTER the /sessions hop — and scoped to
+    // this document, so the hop cannot cancel a parked request.
     await page.goto("/sessions");
     await expect(page.getByTestId("session-list")).toBeVisible();
     leftByControl = await page.evaluate((key) => localStorage.getItem(key), readingKey);
     await reinstate();
+    const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/);
     await page.goto(`/s/${instanceId}`);
     await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
     await fontGate.waitArrival();
@@ -422,13 +455,15 @@ async function savedPositionSurvivesSwap(
     // A passthrough woff2 route bypasses the HTTP cache the control arm
     // populated, so this is a genuine fetch, not a cached no-op.
     await page.route(/\.woff2(?:\?|$)/, async (route) => route.continue());
+    await page.goto("/sessions");
+    await expect(page.getByTestId("session-list")).toBeVisible();
+    await reinstate();
+    // Gate installed only after the /sessions hop: only this document's
+    // journal seed is parked.
     const journalGate = await gateRoute(
       page,
       (url) => url.pathname === `/v1/instances/${instanceId}/journal`,
     );
-    await page.goto("/sessions");
-    await expect(page.getByTestId("session-list")).toBeVisible();
-    await reinstate();
     await page.goto(`/s/${instanceId}`);
     await journalGate.waitArrival();
     await expect(scroller.getByTestId("transcript-row")).toHaveCount(0);

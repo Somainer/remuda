@@ -2530,15 +2530,17 @@ impl Store {
     /// Hub-owned projection only: never forge a Node journal cursor or native completion.
     pub async fn expire_lost_hosts(&self, grace_ms: u64) -> Result<usize, StoreError> {
         self.run_named("expire_lost_hosts", move |conn| {
+            let now = now_rfc3339();
             let changed = conn.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                    connectivity = 'disconnected', last_error = 'host-lost', updated_at = ?1
+                    connectivity = 'disconnected', last_error = 'host-lost',
+                    updated_at = ?1, ended_at = COALESCE(ended_at, ?1)
                  WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
                     SELECT id FROM hosts WHERE state != 'online' AND
                     (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
                     (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
                  )",
-                params![now_rfc3339(), grace_ms.min(i64::MAX as u64) as i64],
+                params![now, grace_ms.min(i64::MAX as u64) as i64],
             )?;
             Ok(changed)
         }).await
@@ -3403,7 +3405,8 @@ impl Store {
             for id in &lost {
                 conn.execute(
                     "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                        last_error = ?1, updated_at = ?2 WHERE id = ?3",
+                        last_error = ?1, updated_at = ?2, ended_at = COALESCE(ended_at, ?2)
+                     WHERE id = ?3",
                     params![&reason, &now, id],
                 )?;
             }
@@ -3436,7 +3439,8 @@ impl Store {
             for (id, _) in &stale {
                 conn.execute(
                     "UPDATE instances SET lifecycle = 'failed', activity = 'idle',
-                        last_error = 'create-never-acknowledged', updated_at = ?1
+                        last_error = 'create-never-acknowledged', updated_at = ?1,
+                        ended_at = COALESCE(ended_at, ?1)
                      WHERE id = ?2 AND lifecycle = 'requested'",
                     params![&now, id],
                 )?;
@@ -3461,7 +3465,7 @@ impl Store {
         self.run_named("settle_instance_exited", move |conn| {
             let changed = conn.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                    last_error = ?1, updated_at = ?2
+                    last_error = ?1, updated_at = ?2, ended_at = COALESCE(ended_at, ?2)
                  WHERE id = ?3 AND lifecycle NOT IN ('exited', 'failed')",
                 params![reason, now_rfc3339(), instance_id],
             )?;
@@ -3824,11 +3828,13 @@ impl Store {
         last_error: String,
     ) -> Result<(), StoreError> {
         self.run_named("fail_instance", move |conn| {
+            let now = now_rfc3339();
             conn.execute(
                 "UPDATE instances
-                 SET lifecycle = 'failed', last_error = ?1, updated_at = ?2
+                 SET lifecycle = 'failed', last_error = ?1, updated_at = ?2,
+                     ended_at = COALESCE(ended_at, ?2)
                  WHERE id = ?3",
-                params![last_error, now_rfc3339(), instance_id],
+                params![last_error, now, instance_id],
             )?;
             Ok(())
         })
@@ -3894,23 +3900,23 @@ impl Store {
     ) -> Result<Vec<LineageChapter>, StoreError> {
         self.read("list_lineage_chapters", move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, generation, chapter_cause, created_at, updated_at,
-                        lifecycle, fenced_at
+                "SELECT id, generation, chapter_cause, created_at, ended_at, fenced_at
                  FROM instances
                  WHERE COALESCE(lineage_id, id) = ?1
                  ORDER BY generation ASC, created_at ASC",
             )?;
             let rows = stmt
                 .query_map(params![lineage_id], |row| {
-                    let lifecycle: String = row.get(5)?;
-                    let ended = matches!(lifecycle.as_str(), "exited" | "failed" | "closed");
+                    let ended_at: Option<String> = row.get(4)?;
                     Ok(LineageChapter {
                         instance_id: row.get(0)?,
                         generation: row.get(1)?,
                         chapter_cause: row.get(2)?,
                         created_at: row.get(3)?,
-                        ended_at: if ended { Some(row.get(4)?) } else { None },
-                        fenced_at: row.get(6)?,
+                        // ma-lineage round 2: the immutable end-event
+                        // timestamp, never the mutable updated_at.
+                        ended_at,
+                        fenced_at: row.get(5)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -5763,6 +5769,19 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "instances", "chapter_cause", "TEXT")?;
     ensure_column(&conn, "instances", "fenced_at", "TEXT")?;
     ensure_column(&conn, "instances", "restart_json", "TEXT")?;
+    // ma-lineage round 2: an immutable timestamp for the chapter's real end
+    // event (a transition into exited/failed/closed), kept separate from the
+    // mutable `updated_at`. Written once by [`stamp_ended_at`].
+    ensure_column(&conn, "instances", "ended_at", "TEXT")?;
+    // Rows written before the column existed already carry their end event;
+    // `updated_at` was then the end time. Stamp them once; new end events use
+    // the event's own timestamp and never refresh this column.
+    conn.execute(
+        "UPDATE instances SET ended_at = updated_at
+         WHERE ended_at IS NULL
+           AND lifecycle IN ('exited', 'failed', 'closed')",
+        [],
+    )?;
     // Rows written before the column existed are each their own lineage.
     conn.execute(
         "UPDATE instances SET lineage_id = id WHERE lineage_id IS NULL",
@@ -6177,6 +6196,16 @@ fn apply_instance_projection(
              WHERE id = ?5",
             params![seq, lifecycle, last_error, now, instance_id],
         )?;
+        // ma-lineage round 2: an immutable end timestamp at the real end
+        // event; never refreshed by a later journal row.
+        if matches!(lifecycle, "exited" | "failed" | "closed") {
+            let at = event
+                .get("observedAt")
+                .and_then(Value::as_str)
+                .filter(|at| !at.is_empty())
+                .unwrap_or(now);
+            stamp_ended_at(conn, instance_id, at)?;
+        }
         // D-027: a terminal instance can never consume a staged attachment
         // again, and the Node drops its own copy at the same point.
         if matches!(lifecycle, "exited" | "failed") {
@@ -9423,6 +9452,36 @@ fn apply_instance_lifecycle(
     conn.execute(
         "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
         params![lifecycle, activity, now, instance_id],
+    )?;
+    // ma-lineage round 2: the chapter's immutable end timestamp. A journal
+    // end event stamps it once; later events keep updating `updated_at` but
+    // never move this.
+    if matches!(lifecycle, "exited" | "failed" | "closed") {
+        let at = event
+            .get("observedAt")
+            .and_then(Value::as_str)
+            .filter(|at| !at.is_empty())
+            .unwrap_or(&now);
+        stamp_ended_at(conn, instance_id, at)?;
+    }
+    Ok(())
+}
+
+/// Lifecycles that are a real end event (ma-lineage round 2).
+const ENDED_LIFECYCLES: &str = "'exited', 'failed', 'closed'";
+
+/// Stamp the immutable `ended_at` once, at the real end event.
+///
+/// `COALESCE` keeps the first end timestamp: a close ACK landing after the
+/// process-exit event (or any later journal row) must not rewrite it, and the
+/// value must not track the mutable `updated_at`.
+fn stamp_ended_at(conn: &Connection, instance_id: &str, at: &str) -> Result<(), StoreError> {
+    conn.execute(
+        &format!(
+            "UPDATE instances SET ended_at = COALESCE(ended_at, ?1)
+             WHERE id = ?2 AND lifecycle IN ({ENDED_LIFECYCLES})"
+        ),
+        params![at, instance_id],
     )?;
     Ok(())
 }

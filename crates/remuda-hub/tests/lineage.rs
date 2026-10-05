@@ -617,6 +617,110 @@ async fn a_failed_but_alive_chapter_is_closed_when_the_lineage_continues() -> Re
     Ok(())
 }
 
+// --- 5. endedAt is the immutable end event -------------------------------
+
+#[tokio::test]
+async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // Real process-end evidence with a fixed event timestamp.
+    let ended_at = "2026-09-01T08:30:00.000Z";
+    node.appends.send((
+        x.clone(),
+        json!({
+            "kind": "lifecycle",
+            "observedAt": ended_at,
+            "payload": { "type": "entity", "state": "exited", "reasonCode": "native-exit" }
+        }),
+    ))?;
+    ctx.wait_until(&x, |view| view["lifecycle"] == json!("exited"))
+        .await?;
+
+    // A later mutation bumps updated_at (a post-exit command settle, a
+    // reconciler pass, ...) but must not move endedAt.
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE instances SET updated_at = '2026-10-02T09:45:00.000Z' WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+    }
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let chapter = &lineage["chapters"][0];
+    assert_eq!(
+        chapter["endedAt"],
+        json!(ended_at),
+        "endedAt must stay the end-event timestamp, not the mutable updated_at"
+    );
+
+    // A second end event with a different timestamp does not rewrite it.
+    node.appends.send((
+        x.clone(),
+        json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-03T10:00:00.000Z",
+            "payload": { "type": "entity", "state": "exited", "reasonCode": "duplicate" }
+        }),
+    ))?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(lineage["chapters"][0]["endedAt"], json!(ended_at));
+
+    // Migration backfill: a terminal row from before the column existed keeps
+    // what was its end time then (updated_at at migration).
+    let data_dir = ctx._dir.path().to_owned();
+    let (human, host) = (ctx.human.clone(), ctx.host.clone());
+    let Ctx {
+        _dir,
+        hub,
+        http,
+        human: _human,
+        host: _host,
+        db_path,
+    } = ctx;
+    hub.shutdown().await;
+    {
+        let db = rusqlite::Connection::open(&db_path)?;
+        db.execute(
+            "UPDATE instances SET ended_at = NULL, updated_at = '2026-09-02T08:30:00.000Z'
+             WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+    }
+    let hub = spawn(HubConfig::for_test(data_dir.join("data"))).await?;
+    let db = rusqlite::Connection::open(&db_path)?;
+    let stamped: String = db.query_row(
+        "SELECT ended_at FROM instances WHERE id = ?1",
+        rusqlite::params![x],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        stamped, "2026-09-02T08:30:00.000Z",
+        "the migration stamps existing terminal rows once from updated_at"
+    );
+    let _ = (hub, http, human, host, _dir);
+    Ok(())
+}
+
 // --- 2. Ended chapter + host offline ------------------------------------
 
 #[tokio::test]

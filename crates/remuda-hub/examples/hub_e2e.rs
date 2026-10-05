@@ -849,6 +849,14 @@ async fn fake_node(
     // Scripted terminal answers: a spawned timer sends (instance, iid, answers)
     // back into this loop so journal appends stay single-writer.
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<(String, String, Value)>(8);
+    // c-reconnfu round 5: `__gate_journal__` parks its mirrored append
+    // OFF the shared RPC read loop. A spawned task polls the test-controlled
+    // release file and, only when it appears, sends the append work back
+    // through this channel so journal frames keep a single writer. On the 60 s
+    // poll timeout it sends NOTHING (no append), so a failed spec can never
+    // stall this loop (instance.close/purge and later specs must answer).
+    let (journal_gate_tx, mut journal_gate_rx) =
+        tokio::sync::mpsc::channel::<(String, Option<String>, String)>(8);
     // Scripted terminal answers awaiting their first `interaction.list`, keyed
     // by interaction id -> instance id. See the `ask-question-terminal` arm.
     let terminal_pending: Arc<Mutex<HashMap<String, String>>> =
@@ -867,6 +875,29 @@ async fn fake_node(
             biased;
             Some(frame) = requeue_rx.recv() => {
                 frame_queue.push_back(frame);
+            }
+            // c-reconnfu round 5: a __gate_journal__ append whose release
+            // gate the spec just opened. Runs on the read loop (single
+            // writer) after the parked poller task observed the gate file.
+            Some((gate_instance, gate_command, gate_prompt)) = journal_gate_rx.recv() => {
+                append_n = append_command_user(
+                    &mut ws,
+                    &gate_instance,
+                    append_n,
+                    &gate_prompt,
+                    gate_command.as_deref(),
+                )
+                .await?;
+                append_n = append_journal(
+                    &mut ws,
+                    &gate_instance,
+                    append_n,
+                    "assistant",
+                    &format!("echo: {gate_prompt}"),
+                )
+                .await?;
+                append_n =
+                    append_native_status(&mut ws, &gate_instance, append_n, "idle").await?;
             }
             Some((closed_instance, closed_iid, terminal_answers)) = close_rx.recv() => {
                 let Some(card) = pending.lock().await.remove(&closed_iid) else {
@@ -1430,47 +1461,45 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    // c-reconnfu round 4 item 2: `__gate_journal__` is the
-                    // test-controlled twin of `__hold_journal__:<ms>`. The POST is
-                    // answered with a durable acceptance IMMEDIATELY (so the chip
-                    // can be asserted at 已受理), then the mirrored journal user
-                    // observation is withheld until the SPEC creates a release file
-                    // (no autonomous sleep to race): std::env::temp_dir() /
-                    // remuda-e2e-journal-release-<hub port>-<commandId>. Only
-                    // after the gate appears do we append user + echo + idle,
-                    // which replaces the optimistic bubble with the journal row.
+                    // c-reconnfu round 4 item 2 / round 5 item 1:
+                    // `__gate_journal__` answers the POST with a durable
+                    // acceptance IMMEDIATELY and parks the mirrored journal
+                    // appends OFF this read loop: a spawned task polls the
+                    // spec-controlled release file
+                    // (std::env::temp_dir() /
+                    // remuda-e2e-journal-release-<hub port>-<commandId>)
+                    // without touching the socket, and only on release sends
+                    // the append work back via journal_gate_tx (single
+                    // writer). A failed assertion before the spec releases
+                    // therefore cannot block instance.close/purge or later
+                    // specs' RPCs; on the 60 s timeout nothing is appended.
                     if prompt == "__gate_journal__" {
                         send_rpc_ok(&mut ws, id, json!({ "accepted": true })).await?;
                         if let Some(cid) = command_id {
                             let gate = std::env::temp_dir()
                                 .join(format!("remuda-e2e-journal-release-{}-{cid}", addr.port()));
-                            let step = Duration::from_millis(100);
-                            let max = Duration::from_secs(60);
-                            let mut waited = Duration::ZERO;
-                            while !gate.exists() && waited < max {
-                                tokio::time::sleep(step).await;
-                                waited += step;
-                            }
-                            let _ = std::fs::remove_file(&gate);
+                            let gate_tx = journal_gate_tx.clone();
+                            let gate_instance = instance_id.clone();
+                            let gate_prompt = prompt.to_string();
+                            let gate_cid = cid.to_string();
+                            tokio::spawn(async move {
+                                let step = Duration::from_millis(100);
+                                let max = Duration::from_secs(60);
+                                let mut waited = Duration::ZERO;
+                                while !gate.exists() && waited < max {
+                                    tokio::time::sleep(step).await;
+                                    waited += step;
+                                }
+                                // Timeout: leave no journal append behind.
+                                if !gate.exists() {
+                                    return;
+                                }
+                                let _ = std::fs::remove_file(&gate);
+                                let _ = gate_tx
+                                    .send((gate_instance, Some(gate_cid), gate_prompt))
+                                    .await;
+                            });
                         }
-                        append_n = append_command_user(
-                            &mut ws,
-                            &instance_id,
-                            append_n,
-                            prompt,
-                            command_id,
-                        )
-                        .await?;
-                        append_n = append_journal(
-                            &mut ws,
-                            &instance_id,
-                            append_n,
-                            "assistant",
-                            &format!("echo: {prompt}"),
-                        )
-                        .await?;
-                        append_n =
-                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                         continue;
                     }
                     // c-reconnfu round 2 item 5 / round 3 item 5:

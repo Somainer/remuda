@@ -327,7 +327,9 @@ export class JournalClient {
   /**
    * Load one window of older history below the current loaded floor. Prepends
    * are delivered ascending through `onPrepend`; the loaded floor moves down
-   * and returns null once seq 1 is held or an older read yields nothing.
+   * and returns the new floor. Returns null WITHOUT a prepend once seq 1 is held,
+   * an older read yields nothing new (empty or rows already loaded), the journal
+   * diverges, or the read fails (the latter two also settle readonly-stale).
    */
   async loadEarlier(): Promise<U64 | null> {
     if (this.loadingEarlier) return null;
@@ -347,6 +349,7 @@ export class JournalClient {
         this.floorSeq = 1;
         return null;
       }
+      let anyNew = false;
       for (const ev of page.events) {
         const seq = n(ev.seq);
         const prev = this.seen.get(seq);
@@ -355,7 +358,15 @@ export class JournalClient {
           this.setStatus("readonly-stale");
           return null;
         }
+        if (!prev) anyNew = true;
         this.seen.set(seq, ev.eventId);
+      }
+      if (!anyNew) {
+        // The floor claimed older rows but every returned row was already loaded:
+        // nothing to prepend. Stop offering the action like the empty-page case
+        // and report no prepend so the UI can release a held anchor.
+        this.floorSeq = 1;
+        return null;
       }
       this.floorSeq = Math.min(this.floorSeq, n(page.events[0].seq));
       this.listeners.onPrepend?.(page.events.slice());

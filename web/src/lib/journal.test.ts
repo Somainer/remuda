@@ -385,6 +385,41 @@ describe("JournalClient", () => {
     });
     expect(client.retainedFloorSeq).toBe("1001");
   });
+
+  it("loadEarlier retires without a prepend when the page adds no new rows", async () => {
+    const range = (from: number, to: number) =>
+      Array.from({ length: to - from + 1 }, (_, i) => obs(from + i));
+    const reads = vi
+      .fn<JournalRead>()
+      // First page: the bounded window 1001..3000 below the partial floor.
+      .mockResolvedValueOnce(
+        page(range(1001, 3000), { durableSeq: "5000", windowFromSeq: "1001", reachedAfterSeq: false }),
+      )
+      // Second page re-serves rows the client already holds (server floor
+      // bookkeeping drifted above the rows it actually returns).
+      .mockResolvedValueOnce(
+        page(range(2997, 3000), { durableSeq: "5000", windowFromSeq: "2997", reachedAfterSeq: false }),
+      );
+    const prepended: number[][] = [];
+    const client = new JournalClient("obj_journal" as Id, reads, {
+      onPrepend: (events) => prepended.push(events.map((e) => Number(e.seq))),
+    });
+    client.applySnapshot({
+      ...snapshot(5_000),
+      history: { earliestRetainedSeq: "3001", complete: false },
+    });
+
+    await expect(client.loadEarlier()).resolves.toBe("1001");
+    expect(prepended).toHaveLength(1);
+
+    // Non-empty but fully deduped: no second onPrepend, floor retired.
+    await expect(client.loadEarlier()).resolves.toBeNull();
+    expect(prepended).toHaveLength(1);
+    expect(client.retainedFloorSeq).toBe("1");
+    // Retired floor short-circuits: no third read is attempted.
+    await expect(client.loadEarlier()).resolves.toBeNull();
+    expect(reads).toHaveBeenCalledTimes(2);
+  });
 });
 
 it("a contiguous socket batch supersedes a pending resume read that later rejects (item 9)", async () => {

@@ -660,9 +660,14 @@ function TranscriptInner({
         el.scrollTop += delta;
         scrollTopRef.current = el.scrollTop;
       } else {
-        const index = nodesRef.current.findIndex((n) => n.id === pending.anchorId);
+        // The anchor is not mounted yet: jump toward its estimated offset so
+        // the window mounts it, then later passes correct against the real
+        // row. Use THIS commit's lists — on a load-earlier prepend the refs
+        // are still the pre-prepend lists (their sync effect is passive), so
+        // the refs would resolve the anchor at its old index.
+        const index = nodes.findIndex((n) => n.id === pending.anchorId);
         if (index >= 0) {
-          const { offsets } = rowOffsets(nodesRef.current.length, sizesHold.current, estimateRef.current);
+          const { offsets } = rowOffsets(nodes.length, sizes, estimate);
           const top = Math.round((offsets[index] ?? 0) + pending.offset);
           el.scrollTop = top;
           scrollTopRef.current = top;

@@ -226,12 +226,30 @@ function TranscriptInner({
   const saveTimer = useRef<number | null>(null);
   const pendingScroll = useRef<
     | { kind: "index"; index: number; offset: number; tries: number }
-    | { kind: "restore"; anchorId: string; offset: number; tries: number }
+    | {
+        kind: "restore";
+        anchorId: string;
+        offset: number;
+        tries: number;
+        /**
+         * Load-earlier restores only: the anchor's index when the click was
+         * armed. The restore stays inert until rows are actually inserted
+         * BEFORE it (its index advances), so a live append / late row-growth
+         * commit landing during the fetch cannot clear it with a pre-prepend
+         * delta of 0. Absent on saved-position restores, which act at once.
+         */
+        awaitIndex?: number;
+      }
     | null
   >(null);
   // Held anchor for a load-earlier prepend; repinned across post-prepend
   // estimate/size changes (see the effect near the scroll math).
-  const prependAnchorRef = useRef<{ anchorId: string; offset: number; tries: number } | null>(null);
+  const prependAnchorRef = useRef<{
+    anchorId: string;
+    offset: number;
+    tries: number;
+    armedIndex: number;
+  } | null>(null);
   // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
   // click on a held transcript row posts exactly once.
   const steeringRef = useRef<Set<string>>(new Set());
@@ -426,12 +444,13 @@ function TranscriptInner({
     // the prepend commit itself; with the page body no longer re-rendering on an
     // incidental 1 s/2 s tick, the anchor effects never re-ran and the anchor
     // row stayed unmounted. Armed up front, the prepend commit runs the restore.
+    const armedIndex = range.start;
     if (anchorId) {
       restoringRef.current = true;
-      pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0 };
+      pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0, awaitIndex: armedIndex };
       // Keep repinning as the prepended (unmeasured) rows settle; the
       // one-shot restore effect alone stops before the average converges.
-      prependAnchorRef.current = { anchorId, offset, tries: 0 };
+      prependAnchorRef.current = { anchorId, offset, tries: 0, armedIndex };
     }
     setLoadingEarlier(true);
     let floor: string | null = null;
@@ -537,6 +556,11 @@ function TranscriptInner({
     const held = prependAnchorRef.current;
     const el = scrollerRef.current;
     if (!held || !el || !nodesRef.current.length) return;
+    // Wait for the prepend itself: inert while the anchor still sits at its
+    // armed index (a live append or row-growth commit during the fetch must
+    // neither repin nor burn the stable-pass budget).
+    const anchorIndex = nodes.findIndex((n) => n.id === held.anchorId);
+    if (anchorIndex < 0 || anchorIndex <= held.armedIndex) return;
     const rowEl = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.anchorId)}"]`);
     if (!rowEl) {
       // Anchor not mounted yet (the pendingScroll restore runs after this
@@ -612,6 +636,13 @@ function TranscriptInner({
     const pending = pendingScroll.current;
     if (!el || !pending || !nodesRef.current.length) return;
     if (pending.kind === "restore") {
+      if (pending.awaitIndex !== undefined) {
+        const armed = nodes.findIndex((n) => n.id === pending.anchorId);
+        // The older page has not landed yet (the read is in flight). Stay
+        // armed without scrolling or burning the retry budget on the
+        // pre-prepend commits a live append / row growth may cause meanwhile.
+        if (armed < 0 || armed <= pending.awaitIndex) return;
+      }
       // Estimate a starting position from the saved average, then correct
       // against the anchor's real DOM position once the window mounts it.
       // Pure estimate math drifts because the sets of already-measured rows

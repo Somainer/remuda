@@ -82,6 +82,43 @@ for a single listing, or compact newline-delimited snapshots when watching,
 with `items`, `stream`, and `stale`. Instance rows retain IDs, host link state,
 and separate lifecycle/activity/connectivity fields for automation.
 
+## Planned: seating and dispatch permission flags (D-057)
+
+Planned, not yet implemented. The `instance create` flags land with the
+Phase 1 task `ma-seat-cli`; `dispatch --permission-mode` lands with
+`ma-admission`. Until then the CLI rejects them as unknown arguments. The
+design is [main-agent.md §3.2 and §4.2](./main-agent.md#32-seating).
+
+`remuda instance create` gains flags for fields `CreateInstanceBody` already
+accepts, plus `restart`:
+
+| Flag | Body field | Meaning |
+| --- | --- | --- |
+| `--role <preset>` | `role` | Preset name (`worker`, `project-coordinator`, `top-coordinator`), expanded once into grants at create and kept for display. Enforcement reads grants, never the role. |
+| `--grant <verb>` | `grants` | Repeatable: `address-owner`, `dispatch`, `land`, `spend`. Explicit grants replace the preset's bundle. |
+| `--scope-project <prj_…>` | `scope.projectIds` | Repeatable. Scope only narrows along the delegation tree. |
+| `--scope-host <hst_…>` | `scope.hostIds` | Repeatable. |
+| `--scope-workspace <wsp_…>` | `scope.workspaceIds` | Repeatable. |
+| `--project <prj_…>` | `projectId` | Single-project shortcut when no explicit project scope is given. |
+| `--permission-mode <mode>` | `permissionMode` | A value from the harness's own vocabulary. For an Agent caller, a mode that switches the harness's own permission control off is admitted only if the caller itself runs with it off, and an omitted mode inherits the caller's own mode (D-057). |
+| `--model <id>` | `model` | Model id. |
+| `--restart process-loss:<max-per-hour>` | `restart` | Sets `{onProcessLoss: true, maxPerHour}`. Human devices only; Agent and Bot callers get 403. The suggested cap is 3 per hour. |
+
+The existing `--host`, `--workspace-id`, `--kind`, `--driver`, `--name`,
+`--title` and `--prompt-file` flags are unchanged.
+
+`remuda dispatch` gains `--permission-mode <mode>` with the same vocabulary.
+A Human-origin dispatch without it keeps today's default byte for byte. An
+Agent-origin dispatch without it inherits the caller's own mode; the
+framework picks no new mode.
+
+A Claude dispatch without `--carrier` prefers the Node's native `shell-pty`
+whenever the Node reports it launchable. `shell-pty` is a shell driver, so for
+an Agent caller that dispatch asks the owner for a one-shot approval (D-017).
+The same-host paths that need no approval are an explicit `--carrier herdr`
+for Claude, or a codex/grok worker, on a host whose record advertises herdr.
+Cross-host dispatch by an Agent asks once per dispatch.
+
 ## Local Git worktrees
 
 ```sh

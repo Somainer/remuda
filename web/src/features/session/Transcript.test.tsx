@@ -1554,17 +1554,22 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
     });
     class GeometryRO {
       private readonly cb: () => void;
+      private el: Element | null = null;
       constructor(cb: () => void) {
         this.cb = cb;
       }
       observe(el: Element) {
+        this.el = el;
         observerCbs.set(el, this.cb);
       }
       unobserve(el: Element) {
-        observerCbs.delete(el);
+        if (observerCbs.get(el) === this.cb) observerCbs.delete(el);
       }
       disconnect() {
-        observerCbs.clear();
+        // Real ResizeObserver disconnects only THIS observation: unmounting a
+        // row must not drop the surviving rows' callbacks from the map.
+        if (this.el && observerCbs.get(this.el) === this.cb) observerCbs.delete(this.el);
+        this.el = null;
       }
     }
     vi.stubGlobal("ResizeObserver", GeometryRO);
@@ -2045,17 +2050,22 @@ describe("load-earlier anchor lifecycle round 5", () => {
     });
     class GeoRO {
       private readonly cb: () => void;
+      private el: Element | null = null;
       constructor(cb: () => void) {
         this.cb = cb;
       }
       observe(el: Element) {
+        this.el = el;
         observerCbs.set(el, this.cb);
       }
       unobserve(el: Element) {
-        observerCbs.delete(el);
+        if (observerCbs.get(el) === this.cb) observerCbs.delete(el);
       }
       disconnect() {
-        observerCbs.clear();
+        // Real ResizeObserver disconnects only THIS observation: unmounting a
+        // row must not drop the surviving rows' callbacks from the map.
+        if (this.el && observerCbs.get(this.el) === this.cb) observerCbs.delete(this.el);
+        this.el = null;
       }
     }
     vi.stubGlobal("ResizeObserver", GeoRO);
@@ -2643,6 +2653,163 @@ describe("load-earlier anchor lifecycle round 5", () => {
       await act(async () => {});
       const before = geo.top();
       geo.growRow(4, ROW + 40);
+      expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+    });
+  });
+
+  // UO-6a round 6 item 3: a route switch must reset EVERY restore field, not
+  // just the estimate freeze — the settle timer, the loading latch, the held
+  // anchor/pending restore and the request identity.
+  describe("round 6 item 3: route switch resets every restore field", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("clears the armed settle timer and all anchors when switching mid-settle", async () => {
+      const user = userEvent.setup();
+      const writes: number[] = [];
+      const geo = installGeo(50, { onWrite: (v) => writes.push(v) });
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      // A: a 20-row tail plus a final 30-row page; after the prepend the armed
+      // anchor sits 30 rows deep, unmounted — only the settle timer holds it.
+      const aTail: Observation[] = [];
+      for (let i = 0; i < 20; i += 1) aTail.push(m(31 + i, i % 2 === 0 ? "user" : "assistant", "insResetA"));
+      const aOlder: Observation[] = [];
+      for (let seq = 1; seq <= 30; seq += 1) aOlder.push(m(seq, seq % 2 ? "user" : "assistant", "insResetA"));
+      const gA = gate<ReturnType<typeof pageOf>>();
+      // The store call stays UNFINISHED after the client already emitted the
+      // prepend: the route switch happens with the click genuinely in flight
+      // (loading latch + request identity held), not in its finally.
+      const returnGate = gate<void>();
+      makeClient(reg, "insResetA", aTail, () => gA.promise, "31", "50");
+      // B: a 200-node window, floor above 1 so it shows its own pager.
+      const bEvents: Observation[] = [];
+      for (let i = 0; i < 200; i += 1) bEvents.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insResetB"));
+      makeClient(reg, "insResetB", bEvents, vi.fn<JournalRead>().mockResolvedValue(pageOf([])), "1001", "1200");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        if (instanceId === "insResetA") await returnGate.promise;
+        return result;
+      });
+
+      function GoB() {
+        const navigate = useNavigate();
+        return (
+          <button type="button" data-testid="go-b" onClick={() => navigate("/s/insResetB")}>
+            go
+          </button>
+        );
+      }
+
+      render(
+        <MemoryRouter initialEntries={["/s/insResetA"]}>
+          <Routes>
+            <Route
+              path="/s/:instanceId"
+              element={
+                <>
+                  <Driver reg={reg} compact={false} />
+                  <GoB />
+                </>
+              }
+            />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+      // Let the manual scroll's real-timer persist debounce flush so only the
+      // restore's own timers remain once fake time starts.
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 300));
+      });
+
+      vi.useFakeTimers();
+      await act(async () => {
+        gA.resolve(pageOf(aOlder, true));
+        await Promise.resolve();
+      });
+      // Fire the restore writes' rAFs (scheduled during the landing commit);
+      // the 800ms settle timer is then the only pending timer.
+      act(() => {
+        vi.advanceTimersByTime(50);
+      });
+      expect(vi.getTimerCount()).toBe(1);
+      writes.length = 0;
+
+      // Switch routes WHILE A's restore is settling: the render-phase reset
+      // must clear the settle timer and every restore ref.
+      geo.setTotal(200);
+      act(() => {
+        fireEvent.click(screen.getByTestId("go-b"));
+      });
+      act(() => {
+        vi.advanceTimersByTime(50);
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      // loadingEarlier reset: B's own pager is enabled, not stuck on A's click.
+      expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
+      // pinRef reset: a fresh B session pins to the tail, which writes the
+      // mount scrollHeight right here (A's click had left pinRef false — a
+      // leak suppresses the pin write and the cleared log stays empty).
+      expect(writes).toContain(200 * ROW);
+
+      // Past A's settle deadline: no late correction toward A's anchor (30
+      // rows deep) may land on B, and no timer is ever re-armed.
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(writes).not.toContain(30 * ROW);
+
+      // The rest mirrors real timing: restoringRef reset lets B's estimate
+      // converge, and the anchor reset leaves growth anchoring working.
+      vi.useRealTimers();
+
+      // A's click finally lands late: its request identity was superseded by
+      // the route reset, so it must not finalize anything on B or restore A's
+      // anchor (30 rows deep).
+      await act(async () => {
+        returnGate.resolve();
+        await Promise.resolve();
+      });
+      expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
+      expect(writes).not.toContain(30 * ROW);
+
+      // Estimate convergence (same geometry as the round-5 route test):
+      // frozen at 96 the hit lands near 4064, converged past 4500.
+      for (let pass = 0; pass < 4; pass += 1) {
+        const rows = geo.scroller().querySelectorAll<HTMLElement>("[data-anchor]");
+        await act(async () => {
+          rows.forEach((_row, idx) => {
+            if (idx >= rows.length - 16) geo.growRow(idx, 200);
+          });
+        });
+      }
+      await user.click(screen.getByTestId("transcript-search-open"));
+      await user.type(screen.getByTestId("transcript-search-input"), "insResetB-m1026");
+      await user.keyboard("[Enter]");
+      expect(geo.top()).toBeGreaterThan(4500);
+
+      // The geometry harness does not echo programmatic scrollTop writes into
+      // a scroll event, so React's scrollTop state still renders the head:
+      // re-dispatch the hit position to mount the hit rows, let the search
+      // refinement clear, and THEN verify the reading anchor works — a leaked
+      // prepend anchor makes its hold bail for the whole session.
+      geo.scrollTo(geo.top());
+      for (let flush = 0; flush < 5; flush += 1) {
+        await act(async () => {});
+      }
+      geo.scrollTo(25 * ROW);
+      await act(async () => {});
+      const before = geo.top();
+      // A mounted row above the sampled anchor grows: a leaked prepend anchor
+      // makes the reading-anchor hold bail for the whole session, so the
+      // scroller would stay put instead of compensating by ~40px.
+      geo.growRow(4, ROW + 40);
+      await act(async () => {});
       expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
     });
   });

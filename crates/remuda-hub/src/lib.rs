@@ -104,6 +104,12 @@ pub struct AppState {
     secrets: Arc<FileSecretStore>,
     nodes: ConnectedNodes,
     bus: Bus,
+    /// c-cardsettle: DEDICATED low-traffic bus for settlement control notices.
+    /// These ride separately from the high-volume journal bus so a follower
+    /// lagging on a journal burst during page load cannot permanently miss the
+    /// one-shot "your card was invalidated" notice (settlements are rare and
+    /// tiny, so this channel effectively never lags).
+    settlement_bus: tokio::sync::broadcast::Sender<crate::ws::SettlementNotice>,
     tty: crate::ws::TtyRelay,
     /// D-048 relay stream registry (per-Hub-process).
     api_relay: crate::api_relay::ApiRelay,
@@ -132,10 +138,16 @@ impl AppState {
     /// regardless, so a missed notice is self-healing.
     pub(crate) fn broadcast_settlement(&self, settlement: &Settlement) {
         for (instance_id, interaction_id) in &settlement.interactions {
-            self.bus.publish(crate::ws::FollowEvent::settlement(
-                instance_id.clone(),
-                interaction_id.clone(),
-            ));
+            // Publish on the DEDICATED settlement bus (not the journal bus): a
+            // follower lagging on a journal burst during page load must not
+            // miss the one-shot terminal notice. Recent settlements are also
+            // replayed to unfiltered followers on connect (see follow_session).
+            let _ = self.settlement_bus.send(crate::ws::SettlementNotice {
+                instance_id: instance_id.clone(),
+                interaction_id: interaction_id.clone(),
+                state: "invalidated".to_string(),
+                reason: "generation-ended".to_string(),
+            });
         }
     }
 
@@ -733,6 +745,12 @@ async fn spawn_inner(
         secrets: Arc::new(secrets),
         nodes: crate::transport::ConnectedNodes::default(),
         bus: Bus::with_capacity(config.follow_buffer_events),
+        settlement_bus: {
+            // Settlements are rare control notices; a small capacity is plenty
+            // and keeps a lagging follower from skipping the terminal state.
+            let (tx, _rx) = tokio::sync::broadcast::channel(64);
+            tx
+        },
         tty: crate::ws::TtyRelay::default(),
         api_relay: crate::api_relay::ApiRelay::new(),
         push,

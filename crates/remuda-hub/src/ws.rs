@@ -39,6 +39,21 @@ use tokio::sync::{broadcast, mpsc};
 /// Cap on remembered tty stream bindings across all hosts.
 const MAX_TTY_STREAMS: usize = 1_024;
 
+/// c-cardsettle: one interaction invalidated because its instance ended.
+/// Carried on the dedicated low-traffic [`AppState::settlement_bus`] (not the
+/// journal bus) so a follower lagging on journal frames cannot miss it.
+#[derive(Clone, Debug)]
+pub struct SettlementNotice {
+    /// Owning instance (used to filter per-instance followers).
+    pub instance_id: String,
+    /// The interaction id that was invalidated.
+    pub interaction_id: String,
+    /// Terminal state ("invalidated").
+    pub state: String,
+    /// Resolution reason ("generation-ended").
+    pub reason: String,
+}
+
 /// Live event for `/v1/follow`.
 #[derive(Clone, Debug)]
 pub struct FollowEvent {
@@ -50,12 +65,6 @@ pub struct FollowEvent {
     pub event: Value,
     /// Binary `tty.frame` envelope when this is TTY output.
     pub binary: Option<Vec<u8>>,
-    /// c-cardsettle: a Hub-side settlement notice (an interaction invalidated
-    /// because its instance ended). This is NOT a journal observation: the Hub
-    /// forges no Node journal seq, it carries no journal position, and it is
-    /// delivered as a `settlement` control frame so followers can never insert
-    /// it into a journal or mark a journal stale/duplicate.
-    pub hub_settlement: bool,
 }
 
 impl FollowEvent {
@@ -67,25 +76,6 @@ impl FollowEvent {
             seq,
             event,
             binary: None,
-            hub_settlement: false,
-        }
-    }
-
-    /// c-cardsettle: Hub settlement notice for one invalidated interaction.
-    /// No journal seq (`seq` is 0 and never serialised for settlement frames).
-    #[must_use]
-    pub fn settlement(instance_id: impl Into<String>, interaction_id: impl Into<String>) -> Self {
-        Self {
-            instance_id: instance_id.into(),
-            seq: 0,
-            event: json!({
-                "type": "settlement",
-                "interactionId": interaction_id.into(),
-                "state": "invalidated",
-                "reason": "generation-ended",
-            }),
-            binary: None,
-            hub_settlement: true,
         }
     }
 }
@@ -794,7 +784,6 @@ pub(crate) async fn handle_node_method(
                             seq: 0,
                             event: json!({ "type": "tty.frame", "params": params }),
                             binary: Some(frame),
-                            hub_settlement: false,
                         });
                     }
                 } else {
@@ -1185,7 +1174,6 @@ fn handle_tty_binary(state: &AppState, host_id: &str, bytes: &[u8]) {
             "payloadLength": payload.len(),
         }),
         binary: Some(bytes.to_vec()),
-        hub_settlement: false,
     });
 }
 
@@ -1331,6 +1319,8 @@ async fn follow_session(
     let (out_tx, mut out_rx) = mpsc::channel::<FollowMsg>(cap);
     let (mut sink, mut stream) = socket.split();
     let mut rx = state.bus.subscribe();
+    // c-cardsettle: separate receiver on the dedicated settlement bus.
+    let mut settlement_rx = state.settlement_bus.subscribe();
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
     for id in &instance_ids {
         state.followers.watch(device_id.clone(), id.clone()).await;
@@ -1355,6 +1345,29 @@ async fn follow_session(
                 .is_err()
             {
                 return;
+            }
+        }
+        // c-cardsettle r3 item 4: an UNFILTERED follower (the global inbox/
+        // settlement socket) gets the very recent invalidated interactions
+        // replayed on (re)connect, so a browser that misses the one-shot bus
+        // notice across a page-navigation socket churn still drops the card
+        // immediately instead of waiting on its (possibly halted) poll. The
+        // client de-dupes; a fresh load also converges via the durable list.
+        if instance_ids.is_empty()
+            && let Ok(recent) = state.store.recent_invalidated_interactions().await
+        {
+            for (instance_id, interaction_id) in recent {
+                let frame = json!({
+                    "type": "settlement",
+                    "instanceId": instance_id,
+                    "interactionId": interaction_id,
+                    "state": "invalidated",
+                    "reason": "generation-ended",
+                })
+                .to_string();
+                if out_tx.send(FollowMsg::Text(frame)).await.is_err() {
+                    return;
+                }
             }
         }
         loop {
@@ -1407,34 +1420,9 @@ async fn follow_session(
                             if !want_tty && event.event["type"] == "tty.mode" {
                                 continue;
                             }
-                            // c-cardsettle: a Hub settlement is a CONTROL frame,
-                            // not a journal observation. It carries no seq: it
-                            // can never be inserted into a journal or make a
-                            // follower mark its journal stale/duplicate. Clients
-                            // refresh the interaction list instead of cursoring.
-                            if event.hub_settlement {
-                                let send = FollowMsg::Text(json!({
-                                    "type": "settlement",
-                                    "instanceId": event.instance_id,
-                                    "interactionId": event.event["interactionId"],
-                                    "state": event.event["state"],
-                                    "reason": event.event["reason"],
-                                }).to_string());
-                                match out_tx.try_send(send) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        // Backpressure must not drop a settlement
-                                        // silently: the resync snapshot carries
-                                        // the durable (already-invalidated) rows.
-                                        if resync_after_gap(&state, &out_tx, &instance_ids, want_tty).await.is_err()
-                                        {
-                                            return;
-                                        }
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
-                                }
-                                continue;
-                            }
+                            // c-cardsettle settlements arrive on the dedicated
+                            // settlement_bus select arm below; the journal bus
+                            // carries only journal/TTY frames now.
                             let send = if want_tty && let Some(binary) = event.binary {
                                 FollowMsg::Binary(binary)
                             } else if event.binary.is_some() {
@@ -1460,6 +1448,51 @@ async fn follow_session(
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             if resync_after_gap(&state, &out_tx, &instance_ids, want_tty).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                // c-cardsettle: the dedicated settlement notice. Backpressure
+                // here must AWAIT (never try_send/drop): this channel is low
+                // traffic and the notice is the whole reason a poll-stopped
+                // client drops the card. Each follower is an independent task,
+                // so awaiting one slow writer cannot stall another.
+                notice = settlement_rx.recv() => {
+                    match notice {
+                        Ok(notice) => {
+                            if !instance_ids.is_empty()
+                                && !instance_ids.iter().any(|id| id == &notice.instance_id)
+                            {
+                                continue;
+                            }
+                            let frame = json!({
+                                "type": "settlement",
+                                "instanceId": notice.instance_id,
+                                "interactionId": notice.interaction_id,
+                                "state": notice.state,
+                                "reason": notice.reason,
+                            }).to_string();
+                            if out_tx
+                                .send(FollowMsg::Text(frame))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // Settlements are tiny and the bus is generously
+                            // sized; a lag here is effectively impossible, but a
+                            // gap frame still lets the client refresh (its
+                            // durable row is already invalidated).
+                            let gap = json!({ "type": "gap", "reason": "settlement-backpressure" });
+                            if out_tx
+                                .send(FollowMsg::Text(gap.to_string()))
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }

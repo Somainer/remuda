@@ -696,6 +696,8 @@ class HubStore {
   private stopSettlementFollow: (() => void) | null = null;
   /** Trailing coalescer so a burst of settlement notices triggers one refresh. */
   private settlementRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Dev/observability: how many settlement frames THIS store handled. */
+  private settlementCount = 0;
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -1842,6 +1844,7 @@ class HubStore {
       // interaction refresh; missed notices converge on the next 2 s poll.
       this.stopSettlementFollow?.();
       this.stopSettlementFollow = api.settlementSubscribe((interactionId) => {
+        this.settlementCount += 1;
         // Install the terminal pin against the CURRENT list seq BEFORE
         // refreshing, so an older in-flight poll resolving last cannot
         // resurrect the settled card (r2 item 4).
@@ -1978,8 +1981,17 @@ class HubStore {
    * attributed to the settlement follow frame instead of polling. */
   private installDevHandle() {
     if (!import.meta.env.DEV || typeof window === "undefined") return;
-    (window as unknown as { __remudaHub?: { stopPoll: () => void } }).__remudaHub = {
+    (window as unknown as {
+      __remudaHub?: {
+        stopPoll: () => void;
+        settlementCount: () => number;
+        interactionState: (id: string) => string | undefined;
+      };
+    }).__remudaHub = {
       stopPoll: () => this.stopPoll(),
+      settlementCount: () => this.settlementCount,
+      interactionState: (id: string) =>
+        this.state.interactions.find((row) => row.id === id)?.state,
     };
   }
 

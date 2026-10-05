@@ -153,9 +153,8 @@ async function answerStatus(
 }
 
 test.describe("390px cardsettle: pending card drops when its session ends", () => {
-  /** Inbound settlement frames captured from BEFORE login, when the store's
-   * global follow socket is opened at bootstrap. */
-  let settlementFrames: string[];
+  /** Settlement frames per follow socket URL, captured from before login. */
+  let settlementFramesByUrl: Record<string, string[]>;
 
   test.use({
     viewport: { width: 390, height: 844 },
@@ -164,13 +163,11 @@ test.describe("390px cardsettle: pending card drops when its session ends", () =
   });
 
   test.beforeEach(async ({ page }) => {
-    settlementFrames = [];
-    // Register before login: the settlement follow socket is created at
-    // bootstrap, so a listener added afterwards would miss it.
+    settlementFramesByUrl = {};
     page.on("websocket", (ws) => {
       ws.on("framereceived", ({ payload }) => {
         if (typeof payload === "string" && payload.includes('"type":"settlement"')) {
-          settlementFrames.push(payload);
+          (settlementFramesByUrl[ws.url()] ??= []).push(payload);
         }
       });
     });
@@ -212,16 +209,53 @@ test.describe("390px cardsettle: pending card drops when its session ends", () =
     // End the instance for real: new-epoch node hello omits it.
     await endInstance(page, instanceId);
 
-    // The settlement control frame for THIS card is observed on the wire…
+    // The settlement control frame for THIS card is observed on SOME socket…
     await expect
       .poll(
         () =>
-          settlementFrames.some((text) =>
-            text.includes(`"interactionId":"${interactionId}"`),
-          ),
+          Object.values(settlementFramesByUrl)
+            .flat()
+            .some((text) => text.includes(`"interactionId":"${interactionId}"`)),
         { timeout: 20_000 },
       )
       .toBe(true);
+
+    // The frame is observed on an unfiltered /v1/follow socket (the store's
+    // own global settlement socket is one of these; the per-instance session
+    // socket cannot carry it here).
+    const carryingUrls = Object.entries(settlementFramesByUrl)
+      .filter(([, frames]) =>
+        frames.some((text) => text.includes(`"interactionId":"${interactionId}"`)),
+      )
+      .map(([url]) => new URL(url).search);
+    expect(
+      carryingUrls,
+      "the settlement must arrive on the unfiltered follow bus",
+    ).toContain("");
+
+    // The store's OWN global settlement callback fired and its immediate pin
+    // already projects the card invalidated — with polling stopped this is the
+    // only thing that can remove the card, so the assertion fails if
+    // settlement handling is a no-op.
+    const storeState = () =>
+      page.evaluate((iid) => {
+        const debug = (window as unknown as {
+          __remudaHub?: {
+            settlementCount: () => number;
+            interactionState: (id: string) => string | undefined;
+          };
+        }).__remudaHub;
+        return {
+          count: debug?.settlementCount() ?? 0,
+          state: debug?.interactionState(iid) ?? "missing",
+        };
+      }, interactionId);
+    await expect
+      .poll(async () => (await storeState()).count, { timeout: 10_000 })
+      .toBeGreaterThan(0);
+    await expect
+      .poll(async () => (await storeState()).state, { timeout: 5_000 })
+      .toBe("invalidated");
 
     // …and the card leaves the queue and the badge agrees with NO reload and
     // NO periodic poll — the frame-driven refresh did it. Plain eventual

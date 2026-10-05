@@ -4205,6 +4205,41 @@ impl Store {
         .await
     }
 
+    /// c-cardsettle r3 item 4: recent `(instance_id, interaction_id)` pairs
+    /// invalidated within the replay window. A settlement notice is one-shot on
+    /// the live bus and a browser can miss it during a page-navigation socket
+    /// churn; replaying the very recent terminal rows when an unfiltered follow
+    /// socket connects makes the push reconnect-safe (the client de-dupes by
+    /// pin/state). Window is deliberately short (a reload already converges via
+    /// the durable interaction list; this only closes the navigation gap).
+    pub async fn recent_invalidated_interactions(
+        &self,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        self.run_named("recent_invalidated_interactions", move |conn| {
+            // RFC3339 timestamps use a `T` separator; SQLite `datetime()` uses a
+            // space, so a lexical string compare is wrong. Compare on
+            // julianday (both forms parse) against a 5-minute lookback.
+            let mut stmt = conn.prepare(
+                "SELECT instance_id, id FROM interactions
+                 WHERE state = 'invalidated'
+                   AND julianday(updated_at) >= julianday('now','-5 minutes')
+                 UNION
+                 SELECT instance_id, id FROM interaction_tombstones
+                 WHERE state = 'invalidated'
+                   AND julianday(updated_at) >= julianday('now','-5 minutes')",
+            )?;
+            let rows = stmt.query_map(params![], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// One interaction by id.
     pub async fn get_interaction(
         &self,
@@ -7539,6 +7574,65 @@ mod tests {
 
     /// Age an interaction row's updated_at so the 24 h departed retention can
     /// be tested without sleeping.
+    /// c-cardsettle r3 item 4: the replay-on-connect window returns recent
+    /// invalidated rows (live and tombstoned) but not aged or pending rows.
+    #[tokio::test]
+    async fn recent_invalidated_interactions_replay_window() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "recent-invalidated").await;
+
+        // Fresh invalidated (live row): included.
+        let fresh = seed_acknowledged_instance(&store, &host).await;
+        let fresh_int = seed_pending_interaction(&store, &host, &fresh.instance_id).await;
+        let (_, _) = store
+            .settle_instance_exited(fresh.instance_id.clone(), "x".into())
+            .await
+            .expect("settle");
+
+        // Aged invalidated: excluded (older than the 5-minute replay window).
+        let aged = seed_acknowledged_instance(&store, &host).await;
+        let aged_int = seed_pending_interaction(&store, &host, &aged.instance_id).await;
+        let (_, _) = store
+            .settle_instance_exited(aged.instance_id.clone(), "x".into())
+            .await
+            .expect("settle");
+        backdate_interaction(&store, &aged_int, 1).await;
+
+        // Tombstoned fresh: included.
+        let deleted = seed_acknowledged_instance(&store, &host).await;
+        let deleted_int = seed_pending_interaction(&store, &host, &deleted.instance_id).await;
+        let (_, _) = store
+            .settle_instance_exited(deleted.instance_id.clone(), "x".into())
+            .await
+            .expect("settle");
+        assert!(
+            store
+                .delete_instance(deleted.instance_id)
+                .await
+                .expect("delete")
+        );
+
+        // Still-pending: never replayed as a settlement.
+        let pending = seed_acknowledged_instance(&store, &host).await;
+        let _pending_int = seed_pending_interaction(&store, &host, &pending.instance_id).await;
+
+        let recent = store
+            .recent_invalidated_interactions()
+            .await
+            .expect("recent");
+        let ids: std::collections::HashSet<String> = recent.into_iter().map(|(_, id)| id).collect();
+        assert!(ids.contains(&fresh_int), "fresh invalidated replayed");
+        assert!(ids.contains(&deleted_int), "fresh tombstone replayed");
+        assert!(!ids.contains(&aged_int), "aged invalidated outside window");
+        assert!(
+            !ids.iter().any(|id| id == &_pending_int),
+            "pending rows are not settlements"
+        );
+        store.close().await;
+    }
+
     async fn backdate_interaction(store: &Store, interaction_id: &str, hours: i64) {
         let interaction_id = interaction_id.to_owned();
         store

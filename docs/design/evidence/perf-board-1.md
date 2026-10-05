@@ -405,3 +405,90 @@ task-model-board、task-model-boardui、uo13-evidence）：**
 - 不做虚拟列表：80 卡级别安静轮询已零提交、单波 <5 ms，没有必要。
 - 初始 chunk 内仍保留 Shell/router/store：再往下切（如把 lucide 图标
   按需化）收益小且动到全站 chrome，留给后续批次。
+
+## 7 落地闸门二次失败复核与 SW 路由 chunk 预缓存（c-perffu r8，2026-10-05/06）
+
+r7 验收通过后落地闸门（chromium 全量 hub 套件，39.0 min）报 250
+passed / 3 failed / 2 flaky。owner 裁决：service worker 预缓存全部路由
+chunk。逐条复核：
+
+### 7.1 offline-outbox:323（重连后 journal 0 vs 1）——环境既有，非本分支
+
+闸门错误不是"chunk 加载失败/错误面板"，而是重连后
+`hubJournalMessageCount(...).toBe(1)`（spec:365）30 s 超时收到 0：
+instance.send 的 command 行存在，fake Node 的用户消息 journal 帧没落进
+Hub 尾部窗口。fake Node（crates/remuda-hub/examples/hub_e2e.rs）对
+instance.send 先 `journal.append`（等 Hub 5 s ack）再回裸 `{ok:true}`，
+Hub 因此每次都打 `node did not durably accept ... result:{ok:true}`——
+这是该 fixture 的正常噪声；CPU/IO 饥饿时该帧/ack 时序丢帧。
+
+关键事实：**闸门 hub 套件跑的是 Vite dev，不注册 service worker**
+（`startPWA` 仅 `import.meta.env.PROD` 注册），"只 precache shell、reload
+拿不到路由 chunk"在该环境不可能发生。
+
+同机对照（gate-e2e.lock 内；crates/ 与 origin/main 零 diff，共用同一
+hub_e2e 二进制，仅切换 Vite 服务的前端工作树）：
+
+| 实验 | 结果 |
+|---|---|
+| origin/main + 60 CPU hog，单跑该 reload 用例 | 同样失败（:365, 0 vs 1） |
+| 同一噪声窗口 main↔分支交替 4 轮（正常负载） | 分支 3 失败 / main 2 失败，错误逐字一致 |
+| 分支，邻居高负载窗口 8 连 | 仅 1 次全过，失败全部只此用例 |
+| 分支，安静窗口（1m loadavg 4–5）5 次尝试 | 通过/失败/通过/通过/**通过**，末尾三连 |
+
+失败随机器窗口来去、两棵前端树同窗口同概率翻转 → 与 §5.4 同族的共享机
+饥饿 flake，不是 lazy chunk/precache/前端改动引入。
+
+### 7.2 uo10 xterm 主题（:314、:402）——断言在 PTY 回显哨兵，不在主题订阅
+
+闸门两处失败都在 `bufferText().includes(UO10_SENTINEL)`：:314 失败于
+第 341 行（切主题**之前**），:402 失败于第 482 行（第 476 行主题切换
+断言已先通过）。没有一处失败在 matchMedia/主题订阅/xterm option 断言
+上；lazy 化 TerminalView 未推迟 `useTerminalAppearance` 的订阅。
+
+对照：60 hog 下 4 个主题用例分支 4 passed；origin/main 全 spec 60 hog
+13 passed；分支全 spec 13 passed ×3（7.4 表）。同族 PTY 回显时序。
+
+### 7.3 font-swap（:382、:387）——确认既有，不在本任务修
+
+失败字符串与 r6/r7 记录逐字相同（800 ms 延迟 woff2 与 restore 赛跑，
+`swappedBeforeRestore=true`）。r7 已在同机 origin/main 对照抓到
+:382/:387；本轮 60 hog 下 main 连跑 6 次 0 翻转（概率性）。
+sw.src.js/Transcript 本分支此前未触碰。按 owner 指示不修。
+
+### 7.4 修复：SW 预缓存全部路由 chunk（唯一代码改动）
+
+- `web/sw-build.ts`：新增第二个构建期占位符 `__PRECACHE_MANIFEST__`；
+  导出 `derivePrecacheUrls(bundle)`，从 Vite generateBundle 图派生——
+  index.html 引用的入口 chunk 出发，取 `imports` 与 **`dynamicImports`
+  全闭包**（lazyRoutes.ts 的全部页面 chunk 及传递依赖），加每个 chunk
+  `viteMetadata.importedCss/importedAssets`（CSS、KaTeX/Plex 字体）。
+  构建期生成、随构建版本进入 sw.js 字节，绝不手维护。Rolldown 会把零
+  代码 chunk（mathKatex，仅承载 CSS/字体归属）留在图中但写出时剪枝；
+  跳过其 .js、仍收其 CSS/字体，否则 install 的 addAll 404。
+- `web/sw.src.js`：install 时 `addAll(SHELL.concat(PRECACHE_URLS))`，
+  原子失败则不接管；旧构建保留各自缓存直到新 worker activate（无
+  skipWaiting，沿用"新版本"条流程）；真实 chunk 失败仍由 in-shell
+  RouteErrorBoundary 兜住（r2-4 未动）。dev 中间件盖空清单。
+- 实测生产构建清单 96 项，全部存在于 dist：52 JS（14 路由 chunk +
+  闭包）、21 CSS、23 字体。
+
+测试：
+
+- 单测 sw-build.test.ts：闭包/去重排序/零代码 chunk/HTML 根选取/
+  Uint8Array，外加一次**真实生产构建**断言清单覆盖 lazyRoutes.ts 声明的
+  每个路由 chunk 且每项都是实际发出的文件（37 用例；全量 191 文件 /
+  2169 用例通过，0 unhandled）。
+- pwa-shell.hub 新增"离线首次访问从未访问的路由"：在线首装后断网深链
+  导航，从未加载的 route chunk 由 SW（`response.fromServiceWorker()`）
+  从预缓存满足并渲染；旧重部署用例保持通过，共 2 passed。
+
+验收（gate-e2e.lock 内，服务器在锁内、EXIT trap 清端口）：
+
+| 集合 | 结果 |
+|---|---|
+| offline-outbox 全 spec（安静窗口三连） | 3 passed ×3 |
+| uo10-evidence 全 spec ×3 | 13 passed ×3 |
+| pwa-shell（新增离线首访 + 旧重部署） | 2 passed |
+| m-shell | 4 passed |
+| typecheck / lint / unit / pnpm build | 全通过 |

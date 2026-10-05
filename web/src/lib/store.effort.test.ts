@@ -195,6 +195,30 @@ it("a level+flag push-down settles each axis independently", async () => {
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
+it("a rapid level→switch flip reads the freshest requested tier (D-056 race)", async () => {
+  const ctx = await startFollowing("rapid-flag");
+  const posts: { name?: string; ultracode?: boolean }[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  // Tier drag to xhigh...
+  const level = hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, false));
+  // ...and flip the switch on BEFORE the level POST resolves.
+  await hubStore.setUltracode(ctx.instance.id, true);
+  await level;
+
+  // The switch configure carries the FRESH xhigh tier, not the stale high.
+  const flagPost = posts.find((p) => p.ultracode === true);
+  expect(flagPost?.name).toBe("xhigh");
+  // The optimistic selection is xhigh + on.
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({
+    name: "xhigh",
+    ultracode: true,
+  });
+});
+
 it("a level clamp settles the level axis while the unobserved switch stays pending", async () => {
   const ctx = await startFollowing("clamp-flag");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);

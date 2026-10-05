@@ -3516,9 +3516,14 @@ class HubStore {
       flagSettled: effort.ultracode !== true && currentView?.ultracode !== true,
     };
     this.settledEffortPushdown.delete(instanceId);
+    // Optimistically adopt the requested axes SYNCHRONOUSLY, before the
+    // configure POST resolves: a second switch (e.g. the ultracode switch
+    // flipped right after a tier drag) must read the freshest requested tier
+    // from effortOf(), not the pre-POST value (D-056 rapid level→flag race).
     this.emit({
       effortNonces: { ...this.state.effortNonces, [instanceId]: nonce },
       effortPending: { ...this.state.effortPending, [instanceId]: pending },
+      effort: { ...this.state.effort, [instanceId]: effort },
     });
     try {
       await this.configure(instanceId, this.permissionModeOf(instanceId), { effort });

@@ -338,13 +338,36 @@ hog、同一套 595xx 端口、gate 构建的 hub_e2e 经 cargo shim 复用）�
 
 四个状态类失败在 origin/main 上同样出现，症状逐字一致（jumpto 实测
 `状态待确认…data-blocked="0"`、session-page `data-activity="idle"
-data-status="unknown"`）。机理：CPU 饥饿下 Hub↔Node WS 心跳错过 → Hub
-`mark_host_offline`/epoch changed → `connectivity='disconnected'` →
-`projectStatus` 返回 unknown、`projectInteraction` 返回 paused；这是
-Hub 服务端的 liveness 投影，c-perffu 的 store no-emit/时钟改动不涉及该
-路径（值合并与 main 完全相同，只少了内容未变时的 React 重渲）。
-正常负载下这些用例在本分支 4.6 分钟的完整集合里全部通过（两次运行，
-见下）。
+data-status="unknown"`）。
+
+**r7 复核后对机理的修正（撤回 r6 的「心跳错过」表述）：** fake e2e Node
+**没有心跳循环**，`crates/remuda-hub/src/ws.rs` 也没有心跳 watchdog
+（ws.rs 文件头注释明确 follow socket 无 idle heartbeat；主机链路上
+host 存活只看 socket 是否连着）。因此「心跳错过」不是触发路径。实际
+机制是 **CPU 饥饿导致 Hub↔Node 长连接 socket 被拆除**：fake Node 的
+单写者循环在每次 journal append 后同步等 Hub 应答
+（`wait_frame_ack`，5 s 超时），高负载下 Hub 应答/读取不及时，叠加
+TCP 回压（axum/tungstenite 写缓冲 128 KiB、follow 每 socket 256 事件
+有界队列，慢消费者溢出后 `resync_after_gap`）使 node↔Hub 的 WS 关闭；
+Hub 的 `node_session` 结束路径执行 `mark_host_offline`
+（`connectivity='disconnected'`、host.state=offline），于是
+`projectStatus` 返回 unknown、`projectInteraction` 返回 paused。
+**已实测/已排除（不夸大）**：
+
+| 事实 | 证据 |
+|---|---|
+| origin/main 在相同 60-hog 负载下出现同样四个失败 | §5.4 两次 main 对照；jumpto 字符串逐字一致 |
+| 失败时前端实例确为 connectivity 非 connected | 失败 DOM：`data-lifecycle="running" data-activity="idle" data-status="unknown"`（unknown 仅能由 connectivity≠connected 产生） |
+| 不是「相等轮询抑制吞掉 connectivity 变化」 | 单测 store.followLiveness：仅 connectivity 翻转（其余全等）的两次 refresh 都正常 emit |
+| socket 拆除经 mark_host_offline 写 connectivity | ws.rs node_session 结束路径 + store.rs SQL（代码路径） |
+
+**尚未逐帧坐实**：拆除发生在 Hub 还是 fake Node 一侧、具体是 write
+EPIPE 还是 5 s ack 超时——r7 带 1 s 状态轮询的负载运行因引导设备不在
+测试 workspace（/v1/hosts、/v1/instances 对其返回空作用域）没采到
+数据；这里只陈述代码上唯一能产生该 DB 投影的路径，不声称已抓到具体
+失败的 socket 操作。Hub 侧没有节点 liveness 宽限，任何拆除都立即落
+`disconnected`。c-perffu 的 store no-emit/时钟改动不在该路径上（值
+合并与 main 完全相同，且单测证明 connectivity 变化不会被抑制）。
 
 font-swap 是既有的**字体加载时序竞态**：spec 人为延迟 woff2 800 ms
 并断言延迟字体不在 restore 前到达；CPU 饥饿使该断言翻转。关键证据：
@@ -353,15 +376,27 @@ swappedBeforeRestore=true` 测量**逐字节相同**，且它在当前正常负�
 （load≈5）也翻转，与本任务前端改动无关（sw/src.js、Transcript 均未
 碰）。
 
-**正常负载（gate-e2e.lock 内）两次完整集合**（m-homeend、m-realdevice、
-m-jumpto、m-inbox、font-swap、task-model-board、
-task-model-boardui、uo13-evidence）：**两次均 27 passed / 11 skipped
-（uo13 未设 REMUDA_EVIDENCE）/ 1 failed，且唯一失败两次都是
-font-swap:382**（`FONTSWAP saved=252.453125 control=320.453125
-swappedBeforeRestore=true` 与 origin/main 逐字节相同）；四个状态类
-spec 两次全部通过。新增单测 `useStaleCutoffTick`
-「online recently-seen host never stale at mount or after ticks」
-在 30 分钟滴答下钉住在线主机永不判 stale。
+**正常负载完整集合（r6 两次 + r7 两个顺序集合，gate-e2e.lock 内；
+m-homeend、m-realdevice、m-jumpto、m-inbox、font-swap、
+task-model-board、task-model-boardui、uo13-evidence）：**
+
+- r6 两次（uo13 未设 env）：均 27 passed / 11 skipped / 1 failed（仅
+  font-swap:382）。
+- r7（2026-10-05，每个 spec 两次，其中一个集合设
+  REMUDA_EVIDENCE=1）：
+
+| 集合 | passed | skipped | failed |
+|---|---|---|---|
+| REMUDA_EVIDENCE=1（uo13 8 张全跑，含 /hosts→详情→/fleet 四宽度） | 37 | 2 | 1（font-swap:387） |
+| 不设 env（uo13 8 张 skip） | 27 | 11 | 1（font-swap:382） |
+
+四个状态类 spec 每次都全过（两集合合计 m-homeend 2、m-realdevice
+14、m-jumpto 10、m-inbox 13、task-model-board/boardui 各 8）；uo13
+证据截图重生成后已回滚不提交。唯一失败均为 font-swap 延迟字体竞态
+（382/387 各一次，`swappedBeforeRestore=true`，与 c-perffu 代码无关）。
+
+`useStaleCutoffTick` 的 r7 回归直接由 hook 时钟驱动离线行跨越：冻结/
+零时钟下失败（r6 旧用例绕过时钟，已替换）。
 
 ## 6 刻意不做
 

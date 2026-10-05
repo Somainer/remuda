@@ -232,6 +232,10 @@ impl DriverFactory for NativeClaudeFactory {
         self.kind
     }
 
+    fn requires_local_resume_transcript(&self) -> bool {
+        true
+    }
+
     fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError> {
         // D-045 gate 2, Node half: the CLI/Hub preflight is advisory over the
         // wire; this is the boundary that actually controls materialization.
@@ -300,6 +304,13 @@ impl DriverFactory for NativeClaudeFactory {
         let inherit_default_config = self.kind != DriverKind::GenericPty
             && !explicit_config_chosen
             && matches!(delegation, Delegation::None);
+        let resume_session_id = launch
+            .request
+            .resume_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
         let native_home = if let Some(path) = explicit_config_dir {
             path
         } else if inherit_default_config {
@@ -332,6 +343,29 @@ impl DriverFactory for NativeClaudeFactory {
         if !inherit_default_config {
             crate::prepare_workspace(&native_home)
                 .map_err(|error| DriverError::Failed(error.to_string()))?;
+        }
+        // c-resumehome: the resume launches in a fresh native home (this
+        // instance's own config dir), but `claude --resume <id>` only finds a
+        // conversation under `<home>/projects/<encoded cwd>/<id>.jsonl`. Stage
+        // the predecessor conversation there before any process starts. The
+        // runtime already refused a transcript it could not locate, so a `None`
+        // here or a vanished file is a hard, explicit failure — never a silent
+        // process that dies a second later with "No conversation found".
+        if let Some(session_id) = resume_session_id.as_deref() {
+            let Some(source) = launch.resume_transcript.as_ref() else {
+                return Err(DriverError::Failed(format!(
+                    "cannot resume session {session_id}: predecessor transcript was not located on this host"
+                )));
+            };
+            remuda_driver::claude_transcript::stage_for_resume(
+                source,
+                &native_home,
+                &launch.workspace_root,
+                session_id,
+            )
+            .map_err(|error| {
+                DriverError::Failed(format!("cannot resume session {session_id}: {error}"))
+            })?;
         }
         let spec = instance_spec(&launch, &self.config, &profile)?;
         let binary = resolve_binary_source(
@@ -594,13 +628,7 @@ impl DriverFactory for NativeClaudeFactory {
             kind: self.kind,
             native,
             spec,
-            resume_session_id: launch
-                .request
-                .resume_session_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
+            resume_session_id,
             recipe: std::sync::Mutex::new(None),
             startup_error: std::sync::Mutex::new(None),
         }))
@@ -1823,6 +1851,7 @@ mod tests {
                         workspace_root: dir.path().to_path_buf(),
                         registered_workspace_root: dir.path().to_path_buf(),
                         api_relay: None,
+                        resume_transcript: None,
                     },
                 )
                 .expect("build must succeed even when the pin fails");
@@ -2036,6 +2065,7 @@ mod tests {
                         workspace_root: dir.path().to_path_buf(),
                         registered_workspace_root: dir.path().to_path_buf(),
                         api_relay: None,
+                        resume_transcript: None,
                     },
                 )
                 .expect("build driver");
@@ -2282,6 +2312,7 @@ mod tests {
                 workspace_root: dir.path().to_path_buf(),
                 registered_workspace_root: dir.path().to_path_buf(),
                 api_relay: None,
+                resume_transcript: None,
             };
             let profile = provider_profile(&launch, Delegation::None).expect("profile");
             let spec = instance_spec(&launch, &config, &profile).expect("spec");
@@ -2342,6 +2373,7 @@ mod tests {
             workspace_root: dir.path().to_path_buf(),
             registered_workspace_root: dir.path().to_path_buf(),
             api_relay: None,
+            resume_transcript: None,
         };
         let profile = provider_profile(&launch, Delegation::None).expect("profile");
         let spec = instance_spec(&launch, &config, &profile).expect("spec");
@@ -2450,6 +2482,7 @@ mod tests {
                     workspace_root: dir.path().to_path_buf(),
                     registered_workspace_root: dir.path().to_path_buf(),
                     api_relay: None,
+                    resume_transcript: None,
                 },
             )
             .expect("user overlay must be accepted while generated overlay is unavailable");
@@ -2508,6 +2541,7 @@ mod tests {
                 workspace_root: dir.path().to_path_buf(),
                 registered_workspace_root: dir.path().to_path_buf(),
                 api_relay: None,
+                resume_transcript: None,
             },
         ) {
             Ok(_) => panic!("gateway without overlay must fail closed"),
@@ -2996,6 +3030,7 @@ mod tests {
                 workspace_root: dir.path().to_path_buf(),
                 registered_workspace_root: dir.path().to_path_buf(),
                 api_relay: None,
+                resume_transcript: None,
             },
         ) {
             Ok(_) => panic!("wrong-host scoped overlay must fail"),
@@ -3454,6 +3489,7 @@ mod tests {
                     workspace_root: dir.path().to_path_buf(),
                     registered_workspace_root: dir.path().to_path_buf(),
                     api_relay: None,
+                    resume_transcript: None,
                 },
             )
             .map(drop)
@@ -3498,6 +3534,7 @@ mod tests {
                     workspace_root: dir.path().to_path_buf(),
                     registered_workspace_root: dir.path().to_path_buf(),
                     api_relay: None,
+                    resume_transcript: None,
                 },
             )
             .map(drop)

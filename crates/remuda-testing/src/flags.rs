@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct ClaudeFlags {
     /// `--session-id`.
     pub session_id: Option<String>,
+    /// `--resume <id>`: continue an existing conversation.
+    pub resume: Option<String>,
     /// `--model`.
     pub model: Option<String>,
     /// `--permission-mode` (default `default`).
@@ -23,6 +25,7 @@ impl Default for ClaudeFlags {
     fn default() -> Self {
         Self {
             session_id: None,
+            resume: None,
             model: None,
             permission_mode: "default".to_string(),
             replay_user_messages: false,
@@ -59,6 +62,10 @@ impl ClaudeFlags {
             }
             if let Some(value) = take_value(arg, "--session-id", &args, &mut i) {
                 flags.session_id = Some(value);
+                continue;
+            }
+            if let Some(value) = take_value(arg, "--resume", &args, &mut i) {
+                flags.resume = Some(value);
                 continue;
             }
             if let Some(value) = take_value(arg, "--model", &args, &mut i) {
@@ -127,6 +134,8 @@ mod tests {
             "--verbose",
             "--session-id",
             "00000000-0000-4000-8000-000000000001",
+            "--resume",
+            "00000000-0000-4000-8000-000000000002",
             "--model=haiku",
             "--permission-mode",
             "auto",
@@ -139,6 +148,10 @@ mod tests {
         assert_eq!(
             flags.session_id.as_deref(),
             Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert_eq!(
+            flags.resume.as_deref(),
+            Some("00000000-0000-4000-8000-000000000002")
         );
         assert_eq!(flags.model.as_deref(), Some("haiku"));
         assert_eq!(flags.permission_mode, "auto");

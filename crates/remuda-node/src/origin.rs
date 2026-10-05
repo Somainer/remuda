@@ -127,6 +127,7 @@ mod tests {
                 workspace_root: ".".into(),
                 registered_workspace_root: ".".into(),
                 api_relay: None,
+                resume_transcript: None,
             };
             let env = instance_env(&inherited);
             assert!(!env.keys().any(|name| name.starts_with("REMUDA_")));

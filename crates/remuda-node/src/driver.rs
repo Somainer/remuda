@@ -40,6 +40,15 @@ pub struct DriverLaunch {
     /// the per-instance bearer replace the gateway base URL and credential in
     /// the materialized overlay. `None` for direct delivery.
     pub(crate) api_relay: Option<crate::api_relay::RelayOverlay>,
+    /// c-resumehome: predecessor conversation to stage before a resume launch.
+    ///
+    /// `claude --resume <id>` reads the conversation only from the *new*
+    /// instance's config home (`projects/<encoded cwd>/<id>.jsonl`), while the
+    /// predecessor transcript lives in the old instance's home. The runtime
+    /// resolves this path from the predecessor's recorded
+    /// `nativeTranscriptPath` (or its durable launch recipe) before the driver
+    /// builds, and the native factory copies it into the new home.
+    pub resume_transcript: Option<PathBuf>,
 }
 
 /// One operation delivered to an instance-local driver task.
@@ -236,6 +245,15 @@ pub trait DriverFactory: Send + Sync {
     fn kind(&self) -> DriverKind;
     /// Build an unstarted instance-local driver.
     fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError>;
+    /// Whether a resume launch through this factory can only start once the
+    /// predecessor transcript is staged into its native home (c-resumehome).
+    ///
+    /// Local native Claude factories answer `true`, so the runtime refuses a
+    /// transcript-less resume *before* accepting it. Fakes and carriers do no
+    /// local `--resume`, so they keep the default.
+    fn requires_local_resume_transcript(&self) -> bool {
+        false
+    }
 }
 
 /// Deterministic no-network driver for local API and Web integration.
@@ -426,6 +444,17 @@ impl DriverRegistry {
         self.drivers
             .read()
             .is_ok_and(|drivers| drivers.contains_key(&kind))
+    }
+
+    /// Whether this kind's factory requires the predecessor transcript to be
+    /// staged locally before a resume launch (c-resumehome).
+    pub fn requires_local_resume_transcript(&self, kind: DriverKind) -> bool {
+        self.drivers
+            .read()
+            .is_ok_and(|drivers| match drivers.get(&kind) {
+                Some(Registration::Factory(factory)) => factory.requires_local_resume_transcript(),
+                _ => false,
+            })
     }
 
     /// Construct one driver or fail closed when no adapter is registered.

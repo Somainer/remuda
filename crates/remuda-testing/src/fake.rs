@@ -89,12 +89,13 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // kill and is reaped only by the group signal.
     #[cfg(unix)]
     let _grandchild = spawn_group_grandchild();
-    let session_id = flags
-        .session_id
+    let resume_id = flags.resume.clone();
+    let session_id = resume_id
         .clone()
+        .or_else(|| flags.session_id.clone())
         .unwrap_or_else(|| FIXED_SESSION_ID.to_string());
     let steps = load_script_from_env().map_err(FakeClaudeError::Script)?;
-    let transcript = transcript_file(&session_id)?;
+    let transcript = transcript_file(&session_id, &flags)?;
     let mut session = Session {
         flags,
         session_id,
@@ -363,18 +364,73 @@ impl Session {
     }
 }
 
-fn transcript_file(session_id: &str) -> Result<Option<File>, FakeClaudeError> {
-    let Ok(dir) = std::env::var("FAKE_CLAUDE_TRANSCRIPT_DIR") else {
-        return Ok(None);
-    };
-    if dir.is_empty() {
-        return Ok(None);
+/// Open the transcript this session appends to.
+///
+/// Resume (`--resume <id>`) mimics the real CLI's lookup: the conversation
+/// must already exist at
+/// `<CLAUDE_CONFIG_DIR>/projects/<encoded cwd>/<id>.jsonl`, otherwise the
+/// process dies with the same "No conversation found with session ID" failure
+/// instead of silently starting an empty conversation. A fresh session writes
+/// into that projects layout itself (as `claude -p` does); the explicit
+/// `FAKE_CLAUDE_TRANSCRIPT_DIR` knob keeps the older flat layout for callers
+/// that asserted on it.
+fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>, FakeClaudeError> {
+    if let Some(resume_id) = &flags.resume {
+        let Some(home) = config_home() else {
+            return Err(FakeClaudeError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("resume: no CLAUDE_CONFIG_DIR to look up session {resume_id}"),
+            )));
+        };
+        let path = remuda_driver::claude_transcript::project_dir(&home, &flags.cwd)
+            .join(format!("{resume_id}.jsonl"));
+        if !path.is_file() {
+            return Err(FakeClaudeError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "No conversation found with session ID: {resume_id} (looked in {})",
+                    path.display()
+                ),
+            )));
+        }
+        return Ok(Some(OpenOptions::new().append(true).open(&path)?));
     }
-    let dir = PathBuf::from(dir);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{session_id}.jsonl"));
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    Ok(Some(file))
+    if let Ok(dir) = std::env::var("FAKE_CLAUDE_TRANSCRIPT_DIR")
+        && !dir.is_empty()
+    {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{session_id}.jsonl"));
+        return Ok(Some(
+            OpenOptions::new().create(true).append(true).open(path)?,
+        ));
+    }
+    // Fresh session: persist under the config home's projects layout, exactly
+    // like the real CLI, so a later `--resume` against a fresh managed home can
+    // find (or be proven not to find) the conversation.
+    if let Some(home) = config_home() {
+        let dir = remuda_driver::claude_transcript::project_dir(&home, &flags.cwd);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{session_id}.jsonl"));
+        return Ok(Some(
+            OpenOptions::new().create(true).append(true).open(path)?,
+        ));
+    }
+    Ok(None)
+}
+
+/// Resolved Claude config home: `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`.
+fn config_home() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        && !path.is_empty()
+    {
+        return Some(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".claude"))
 }
 
 fn emit(value: &Value) -> Result<(), FakeClaudeError> {

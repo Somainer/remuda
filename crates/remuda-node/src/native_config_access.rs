@@ -281,6 +281,7 @@ mod tests {
                 workspace_root: directory.path().into(),
                 registered_workspace_root: directory.path().into(),
                 api_relay: None,
+                resume_transcript: None,
             },
         );
         let error = match result {

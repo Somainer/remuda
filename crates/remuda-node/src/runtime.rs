@@ -742,6 +742,26 @@ impl DevNode {
         }
 
         let instance_id = request.instance_id.clone().unwrap_or_default();
+        // c-resumehome: locate the predecessor conversation now, before the
+        // command is durably accepted. The native factory copies it into the
+        // new instance's native home at build time; a transcript that is not
+        // on this host is a refusal with a clear message for carriers that do
+        // a local `--resume`, never an accepted instance that dies one second
+        // after launch. Non-local carriers (the in-process fake) do not stage.
+        let resume_lookup =
+            crate::resume::resolve_resume_transcript(self.inner.store.as_ref(), &request)?;
+        if resume_lookup.path.is_none()
+            && request.resume_session_id.is_some()
+            && self
+                .inner
+                .drivers
+                .requires_local_resume_transcript(request.driver)
+        {
+            return Err(NodeError::Conflict(
+                resume_lookup.missing_error(request.resume_session_id.as_deref().unwrap_or("")),
+            ));
+        }
+        let resume_transcript = resume_lookup.path;
         let mut instance = fixture_instance_with_session(
             instance_id.clone(),
             host_id.clone(),
@@ -881,6 +901,7 @@ impl DevNode {
             workspace_root,
             registered_workspace_root: workspace.root_path.into(),
             api_relay: relay_overlay,
+            resume_transcript,
         };
         // The instance insert is the idempotency point for two creates whose
         // provisions overlapped the multi-second route probe (the per-instance

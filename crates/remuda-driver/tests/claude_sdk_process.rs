@@ -365,8 +365,12 @@ async fn a_second_send_reaches_the_same_process_and_session() {
 /// never resurrected and `--continue` is never passed.
 #[tokio::test]
 async fn start_resumed_passes_resume_on_a_new_child() {
-    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let (tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let session = "77777777-7777-4777-8777-777777777777";
+    // The fake enforces the real `--resume` contract: the conversation must
+    // already exist under `<home>/projects/<encoded cwd>/<id>.jsonl`. Seed it,
+    // the way the Node's resume staging (c-resumehome) does before launch.
+    seed_transcript(tmp.path().join("home"), &spec.cwd, session);
     let handle = driver
         .start_resumed(spec, session.to_string())
         .await
@@ -386,6 +390,20 @@ async fn start_resumed_passes_resume_on_a_new_child() {
         "{argv:?}"
     );
     driver.close().await.expect("close");
+}
+
+/// Seed `<home>/projects/<encoded cwd>/<session>.jsonl` with one prior turn.
+fn seed_transcript(home: std::path::PathBuf, cwd: &str, session: &str) {
+    let dir = remuda_driver::claude_transcript::project_dir(&home, std::path::Path::new(cwd));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{session}.jsonl")),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"earlier turn\"},\"sessionId\":\""
+            .to_string()
+            + session
+            + "\"}\n",
+    )
+    .unwrap();
 }
 
 /// A missing or empty session id is an error, never a silent empty

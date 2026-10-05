@@ -392,10 +392,172 @@ pub fn cwd_matches(path: &Path, terminal_cwd: &Path) -> bool {
     same_dir(Path::new(&found), terminal_cwd)
 }
 
-/// Compare two directories the way Claude resolves them (canonical, no symlinks).
-fn same_dir(a: &Path, b: &Path) -> bool {
+/// What [`stage_for_resume`] made visible inside the resume launch's home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedResume {
+    /// The transcript path the resumed process opens (`--resume <id>` target).
+    pub transcript: PathBuf,
+    /// Side directories copied beside it (subagent transcripts, memory, …).
+    pub sidecar_dirs: Vec<PathBuf>,
+}
+
+/// Make a predecessor conversation visible inside a new launch's config home.
+///
+/// `claude --resume <session>` resolves the conversation **only** as
+/// `<CLAUDE_CONFIG_DIR>/projects/<encoded cwd>/<session>.jsonl`. Every Remuda
+/// managed instance owns a fresh native home, so without staging the resumed
+/// process starts in an empty home and dies with "No conversation found with
+/// session ID". The source is always the predecessor's *recorded* transcript
+/// path — never a newest-file guess.
+///
+/// Copy semantics, deliberately not a hardlink: the resumed process appends
+/// to the transcript, and a hardlink would append those turns into the
+/// predecessor's file too (and links fail across filesystems). The predecessor
+/// stays byte-frozen.
+///
+/// Copied when present beside the transcript:
+/// - `<session>/` — subagent transcripts and tool-result payloads;
+/// - `memory/` — the project memory Claude reloads on SessionStart.
+///
+/// Existing destination files are kept: a retried build must never clobber a
+/// transcript the resumed instance has already appended to.
+///
+/// The destination file is always named `<session_id>.jsonl` — the exact name
+/// `claude --resume <session_id>` looks for — even when the recorded source
+/// path carries a different file name (a promoted session moved outside the
+/// managed home keeps whatever name the hook reported).
+pub fn stage_for_resume(
+    source_transcript: &Path,
+    target_home: &Path,
+    target_cwd: &Path,
+    session_id: &str,
+) -> std::io::Result<StagedResume> {
+    let metadata = source_transcript.metadata().map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "resume transcript not found at {}: {err}",
+                source_transcript.display()
+            ),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "resume transcript is not a regular file: {}",
+                source_transcript.display()
+            ),
+        ));
+    }
+    if session_id.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "resume session id is empty",
+        ));
+    }
+    let source_name = source_transcript.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "resume transcript path has no file name: {}",
+                source_transcript.display()
+            ),
+        )
+    })?;
+    let dest_dir = project_dir(target_home, target_cwd);
+    std::fs::create_dir_all(&dest_dir)?;
+    let dest_transcript = dest_dir.join(format!("{}.jsonl", session_id.trim()));
+
+    // Inherited-home resume (or a replayed build): the conversation already
+    // lives where the new process will look. Nothing to stage.
+    if same_path(&dest_transcript, source_transcript) {
+        return Ok(StagedResume {
+            transcript: dest_transcript,
+            sidecar_dirs: Vec::new(),
+        });
+    }
+
+    if !dest_transcript.exists() {
+        std::fs::copy(source_transcript, &dest_transcript)?;
+    }
+
+    // Sidecars are siblings of the transcript in the source project dir. The
+    // per-session dir keeps the source file's stem (the session id in any
+    // well-formed layout); `memory/` is project-global.
+    let source_dir = source_transcript.parent().unwrap_or_else(|| Path::new("/"));
+    let session_stem = Path::new(source_name)
+        .file_stem()
+        .map(|stem| stem.to_os_string());
+    let mut sidecar_dirs = Vec::new();
+    // (name in the source project dir, name in the destination project dir).
+    // The per-session sidecar dir is keyed by session id: it lands under the
+    // resumed id even if the source transcript carried a different file name.
+    let mut sidecars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        vec![("memory".into(), "memory".into())];
+    if let Some(stem) = session_stem {
+        sidecars.insert(0, (stem, session_id.trim().into()));
+    }
+    for (source_name, dest_name) in sidecars {
+        let source_side = source_dir.join(&source_name);
+        if source_side.is_dir() {
+            let dest_side = dest_dir.join(&dest_name);
+            copy_dir_merge(&source_side, &dest_side)?;
+            sidecar_dirs.push(dest_side);
+        }
+    }
+
+    Ok(StagedResume {
+        transcript: dest_transcript,
+        sidecar_dirs,
+    })
+}
+
+/// Path equality after canonicalization, falling back to lexical equality.
+fn same_path(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(a) == canon(b)
+}
+
+/// Recursively merge `src` into `dst`, never overwriting destination files.
+fn copy_dir_merge(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let source = entry.path();
+        let dest = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_merge(&source, &dest)?;
+        } else if file_type.is_symlink() {
+            copy_symlink(&source, &dest);
+        } else if !dest.exists() {
+            std::fs::copy(&source, &dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// Preserve a symlink as a link when the platform allows; fall back to a
+/// content copy (e.g. privileges that forbid creating links).
+fn copy_symlink(source: &Path, dest: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(target) = std::fs::read_link(source)
+            && !dest.exists()
+            && std::os::unix::fs::symlink(target, dest).is_ok()
+        {
+            return;
+        }
+    }
+    if !dest.exists() {
+        let _ = std::fs::copy(source, dest);
+    }
+}
+
+/// Compare two directories the way Claude resolves them (canonical, no symlinks).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    same_path(a, b)
 }
 
 /// First cwd-bearing record's value, the first user timestamp, and an excerpt
@@ -776,5 +938,194 @@ mod tests {
         assert_eq!(tail.poll().expect("poll").len(), 2);
         write(&path, "{\"c\":3}\n");
         assert_eq!(tail.poll().expect("poll"), vec!["{\"c\":3}"]);
+    }
+
+    // --- c-resumehome: staging a predecessor conversation for `--resume` ---
+
+    fn write_file(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        std::fs::write(path, body).expect("write");
+    }
+
+    fn transcript_layout(home: &std::path::Path, cwd: &std::path::Path, session: &str) -> PathBuf {
+        project_dir(home, cwd).join(format!("{session}.jsonl"))
+    }
+
+    #[test]
+    fn resume_staging_copies_transcript_session_dir_and_memory() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old-native-home");
+        let new_home = tmp.path().join("new-native-home");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000aa";
+
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{\"type\":\"user\"}\n");
+        write_file(
+            &old_home
+                .join("projects")
+                .join(encode_project_dir(&cwd))
+                .join(session)
+                .join("subagents")
+                .join("side.jsonl"),
+            "{\"side\":true}\n",
+        );
+        write_file(
+            &old_home
+                .join("projects")
+                .join(encode_project_dir(&cwd))
+                .join("memory")
+                .join("MEMORY.md"),
+            "project memory\n",
+        );
+
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
+
+        assert_eq!(
+            staged.transcript,
+            transcript_layout(&new_home, &cwd, session)
+        );
+        assert!(staged.transcript.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&staged.transcript).unwrap(),
+            "{\"type\":\"user\"}\n"
+        );
+        let session_dir = staged
+            .sidecar_dirs
+            .iter()
+            .find(|dir| dir.ends_with(session))
+            .expect("session sidecar dir");
+        assert!(session_dir.join("subagents/side.jsonl").is_file());
+        let memory_dir = staged
+            .sidecar_dirs
+            .iter()
+            .find(|dir| dir.ends_with("memory"))
+            .expect("memory sidecar dir");
+        assert!(memory_dir.join("MEMORY.md").is_file());
+    }
+
+    #[test]
+    fn resume_staging_never_mutates_the_predecessor() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000bb";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "original\n");
+
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
+
+        // The resumed process appends to its own copy; the predecessor file
+        // must stay exactly as it was (no shared inode, no propagated write).
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&staged.transcript)
+                .unwrap(),
+            "continued"
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            "original\n",
+            "predecessor transcript must stay frozen"
+        );
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().len(),
+            std::fs::metadata(&staged.transcript).unwrap().len(),
+            "a copy, not a hardlink"
+        );
+    }
+
+    #[test]
+    fn resume_staging_chains_across_generations() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000cc";
+        let home0 = tmp.path().join("home0");
+        let home1 = tmp.path().join("home1");
+        let home2 = tmp.path().join("home2");
+
+        let transcript0 = transcript_layout(&home0, &cwd, session);
+        write_file(&transcript0, "turn-0\n");
+        let staged1 = stage_for_resume(&transcript0, &home1, &cwd, session).expect("stage 1");
+        write_file(&staged1.transcript, "turn-0\nturn-1\n");
+        // Second-generation resume: source is the first child's home.
+        let staged2 =
+            stage_for_resume(&staged1.transcript, &home2, &cwd, session).expect("stage 2");
+        assert_eq!(
+            std::fs::read_to_string(&staged2.transcript).unwrap(),
+            "turn-0\nturn-1\n",
+            "the grandchild inherits the newest generation's transcript"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&transcript0).unwrap(),
+            "turn-0\n",
+            "the original instance stays untouched"
+        );
+    }
+
+    #[test]
+    fn resume_staging_is_a_noop_when_source_already_lands_in_target() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000dd";
+        let transcript = transcript_layout(&home, &cwd, session);
+        write_file(&transcript, "{}\n");
+
+        let staged = stage_for_resume(&transcript, &home, &cwd, session).expect("stage");
+        assert_eq!(staged.transcript, transcript);
+        assert!(staged.sidecar_dirs.is_empty());
+    }
+
+    #[test]
+    fn resume_staging_keeps_an_existing_destination_transcript() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000ee";
+        let source = transcript_layout(&old_home, &cwd, session);
+        let dest = transcript_layout(&new_home, &cwd, session);
+        write_file(&source, "source\n");
+        write_file(&dest, "destination already has turns\n");
+
+        stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "destination already has turns\n",
+            "a retried build must not clobber the child's own transcript"
+        );
+    }
+
+    #[test]
+    fn resume_staging_missing_transcript_is_a_clear_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let missing = tmp
+            .path()
+            .join("gone/01993ab0-0000-7000-8000-0000000000ff.jsonl");
+
+        let session = "01993ab0-0000-7000-8000-0000000000ff";
+        let error = stage_for_resume(&missing, &tmp.path().join("new"), &cwd, session)
+            .expect_err("a missing transcript must error, not silently launch");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains("resume transcript not found"),
+            "unexpected message: {error}"
+        );
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "the message names the path it looked for: {error}"
+        );
     }
 }

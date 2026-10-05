@@ -30,6 +30,7 @@ mod origin;
 pub mod prompt_correlation;
 /// Carrier reclamation, adoption without replay, and restart reconciliation.
 pub mod reclaim;
+mod resume;
 mod runtime;
 mod runtime_link;
 mod server;

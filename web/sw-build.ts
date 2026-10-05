@@ -52,8 +52,13 @@ interface BundleAsset {
 type BundleFile = BundleChunk | BundleAsset | { type: string };
 export type BuildBundle = Record<string, BundleFile>;
 
-function asChunk(file: BundleFile): BundleChunk | null {
-  return file.type === "chunk" ? (file as BundleChunk) : null;
+function asChunk(file: BundleFile | undefined): BundleChunk | null {
+  // A missing bundle key is "not a chunk", never a throw: index.html can
+  // reference public-dir files (/favicon.svg, /manifest.webmanifest, icons)
+  // that a plugin-ordering change may leave out of the generateBundle graph,
+  // and a chunk's `imports` can name a key absent from this snapshot. Deref
+  // with optional chaining so generateBundle still emits sw.js in that case.
+  return file?.type === "chunk" ? (file as BundleChunk) : null;
 }
 
 /** Asset references (src/href, leading slash) inside the emitted HTML. */
@@ -88,7 +93,9 @@ export function derivePrecacheUrls(
   const html = bundle[htmlFileName];
   if (html && html.type === "asset") {
     for (const ref of htmlAssetReferences((html as BundleAsset).source)) {
-      if (asChunk(bundle[ref] as BundleFile)) roots.add(ref);
+      // Skip non-chunk HTML refs (public-dir files, assets): they are shell
+      // precache entries in sw.src.js, never roots of the JS/CSS closure.
+      if (asChunk(bundle[ref])) roots.add(ref);
     }
   }
   // Fallback for builds that reach the plugin without an in-bundle HTML (unit
@@ -106,7 +113,7 @@ export function derivePrecacheUrls(
     const fileName = queue.shift()!;
     if (visited.has(fileName)) continue;
     visited.add(fileName);
-    const chunk = asChunk(bundle[fileName] as BundleFile);
+    const chunk = asChunk(bundle[fileName]);
     if (!chunk) continue;
     // Walk the CSS/assets even for a zero-code chunk: its JS is pruned but
     // its stylesheet/font attribution is real and still gets emitted.

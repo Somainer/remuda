@@ -196,6 +196,54 @@ describe("derivePrecacheUrls", () => {
     };
     expect(derivePrecacheUrls(b)).toEqual(["/assets/index-entry.js"]);
   });
+
+  it("treats missing bundle keys and non-chunk HTML refs as 'not a chunk', never throws", () => {
+    // c-perffu r9 item 2: index.html references public-dir files that a
+    // plugin-ordering change may leave OUT of the generateBundle graph, and a
+    // chunk's imports may name an absent key. asChunk must skip both instead
+    // of dereferencing `.type` on undefined (which would abort generateBundle
+    // and emit no sw.js at all).
+    const b: BuildBundle = {
+      "index.html": {
+        type: "asset",
+        fileName: "index.html",
+        // Public files (favicon/manifest) are absent from the bundle below;
+        // the only in-bundle ref is the real entry chunk.
+        source:
+          `<link rel="icon" href="/favicon.svg">` +
+          `<link rel="manifest" href="/manifest.webmanifest">` +
+          `<link rel="apple-touch-icon" href="/icons/icon-192.png">` +
+          `<script type="module" src="/assets/index-entry.js"></script>`,
+      },
+      "assets/index-entry.js": chunk("assets/index-entry.js", {
+        isEntry: true,
+        // An imports edge to a key the graph does not carry (a pruned
+        // zero-code chunk or a plugin-order gap) must be walked over, not
+        // dereferenced.
+        imports: ["assets/missing-static.js"],
+        dynamicImports: ["assets/missing-dynamic.js", "assets/Board-route.js"],
+      }),
+      "assets/Board-route.js": chunk("assets/Board-route.js", {}),
+    };
+    let urls: string[] = [];
+    expect(() => {
+      urls = derivePrecacheUrls(b);
+    }).not.toThrow();
+    // The closure still starts at the in-bundle entry and reaches the real
+    // route chunk.
+    expect(urls).toContain("/assets/index-entry.js");
+    expect(urls).toContain("/assets/Board-route.js");
+    // Public/non-chunk refs and missing import keys never enter the list.
+    for (const absent of [
+      "/favicon.svg",
+      "/manifest.webmanifest",
+      "/icons/icon-192.png",
+      "/assets/missing-static.js",
+      "/assets/missing-dynamic.js",
+    ]) {
+      expect(urls).not.toContain(absent);
+    }
+  });
 });
 
 // The failure that is actually silent in production: if the placeholder in

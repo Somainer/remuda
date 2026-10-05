@@ -175,30 +175,39 @@ async function clearApprovals(page: Page, instanceId: string) {
   }, instanceId);
 }
 
-/** Open the effort popover. */
+/** Open the effort popover (idempotent: a no-op if already open). */
 async function openPopover(page: Page) {
+  if (await page.getByTestId("effort-slider").isVisible().catch(() => false)) return;
   await page.getByTestId("model-effort-chip").click();
   await expect(page.getByTestId("effort-slider")).toBeVisible();
 }
 
-/** Move the slider via keyboard, closing the popover afterwards. */
+/** Close the effort popover if it is open. */
+async function closePopover(page: Page) {
+  if (await page.getByTestId("effort-slider").isVisible().catch(() => false)) {
+    await page.keyboard.press("Escape");
+  }
+}
+
+/** Move the slider via keyboard; leaves the popover closed. */
 async function moveSlider(page: Page, key: "ArrowRight" | "ArrowLeft" | "Home" | "End") {
   await openPopover(page);
   const slider = page.getByTestId("effort-slider");
   await slider.focus();
   await page.keyboard.press(key);
-  await page.keyboard.press("Escape");
+  await closePopover(page);
 }
 
-/** Pick a native tier row in the popover list, then close the popover. */
+/** Pick a native tier row in the popover list; leaves the popover closed. */
 async function pickTier(page: Page, stop: string) {
   await openPopover(page);
   await page.getByTestId("effort-open-list").click();
   await page.getByTestId(`effort-tier-${stop}`).click();
-  await page.keyboard.press("Escape");
+  await closePopover(page);
 }
 
-/** Flip the D-056 ultracode switch to the desired state; leaves popover open. */
+/** Flip the D-056 ultracode switch to the desired state; leaves popover open
+ *  so subsequent assertions can read the slider/switch. */
 async function setSwitch(page: Page, on: boolean) {
   await openPopover(page);
   const sw = page.getByTestId("effort-ultracode-switch");

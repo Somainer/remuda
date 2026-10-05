@@ -372,15 +372,21 @@ pub fn class_of(model_id: &str, declared_role: Option<&str>) -> Option<ModelClas
 /// slider and uses when a draft is unpinned. `None` = the catalog does not
 /// know this model (no marker; the draft stays on "follow the model
 /// default"). Non-Claude rows always return `None`.
+///
+/// Read by the web via `GET /v1/supply/catalog` (serialised as
+/// `defaultEffort`); not called from Rust server code today.
 #[must_use]
+#[allow(dead_code)]
 pub fn default_effort_of(model_id: &str) -> Option<&'static str> {
     lookup(model_id).and_then(|row| row.default_effort)
 }
 
 /// D-056: whether the model accepts the orthogonal ultracode session toggle
 /// according to the static catalog. A `false` here is advisory — a runtime
-/// refusal still comes from the session journal.
+/// refusal still comes from the session journal. Serialised as
+/// `ultracodeCapable`; kept for a future Rust-side launch gate.
 #[must_use]
+#[allow(dead_code)]
 pub fn ultracode_capable(model_id: &str) -> bool {
     lookup(model_id).is_some_and(|row| row.ultracode_capable)
 }

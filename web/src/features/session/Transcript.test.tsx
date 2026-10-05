@@ -2010,6 +2010,48 @@ describe("load-earlier anchor lifecycle round 5", () => {
     vi.unstubAllGlobals();
   });
 
+  it("keeps restoring on the final history page until the anchor settles (item 3)", async () => {
+    const user = userEvent.setup();
+    const jumps: number[] = [];
+    const geo = installGeo(50, { onWrite: (v) => { if (v > 0) jumps.push(v); } });
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    // 20-row tail; the final page adds 30 rows down to seq 1 (window complete),
+    // so the armed first row lands at index 30, below the mounted window.
+    const tail: Observation[] = [];
+    for (let i = 0; i < 20; i += 1) tail.push(m(31 + i, i % 2 === 0 ? "user" : "assistant", "insE"));
+    const finalPage: Observation[] = [];
+    for (let seq = 1; seq <= 30; seq += 1) finalPage.push(m(seq, seq % 2 ? "user" : "assistant", "insE"));
+    let resolve!: (v: ReturnType<typeof pageOf>) => void;
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const r = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return r;
+    });
+    makeClient(reg, "insE", tail, () => new Promise((r2) => { resolve = r2; }), "31", "50");
+    render(<MemoryRouter initialEntries={["/s/insE"]}><Routes><Route path="/s/:instanceId" element={<Driver reg={reg} />} /></Routes></MemoryRouter>);
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+
+    await act(async () => {
+      resolve(pageOf(finalPage, true));
+      await Promise.resolve();
+    });
+    jumps.length = 0;
+
+    // Mount measurements keep arriving while the anchor is still deep and
+    // unmounted: a live restore RE-JUMPS toward it on every measurement commit
+    // until it mounts. The old end-page finally retired the restore, so the
+    // jump happened once and never repeats.
+    for (let i = 0; i <= 15; i += 1) {
+      await act(async () => {
+        geo.growRow(i, 50);
+      });
+    }
+    expect(jumps.length).toBeGreaterThan(1);
+    expect(screen.queryByTestId("load-earlier")).toBeNull();
+  });
+
   it("a route switch mid-click clears the restore so estimate convergence resumes (item 4)", async () => {
     const user = userEvent.setup();
     const geo = installGeo(60);

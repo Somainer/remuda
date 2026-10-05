@@ -506,10 +506,13 @@ function TranscriptInner({
       if (loadReqRef.current === req) {
         setLoadingEarlier(false);
         setLoadTick((n) => n + 1);
-        if (req.cancelled || !result || result.end || !result.prepended) {
-          // Nothing to anchor to (cancelled by a user scroll, a duplicate-only
-          // page, the retained end, or a failed read): retire what this click
-          // armed. A SUCCESSFUL prepend leaves the anchors to converge.
+        if (req.cancelled || !result || !result.prepended) {
+          // Nothing to anchor to (cancelled by a user scroll, a failed read,
+          // or a duplicate-only/empty page). A page that PREPENDED keeps the
+          // anchors until the mounted anchor settles — INCLUDING the final
+          // history page (result.end): its rows still have to mount and
+          // measure before the held offset is correct; clearing here retired
+          // the restore before the virtual window ever reached the anchor.
           if (prependAnchorRef.current?.reqId === reqId) prependAnchorRef.current = null;
           const pending = pendingScroll.current;
           if (pending?.kind === "restore" && pending.reqId === reqId) {

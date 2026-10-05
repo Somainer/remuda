@@ -350,20 +350,14 @@ async function waitAnchorStable(
 }
 
 /**
- * The restore has placed the anchor at its saved viewport offset. This runs
- * INSIDE the page on animation frames, so it catches the commit where the
- * correction lands — before the restore formally clears / before a
- * measurement-cycle settle — letting an arm release the font while the
- * restore is still running instead of racing it from the test runner.
+ * The saved anchor has painted on the FALLBACK face for the first time. At
+ * this frame the restore's initial estimate jump is on screen but its
+ * measurement correction tail has not run: the font released right after this
+ * genuinely races the restore, instead of waiting until it has settled.
  */
-async function waitAnchorAtTarget(
-  page: Page,
-  anchor: number,
-  target: number,
-  { timeout = 15_000 }: { timeout?: number } = {},
-): Promise<number> {
-  const value = await page.waitForFunction(
-    ({ label, wanted, drift }) => {
+async function waitAnchorRendered(page: Page, anchor: number, { timeout = 15_000 }: {} = {}): Promise<number> {
+  const handle = await page.waitForFunction(
+    ({ label }) => {
       const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']");
       if (!el) return null;
       const re = new RegExp(`journal_burst_* event ${label}\\b`);
@@ -371,13 +365,31 @@ async function waitAnchorAtTarget(
         re.test(candidate.textContent ?? ""),
       );
       if (!row) return null;
-      const offset = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
-      return Math.abs(offset - wanted) <= drift ? offset : null;
+      return row.getBoundingClientRect().top - el.getBoundingClientRect().top;
     },
-    { label: anchor, wanted: target, drift: DRIFT_PX + 2 },
+    { label: anchor },
     { polling: "raf", timeout },
   );
-  return value.jsonValue() as Promise<number>;
+  return handle.jsonValue() as Promise<number>;
+}
+
+/**
+ * Advance width of a long mixed monospace string at the transcript's 13px.
+ * The web font and the system fallback differ in glyph advances even when a
+ * particular short fenced block happens to occupy the same number of lines /
+ * pixels of height, so this (not a <pre> height) proves the swap actually
+ * changed the metrics the virtualised rows are measured from.
+ */
+async function monoAdvance(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return -1;
+    ctx.font = '400 13px "IBM Plex Mono", monospace';
+    return ctx.measureText(
+      "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()_+-=[]{}|;:',.<>/?~",
+    ).width;
+  });
 }
 
 /** Rendered rows never overlap once the new metrics are measured. */
@@ -540,26 +552,37 @@ async function savedPositionSurvivesSwap(
   } else {
     // The swap lands WHILE the restore is still running (a genuinely early
     // swap, but after fallback paint — not before any row exists). Hold the
-    // woff2 only: the journal loads normally, at least one row paints on the
-    // FALLBACK face, and the saved-position restore starts on fallback
-    // metrics. Release the font on the frame the restore first places the
-    // anchor at its saved viewport offset — before the measurement-cycle
-    // settle — so the swap races the tail of the restore, not the first
-    // paint. The gate is installed after the /sessions hop and scoped to
-    // this document; the no-cache header makes it a real fetch even though
-    // the control arm cached the woff2.
+    // woff2 only: the journal loads normally, rows paint on the FALLBACK face,
+    // and the saved-position restore runs on fallback metrics. Release on the
+    // first frame the saved anchor is painted, before its ResizeObserver
+    // measurement tail settles, so the swap races the restore rather than the
+    // first paint. The gate is installed after the /sessions hop and scoped to
+    // this document; the no-cache headers make it a real fetch even though the
+    // control arm cached the woff2.
     await page.goto("/sessions");
     await expect(page.getByTestId("session-list")).toBeVisible();
     await reinstate();
     const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
     await page.goto(`/s/${instanceId}`);
     await fontGate.waitArrival();
-    await expect.poll(() => scroller.getByTestId("transcript-row").count(), { timeout: 30_000 }).toBeGreaterThan(0);
+    // The saved anchor paints on the fallback face; the font is still held, so
+    // this is strictly before the swap (and before the restore's measurement
+    // tail settles).
+    beforeSwap = await waitAnchorRendered(page, anchor);
     expect(await monoLoaded(page), "rows must paint on the fallback face before the swap").toBe(false);
-    beforeSwap = await waitAnchorAtTarget(page, anchor, saved!);
+    const advanceFallback = await monoAdvance(page);
     fontGate.release();
     await afterSwap(page);
     settled = await waitAnchorStable(page, scroller, anchor);
+    // The swap genuinely changed the face's metrics: glyph advances differ
+    // while the anchor row stayed put.
+    const advanceSwapped = await monoAdvance(page);
+    expect
+      .soft(
+        advanceSwapped !== advanceFallback,
+        `the font swap did not change monospace advances (fallback=${advanceFallback} swapped=${advanceSwapped})`,
+      )
+      .toBe(true);
   }
   const armInput = await consumed();
 

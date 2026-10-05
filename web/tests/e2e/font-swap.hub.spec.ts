@@ -13,10 +13,11 @@ import { login } from "./hub-auth";
  *
  * Where the swap lands relative to the restore is CONTROLLED AT THE NETWORK
  * LAYER, never by a timer: one arm holds every woff2 response and releases it
- * only after the restored anchor has stopped moving (a genuinely late swap),
- * the other holds the journal seed — the only source of rows on a fresh
- * mount — and loads the font before any rows exist (a genuinely early swap).
- * The owner requirement holds in both: the saved reading position survives.
+ * only after the restored anchor has stopped moving on fallback metrics (a
+ * genuinely late swap); the other holds the woff2, lets rows paint on the
+ * fallback face, and releases it the frame the still-running restore first
+ * places its anchor (a swap landing mid-restore). The owner requirement
+ * holds in both: the saved reading position survives.
  * Fake Node only: `__journal_burst__:<n>` appends n assistant rows in one
  * journal append. The long-journal case writes more than the Hub's tail
  * window first, so the restore runs on a bounded replay.
@@ -75,6 +76,7 @@ function belongsToSessionDocument(route: Route): boolean {
 async function gateRoute(
   page: Page,
   pick: RegExp | ((url: URL) => boolean),
+  opts: { revalidate?: boolean } = {},
 ): Promise<{ waitArrival: () => Promise<void>; release: () => void; dispose: () => Promise<void> }> {
   let markArrival: (() => void) | null = null;
   const arrival = new Promise<void>((resolve) => {
@@ -84,6 +86,9 @@ async function gateRoute(
   const released = new Promise<void>((resolve) => {
     open = resolve;
   });
+  // A document whose warm disk cache already holds an immutable woff2 would
+  // never re-request it: force revalidation (merged onto the request's own
+  // headers — continue() replaces, not merges) so a later visit stays gated.
   const handler = async (route: Route) => {
     // Anything outside the gated session document (the /sessions page being
     // left, a subframe) flows straight through and never parks.
@@ -95,7 +100,11 @@ async function gateRoute(
     // parked; continuing a disposed route rejects — that is expected, not a
     // test failure.
     try {
-      await route.continue();
+      await route.continue(
+        opts.revalidate
+          ? { headers: { ...route.request().headers(), "cache-control": "no-cache", pragma: "no-cache" } }
+          : undefined,
+      );
     } catch {
       // Request was aborted by navigation.
     }
@@ -340,6 +349,37 @@ async function waitAnchorStable(
   return Number(result.slice("stable:".length));
 }
 
+/**
+ * The restore has placed the anchor at its saved viewport offset. This runs
+ * INSIDE the page on animation frames, so it catches the commit where the
+ * correction lands — before the restore formally clears / before a
+ * measurement-cycle settle — letting an arm release the font while the
+ * restore is still running instead of racing it from the test runner.
+ */
+async function waitAnchorAtTarget(
+  page: Page,
+  anchor: number,
+  target: number,
+  { timeout = 15_000 }: { timeout?: number } = {},
+): Promise<number> {
+  const value = await page.waitForFunction(
+    ({ label, wanted, drift }) => {
+      const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']");
+      if (!el) return null;
+      const re = new RegExp(`journal_burst_* event ${label}\\b`);
+      const row = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']")).find((candidate) =>
+        re.test(candidate.textContent ?? ""),
+      );
+      if (!row) return null;
+      const offset = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+      return Math.abs(offset - wanted) <= drift ? offset : null;
+    },
+    { label: anchor, wanted: target, drift: DRIFT_PX + 2 },
+    { polling: "raf", timeout },
+  );
+  return value.jsonValue() as Promise<number>;
+}
+
 /** Rendered rows never overlap once the new metrics are measured. */
 async function assertRowsStacked(scroller: Locator): Promise<void> {
   const overlaps = await scroller.evaluate((el) => {
@@ -373,7 +413,8 @@ async function afterSwap(page: Page): Promise<void> {
  * Save a reading position just below the code block, leave, then restore it
  * twice: once with the font cached (the no-swap control) and once on a fresh
  * document where the swap's landing point is network-gated — strictly after
- * the restored anchor settles ("late"), or before any rows exist ("first").
+ * the restored anchor settles ("late"), or while that restore is still
+ * running ("first" — rows have already painted on the fallback face).
  */
 async function savedPositionSurvivesSwap(
   page: Page,
@@ -497,36 +538,28 @@ async function savedPositionSurvivesSwap(
     await afterSwap(page);
     settled = await waitAnchorStable(page, scroller, anchor);
   } else {
-    // The swap lands BEFORE the restore. Rows only exist once the REST seed
-    // returns (the follow socket is opened after the seed), so hold that one
-    // request, load the web font explicitly while nothing is rendered, prove
-    // no rows exist, and only then release the seed.
-    // A passthrough woff2 route bypasses the HTTP cache the control arm
-    // populated, so this is a genuine fetch, not a cached no-op.
-    await page.route(/\.woff2(?:\?|$)/, async (route) => route.continue());
+    // The swap lands WHILE the restore is still running (a genuinely early
+    // swap, but after fallback paint — not before any row exists). Hold the
+    // woff2 only: the journal loads normally, at least one row paints on the
+    // FALLBACK face, and the saved-position restore starts on fallback
+    // metrics. Release the font on the frame the restore first places the
+    // anchor at its saved viewport offset — before the measurement-cycle
+    // settle — so the swap races the tail of the restore, not the first
+    // paint. The gate is installed after the /sessions hop and scoped to
+    // this document; the no-cache header makes it a real fetch even though
+    // the control arm cached the woff2.
     await page.goto("/sessions");
     await expect(page.getByTestId("session-list")).toBeVisible();
     await reinstate();
-    // Gate installed only after the /sessions hop: only this document's
-    // journal seed is parked.
-    const journalGate = await gateRoute(
-      page,
-      (url) => url.pathname === `/v1/instances/${instanceId}/journal`,
-    );
+    const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
     await page.goto(`/s/${instanceId}`);
-    await journalGate.waitArrival();
-    await expect(scroller.getByTestId("transcript-row")).toHaveCount(0);
-    await page.evaluate(async () => {
-      await Promise.all([
-        document.fonts.load('400 13px "IBM Plex Mono"'),
-        document.fonts.load('500 13px "IBM Plex Mono"'),
-      ]);
-    });
-    await expect.poll(() => monoLoaded(page), { timeout: 10_000 }).toBe(true);
-    journalGate.release();
-    await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
+    await fontGate.waitArrival();
+    await expect.poll(() => scroller.getByTestId("transcript-row").count(), { timeout: 30_000 }).toBeGreaterThan(0);
+    expect(await monoLoaded(page), "rows must paint on the fallback face before the swap").toBe(false);
+    beforeSwap = await waitAnchorAtTarget(page, anchor, saved!);
+    fontGate.release();
     await afterSwap(page);
-    settled = (await rowOffset(scroller, anchor))!;
+    settled = await waitAnchorStable(page, scroller, anchor);
   }
   const armInput = await consumed();
 
@@ -538,8 +571,9 @@ async function savedPositionSurvivesSwap(
   // at all (Transcript places never-measured rows by its row estimate), a
   // baseline gap reported separately. What this spec owns is that the swap
   // adds nothing on top: the gated restore is no further from the saved
-  // position than the no-swap restore, and (in the late arm) nothing moves
-  // at the moment the font lands.
+  // position than the no-swap restore, and the anchor does not move at the
+  // moment the font lands (in BOTH arms — swap racing the restore, and swap
+  // after the fallback restore settled).
   const measured = `order=${order} longBurst=${longBurst} saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} input=${original} leftByControl=${leftByControl}`;
   test.info().annotations.push({ type: "font-swap", description: measured });
   console.log(`FONTSWAP ${measured}`);
@@ -564,7 +598,7 @@ test("a saved reading position survives a late monospace swap", async ({ page })
   await savedPositionSurvivesSwap(page, 0, "late");
 });
 
-test("a saved reading position survives a monospace swap that lands first", async ({ page }) => {
+test("a saved reading position survives a monospace swap landing mid-restore", async ({ page }) => {
   test.setTimeout(120_000);
   await savedPositionSurvivesSwap(page, 0, "first");
 });

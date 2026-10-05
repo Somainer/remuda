@@ -507,7 +507,7 @@ export interface paths {
         };
         /**
          * Browse host directories for one to register (read-only, human-only)
-         * @description Human operator origin only; Bot and Agent origins are 403. Proxied to the addressed online Node's host.dirs.list RPC. The Node lists directories only, never follows symlinks, confines every path to its configured workspace_roots allowlist, hides dot-directories unless showHidden=true, and caps the reply (truncated=true past the cap). Never cached.
+         * @description Human operator origin only; Bot and Agent origins are 403. Proxied to the addressed online Node's host.dirs.list RPC. The Node lists directories only, never follows symlinks, confines every path to its configured workspace_roots allowlist, hides dot-directories unless showHidden=true, and caps the reply (truncated=true past the cap). Never cached. Invalid query paths (relative, outside the Node allowlist, missing, or not a directory) return 400 with the Node's reason.
          */
         get: operations["hostDirsList"];
         put?: never;
@@ -4178,6 +4178,7 @@ export interface operations {
                     "application/json": Record<string, never>;
                 };
             };
+            400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];

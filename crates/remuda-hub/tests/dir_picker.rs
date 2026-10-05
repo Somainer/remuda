@@ -389,3 +389,47 @@ async fn unregister_is_refused_while_a_session_is_live_and_settles_after_it_ends
     fixture.hub.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn node_prepare_occupancy_refusal_surfaces_as_409_not_400() -> Result<()> {
+    // The Hub store has no session rows for this workspace, so its own guard
+    // passes and the command is queued; the Node then refuses the prepare.
+    // That authoritative refusal must map to 409 with its reason visible.
+    let fixture = fixture().await?;
+    let observe = json_request(
+        fixture.hub.addr,
+        "GET",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(observe.0, 200);
+    fixture
+        .hub
+        .test_set_node_reply(
+            &fixture.host,
+            Some(json!({
+                "error": {
+                    "code": -32602,
+                    "message": format!(
+                        "workspace {ROOT} is still used by 3 live session(s); \
+                         end them before removing the directory (session history is kept)"
+                    )
+                }
+            })),
+        )
+        .await;
+    let (status, body) = json_request(
+        fixture.hub.addr,
+        "DELETE",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        Some(&json!({"path": ROOT}).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 409, "node occupancy refusal must be 409: {body}");
+    assert!(body.contains("3 live session(s)"), "{body}");
+    fixture.hub.shutdown().await;
+    Ok(())
+}

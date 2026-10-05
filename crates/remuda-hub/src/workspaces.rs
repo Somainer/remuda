@@ -31,6 +31,23 @@ fn unbind_lock(host_id: &str, workspace_id: &str) -> Arc<AsyncMutex<()>> {
     map.entry(key).or_default().clone()
 }
 
+/// Stable substrings the Node's unregister prepare emits for occupancy/race
+/// refusals. These must reach the operator as 409 rather than the channel's
+/// generic 400; keep them in sync with the Node messages in
+/// `remuda-node/src/workspace.rs`.
+const NODE_UNREGISTER_CONFLICT_MARKERS: &[&str] = &[
+    "live session(s)",
+    "being unregistered",
+    "was replaced after unregister prepare",
+];
+
+fn node_unregister_conflict(reason: &str) -> Option<&str> {
+    NODE_UNREGISTER_CONFLICT_MARKERS
+        .iter()
+        .find(|marker| reason.contains(**marker))
+        .map(|_| reason)
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
@@ -368,6 +385,19 @@ async fn mutate(
     )
     .await;
     let prepared = match prepared {
+        Err(HubError::BadRequest(reason)) if method == "workspace.unregister" => {
+            // The Node enforces the same occupancy rule at prepare (its view
+            // is authoritative, e.g. a command queued while the host was
+            // unreachable). Surface its busy/unbinding refusal as 409 with
+            // the visible reason rather than the generic 400 channel error.
+            let conflict = node_unregister_conflict(&reason).map(str::to_owned);
+            if let Some(conflict) = conflict {
+                mark_rejected(&state.store, &command.command_id, &id, &conflict).await?;
+                return Err(HubError::Conflict(conflict));
+            }
+            mark_rejected(&state.store, &command.command_id, &id, &reason).await?;
+            return Err(HubError::BadRequest(reason));
+        }
         Err(HubError::BadRequest(reason)) => {
             mark_rejected(&state.store, &command.command_id, &id, &reason).await?;
             return Err(HubError::BadRequest(reason));
@@ -650,6 +680,30 @@ mod tests {
             count_workspace_users(&conn, "hst_a", "wsp_other").unwrap(),
             (1, 0)
         );
+    }
+
+    #[test]
+    fn node_occupancy_refusals_are_conflicts_other_node_errors_stay_400() {
+        assert!(
+            node_unregister_conflict(
+                "workspace /srv/app is still used by 2 live session(s); end them"
+            )
+            .is_some()
+        );
+        assert!(
+            node_unregister_conflict(
+                "workspace /srv/app is being unregistered; wait for it to settle"
+            )
+            .is_some()
+        );
+        assert!(
+            node_unregister_conflict("workspace was replaced after unregister prepare").is_some()
+        );
+        assert!(
+            node_unregister_conflict("workspace /outside is outside allowed workspace_roots")
+                .is_none()
+        );
+        assert!(node_unregister_conflict("workspace /srv/app is not registered").is_none());
     }
 
     #[test]

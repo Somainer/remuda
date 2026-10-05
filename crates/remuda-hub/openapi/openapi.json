@@ -10534,7 +10534,7 @@
         ],
         "operationId": "hostDirsList",
         "summary": "Browse host directories for one to register (read-only, human-only)",
-        "description": "Human operator origin only; Bot and Agent origins are 403. Proxied to the addressed online Node's host.dirs.list RPC. The Node lists directories only, never follows symlinks, confines every path to its configured workspace_roots allowlist, hides dot-directories unless showHidden=true, and caps the reply (truncated=true past the cap). Never cached.",
+        "description": "Human operator origin only; Bot and Agent origins are 403. Proxied to the addressed online Node's host.dirs.list RPC. The Node lists directories only, never follows symlinks, confines every path to its configured workspace_roots allowlist, hides dot-directories unless showHidden=true, and caps the reply (truncated=true past the cap). Never cached. Invalid query paths (relative, outside the Node allowlist, missing, or not a directory) return 400 with the Node's reason.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdPath"
@@ -10559,15 +10559,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Node answer"
+          "400": {
+            "$ref": "#/components/responses/Error"
           },
           "401": {
             "$ref": "#/components/responses/Error"
@@ -10583,6 +10576,16 @@
           },
           "422": {
             "$ref": "#/components/responses/Error"
+          },
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Node answer"
           }
         }
       }

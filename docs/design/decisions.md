@@ -30,11 +30,13 @@
 | D-049 | 2026-09-19 | **手机优先 UI：受限 `/m` 路由树 + 会话本体不分叉 + 视口重定向层 + `start_url: /` + badge/权限横幅口径 + 平台听写真名。** (1) **受限路由树**：同一 Vite PWA 内新增手机优先路由树，`/m` **只拥有导航与首页级信息架构**——`/m`（会话 home）、`/m/inbox`（收件箱）、Jump To sheet、phone 底栏（会话·收件箱(n)·新建·更多）；桌面路由零改动，不做独立客户端、不做原生 app。(2) **会话本体不分叉**：手机打开会话仍是共享的 `/s/:instanceId`（及 `/tty` `/structured` `/files` `/events`），`/sessions/new` `/login` `/pair` `/settings` 同样共享；改善靠该路由的 compact 形态（D-040/D-041/D-042 + ui-spec §4.7 铬预算：一条顶栏 `--top-mobile` 52px + 一条底栏 `--bar` 64px、正文 ≥ 60% 视口、截断优先级=标题→space 芯片→状态文字、状态点恒在主行、`终端\|结构` 分段与 Stop 永不截断/进 ⋯；§1.4 chips 折单芯片 + tabs 行收起；**host 芯片与 cost 仅 compact 折入「运行详情」，D-040 桌面主行规则不变**），不复制 transcript。(3) **重定向与深链**（`<Navigate replace>`）：compact 下 `/sessions`→`/m`、`/approvals?focus=`→`/m/inbox?focus=`（**query 原样保留**）；桌面下 `/m*`→`/sessions`；**`/s/:id` 永不重定向**（两套壳下同一条路由）；`/sessions/new` `/login` `/pair` `/settings` 两侧不重定向。(4) **`start_url` 从 `/sessions` 改为 `/`**，由重定向层按视口判定落点（手机装的 PWA 落 `/m`，桌面落 `/sessions`），一份 manifest、一份 SW。(5) **badge**：推送 payload 增加一个**可选**整数 `badge` 字段（该设备 pending interaction 数），SW 调 `setAppBadge`/`clearAppBadge`，无 Badging API 则什么都不做、不用通知条数冒充，字段缺失行为逐字节不变；**不新增推送事件类型**。(6) **权限申请不在启动时弹**，只在 `/m/inbox` 顶部横幅（用户手势触发）与设置→通知两处；iOS 未加主屏时横幅文案改「先加到主屏幕」。(7) **语音**：平台键盘听写优先、先成文再发送（`composing()` 守卫对听写同样生效）、Web Speech API 仅作可用时增强且默认关、不做云转写/录音上传/协议字段、iOS Safari 无 `SpeechRecognition`（写进设置文案）、终端段不提供语音。(8) **里程碑**：M1 = home、会话、收件箱、新建、登录、语音；键盘条、分组 Jump To、badge 与推送真机验证排 M2。取舍：会话路由 compact 去掉 app 底栏后「回家」靠 44px 返回键 + Jump To（ui-spec §4.7 / 计划风险 E9），若实测反感只回滚该条、不回滚整棵 `/m` 树。 | coordinator（mobile-ui 计划 section (B)/(D) D1–D8 默认值，所有者未拍板即按默认执行；任务 c-mspec 落规格） | [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §5（P0 能读能批能说 + 明确不做）、§6（落地顺序）、§7.1（home）、§9（SOTA 一句话「投影不是第二个 agent、终端一键可回不 fork」+「不要抄」清单）、§10-19（主分段）、§10-23（Jump To 不做第二套空间模型）、§11.2（分组/时钟/只搜标题）、§11.3（Inbox 两档、错误当正文、权限横幅）、§11.4（git 扫视串可学、硬裁 diff 不抄）、§11.5（端口/Kill 面板与隧道整体不抄，D-031）；[ui-spec.md §1.2/§1.3/§4.5/§4.6/§4.7/§4.8](./ui-spec.md)；D-026/D-028a/D-031/D-038/D-039/D-040/D-041/D-042；[evidence/mobile-ui-1.md](./evidence/mobile-ui-1.md) |
 
 | D-050 | 2026-09-20 | **Task 优先模型：Task 是 instance 之上的聚合（非第二状态机）；目录绑定 `workspaceBinding{reuse\|pool}` + 唯一新表 `worktree_leases`（`mode`、复合键 `(host_id,workspace_id,dir_key)`、可空 `worktree_name`、`holder_instance_id` attach-lock）；reuse=顺序轮用、归还对目录零操作，pool=detached-HEAD 停放、租借切 `wt/<slot>/<task-slug>`、return-don't-delete（reset/clean/park 仅 pool）；既有回收路径（`remove_record`/`worker.remove_worker`/`delete_instance`/`retire_worker`）必须 lease-aware；看板 8 态→4 列只读投影，failed 按 `placement.is_some()` 归位 + 角标（不存 pre-fail 列），拖卡列→列多跳；门控用 grant 动词（create/set-state=`GrantVerb::Dispatch`、land=`GrantVerb::Land`，持 grant 的协调员 agent 授权，非「agent 一律 403」）；迁移预算=一个增量列 `archived_at`（落 `tasks.rs` migrate）+ 一张新表；批注=composer 草稿（零 wire）；任务空间=文件视图客户端过滤投影（零端点）；参考产品合规护栏（只泛称、开源项目可具名、不引述内部文档、截图只提交 Remuda 渲染） | coordinator（task-model 计划任务 1 t-spec，docs-only） | [task-model.md](./task-model.md) 全文；[ui-spec.md §1.5/§2.9](./ui-spec.md)；[evidence/task-model-1.md](./evidence/task-model-1.md)；D-024/D-033/D-035/D-047/D-049 |
-| D-051 | 2026-09-24 | **委托决策（delegated decisions）：agent 可代人审批，但 plan-review 由 Node 侧 driver 直接铸造。** (1)-(5) Agent 设备经一跳家庭边（self 或直接子实例，`owns()`）可列出/回答非 approval 的交互；approval 永不下放，bypass 双侧排除；开关为 **Hub 进程环境变量**（全局开关 + per-project 覆盖名单，非 driver→Node→Hub 传播、无 wire/schema/create-spec 字段）；actor 真实化（`AnswerCaller` → committed `ActorRef.instance_id`，c-deleg2 审计链）。**(6) 2026-09-24 修正（取代早先 Hub-fold 设计）**：print/sdk 上 driver 把子代理的 `ExitPlanMode` 原生 `can_use_tool` 暂停铸为 `InteractionRequest::PlanReview`（内联 `plan` 正文 ≤ 32 KiB、sha256 digest、approve/deny、allowFeedback），走既有 Node first-answer-wins CAS；仅顶层（非 sub-agent）、有可回复原生暂停时铸，其余回人类 Approval；正文 inline（加性可选 `PlanReviewRequest.plan`，`planRef` 仅占位，**不写对象表/不新增 `AttachmentKind`/零新 wire enum**）；approve 只 allow 原 input 绝不附 `updatedPermissions`/setMode，deny 用 feedback 回喂模型；plan-review 不吃 `owns()` self 边（child 不能列/答自己的 plan）；Node 不论 carrier 先 `validate_answer`（offered option/请求 revision/digest/feedback 规则）再进 CAS。刮屏 carrier（claude-pty、无 hooks 的 shell-pty）不产生 plan-review；shell-pty+hooks 待真录验证（T2）。真实父子 gateway 轮次待协调员验证。 | 用户 + coordinator（D-051 (6) 修正 2026-09-24；c-deleg1/2/3 实跑证据） | [evidence/delegated-decisions-1.md](./evidence/delegated-decisions-1.md)、[-2](./evidence/delegated-decisions-2.md)、[-3](./evidence/delegated-decisions-3.md)；D-017/D-011；`protocol.md §5.4` |
+| D-051 | 2026-09-24 | **委托决策（delegated decisions）：agent 可代人审批，但 plan-review 由 Node 侧 driver 直接铸造。** (1)-(5) Agent 设备经一跳家庭边（self 或直接子实例，`owns()`）可列出/回答非 approval 的交互；approval 永不下放，bypass 双侧排除（2026-10-05 由 D-057 修订：提问与 plan review 不再因 bypass 排除，approval 仍只由人回答）；开关为 **Hub 进程环境变量**（全局开关 + per-project 覆盖名单，非 driver→Node→Hub 传播、无 wire/schema/create-spec 字段）；actor 真实化（`AnswerCaller` → committed `ActorRef.instance_id`，c-deleg2 审计链）。**(6) 2026-09-24 修正（取代早先 Hub-fold 设计）**：print/sdk 上 driver 把子代理的 `ExitPlanMode` 原生 `can_use_tool` 暂停铸为 `InteractionRequest::PlanReview`（内联 `plan` 正文 ≤ 32 KiB、sha256 digest、approve/deny、allowFeedback），走既有 Node first-answer-wins CAS；仅顶层（非 sub-agent）、有可回复原生暂停时铸，其余回人类 Approval；正文 inline（加性可选 `PlanReviewRequest.plan`，`planRef` 仅占位，**不写对象表/不新增 `AttachmentKind`/零新 wire enum**）；approve 只 allow 原 input 绝不附 `updatedPermissions`/setMode，deny 用 feedback 回喂模型；plan-review 不吃 `owns()` self 边（child 不能列/答自己的 plan）；Node 不论 carrier 先 `validate_answer`（offered option/请求 revision/digest/feedback 规则）再进 CAS。刮屏 carrier（claude-pty、无 hooks 的 shell-pty）不产生 plan-review；shell-pty+hooks 待真录验证（T2）。真实父子 gateway 轮次待协调员验证。 | 用户 + coordinator（D-051 (6) 修正 2026-09-24；c-deleg1/2/3 实跑证据） | [evidence/delegated-decisions-1.md](./evidence/delegated-decisions-1.md)、[-2](./evidence/delegated-decisions-2.md)、[-3](./evidence/delegated-decisions-3.md)；D-017/D-011；`protocol.md §5.4` |
 | D-052 | 2026-09-23 | **provenance-first UI 批次口径（ui-upgrade 批次，docs 先合）**：(a) 本批零新 wire/表/端点，出处读既有 envelope（`seq`/`source`/`completeness`）与既有 `Interaction`，迁移预算零；(b) 审批卡**不显** confidence/risk 分（`ApprovalRequest` 无 `risk`，`web/src/types/generated.ts:98-106`）且**不在 UI 断言会话边界**（`DecisionOption` 无 `destination`，`web/src/types/interaction.ts:4-8`；harness 的 permission suggestions 实测含 `session` 与 `localSettings` 两种 destination）——线框 `risk`/`Always in this cwd` 改为 preview 原文 + carrier + deadline + harness 原范围标签，副文案统一「按 harness 建议的范围持续允许」，引 §3.3；(c) completeness 三值不变、仅活过 `FoldedToolRow` 折叠（interaction 节点/ApprovalCard 需先做 store 连接键调研，批次计划 D11 默认本批不做）；(d) D-041「折叠在 family 判定之后」保留并被回归断言守住；(e) `/board` 路由与三列只读投影已上线，本批只在既有面上 graft、不新建页面/路由，已完成列不暴露 land；(f) ledger 浅色主题由 D-053（任务 15）正式化，D-052 不处理主题；(g) `/approvals` 与 `/m/inbox` 收敛为 InboxShell 单壳，桌面三档/手机两档各自保留；(h) 新增 `--warn`/`--info`/`--text-xl`/`--text-13` 四个 token（双主题各一值、文本对 `--ink-2` ≥ 4.5:1）；(i) stylelint 按文件白名单 opt-in，白名单是带摘除批次的台账，「辅助文本 vs 图形标注」分类口径进 ui-spec §3.4；(j) 参考清单定性「MIT 组件画廊，不声明任何 spacing/type/colour 规则」，证据只用 Remuda 自身 390/1440 渲染 | coordinator（ui-upgrade 计划任务 1 c-uispec2，docs-only） | [ui-spec.md §2.2/§2.5/§2.9/§3.3/§3.4/§4.7](./ui-spec.md)；[evidence/ui-upgrade-1.md](./evidence/ui-upgrade-1.md)；D-002/D-024/D-035/D-038/D-039/D-040/D-041/D-042/D-045/D-046/D-049/D-050 |
 | D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端跟随外观（2026-09-24 所有者改定，原恒深色口径废止）**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 z-index / elevation / 阴影 / disabled token」中的阴影部分（z-index/disabled 口径不变）；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围，并修订 D-024 addendum「侧栏强当前态」的品牌左条（改为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，关闭语义不变，详见 ui-spec §1.4）与「活动 tab」的品牌下划线（改为 2px `--fg-strong` 下划线 + `--bg-selected` 底 + 加粗，详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
 | D-055 | 2026-09-25 | **命令重放按操作分叉：`instance.send` 可重放，`instance.configure` 不可重放。** 同一 commandId 重放 `instance.send` 继续用于恢复丢失响应：返回存储原记录，对仍排队的行恰好转发一次（G1/G2 不变）。`instance.configure` 的 spec merge 只在首次 POST 发生且只发生一次，重放永不再次 merge：终态行（accepted/settled）原样返回存储记录（含首次 merge 失败时持久化的原始 500 与原始 body）；原始结果尚未持久化（转发仍在飞）时返回明确的 409「still in flight」并指引轮询 `GET …/commands/{commandId}`；离线排队（`forwarded=0`）的 configure 重放返回明确 409，要求客户端换用新 commandId 发新命令，绝不代为转发。理由：web 离线 outbox 只重放 send，configure 重放无法闭合「重复 merge / 首次 500 重放成 200 / 并发同 id 双 merge / 排队行重放被转发」四类边角。配套：`GET /v1/instances/{id}/commands/{commandId}` 在转发尝试进行中绑定到**本次尝试**发布的终态行（尝试尚未开始时如实返回 pending 的 `queued`/`forwarded=false`），永不先报 `forwarded=true` 再报回滚后的 `forwarded=false`。 | coordinator（c-configfix） | `protocol.md §2.5`；D-055 任务 B（send 重放） |
 | D-056 | 2026-10-05 | **Claude ultracode 是正交的会话开关（Claude ultracode is an orthogonal session toggle）：effort 档位与 ultracode 端到端是两条独立的轴，按 Claude Code 版本门控。** Claude Code 2.1.284 起 ultracode 不再强制 xhigh，在任意档都保持开启；2.1.203–2.1.283 是耦合基线（开 ultracode = xhigh，选任何档即关）。(1) wire `EffortSelection{name, ultracode}` 不变，但在 ≥2.1.284 上 `ultracode` 不再蕴含 xhigh；旧名 `ultracode` 只作输入别名，读入为 `{xhigh, true}`。(2) launch：≥2.1.284 发 `--effort <level>`，并把 `"ultracode": true` 写进**同一份** per-launch settings overlay（两个 `--settings` 不合并，后出现的整份胜出）；2.1.203–2.1.283 只有 `{xhigh, true}` 可发 `--effort ultracode`，其余组合以 `InvalidLaunchSpec` 拒绝并点名版本；低于 2.1.203 或版本读不出时，任何 `ultracode: true` 都拒绝；版本取 pinned binary 的 `--version`；`--resume` 不恢复 ultracode，resume launch 须再带一次。(3) 会话内：档位走 `/effort <level>`，保留确认框门控（2.1.289 上不弹框）；开关走 `/effort ultracode on\|off`，没有确认框；每次 configure 至多两条命令，档位在前；耦合版本上开 = 单独一条 `/effort ultracode`（仅 `{xhigh, true}`，不先发会保存默认档的 `/effort xhigh`），关 = `/effort <level>`。(4) 回读：档位读 assistant `effort`/`perTurnEffort`；开关只读 verdict 与 `ultra_effort_enter`/`ultra_effort_exit` 附件，且只认本进程产生的记录（resume 重放的旧 verdict 不算），≥2.1.284 上在任意档锁存；版本读 transcript 的 `version`；拒绝映射为稳定 reason（`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`）；被 clamp 的 accept 报 clamp 后的档；切换失败只是这次 configure 的结局，不结束会话，可以重试。(5) UI：Claude 五档滑杆 + 独立的 Ultracode 开关，芯片显示 `<level> · ultracode`；不可用时开关禁用并给出原因，模型拒绝只对那个模型禁用、换模型后重新启用；耦合版本上开关注明以 xhigh 运行。(6) 默认档按模型（官方文档：Opus 5.5 / Sonnet 5.5 为 medium，Opus 4.7 为 xhigh，其余为 high），不得把任何一档标成通用默认。(7) `CLAUDE_CODE_EFFORT_LEVEL` 继续从子进程剥离。取代 D-028a 第 (5) 项中「ultracode ≡ xhigh + dynamic workflow」的口径。per-task / 供给层的 ultracode 请求是所有者的未决问题，本条不定。 | coordinator（c-effortadr，docs-only）；会话级开关为所有者现行口径 | [evidence/effort-sync-4.md](./evidence/effort-sync-4.md)（2.1.289 实测）；Claude Code 官方文档 model-config / cli-reference / settings-reference / workflows 与 2.1.284 changelog；effort-sync-2/3（耦合基线）；D-028、D-028a |
+| D-057 | 2026-10-05 | **main agent = an ordinary claude-sdk instance holding address-owner on the always-on intranet Hub**; lineage continuation (restart only on Node-attested process loss or start failure, any close pauses, Resume only from paused); fence transaction F is the Hub admission boundary, Nodes apply fences eventually and every pre-fence operation gets a truthful outcome; direct RPCs share one initiator-aware boundary; push suppressed only for interactions routed to an effectively running Agent parent, lifted when it stops running; no special permission design (D3). **Owner amendments OA1–OA6 (same day)**: an Agent-created child may turn its harness's permission control off only if its Agent creator runs with it off, and an omitted mode inherits the creator's (the one change to the Agent-origin permission rules, Hub and Node together); the seat's mode and grants are creation-time configuration with no stated default; D-051(b) amended so questions and plan reviews reach the Agent parent even under bypass, approvals stay human-only; failed is not the process exiting (only process-end evidence is terminal; other failures are retryable in place and never restart; only settled root-turn end evidence sets activity idle (a root StopFailure counts only once protocol §5.6 settles it, otherwise the turn stays unknown and held prompts do not flush), while subagent, workflow, configure and diagnostic failures leave it unchanged; C1 restarts only on process loss or start failure) | owner + coordinator | [main-agent.md](./main-agent.md) |
+| D-058 | 2026-10-05 | **新建任务的目录浏览器与「移除目录」占用门（c-dirpicker）**：新增 Node RPC `host.dirs.list`（只列目录、lstat 不跟随 symlink、限定 `workspace_roots` allowlist、隐藏目录默认关、4096 条目/16384 扫描上限并回 `truncated`，给 home/roots/已注册根/allowlist 边界 parent）与 Hub `GET /v1/hosts/{id}/dirs` 代理（Human-only，Bot/Agent 403，未知主机 404，离线 409）；前端「+ 添加目录」改为浏览器 Modal（面包屑+过滤+隐藏开关+使用此文件夹），手敲绝对路径保留为高级选项，注册仍走既有两阶段 `workspace.register`；unregister 增加占用门——Hub 在排队命令前按 live 会话（lifecycle 非 exited/failed/closed）与未归档且非 done/failed 的绑定任务计数 409 拒绝，Node 在 prepare 做同一 live-session 门（canonical 别名同样挡住，幂等 prepare 重放豁免），只解绑不删文件、已结束会话保留历史；前端移除先确认、理由内联。非目标：文件浏览仍归 `host.files.*`，不做递归/提权浏览，不自动结束会话或归档任务。 | coordinator（c-dirpicker） | [ui-spec.md §2.4/§2.6](./ui-spec.md)；D-023；[files-view-contract.md](./files-view-contract.md) |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -66,7 +68,7 @@ docs/                      # design/ research/
 | D-021 | 2026-09-13 | **Provider scoping**：Hub 存储的 Provider 分 **universal**（任意主机经 SecretBroker 拿到 profile + secret）与 **host:<hostId>**（secret 只对该机释放）。Host `providerBinding` 为 `auto`（默认）\| `native`（该机自己的 CLI 登录/网关，Hub 不发 API key）\| `profile:<id>`。Claude launch 在 Hub 侧按 显式 request → host binding → host-scoped default → universal default → 主机 inventory 原生登录（若检测到）解析，否则 422。 | 用户 | [providers.md](./providers.md) |
 | D-022 | 2026-09-13 | **PTY 启动对话框与排队**：启动后的原生 TTY 阻塞保留 ready/blocked 实例和 interaction，prompt 排队并在 idle 后发送（Claude 另需当前 SessionStart hook），create 仍 accepted。Node `auto_trust_registered_workspaces` 默认 true，仅 claude-pty 的完整、精确 folder-trust 对话框且 canonical cwd 位于本 Node 注册 workspace 内时，按当前选项游标自动确认；目录外或关闭配置时交用户。记录 interaction 与 auto-accepted diagnostic，按键 ACK 不明时不重放。 | 用户 | [pty-trust-1.md](./evidence/pty-trust-1.md) |
 | D-023 | 2026-09-13 | **运行中注册 Workspace**：Node data dir 持久化 workspace registry，重复 `--workspace` 与已有记录合并；Node `workspace_roots` 限制可注册范围，默认本机用户 HOME。注册须是存在的绝对目录并 canonicalize，禁止落入其他 workspace 的 worktree 目录。Hub↔Node 增加 `workspace.list/register/unregister`，变更经 prepare/commit 两阶段，Node 持久化后 Hub 才保存并广播最新 registry。Human/Bot 可用 `GET/POST/DELETE /v1/hosts/{id}/workspaces`，Agent 一律 403。新建会话选择主机注册目录并填写可选相对子路径；Node 展开开头的 `~`/`$HOME`，仍按注册目录或其 worktree sibling 检查 containment，越界错误列出已注册根和注册方式。取消注册仅撤销后续会话准入，保留目录与已有会话。 | 用户 | [workspace-reg-1.md](./evidence/workspace-reg-1.md) |
-| D-024 | 2026-09-13 | **项目 Space → agent Tabs**：借鉴 herdr 的 workspace → tabs → panes，Remuda 的 Space 对应某台主机上一个已注册 Workspace（D-023），以 `(hostId, workspaceId)` 唯一标识；同名目录或跨主机目录不合并。展示名默认取 workspace 根目录 basename，重命名、手动排序、分组展开状态、侧栏折叠和每个 space 的上次选中 tab 存本设备 `localStorage`。每个实例按 host/workspace 精确归属一个 space，无匹配项归入「其他」。当前 space 的 agent 会话显示为内容上方 tabs（标题、harness 字形、活动点、关闭），切换 space 恢复该 space 的 tab，并为新建会话预填其 host 与 cwd；`/s/:instanceId` 深链反向选中对应 space 和 tab。桌面支持可折叠 Spaces/Sessions 左栏及首字母窄轨，⌘/Ctrl+B 切换侧栏、⌘/Ctrl+1..9 切换 tabs、⌘/Ctrl+[ / ] 切换 spaces；手机使用横向 space chips、可滚动 tab 条和侧栏抽屉。沿用 Night Corral tokens，不引入 panes；fleet、全局审批及 composer 的职责保持原状。 | 用户 | [ui-spec.md §1.4](./ui-spec.md#14-space--tabs-项目工作台d-024)；[spaces-1.md](./evidence/spaces-1.md) |
+| D-024 | 2026-09-13 | **项目 Space → agent Tabs**：借鉴 herdr 的 workspace → tabs → panes，Remuda 的 Space 对应某台主机上一个已注册 Workspace（D-023），以 `(hostId, workspaceId)` 唯一标识；同名目录或跨主机目录不合并。展示名默认取 workspace 根目录 basename，重命名、手动排序、分组展开状态、侧栏折叠和每个 space 的上次选中 tab 存本设备 `localStorage`。每个实例按 host/workspace 精确归属一个 space，无匹配项归入「其他」。当前 space 的 agent 会话显示为内容上方 tabs（标题、harness 字形、活动点、关闭），切换 space 恢复该 space 的 tab，并为新建会话预填其 host 与 cwd；`/s/:instanceId` 深链反向选中对应 space 和 tab。桌面支持可折叠 Spaces/Sessions 左栏及首字母窄轨，⌘/Ctrl+B 切换侧栏、⌘/Ctrl+1..9 切换 tabs、⌘/Ctrl+[ / ] 切换 spaces；手机使用横向 space chips、可滚动 tab 条和侧栏抽屉。沿用 Night Corral tokens，不引入 panes；fleet、全局审批及 composer 的职责保持原状。 | 用户 | [ui-spec.md §1.4](./ui-spec.md#14-space--tabs-项目工作台d-024面板位置与-tab-范围经-d-053-修订)；[spaces-1.md](./evidence/spaces-1.md) |
 | D-025 | 2026-09-13 | **Terminal → agent promotion**：`terminal` + `shell-pty` 实例不再永远是纯 screen text。Node 每 ~1s 轮询该 PTY 的前台进程组（master fd 的 `tcgetpgrp`，再按 pid 读进程名/argv），命中已知 agent CLI 表（MVP：`claude`；`codex`/`grok`/`agy` 只做检测与 kind 切换）就把实例 **promote**：`kind` 改为该 agent，`driver` 仍是 `shell-pty`，新增实例字段 `mode: "native" | "promoted"` 与 `promotedAt`，并记一条 native diagnostic `agent detected: <kind>`。promote 后 agent_status 复用 claude-pty 的屏幕启发式，interaction 复用既有 PTY 检测，composer 的 prompt 以 PTY 文本 + Enter 送入（bracketed-paste 感知，阻塞时走 D-022 队列）。**结构化消息**由 Claude transcript 水合：按 cwd 编码定位 `~/.claude/projects/<encoded>/<session>.jsonl`（优先取 argv 里的 `--session-id` / `--resume`，否则取检测时刻之后新建/更新的最新文件），逐行喂给既有 claude transcript mapper，产出 open→append→close 的 message/thinking/tool 事件。前台 agent 退出即 **demote** 回 `terminal`，同样记 diagnostic。promote/demote 幂等且全部进 journal，Hub/web/MCP 因此实时反映。屏幕签名是 `tcgetpgrp` 不可用时的 fallback，不是主路径。 | 用户 | [remote-terminal.md](./remote-terminal.md#terminal--agent-promotion)；[terminal-promote-1.md](./evidence/terminal-promote-1.md)；D-016 / D-022 |
 | D-026 | 2026-09-13 | **会话续接（Session continuity）**：每个 Claude 实例都把驱动**实际上报**的 native session id 记进 `nativeRef`（claude-print 取 stream-json `system/init` 映射出的 `session` lifecycle；claude-pty 取 SessionStart hook 的 `session-meta.json`，并带 `transcriptPath`），取代 create 时用 Instance id 造的占位值——占位值 `claude --resume` 根本不接受。Resume **不复活**已退出的进程：它在**同一 host / workspace** 上新建一个实例，沿用父实例的 provider / permission / model / cwd，由 materializer 走 `SessionAction::Resume` 发出 `--resume <sessionId>`（`--resume` 属 RESERVED，仅 materializer 可发；`--continue` 仍 BANNED，因为它按时间而非身份选会话）。父子双向落账：子实例 `instance.parent` 指向父实例，Hub 记 `resumedFrom`，两侧各journal 一条 lifecycle；旧实例保持 exited，历史完整保留。Resume 控件提供两个目标：**继续（结构化）** 沿用父实例驱动，**在终端中继续** 用 claude-pty 续同一个 session——这也是structured-only 会话「回到 Terminal view」的答案：不是给旧实例补一个终端，而是让同一段对话在一个有终端的新实例里继续。`POST /v1/instances/{id}/resume {mode:"structured"|"terminal"}` 仅 Human/Bot，Agent 一律 403（resume 会占用主机容量并拉起原生进程，超出实例凭证的授权范围）；同一 (instance, mode) 在短窗口内幂等，重复点击复用既有子实例而不是对同一段对话再拉一个进程。未上报过 session id → 409 并说明「没有可续接的 transcript」，退出超过 30 天 → 409 并说明过期；两者分开报，避免 resume 静默开出一个看起来连续、实际为空的新对话。 | 用户 | [resume-1.md](./evidence/resume-1.md) |
 | D-027 | 2026-09-13 | **附件与图片直通（MVP）**：浏览器→agent 的图片走「Hub 暂存 + Node 回拉落盘 + driver 按能力投递」三段，字节**只走 HTTP**，命令帧里只带 metadata（绕开 JSON 帧 1 MiB / prompt 64 KiB / TTY input 4096 B 三道上限）。Hub 新增 `POST /v1/objects`（raw body + `Content-Type`，`X-Remuda-Instance-Id`）与 `GET /v1/objects/{id}`，仅该子路由挂 `DefaultBodyLimit`；allowlist `image/png|jpeg|gif|webp` 且**以服务端 magic bytes 嗅探为准**，与声明的 `Content-Type` 不符即拒；丢弃原始文件名，落盘名固定 `<obj_id>.<ext>`；单文件 ≤5 MiB、单条消息 ≤4 个附件、单 instance 暂存 ≤64 MiB；24 h TTL + 惰性删除。EXIF 在**浏览器侧**无条件 canvas 重编码剥除，Hub 不引图片库。鉴权：上传要 `require_origin` + device，**Agent origin 一律 403**（不进 `agent_scope` 白名单）；回拉对 device owner 与**该 instance 所属 host** 双向放行，host 侧按 `object.instance_id -> instance.host_id` 绑定，一台 Node 读不到别台 Node 的附件。协议纯增量：`InstanceSendParams.attachments[]{objectId,mediaType,name,size}`，`prompt`/`prompt_text()` 不变，老 Node 忽略即降级为纯文本。Node 在 dispatch **前同步** materialize 到 `<data_dir>/instances/<ins>/attachments/`（目录 0700、文件 0600，不进 workspace），失败整条 send 失败、**不静默降级为纯文本**；instance 停止/退出时递归清理。driver 分层投递：claude-print 发 base64 image block，claude-pty/generic-pty/shell-pty 追加绝对路径提及（codex 必须显式写「读取 <path>」），grok 记一条「该 agent 不支持读图」的 journal note。**刻意留 v2**：channel 2 `ObjectChunk`、`object.prepare/write/commit` handler、上行 `blocks`、服务端回显、远端 pasteboard、终端粘贴、share target。 | 用户（设计已批准）/ x-clip 实施 | [clipboard-images.md](./clipboard-images.md) §5–§7 |
@@ -979,6 +981,8 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 - 任一调用方/目标子任一侧为 bypass 姿态时，Agent 答案在 list 和 answer 两处都被拒。
 - 非一跳（祖父/兄弟）不路由。
 
+> **2026-10-05 修订（D-057，所有者补充裁定 OA3；main-agent.md 称本条 bypass 排除为 D-051(b)，approval 排除为 D-051(a)）**：自开发项目开启本开关。上面的 bypass 排除改为：提问与 plan review 即使上级或子实例运行 bypass，也路由给 Agent 上级；approval 仍永不下放，只由人回答（D-017）；非一跳不路由、plan-review 自排除不变。理由：D-057 的「子不超父」（OA1）让子实例只有在 Agent 创建者自身关闭 harness 控制时才能关闭控制，所以委托不扩大权限。实现随第一阶段 `ma-admission` 落地，此前代码仍按上面的旧条文执行。
+
 **(6) plan-review v2（2026-09-24 修正，取代早先 Hub-fold 设计）**
 
 > 早先（c-deleg3 初版）让 Hub fold-stage 把观察到的 ExitPlanMode 重新铸 plan-review、经 Hub-native broker 与伪造的 plan 对象通道审批。该设计有三个问题：Hub-fold 与 Node 拥有的审批卡两行重复需要 settlement 关联、Hub 需要翻译层与伪造 device、以及引入 plan 对象表/`AttachmentKind`。v2 改为 **driver 在 Node 侧直接铸 PlanReview，走同一条 Node CAS**，全部撤回。
@@ -1405,6 +1409,179 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
   - `web/src/features/session/effort.ts:419-438`
 
 ## D-057
+
+**2026-10-05 · 主 agent：常驻内网 Hub 上的一个普通 Agent 实例——按血缘续接；隔离分成 Hub 受理边界与 Node 执行边界；只在事项真正转给上级时静音推送**
+
+| 日期 | 2026-10-05 |
+|---|---|
+| 状态 | adopted（规格层；第一阶段按 [main-agent.md](./main-agent.md) §15 的顺序实施。本决策与设计文档先合入，不含代码） |
+| 相关 | [main-agent.md](./main-agent.md)（机制以它为准）、[hub-topology.md](./hub-topology.md)、[deploy-runbook.md](./deploy-runbook.md)、[coordinator-hierarchy.md §2.0/§2.5](./coordinator-hierarchy.md)、[protocol.md §2.5/§Origin/§7.2/§9](./protocol.md)、[ui-spec.md §2.2/§4.5/§4.7](./ui-spec.md)、D-002、D-011、D-017、D-019、D-026、D-031、D-034、D-035、D-037、D-045、D-049、D-050、D-051、D-055 |
+| 参考 | open-muse（开源的长期运行个人 agent）：循环跑在常驻基础设施上；服务只充当时钟，不做推理；主动发起的回合就是普通消息，绝不打断正在等人回复的对话；只在 App 处于前台的那台设备上静音通知 |
+
+**背景**：Remuda 自身开发用的「主 agent」，目前是所有者在笔记本上手动运行的一个 Claude Code 会话，用的是 Human 设备 token。它反复出现的故障就是本决策的验收标准：笔记本休眠后评审与 gate 轮询停住（A1）；重启清空 /tmp，所有 watcher 都被杀掉（A2）；一次长时间的 gate 跟着一条 ssh 会话一起断掉（A3）；watcher 与 cron 只在会话存续期间存在（A4）；遇到 429 或上下文耗尽的 worker 一闲就是几天（A5）；记忆只是不断追加的 markdown（A6）；对外动作需要判断，有时还得问所有者（A7）；所有者只能在终端里聊天（A8）。
+
+在 origin/main 上核对过的阻挡项：
+- (1) `restrict_agent_routes` 不放行 `/v1/workers/*`；worker 处理器只检查 project scope，不检查归属。
+- (2) dispatch 对每个 harness 都写死 `bypassPermissions`；Hub 的 `restrict_permission` 只允许 Agent 创建 manual/plan；Node 物化器的 `permission_plan` 拒绝 Bot/Agent 来源使用关闭权限控制的档位，所以 Agent 来源的 dispatch 一定失败。`prepare_create` 的一次性审批发生在分配 worktree 之后，审批对象是一份每次重试都会变的 spec。另外，`select_carrier` 在不指定 carrier 时，只要 Node 报告原生 `shell-pty` 可启动就选它；`shell-pty` 属于 shell 驱动，Agent 来源使用时要一次性人审。
+- (3) claude-sdk 的回合结果不会投影为 idle；`status:error` 被当成启动失败，投影为不可恢复的 `lifecycle=failed`。
+- (4) D-026 resume 只限操作员使用；它把 claude-sdk 降为一轮即退出的 claude-print，丢掉 delegation，并把新实例挂在旧实例之下；`owns()` 只看一跳。worker resume 经 `respawn_instance`，以调用者身份调用这条只限操作员的路由，所以只要 worker 有原生会话 id，Agent 调用者就一定被拒。
+- (5) 进程丢失后，没有任何机制重启实例，也没有任何机制阻止被取代的章节继续行使权限：请求认证之后不再复查；`stamp()` 丢掉 actor，却不记录发起实例；Node 只按目标实例接收命令；同一 commandId 的重复 POST 会转发任何仍在排队的操作。`interaction.answer`、`gate.run`/`gate.land`、`worker.provision`/`worker.remove`、`worktree.lease`/`worktree.return` 是绕过命令表和 Node `insert_command` 的直连 RPC；gate job 甚至先在 Hub 标为 running，再异步发出 `gate.run`。Node 的 PTY 提示队列不依赖 Hub 连接，断网时照样投递。
+- (6) `alerts.rs` 只要有任一设备 follow，就静音全部设备；也没有「回复好了」的推送。
+
+**所有者裁定（2026-10-05，约束本决策）**：
+- **D1** Hub 跑在常驻机器上：沿用现有 deploy/intranet 的内网 Hub（现有 Caddy + 内网 HTTPS），从 `9dd7ec7` 升级到当前 main。笔记本只是又一个 Node，devbox Node 也接入。部署、Caddy、Compose 步骤由所有者或运维执行；worker 永远不执行 `deploy/` 下的任何脚本。
+- **D2** 从内网 Hub 的现有数据起步。笔记本上的 demo 成为历史，不迁移；Node 重新接入（笔记本 Node 保留已接入的身份，OA5）。
+- **D3** 主 agent 没有特殊的权限设计，依靠各 agent 循环自己的权限控制（Claude Code 权限模式、Codex 审批策略等）。不做按 harness 区分的姿态表，不做 OS 用户隔离，不做 land 授予机制（至多列为后续选项）。保留 Remuda 已有的真实安全性质：D-017 留给人的审批仍只由人来答；委托不扩大权限；按键不能代替审批。主 agent 和任何 agent 一样，在自己既有的 scope 内使用既有的 gate/land 动词。
+- **D4** 第一阶段退出标准全部通过后，从人工运行的 coordinator 一次性切换。
+
+**所有者补充裁定（2026-10-05，在设计 v3 之后作出；与本节其他文字或 main-agent.md 冲突时以本段为准）**。编号为 OA1–OA6，因为 A1–A8 已用于上文的故障编号：
+- **OA1 子不超父**：Agent 创建的子实例，只有当它的 Agent 创建者自身运行在关闭 harness 控制的档位时，才可以使用关闭控制的档位（Claude `bypassPermissions`/`dontAsk`、Codex `never`、Grok `always-approve`、Agy `always-proceed`）；否则可以使用任何保留 harness 控制的档位。省略档位时，子实例继承创建者自己的档位，框架不另选档位。Hub 的 `restrict_permission` 与 Node 物化器一起改为这条规则。这是第一阶段唯一改动既有 Agent 来源权限规则的地方。
+- **OA2** 主 agent 自己的权限档位与 grants（包括 `land`）和任何实例一样，是创建时选定的配置。本决策与设计文档不为它们规定默认值、建议或策略。
+- **OA3** 自开发项目开启委托决策（D-051 项目开关）。D-051(b) 修订（同日在 D-051 节加注）：即使上级或子实例运行在 bypass，提问与 plan review 也路由给 Agent 上级；approval 仍只由人回答（D-017）。理由：OA1 保证委托不扩大权限。
+- **OA4** 手机在办公网之外也有获准的路由到达内网 Hub；Hub 所在主机可以访问 Web Push 服务。
+- **OA5** 采纳的默认：
+  - 重启沿用入座时的 Human 授权，作为常设授权；
+  - 建议的重启上限为每小时 3 次；
+  - 笔记本 Node 保留已接入的身份；
+  - 跨 host 的 Agent dispatch 在第一阶段保留 D-017 一次性人审。
+- **OA6 失败不等于进程退出**（failed is not the process exiting）：只有进程结束的证据才让实例进入终态，即进程退出（exit 或退出码）、PTY 或 tty 消失、启动根本没有开始、或 Node 报告该实例已不存在。其他一切失败都可原地重试，绝不触发 C1 重启，也不发结束类推送。`activity` 只随根回合结束的证据变化：根会话的回合失败以 outcome `failed` 结束根回合，`activity` 变为 idle，所有者可以重试。不带 `agentId` 的主会话 StopFailure 只有在 protocol.md §5.6 实际结算之后才算根回合失败；在此之前回合保持 unknown，`activity` 不变，held 提示不冲出。subagent、workflow、configure 与诊断失败不改变 `activity`，各自记录在自己的范围里。C1 只在进程丢失或启动失败时重启。
+
+**决策**：
+1. **主 agent 是一个普通实例**：`kind: claude`、`driver: claude-sdk`，跑在常驻 devbox Node 的持久工作区里（不放在 /tmp），由所有者从 Human 设备创建。不新增 AgentKind，也不新增「座位」表：「Main」就是当前持有 `address-owner` 的那条血缘（每个 Hub 至多一个，这是既有约束）。它的其他 grants（包括 `land`）、scope 与权限档位和任何实例一样，是创建时选定的配置，由 harness 执行自己的权限控制（D3、OA2）；本决策不为它们规定默认值、建议或策略。它创建的子实例按第 2 条不超过它（OA1）。
+2. **Agent 来源可以使用既有的 coordinator 动词**：
+   - 放行 `/v1/workers/*`。Agent 来源的 worker 变更动词要求该 worker 的实例在调用者血缘之下（委托不扩大权限：不能动所有者亲手派出的 worker）；读操作仍按 scope 放行。
+   - dispatch 增加可选的 `permissionMode`。Human 来源的默认值逐字节不变；Agent 来源省略时继承创建者自己的档位，框架不另选档位（OA1）；显式请求的档位按下一条判定。请求的与生效的档位都原样记录（D-035）。
+   - **子不超父（OA1）**：Hub 的 `restrict_permission`（今天只许 manual/plan）与 Node 物化器的 `permission_plan`（今天对 Bot/Agent 来源拒绝关闭控制的档位）一起改为同一条规则：Agent 创建的子实例，只有当创建者自身关闭 harness 控制时，才可以使用关闭控制的档位（Claude `bypassPermissions`/`dontAsk`、Codex `never`、Grok `always-approve`、Agy `always-proceed`）；否则可以使用任何保留控制的档位。省略时继承创建者的档位；创建者的档位不在子实例 harness 的词表里时拒绝并说明原因，由调用者显式指定。Hub 依据创建者章节上记录的生效档位判定，并把它作为 `creatorPermissionMode` 盖章在转发的 create 上（绝不取自请求体），Node 据此在物化器、generic-pty 的 Agent 降级与 preset bypass flags 处执行同一规则；preset 的 yolo argv 只在子实例解析后的档位正是该 argv 所实现的关闭控制档位、并且 Agent 创建者自身关闭控制时合并，显式的保留控制档位永远不得到它（protocol.md §4.3）。Bot 来源不变。这是第一阶段唯一改动既有 Agent 来源权限规则的地方。
+   - D-017 对跨 host 与 shell 驱动 create 的一次性人审保留，跨 host 的 Agent dispatch 在第一阶段同样保留（OA5）；对 dispatch 改为在任何分配之前按请求摘要判定：批准后，内容相同的重试能通过；等待批准期间不留下 worktree。
+   - 免审的同 host dispatch 指：显式 `--carrier herdr`（Claude）或 codex/grok（generic-pty），并且该 host 的记录已登记 herdr。不指定 carrier 的 Claude dispatch，在 Node 报告原生 shell-pty 可用时会选 shell-pty，按 D-017 走一次性人审（行为不变）。
+   - Agent 的按键（`worker answer` 的 keys、`instance keys`、`tty.write`）一律保留一次性人审。
+   - worker resume/replace 改用 Hub 内部、按 scope 授权的 worker 重生帮助函数，不再走只限操作员的公开 resume 路由。授权依据是 dispatch grant、scope 与血缘归属；保留 carrier 以及请求与生效的权限档位。新实例的 parent 等于旧 worker 实例的 parent（即创建它的 coordinator 章节），`resumedFrom` 指向旧实例；旧 worker 实例永远不会成为 parent。公开的 `POST /v1/instances/{id}/resume` 仍只限操作员，行为不变；Human 对没有 Agent 上级的 worker 执行 resume，结果与今天逐字节相同。
+3. **血缘与章节**：同一个 agent 的历次进程，是一条血缘里的多个章节。每个章节是一个 instance，带 `lineageId`、`generation`、`resumedFrom`、`chapterCause`。续接边不是委托边：新章节的 parent 等于前任的 parent，深度不增加。只有一个血缘帮助函数，供 `owns()`、D-051 一跳边、worker 归属、fan-out（跨章节计数）共同读取；worker 的 `parentInstanceId` 保持为创建它的那个章节。claude-sdk 的 resume 改用 claude-sdk `--resume` 续接（这是一项对所有 claude-sdk 会话都生效的承载修正，D-035）。
+4. **续接（C1）**：Human 创建者可以给实例设置 `restart: {onProcessLoss, maxPerHour}`（建议上限每小时 3 次，OA5）。Hub 的监督步骤只依据**绑定到当前章节与当前 generation 的 Node 证据**行动，证据有三种：
+   - 章节进入运行后，进程自行结束（退出码、崩溃、信号）；
+   - 章节**启动失败**：它的 create 被 Node 结算为失败或拒绝，或出现启动失败的生命周期事件，或进程在第一个 running 事件之前就已结束。此时血缘仍处于 `starting`，同样符合重启条件；
+   - `node-epoch-changed`，且清单中已经没有该章节。
+
+   这三种都是进程结束的证据（OA6：失败不等于进程退出）。其他失败都不是证据：实例保持存活，绝不是 `lifecycle=failed`，可原地重试，C1 绝不因此重启，也不发结束类推送。它们对 `activity` 的影响按范围区分：
+   - **已结算的根会话回合失败**（根回合匹配的结果报告 429 等 API 错误，protocol.md §5.7；或不带 `agentId` 的主会话 StopFailure，且 §5.6 已依据有版本规则的精确原生错误结算它）以 outcome `failed` 结束根回合：`activity` 变为 idle 并带回合错误标记，composer 可以重试，held 提示可以像任何根回合结束后一样冲出；
+   - **未结算的根 StopFailure**（§5.6 无法结算，即没有带版本规则的精确原生错误）不算根回合失败：回合保持 unknown，`activity` 不变，composer 不呈现为空闲，held 提示不冲出；它先作为诊断记录，等后续证据结算回合；
+   - **有自己范围的失败**（subagent 或 workflow 失败、configure 失败、`severity=error` 诊断）不改变 `activity`，分别记录在 workflow member、configure 命令结果与诊断事件里。后台 subagent 失败时根 agent 可能仍在工作，所以它绝不让回合显示为已结束、绝不把 composer 呈现为空闲，也绝不冲出 held 提示。
+
+   只有已结算的根回合结束证据才把 `activity` 置为 idle，沿用 protocol.md §5.6–§5.8 已有的范围（StopFailure 只在有版本规则的精确原生错误时结算对应回合，否则保持 unknown；SubagentStop 不是根 Stop；workflow member 结束不证明根已无工作）。这条规则对所有实例成立，第一阶段由 `ma-sdk-state` 落实到 claude-sdk 的状态投影。
+
+   决定规则：
+   - **每个失败章节恰好做一次决定**：决定在 F 内作出并带 generation CAS，以失败章节 id 为唯一键写入血缘的重启决定记录；Hub 重启后按持久化的证据重新评估。
+   - **恢复来源**：失败章节有原生会话 id，就 `--resume` 它；没有的话，用最近一个有会话 id 的前任章节；如果首个章节就失败、且从未报告过会话 id，就用血缘最初的启动规格重新启动。
+   - 最近一小时内的重启决定达到 `maxPerHour` 时，经「无继任者的 F」进入 `paused(restart-cap)`。没有设置 `restart` 的持续性血缘丢失进程时，经无继任者的 F 进入 `paused(process-exit)`。
+   - `host-lost` 只表示结果未知（D-019 下进程可能还活着），不触发重启，也不再把这类章节结算为 `host-lost`。
+   - 任何 close（来自人、自身或 Agent 祖先）在受理时就让血缘进入 `paused`，并原样记录关闭者；这个状态永远不会被自动重启撤销。
+   - 恢复（既有的 resume 动词）只对已暂停的血缘有效，否则返回 409「先暂停」；删除未暂停血缘的当前章节返回 409「先关闭」。
+   - **继任章节的启动授权**：create 沿用血缘创建者记录在案的 Human 启动来源（只有 Human 能设置 `restart`，这个设置就是所有者在入座时给出的常设授权，OA5）；actor 记为 Hub 监督者，并附上创建设备。这样，所有者选的权限档位在重启后保持不变，记录也真实。
+   - 继任章节的第一条输入是一条由 Hub 生成的重启通知，来源是新增的 `InputOrigin` 值 `hub`。在 Node 上，`hub` 与命令来源 `system` 双向映射，永远不映射为 Human 或 Agent。通知列出重启原因、被取代的提问，以及前任操作按第 5 条结果类别得到的结果。
+5. **隔离（fencing）**：每个 Agent 发起的 Hub 变更，都带上 Hub 依据认证结果盖章的发起者 `{instanceId, lineageId, generation}`，旁边记下认证设备 id（只存在 Hub）。命令行、gate job、直连操作行都带这些字段；转发给 Node 的参数里带上发起者，且绝不从请求体读取。两条边界分开定义：
+   - **Hub 受理边界（严格）**：单一 SQLite writer 中、带 generation CAS 的隔离事务 F。F 依次做以下几件事：
+     - generation 加 1；把前任章节标记为已隔离；删除绑定前任的全部 Agent 设备行；
+     - 在 Hub 内取消以下尚未离开 Hub 的操作：前任 generation 发起、还没有提交转发意图的命令（任何操作；D-055 的重放覆盖 `instance.configure` 以外的全部操作），尚未被认领的 gate job，已受理但还没发出的直连操作；
+     - 把下列操作记为「可能已执行」：已提交转发意图、尚未结算的命令；已发出、尚未结算的直连操作；已被认领但 Node 还没开跑的 gate job；
+     - 把前任待答的交互标为 superseded；为每台已知 host 写一条持久的 fence；续接时，在同一事务里插入新章节、它的 create 和通知的 commandId。
+
+     F 之后，凡是旧 generation 发起的变更，在 writer 中受理时一律被拒，包括 F 之前已经通过认证的请求。拒绝点包括：`queue_command`；`mark_forward_intent`（复核行上记录的发起者和设备）；gate 入队与认领；直连操作受理；所有对 Agent 开放的写路由。写出帧之前还有一道发送闸：如果内存中的 fence 表显示发起者已被隔离，就不写出，并结算为 withheld。这道闸只缩小窗口，不构成保证。
+   - **Node 执行边界（最终一致）**：每台 Node 收到并持久化 fence 时，fence 在这台 Node 上生效。生效之前，F 前受理的操作仍可能在该 Node 上执行：断网 Node 的本地队列照常推进（例如 worker 结束一轮忙碌后，PTY 队列里的提示照样送出），在线 Node 也存在 fence 尚在途中的窗口。生效时，Node 取消尚未交付的旧 generation 操作（包括 PTY 提示队列），拒绝之后到达的操作，并在确认中报告：取消了什么、什么已经执行、拒绝了什么，以及无法确定的操作（`unknown`：有记录，但 Node 或进程在持久意图与任何证据之间崩溃，无法确定它是否已到达执行者）。Hub 只按明确的结果把「可能已执行」结算为已执行、已取消或被拒；Node 报告 `unknown`、确认没有提到、或目标 host 一直不确认时保持「未知」，如实展示，绝不推断为未执行。host 确认并不总能结算每个操作。
+   - **直连 RPC**：`interaction.answer`、`worker.provision`/`worker.remove`、`worktree.lease`/`worktree.return`、`gate.run` 及其后续步骤，共用一个带发起者信息的分发边界：产生外部效果之前，先在 writer 中复核并持久化受理记录；线上参数带发起者；Node 在分发入口按已持久化的 fence 拒绝，并记录结果供确认使用。Hub 上的 gate `running` 只表示已被认领；Node 是否开跑，以 lane 发出的第一个 phase 事件为准。已开跑的 job（包括它的 land 步骤）会执行完毕。
+   - **重连顺序**：Node hello 之后，Hub 先把这台 Node 全部未确认的 fence 送达并得到确认。在此之前：`forward_if_online` 不理会调用方传入的在线标志，既不标记、也不写出任何转发；直连操作按离线处理；gate 不在这台 Node 的 lane 上认领任务。不支持 fence 的 Node 不接收续接血缘发起的命令，也不接收 `hub` 来源的输入。
+   - 人工 close 与自动重启的竞争由 generation CAS 决定，两种先后顺序最终都停在 `paused`，且没有存活章节。
+   - 严格的「F 提交前要求每个执行者都确认」协议不在第一阶段范围内，列为后续选项。
+6. **如实推送**：一条关于实例 I 的告警，只有同时满足下列条件才不推给所有者：
+   - (a) I 有 Agent 上级血缘 P；
+   - (b) 该事项确实转给了 P：交互不是 approval，并且 D-051 谓词对 P 的当前章节成立（谓词包括项目开关、一跳血缘边与 plan-review 自排除；按第 8 条，bypass 不再排除提问与 plan review）。第一阶段其他种类的告警从不静音；
+   - (c) P **实际在运行**：状态为 running，当前章节未结束，且该章节所在 host 有活连接。
+
+   静音会写入持久的静音行。P 从「实际在运行」变为否的那一刻，会在同一个 writer 作业里，把仍待回答的被静音交互各标记一次补推，并写入推送发件箱。触发点有：F、监督者状态转移、host 断开（`mark_host_offline`）、host 丢失判定、Hub 启动对账。发件箱在 Hub 重启后仍会投递，并按交互去重（推送 tag 用交互 id）。
+
+   Hub 启动时把所有 host 标为离线，这只是记账。对于按状态仍为 running 的血缘，等它的 host 首次 hello 后再决定：同一 epoch 且章节还在，就不补推；否则补推。如果 host 一直不回来，就按既有的 host 丢失宽限期判定。
+
+   approval 永远推送。静音按设备区分：只跳过正在 follow 且页面可见的那台设备（通过新增的 follow 可见性帧）。对 address-owner 的当前章节，凡是包含所有者输入的回合结束时，推送「Main 回复了」。续接章节的通用「Session exited」推送，由一次 C1 推送（已重启／因上限暂停／自行关闭）替代；所有者自己暂停时不推送。结束类推送（Session exited 与 C1 推送）只在有进程结束证据时发出；其他失败都不是结束，两者都不发（OA6）。每次静音都写审计行。
+7. **D-055 口径更正**：commandId 身份（同一 id 必须对应同一载荷）、仍在排队的行在重放时被转发、Node 侧按 commandId+digest 去重，这三点覆盖所有实例命令，只有 `instance.configure` 不可重放。第 5 条据此覆盖旧章节的全部挂起命令。
+8. **D-051(b) 修订（OA3）**：自开发项目开启 D-051 项目开关。今天 `delegated_visible_items` 与 `authorize_agent_answer` 在调用方或目标任一侧运行 bypass 时拒绝委托；第一阶段起，提问与 plan review 即使上级或子实例运行 bypass，也路由给 Agent 上级。approval 仍只由人回答（D-017、D-051 第 (3) 项的 approval 排除）；plan-review 自排除与一跳边不变。理由：按 OA1，子实例只有在创建者运行 bypass 时才能运行 bypass，所以委托不扩大权限。D-051 节内已同日加注。
+
+**保证与明确不保证**：
+
+保证：
+- (G1) 任一时刻，一条血缘至多一个章节能让 Hub 受理变更（由 writer 线性化）。
+- (G2) F 提交后，Hub 不再受理、入队、标记转发或认领任何由旧 generation 发起的操作。
+- (G3) F 时尚未完成的每个旧 generation 操作都有如实的结果：在 Hub 内取消、被发送闸拦下、被 Node 取消、被 Node 拒绝、已执行，或未知。未知既包括目标 host 尚未确认，也包括 host 确认了却无法确定；未知绝不被推断为未执行。
+- (G4) 所有者的 close 不会被自动撤销。
+- (G5) Human 来源的 dispatch 默认值与既有路由行为不变；推送只有两处投递修正：按设备静音，以及 address-owner 的回复推送。
+
+不保证：
+- F 是 Hub 的受理边界，不是全局的执行边界：F 前已受理的操作，在目标 Node 应用 fence 之前仍可能执行（断网 Node 的本地队列、fence 在途的窗口、F 前已通过发送闸的帧）。
+- 被隔离的进程，在其 Node 失联期间经自身 shell 对本机造成的副作用。
+- Node 重启后成为孤儿的进程，只受已撤销凭据的约束。
+- 已经执行的副作用不可撤回。
+- host 确认能结算每个操作：Node 或进程崩溃后，某个操作是否执行过可能无从得知，它就保持未知。
+- 第一阶段不保证对外写入恰好一次（dispatch/create/gate/land 的幂等键在第三阶段）。
+- 没有 OS 隔离时，主 agent 的 shell 能读取其 OS 用户能读的一切；Hub 侧检查只约束经过 Hub 的动作。
+- Remuda 只在「是否关闭 harness 控制」这一维上比较子实例与创建者的权限档位（OA1）；保留控制的档位之间不排序，创建调用本身由创建者 harness 的权限控制把关。
+
+**分阶段**：
+- **第一阶段**（本决策）：内网 Hub 升级、Node 接入与 D-051 开关（由所有者/运维执行）；claude-sdk 状态投影；血缘与 claude-sdk 续接；发起者盖章、提交时复核与直连 RPC 边界；隔离与重连顺序；Agent 动词放行、子不超父（OA1）、D-051(b) 修订（OA3）与 worker 重生帮助函数；C1；入座 CLI 参数；如实推送；Main 入口、章节分隔、状态行、暂停/恢复；skill 更新；取证与切换。退出标准见 main-agent.md §14.1（E1–E9）。
+- **第二阶段**：由 Hub 投递事实的收件箱（空闲时合并投递、所有者消息优先、持久化 commandId）；agent 自己写的持久 wake-up；事实转达后的告警静音；分层 transcript；`owner notify`；`remuda chat`；`/healthz` 时钟健康。
+- **第三阶段**：Hub 持有的记忆文档与指令块；agent 自行关闭后开新章节；dispatch/create/gate/land 幂等键；gate `conflict` 透传；评审作为子任务。
+
+**推迟（后续选项，不在任何阶段的承诺内）**：
+- 按 harness 区分的姿态表（在保留控制的档位之间排序比较；OA1 只约束是否关闭控制）；
+- agent 进程的 OS 用户隔离与 Node deny list；
+- land 授予／分离策略；
+- 按子树设置的 delegatedDecisions 属性（第一阶段沿用 D-051 项目开关）；
+- coordinator 动词的 MCP 镜像；
+- 对 scope 内显式列出的 host 免除跨 host 审批；
+- 区分 agent 目标的 shell-pty 与原始 shell；
+- 严格的执行确认式隔离（F 提交前要求每个执行者确认）；
+- 主 agent 跨 host 迁移；
+- Agent 创建者为子实例设置 `restart`；
+- 跨血缘放宽 dispatch 持有者唯一性（递归 coordinator）；
+- 凭据代理；
+- 入站渠道；
+- 推送正文带内容；
+- 设备与所有者绑定。
+
+**否决**：
+- 留在笔记本会话里，加脚本补救：A1–A4 由放置位置决定，必然失败。
+- 用所有者的 Human token 跑主 agent：等于借用人的权限，审计也不真实（D-017）。
+- Hub 侧 LLM 循环或工作流引擎（D-002）。
+- 托管运行时：没有隧道就够不到 Node（D-031）。
+- 一出现 `host-lost` 就重启：进程可能还活着，会出现两个行动者。
+- 只隔离前任的行与凭据：已经认证的请求、已排队或挂起的命令、直连 RPC 仍会执行。
+- 宣称 F 是全局执行边界：断网 Node 的本地队列在 F 之后仍会推进，这样说不真实。
+- 只要有 Agent 上级，就一律静音非 approval 告警：没有转达出去的提问会无人收到。
+- 只在 F 与监督者处补推：Main 的 Node 掉线时，之前被静音的提问会一直没人通知。
+- 重启时把 worker 改挂到新章节：审计将不再显示谁创建了谁。
+- 忙碌时拒收事实：会让几乎总在回合中的 coordinator 饿死。
+- 隐藏 Hub 生成的消息：违背真实记录原则。
+- 第一阶段做姿态表、OS 隔离、land 授予机制：D3 已删除，列入后续选项。
+
+**由谁**：所有者（D1–D4 与补充裁定 OA1–OA6，均为 2026-10-05）+ coordinator（设计 v3：按核查结论修复阻塞缺口，并在复核后进一步修正。具体包括：Hub 受理边界与 Node 执行边界分开定义，并如实记录「可能已执行」的结果；直连 RPC 纳入同一受理边界；认证设备 id 参与复核；重连期间 `forward_if_online` 不再相信调用方传入的在线标志；C1 覆盖启动失败；worker 重生不走只限操作员的路由；补推覆盖 host 断开；`hub` 来源双向映射。另外更正了 D-055 口径）。
+
+**依据**：[main-agent.md](./main-agent.md)。代码锚点（origin/main）：
+- `crates/remuda-hub/src/agent_scope.rs`（`restrict_agent_routes`、`owns`、`stamp`、`prepare_create`、`restrict_permission`、`shell_driver`、`authorize_command`）
+- `crates/remuda-hub/src/workers.rs`（`dispatch_core`、`worker_launch_spec`、`select_carrier`、`resolve_worker`，以及 `worker.provision`/`worker.remove` 调用）
+- `crates/remuda-hub/src/worker_watch.rs`（`respawn_instance`、`relaunch_instance`、`answer_worker`/`write_keys`）
+- `crates/remuda-hub/src/http.rs`（`post_command`、`replay_existing_command`、`forward_if_online`、`release_forward_intent`、`resume_instance`、`ResumeMode`、`lease_on_host`、`healthz`）
+- `crates/remuda-hub/src/interactions.rs`（`answer_interaction`、`delegated_visible_items`、`authorize_agent_answer`）
+- `crates/remuda-hub/src/gatequeue.rs`（`dispatch`、`tick`）
+- `crates/remuda-hub/src/store.rs`（`enforce_grant_uniqueness`、`validate_child_delegation`、`node_depth`、`expire_lost_hosts`、`mark_host_offline`、`mark_all_hosts_offline`、`queue_command`、`mark_forward_intent`、`normalize_activity`、`derive_instance_state`）
+- `crates/remuda-hub/src/ws.rs`（`reconcile_lost_instances`、`follow_session`、连接结束时的 `mark_host_offline`）
+- `crates/remuda-hub/src/lib.rs`（启动时的 `mark_all_hosts_offline`）
+- `crates/remuda-hub/src/alerts.rs`（`classify`、`fanout`）
+- `crates/remuda-driver/src/materializer.rs`（`permission_plan`）
+- `crates/remuda-driver/src/generic_pty.rs`（Agent 来源的 bypass/dontAsk 降级）、`crates/remuda-driver/src/presets.rs`（`merge_yolo_argv`）：OA1 在 Node 侧一并改动的位置
+- `crates/remuda-driver/src/claude_print.rs`（`map_result`）
+- `crates/remuda-node/src/transport/hubnode_codec.rs`（`dispatch_frame`）
+- `crates/remuda-node/src/origin.rs`（`parse_origin`、`command_origin`、`input_origin`）
+- `crates/remuda-node/src/store.rs`（`insert_command`）
+- `crates/remuda-node/src/runtime/pty_queue.rs`
+
+## D-058
 
 **2026-10-05 · 新建任务的目录浏览器与「移除目录」占用门（c-dirpicker：host.dirs.list + unregister guard）**
 

@@ -321,6 +321,48 @@ m-ghostbadge 1、m-push 3、uo3-evidence 5 共 29 项 + uo13-evidence
 REMUDA_EVIDENCE=1 时 8 passed（实测 /hosts→主机详情→/fleet→
 /projects 导航与渲染，截图是重生成的已回滚不提交）。
 
+## 5.4 落地闸门负载失败复核（b-perffu r6）
+
+闸门全量（chromium，重试一次）报 5 失败：m-homeend、m-realdevice、
+m-jumpto、m-inbox(允许一次) 显示 `unknown`/`状态待确认`/按钮禁用，
+font-swap:382/387 「延迟字体先于 restore 到达」。
+
+**与 origin/main 的对照实验（同一台机器、同 60 个 nice-19 CPU 满负荷
+hog、同一套 595xx 端口、gate 构建的 hub_e2e 经 cargo shim 复用）：**
+
+| 运行 | 结果 |
+|---|---|
+| 本分支，60 hogs | 5 failed（font-swap:382、m-homeend、m-inbox:171、m-jumpto:162、+）；其余通过 |
+| origin/main(5cbd8ffd) web，60 hogs，第 1 次 | 3 failed：**font-swap:382、m-inbox:277、+**（homeend/inbox:171/jumpto:162 当次通过） |
+| origin/main web，60 hogs，第 2 次 | font-swap:387、**m-homeend、m-inbox:171（90 s 超时）、m-jumpto:162 全部复现**（17 did not run，达 max-failures 提前停） |
+
+四个状态类失败在 origin/main 上同样出现，症状逐字一致（jumpto 实测
+`状态待确认…data-blocked="0"`、session-page `data-activity="idle"
+data-status="unknown"`）。机理：CPU 饥饿下 Hub↔Node WS 心跳错过 → Hub
+`mark_host_offline`/epoch changed → `connectivity='disconnected'` →
+`projectStatus` 返回 unknown、`projectInteraction` 返回 paused；这是
+Hub 服务端的 liveness 投影，c-perffu 的 store no-emit/时钟改动不涉及该
+路径（值合并与 main 完全相同，只少了内容未变时的 React 重渲）。
+正常负载下这些用例在本分支 4.6 分钟的完整集合里全部通过（两次运行，
+见下）。
+
+font-swap 是既有的**字体加载时序竞态**：spec 人为延迟 woff2 800 ms
+并断言延迟字体不在 restore 前到达；CPU 饥饿使该断言翻转。关键证据：
+本分支与 origin/main 的 `FONTSWAP saved=252.453125 control=320.453125
+swappedBeforeRestore=true` 测量**逐字节相同**，且它在当前正常负载
+（load≈5）也翻转，与本任务前端改动无关（sw/src.js、Transcript 均未
+碰）。
+
+**正常负载（gate-e2e.lock 内）两次完整集合**（m-homeend、m-realdevice、
+m-jumpto、m-inbox、font-swap、task-model-board、
+task-model-boardui、uo13-evidence）：**两次均 27 passed / 11 skipped
+（uo13 未设 REMUDA_EVIDENCE）/ 1 failed，且唯一失败两次都是
+font-swap:382**（`FONTSWAP saved=252.453125 control=320.453125
+swappedBeforeRestore=true` 与 origin/main 逐字节相同）；四个状态类
+spec 两次全部通过。新增单测 `useStaleCutoffTick`
+「online recently-seen host never stale at mount or after ticks」
+在 30 分钟滴答下钉住在线主机永不判 stale。
+
 ## 6 刻意不做
 
 - 不动轮询间隔、协议、Hub；不加任何 gated e2e 的毫秒阈值。

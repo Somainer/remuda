@@ -1,6 +1,6 @@
 # Main agent: a resident Remuda instance on the always-on Hub
 
-> Status: design v3, 2026-10-05. Decision record: ADR D-057 in [decisions.md](./decisions.md). This document lands before any Phase 1 code (§15). Owner decisions D1–D4 and the owner amendments OA1–OA5 (§0) are binding. Where this document and an older design disagree, the owner decisions win.
+> Status: design v3, 2026-10-05. Decision record: ADR D-057 in [decisions.md](./decisions.md). This document lands before any Phase 1 code (§15). Owner decisions D1–D4 and the owner amendments OA1–OA6 (§0) are binding. Where this document and an older design disagree, the owner decisions win.
 
 ## 0 Binding owner decisions (2026-10-05)
 
@@ -14,7 +14,7 @@
   Like any agent, the main agent uses the existing gate and land verbs within its existing scope.
 - **D4 Cutover.** One cutover from the human-run coordinator, after Phase 1's exit criteria pass (§16).
 
-Owner amendments (2026-10-05, made after design v3). They override any text below that disagrees. They are numbered OA1–OA5 because A1–A8 already name the failures in §1.
+Owner amendments (2026-10-05, made after design v3). They override any text below that disagrees. They are numbered OA1–OA6 because A1–A8 already name the failures in §1.
 - **OA1 Never beyond the creator.** A child created by an Agent may use a mode that switches its harness's own permission control off (Claude `bypassPermissions`/`dontAsk`, Codex `never`, Grok `always-approve`, Agy `always-proceed`) only if its Agent creator itself runs with that control off. Otherwise any mode that keeps harness control on is allowed. When the mode is omitted, the child inherits the creator's own mode; the framework picks no new mode. The Hub's `restrict_permission` and the Node materializer move together to this rule. It is the one place Phase 1 changes the existing Agent-origin permission rules (§4.2 item 3).
 - **OA2 The seat's own configuration.** The main agent's permission mode and its grants, `land` included, are configuration chosen when it is created, like any instance's. This design states no default, recommendation or policy for them (§3.2, §3.3).
 - **OA3 Delegated decisions.** The D-051 switch is on for the self-development project. D-051(b) is amended: questions and plan reviews route to the Agent parent even when the parent or the child runs bypass. Approvals stay human-only (D-017, D-051(a)). OA1 is what keeps this delegation from widening authority (§4.2 item 6, §8.1).
@@ -24,6 +24,7 @@ Owner amendments (2026-10-05, made after design v3). They override any text belo
   - The suggested restart cap is 3 per hour (§3.2, §6.1).
   - The laptop Node keeps its enrolled identity (§2).
   - Cross-host Agent dispatch keeps the D-017 one-shot approval in Phase 1 (§4.2).
+- **OA6 Failed is not the process exiting.** Only process-end evidence makes an instance terminal: an exit or exit code, the PTY or tty gone, a launch that never started, or the Node reporting the instance gone. Every other failure is turn-level and retryable in place: an API error, a main-session StopFailure, a configure failure, a subagent or workflow failure, a `severity=error` diagnostic. C1 restarts only on process loss or start failure, never on a turn-level failure (§6.2, §6.3, §8.5).
 
 Owner principles applied throughout:
 - the harness supplies capabilities and the agent decides;
@@ -70,7 +71,7 @@ A person can still take the seat (coordinator-hierarchy §2.0). Continuity then 
 The owner creates the seat with `remuda instance create` and the flags that the Phase 1 CLI task adds. The flags expose fields `CreateInstanceBody` already accepts, plus `restart`:
 
 ~~~text
-remuda instance create --host <devbox-host-id> --workspace <workspace-id> \
+remuda instance create --host <devbox-host-id> --workspace-id <workspace-id> \
   --kind claude --driver claude-sdk --name main --title Main \
   --grant address-owner [--grant <grant> …] \
   --scope-project <project-id> --scope-host <devbox-host-id> \
@@ -214,6 +215,14 @@ Stored states:
 
 Derived state: `host-offline` means the current chapter's host has no live link. The UI shows "restarting" for `starting` after a restart decision.
 
+**Failed is not the process exiting (owner rule OA6).** Only process-end evidence makes an instance terminal:
+- the process exited (an exit, or an exit code);
+- its PTY or tty is gone;
+- its launch never started;
+- the Node reports the instance gone.
+
+Every other failure is turn-level and retryable in place: an API error (429 included), a main-session StopFailure, a configure failure, a subagent or workflow failure, or a `severity=error` diagnostic. A turn-level failure leaves the instance live, with `activity=idle` and a turn-error marker and never `lifecycle=failed`, and the next input retries in the same process. The rule holds for every instance; the `ma-sdk-state` task applies it to the claude-sdk projection (§15). C1 acts only on process-end evidence: it restarts on process loss or start failure (§6.3), never on a turn-level failure.
+
 ### 6.3 Cause table
 
 Evidence is always Node-attested and about the lineage's current chapter at the live generation.
@@ -229,7 +238,7 @@ Evidence is always Node-attested and about the lineage's current chapter at the 
 | A close admitted from a Human device (PWA Pause, CLI, fleet) | → paused{device} | F without successor at admission; the close is then forwarded |
 | A close by the chapter itself | → paused{self} | Same; C1 push |
 | A close by an Agent ancestor | → paused{ancestor} | Same; C1 push |
-| A turn ended with an error (429, API error) | none | Not an exit: `activity=idle` plus a turn-error marker, never `lifecycle=failed` |
+| A turn-level failure (§6.2): an API error such as 429, a main-session StopFailure, a configure failure, a subagent or workflow failure, a `severity=error` diagnostic | none | Not an exit and not a restart cause: `activity=idle` plus a turn-error marker, never `lifecycle=failed`; retryable in place |
 | Owner Resume (existing resume verb) on a paused lineage | paused → starting | F with successor; 409 while the chapter's host is offline |
 | Owner Resume on a lineage that is not paused | — | 409: pause it first |
 | `DELETE` of the current chapter of a lineage that is not paused | — | 409: close it first |
@@ -275,6 +284,7 @@ cancelled, never left the Hub: cmd_… instance.send -> worker w-… "…"
 cancelled by host h-… when it applied the fence: cmd_… instance.send -> worker w-…
 ran before its host applied the fence: cmd_… instance.close -> worker w-…
 may still run, host h-… has not applied the fence (offline since T): cmd_… instance.send -> worker w-…
+unknown, host h-… applied the fence but cannot tell after a crash: cmd_… instance.send -> worker w-…
 gate jobs: gjb_… cancelled (queued); gjb_… started on its lane before the fence, completes
 later outcomes: GET /v1/lineages/ins_…
 previous chapter: remuda instance read ins_…
@@ -366,17 +376,19 @@ Handlers with several steps fail at their next commit and use their existing unw
 From the moment a Node applies the fence, it:
 - cancels its not-yet-delivered operations from fenced initiators;
 - refuses operations that arrive later;
-- reports in its acknowledgement what it cancelled, what had already run, and what it refused.
+- reports in its acknowledgement what it cancelled, what had already run, what it refused, and what it cannot establish (`unknown`).
+
+A Node reports `unknown` when it holds a record of an operation but cannot establish whether it reached its executor. That typically follows a Node or process crash between the Node's durable intent and any evidence: a PTY prompt whose write was attempted as the process died, a direct operation whose entry was logged but whose outcome was not, or a command left at `intent-durable` with no native evidence (§2.5 of protocol.md: never presumed not to have run).
 
 | Where the operation is when F commits | Outcome | Known at F? |
 |---|---|---|
 | In a request handler, not yet admitted | Refused at commit (§7.3) | Yes |
 | Admitted, but never forward-intended or sent (held command, queued gate job, admitted direct operation) | Cancelled at the Hub by F | Yes |
 | Forward-intended before F, then stopped by the send gate | Withheld | Yes, at the gate |
-| Sent, or still to be written after passing the gate, and the target Node has not applied the fence | **Potentially executed**: unknown until that host's acknowledgement or reply. It then resolves to `ran`, `cancelled-by-node` or `refused-by-node`. If the Node has no record of it, it is "not executed" | No |
-| Reached its executor before the target Node applied the fence (prompt delivered, instance spawned, gate run started on its lane, answer committed, worktree provisioned or removed). This may be after F | Ran; it completes and is reported | Resolved by the acknowledgement or reply |
+| Sent, or still to be written after passing the gate, and the target Node has not applied the fence | **Potentially executed**: unknown until that host's acknowledgement or the operation's own reply gives a definite outcome: `ran`, `cancelled-by-node` or `refused-by-node`. It stays `unknown` when the Node reports `unknown`, when the acknowledgement does not mention it, or when the host never returns. Absence of a record is never read as "not executed" | No |
+| Reached its executor before the target Node applied the fence (prompt delivered, instance spawned, gate run started on its lane, answer committed, worktree provisioned or removed). This may be after F | Ran; it completes and is reported. If a crash leaves the Node unable to tell, it reports `unknown` instead | Resolved by the acknowledgement or reply only when the Node can establish it |
 
-Unknown outcomes stay in the fence record and are shown to the successor and in the UI until the host acknowledges. A host that never returns leaves them unknown.
+Unknown outcomes stay in the fence record and are shown truthfully as unknown to the successor and in the UI. A host acknowledgement does not always resolve them. A later reply or the existing read-only reconciliation (`reconcile.instance`, protocol.md §7.2) may still resolve one. Nothing resolves an operation as "not executed" by inference, and a host that never returns leaves its operations unknown.
 
 A strict execution boundary would need every executor to acknowledge against the fence before F may commit. That is a coordinated protocol, and it is not part of Phase 1 (§14.4).
 
@@ -401,7 +413,7 @@ One Hub helper is the shared boundary for every row above:
 2. **Host gating.** A host with unacknowledged fences is not sent to. Request paths get the existing host-offline shape. The gate tick does not claim on that host's lanes.
 3. **Send gate** (§7.4).
 4. **Wire.** Params carry `initiator` and `opId`.
-5. **Node entry.** The Node's dispatcher (`dispatch_frame`) checks persisted fences at entry for these methods, before any side effect, and refuses a fenced initiator with reason `fenced`. The Node logs each initiator-carrying direct operation (op id, method, initiator, outcome), so its fence acknowledgement can report it.
+5. **Node entry.** The Node's dispatcher (`dispatch_frame`) checks persisted fences at entry for these methods, before any side effect, and refuses a fenced initiator with reason `fenced`. The Node writes each initiator-carrying direct operation's entry (op id, method, initiator) durably at entry, before any side effect, and its outcome afterwards, so its fence acknowledgement can report it. An entry without an outcome is reported `unknown`.
 
 Gate jobs are distinguished as follows:
 - Hub `running` only means claimed.
@@ -411,7 +423,7 @@ Gate jobs are distinguished as follows:
 
 ### 7.6 Node fence and reconnect ordering
 
-**The fence method.** A new Hub→Node method, `lineage.fence`, is documented in protocol.md §7.2. Its params are `{fenceId, lineageId, liveGeneration}`. Its result lists the instances the Node closed and, per operation, `cancelled`, `ran` or `refused`. Create and resume params carry the instance's lineage and generation, so the Node knows them.
+**The fence method.** A new Hub→Node method, `lineage.fence`, is documented in protocol.md §7.2. Its params are `{fenceId, lineageId, liveGeneration}`. Its result lists the instances the Node closed and, per operation it holds a record of, `cancelled`, `ran`, `refused` or `unknown` (§7.4). An operation the result does not mention stays unknown. Create and resume params carry the instance's lineage and generation, so the Node knows them.
 
 **What a Node does with a fence.**
 - It persists the fence, idempotently by fenceId.
@@ -453,14 +465,14 @@ F is atomic. Fence delivery rows survive a restart and are re-sent on boot and o
   - If its frame reaches the link after the fence frame, the Node refuses it.
   - If it reaches the link before the fence frame, the Node runs or queues it. Applying the fence then cancels it if it is still queued.
 
-  Every path settles it truthfully from what the Node reports.
+  Every path settles it truthfully from what the Node reports, and that may be `unknown`.
 
 ### 7.9 Guarantees and non-guarantees
 
 Guaranteed by the mechanism:
 - At any instant, the Hub admits mutations for at most one chapter of a lineage. The writer orders F against every admission.
 - After F commits, the Hub admits, queues, marks for forwarding and claims nothing initiated by the fenced generation. This includes requests authenticated before F.
-- Every operation of the fenced generation that was unfinished at F gets a truthful outcome from §7.4: cancelled at the Hub, withheld, cancelled by the Node, refused by the Node, ran, or unknown until its host acknowledges.
+- Every operation of the fenced generation that was unfinished at F gets a truthful outcome from §7.4: cancelled at the Hub, withheld, cancelled by the Node, refused by the Node, ran, or unknown. Unknown covers both "not yet acknowledged" and "the host cannot establish it"; it is never turned into "not executed" by inference.
 - A Node that has applied the fence drops undelivered work from the fenced generation and refuses new work from it.
 - The owner's close is never undone automatically.
 
@@ -468,6 +480,7 @@ Not guaranteed:
 - F is the Hub's admission boundary, not a global execution boundary. Work admitted before F may still run on a Node until that Node applies the fence. This covers a disconnected Node's own queues, a fence in transit, and a frame written after passing the send gate.
 - A fenced process whose Node is unreachable can keep acting on its own host through its shell, until the Node reconnects and applies the fence. A process orphaned by a Node restart is unknown to that Node, and only its revoked credential bounds it.
 - Effects that ran are not recalled.
+- That a host acknowledgement resolves every operation. After a Node or process crash, whether an operation ran can be unknowable; it then stays unknown.
 - Exactly-once outward writes: idempotency keys for dispatch, create, gate and land are Phase 3.
 
 ### 7.10 Test matrix (fake Nodes, gated suite, deterministic hooks, no millisecond thresholds)
@@ -488,6 +501,7 @@ Not guaranteed:
 - **Hub restart between F and fence delivery.** The fence is delivered once.
 - **Human close vs restart, both orders.** Driven by a test hook, not by timing.
 - **Seat's Node changes epoch.** The seat's Node reconnects with a changed epoch while a worker's Node holds an in-flight prompt.
+- **Crash ambiguity.** A Node is killed after a PTY prompt's write is attempted and before any delivery evidence, and a direct operation's entry is logged without an outcome. After restart and fence application, the acknowledgement reports both `unknown`; the Hub keeps them unknown, the UI and the restart notice show unknown, and nothing shows them as not executed. An operation the acknowledgement omits also stays unknown.
 
 ## 8 Push
 
@@ -539,6 +553,7 @@ A follow suppresses pushes only for the device that is following, and only while
 - **Its own interactions** page as today, because its parent is the human.
 - **Reply-ready.** When a turn of the live `address-owner` chapter ends and at least one Human-origin input reached that turn, the Hub pushes "Main replied: <first line of the final message>" (truncated). Per-device suppression applies. Turns reached only by Hub or Agent input do not push. The `address-owner` grant already means "the agent that addresses the owner", so this needs no new property.
 - **C1 pushes** replace the generic "Session exited" push for lineages with `restart`: "Main restarted (cause)", "Main paused: restart cap" and "Main closed itself". A pause from a Human device sends nothing.
+- **End pushes need process-end evidence (OA6).** The exited push and the C1 pushes fire only when an instance ends by the evidence in §6.2. A turn-level failure is not an end and sends neither; it shows as a turn-error marker in the transcript and the status line.
 
 ### 8.6 Audit
 
@@ -645,6 +660,7 @@ New frames are documented in protocol.md inside `~~~text` fences, because a `jso
 - `owns()`, the D-051 edge and fan-out read the lineage.
 - claude-sdk resume stays claude-sdk.
 - Continuity rows are not settled `host-lost`.
+- Only process-end evidence makes an instance terminal; turn-level failures stay live and are never a restart cause (OA6).
 - Uniqueness ignores fenced chapters.
 - Resume works only on paused lineages, and `DELETE` of an unpaused current chapter returns 409.
 - `forward_if_online` withholds while fences are unacknowledged.
@@ -704,7 +720,7 @@ Every new route and CommandRecord field is reflected in `crates/remuda-hub/opena
   - 403 on mutating an owner-dispatched worker;
   - the keys approval;
   - Human-origin dispatch byte-identical to today.
-- **E8 Projection fixtures.** claude-sdk goes working → idle. A turn error keeps the seat running and its address-owner seat held.
+- **E8 Projection fixtures.** claude-sdk goes working → idle. Each turn-level failure of §6.2 (API error, main-session StopFailure, configure failure, subagent or workflow failure, `severity=error` diagnostic) keeps the seat running and its address-owner seat held, triggers no restart and sends no end push; only the process-end evidence of §6.2 ends it.
 - **E9 Push audit** for the E2 run. Every push sent and every suppression is accounted for by §8. Nothing was suppressed that had not been routed to an effectively running chapter.
 
 ### 14.2 Phase 2: facts, not polling
@@ -768,7 +784,7 @@ Docs come first. Each task keeps the full gated suite (Rust, web, and hub e2e ag
 
 1. `ma-docs`: this document, the ADR, and the protocol, ui-spec, runbook, coordinator-hierarchy and CLI doc updates.
 2. `ma-ops-attach`: the owner or ops upgrade the intranet Hub, attach the Nodes, pair the phone and turn the D-051 switch on for the self-development project (no worker).
-3. `ma-sdk-state`: claude-sdk working, idle and turn-error projection.
+3. `ma-sdk-state`: claude-sdk working, idle and turn-error projection; only process-end evidence is terminal (OA6).
 4. `ma-lineage`: lineages; continuation resume (claude-sdk to claude-sdk) as one transaction; lineage-aware ownership and fan-out; `restart` stored.
 5. `ma-initiator`: initiator and device stamping, the commit-time authority check, and the Hub side of the direct-RPC boundary.
 6. `ma-fence`: F, the send gate, the Node fence at every executor entry, reconnect ordering, outcome resolution, close becomes pause, Resume only from paused.

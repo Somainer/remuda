@@ -337,7 +337,7 @@ stateDiagram-v2
 
 > **2026-09-25 注（D-055）：重放按操作分叉——send 可重放，configure 不可重放。** 同 commandId 重放 `instance.send` 用于恢复丢失响应：返回存储的原始结局，仍排队的行恰好转发一次。`instance.configure` 的 spec merge 只在首次 POST 发生一次：重放命中终态行时原样返回存储记录（包括首次 merge 失败时持久化的原始 500/body，绝不把它重放成 200）；原始结局尚未持久化（转发在飞，`queued`+`forwarded=1`）时 Hub 返回 409 指明 “still in flight”，客户端应轮询 `GET /v1/instances/{id}/commands/{commandId}`；离线排队（`queued`+`forwarded=0`）的 configure 重放同样被 409 拒绝，客户端必须换用新 commandId 发新命令，重放不代为转发。并发同 id 首次 POST 在 Hub 串行 writer 上分出唯一创建行，merge 严格一次。GET 单行命令在转发尝试进行中返回该尝试的终态行（尝试未开始时如实返回 pending），任何读都不先报 `forwardIntent` 再报其回滚。（2026-10-05 补，D-057）commandId 身份（同一 id 必须对应同一载荷）、同 id 重放时转发仍排队的行、Node 按 commandId+digest 去重，这三点适用于除 `instance.configure` 以外的每一种操作，不只 `instance.send`；被隔离（fenced）发起者的行结算为 `rejected(fenced)`。
 
-> **2026-10-05 注（D-057）：发起者隔离（fencing）的两条边界与结果类别。** 续接血缘换代或暂停时，Hub 在单一 SQLite writer 中执行带 generation CAS 的隔离事务 F。**F 是 Hub 受理边界**：F 提交后，旧 generation 发起的变更在 writer 中受理时一律被拒（`queue_command`、`mark_forward_intent`、gate 入队与认领、直连操作受理），包括 F 之前已通过认证的请求。写出帧之前还有一道**发送闸**：内存 fence 表显示发起者已被隔离时不写出，并结算为 withheld；发送闸只缩小窗口，不构成任何保证。**Node 执行边界是最终一致的**：fence 在某台 Node 收到并持久化它（`lineage.fence`，§7.2）时才在该 Node 生效；此前，F 前已受理的操作仍可能在该 Node 上执行（断网 Node 的本地队列、fence 在途的窗口、F 前已通过发送闸的帧）。生效时 Node 取消尚未交付的旧 generation 操作、拒绝之后到达的操作，并在确认中报告结果。F 时尚未完成的每个旧 generation 操作都得到如实的结果类别：在 Hub 取消（cancelled at the Hub）、被发送闸拦下（withheld）、被 Node 取消（cancelled by the Node）、被 Node 拒绝（refused by the Node）、已执行（ran）；目标 host 确认之前记为未知（unknown）。机制、竞争与测试矩阵见 [main-agent.md §7](./main-agent.md#7-fencing)。
+> **2026-10-05 注（D-057）：发起者隔离（fencing）的两条边界与结果类别。** 续接血缘换代或暂停时，Hub 在单一 SQLite writer 中执行带 generation CAS 的隔离事务 F。**F 是 Hub 受理边界**：F 提交后，旧 generation 发起的变更在 writer 中受理时一律被拒（`queue_command`、`mark_forward_intent`、gate 入队与认领、直连操作受理），包括 F 之前已通过认证的请求。写出帧之前还有一道**发送闸**：内存 fence 表显示发起者已被隔离时不写出，并结算为 withheld；发送闸只缩小窗口，不构成任何保证。**Node 执行边界是最终一致的**：fence 在某台 Node 收到并持久化它（`lineage.fence`，§7.2）时才在该 Node 生效；此前，F 前已受理的操作仍可能在该 Node 上执行（断网 Node 的本地队列、fence 在途的窗口、F 前已通过发送闸的帧）。生效时 Node 取消尚未交付的旧 generation 操作、拒绝之后到达的操作，并在确认中报告结果；无法确定某操作是否已到达执行者时（通常是 Node 或进程在持久意图与任何证据之间崩溃）报告 `unknown`。F 时尚未完成的每个旧 generation 操作都得到如实的结果类别：在 Hub 取消（cancelled at the Hub）、被发送闸拦下（withheld）、被 Node 取消（cancelled by the Node）、被 Node 拒绝（refused by the Node）、已执行（ran）、未知（unknown）。未知包括 host 尚未确认，也包括 host 确认了却无法确定：Node 报告 `unknown`、确认没有提到该操作、或 host 再也不回来时都保持未知，绝不推断为未执行。host 确认并不总能结算每个操作。机制、竞争与测试矩阵见 [main-agent.md §7](./main-agent.md#7-fencing)。
 
 派发顺序固定为：Hub durable inbox → Node durable command receipt → Node 写 `intent-durable` 并 fsync → 唯一 driver owner 发一次原生操作 → 记录 transport-written → 原生证据推进 accepted → 业务证据推进 settled。进程恰好在发出与落账之间崩溃时，intent 已存在即视为“可能发送”；恢复先查原生历史/请求状态，没有原生幂等保证则保持 unknown，**绝不因为找不到 ACK 而重发**。无法证明没执行时也不能标 rejected；超时查询返回 unknown 的现状。
 
@@ -370,7 +370,12 @@ Hub 在 create 与 command 的载荷外层覆盖 `origin: "human" | "bot" | "age
 
 MCP `call_tool` 在副作用前决定范围，并把需审批动作送到 Hub broker gate；Hub 重新依据认证与真实目标检查后才排队或转发。需要审批时 HTTP 返回 `409 HUMAN_APPROVAL_REQUIRED` 和 `interactionId`，MCP 将其作为明确的工具错误返回。票据显示在 `GET /v1/interactions`，只能由 Human 设备通过既有 `/v1/interactions/{id}/answer` 提交 `allow-once` / `deny` 及匹配的 `inputDigest`。随后用 MCP `approvalId`（HTTP `x-remuda-approval-id`）重试完全相同的动作。grant 绑定 caller device、caller instance/host、操作、目标 host/instance 和完整有效载荷；更改文本/目标、其他设备使用、重复消费、拒绝、过期均不能执行。复用 `InteractionBroker` 的 first-answer-wins，TTL 为 15 分钟；Hub 重启丢弃未消费 grant，必须重新申请审批。超时或 ACK 丢失不自动重放已批准的动作。
 
-Agent create 的 generic-pty 在 materialize 前把 bypass/dontAsk 降为 asking mode，因而得到非 yolo argv。preset bypass flags 仅在 `permissionMode=bypassPermissions` 且 Human/Bot 时合并；默认模式绝不追加。D-011 的 Bot materializer 拒绝 bypass/dontAsk 规则继续存在，因此此条件不授予 Bot 额外豁免。2026-10-05（D-057，子不超父）：Agent 创建的子实例，只有当它的 Agent 创建者自身运行在关闭 harness 控制的档位时，才可以使用关闭控制的档位（Claude `bypassPermissions`/`dontAsk`、Codex `never`、Grok `always-approve`、Agy `always-proceed`）；否则可以使用任何保留 harness 控制的档位。省略权限模式时，子实例继承创建者自己的档位，框架不另选档位。Hub 的 `restrict_permission` 与 Node 物化器（包括上文 generic-pty 的 Agent 降级与 preset bypass flags）一起改为这条规则，Node 依据 Hub 盖章的 `creatorPermissionMode`（§7.2）判定；Bot 来源不变。这是第一阶段唯一改动既有 Agent 来源权限规则的地方，取代此前「Agent 的结构化 Claude create 显式请求 bypass/dontAsk 会被拒绝，省略权限模式则采用 manual」的规则（实现随 `ma-admission` 落地）。
+**Agent create 的权限档位：子不超父（2026-10-05，D-057）。** Agent 创建的子实例，只有当它的 Agent 创建者自身运行在关闭 harness 控制的档位时，才可以使用关闭控制的档位（Claude `bypassPermissions`/`dontAsk`、Codex `never`、Grok `always-approve`、Agy `always-proceed`）；否则可以使用任何保留 harness 控制的档位。省略权限模式时，子实例继承创建者自己的档位，框架不另选档位，也不跨 driver 翻译（§6.4）；创建者的档位不是子实例 harness 词表里的值时，create 被拒并说明原因，由调用者显式指定。「创建者的档位」是 Hub 依据创建者章节上记录的生效档位、盖章在转发 create 上的 `creatorPermissionMode`（§7.2），绝不取自请求体。Hub 的 `restrict_permission` 与 Node 侧每一处执行 Agent 来源规则的位置一起改为这条规则：
+- 物化器 `permission_plan`：Agent 来源请求关闭控制的档位时，只有 `creatorPermissionMode` 同样是关闭控制的档位才放行，否则拒绝；
+- generic-pty：Agent create 的 bypass/dontAsk 只在创建者自身关闭控制时保留，否则在 materialize 前降为 asking mode，得到非 yolo argv；
+- preset bypass flags（下文 §4.3 的 yolo argv）只在 spec 的档位为 `bypassPermissions`（显式请求，或按上面的规则继承）时合并，并且来源为 Human/Bot，或来源为 Agent 且其 Agent 创建者自身关闭控制；默认模式绝不追加。
+
+D-011 的 Bot materializer 拒绝 bypass/dontAsk 规则继续存在，Bot 来源不变，上面的条件不授予 Bot 额外豁免。这是第一阶段唯一改动既有 Agent 来源权限规则的地方。它取代此前的规则：Agent create 的 generic-pty 一律降级，preset bypass flags 仅限 Human/Bot，Agent 的结构化 Claude create 显式请求 bypass/dontAsk 被拒绝，省略权限模式则采用 manual。实现随 `ma-admission` 落地。
 
 此范围约束覆盖 Hub 与 MCP 控制面。Node stdio 的认证依赖其 SSH carrier，本地开发 Node HTTP 的 access code 仍是操作员凭据；同 UID 文件、原生 CLI 与 herdr 的进程隔离和凭据清理是独立边界（security-review-2 tasks 9/12/13），不能把 parent-child 范围检查描述为 OS sandbox。
 
@@ -717,20 +722,20 @@ resume 配方用 `--resume <exact session UUID>` 替换新建 `--session-id`，�
 
 这里只示范 provider overlay，已有 hooks/MCP/skills 从 native 配置加载，runtime 自己的已审查扩展另行合入。选静态 credential 时只注入 `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY` 之一；选择 `apiKeyHelper` 时不让静态凭据抢占它。helper 是明确受信的绝对命令，只向 CLI 输出 secret，不向 Hub 回传。模型 requested、CLI 回显 model、gateway wire/resolved model 分开记录，无法观测 wire 时保持 unknown。
 
-**claude-pty：**同一 Claude 配方移除 `-p`、输入/输出 stream flags 和 host permission flags；保留 settings sources、settings、model、session ID 与 native permission mode，由 carrier 分配终端。runtime 默认使用 `manual` + native TUI，已选 auto 的 profile 可原样保留；不自动 bypass。采用 Herdr 时先取得专用 pane，通过已验证的 `agent.start`/受控 launcher 执行 argv；Herdr args 若只能接受 shell 命令文本，使用只含固定 executable 与 launchId 的本地 launcher，让它读取私有 manifest 后 exec，禁止拼 prompt/env/token 到 shell。
+**claude-pty：**同一 Claude 配方移除 `-p`、输入/输出 stream flags 和 host permission flags；保留 settings sources、settings、model、session ID 与 native permission mode，由 carrier 分配终端。runtime 默认使用 `manual` + native TUI，已选 auto 的 profile 可原样保留；不自动 bypass。（Agent 创建的子实例省略档位时，由 Hub 按 §Origin 的 D-057 规则把创建者的档位写入 spec，runtime 不另选。）采用 Herdr 时先取得专用 pane，通过已验证的 `agent.start`/受控 launcher 执行 argv；Herdr args 若只能接受 shell 命令文本，使用只含固定 executable 与 launchId 的本地 launcher，让它读取私有 manifest 后 exec，禁止拼 prompt/env/token 到 shell。
 
 Herdr 负责 pane 生存，Node 负责 Instance/native session 对应；runtime 使用 hook 的 `SessionStart.transcript_path` 定位文件，不自己将 cwd 简单替换 `/` 来猜完整目录编码。`--bg` 是未来单独的 carrier variant，不与 print 混用；本规格不把它作为六个 driver 的隐式实现。若以后接入，必须处理它忽略 `--session-id`、attach 会 wake、多个 settings 共享 daemon、logs 是 PTY 转储的行为，不杀共享 supervisor。control-plane §1–3
 
 **agent-in-native-pty（`shell-pty` + agent kind，D-028 §5.1）：**Remuda 自持 PTY 里跑 agent CLI，与 D-025 promote 的终端**同一条路径**。argv 来自 per-kind recipe，不是把 `spec.args` 原样交给 `CommandBuilder`；`flags.rs` 的 BANNED / RESERVED / EXTRA allowlist 在这条路径上同样生效（此前 shell-pty 完全绕过它）。
 
-| kind | argv 模板 | 配置注入 | yolo argv（仅 Human/Bot 且显式 bypass） |
+| kind | argv 模板 | 配置注入 | yolo argv（仅当档位为 bypass，且来源为 Human/Bot，或为 Agent 且其 Agent 创建者自身关闭 harness 控制；D-057） |
 | --- | --- | --- | --- |
 | `claude` | `--setting-sources user,project,local` [`--settings <overlay>`] [`--effort <v>`] | argv 上的 settings overlay | `--dangerously-skip-permissions` |
 | `codex` | [`-c model_reasoning_effort="<v>"`] | env `CODEX_HOME` 指向影子目录 | `--dangerously-bypass-approvals-and-sandbox` |
 | `grok` | [`--effort <v>`] | env `GROK_HOME` 指向影子目录 | `--always-approve` |
 | `agy` | [`--effort <v>`] | 无 | `--yolo` |
 
-新建 session **不**钉 `--session-id`：id 由 harness 回报（SessionStart hook / `session_index.jsonl` / `active_sessions.json`），自己造一个只会多出一个要对账的身份。resume 走 `--resume <sid>`，与 §5.6 同路径。`LaunchRecipe` 必须真填 `settings_digest`、`env_allowlist`、provider kind——旧的 shell-pty stub 发的是空白名单加硬编码 provider，D-028 §5.1 步骤 4 把它们列为审计要求。**D-011 / D-017 的授权规则随表一起搬家、一字不改**：Agent origin 一律使用非 yolo preset，bot dispatcher 不自动 bypass。
+新建 session **不**钉 `--session-id`：id 由 harness 回报（SessionStart hook / `session_index.jsonl` / `active_sessions.json`），自己造一个只会多出一个要对账的身份。resume 走 `--resume <sid>`，与 §5.6 同路径。`LaunchRecipe` 必须真填 `settings_digest`、`env_allowlist`、provider kind——旧的 shell-pty stub 发的是空白名单加硬编码 provider，D-028 §5.1 步骤 4 把它们列为审计要求。**D-011 / D-017 的授权规则随表一起搬家**；其中 Agent 来源的部分自 2026-10-05 起按 D-057「子不超父」（§Origin）：Agent 创建的子实例，只有当它的 Agent 创建者自身关闭 harness 控制时才使用 yolo preset，否则使用非 yolo preset；省略档位时继承创建者的档位，框架不另选。bot dispatcher 不自动 bypass。
 
 **codex-appserver：**
 
@@ -1399,7 +1404,7 @@ Claude `PermissionRequest` 的输出必须是该事件专属的 hook JSON，不�
 
 ### 6.4 超时策略与权限默认值
 
-MVP 不把 bot 等同于无人审批：默认 Claude human/bot 都采用已配置的 native manual/auto 决策与可工作的审批 carrier；auto 由 Claude 自己评估，runtime不再自动 approve 所有 server request。bypass/always-proceed/never 等保持原生不同含义，只有 spec 明确选择才使用，不能做跨 driver 的无损布尔映射。
+MVP 不把 bot 等同于无人审批：默认 Claude human/bot 都采用已配置的 native manual/auto 决策与可工作的审批 carrier；auto 由 Claude 自己评估，runtime不再自动 approve 所有 server request。bypass/always-proceed/never 等保持原生不同含义，只有 spec 明确选择才使用，不能做跨 driver 的无损布尔映射。D-057 起，Agent 创建的子实例省略档位时继承创建者的档位：Hub 把创建者的档位原样写入子实例 spec，这是 spec 的选择而不是 runtime 默认，也不跨 driver 映射；关闭控制的档位只在创建者自身关闭控制时可用（§Origin）。
 
 `interactionDeadlineMs`、`hookDeadlineMs`、`controlWriteTimeoutMs` 是 Node 配置，记录在 LaunchManifest；hook helper 的 deadline 必须早于原生 hook timeout，留出写出合法 deny 的时间。原生不支持外部暂停时，在超时后使用已验证的 native deny/cancel encoder，或保持 native TUI等待；不支持时记录 `CONTROL_UNAVAILABLE`，禁止把超时当 consent。由 deadline 导致的拒绝是系统策略事件，actor=system，与人类选择分开。Node→Hub 断线不延长已给出的 native deadline。
 
@@ -1492,19 +1497,19 @@ object 上传授权绑定 actor、host/workspace 和用途；uploadId 使用 obj
 
 | 方法 / 字段 | 方向 | payload / result |
 | --- | --- | --- |
-| `lineage.fence` | Hub→Node | `{fenceId,lineageId,liveGeneration:U64}` → `{fenceId,closedInstanceIds:Id[],outcomes:[{opId,outcome:cancelled\|ran\|refused}]}`。Node 按 fenceId 幂等持久化；关闭该血缘 generation 低于 liveGeneration 的本地实例；取消这些旧发起者尚未交付的工作（含 PTY 提示队列）；此后在 `insert_command`、PTY 投递与下面直连方法的入口拒绝它们；daemon 重启后先应用已持久化的 fence，再恢复任何排队投递。结果里没有记录的操作即「未执行」 |
+| `lineage.fence` | Hub→Node | `{fenceId,lineageId,liveGeneration:U64}` → `{fenceId,closedInstanceIds:Id[],outcomes:[{opId,outcome:cancelled\|ran\|refused\|unknown}]}`。Node 按 fenceId 幂等持久化；关闭该血缘 generation 低于 liveGeneration 的本地实例；取消这些旧发起者尚未交付的工作（含 PTY 提示队列）；此后在 `insert_command`、PTY 投递与下面直连方法的入口拒绝它们；daemon 重启后先应用已持久化的 fence，再恢复任何排队投递。`outcomes` 覆盖 Node 有记录的操作；有记录但无法确定是否已到达执行者时（通常是 Node 或进程在持久意图与任何证据之间崩溃）报告 `unknown`。Hub 只按明确的结果结算：`unknown` 与确认没有提到的操作都保持未知，绝不推断为未执行；之后该操作自己的回复或只读的 `reconcile.instance` 仍可能结算它 |
 | hello `capabilities.lineageFence` | Node→Hub | `true` 表示支持 `lineage.fence` 及本表其余字段；缺失即不支持。Hub 不向不支持的 Node 发送续接血缘发起的命令或直连操作（409，reason `node-lacks-fence`，§9），也不发送 `hub` 来源输入；发往它的其余流量不变 |
 | create / resume 的 `lineage` | Hub→Node | `instance.create` 与 `instance.resume` 的 params 增加 `lineage:{id:Id,generation:U64}`，让 Node 知道实例所属的血缘与代数 |
 | Agent 来源 create 的 `creatorPermissionMode` | Hub→Node | Hub 依据创建者章节上记录的生效档位盖章，绝不取自请求体；Node 物化器据此执行 §Origin 的「子不超父」 |
 | 转发命令的 `initiator` | Hub→Node | §2.5 的 `initiator`（不含设备 id）；Node 持久化到它的 Command 记录并写入 journal |
-| `initiator` 与 `opId` | Hub→Node | 加在 `interaction.answer`、`worker.provision`、`worker.remove`、`worktree.lease`、`worktree.return`、`gate.run` 的 params 上。`opId` 是 Hub 在任何外部效果之前已持久化的受理记录 id：`interaction.answer` 用该答案的 commandId，`gate.run` 用 gate job id，其余方法用 Hub 的直连操作行 id。Node 在分发入口（`dispatch_frame`）、任何副作用之前按已持久化的 fence 拒绝被隔离的发起者（reason `fenced`），并记录 opId、方法、发起者与结果，供 fence 确认报告 |
+| `initiator` 与 `opId` | Hub→Node | 加在 `interaction.answer`、`worker.provision`、`worker.remove`、`worktree.lease`、`worktree.return`、`gate.run` 的 params 上。`opId` 是 Hub 在任何外部效果之前已持久化的受理记录 id：`interaction.answer` 用该答案的 commandId，`gate.run` 用 gate job id，其余方法用 Hub 的直连操作行 id。Node 在分发入口（`dispatch_frame`）、任何副作用之前按已持久化的 fence 拒绝被隔离的发起者（reason `fenced`）；对放行的操作，在任何副作用之前持久记下 opId、方法与发起者，之后再记结果。只有入口记录、没有结果的操作在 fence 确认里报告 `unknown` |
 | `gate.then` / `gate.land` / `gate.unpin` / `gate.cancel` | Hub→Node | 带 job id，是一个已开跑 job 的延续：Node 把它们作为 fence 之前已到达执行者的操作的后续步骤接纳，已开跑的 job（含 land 步骤）执行完毕 |
 
 示例（只为说明形状；本节新增的帧与字段一律放在 text 围栏里，不进 JSON 金样）：
 
 ~~~text
 → {"jsonrpc":"2.0","id":"h-17","method":"lineage.fence","params":{"fenceId":"…","lineageId":"ins_…","liveGeneration":"3"}}
-← {"jsonrpc":"2.0","id":"h-17","result":{"fenceId":"…","closedInstanceIds":["ins_…"],"outcomes":[{"opId":"cmd_…","outcome":"cancelled"},{"opId":"cmd_…","outcome":"ran"}]}}
+← {"jsonrpc":"2.0","id":"h-17","result":{"fenceId":"…","closedInstanceIds":["ins_…"],"outcomes":[{"opId":"cmd_…","outcome":"cancelled"},{"opId":"cmd_…","outcome":"ran"},{"opId":"…","outcome":"unknown"}]}}
 hello params: "capabilities": {"driverInventory": […], "lineageFence": true}
 instance.create params: "lineage": {"id": "ins_…", "generation": "3"}, "creatorPermissionMode": "acceptEdits"
 worker.provision params: "initiator": {"instanceId": "ins_…", "lineageId": "ins_…", "generation": "3"}, "opId": "…"
@@ -1867,7 +1872,7 @@ Node 提供本机受控 MCP server `runtime`，由 Claude 的原生 MCP 配置�
 | `runtime_instance_read` | `{instanceId,runId?,afterSeq?,beforeSeq?,limit?,include:messages\|tools\|workflow\|summary}` | `{observations,result,completeness,asOfSeq,nextCursor,truncated}`；不给模型未授权的 raw/secret |
 | `runtime_instance_stop` | `{commandId,instanceId,expectedGeneration,scope:run\|instance,runId?}` | scope=run 调 cancel，scope=instance 调 close；返回 Command，不伪装完成 |
 
-MCP 输出是 runtime 的已观测事实，原始 agent 文本标 source 和 completeness；不把 child 的文本当命令执行。`instance_create` 只能引用已登记的 profile/permission preset，不能让模型传任意 executable、env secret、hooks 脚本或解除权限。默认 child 不拥有批准自己/同级原生审批的权限；需要特定自动化批准时必须是单独明确授权的机器 policy，不将“主 agent 已决定”混成人类批准。
+MCP 输出是 runtime 的已观测事实，原始 agent 文本标 source 和 completeness；不把 child 的文本当命令执行。`instance_create` 只能引用已登记的 profile/permission preset，不能让模型传任意 executable、env secret、hooks 脚本，也不能超出创建者自身的权限档位（D-057「子不超父」，§Origin）。默认 child 不拥有批准自己/同级原生审批的权限；需要特定自动化批准时必须是单独明确授权的机器 policy，不将“主 agent 已决定”混成人类批准。
 
 对应非交互 CLI 是同一 API 的薄客户端，不提供另一份队列或 loop：
 

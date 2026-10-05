@@ -332,7 +332,7 @@ bootstrap 轮转并首启成功，旧机配对码已失效，回滚方向只能�
 ### 12. 第一阶段代码合入后：第二次执行、入座、取证与切换
 1. 按第 1–5 步把 Hub 升级到包含第一阶段的提交，再在空闲时依次升级 devbox 与笔记本 Node（第 8 步）。确认每个 Node 都报告了 fence 能力，确认 devbox 主机记录的 `herdr` 非空，并确认 D-051 开关已对自开发项目生效（第 9 步）。未升级的 Node 会把 Hub 生成的重启通知错记成 Agent 来源，所以全部 Node 升级完成之前不入座。
 2. 所有者用 Human 设备入座 Main（以下全部为占位）：
-   `remuda instance create --host <devbox-host-id> --workspace <workspace-id> --kind claude --driver claude-sdk --name main --title Main --grant address-owner [--grant <grant> …] --scope-project <project-id> --scope-host <devbox-host-id> --permission-mode <mode> --model <model> --restart process-loss:3 --prompt-file <启动说明>`
+   `remuda instance create --host <devbox-host-id> --workspace-id <workspace-id> --kind claude --driver claude-sdk --name main --title Main --grant address-owner [--grant <grant> …] --scope-project <project-id> --scope-host <devbox-host-id> --permission-mode <mode> --model <model> --restart process-loss:3 --prompt-file <启动说明>`
 
    Main 由 `address-owner` 定义；其他 grants（包括 `land`）与权限档位和任何实例一样，是入座时选定的配置，本清单不作建议（D-057 OA2）。`process-loss:3` 是建议的重启上限，每小时 3 次（OA5）。
 3. 取证窗口内，人工 coordinator 与脚本化 gate 保持空闲。按 main-agent.md §14.1 的 E1–E9 取证，写入 `docs/design/evidence/main-agent-1.md`（脱敏）。E2 中的 worker 用 `--carrier herdr` 或 codex/grok。E3 要杀掉 Main 进程，由所有者或 coordinator 在 devbox 上执行，不由 worker 执行。

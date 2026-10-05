@@ -1922,16 +1922,9 @@ async fn pump(
             }
         };
         for observation in mapped {
-            if emit(
-                events,
-                seq,
-                ctx,
-                SourceChannel::Transcript,
-                observation.completeness,
-                observation.body,
-            )
-            .await
-            .is_err()
+            if emit_mapped(events, seq, ctx, SourceChannel::Transcript, observation)
+                .await
+                .is_err()
             {
                 return Err(());
             }
@@ -1973,6 +1966,32 @@ async fn emit(
         completeness,
         body,
     )?;
+    events
+        .send(observation)
+        .await
+        .map_err(|_| DriverError::ControlUnavailable)
+}
+
+/// Stamp and send a mapper-produced observation while PRESERVING its
+/// deterministic event id (§9.1 live/journal parity: an effort edge derives
+/// one id from its native record, and the journal tailer derives the same id;
+/// rebuilding it here with a fresh random id would publish a different one).
+async fn emit_mapped(
+    events: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &PromoteCtx,
+    channel: SourceChannel,
+    mapped: Observation,
+) -> DriverResult<()> {
+    let event_id = mapped.event_id;
+    let mut observation = build(
+        ctx,
+        seq.fetch_add(1, Ordering::SeqCst) + 1,
+        channel,
+        mapped.completeness,
+        mapped.body,
+    )?;
+    observation.event_id = event_id;
     events
         .send(observation)
         .await

@@ -1501,16 +1501,9 @@ fn spawn_transcript_pump(
                         }
                     };
                     for observation in mapped {
-                        if emit_obs(
-                            &tx,
-                            &seq,
-                            &ctx,
-                            SourceChannel::Transcript,
-                            observation.completeness,
-                            observation.body,
-                        )
-                        .await
-                        .is_err()
+                        if emit_mapped_obs(&tx, &seq, &ctx, SourceChannel::Transcript, observation)
+                            .await
+                            .is_err()
                         {
                             return;
                         }
@@ -1646,6 +1639,33 @@ async fn emit_obs(
 ) -> DriverResult<()> {
     let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
     tx.send(build_observation(ctx, n, channel, completeness, payload)?)
+        .await
+        .map_err(|_| DriverError::ControlUnavailable)?;
+    Ok(())
+}
+
+/// Emit a mapper-produced observation while PRESERVING the deterministic
+/// `event_id` the transcript mapper minted.
+///
+/// §9.1: an effort edge's id is derived from the native record (assistant
+/// message id or the verdict/attachment record uuid), and the journal tailer
+/// derives the same id for the same native edge. The TUI pump rebuilds every
+/// other field with this run's identity, but rebuilding the event id with a
+/// fresh random [`EventId::new`] — as [`emit_obs`] does — would publish a
+/// different id live than the one the journal later derives, breaking live/
+/// journal parity.
+async fn emit_mapped_obs(
+    tx: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &ObsCtx,
+    channel: SourceChannel,
+    mapped: Observation,
+) -> DriverResult<()> {
+    let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let event_id = mapped.event_id;
+    let mut observation = build_observation(ctx, n, channel, mapped.completeness, mapped.body)?;
+    observation.event_id = event_id;
+    tx.send(observation)
         .await
         .map_err(|_| DriverError::ControlUnavailable)?;
     Ok(())
@@ -2485,6 +2505,68 @@ mod tests {
         assert!(refuse_bare(&["--model".into(), "haiku".into()]).is_ok());
         assert!(refuse_bare(&["--bare".into()]).is_err());
         assert!(refuse_bare(&["--continue".into()]).is_err());
+    }
+
+    /// c-effortread r2: the deterministic effort edge id the transcript mapper
+    /// mints must survive live publication. The TUI pump used to rebuild every
+    /// observation (including a fresh random event id), so the published id did
+    /// not match the journal tailer's derived id.
+    #[tokio::test]
+    async fn mapped_effort_observation_keeps_its_deterministic_event_id() {
+        let instance = InstanceId::new();
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+        // First assistant record always emits one effort edge with a
+        // deterministic id derived from the native message id.
+        let line = json!({
+            "type": "assistant",
+            "uuid": "msg-1",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-1",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+            "effort": "high",
+            "perTurnEffort": null,
+        })
+        .to_string();
+        let mapped = mapper
+            .map_line(&line)
+            .expect("map")
+            .into_iter()
+            .find(|obs| matches!(obs.body, ObservationPayload::Effort(_)))
+            .expect("an effort edge");
+        let deterministic = mapped.event_id.clone();
+
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            session_id: "effort-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let seq = Arc::new(AtomicU64::new(0));
+        emit_mapped_obs(&tx, &seq, &ctx, SourceChannel::Transcript, mapped)
+            .await
+            .expect("emit");
+        let published = rx.try_recv().expect("the observation was published");
+        assert_eq!(
+            published.event_id, deterministic,
+            "the live TUI channel must publish the mapper's deterministic id"
+        );
     }
 }
 

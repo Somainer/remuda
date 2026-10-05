@@ -1854,6 +1854,7 @@ class HubStore {
       });
       await this.initConnection();
       this.startPoll();
+      this.installDevHandle();
     } catch (err) {
       if (gen !== this.bootGen) return;
       const unauth = isUnauthorized(err);
@@ -1962,12 +1963,40 @@ class HubStore {
     }, 2000);
   }
 
+  /** Stop the periodic poll. Settlement-driven and user-triggered refreshes
+   * still run; used by the cardsettle hub spec to prove a card drops from the
+   * settlement frame rather than a poll. */
+  stopPoll() {
+    if (this.pollTimer != null && typeof window !== "undefined") {
+      window.clearInterval(this.pollTimer);
+    }
+    this.pollTimer = null;
+  }
+
+  /** Dev-only debug handle (the hub e2e runs against the vite dev server):
+   * lets a spec halt the 2 s interaction poll so a UI change can be
+   * attributed to the settlement follow frame instead of polling. */
+  private installDevHandle() {
+    if (!import.meta.env.DEV || typeof window === "undefined") return;
+    (window as unknown as { __remudaHub?: { stopPoll: () => void } }).__remudaHub = {
+      stopPoll: () => this.stopPoll(),
+    };
+  }
+
+  private clearDevHandle() {
+    if (typeof window !== "undefined") {
+      delete (window as unknown as { __remudaHub?: unknown }).__remudaHub;
+    }
+  }
+
   logout() {
     const mine = this.state.session?.deviceId;
     if (mine) void api.deviceRevoke(mine).catch(() => undefined);
     clearSession();
     dropDeviceCookie();
     api.disconnect();
+    this.stopPoll();
+    this.clearDevHandle();
     this.stopWorkspaceFollow?.();
     this.stopWorkspaceFollow = null;
     this.stopSettlementFollow?.();

@@ -188,22 +188,6 @@ test.describe("390px cardsettle: pending card drops when its session ends", () =
   }) => {
     const instanceId = await createSession(page, "cardsettle-live sentinel");
     const interactionId = await pendingInteractionId(page, instanceId);
-    // r2 item 8: prove the drop is driven by the settlement FRAME, not the 2 s
-    // poll. Once THIS card's settlement frame arrives, it must be gone within
-    // LESS than one poll interval (2000 ms): the trailing coalesce (300 ms)
-    // plus one interaction fetch is well under that; a poll-driven drop could
-    // not be.
-    const waitForSettlementFrame = async () => {
-      await expect
-        .poll(
-          () =>
-            settlementFrames.some((text) =>
-              text.includes(`"interactionId":"${interactionId}"`),
-            ),
-          { timeout: 20_000 },
-        )
-        .toBe(true);
-    };
 
     // Live 1/1 before the end (unknown deadline — only the Hub can retire it).
     await page.goto("/m");
@@ -216,25 +200,35 @@ test.describe("390px cardsettle: pending card drops when its session ends", () =
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toBeVisible();
     await shot(page, "cardsettle-mobile-pending.png");
 
+    // r3 item 4: stop the periodic interaction poll BEFORE ending the
+    // instance. With no poll, the only thing that can remove the card is the
+    // settlement frame's own refresh — so the assertions below fail if
+    // settlement handling is a no-op.
+    await page.evaluate(() => {
+      const debug = (window as unknown as { __remudaHub?: { stopPoll: () => void } }).__remudaHub;
+      debug?.stopPoll();
+    });
+
     // End the instance for real: new-epoch node hello omits it.
     await endInstance(page, instanceId);
-    await expect
-      .poll(() => instanceLifecycle(page, instanceId), { timeout: 20_000 })
-      .toBe("exited");
 
-    // The settlement control frame must arrive…
-    await waitForSettlementFrame();
-    // …and the card/badge drop within less than one 2000 ms poll interval —
-    // this cannot be the periodic poll, it is the frame-driven refresh.
-    const frameAt = Date.now();
-    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)", {
-      timeout: 1_500,
-    });
+    // The settlement control frame for THIS card is observed on the wire…
+    await expect
+      .poll(
+        () =>
+          settlementFrames.some((text) =>
+            text.includes(`"interactionId":"${interactionId}"`),
+          ),
+        { timeout: 20_000 },
+      )
+      .toBe(true);
+
+    // …and the card leaves the queue and the badge agrees with NO reload and
+    // NO periodic poll — the frame-driven refresh did it. Plain eventual
+    // assertions, no elapsed-time bound.
+    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)");
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toHaveCount(0);
     await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
-    expect(Date.now() - frameAt, "drop within one poll interval, from the frame").toBeLessThan(
-      2_000,
-    );
     await shot(page, "cardsettle-mobile-settled.png");
 
     // The durable row really is invalidated (checked after the UI assertion).

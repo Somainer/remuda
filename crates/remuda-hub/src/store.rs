@@ -5768,6 +5768,34 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS lineages_current ON lineages(current_instance_id);",
     )?;
+    // D-057 §5 (ma-lineage round 2): rows written before ma-lineage got their
+    // lineage_id stamped above but no lineage ROW, so a holder's resume fell
+    // back to the plain D-026 path and dropped every continuity property.
+    // Backfill one lineage per existing continuity instance — one that holds
+    // any grant or carries a restart policy — with the instance itself as the
+    // first chapter. Idempotent: runs on every open but never duplicates
+    // (NOT EXISTS guard), and never touches rows created with the table.
+    conn.execute(
+        "INSERT INTO lineages
+            (lineage_id, current_instance_id, generation, state,
+             paused_by_json, paused_at, restart_json, origin_spec_ref, updated_at)
+         SELECT i.id, i.id, 1,
+                CASE WHEN i.lifecycle IN ('requested','preparing','starting')
+                     THEN 'starting' ELSE 'running' END,
+                NULL, NULL, i.restart_json,
+                json_object(
+                    'origin', COALESCE(json_extract(i.spec_json, '$.origin'), 'agent'),
+                    'spec', json(i.spec_json)
+                ),
+                i.updated_at
+           FROM instances i
+          WHERE (i.restart_json IS NOT NULL
+                 OR (i.grants_json IS NOT NULL AND i.grants_json != '[]'))
+            AND NOT EXISTS (
+                SELECT 1 FROM lineages l WHERE l.lineage_id = i.id
+            )",
+        [],
+    )?;
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
     ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;

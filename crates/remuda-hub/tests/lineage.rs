@@ -49,12 +49,15 @@ struct FakeNode {
 }
 
 impl FakeNode {
-    async fn connect(hub: &remuda_hub::RunningHub, host: &str) -> Result<Self> {
-        let enroll = hub.mint_enroll_token(5).await?;
+    async fn connect_bearer(
+        hub: &remuda_hub::RunningHub,
+        host: &str,
+        bearer: &str,
+    ) -> Result<(Self, Option<String>)> {
         let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
         request
             .headers_mut()
-            .insert("Authorization", format!("Bearer {enroll}").parse()?);
+            .insert("Authorization", format!("Bearer {bearer}").parse()?);
         let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
         node.send(Message::Text(
             json!({
@@ -69,8 +72,10 @@ impl FakeNode {
             .into(),
         ))
         .await?;
-        let hello = node.next().await.context("hello")??;
-        assert!(hello.into_text()?.contains("result"));
+        let hello: Value = serde_json::from_str(&node.next().await.context("hello")??.into_text()?)
+            .context("hello json")?;
+        let node_token = hello["result"]["nodeToken"].as_str().map(str::to_owned);
+        assert!(hello.get("result").is_some(), "hello failed: {hello}");
 
         let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel();
         let (append_tx, mut append_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -109,11 +114,32 @@ impl FakeNode {
                 }
             }
         });
-        Ok(Self {
-            frames: frame_rx,
-            appends: append_tx,
-            task: Some(task),
-        })
+        Ok((
+            Self {
+                frames: frame_rx,
+                appends: append_tx,
+                task: Some(task),
+            },
+            node_token,
+        ))
+    }
+
+    /// Connect presenting an explicit bearer — the `nodeToken` from a prior
+    /// hello when re-enrolling the same host after a Hub restart (D-018:
+    /// enroll tokens are single-use).
+    async fn connect_with_token(
+        hub: &remuda_hub::RunningHub,
+        host: &str,
+        bearer: &str,
+    ) -> Result<Self> {
+        Ok(Self::connect_bearer(hub, host, bearer).await?.0)
+    }
+
+    /// Fresh enrollment (new host): enrolls and returns the persistent
+    /// `nodeToken` a later reconnect after a Hub restart must present.
+    async fn connect(hub: &remuda_hub::RunningHub, host: &str) -> Result<Self> {
+        let enroll = hub.mint_enroll_token(5).await?;
+        Ok(Self::connect_bearer(hub, host, &enroll).await?.0)
     }
 
     async fn next_frame(&mut self) -> Result<(String, Value)> {
@@ -1244,5 +1270,110 @@ async fn restart_policy_from_agent_or_bot_origin_is_forbidden() -> Result<()> {
         .await?;
     assert_eq!(bad.status(), 400);
     let _ = maker;
+    Ok(())
+}
+
+// --- 10. Pre-ma-lineage grant holders are backfilled on open ---------------
+
+#[tokio::test]
+async fn an_existing_grant_holder_gets_a_backfilled_lineage_and_then_resumes_as_a_continuation()
+-> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let node_token = node_token.context("first enrollment mints a nodeToken")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // Simulate a database from the build before ma-lineage: the migration adds
+    // the columns, but the holder has no lineage row and no lineage_id stamp.
+    let data_dir = ctx._dir.path().to_owned();
+    let (human, host) = (ctx.human.clone(), ctx.host.clone());
+    let Ctx {
+        _dir,
+        hub,
+        http,
+        human: _human,
+        host: _host,
+        db_path,
+    } = ctx;
+    hub.shutdown().await;
+    {
+        let db = rusqlite::Connection::open(&db_path)?;
+        db.execute("DELETE FROM lineages", [])?;
+        db.execute(
+            "UPDATE instances SET lineage_id = NULL WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+    }
+
+    // Reopen: the migration must backfill exactly one lineage row.
+    let hub = spawn(HubConfig::for_test(data_dir.join("data"))).await?;
+    macro_rules! assert_backfilled {
+        () => {{
+            let db = rusqlite::Connection::open(&db_path)?;
+            let (count, current, generation, restart): (i64, String, i64, String) = db.query_row(
+                "SELECT COUNT(*), COALESCE(current_instance_id,''), COALESCE(generation,0),
+                        COALESCE(restart_json,'')
+                 FROM lineages WHERE lineage_id = ?1",
+                rusqlite::params![x],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            assert_eq!(count, 1, "backfill must create exactly one row");
+            assert_eq!(current, x);
+            assert_eq!(generation, 1);
+            assert!(
+                restart.contains("onProcessLoss"),
+                "restart policy is copied"
+            );
+        }};
+    }
+    assert_backfilled!();
+    hub.shutdown().await;
+
+    // A second open runs the migration again without duplicating the row.
+    let hub = spawn(HubConfig::for_test(data_dir.join("data"))).await?;
+    assert_backfilled!();
+
+    // Drive the resumed continuation over HTTP against the reopened Hub: the
+    // backfilled holder must resume through the lineage path, not plain D-026.
+    // Re-enrollment presents the original host's nodeToken (D-018).
+    let mut node = FakeNode::connect_with_token(&hub, &host, &node_token).await?;
+    let ctx = Ctx {
+        _dir,
+        hub,
+        http,
+        human,
+        host,
+        db_path,
+    };
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = response["instance"]["instanceId"]
+        .as_str()
+        .context("successor")?
+        .to_owned();
+    assert_ne!(x, y);
+    assert_eq!(response["instance"]["lineageId"], json!(x));
+    assert_eq!(response["instance"]["generation"], json!(2));
+    assert_eq!(
+        response["instance"]["chapterCause"],
+        json!("owner-resume"),
+        "the backfilled holder resumes as a continuation, not plain D-026"
+    );
+    assert_eq!(
+        response["instance"]["grants"],
+        json!(["address-owner", "dispatch"]),
+        "the backfilled lineage keeps the holder's grants on the successor"
+    );
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close", "the live predecessor is closed");
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    assert_eq!(params["spec"]["resumeSessionId"], json!(SESSION));
     Ok(())
 }

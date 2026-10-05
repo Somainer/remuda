@@ -313,6 +313,10 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         .clone()
         .or_else(|| default_home(dialect))
         .ok_or_else(|| RunError::Args("could not resolve a harness home".into()))?;
+    // Review item 8: an explicitly supplied `--home` is still a test write
+    // target — confine it to the temp tree (the deliberate-run knob excepted).
+    crate::sandbox::ensure_path_in_temp(&home, "FAKE_HARNESS_ALLOW_HOME_WRITE")
+        .map_err(RunError::Io)?;
     std::fs::create_dir_all(&home)?;
     let session_id = opts
         .session_id
@@ -369,7 +373,10 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
     };
 
     let events_file = match &events_path {
-        Some(path) => Some(OpenOptions::new().create(true).append(true).open(path)?),
+        Some(path) => {
+            crate::sandbox::ensure_path_in_temp(path, "FAKE_HARNESS_ALLOW_HOME_WRITE")?;
+            Some(OpenOptions::new().create(true).append(true).open(path)?)
+        }
         None => None,
     };
 
@@ -584,12 +591,25 @@ fn default_home(dialect: Dialect) -> Option<PathBuf> {
         Dialect::Codex => ("CODEX_HOME", ".codex"),
         Dialect::Grok => ("GROK_HOME", ".grok"),
     };
-    if let Ok(path) = std::env::var(env)
-        && !path.is_empty()
-    {
-        return Some(PathBuf::from(path));
+    // c-resumehome review item 8: the engine must never fall back to the
+    // operator's real `$HOME` (a spawned test that did not pin a config dir
+    // used to leak transcripts there). An explicit env home must live in the
+    // temp tree; with none, the engine mints a private per-process temp home.
+    // `FAKE_HARNESS_ALLOW_HOME_WRITE=1` is the deliberate-manual-run escape
+    // hatch.
+    const ALLOW_ENV: &str = "FAKE_HARNESS_ALLOW_HOME_WRITE";
+    match crate::sandbox::sandboxed_home(env, "HOME", fallback, ALLOW_ENV) {
+        Ok(Some(home)) => Some(home),
+        Ok(None) => Some(crate::sandbox::private_temp_home(match dialect {
+            Dialect::Claude => "fake-harness-claude",
+            Dialect::Codex => "fake-harness-codex",
+            Dialect::Grok => "fake-harness-grok",
+        })),
+        Err(error) => {
+            eprintln!("fake-harness: {error}");
+            None
+        }
     }
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(fallback))
 }
 
 #[must_use]

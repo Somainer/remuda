@@ -23,6 +23,8 @@ pub struct SpawnOptions {
     pub extra_args: Vec<String>,
     /// Working directory for the child.
     pub cwd: Option<PathBuf>,
+    /// Extra environment variables for the child (e.g. a per-test `HOME`).
+    pub extra_envs: Vec<(String, String)>,
 }
 
 impl Default for SpawnOptions {
@@ -33,6 +35,7 @@ impl Default for SpawnOptions {
             transcript_dir: None,
             extra_args: Vec::new(),
             cwd: None,
+            extra_envs: Vec::new(),
         }
     }
 }
@@ -215,6 +218,9 @@ fn spawn_fake_claude_mode(options: SpawnOptions, print: bool) -> Result<FakeClau
         .stderr(Stdio::inherit());
     if let Some(dir) = &options.transcript_dir {
         command.env("FAKE_CLAUDE_TRANSCRIPT_DIR", dir);
+    }
+    for (key, value) in &options.extra_envs {
+        command.env(key, value);
     }
     if let Some(cwd) = &options.cwd {
         command.current_dir(cwd);

@@ -23,6 +23,7 @@ mod fake_herdr;
 mod flags;
 mod parent_watch;
 mod paths;
+pub(crate) mod sandbox;
 mod script;
 mod short_temp;
 mod stub;

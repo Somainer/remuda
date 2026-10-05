@@ -73,8 +73,10 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // on what the child *received*, which is the thing that would regress if
     // `-p` ever came back.
     if let Ok(path) = std::env::var("FAKE_CLAUDE_ARGV_FILE") {
+        let target = std::path::Path::new(&path);
+        ensure_path_in_temp(target)?;
         let argv: Vec<String> = std::env::args().skip(1).collect();
-        let _ = std::fs::write(&path, argv.join("\n"));
+        let _ = std::fs::write(target, argv.join("\n"));
     }
     // `FAKE_CLAUDE_GRANDCHILD_PID_FILE=<path>`: spawn one long-lived child in
     // **this process's group** and write its pid to the file.
@@ -374,6 +376,10 @@ impl Session {
 /// into that projects layout itself (as `claude -p` does); the explicit
 /// `FAKE_CLAUDE_TRANSCRIPT_DIR` knob keeps the older flat layout for callers
 /// that asserted on it.
+///
+/// Every one of these writes is sandboxed to the per-test temp tree
+/// (see [`sandboxed_transcript_home`]): a test double must never create files
+/// in the operator's real `~/.claude`.
 fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>, FakeClaudeError> {
     if let Some(resume_id) = &flags.resume {
         // The id is interpolated into a file name, exactly like the real CLI's
@@ -385,7 +391,7 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
                 format!("invalid --resume session id: {resume_id:?}"),
             )));
         }
-        let Some(home) = config_home() else {
+        let Some(home) = sandboxed_transcript_home()? else {
             return Err(FakeClaudeError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("resume: no CLAUDE_CONFIG_DIR to look up session {resume_id}"),
@@ -404,10 +410,9 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
         }
         return Ok(Some(OpenOptions::new().append(true).open(&path)?));
     }
-    if let Ok(dir) = std::env::var("FAKE_CLAUDE_TRANSCRIPT_DIR")
-        && !dir.is_empty()
-    {
+    if let Some(dir) = std::env::var_os("FAKE_CLAUDE_TRANSCRIPT_DIR").filter(|v| !v.is_empty()) {
         let dir = PathBuf::from(dir);
+        ensure_path_in_temp(&dir)?;
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{session_id}.jsonl"));
         return Ok(Some(
@@ -416,30 +421,46 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
     }
     // Fresh session: persist under the config home's projects layout, exactly
     // like the real CLI, so a later `--resume` against a fresh managed home can
-    // find (or be proven not to find) the conversation.
-    if let Some(home) = config_home() {
-        let dir = remuda_driver::claude_transcript::project_dir(&home, &flags.cwd);
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{session_id}.jsonl"));
-        return Ok(Some(
-            OpenOptions::new().create(true).append(true).open(path)?,
-        ));
+    // find (or be proven not to find) the conversation. With no writable
+    // per-test home the fake simply does not persist — it never falls back to
+    // the operator's real ~/.claude.
+    match sandboxed_transcript_home()? {
+        Some(home) => {
+            let dir = remuda_driver::claude_transcript::project_dir(&home, &flags.cwd);
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(format!("{session_id}.jsonl"));
+            Ok(Some(
+                OpenOptions::new().create(true).append(true).open(path)?,
+            ))
+        }
+        None => Ok(None),
     }
-    Ok(None)
 }
 
-/// Resolved Claude config home: `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`.
-fn config_home() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("CLAUDE_CONFIG_DIR")
-        && !path.is_empty()
-    {
-        return Some(PathBuf::from(path));
-    }
-    let home = std::env::var_os("HOME")?;
-    if home.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(home).join(".claude"))
+/// Escape hatch for a deliberate manual run of the fake outside a test temp
+/// tree (never set by a test harness).
+const ALLOW_HOME_WRITE_ENV: &str = "FAKE_CLAUDE_ALLOW_HOME_WRITE";
+
+/// Resolve a config home the fake is allowed to persist into.
+///
+/// - `CLAUDE_CONFIG_DIR` is honoured only inside the OS temp tree; an explicit
+///   path outside it is a loud error, because that knob names an exact write
+///   target the test asked for.
+/// - The implicit `$HOME/.claude` fallback is honoured only when `$HOME`
+///   itself lives in the temp tree (a per-test home). A real operator home
+///   silently yields `None` for fresh sessions, so the test double creates no
+///   files there, while a resume still fails its honest "no config dir" error.
+///
+/// `FAKE_CLAUDE_ALLOW_HOME_WRITE=1` removes the restriction for a deliberate
+/// manual run.
+fn sandboxed_transcript_home() -> Result<Option<PathBuf>, FakeClaudeError> {
+    crate::sandbox::sandboxed_home("CLAUDE_CONFIG_DIR", "HOME", ".claude", ALLOW_HOME_WRITE_ENV)
+        .map_err(FakeClaudeError::from)
+}
+
+/// Refuse to use a write target outside the per-test temp tree.
+fn ensure_path_in_temp(path: &Path) -> Result<(), FakeClaudeError> {
+    crate::sandbox::ensure_path_in_temp(path, ALLOW_HOME_WRITE_ENV).map_err(FakeClaudeError::from)
 }
 
 fn emit(value: &Value) -> Result<(), FakeClaudeError> {
@@ -533,6 +554,10 @@ fn block_sigterm() {
 #[cfg(unix)]
 fn spawn_group_grandchild() -> Option<std::process::Child> {
     let pid_path = std::env::var("FAKE_CLAUDE_GRANDCHILD_PID_FILE").ok()?;
+    if ensure_path_in_temp(std::path::Path::new(&pid_path)).is_err() {
+        // Never write a pid file outside the per-test temp tree.
+        return None;
+    }
     // No `process_group`/`setsid`: stay in the fake's group. `sleep` ignores
     // stdin, so it survives EOF like the IGNORE_EOF/IGNORE_SIGTERM parent.
     let child = std::process::Command::new("sleep")

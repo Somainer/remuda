@@ -1002,6 +1002,7 @@ async fn fake_node(
                         ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
                         append_n = append_instance_state(
                             &mut ws,
+                        &mut frame_queue,
                             &instance_id,
                             append_n,
                             "ready",
@@ -1055,6 +1056,7 @@ async fn fake_node(
                             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
                         append_n = append_instance_state(
                             &mut ws,
+                        &mut frame_queue,
                             &instance_id,
                             append_n,
                             "ready",
@@ -1107,6 +1109,7 @@ async fn fake_node(
                         let session_id = format!("mhome-exit-{}", uuid::Uuid::now_v7());
                         append_n = append_instance_state(
                             &mut ws,
+                        &mut frame_queue,
                             &instance_id,
                             append_n,
                             "ready",
@@ -1115,6 +1118,7 @@ async fn fake_node(
                         .await?;
                         append_n = append_instance_exit(
                             &mut ws,
+                        &mut frame_queue,
                             &instance_id,
                             append_n,
                             &session_id,
@@ -1234,6 +1238,7 @@ async fn fake_node(
                         let command_id = params.get("commandId").and_then(Value::as_str);
                         append_n = append_command_user(
                             &mut ws,
+                        &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt,
@@ -1310,7 +1315,7 @@ async fn fake_node(
                     // carries the commandId the Hub forwards in params.
                     let command_id = params.get("commandId").and_then(Value::as_str);
                     append_n =
-                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
+                        append_command_user(&mut ws, &mut frame_queue, &instance_id, append_n, prompt, command_id)
                             .await?;
                     // r-ux-comment: a fenced block to exercise 评论.
                     if let Some(reply) = code_comment_reply(prompt) {
@@ -1527,6 +1532,7 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_command_user(
                             &mut ws,
+                        &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt,
@@ -1613,6 +1619,7 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_command_user(
                             &mut ws,
+                        &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt,
@@ -1672,6 +1679,7 @@ async fn fake_node(
                         .await?;
                         append_n = append_cua_scenario(
                             &mut ws,
+            &mut frame_queue,
                             addr,
                             host_id.as_id().as_str(),
                             &durable_token,
@@ -1687,7 +1695,7 @@ async fn fake_node(
                     // exact commandId the HTTP response returned, so the web folds
                     // optimistic bubble and transcript node into one.
                     append_n =
-                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
+                        append_command_user(&mut ws, &mut frame_queue, &instance_id, append_n, prompt, command_id)
                             .await?;
                     // D-027: echo the attachment metadata the Hub resolved, so the
                     // e2e can prove staging reached the Node without a real agent.
@@ -1830,6 +1838,7 @@ async fn fake_node(
                         if let Some(mid) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                        &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("model-queued:{mid}"),
@@ -1838,6 +1847,7 @@ async fn fake_node(
                         } else if let Some(mid) = requested.strip_prefix("__notfound__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                        &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("model-degraded:{mid}:not-found"),
@@ -1858,6 +1868,7 @@ async fn fake_node(
                             // verdict lands.
                             append_n = append_native_user(
                                 &mut ws,
+                        &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("/model {requested_id}"),
@@ -1912,6 +1923,7 @@ async fn fake_node(
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                        &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("effort-queued:{word}"),
@@ -1920,6 +1932,7 @@ async fn fake_node(
                         } else if let Some(word) = requested.strip_prefix("__degrade__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                        &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("effort-degraded:{word}:dialog-kept"),
@@ -1981,6 +1994,7 @@ async fn fake_node(
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                        &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("permission-queued:{word}"),
@@ -1989,6 +2003,7 @@ async fn fake_node(
                         } else if let Some(word) = requested.strip_prefix("__degrade__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                        &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("permission-degraded:{word}:no-status-line"),
@@ -2019,7 +2034,7 @@ async fn fake_node(
                     if claude_ptys.contains(&instance_id) {
                         ttys.remove(&instance_id);
                         append_n =
-                            append_instance_state(&mut ws, &instance_id, append_n, "exited", None)
+                            append_instance_state(&mut ws, &mut frame_queue, &instance_id, append_n, "exited", None)
                                 .await?;
                     }
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
@@ -2431,7 +2446,7 @@ async fn fake_node(
                     }
                     if let Some(line) = submitted {
                         append_n =
-                            append_native_user(&mut ws, &instance_id, append_n, &line).await?;
+                            append_native_user(&mut ws, &mut frame_queue, &instance_id, append_n, &line).await?;
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -2926,6 +2941,12 @@ async fn send_rpc_ok(
 type NodeWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// c-hubfakeack: frames stashed while an append waits for its own ack. Every
+/// journal.append waits on its JSON-RPC id; a Hub RPC (instance.send,
+/// interaction.list, tty.screen, …) that arrives meanwhile is pushed here so
+/// the main dispatch loop answers it — never swallowed by the ack wait.
+type FrameQueue = std::collections::VecDeque<String>;
+
 // ── t-bind fake worktree layer (HUB_E2E_TASK_BIND=1 only) ──────────────────
 //
 // The default fake Node holds no git repository, so the worktree lease RPCs
@@ -3154,6 +3175,7 @@ async fn send_rpc_error(ws: &mut NodeWs, id: Value, message: &str) -> Result<()>
 /// Confirm resource lifecycle and the native identity needed by Hub resume.
 async fn append_instance_state(
     ws: &mut NodeWs,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     state: &str,
@@ -3178,7 +3200,7 @@ async fn append_instance_state(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -3188,6 +3210,7 @@ async fn append_instance_state(
 /// the session id keeps D-026 resume available.
 async fn append_instance_exit(
     ws: &mut NodeWs,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     session_id: &str,
@@ -3215,7 +3238,7 @@ async fn append_instance_exit(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -3227,7 +3250,7 @@ async fn append_instance_exit(
 /// decision in `working` (so Esc 打断 renders), and an 858-output-token usage
 /// snapshot. The web spec asserts the compact keyboard band still shows the
 /// composer and a >=40% transcript.
-async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64) -> Result<u64> {
+async fn append_mfix_chrome_combo(ws: &mut NodeWs, queue: &mut FrameQueue, instance_id: &str, mut n: u64) -> Result<u64> {
     let session_id = format!("mfix-chrome-{}", uuid::Uuid::now_v7());
     let rfc3339 = |t: time::OffsetDateTime| {
         format!(
@@ -3260,9 +3283,10 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
             }
         })
     };
-    n = append_full_event(ws, instance_id, n, entity("ready", &now_at)).await?;
+    n = append_full_event(ws, queue, instance_id, n, entity("ready", &now_at)).await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3279,6 +3303,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     for i in 1..=12 {
         n = append_full_event(
             ws,
+        queue,
             instance_id,
             n,
             json!({
@@ -3298,6 +3323,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     // running AskUserQuestion card is the transcript's final (latest) row.
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3327,6 +3353,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3354,6 +3381,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3380,6 +3408,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     // hook tier is stalled (Esc 打断 must render).
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3400,7 +3429,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
         }),
     )
     .await?;
-    append_full_event(ws, instance_id, n, entity("exited", &now_at)).await
+    append_full_event(ws, queue, instance_id, n, entity("exited", &now_at)).await
 }
 
 /// UO-6b round 2: a turn that stays LIVE — a latched hook text-streaming
@@ -3413,7 +3442,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
 /// message and NO `status`), and the strip must settle on that instead of
 /// throwing / keeping the growing timer. The web spec triggers the restart
 /// with `TTYNODE_RESTART` after this fixture lands.
-async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) -> Result<u64> {
+async fn append_uo6b_epoch_live(ws: &mut NodeWs, queue: &mut FrameQueue, instance_id: &str, mut n: u64) -> Result<u64> {
     let now_at = {
         let t = time::OffsetDateTime::now_utc();
         format!(
@@ -3429,6 +3458,7 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
     };
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3446,6 +3476,7 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3458,6 +3489,7 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3482,6 +3514,7 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
     .await?;
     append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3508,6 +3541,7 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
 /// `command_id` (C2 correlation); a natively typed prompt omits it.
 async fn append_user_message(
     ws: &mut NodeWs,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     text: &str,
@@ -3550,13 +3584,14 @@ async fn append_user_message(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
 /// A command-delivered prompt: its user node carries the delivering commandId.
 async fn append_command_user(
     ws: &mut NodeWs,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     text: &str,
@@ -3568,12 +3603,12 @@ async fn append_command_user(
                 .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
         })
         .unwrap_or_else(|| format!("obj_legacy_{n}"));
-    append_user_message(ws, instance_id, n, text, command_id, &node).await
+    append_user_message(ws, queue, instance_id, n, text, command_id, &node).await
 }
 
 /// A prompt typed natively into the PTY: human origin, no commandId, its own
 /// node (eventId-derived identity through the hub shorthand normaliser).
-async fn append_native_user(ws: &mut NodeWs, instance_id: &str, n: u64, text: &str) -> Result<u64> {
+async fn append_native_user(ws: &mut NodeWs, queue: &mut FrameQueue, instance_id: &str, n: u64, text: &str) -> Result<u64> {
     let seq = n + 1;
     ws.send(Message::Text(
         json!({
@@ -3593,7 +3628,7 @@ async fn append_native_user(ws: &mut NodeWs, instance_id: &str, n: u64, text: &s
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -4258,6 +4293,7 @@ async fn append_configure_status(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     status: &str,
@@ -4284,7 +4320,7 @@ async fn append_configure_status(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -4292,6 +4328,7 @@ async fn append_event(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     kind: &str,
@@ -4299,6 +4336,8 @@ async fn append_event(
 ) -> Result<u64> {
     append_full_event(
         ws,
+        queue,
+        queue,
         instance_id,
         n,
         json!({ "kind": kind, "payload": payload }),
@@ -4312,6 +4351,7 @@ async fn append_full_event(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     event: Value,
@@ -4328,7 +4368,7 @@ async fn append_full_event(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -4483,6 +4523,7 @@ async fn append_toolfold_settle_scenario(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     mut n: u64,
     long_mcp: bool,
@@ -4491,6 +4532,7 @@ async fn append_toolfold_settle_scenario(
     if long_mcp {
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "tool_call",
@@ -4513,6 +4555,7 @@ async fn append_toolfold_settle_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "tool_result",
@@ -4536,6 +4579,7 @@ async fn append_toolfold_settle_scenario(
     }
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "tool_call",
@@ -4561,6 +4605,7 @@ async fn append_toolfold_settle_scenario(
     tokio::time::sleep(Duration::from_millis(3_000)).await;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "tool_result",
@@ -4590,6 +4635,7 @@ async fn append_workflow_scenario(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     mut n: u64,
     kind: &str,
@@ -4620,6 +4666,7 @@ async fn append_workflow_scenario(
     // The Workflow tool call the card hangs on.
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "tool_call",
@@ -4705,6 +4752,7 @@ async fn append_workflow_scenario(
         // Decision 6: old daemon — run with a note and no phase/member detail.
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.run",
@@ -4732,6 +4780,7 @@ async fn append_workflow_scenario(
         // can be proven to fold the card into the compact summary row.
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.run",
@@ -4747,6 +4796,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -4755,6 +4805,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -4763,6 +4814,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -4786,6 +4838,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -4809,6 +4862,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -4832,6 +4886,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -4858,6 +4913,7 @@ async fn append_workflow_scenario(
         let bash_id = format!("obj_bash_{tag}");
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "tool_call",
@@ -4880,6 +4936,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "tool_result",
@@ -4900,6 +4957,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "thought",
@@ -4925,6 +4983,7 @@ async fn append_workflow_scenario(
     if kind == "demo-done" {
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -4948,6 +5007,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -4971,6 +5031,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -4994,6 +5055,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5002,6 +5064,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5010,6 +5073,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.run",
@@ -5030,6 +5094,7 @@ async fn append_workflow_scenario(
         let running_only = kind == "demo-running";
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.run",
@@ -5045,6 +5110,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5053,6 +5119,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5061,6 +5128,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -5084,6 +5152,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -5107,6 +5176,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -5130,6 +5200,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -5157,6 +5228,7 @@ async fn append_workflow_scenario(
         tokio::time::sleep(Duration::from_millis(900)).await;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -5180,6 +5252,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -5203,6 +5276,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -5226,6 +5300,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5234,6 +5309,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5242,6 +5318,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.run",
@@ -5262,6 +5339,7 @@ async fn append_workflow_scenario(
         // One 20-agent phase: the >12-row quiet tail must fold behind 还有 8 个.
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.run",
@@ -5277,6 +5355,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5287,6 +5366,7 @@ async fn append_workflow_scenario(
             let state = if i == 0 { "running" } else { "queued" };
             n = append_event(
                 ws,
+        queue,
                 instance_id,
                 n,
                 "workflow.member",
@@ -5321,6 +5401,7 @@ async fn append_workflow_scenario(
         for i in 0..20 {
             n = append_event(
                 ws,
+        queue,
                 instance_id,
                 n,
                 "workflow.member",
@@ -5345,6 +5426,7 @@ async fn append_workflow_scenario(
         }
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5353,6 +5435,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.run",
@@ -5372,6 +5455,7 @@ async fn append_workflow_scenario(
     // kind == "fail": 14 done, 1 failed. Failed rows never fold.
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.run",
@@ -5387,6 +5471,7 @@ async fn append_workflow_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.phase",
@@ -5396,6 +5481,7 @@ async fn append_workflow_scenario(
     for i in 0..14 {
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "workflow.member",
@@ -5420,6 +5506,7 @@ async fn append_workflow_scenario(
     }
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.member",
@@ -5561,6 +5648,7 @@ impl remuda_protocol::ToolMediaStager for CuaStager {
 #[allow(clippy::too_many_arguments)]
 async fn append_cua_scenario(
     ws: &mut NodeWs,
+    queue: &mut FrameQueue,
     addr: SocketAddr,
     host: &str,
     token: &str,
@@ -5696,7 +5784,7 @@ async fn append_cua_scenario(
             .get("payload")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("mapped event missing payload"))?;
-        n = append_event(ws, instance_id, n, &kind, payload).await?;
+        n = append_event(ws, queue, instance_id, n, &kind, payload).await?;
     }
 
     n = append_journal(
@@ -5724,6 +5812,7 @@ async fn append_drill_scenario(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     mut n: u64,
     workflow_id: &str,
@@ -5747,6 +5836,7 @@ async fn append_drill_scenario(
     }
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.run",
@@ -5775,6 +5865,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.phase",
@@ -5783,6 +5874,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.phase",
@@ -5791,6 +5883,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.member",
@@ -5812,6 +5905,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.member",
@@ -5838,6 +5932,7 @@ async fn append_drill_scenario(
     let sub_tool = "toolu_sec_bash1";
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -5866,6 +5961,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -5891,6 +5987,7 @@ async fn append_drill_scenario(
     // A main-agent tool call stays at top level (no agent id on the source).
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "tool_call",

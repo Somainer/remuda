@@ -63,6 +63,8 @@ passkey、设备/主机表与 provider secret envelope 的**唯一权威**
 在 D-031 现状下，浏览器、手机与 Node 必须有获准的内网路由才能访问 Hub
 （`docs/design/deploy-runbook.md:14-16`）；本文不讨论改变这一可达性的任何方案。
 
+> **2026-10-05（D-057，D2）**：常驻 Hub 现在是 deploy/intranet 的内网 Hub，从它自己的数据起步；笔记本 demo Hub 不迁移，成为历史。
+
 ## 2. 失效模型
 
 两张表都按同一组四格写：**什么死了 / 什么还能用 / 丢什么 / 用户看到什么**。

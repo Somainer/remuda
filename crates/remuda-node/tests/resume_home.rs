@@ -618,6 +618,68 @@ async fn resume_into_a_home_holding_an_unmarked_same_session_file_is_rejected() 
     );
 }
 
+/// Review item 6: a transcript that exists but cannot be read is refused
+/// BEFORE acceptance — the failure must not surface only inside the staging
+/// factory after the instance row exists. Skipped under root, which bypasses
+/// permission bits.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_with_an_unreadable_predecessor_transcript_is_refused_before_acceptance() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        eprintln!("skipping permission test when running as root");
+        return;
+    }
+    let harness = ChainHarness::new();
+    let parent_home = harness.fresh_home();
+    let parent = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "first turn",
+            None,
+            &harness.binary,
+            &parent_home,
+        ))
+        .await
+        .expect("parent create");
+    wait_settled(&harness.node, &parent.command.command_id).await;
+    let parent_id = parent.instance.meta.id.clone();
+    let session = recorded_session(&harness.node, &parent_id).await;
+    let transcript = transcript_in(&parent_home, &harness.workspace, &session);
+    wait_contains(&transcript, "first turn").await;
+
+    std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o000))
+        .expect("deny read on the predecessor transcript");
+    let child_home = harness.fresh_home();
+    let before = harness.node.list_instances().expect("list").items.len();
+    let error = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "second turn",
+            Some((&parent_id, session.as_str())),
+            &harness.binary,
+            &child_home,
+        ))
+        .await
+        .expect_err("an unreadable transcript is refused before acceptance");
+    // Restore before asserting so the temp dir cleanup and any diagnostics are
+    // unaffected; unlink does not require the file itself to be readable.
+    std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o644))
+        .expect("restore perms");
+    let message = error.to_string();
+    assert!(
+        message.contains("not readable before acceptance"),
+        "unexpected refusal: {message}"
+    );
+    assert_eq!(
+        harness.node.list_instances().expect("list").items.len(),
+        before,
+        "a refused resume creates no instance row"
+    );
+}
+
 /// Review item 5: when the NEWEST predecessor's transcript is missing, resume
 /// is refused naming that instance — the resolver must not fall back to an
 /// older ancestor (whose transcript would silently drop the newest chapter's

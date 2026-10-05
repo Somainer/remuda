@@ -121,12 +121,22 @@ pub(crate) fn resolve_resume_transcript(
     }
     if let Knowledge::Known { value } = &parent.native_ref.transcript {
         let path = PathBuf::from(value.source_path.trim());
-        if path.is_file() {
-            lookup.path = Some(path);
-            return Ok(lookup);
-        }
         if !value.source_path.trim().is_empty() {
-            lookup.checked.push(path);
+            match readable_regular_file(&path) {
+                Ok(true) => {
+                    lookup.path = Some(path);
+                    return Ok(lookup);
+                }
+                Ok(false) => lookup.checked.push(path),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => lookup.checked.push(path),
+                Err(err) => {
+                    return Err(crate::NodeError::Conflict(format!(
+                        "cannot resume session {session_id}: predecessor transcript {} is not \
+                         readable before acceptance: {err}",
+                        path.display()
+                    )));
+                }
+            }
         }
     }
     if let Some(recipe) = store.launch_recipe(&parent_id)? {
@@ -135,11 +145,49 @@ pub(crate) fn resolve_resume_transcript(
             Path::new(recipe.cwd.trim()),
         )
         .join(format!("{session_id}.jsonl"));
-        if path.is_file() {
-            lookup.path = Some(path);
-            return Ok(lookup);
+        match readable_regular_file(&path) {
+            Ok(true) => {
+                lookup.path = Some(path);
+                return Ok(lookup);
+            }
+            // Review item 6: a present-but-unreadable file (permissions, an IO
+            // error) is refused explicitly instead of accepted and failed by
+            // the staging factory; an absent path is the ordinary "looked in".
+            Ok(false) => lookup.checked.push(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => lookup.checked.push(path),
+            Err(err) => {
+                return Err(crate::NodeError::Conflict(format!(
+                    "cannot resume session {session_id}: predecessor transcript {} is not \
+                     readable before acceptance: {err}",
+                    path.display()
+                )));
+            }
         }
-        lookup.checked.push(path);
     }
     Ok(lookup)
+}
+
+/// Whether `path` is an existing regular file that this process can actually
+/// open for reading (review item 6).
+///
+/// `Path::is_file` only stats and follows symlinks, so a transcript whose
+/// permissions deny reading would pass acceptance and fail only later inside
+/// the staging factory. This performs the open the copy will need, using
+/// `symlink_metadata` first so a symlink is never accepted as the source.
+/// `Ok(false)` means absent or not a readable regular file candidate; an
+/// `Err` other than [`std::io::ErrorKind::NotFound`] names the real failure.
+fn readable_regular_file(path: &Path) -> std::io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }

@@ -35,8 +35,11 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
   const [busy, setBusy] = useState(false);
   const requestSeq = useRef(0);
   const filterRef = useRef<HTMLInputElement>(null);
+  // Ref mirror so the memoized loader always sees the current hidden
+  // preference when navigating rows (avoids a stale false closure).
+  const showHiddenRef = useRef(false);
 
-  const load = useCallback((nextPath?: string, hidden = showHidden) => {
+  const load = useCallback((nextPath?: string, hidden = showHiddenRef.current) => {
     const seq = ++requestSeq.current;
     setLoading(true);
     setError(null);
@@ -56,33 +59,39 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
       .finally(() => {
         if (seq === requestSeq.current) setLoading(false);
       });
-    // showHidden is deliberately read at call sites through the parameter.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId]);
 
   // Reload whenever the modal is (re)opened or the host changes; no path means
-  // "Node default start" (home or the first allowed root).
+  // "Node default start" (home or the first allowed root). The hidden-folder
+  // preference deliberately survives navigation and reopens for this modal's
+  // life — it is component state and resets only on a fresh mount.
   useEffect(() => {
     if (!open) return;
-    setShowHidden(false);
     setManualOpen(false);
     setManualPath("");
-    load(undefined, false);
+    load(undefined, showHiddenRef.current);
+    // load is stable per host; showHidden is intentionally not a dependency:
+    // the reopen effect must not re-fire when the user toggles hidden.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, hostId]);
 
   const crumbs = useMemo<Crumb[]>(() => {
     if (!listing) return [];
+    const under = (candidate: string, root: string) =>
+      root === "/" || candidate === root || candidate.startsWith(`${root}/`);
     const boundary = listing.roots
-      .filter((root) => listing.path === root || listing.path.startsWith(`${root}/`))
+      .filter((root) => under(listing.path, root))
       .sort((a, b) => b.length - a.length)[0];
     if (!boundary) return [{ label: listing.path, path: listing.path }];
-    const rest = listing.path === boundary ? [] : listing.path.slice(boundary.length).split("/").filter(Boolean);
+    const rest =
+      listing.path === boundary
+        ? []
+        : listing.path.slice(boundary.length === 1 ? 1 : boundary.length).split("/").filter(Boolean);
     return [
       { label: boundary, path: boundary },
       ...rest.map((_, index) => {
         const segment = rest.slice(0, index + 1).join("/");
-        return { label: rest[index], path: `${boundary}/${segment}` };
+        return { label: rest[index], path: `${boundary === "/" ? "" : boundary}/${segment}` };
       }),
     ];
   }, [listing]);
@@ -96,17 +105,20 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
     return rows;
   }, [listing, filter]);
 
+  /// Register an already-resolved absolute path. Paths chosen from the
+  /// filesystem (use-this-folder, breadcrumb, typed-and-canonical quick path)
+  /// are passed verbatim — only the advanced manual text input is trimmed by
+  /// its caller, never a filesystem-selected path.
   const registerPath = useCallback(
     async (absolutePath: string) => {
-      const trimmed = absolutePath.trim();
-      if (!trimmed.startsWith("/")) {
+      if (!absolutePath.startsWith("/")) {
         setError("请输入这台主机上的绝对路径，例如 /opt/projects/app");
         return;
       }
       setBusy(true);
       setError(null);
       try {
-        const workspace = await hubStore.registerWorkspace(hostId, trimmed);
+        const workspace = await hubStore.registerWorkspace(hostId, absolutePath);
         if (workspace) onRegistered(workspace);
         onClose();
       } catch (reason) {
@@ -118,11 +130,32 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
     [hostId, onClose, onRegistered],
   );
 
+  /// Validate and submit the advanced manually-typed path. Typed input is the
+  /// only place whitespace is trimmed.
+  const submitManual = useCallback(() => {
+    const typed = manualPath.trim();
+    if (!typed.startsWith("/")) {
+      setError("请输入这台主机上的绝对路径，例如 /opt/projects/app");
+      return;
+    }
+    void registerPath(typed);
+  }, [manualPath, registerPath]);
+
   if (!open) return null;
 
   return (
     <Modal open={open} onClose={() => { if (!busy) onClose(); }} initialFocusRef={filterRef}>
-      <div className={css.browser} data-testid="dir-browser">
+      {/* The modal renders inside the New Session <form>; this inner form
+          swallows Enter (filter, manual path) so it never submits the
+          surrounding page. */}
+      <form
+        className={css.browser}
+        data-testid="dir-browser"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (manualOpen) submitManual();
+        }}
+      >
         <h2 className={css.browserTitle}>浏览主机目录</h2>
         <p className={css.browserHint}>
           只显示目录，范围限定在这台主机允许注册的根目录内；使用当前文件夹即完成注册，不会创建或删除任何文件。
@@ -164,7 +197,11 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
           <label className={css.browserToggle}>
             <input type="checkbox" data-testid="dir-browser-hidden" checked={showHidden}
               disabled={loading || busy}
-              onChange={(event) => { setShowHidden(event.target.checked); load(path, event.target.checked); }} />
+              onChange={(event) => {
+                showHiddenRef.current = event.target.checked;
+                setShowHidden(event.target.checked);
+                load(path, event.target.checked);
+              }} />
             显示隐藏目录
           </label>
         </div>
@@ -194,13 +231,7 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
             <label className={css.field}>主机上的绝对路径
               <input className={css.input} data-testid="dir-browser-manual-path"
                 value={manualPath} disabled={busy} autoFocus placeholder="/opt/projects/app"
-                onChange={(event) => setManualPath(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.nativeEvent.isComposing && !busy && !disabled) {
-                    event.preventDefault();
-                    void registerPath(manualPath);
-                  }
-                }} />
+                onChange={(event) => setManualPath(event.target.value)} />
             </label>
             <Button type="button" data-testid="dir-browser-manual-cancel"
               disabled={busy} onClick={() => setManualOpen(false)}>
@@ -218,9 +249,8 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
             取消
           </Button>
           {manualOpen ? (
-            <Button type="button" variant="primary" data-testid="dir-browser-manual-submit"
-              disabled={busy || disabled || !manualPath.trim()}
-              onClick={() => void registerPath(manualPath)}>
+            <Button type="submit" variant="primary" data-testid="dir-browser-manual-submit"
+              disabled={busy || disabled || !manualPath.trim()}>
               {busy ? "添加中…" : "添加该路径"}
             </Button>
           ) : (
@@ -231,7 +261,7 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
             </Button>
           )}
         </div>
-      </div>
+      </form>
     </Modal>
   );
 }

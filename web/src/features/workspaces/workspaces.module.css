@@ -258,3 +258,26 @@
 .browserItem .browserRow {
   flex: 1;
 }
+
+/* c-dirpicker round 2 item 11: coarse pointers get full 44 px hit targets
+   for breadcrumbs, folder rows and the filter, following visual-system.md
+   §8 (hit area follows pointer, not viewport width). */
+@media (pointer: coarse) {
+  .browserRow {
+    min-height: var(--touch, 44px);
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+
+  .crumb {
+    min-height: var(--touch, 44px);
+  }
+
+  .browserFilter {
+    min-height: var(--control-h, 44px);
+  }
+
+  .browserToggle {
+    min-height: var(--touch, 44px);
+  }
+}

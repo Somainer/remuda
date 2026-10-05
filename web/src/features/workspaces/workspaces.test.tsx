@@ -103,6 +103,60 @@ it("keeps manual absolute-path entry as an advanced option", async () => {
   await waitFor(() => expect(register).toHaveBeenCalledWith(workspace.hostId, "/srv/app"));
 });
 
+it("trims only the typed manual path, never a filesystem-selected path", async () => {
+  const register = vi.spyOn(hubStore, "registerWorkspace").mockResolvedValue(workspace);
+  render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);
+  await screen.findByTestId("dir-browser");
+  // The chosen folder path is sent verbatim (no surrounding whitespace).
+  fireEvent.click(screen.getByTestId("dir-browser-use"));
+  await waitFor(() =>
+    expect(register).toHaveBeenCalledWith(workspace.hostId, "/home/dev"),
+  );
+  register.mockClear();
+  // Typed input is trimmed at submission.
+  fireEvent.click(screen.getByTestId("dir-browser-manual-toggle"));
+  fireEvent.change(screen.getByTestId("dir-browser-manual-path"), {
+    target: { value: "   /srv/app  " },
+  });
+  fireEvent.click(screen.getByTestId("dir-browser-manual-submit"));
+  await waitFor(() =>
+    expect(register).toHaveBeenCalledWith(workspace.hostId, "/srv/app"),
+  );
+});
+
+it("Enter in the filter is swallowed by the modal and never submits the page form", async () => {
+  const submitted = vi.fn();
+  render(
+    <form onSubmit={(event) => {
+      event.preventDefault();
+      submitted();
+    }}>
+      <DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />
+    </form>,
+  );
+  await screen.findByTestId("dir-browser");
+  fireEvent.keyDown(screen.getByTestId("dir-browser-filter"), { key: "Enter" });
+  expect(submitted).not.toHaveBeenCalled();
+});
+
+it("keeps the hidden-folder preference for the life of the modal across navigation", async () => {
+  const dirsList = vi.mocked(api.hostDirsList);
+  render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);
+  const browser = await screen.findByTestId("dir-browser");
+  fireEvent.click(screen.getByTestId("dir-browser-hidden"));
+  await waitFor(() =>
+    expect(dirsList.mock.calls.at(-1)?.[1]).toMatchObject({ showHidden: true }),
+  );
+  await expect(within(browser).getByText(".config")).toBeVisible();
+  fireEvent.click(within(browser).getByText("projects"));
+  await waitFor(() =>
+    expect(dirsList.mock.calls.at(-1)).toEqual([
+      workspace.hostId,
+      { path: "/home/dev/projects", showHidden: true },
+    ]),
+  );
+});
+
 it("rejects a relative manual path before calling the API", async () => {
   const register = vi.spyOn(hubStore, "registerWorkspace").mockResolvedValue(workspace);
   render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);

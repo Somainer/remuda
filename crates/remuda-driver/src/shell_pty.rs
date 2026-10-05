@@ -1059,8 +1059,22 @@ impl ShellPtyDriver {
         let pgid = child.process_id().and_then(|pid| i32::try_from(pid).ok());
         let killer = child.clone_killer();
         let master = pair.master;
-        let writer = master.take_writer().map_err(pty_err)?;
-        let reader = master.try_clone_reader().map_err(pty_err)?;
+        // Each of the next steps can fail; the spawned child must be killed and
+        // reaped on any of those errors rather than orphaned.
+        let writer = match master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                Self::abort_failed_launch(child, pgid, Some((master, None))).await;
+                return Err(pty_err(error));
+            }
+        };
+        let reader = match master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                Self::abort_failed_launch(child, pgid, Some((master, Some(writer)))).await;
+                return Err(pty_err(error));
+            }
+        };
         let (output, _) = broadcast::channel(64);
         let emulator = self.options.emulator.then(|| {
             tracing::info!(
@@ -1088,7 +1102,7 @@ impl ShellPtyDriver {
         });
         let pump = Arc::clone(&state);
         let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("remuda-shell-pty".into())
             .spawn(move || {
                 read_pty(pump, reader);
@@ -1096,7 +1110,14 @@ impl ShellPtyDriver {
                 // closed at both ends. It frequently beats `wait()`.
                 let _ = eof_tx.send(());
             })
-            .map_err(DriverError::Io)?;
+        {
+            // The reader never started: run the stop ladder so the spawned
+            // child is killed and reaped, not orphaned.
+            if let Err(stop_error) = self.stop_tree(&state).await {
+                tracing::warn!(%stop_error, "cleanup after failed launch failed");
+            }
+            return Err(DriverError::Io(error));
+        }
         *self.inner.lock().await = Some(Arc::clone(&state));
         *self.hooks.lock().await = hooks.clone();
         *self.events_tx.lock().await = Some(tx.clone());
@@ -1267,8 +1288,17 @@ impl ShellPtyDriver {
         // GROK_HOME), follow the child pid, and emit on the instance's one
         // ordered observation channel. Hook-confirmed session identity wins
         // over file discovery (Hook > File) via the adapter confirm path.
-        if let Some(handle) = self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd)? {
-            *self.adapters.lock().await = Some(handle);
+        match self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd) {
+            Ok(Some(handle)) => *self.adapters.lock().await = Some(handle),
+            Ok(None) => {}
+            Err(error) => {
+                // The child is already running: kill and reap it so an adapter
+                // setup failure does not orphan the launched agent.
+                if let Err(stop_error) = self.stop_tree(&state).await {
+                    tracing::warn!(%stop_error, "cleanup after failed launch failed");
+                }
+                return Err(error);
+            }
         }
         if self.options.promote {
             // Built before `hooks` moves into the poller: the silence probe
@@ -1597,6 +1627,82 @@ impl ShellPtyDriver {
             }
         }
         Ok(outcome)
+    }
+
+    /// Tear down a child whose launch failed BEFORE its [`PtyState`] existed
+    /// (writer/reader setup failed). A launch error after spawn must never
+    /// orphan the child, so this runs the same close-first stop ladder as
+    /// [`Self::stop_tree`], then makes one bounded attempt to reap the leader.
+    async fn abort_failed_launch(
+        mut child: Box<dyn portable_pty::Child + Send + Sync>,
+        pgid: Option<i32>,
+        mut pty: Option<(Box<dyn MasterPty + Send>, Option<Box<dyn io::Write + Send>>)>,
+    ) {
+        let mut close = move || {
+            if let Some((master, writer)) = pty.take() {
+                // Close the writer first, then the master box: the slave's
+                // last endpoint going is what delivers SIGHUP.
+                drop(writer);
+                drop(master);
+            }
+        };
+        let reaped = match pgid {
+            Some(pgid) if pgid > 0 => {
+                let mut reaped = false;
+                let ladder = {
+                    let mut reap = || {
+                        if reaped {
+                            return true;
+                        }
+                        match child.try_wait() {
+                            Ok(Some(_status)) => {
+                                reaped = true;
+                                true
+                            }
+                            Ok(None) => false,
+                            Err(error) => {
+                                tracing::debug!(%error, "failed-launch pty child reap failed");
+                                true
+                            }
+                        }
+                    };
+                    lifecycle::stop_group(pgid, &mut close, &mut reap).await
+                };
+                if let Err(error) = ladder {
+                    tracing::warn!(%error, pgid, "failed-launch stop ladder errored");
+                }
+                reaped
+            }
+            _ => {
+                // No process group (or no pid): hang up, then kill the direct
+                // child and mark it for one bounded reap below.
+                close();
+                if let Err(error) = child.kill() {
+                    tracing::debug!(%error, "failed-launch direct child kill failed");
+                }
+                false
+            }
+        };
+        if !reaped {
+            // Same bounded transition-to-zombie wait as the regular stop path.
+            let deadline = tokio::time::Instant::now() + REAP_EXITING_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(lifecycle::EXIT_REAP_POLL).await;
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            pgid,
+                            "reap-incomplete after a failed launch: the process group is dead \
+                             but the leader has not become reapable; it stays a child of this Node"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Shared body of [`Driver::resume`] and [`Driver::start_resumed`].
@@ -4417,6 +4523,47 @@ mod tests {
             shell_quote("/data/it's.png"),
             "'/data/it'\\''s.png'",
             "an embedded quote must not end the quoting"
+        );
+    }
+
+    /// c-effortread r2: a launch that fails AFTER the child was spawned must
+    /// kill and reap that child, never leave it orphaned.
+    #[tokio::test]
+    async fn failed_launch_after_spawn_reaps_the_child() {
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg("sleep 30");
+        let child = pair.slave.spawn_command(cmd).expect("spawn");
+        let pgid = child
+            .process_id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .expect("portable-pty reports the leader pid");
+        assert!(lifecycle::group_alive(pgid), "the child is running");
+        let master = pair.master;
+        let writer = master.take_writer().expect("writer");
+
+        // Simulates the try_clone_reader failure path: child, pgid and the pty
+        // endpoints are handed straight to the abort cleanup.
+        ShellPtyDriver::abort_failed_launch(child, Some(pgid), Some((master, Some(writer)))).await;
+
+        for _ in 0..100 {
+            if !lifecycle::group_alive(pgid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !lifecycle::group_alive(pgid),
+            "the spawned child survived the failed launch"
         );
     }
 }

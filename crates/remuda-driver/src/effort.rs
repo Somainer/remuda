@@ -264,12 +264,20 @@ impl EffortRequest {
         self.ultracode || self.word == "ultracode off"
     }
 
-    /// Build the launch-time request from a protocol [`EffortSelection`]. The
-    /// launch word is the native `--effort` flag value (`ultracode` carries the
-    /// flag on every version; ≥2.1.284 additionally accepts it via overlay).
+    /// Build the launch-time request from a protocol [`EffortSelection`].
+    ///
+    /// This is launch provenance for a shell-pty launch that can target ANY
+    /// harness: a codex launch legitimately carries `ultra` (and an older
+    /// Claude launch `minimal`), neither of which is a Claude `/effort` word.
+    /// Map the fields directly instead of round-tripping through
+    /// [`Self::from_level`], which panics on those words — a panic here ran
+    /// AFTER the child was spawned and orphaned it.
     pub(crate) fn from_selection(selection: EffortSelection) -> Self {
-        Self::from_level(selection.flag_value())
-            .expect("EffortSelection only carries launchable Claude words")
+        Self {
+            name: selection.name,
+            ultracode: selection.ultracode,
+            word: selection.flag_value(),
+        }
     }
 
     /// The native spelling to type after `/effort ` — a level word,
@@ -909,6 +917,27 @@ mod argv_tests {
                 Err(DriverError::InvalidLaunchSpec(_))
             ));
         }
+    }
+
+    #[test]
+    fn launch_provenance_never_panics_on_non_claude_words() {
+        // c-effortread r2: from_selection runs after the child has been
+        // spawned for a shell-pty launch, which can target any harness. A
+        // codex `ultra` launch (and a legacy `minimal`) used to panic here and
+        // orphan the spawned child.
+        let ultra = EffortRequest::from_selection(sel(EffortName::Ultra, false));
+        assert_eq!(ultra.name, EffortName::Ultra);
+        assert!(!ultra.ultracode);
+        assert_eq!(ultra.word, "ultra");
+        let minimal = EffortRequest::from_selection(sel(EffortName::Minimal, false));
+        assert_eq!(minimal.name, EffortName::Minimal);
+        assert_eq!(minimal.word, "minimal");
+        let flag = EffortRequest::from_selection(sel(EffortName::Xhigh, true));
+        assert_eq!(flag.name, EffortName::Xhigh);
+        assert!(flag.ultracode);
+        assert_eq!(flag.word, "ultracode");
+        let plain = EffortRequest::from_selection(sel(EffortName::Max, false));
+        assert_eq!(plain.word, "max");
     }
 
     #[test]

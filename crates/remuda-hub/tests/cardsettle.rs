@@ -526,6 +526,33 @@ async fn late_answer_after_delete_with_rejected_purge_is_rejected_and_not_forwar
     let state = poll_card_state(addr, &cookie, &instance_id).await?;
     assert_eq!(state, "missing", "the deleted instance's card row is gone");
 
+    // r3 item 2: the Node that failed to purge still lists the id as pending.
+    // The tombstone must suppress that live copy in the merge, so the deleted
+    // card can never come back into the inbox or the badge.
+    node.set_live_items(vec![json!({
+        "interactionId": interaction_wire,
+        "id": interaction_wire,
+        "instanceId": instance_id,
+        "hostId": host_id.as_id().as_str(),
+        "kind": "approval",
+        "state": "pending",
+        "blocking": true,
+        "answerable": true
+    })]);
+    let (status, body) = http(addr, "GET", "/v1/interactions", &cookie, None).await?;
+    assert_eq!(status, 200);
+    let page: Value = serde_json::from_str(&body)?;
+    let ids: Vec<&str> = page["items"]
+        .as_array()
+        .context("items array")?
+        .iter()
+        .filter_map(|item| item.get("interactionId").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !ids.contains(&interaction_wire.as_str()),
+        "a tombstoned id's stale Node-pending copy must not return after delete: {body}"
+    );
+
     // …yet the late answer is still 404 via the retained tombstone.
     let (status, body) = post_answer(addr, &cookie, &interaction_wire).await?;
     assert_eq!(

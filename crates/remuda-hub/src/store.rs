@@ -4149,11 +4149,13 @@ impl Store {
         .await
     }
 
-    /// c-cardsettle r2 item 3: of the given ids, return those whose DURABLE
-    /// Hub row is terminal, regardless of the 24 h inbox display retention.
-    /// Display retention decides whether a departed row is SHOWN; this decides
-    /// authoritative dedup, so a restarted Node's `interaction.list` can never
-    /// re-queue the same id as pending and put it back on the badge.
+    /// c-cardsettle r2 item 3 / r3 item 2: of the given ids, return those whose
+    /// DURABLE Hub row is terminal, regardless of the 24 h inbox display
+    /// retention, PLUS tombstone ids left behind when a terminal instance was
+    /// deleted. Display retention decides whether a departed row is SHOWN; this
+    /// decides authoritative dedup, so a restarted Node's `interaction.list`
+    /// can never re-queue the same id as pending (even after the Hub row was
+    /// deleted with a rejected purge) and put it back on the badge.
     pub async fn terminal_interaction_ids(
         &self,
         ids: Vec<String>,
@@ -4163,13 +4165,19 @@ impl Store {
         }
         self.run_named("terminal_interaction_ids", move |conn| {
             let placeholders = vec!["?"; ids.len()].join(",");
+            // Tombstones only ever record terminal/non-answerable state (the
+            // delete transaction snapshots the row as it stood), so every match
+            // there is authoritative; live rows must additionally be terminal.
             let sql = format!(
-                "SELECT id FROM interactions
+                "SELECT id FROM interaction_tombstones WHERE id IN ({placeholders})
+                 UNION
+                 SELECT id FROM interactions
                  WHERE id IN ({placeholders})
                    AND state IN ('expired', 'invalidated', 'answer-committed', 'resolved')"
             );
             let params: Vec<&dyn rusqlite::types::ToSql> = ids
                 .iter()
+                .chain(ids.iter())
                 .map(|id| id as &dyn rusqlite::types::ToSql)
                 .collect();
             let mut stmt = conn.prepare(&sql)?;
@@ -8402,6 +8410,13 @@ mod tests {
         assert_eq!(tombstone.interaction_id, int_id);
         assert_eq!(tombstone.instance_id, instance.instance_id);
         assert_eq!(tombstone.state, "invalidated");
+        // r3 item 2: the tombstone is authoritative in the merge dedup, so a
+        // Node that still lists the id pending cannot re-queue it post-delete.
+        let terminal = store
+            .terminal_interaction_ids(vec![int_id.clone()])
+            .await
+            .expect("terminal ids");
+        assert!(terminal.contains(&int_id), "tombstone id is dedup-terminal");
         store.close().await;
     }
 

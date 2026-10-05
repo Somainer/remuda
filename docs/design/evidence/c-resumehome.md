@@ -72,3 +72,52 @@ covers all local carriers through one factory hook.
 - `cargo fmt`, `cargo clippy -D warnings` on changed crates; full
   `remuda-driver`/`remuda-node`/`remuda-hub`/`remuda-testing` suites green
   (workspace run once under `nice`).
+
+## Round 2 — security/hardness review fixes (2026-10-06)
+
+Follow-up review on 2792100e (codex REJECT; grok timeout):
+
+1. **Path traversal + predecessor binding.** `resumeSessionId` is validated
+   before acceptance (`is_safe_session_id`: one file-name component,
+   alnum/`-`/`_`, ≤64 chars) in the Node resolver, the staging factory, the
+   driver's exact-id binds and `fake-claude`; staging verifies destination
+   containment lexically (no `canonicalize`) and requires the source
+   transcript to be a real regular file (`symlink_metadata`). The id must
+   equal the immediate predecessor's recorded native session (empty/`ins_`
+   placeholders stay inconclusive).
+2. **Sidecar symlinks.** Links are never recreated verbatim. They are
+   resolved hop by hop (≤32, cycle-checked), every hop containment-checked
+   against the source project dir, and permitted regular-file targets are
+   copied as independent files; escaping/absolute/broken/directory links and
+   symlinked sidecar roots are hard errors, never silent skips.
+3. **Renamed transcript sidecars.** A promoted transcript whose file name is
+   not the session id now finds `<dir>/<S>/` first, falling back to the
+   file-stem dir only for older layouts.
+4. **Provenance + atomic publish.** A `.remuda-staging/<S>.json` marker
+   (source path, size, sha256) gates every existing destination: unmarked or
+   mismatching files are a clear conflict and are never overwritten; the
+   transcript is published through same-directory temp file + rename after
+   sidecars and the marker land.
+5. **No chain rollback.** The resolver consults only the immediate
+   predecessor (newest chapter); a missing newest transcript is refused
+   naming that instance instead of falling back to a grandparent.
+6. **Readability before acceptance.** Both candidate paths are checked with
+   `symlink_metadata` plus an actual O_RDONLY open; permission/IO errors are
+   refused pre-acceptance.
+7. **Staging bounds.** 256 MiB / 10 000 files / 32 directory levels,
+   transcript included; clear errors when exceeded.
+8. **Fake sandbox.** `fake-claude` and `fake-harness` write only inside the
+   system temp tree (`$TMPDIR`, `/tmp`, `/var/tmp`); explicit out-of-temp
+   targets are refused loudly, implicit operator homes are skipped (claude)
+   or replaced with a private per-process temp home (harness). Guard tests
+   verify all three behaviours; an mtime audit of `~/.claude` before/after
+   the full workspace run shows no fake-shaped writes.
+
+Owner rule preserved: nothing changes when a session counts as ended — only
+process-end evidence is terminal.
+
+Tests: driver unit tests in `claude_transcript.rs` (28), node e2e in
+`resume_home.rs` (9), the existing `resume_home_pty.rs` chain, new
+`fake_home_guard.rs` (3), sandbox unit tests. `cargo fmt`,
+`cargo clippy --workspace -D warnings`, four-crate suites and a full
+`nice cargo test --workspace` all green.

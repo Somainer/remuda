@@ -1,0 +1,1033 @@
+===== 01 boot =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/walk/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+
+===== 02 prompt — after turn =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/walk/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 2s · done 3:26 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+
+===== 03 /effort ultracode — after verdict =====
+ ▐▛███▛█▄╱✦  Claude Code v2.1.289
+▝▜██████▘    Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝     /tmp/remuda-c-effortev/walk/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 2s · done 3:26 PM
+
+❯ /effort ultracode
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                     ● high · ultracode · /effort
+
+===== 04 prompt — after turn =====
+ ▐▛███▛█▄╱✦  Claude Code v2.1.289
+▝▜██████▘    Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝     /tmp/remuda-c-effortev/walk/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 2s · done 3:26 PM
+
+❯ /effort ultracode
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 5s · done 3:27 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                     ● high · ultracode · /effort
+
+===== 05 /effort high — after verdict =====
+ ▐▛███▛█▄╱✦  Claude Code v2.1.289
+▝▜██████▘    Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝     /tmp/remuda-c-effortev/walk/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 2s · done 3:26 PM
+
+❯ /effort ultracode
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 5s · done 3:27 PM
+
+❯ /effort high
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                     ● high · ultracode · /effort
+
+===== 06 prompt — after turn =====
+ ▐▛███▛█▄╱✦  Claude Code v2.1.289
+▝▜██████▘    Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝     /tmp/remuda-c-effortev/walk/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 2s · done 3:26 PM
+
+❯ /effort ultracode
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 5s · done 3:27 PM
+
+❯ /effort high
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:27 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                     ● high · ultracode · /effort
+
+===== 07 /effort max — after verdict =====
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 2s · done 3:26 PM
+
+❯ /effort ultracode
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 5s · done 3:27 PM
+
+❯ /effort high
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:27 PM
+
+❯ /effort max
+  ⎿  Set effort level to max (this session only): Maximum capability with deepest reasoning. May use excessive tokens
+     resulting in long response times or overthinking. Use sparingly for the hardest tasks.
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                      ◈ max · ultracode · /effort
+
+===== 08 prompt — after turn =====
+
+⏺ ok
+
+✻ Cooked for 2s · done 3:26 PM
+
+❯ /effort ultracode
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 5s · done 3:27 PM
+
+❯ /effort high
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:27 PM
+
+❯ /effort max
+  ⎿  Set effort level to max (this session only): Maximum capability with deepest reasoning. May use excessive tokens
+     resulting in long response times or overthinking. Use sparingly for the hardest tasks.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 4s · done 3:27 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                      ◈ max · ultracode · /effort
+
+===== 09 /effort ultracode off — after verdict =====
+
+✻ Cooked for 2s · done 3:26 PM
+
+❯ /effort ultracode
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 5s · done 3:27 PM
+
+❯ /effort high
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:27 PM
+
+❯ /effort max
+  ⎿  Set effort level to max (this session only): Maximum capability with deepest reasoning. May use excessive tokens
+     resulting in long response times or overthinking. Use sparingly for the hardest tasks.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 4s · done 3:27 PM
+
+❯ /effort ultracode off
+  ⎿  Ultracode off. Effort stays max.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                  ◈ max · /effort
+
+===== 10 prompt — after turn =====
+
+⏺ ok
+
+✻ Baked for 5s · done 3:27 PM
+
+❯ /effort high
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:27 PM
+
+❯ /effort max
+  ⎿  Set effort level to max (this session only): Maximum capability with deepest reasoning. May use excessive tokens
+     resulting in long response times or overthinking. Use sparingly for the hardest tasks.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 4s · done 3:27 PM
+
+❯ /effort ultracode off
+  ⎿  Ultracode off. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 1s · done 3:27 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                  ◈ max · /effort
+
+===== 11 /effort ultracode on — after verdict =====
+
+✻ Baked for 5s · done 3:27 PM
+
+❯ /effort high
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:27 PM
+
+❯ /effort max
+  ⎿  Set effort level to max (this session only): Maximum capability with deepest reasoning. May use excessive tokens
+     resulting in long response times or overthinking. Use sparingly for the hardest tasks.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 4s · done 3:27 PM
+
+❯ /effort ultracode off
+  ⎿  Ultracode off. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 1s · done 3:27 PM
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays max.
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                      ◈ max · ultracode · /effort
+
+===== 12 prompt — after turn =====
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:27 PM
+
+❯ /effort max
+  ⎿  Set effort level to max (this session only): Maximum capability with deepest reasoning. May use excessive tokens
+     resulting in long response times or overthinking. Use sparingly for the hardest tasks.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 4s · done 3:27 PM
+
+❯ /effort ultracode off
+  ⎿  Ultracode off. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 1s · done 3:27 PM
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Sautéed for 3s · done 3:27 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                      ◈ max · ultracode · /effort
+
+===== 13 /effort xhigh — after verdict =====
+
+✻ Worked for 2s · done 3:27 PM
+
+❯ /effort max
+  ⎿  Set effort level to max (this session only): Maximum capability with deepest reasoning. May use excessive tokens
+     resulting in long response times or overthinking. Use sparingly for the hardest tasks.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 4s · done 3:27 PM
+
+❯ /effort ultracode off
+  ⎿  Ultracode off. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 1s · done 3:27 PM
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Sautéed for 3s · done 3:27 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                    ◉ xhigh · ultracode · /effort
+
+===== 14 prompt — after turn =====
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 4s · done 3:27 PM
+
+❯ /effort ultracode off
+  ⎿  Ultracode off. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 1s · done 3:27 PM
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Sautéed for 3s · done 3:27 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 1s · done 3:27 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                    ◉ xhigh · ultracode · /effort
+
+===== 15 /effort auto — after verdict =====
+⏺ ok
+
+✻ Churned for 4s · done 3:27 PM
+
+❯ /effort ultracode off
+  ⎿  Ultracode off. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 1s · done 3:27 PM
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Sautéed for 3s · done 3:27 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 1s · done 3:27 PM
+
+❯ /effort auto
+  ⎿  Effort level set to auto
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                   ◐ medium · ultracode · /effort
+
+===== 16 prompt — after turn =====
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 1s · done 3:27 PM
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Sautéed for 3s · done 3:27 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 1s · done 3:27 PM
+
+❯ /effort auto
+  ⎿  Effort level set to auto
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cogitated for 3s · done 3:27 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                   ◐ medium · ultracode · /effort
+
+===== 17 /effort status — after verdict =====
+⏺ ok
+
+✻ Baked for 1s · done 3:27 PM
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays max.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Sautéed for 3s · done 3:27 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 1s · done 3:27 PM
+
+❯ /effort auto
+  ⎿  Effort level set to auto
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cogitated for 3s · done 3:27 PM
+
+❯ /effort status
+  ⎿  Effort level: auto (currently medium) · Ultracode on
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                   ◐ medium · ultracode · /effort
+
+===== 18 prompt — after turn =====
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Sautéed for 3s · done 3:27 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 1s · done 3:27 PM
+
+❯ /effort auto
+  ⎿  Effort level set to auto
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cogitated for 3s · done 3:27 PM
+
+❯ /effort status
+  ⎿  Effort level: auto (currently medium) · Ultracode on
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 3s · done 3:27 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                   ◐ medium · ultracode · /effort
+
+===== 19 /effort bogus — after verdict =====
+⏺ ok
+
+✻ Sautéed for 3s · done 3:27 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 1s · done 3:27 PM
+
+❯ /effort auto
+  ⎿  Effort level set to auto
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cogitated for 3s · done 3:27 PM
+
+❯ /effort status
+  ⎿  Effort level: auto (currently medium) · Ultracode on
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 3s · done 3:27 PM
+
+❯ /effort bogus
+  ⎿  Invalid argument: bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                   ◐ medium · ultracode · /effort
+
+===== 20 prompt — after turn =====
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cooked for 1s · done 3:27 PM
+
+❯ /effort auto
+  ⎿  Effort level set to auto
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cogitated for 3s · done 3:27 PM
+
+❯ /effort status
+  ⎿  Effort level: auto (currently medium) · Ultracode on
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 3s · done 3:27 PM
+
+❯ /effort bogus
+  ⎿  Invalid argument: bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                   ◐ medium · ultracode · /effort
+
+===== 21 /effort ultracode bogus — after verdict =====
+
+⏺ ok
+
+✻ Cooked for 1s · done 3:27 PM
+
+❯ /effort auto
+  ⎿  Effort level set to auto
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cogitated for 3s · done 3:27 PM
+
+❯ /effort status
+  ⎿  Effort level: auto (currently medium) · Ultracode on
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 3s · done 3:27 PM
+
+❯ /effort bogus
+  ⎿  Invalid argument: bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+❯ /effort ultracode bogus
+  ⎿  Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                   ◐ medium · ultracode · /effort
+
+===== 22 prompt — after turn =====
+  ⎿  Effort level set to auto
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Cogitated for 3s · done 3:27 PM
+
+❯ /effort status
+  ⎿  Effort level: auto (currently medium) · Ultracode on
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 3s · done 3:27 PM
+
+❯ /effort bogus
+  ⎿  Invalid argument: bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+❯ /effort ultracode bogus
+  ⎿  Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 1s · done 3:27 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                   ◐ medium · ultracode · /effort
+
+===== 23 /effort (bare) — slider open =====
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+❯ /effort ultracode bogus
+  ⎿  Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 1s · done 3:27 PM
+
+❯ /effort
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Effort
+
+                             Faster                             Smarter
+                             ──────────▲───────────────────────────────      Ultracode  on
+                             low     medium     high     xhigh      max      Tab to toggle
+                             Ultracode: dynamic workflows on every task
+
+  ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel
+
+===== 24 /effort (bare) — after Right =====
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+❯ /effort ultracode bogus
+  ⎿  Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 1s · done 3:27 PM
+
+❯ /effort
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Effort
+
+                             Faster                             Smarter
+                             ────────────────────▲─────────────────────      Ultracode  on
+                             low     medium     high     xhigh      max      Tab to toggle
+                             Ultracode: dynamic workflows on every task
+
+  ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel
+
+===== 25 /effort (bare) — after Tab =====
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+❯ /effort ultracode bogus
+  ⎿  Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 1s · done 3:27 PM
+
+❯ /effort
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Effort
+
+                             Faster                             Smarter
+                             ────────────────────▲─────────────────────      Ultracode  off
+                             low     medium     high     xhigh      max      Tab to toggle
+
+
+  ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel
+
+===== 26 /effort (bare) → Right, Tab, Enter — after verdict =====
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+❯ /effort ultracode bogus
+  ⎿  Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 1s · done 3:27 PM
+
+❯ /effort
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation · Ultracode off
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+
+===== 27 prompt — after turn =====
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+❯ /effort ultracode bogus
+  ⎿  Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 1s · done 3:27 PM
+
+❯ /effort
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation · Ultracode off
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 2s · done 3:27 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+
+===== 28 /model claude-opus-5-5 — after verdict =====
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+❯ /effort ultracode bogus
+  ⎿  Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 1s · done 3:27 PM
+
+❯ /effort
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation · Ultracode off
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 2s · done 3:27 PM
+
+❯ /model claude-opus-5-5
+  ⎿  Set model to Opus 5.5 and saved as your default for new sessions
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+
+===== 29 prompt — after turn =====
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 1s · done 3:27 PM
+
+❯ /effort ultracode bogus
+  ⎿  Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 1s · done 3:27 PM
+
+❯ /effort
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation · Ultracode off
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 2s · done 3:27 PM
+
+❯ /model claude-opus-5-5
+  ⎿  Set model to Opus 5.5 and saved as your default for new sessions
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 1s · done 3:28 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+

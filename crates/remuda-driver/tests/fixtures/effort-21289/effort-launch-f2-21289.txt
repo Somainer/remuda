@@ -1,0 +1,93 @@
+===== 01 boot =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/f/ws
+
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 2s · done 3:31 PM
+
+❯ /effort status
+  ⎿  Current effort level: high (Comprehensive implementation with extensive testing and documentation) · Ultracode on
+
+❯ /exit
+  ⎿  See ya!
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                               ◐ medium · /effort
+
+===== 02 prompt — after turn =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/f/ws
+
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 2s · done 3:31 PM
+
+❯ /effort status
+  ⎿  Current effort level: high (Comprehensive implementation with extensive testing and documentation) · Ultracode on
+
+❯ /exit
+  ⎿  See ya!
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 2s · done 3:31 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                               ◐ medium · /effort
+
+===== 03 /effort status — after verdict =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/f/ws
+
+
+❯ /effort ultracode on
+  ⎿  Ultracode on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 2s · done 3:31 PM
+
+❯ /effort status
+  ⎿  Current effort level: high (Comprehensive implementation with extensive testing and documentation) · Ultracode on
+
+❯ /exit
+  ⎿  See ya!
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Churned for 2s · done 3:31 PM
+
+❯ /effort status
+  ⎿  Effort level: auto (currently medium)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                               ◐ medium · /effort
+

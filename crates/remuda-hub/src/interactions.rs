@@ -110,7 +110,6 @@ pub(crate) fn delegated_decisions_enabled(project_id: Option<&str>) -> bool {
 /// from the raw create spec via the existing accessor
 /// (`crates/remuda-hub/src/store.rs:3551` `get_instance_spec_json`).
 struct RouteTarget {
-    parent_instance_id: Option<String>,
     project_id: Option<String>,
     permission_mode: Option<String>,
 }
@@ -130,7 +129,6 @@ impl RouteTarget {
                     .map(str::to_string)
             });
         Ok(Some(Self {
-            parent_instance_id: instance.parent_instance_id,
             project_id: instance.project_id,
             permission_mode,
         }))
@@ -185,9 +183,14 @@ async fn delegated_visible_items(
             // Missing instance: `owns()` fails the same way.
             continue;
         };
-        // The single one-hop family edge: self or direct child.
-        if target != caller_instance
-            && route_target.parent_instance_id.as_deref() != Some(caller_instance)
+        // The single one-hop family edge, D-057 §5: self, another chapter in
+        // the caller's lineage, or a target whose parent chapter is. A worker
+        // an earlier chapter created stays routed to the successor chapter.
+        if !state
+            .store
+            .lineage_owns(caller_instance.to_string(), target.to_string())
+            .await
+            .map_err(crate::http::map_store)?
         {
             continue;
         }

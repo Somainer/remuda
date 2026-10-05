@@ -655,6 +655,137 @@ pub struct InstanceRecord {
         rename = "usageRollup"
     )]
     pub usage_rollup: Option<crate::usage_store::InstanceUsageRollup>,
+    /// D-057 §5: lineage this chapter belongs to (its own id for a plain
+    /// instance); serialized as `lineageId`.
+    #[serde(rename = "lineageId")]
+    pub lineage_id: String,
+    /// Chapter position inside the lineage, 1-based.
+    pub generation: i64,
+    /// Why this chapter exists: `owner-resume` / later C1 causes; `null` for
+    /// a first chapter or a plain instance.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "chapterCause"
+    )]
+    pub chapter_cause: Option<String>,
+    /// When authority moved away from this chapter to its successor.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "fencedAt")]
+    pub fenced_at: Option<String>,
+    /// C1 restart policy copied to every chapter of a continuity lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Value>,
+}
+
+/// C1 restart policy chosen at create time (D-057 §6.1).
+///
+/// Stored on every chapter of a continuity lineage and on the lineage row.
+/// Only a Human creator may set it; no behaviour follows until `ma-restart`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartPolicy {
+    /// Restart on Node-attested process loss / start failure.
+    pub on_process_loss: bool,
+    /// At-most restart decisions per rolling hour (>= 1).
+    pub max_per_hour: u32,
+}
+
+/// One agent across process lifetimes (D-057 §5). The row exists only for
+/// continuity instances: one that holds a grant or carries a restart policy.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageRecord {
+    /// First chapter's instance id.
+    pub lineage_id: String,
+    /// The chapter authority currently belongs to.
+    pub current_instance_id: String,
+    /// Current chapter generation; bumped inside every fence transaction.
+    pub generation: i64,
+    /// Stored state (`starting` / `running` / `paused`). Reads derive the
+    /// host-offline/live view from the current chapter on top of this.
+    pub state: String,
+    /// Who paused (`device` / `self` / `ancestor` / `restart-cap` /
+    /// `process-exit`) with its attributes; `None` while unpaused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_by: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+    /// C1 restart policy copied to every chapter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Value>,
+    /// Reference to the first chapter's create spec and launch origin.
+    #[serde(skip_serializing)]
+    pub origin_spec_ref: Option<Value>,
+    pub updated_at: String,
+}
+
+/// One chapter row in a lineage projection (`GET /v1/lineages/{id}`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageChapter {
+    pub instance_id: String,
+    pub generation: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chapter_cause: Option<String>,
+    pub created_at: String,
+    /// Last update once the chapter reached an ended lifecycle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    /// When authority moved to the successor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fenced_at: Option<String>,
+}
+
+/// Raw `lineages` columns, in SELECT order.
+type LineageRow = (
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn load_lineage(conn: &Connection, lineage_id: &str) -> Result<Option<LineageRecord>, StoreError> {
+    let row: Option<LineageRow> = conn
+        .query_row(
+            "SELECT lineage_id, current_instance_id, generation, state,
+                    paused_by_json, paused_at, restart_json, origin_spec_ref, updated_at
+             FROM lineages WHERE lineage_id = ?1",
+            params![lineage_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let parse = |raw: Option<String>| raw.and_then(|text| serde_json::from_str(&text).ok());
+    Ok(Some(LineageRecord {
+        lineage_id: row.0,
+        current_instance_id: row.1,
+        generation: row.2,
+        state: row.3,
+        paused_by: parse(row.4),
+        paused_at: row.5,
+        restart: parse(row.6),
+        origin_spec_ref: parse(row.7),
+        updated_at: row.8,
+    }))
 }
 
 /// Delegation-tree state attached at instance create; design §2.5.
@@ -675,6 +806,9 @@ pub struct InstanceDelegation {
     /// non-delegating insert paths (fleet fan-out, D-026 resume, SSH host
     /// creates), which the operator already authorized directly.
     pub enforce_tree: bool,
+    /// D-057 §6.1 C1 restart policy; `Some` makes the new instance a
+    /// continuity lineage even when it holds no grants.
+    pub restart: Option<RestartPolicy>,
 }
 
 impl Default for InstanceDelegation {
@@ -690,6 +824,7 @@ impl Default for InstanceDelegation {
             grants: Vec::new(),
             task_id: None,
             enforce_tree: false,
+            restart: None,
         }
     }
 }
@@ -716,6 +851,7 @@ fn enforce_grant_uniqueness(
             .query_row(
                 &format!(
                     "SELECT 1 FROM instances WHERE {ACTIVE_HOLDER_SQL}
+                 AND fenced_at IS NULL
                  AND grants_json LIKE '%\"address-owner\"%' LIMIT 1"
                 ),
                 [],
@@ -739,6 +875,7 @@ fn enforce_grant_uniqueness(
                 .query_row(
                     &format!(
                         "SELECT 1 FROM instances WHERE {ACTIVE_HOLDER_SQL}
+                     AND fenced_at IS NULL
                      AND grants_json LIKE '%\"dispatch\"%'
                      AND scope_json LIKE ?1 LIMIT 1"
                     ),
@@ -881,11 +1018,41 @@ pub(crate) fn validate_child_delegation(
         )));
     }
     if let Some(pid) = parent_id {
-        let active_children: i64 = conn.query_row(
+        // D-057 §5: the parent may be one chapter of a lineage. Earlier
+        // chapters created the same workers, and a continuation chapter adds
+        // no delegation edge (its parent is its predecessor's parent), so
+        // active children are counted across EVERY chapter of the lineage.
+        // Continuation rows themselves (`chapter_cause` set) are never
+        // children, regardless of what their copied parent edge looks like.
+        let mut chapter_stmt = conn.prepare(
+            "SELECT id FROM instances
+             WHERE COALESCE(lineage_id, id) =
+                   (SELECT COALESCE(lineage_id, id) FROM instances WHERE id = ?1)",
+        )?;
+        let chapter_ids: Vec<String> = chapter_stmt
+            .query_map(params![pid], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        drop(chapter_stmt);
+        let parent_clauses = chapter_ids
+            .iter()
+            .map(|chapter| format!("%\"parentInstanceId\":\"{chapter}\"%"))
+            .collect::<Vec<_>>();
+        let mut sql = String::from(
             "SELECT COUNT(*) FROM instances
-             WHERE spec_json LIKE ?1
-               AND lifecycle NOT IN ('exited', 'failed', 'closed')",
-            params![format!("%\"parentInstanceId\":\"{pid}\"%")],
+             WHERE lifecycle NOT IN ('exited', 'failed', 'closed')
+               AND chapter_cause IS NULL AND (",
+        );
+        sql.push_str(
+            &parent_clauses
+                .iter()
+                .map(|_| "spec_json LIKE ?")
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        );
+        sql.push(')');
+        let active_children: i64 = conn.query_row(
+            &sql,
+            rusqlite::params_from_iter(parent_clauses.iter()),
             |row| row.get(0),
         )?;
         if u32::try_from(active_children).unwrap_or(0) >= limits.fan_out {
@@ -926,6 +1093,304 @@ fn node_depth(conn: &Connection, start: &str) -> Result<u32, StoreError> {
         }
     }
     Ok(depth)
+}
+
+/// D-057 §5: the stamped lineage id of an instance.
+///
+/// A row written before ma-lineage has no stamped `lineage_id`, and a plain
+/// instance is always its own lineage, so both read as the instance's own id.
+/// `None` means the instance does not exist.
+pub(crate) fn lineage_id_of(conn: &Connection, id: &str) -> Result<Option<String>, StoreError> {
+    conn.query_row(
+        "SELECT COALESCE(lineage_id, id) FROM instances WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+/// D-057 §5: the single lineage edge every parent-edge rule reads.
+///
+/// A caller owns a target when the target is a chapter in the caller's
+/// lineage, or the target's parent is. Successor chapters therefore keep
+/// reading and controlling what predecessor chapters created, while plain
+/// instances keep the old self-or-direct-parent semantics (each plain
+/// instance is its own lineage).
+pub(crate) fn lineage_owns_conn(
+    conn: &Connection,
+    caller_id: &str,
+    target_id: &str,
+) -> Result<bool, StoreError> {
+    let Some(caller_lineage) = lineage_id_of(conn, caller_id)? else {
+        return Ok(false);
+    };
+    let Some(target_lineage) = lineage_id_of(conn, target_id)? else {
+        return Ok(false);
+    };
+    if target_lineage == caller_lineage {
+        return Ok(true);
+    }
+    let parent: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(spec_json, '$.parentInstanceId')
+             FROM instances WHERE id = ?1",
+            params![target_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(parent) = parent
+        && lineage_id_of(conn, &parent)? == Some(caller_lineage)
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Inputs to the ma-lineage continuation-resume transaction.
+pub struct ContinuationResumeRequest {
+    /// Any chapter the owner addressed; the transaction fences the lineage's
+    /// current chapter.
+    pub addressed_instance_id: String,
+    /// Generation the HTTP handler observed before queueing the writer job;
+    /// the CAS fails when another resume/restart committed first.
+    pub expected_generation: i64,
+    /// Successor host — always the current chapter's host.
+    pub host_id: String,
+    /// Resolved create spec for the successor (continuation edge, resume id,
+    /// provider overlay already attached by the handler).
+    pub spec: Value,
+    /// `instance.resume` (recovery from a native session id) or
+    /// `instance.create` (fresh launch from the origin spec).
+    pub operation: String,
+    /// Optional first prompt for the successor.
+    pub prompt: Option<String>,
+    /// Wire origin of the resume create (`human` for an owner Resume).
+    pub origin: String,
+    /// UI title for the successor.
+    pub title: Option<String>,
+}
+
+/// Payload of the winning continuation transaction.
+#[derive(Debug)]
+pub struct ContinuationResumed {
+    pub lineage_id: String,
+    pub fenced: Box<InstanceRecord>,
+    pub successor: InstanceRecord,
+    pub command: CommandRecord,
+}
+
+/// Outcome of [`Store::continuation_resume`].
+#[derive(Debug)]
+pub enum ContinuationResumeResult {
+    /// This transaction fenced the predecessor and inserted the successor.
+    Resumed(Box<ContinuationResumed>),
+    /// The generation CAS lost: the lineage already advanced. `current` is
+    /// the chapter the winning transaction created, which the caller presents
+    /// as an idempotent replay instead of starting another chapter.
+    Superseded { current: Box<InstanceRecord> },
+}
+
+/// Hook fired at continuation-resume points with `(point, lineageId)`.
+pub(crate) type ContinuationHook = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// Deterministic hook points for the §7.10 race suites. Production builds
+/// leave the slot empty; tests install a blocking rendezvous through
+/// [`lineage_test_support`].
+static CONTINUATION_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ContinuationHook>>> =
+    std::sync::OnceLock::new();
+
+/// Test-only seam for the ma-lineage continuation-resume race.
+#[doc(hidden)]
+pub mod lineage_test_support {
+    /// Hook fired at continuation-resume points with `(point, lineageId)`.
+    pub type Hook = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+    /// Install a hook fired at continuation-resume points with `(point,
+    /// lineageId)`. `None` removes it.
+    ///
+    /// `read` fires in the HTTP handler just after the generation is read and
+    /// before the writer job is queued; `cas` fires inside the writer
+    /// transaction between the lineage read and its compare-and-set. A
+    /// blocking rendezvous on `cas` serialises two resumes deterministically.
+    pub fn set_hook(hook: Option<Hook>) {
+        let slot = super::CONTINUATION_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+        *slot.lock().expect("continuation hook lock") = hook;
+    }
+}
+
+/// Invoke an installed continuation-resume hook at `point` with the lineage
+/// id. `read` fires in the HTTP handler after the generation read; `cas`
+/// fires inside the writer transaction between the read and the CAS write.
+///
+/// `read` (async runtime) and `cas` (writer thread) fire concurrently during
+/// the race suites, so the slot is cloned, never taken, per invocation.
+pub(crate) fn run_continuation_hook(point: &str, lineage_id: &str) {
+    let Some(slot) = CONTINUATION_HOOK.get() else {
+        return;
+    };
+    let hook = slot.lock().ok().and_then(|guard| guard.clone());
+    if let Some(hook) = hook {
+        hook(point, lineage_id);
+    }
+}
+
+/// The fence-and-continue transaction behind [`Store::continuation_resume`].
+fn continuation_resume_tx(
+    conn: &mut Connection,
+    request: ContinuationResumeRequest,
+) -> Result<ContinuationResumeResult, StoreError> {
+    let tx = conn.transaction()?;
+    let addressed = load_instance(&tx, &request.addressed_instance_id)?
+        .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
+    let lineage = load_lineage(&tx, &addressed.lineage_id)?
+        .ok_or_else(|| StoreError::Id("addressed instance is not a continuity lineage".into()))?;
+    let lineage_id = lineage.lineage_id.clone();
+    let current_id = lineage.current_instance_id.clone();
+    run_continuation_hook("cas", &lineage_id);
+    let successor_id = new_id("ins").map_err(|e| StoreError::Id(e.to_string()))?;
+    let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
+    let command_id = new_id("cmd").map_err(|e| StoreError::Id(e.to_string()))?;
+    let now = now_rfc3339();
+    let successor_generation = lineage.generation + 1;
+    // Compare-and-set on (generation, current chapter): a racing resume that
+    // observed the same lineage state matches zero rows.
+    let cas = tx.execute(
+        "UPDATE lineages
+            SET current_instance_id = ?1, generation = ?2, state = 'starting',
+                updated_at = ?3
+          WHERE lineage_id = ?4 AND generation = ?5 AND current_instance_id = ?6",
+        params![
+            successor_id,
+            successor_generation,
+            now,
+            lineage_id,
+            request.expected_generation,
+            current_id,
+        ],
+    )?;
+    if cas == 0 {
+        // The generation CAS lost; roll the (empty) transaction back and
+        // present the winner's current chapter as an idempotent replay.
+        drop(tx);
+        let lineage = load_lineage(conn, &lineage_id)?
+            .ok_or_else(|| StoreError::Id("lineage vanished after lost CAS".into()))?;
+        let current = load_instance(conn, &lineage.current_instance_id)?
+            .ok_or_else(|| StoreError::Id("current chapter vanished after lost CAS".into()))?;
+        return Ok(ContinuationResumeResult::Superseded {
+            current: Box::new(current),
+        });
+    }
+    // 1. Fence the predecessor chapter.
+    tx.execute(
+        "UPDATE instances SET fenced_at = ?1, updated_at = ?2 WHERE id = ?3",
+        params![now, now, current_id],
+    )?;
+    // 2. Delete every device row bound to the predecessor: its launch
+    //    credential and any MCP token minted for it.
+    tx.execute("DELETE FROM devices WHERE instance_id = ?1", [&current_id])?;
+    let current = load_instance(&tx, &current_id)?
+        .ok_or_else(|| StoreError::Id("current chapter missing".into()))?;
+    let host =
+        load_host(&tx, &request.host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
+    let connectivity = if host.online {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    // 4. Successor: continuation edge, delegation and restart copied.
+    let scope_json = serde_json::to_string(&current.scope)?;
+    let grants_json = serde_json::to_string(&current.grants)?;
+    let restart_json = current
+        .restart
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let successor_delegation = InstanceDelegation {
+        role: current.role.clone(),
+        scope: current.scope.clone(),
+        grants: current.grants.clone(),
+        task_id: current.task_id.clone(),
+        enforce_tree: false,
+        restart: current
+            .restart
+            .clone()
+            .and_then(|value| serde_json::from_value(value).ok()),
+    };
+    // The predecessor is fenced inside this same transaction, so the copied
+    // seat grants do not collide with it.
+    enforce_grant_uniqueness(&tx, &successor_delegation)?;
+    tx.execute(
+        "INSERT INTO instances
+            (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
+             title, journal_id, durable_seq, spec_json, created_at, updated_at,
+             role, scope_json, grants_json, task_id,
+             lineage_id, generation, chapter_cause, fenced_at, restart_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
+                 ?7, ?8, 0, ?9, ?10, ?10,
+                 ?11, ?12, ?13, ?14,
+                 ?15, ?16, 'owner-resume', NULL, ?17)",
+        params![
+            successor_id,
+            current.host_id,
+            current.workspace_id,
+            current.kind,
+            current.driver,
+            connectivity,
+            request.title,
+            journal_id,
+            request.spec.to_string(),
+            now,
+            current.role,
+            scope_json,
+            grants_json,
+            current.task_id,
+            lineage_id,
+            successor_generation,
+            restart_json,
+        ],
+    )?;
+    // 5. Queue the successor's resume create (forwarded after commit).
+    let initial_input = request
+        .prompt
+        .as_ref()
+        .map(|text| json!({ "type": "prompt", "text": text }));
+    let payload = json!({
+        "origin": request.origin,
+        "instanceId": successor_id,
+        "spec": request.spec,
+        "initialInput": initial_input,
+    });
+    tx.execute(
+        "INSERT INTO commands
+            (id, instance_id, host_id, operation, state, resolution, forwarded,
+             payload_json, idempotency_key, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, NULL, ?6, ?6)",
+        params![
+            command_id,
+            successor_id,
+            current.host_id,
+            request.operation,
+            payload.to_string(),
+            now
+        ],
+    )?;
+    let fenced = load_instance(&tx, &current_id)?
+        .ok_or_else(|| StoreError::Id("fenced chapter missing".into()))?;
+    let successor = load_instance(&tx, &successor_id)?
+        .ok_or_else(|| StoreError::Id("successor insert missing".into()))?;
+    let command = load_command(&tx, &command_id)?
+        .ok_or_else(|| StoreError::Id("successor command missing".into()))?;
+    tx.commit()?;
+    Ok(ContinuationResumeResult::Resumed(Box::new(
+        ContinuationResumed {
+            lineage_id,
+            fenced: Box::new(fenced),
+            successor,
+            command,
+        },
+    )))
 }
 
 impl InstanceRecord {
@@ -3204,14 +3669,20 @@ impl Store {
             };
             let scope_json = serde_json::to_string(&delegation.scope)?;
             let grants_json = serde_json::to_string(&delegation.grants)?;
+            let restart_json = match &delegation.restart {
+                Some(policy) => Some(serde_json::to_string(policy)?),
+                None => None,
+            };
             conn.execute(
                 "INSERT INTO instances
                     (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                      title, journal_id, durable_seq, spec_json, created_at, updated_at,
-                     role, scope_json, grants_json, task_id)
+                     role, scope_json, grants_json, task_id,
+                     lineage_id, generation, chapter_cause, fenced_at, restart_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
                          ?7, ?8, 0, ?9, ?10, ?10,
-                         ?11, ?12, ?13, ?14)",
+                         ?11, ?12, ?13, ?14,
+                         ?1, 1, NULL, NULL, ?15)",
                 params![
                     instance_id,
                     host_id,
@@ -3227,8 +3698,27 @@ impl Store {
                     scope_json,
                     grants_json,
                     delegation.task_id,
+                    restart_json,
                 ],
             )?;
+            // D-057 §5: a lineage row exists for every continuity instance —
+            // one that holds any grant or carries a restart policy. Plain
+            // instances need none.
+            let continuity = !delegation.grants.is_empty() || delegation.restart.is_some();
+            if continuity {
+                let origin = spec.get("origin").cloned().unwrap_or(json!("agent"));
+                let origin_spec_ref = serde_json::to_string(&json!({
+                    "origin": origin,
+                    "spec": spec,
+                }))?;
+                conn.execute(
+                    "INSERT INTO lineages
+                        (lineage_id, current_instance_id, generation, state,
+                         paused_by_json, paused_at, restart_json, origin_spec_ref, updated_at)
+                     VALUES (?1, ?1, 1, 'starting', NULL, NULL, ?2, ?3, ?4)",
+                    params![instance_id, restart_json, origin_spec_ref, now],
+                )?;
+            }
             load_instance(conn, &instance_id)?
                 .ok_or_else(|| StoreError::Id("instance insert missing".into()))
         })
@@ -3368,6 +3858,104 @@ impl Store {
         instance_id: String,
     ) -> Result<Option<InstanceRecord>, StoreError> {
         self.run_named("get_instance", move |conn| {
+            load_instance(conn, &instance_id)
+        })
+        .await
+    }
+
+    /// D-057 §5: lineage row for `lineage_id`, if the instance is a continuity
+    /// lineage. Plain instances have no row.
+    pub async fn get_lineage(
+        &self,
+        lineage_id: String,
+    ) -> Result<Option<LineageRecord>, StoreError> {
+        self.read("get_lineage", move |conn| load_lineage(conn, &lineage_id))
+            .await
+    }
+
+    /// Chapters of a lineage in generation order, for `GET /v1/lineages/{id}`.
+    pub async fn list_lineage_chapters(
+        &self,
+        lineage_id: String,
+    ) -> Result<Vec<LineageChapter>, StoreError> {
+        self.read("list_lineage_chapters", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, generation, chapter_cause, created_at, updated_at,
+                        lifecycle, fenced_at
+                 FROM instances
+                 WHERE COALESCE(lineage_id, id) = ?1
+                 ORDER BY generation ASC, created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![lineage_id], |row| {
+                    let lifecycle: String = row.get(5)?;
+                    let ended = matches!(lifecycle.as_str(), "exited" | "failed" | "closed");
+                    Ok(LineageChapter {
+                        instance_id: row.get(0)?,
+                        generation: row.get(1)?,
+                        chapter_cause: row.get(2)?,
+                        created_at: row.get(3)?,
+                        ended_at: if ended { Some(row.get(4)?) } else { None },
+                        fenced_at: row.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// D-057 §5: async edge used by `owns()`, the D-051 route and the
+    /// `GET /v1/lineages/{id}` read predicate. See [`lineage_owns_conn`].
+    pub async fn lineage_owns(
+        &self,
+        caller_instance_id: String,
+        target_instance_id: String,
+    ) -> Result<bool, StoreError> {
+        self.read("lineage_owns", move |conn| {
+            lineage_owns_conn(conn, &caller_instance_id, &target_instance_id)
+        })
+        .await
+    }
+
+    /// Stamped lineage id of an instance (its own id for a plain instance).
+    pub async fn lineage_id_for_instance(
+        &self,
+        instance_id: String,
+    ) -> Result<Option<String>, StoreError> {
+        self.read("lineage_id_for_instance", move |conn| {
+            lineage_id_of(conn, &instance_id)
+        })
+        .await
+    }
+
+    /// D-057 §5/§7.2 (ma-lineage): continuation resume in ONE writer
+    /// transaction, with a compare-and-set on the lineage generation.
+    ///
+    /// Fences the lineage's current chapter, deletes every device row bound
+    /// to it, bumps the generation, and inserts the successor chapter with the
+    /// copied delegation plus its queued resume-create command. A
+    /// continuation edge is not a delegation edge: the successor's parent is
+    /// its predecessor's parent. `ma-fence` replaces this with the full
+    /// `fence_lineage` transaction.
+    pub async fn continuation_resume(
+        &self,
+        request: ContinuationResumeRequest,
+    ) -> Result<ContinuationResumeResult, StoreError> {
+        self.run_named("continuation_resume", move |conn| {
+            continuation_resume_tx(conn, request)
+        })
+        .await
+    }
+
+    /// Read-only point load of one instance on the reader pool, for handlers
+    /// that must keep observing committed state while a writer transaction is
+    /// held open by a test hook.
+    pub async fn get_instance_read(
+        &self,
+        instance_id: String,
+    ) -> Result<Option<InstanceRecord>, StoreError> {
+        self.read("get_instance_read", move |conn| {
             load_instance(conn, &instance_id)
         })
         .await
@@ -5146,6 +5734,39 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "instances",
         "configure_seq",
         "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // D-057 (ma-lineage): every instance belongs to a lineage (its own id by
+    // default); a continuity lineage's chapters carry a generation and cause.
+    // `fenced_at` marks a chapter whose authority moved to its successor, and
+    // `restart_json` is the C1 restart policy set at create time.
+    ensure_column(&conn, "instances", "lineage_id", "TEXT")?;
+    ensure_column(
+        &conn,
+        "instances",
+        "generation",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(&conn, "instances", "chapter_cause", "TEXT")?;
+    ensure_column(&conn, "instances", "fenced_at", "TEXT")?;
+    ensure_column(&conn, "instances", "restart_json", "TEXT")?;
+    // Rows written before the column existed are each their own lineage.
+    conn.execute(
+        "UPDATE instances SET lineage_id = id WHERE lineage_id IS NULL",
+        [],
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS lineages (
+            lineage_id TEXT PRIMARY KEY,
+            current_instance_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            paused_by_json TEXT,
+            paused_at TEXT,
+            restart_json TEXT,
+            origin_spec_ref TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS lineages_current ON lineages(current_instance_id);",
     )?;
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
     ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
@@ -8124,7 +8745,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
                 mode, promoted_at, launched_by,
-                role, scope_json, grants_json, task_id, api_route_json, configure_seq
+                role, scope_json, grants_json, task_id, api_route_json, configure_seq,
+                lineage_id, generation, chapter_cause, fenced_at, restart_json
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -8313,6 +8935,16 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 grants,
                 task_id,
                 usage_rollup,
+                lineage_id: {
+                    let stamped: Option<String> = row.get(24)?;
+                    stamped.unwrap_or_else(|| row.get::<_, String>(0).unwrap_or_default())
+                },
+                generation: row.get(25)?,
+                chapter_cause: row.get(26)?,
+                fenced_at: row.get(27)?,
+                restart: row
+                    .get::<_, Option<String>>(28)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
             })
         },
     )

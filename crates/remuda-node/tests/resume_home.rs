@@ -501,10 +501,20 @@ async fn resume_uses_the_recorded_transcript_path_even_outside_the_native_home()
     // The promoted hook evidence: transcript now lives at an arbitrary
     // external location. Delete the home copy so a home-derived guess cannot
     // succeed — only the recorded path can.
-    let external = root.join("elsewhere/promoted-conversation.jsonl");
-    std::fs::create_dir_all(external.parent().unwrap()).expect("external dir");
+    let external_dir = root.join("elsewhere");
+    let external = external_dir.join("promoted-conversation.jsonl");
+    std::fs::create_dir_all(&external_dir).expect("external dir");
     std::fs::copy(&original, &external).expect("stage external copy");
     std::fs::remove_file(&original).expect("remove the home copy");
+    // Review item 3: the renamed transcript's sidecars keep the native session
+    // id and live at <dir>/<S>/, not under the file stem. They must still be
+    // staged into the child home.
+    std::fs::create_dir_all(external_dir.join(&session).join("subagents")).expect("sidecar dir");
+    std::fs::write(
+        external_dir.join(&session).join("subagents/side.jsonl"),
+        b"{\"side\":true}\n",
+    )
+    .expect("sidecar");
     store
         .set_native_session(&parent_id, &session, Some(external.to_str().unwrap()), None)
         .expect("record external transcript path");
@@ -526,6 +536,15 @@ async fn resume_uses_the_recorded_transcript_path_even_outside_the_native_home()
     assert!(
         staged.is_file(),
         "the external recorded transcript was staged into the child home"
+    );
+    assert!(
+        staged
+            .parent()
+            .unwrap()
+            .join(&session)
+            .join("subagents/side.jsonl")
+            .is_file(),
+        "the renamed transcript's <dir>/<S>/ sidecars are staged by session id"
     );
 }
 

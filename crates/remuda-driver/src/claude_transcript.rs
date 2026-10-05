@@ -590,35 +590,31 @@ pub fn stage_for_resume(
         std::fs::copy(source_transcript, &dest_transcript)?;
     }
 
-    // Sidecars are siblings of the transcript in the source project dir. The
-    // per-session dir keeps the source file's stem (the session id in any
-    // well-formed layout); `memory/` is project-global.
+    // Sidecars are siblings of the transcript in the source project dir;
+    // `memory/` is project-global. The per-session directory is keyed by the
+    // native session id: a promoted/renamed transcript can carry a different
+    // file name while its `<S>/` sidecar dir keeps the native id (review item
+    // 3), so `<dir>/<S>/` is looked up FIRST and the file stem is only a
+    // fallback for older promoted layouts.
     let source_dir = source_transcript.parent().unwrap_or_else(|| Path::new("/"));
-    let session_stem = Path::new(source_name)
-        .file_stem()
-        .map(|stem| stem.to_os_string());
     let mut sidecar_dirs = Vec::new();
-    // (name in the source project dir, name in the destination project dir).
-    // The per-session sidecar dir is keyed by session id: it lands under the
-    // resumed id even if the source transcript carried a different file name.
-    let mut sidecars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
-        vec![("memory".into(), "memory".into())];
-    if let Some(stem) = session_stem {
-        sidecars.insert(0, (stem, session_id.into()));
+    let mut per_session_sources: Vec<std::ffi::OsString> = vec![session_id.into()];
+    if let Some(stem) = Path::new(source_name)
+        .file_stem()
+        .map(std::ffi::OsStr::to_os_string)
+        .filter(|stem| stem != session_id)
+    {
+        per_session_sources.push(stem);
     }
-    for (source_name, dest_name) in sidecars {
-        let source_side = source_dir.join(&source_name);
-        // `symlink_metadata`, not `is_dir`: a sidecar root that is itself a
-        // symlink to a directory must not be read through — that directory can
-        // live in the predecessor's home or anywhere else.
+    for source_side_name in per_session_sources {
+        let source_side = source_dir.join(&source_side_name);
         match std::fs::symlink_metadata(&source_side) {
             Ok(metadata) if metadata.is_dir() => {
-                let dest_side = dest_dir.join(&dest_name);
-                // Every staged path must stay inside the project dir (the dest
-                // names are validated tokens; this is the belt-and-braces check).
+                let dest_side = dest_dir.join(session_id);
                 ensure_within(&dest_dir, &dest_side)?;
                 copy_dir_merge(source_dir, &source_side, &dest_side)?;
                 sidecar_dirs.push(dest_side);
+                break;
             }
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(invalid_input(format!(
@@ -626,8 +622,24 @@ pub fn stage_for_resume(
                     source_side.display()
                 )));
             }
-            _ => {}
+            _ => continue,
         }
+    }
+    let memory_side = source_dir.join("memory");
+    if let Ok(metadata) = std::fs::symlink_metadata(&memory_side)
+        && metadata.is_dir()
+    {
+        let dest_side = dest_dir.join("memory");
+        ensure_within(&dest_dir, &dest_side)?;
+        copy_dir_merge(source_dir, &memory_side, &dest_side)?;
+        sidecar_dirs.push(dest_side);
+    } else if let Ok(metadata) = std::fs::symlink_metadata(&memory_side)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(invalid_input(format!(
+            "resume sidecar {} is a symlink, not a real directory",
+            memory_side.display()
+        )));
     }
 
     Ok(StagedResume {
@@ -1396,6 +1408,48 @@ mod tests {
         assert!(bind_manual(&home, &cwd, "../escape").is_none());
         assert!(bind_by_session_id(&home, &cwd, "a/b").is_none());
         assert!(bind_manual(&home, &cwd, ".").is_none());
+    }
+
+    #[test]
+    fn resume_staging_renamed_transcript_finds_sidecars_by_session_id_first() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000af";
+        // A promoted/renamed transcript, outside any managed home and carrying a
+        // file name that is NOT the session id.
+        let external_dir = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&external_dir).expect("external dir");
+        let source = external_dir.join("promoted-conversation.jsonl");
+        write_file(&source, "{}\n");
+        // The real sidecars keep the native session id; a stale stem-named dir
+        // also exists and must NOT be the one staged.
+        write_file(
+            &external_dir.join(session).join("subagents/real-side.jsonl"),
+            "{\"side\":\"real\"}\n",
+        );
+        write_file(
+            &external_dir
+                .join("promoted-conversation")
+                .join("stale-side.jsonl"),
+            "{\"side\":\"stale\"}\n",
+        );
+
+        let new_home = tmp.path().join("new-home");
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
+
+        let dest_project = staged.transcript.parent().unwrap();
+        assert!(
+            dest_project
+                .join(session)
+                .join("subagents/real-side.jsonl")
+                .is_file(),
+            "sidecars under <dir>/<S>/ are staged for a renamed transcript"
+        );
+        assert!(
+            !dest_project.join(session).join("stale-side.jsonl").exists(),
+            "the file-stem dir is only a fallback when no <S>/ dir exists"
+        );
     }
 
     #[cfg(unix)]

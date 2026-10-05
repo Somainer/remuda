@@ -99,7 +99,7 @@ Reading it:
 - **seq 33 → 62** — the turn opens on `UserPromptSubmit` and closes on `Stop`.
   Turn state comes from the harness saying so, not from a screen guess.
 - **seq 35 / 44** — two `StopFailure`s: the host's configured default model
-  (`passthrough/ark/seed-evolving`) is not available to this account, and the
+  (`passthrough/ark/model-y`) is not available to this account, and the
   transcript says so in as many words. **The mapping handled it correctly** —
   `StopFailure` ends the turn (the composer comes back) and stays below
   `Severity::Error`, so the instance is not folded to `failed` for what is a

@@ -284,7 +284,7 @@ async fn observe_one(
     // model-pin-1 §5: populated when the id actually observed answering
     // differs from the one this worker was dispatched with IN THE PIN'S OWN
     // VOCABULARY. A gateway resolving the pin to an upstream vendor name
-    // (`model_hub/…o50[1m]` → `claude-opus-5`) is a normal launch and is
+    // (`acme_hub/…o50[1m]` → `claude-opus-5`) is a normal launch and is
     // deliberately not recorded here. The pair is shown honestly on the row;
     // it never blocks the worker (owner ruling 2026-09-23).
     let mut model_effective: Option<String> = None;
@@ -1702,11 +1702,11 @@ mod tests {
     #[test]
     fn verdict_accepts_a_resolved_alias() {
         let lines = vec![
-            "Set model to `model_hub/es1_orange_o48[1m]` and saved as your default for new sessions"
+            "Set model to `acme_hub/model_x_o48[1m]` and saved as your default for new sessions"
                 .to_owned(),
         ];
-        match read_model_verdict(&lines, "model_hub/es1_orange_o48[1m]") {
-            Some(ModelVerdict::Accepted(id)) => assert_eq!(id, "model_hub/es1_orange_o48[1m]"),
+        match read_model_verdict(&lines, "acme_hub/model_x_o48[1m]") {
+            Some(ModelVerdict::Accepted(id)) => assert_eq!(id, "acme_hub/model_x_o48[1m]"),
             other => panic!("expected accepted verdict, got {other:?}"),
         }
     }

@@ -512,6 +512,25 @@ test.describe("round-3 redesign", () => {
     expect(await rawDelimiterLeak(page)).toBeNull();
   });
 
+  test("a blank-line-rejected \\[ keeps later paragraphs rendering (c-mathfu 1)", async ({
+    page,
+  }) => {
+    const prompt = ["cf1 被拒绝：\\[ x", "", "**bold** 段落", "", "\\] 结束"].join("\n");
+    await createReadySession(page, prompt, false, { display: 0, inline: 0, error: 0 });
+
+    const row = assistantRow(page);
+    // The rejected opener is visible EXACT source, not swallowed into a tail
+    // (wait for the echo row to arrive on a loaded gate box).
+    await expect(row.getByText(/\\\[/)).toBeVisible({ timeout: 30_000 });
+    // Later markdown kept rendering: bold, and the closer line as prose.
+    const strong = row.locator("strong");
+    await expect(strong).toHaveCount(1);
+    expect(await strong.textContent()).toBe("bold");
+    await expect(row.getByText(/结束/)).toBeVisible();
+    // No streaming literal tail (the opener did not reach EOF).
+    await expect(page.getByTestId("math-literal")).toHaveCount(0);
+  });
+
   test("wide INLINE math scrolls inside its box without widening the transcript (round-4 fix 4)", async ({
     page,
   }) => {

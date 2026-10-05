@@ -339,7 +339,7 @@ impl Ctx {
         let _ = range;
         // The two model-pin watch cases are dispatched with an explicit pin.
         let model = match name {
-            "c-modelx" | "c-modelok" | "c-modelswitch" => Some("model_hub/es1_orange_o50[1m]"),
+            "c-modelx" | "c-modelok" | "c-modelswitch" => Some("acme_hub/model_x_o50[1m]"),
             _ => None,
         };
         let body = json!({
@@ -779,7 +779,7 @@ async fn a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids
     // The dispatch pin was o50; the read-back says o48 answered.
     ctx.node.append_journal(
         &instance_id,
-        &[model_edge_event("model_hub/es1_orange_o48[1m]", "launch")],
+        &[model_edge_event("acme_hub/model_x_o48[1m]", "launch")],
     );
 
     // observe() drives a node RPC (tty.screen), which is what flushes the fake
@@ -794,11 +794,11 @@ async fn a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids
     // The status detail honestly records both ids, verbatim.
     let detail = row["watch"]["detail"].as_str().unwrap_or("");
     assert!(
-        detail.contains("model_hub/es1_orange_o50[1m]"),
+        detail.contains("acme_hub/model_x_o50[1m]"),
         "detail must name the requested id: {detail}"
     );
     assert!(
-        detail.contains("model_hub/es1_orange_o48[1m]"),
+        detail.contains("acme_hub/model_x_o48[1m]"),
         "detail must name the observed id: {detail}"
     );
     assert!(
@@ -806,7 +806,7 @@ async fn a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids
         "the detail is a fact, not a refusal: {detail}"
     );
     // The effective id is carried on the roster row for display.
-    assert_eq!(row["modelEffective"], "model_hub/es1_orange_o48[1m]");
+    assert_eq!(row["modelEffective"], "acme_hub/model_x_o48[1m]");
 
     // And it stays working on later passes — the recording is not sticky state.
     let observed = ctx.observe().await;
@@ -817,10 +817,8 @@ async fn a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids
     // A later human `/model` switch supersedes the launch read-back: the stale
     // launch pair must leave the roster row, or `remuda watch` would show it
     // forever even though the operator intentionally changed the model.
-    ctx.node.append_journal(
-        &instance_id,
-        &[model_edge_event("ark/seed-evolving", "slash")],
-    );
+    ctx.node
+        .append_journal(&instance_id, &[model_edge_event("ark/model-y", "slash")]);
     // Two asserting passes: the clear, like the divergence, must persist.
     for _ in 0..2 {
         let observed = ctx.observe().await;
@@ -852,18 +850,18 @@ async fn an_unknown_source_readback_clears_a_stale_launch_divergence() {
     // Launch divergence is recorded first.
     ctx.node.append_journal(
         &instance_id,
-        &[model_edge_event("model_hub/es1_orange_o48[1m]", "launch")],
+        &[model_edge_event("acme_hub/model_x_o48[1m]", "launch")],
     );
     let observed = ctx.observe().await;
     assert_eq!(
         observed["items"][0]["modelEffective"],
-        "model_hub/es1_orange_o48[1m]"
+        "acme_hub/model_x_o48[1m]"
     );
 
     // A later assistant record reports a third id with no attributable command.
     ctx.node.append_journal(
         &instance_id,
-        &[model_edge_event("model_hub/es1_orange_o47", "unknown")],
+        &[model_edge_event("acme_hub/model_x_o47", "unknown")],
     );
     for _ in 0..2 {
         let observed = ctx.observe().await;
@@ -898,7 +896,7 @@ async fn a_mid_session_model_switch_after_an_honoured_launch_never_blocks() {
         // Launch read-back honours the dispatch pin.
         ctx.node.append_journal(
             &instance_id,
-            &[model_edge_event("model_hub/es1_orange_o50[1m]", "launch")],
+            &[model_edge_event("acme_hub/model_x_o50[1m]", "launch")],
         );
         let observed = ctx.observe().await;
         assert_eq!(
@@ -909,7 +907,7 @@ async fn a_mid_session_model_switch_after_an_honoured_launch_never_blocks() {
         // The operator (slash) or the Hub (configure) then changes the model.
         ctx.node.append_journal(
             &instance_id,
-            &[model_edge_event("model_hub/es1_orange_o48[1m]", source)],
+            &[model_edge_event("acme_hub/model_x_o48[1m]", source)],
         );
         // One pass to flush the switch frame through the node RPC and commit
         // its projection; the watch loop runs continuously in production, so a
@@ -1138,12 +1136,12 @@ async fn switch_model_confirms_only_when_dialog_shown() {
         .request(
             "POST",
             "/v1/workers/c-switch/switch-model",
-            Some(json!({ "model": "model_hub/alt[1m]" })),
+            Some(json!({ "model": "acme_hub/alt[1m]" })),
         )
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["confirmed"], true);
-    assert_eq!(body["worker"]["model"], "model_hub/alt[1m]");
+    assert_eq!(body["worker"]["model"], "acme_hub/alt[1m]");
     let writes = ctx.node.payloads("tty.write");
     // esc ×2, "/model alt" + CR, confirming Enter.
     assert_eq!(writes.len(), 4, "{writes:?}");
@@ -1153,18 +1151,17 @@ async fn switch_model_confirms_only_when_dialog_shown() {
     // left unchanged (3 writes: esc, esc, "/model …").
     let project2 = project_with_enrolled_workspace(&ctx, "watch-switch2", "58840-58869").await;
     ctx.dispatch(&project2, "c-switch2", "58840-58869").await;
-    ctx.node
-        .set_screen(&["> /model model_hub/alt[1m]"], "ready");
+    ctx.node.set_screen(&["> /model acme_hub/alt[1m]"], "ready");
     let (status, body) = ctx
         .request(
             "POST",
             "/v1/workers/c-switch2/switch-model",
-            Some(json!({ "model": "model_hub/alt[1m]" })),
+            Some(json!({ "model": "acme_hub/alt[1m]" })),
         )
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["confirmed"], false);
-    assert_ne!(body["worker"]["model"], "model_hub/alt[1m]");
+    assert_ne!(body["worker"]["model"], "acme_hub/alt[1m]");
 }
 
 #[tokio::test]

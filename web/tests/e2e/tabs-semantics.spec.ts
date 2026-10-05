@@ -86,7 +86,7 @@ test.describe("desktop", () => {
     const strip = page.getByTestId("space-tabs");
     // UO-2a: list routes carry the Space index and no tab strip; the strip is
     // the session page's own chrome.
-    await space(page, "sfe-root").click();
+    await space(page, "demo-root").click();
     await expect(strip).toHaveCount(0);
     await page.getByTestId("session-row").first().click();
     await expect(page).toHaveURL(/\/s\//);
@@ -108,7 +108,7 @@ test.describe("desktop", () => {
     // /sessions index (which has no open session to mark).
     await expect(active).toHaveAttribute("data-active", "true");
     await toList(page);
-    await expect(space(page, "sfe-root")).toHaveAttribute("aria-pressed", "true");
+    await expect(space(page, "demo-root")).toHaveAttribute("aria-pressed", "true");
     await expect(panel.getByTestId("space-session").and(page.locator('[data-active="true"]'))).toHaveCount(0);
     await page.goBack();
     await expect(page).toHaveURL(/\/s\//);
@@ -177,7 +177,7 @@ test.describe("desktop", () => {
     const strip = page.getByTestId("space-tabs");
     // UO-2a: the strip only exists on /s/*. Enter via the list so the Vite dev
     // server has served the whole route graph before the strip is queried.
-    await space(page, "sfe-root").click();
+    await space(page, "demo-root").click();
     await page.getByTestId("session-row").first().click();
     await expect(page).toHaveURL(/\/s\//);
     await expect(strip).toBeVisible();
@@ -221,7 +221,7 @@ test.describe("desktop", () => {
     }));
 
     let g = await geometry();
-    expect(g.overflow, "the sfe-root strip overflows at 1440px").toBe(true);
+    expect(g.overflow, "the demo-root strip overflows at 1440px").toBe(true);
 
     // Pan the content fully to the trailing edge; the start cue must stay
     // pinned to the visible left edge, not ride along with the scrolled

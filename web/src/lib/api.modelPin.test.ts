@@ -35,8 +35,8 @@ describe("mapInstance modelPinMismatches", () => {
     const rec = wireRecord({
       modelPinMismatches: [
         {
-          requested: "model_hub/es1_orange_o50[1m]",
-          observed: "model_hub/es1_orange_o48[1m]",
+          requested: "acme_hub/model_x_o50[1m]",
+          observed: "acme_hub/model_x_o48[1m]",
           observedAt: "2026-09-24T00:00:00.000Z",
         },
       ],
@@ -44,8 +44,8 @@ describe("mapInstance modelPinMismatches", () => {
     const mapped = mapInstance(rec);
     expect(mapped.modelPinMismatches).toEqual([
       {
-        requested: "model_hub/es1_orange_o50[1m]",
-        observed: "model_hub/es1_orange_o48[1m]",
+        requested: "acme_hub/model_x_o50[1m]",
+        observed: "acme_hub/model_x_o48[1m]",
         observedAt: "2026-09-24T00:00:00.000Z",
       },
     ]);

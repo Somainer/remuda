@@ -235,10 +235,10 @@ Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mob
 **页面骨架（D-053）**：侧栏之后，内容区在 ≥1024 时左边挂 SpacesPanel 索引列（§1.4），右侧是页头 + 工具行 + 列表。页头为面包屑「会话 / {Space}」，右侧放「新建」主按钮。工具行高 48px：搜索框 `session-search`（高 36px，最宽 480px）、范围 `.seg`、「筛选」按钮、右侧计数（12px `--fg-muted`）。
 
 ```
-┌ 侧栏 ─┬ SpacesPanel ─┬─ 会话 / sfe-root                         ［＋ 新建］ ┐
+┌ 侧栏 ─┬ SpacesPanel ─┬─ 会话 / demo-root                         ［＋ 新建］ ┐
 │        │ （索引列）    │  [搜索标题/cwd/原生 id        ] [全部▾] [筛选]  12 条 │
-│ 会话 ● │ ▾ sfe-root   │──────────────────────────────────────────────────┤
-│ 收件箱  │   bolt      │  ● 标题………………  下一步……  host/工作区·分支   时间  ⋯ │
+│ 会话 ● │ ▾ demo-root   │──────────────────────────────────────────────────┤
+│ 收件箱  │   devbox      │  ● 标题………………  下一步……  host/工作区·分支   时间  ⋯ │
 │ 看板   │   forge     │  ○ …                                                    │
 │ 项目…  │ ▸ 已退出 2  │                                                        │
 └────────┴─────────────┴──────────────────────────────────────────────────┘
@@ -310,7 +310,7 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 ### 2.2 会话页 · 结构化视图 `/s/:instanceId`
 
 ```
-│ 页头 48：sfe-root / 修复滚动 · 会话标题  ● 等待 · bolt · $0.12        [终端|结构] 文件 ■ ⋯ │
+│ 页头 48：demo-root / 修复滚动 · 会话标题  ● 等待 · devbox · $0.12        [终端|结构] 文件 ■ ⋯ │
 │ tab 36（仅 /s/*）：本任务的会话 或 本空间的会话                                   +  │
 │            ┌──── 阅读列 720（页边距 32）────┐        文件右栏 300（≥1280 并排）        │
 │            │ You                                      12:01  │                        │
@@ -603,10 +603,10 @@ Bot / `claude-print` 实例没有终端 tab。Artifact 产物页走订阅登录�
 ┌ 新建会话                                      ✕ ┐
 │ 提示词（第一焦点）                               │
 │ ┌────────────────────────────────────────────┐  │
-│ │ 查 bolt TaskManager spill…                 │  │
+│ │ 查 devbox TaskManager spill…                 │  │
 │ └────────────────────────────────────────────┘  │
 │ 主机   [devbox ▾]     在线 · claude 2.1.268 │
-│ 项目   [sfe-root      ▾]   /home/…/sfe-root      │
+│ 项目   [demo-root      ▾]   /home/…/demo-root      │
 │        （Workspace）         新 worktree □       │
 │ 运行时 [Claude ●] [Codex] [Grok] [agy] [Terminal]│
 │ 模型   [passthrough/auto_model/… ▾]              │
@@ -650,9 +650,9 @@ Bot / `claude-print` 实例没有终端 tab。Artifact 产物页走订阅登录�
 ┌ 收件箱                              待处理 4 ┐      ┌ 收件箱 52              [3] ┐
 │ [全部|审批|提问|计划]（.seg, radiogroup） 主机/Workspace ▾ │      │ [全部|审批|提问]（全宽 .seg）     │
 │                                                 │      │ （推送横幅，一行 44）             │
-│ ● 12:04  bolt / sfe-root / claude        来源…    │      │ ● 审批卡（左右 16px，两档）…       │
+│ ● 12:04  devbox / demo-root / claude        来源…    │      │ ● 审批卡（左右 16px，两档）…       │
 │   Bash  rm -rf /tmp/coord-media   （原文 <pre>）    │      └─────────────────────────────┘
-│   来源 harness · 截止 12:13 · 位置 sfe-root          │
+│   来源 harness · 截止 12:13 · 位置 demo-root          │
 │   [允许一次]  [拒绝]                                │
 └─────────────────────────────────────────────────┘
 ```
@@ -797,7 +797,7 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
 │ 绑定                                                        │
 │  通道 [飞书]  profile [lark-cli oncall-helper]               │
 │  owner_open_ids  [ou_…]   chat_allowlist  [oc_…]            │
-│  默认主机 [bolt] 默认项目 [sfe-root] 默认 driver print      │
+│  默认主机 [devbox] 默认项目 [demo-root] 默认 driver print      │
 │  TTL 4h   群策略 仅 @bot                                     │
 │  最近投递  12:04  甘露寺  → 实例 abc  accepted               │
 └─────────────────────────────────────────────────────────────┘

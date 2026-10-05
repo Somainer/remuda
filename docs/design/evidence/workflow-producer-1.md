@@ -1,7 +1,7 @@
 # Workflow run producer 1 — real run drives the timeline card
 
 - 日期：2026-09-15
-- harness：本机 `claude` **2.1.221**（`claude -p --dangerously-skip-permissions`，模型 `model_hub/es1_orange_o48[1m]`）
+- harness：本机 `claude` **2.1.221**（`claude -p --dangerously-skip-permissions`，模型 `acme_hub/model_x_o48[1m]`）
 - 范围：`crates/remuda-journal/src/workflow/`（脚本解析 + 运行折叠器）、`crates/remuda-node/src/workflow_producer.rs`（Node 活线接入）、`crates/remuda-signal/src/map.rs`（已存在的字段精选）+ `SubagentStart` 注册、`crates/remuda-driver/src/launch/overlay.rs`
 - 前序证据：[workflow-progress-signals-1](workflow-progress-signals-1.md)（信号实测）、[workbench-w-workflow-card-1](workbench-w-workflow-card-1.md)（卡片）
 

@@ -9,7 +9,7 @@
 //! Discipline mirrors `remuda-driver`'s price table: static data with an
 //! explicit [`CATALOG_REVISION`] and a [`CapabilityStatus`] provenance mark.
 //! Gateway models the table cannot know (`<gateway-model-A>[1m]`, family
-//! `es1`) fall back to the per-profile declared `family`/`role` fields; an
+//! `model_x`) fall back to the per-profile declared `family`/`role` fields; an
 //! unknown id is not an admission error on its own.
 
 use remuda_driver::usage::prices::{self, PriceStatus};
@@ -350,16 +350,16 @@ mod tests {
         );
         assert_eq!(lookup("gpt-5-nano").unwrap().class, ModelClass::Cheap);
         assert_eq!(lookup("grok-fast").unwrap().class, ModelClass::Workhorse);
-        assert!(lookup("passthrough/ark/es1_orange_o50[1m]").is_none());
+        assert!(lookup("passthrough/ark/model_x_o50[1m]").is_none());
     }
 
     #[test]
     fn declared_role_fills_unknown_gateway_models() {
         assert_eq!(
-            class_of("gw/seed-evolving[1m]", Some("workhorse")),
+            class_of("gw/model-y[1m]", Some("workhorse")),
             Some(ModelClass::Workhorse)
         );
-        assert_eq!(class_of("gw/seed-evolving[1m]", None), None);
+        assert_eq!(class_of("gw/model-y[1m]", None), None);
         // The catalog always wins over a mis-declared role.
         assert_eq!(
             class_of("claude-opus-5", Some("cheap")),

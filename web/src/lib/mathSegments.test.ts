@@ -25,10 +25,12 @@ describe("prepareMath: accepted math is passed through", () => {
     expect(M("- \\[\n  x^2\n  \\]")).toBe("- $$\n  x^2\n  $$");
   });
 
-  it("never pairs display brackets across a blank line; the opener starts the tail", () => {
+  it("never pairs display brackets across a blank line; only the opener stays literal", () => {
+    // Rejected BEFORE EOF: the opener is emitted as an exact literal and the
+    // rest of the message keeps rendering (no literal tail).
     const src = "\\[\n\nx\n\\]";
-    expect(T(src)).toBe(src);
-    expect(M(src)).toBe("");
+    expect(T(src)).toBeNull();
+    expect(M(src)).toBe("\\\\\\[\n\nx\n\\]");
   });
 
   it("keeps inline \\( … \\) single-line even with a closer later (round-4 fix 2)", () => {
@@ -87,11 +89,12 @@ describe("prepareMath: code is parser-owned (A)", () => {
   });
 
   it("does not let a bracket lookahead swallow a following fence", () => {
-    // The `\[` is never closed on this message → the whole thing is the exact
-    // literal tail (the fence inside is plain source, not parsed at all).
+    // The `\[` is rejected because the fence interrupts its paragraph: only
+    // the opener goes literal; the fence stays code and the later `\]` is
+    // ordinary markdown text — the message is NOT swallowed into a tail.
     const src = "\\[\n```\n$x$\n```\n\\]";
-    expect(prepareMath(src).literalTail).toBe(src);
-    expect(M(src)).toBe("");
+    expect(prepareMath(src).literalTail).toBeNull();
+    expect(M(src)).toBe("\\\\\\[\n```\n$x$\n```\n\\]");
   });
 
   it("masks indented code nested in block quotes/list continuations (round-4 fix 3)", () => {
@@ -103,7 +106,8 @@ describe("prepareMath: code is parser-owned (A)", () => {
 
   it("does not pair a multi-line \\[ across a fenced block that interrupts the paragraph", () => {
     const src = "\\[\n```\n$x$\n```\n\\] tail";
-    expect(T(src)).toBe("\\[\n```\n$x$\n```\n\\] tail");
+    expect(T(src)).toBeNull();
+    expect(M(src)).toBe("\\\\\\[\n```\n$x$\n```\n\\] tail");
   });
 });
 
@@ -121,8 +125,51 @@ describe("prepareMath: blank-line display (E)", () => {
   });
 });
 
-describe("prepareMath: streaming literal tail (G)", () => {
-  it("returns the exact unclosed display source, markdown untouched", () => {
+describe("prepareMath: rejected display opener keeps later markdown (c-mathfu 1)", () => {
+  it("renders a bold paragraph and a later closer after a blank line", () => {
+    const src = "\\[ x\n\n**bold**\n\n\\]";
+    expect(T(src)).toBeNull();
+    const out = M(src);
+    // Only the opener was made literal (exact `\[` source); bold survives.
+    expect(out).toBe("\\\\\\[ x\n\n**bold**\n\n\\]");
+  });
+
+  it("renders lists, code blocks and later math past the rejected opener", () => {
+    const src = "\\[ x\n\n- **item**\n\n```\ncode\n```\n\n$y$";
+    const out = M(src);
+    expect(T(src)).toBeNull();
+    expect(out.startsWith("\\\\\\[ x\n\n")).toBe(true);
+    expect(out).toContain("- **item**");
+    expect(out).toContain("```\ncode\n```");
+    expect(out).toContain("$y$");
+  });
+
+  it("keeps each rejected opener literal when several fail in one paragraph", () => {
+    const src = "\\[a \\[b\n\n**bold**";
+    expect(M(src)).toBe("\\\\\\[a \\\\\\[" + "b\n\n**bold**");
+    expect(T(src)).toBeNull();
+  });
+
+  it("fully inert opener: no link/reference/image can start at the escaped bracket", () => {
+    expect(M("\\[label](https://example.org)\n\n**bold**")).toBe(
+      "\\\\\\[label](https://example.org)\n\n**bold**",
+    );
+    expect(M("\\[label][ref]\n\nx")).toBe("\\\\\\[label][ref]\n\nx");
+    expect(M("!\\[alt](https://example.org/x.png)\n\nx")).toBe(
+      "!\\\\\\[alt](https://example.org/x.png)\n\nx",
+    );
+  });
+
+  it("still takes the literal tail when the rejected opener reaches EOF", () => {
+    // The streaming case is unchanged: the closer search reaches EOF, so the
+    // half-formula is exact literal source and bold inside it is NOT parsed.
+    const src = "intro \\[a *b* + \\{c\\}";
+    expect(T(src)).toBe("\\[a *b* + \\{c\\}");
+    expect(M(src)).toBe("intro ");
+  });
+});
+
+describe("prepareMath: streaming literal tail (G)", () => {  it("returns the exact unclosed display source, markdown untouched", () => {
     expect(T("intro $$\n\\sigma(z)")).toBe("$$\n\\sigma(z)");
     expect(M("intro $$\n\\sigma(z)")).toBe("intro ");
     expect(T("intro \\[a *b* + \\{c\\}")).toBe("\\[a *b* + \\{c\\}");

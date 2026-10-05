@@ -451,7 +451,7 @@ mod tests {
         let openai = tag_surface(
             normalize_catalog(
                 r#"{"object":"list","data":[
-                    {"id":"passthrough/ark/seed-evolving"},
+                    {"id":"passthrough/ark/model-y"},
                     {"id":"cursor/gpt-5"},
                     {"id":"claude-opus-5"}
                 ]}"#,
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(
             merged.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec![
-                "passthrough/ark/seed-evolving",
+                "passthrough/ark/model-y",
                 "cursor/gpt-5",
                 "claude-opus-5",
                 "claude-haiku-4-5",
@@ -519,29 +519,29 @@ mod tests {
     #[test]
     fn declared_supply_fields_round_trip_and_survive_reprobe() {
         let declared = parse_models_json(
-            r#"[{"id":"gw/es1[1m]","family":"es1","role":"workhorse","priority":20,
-                 "concurrencyMax":4,"fallback":["gw/seed[1m]"],"workhorse":true,
-                 "windows":[{"id":"model","appliesTo":["es1"],"windowDurationMins":300,
+            r#"[{"id":"gw/model_x[1m]","family":"model_x","role":"workhorse","priority":20,
+                 "concurrencyMax":4,"fallback":["gw/model-y[1m]"],"workhorse":true,
+                 "windows":[{"id":"model","appliesTo":["model_x"],"windowDurationMins":300,
                              "source":"declared"}]}]"#,
         );
         assert_eq!(declared.len(), 1);
         let m = &declared[0];
-        assert_eq!(m.family.as_deref(), Some("es1"));
+        assert_eq!(m.family.as_deref(), Some("model_x"));
         assert_eq!(m.role.as_deref(), Some("workhorse"));
         assert_eq!(m.priority, Some(20));
         assert_eq!(m.concurrency_max, Some(4));
-        assert_eq!(m.fallback, vec!["gw/seed[1m]".to_string()]);
+        assert_eq!(m.fallback, vec!["gw/model-y[1m]".to_string()]);
         assert!(m.workhorse);
         assert_eq!(m.windows.len(), 1);
         // A fresh gateway discovery lists the same id without supply fields;
         // the union keeps the declaration.
         let rediscovered = tag_surface(
-            normalize_catalog(r#"{"data":[{"id":"gw/es1[1m]"}]}"#),
+            normalize_catalog(r#"{"data":[{"id":"gw/model_x[1m]"}]}"#),
             SURFACE_OPENAI,
         );
         let merged = union_catalogs(declared, rediscovered);
-        assert_eq!(merged[0].family.as_deref(), Some("es1"));
-        assert_eq!(merged[0].fallback, vec!["gw/seed[1m]".to_string()]);
+        assert_eq!(merged[0].family.as_deref(), Some("model_x"));
+        assert_eq!(merged[0].fallback, vec!["gw/model-y[1m]".to_string()]);
         assert!(merged[0].workhorse);
         assert_eq!(merged[0].surfaces, vec!["openai"]);
     }

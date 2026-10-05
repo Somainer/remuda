@@ -8277,10 +8277,10 @@ mod tests {
                 instance.instance_id.clone(),
                 Some(1),
                 json!({"kind":"model","payload":{
-                    "requested":"model_hub/es1_orange_o50[1m]",
-                    "effective":{"id":"model_hub/es1_orange_o48[1m]",
+                    "requested":"acme_hub/model_x_o50[1m]",
+                    "effective":{"id":"acme_hub/model_x_o48[1m]",
                         "source":"launch","observedAt":"2026-09-18T00:00:00.000Z"},
-                    "raw":"model_hub/es1_orange_o48[1m]"}}),
+                    "raw":"acme_hub/model_x_o48[1m]"}}),
             )
             .await
             .expect("model event");
@@ -8292,7 +8292,7 @@ mod tests {
         let effective = row.model_effective.expect("modelEffective stored");
         assert_eq!(
             effective.get("id").and_then(Value::as_str),
-            Some("model_hub/es1_orange_o48[1m]")
+            Some("acme_hub/model_x_o48[1m]")
         );
     }
 
@@ -8312,8 +8312,8 @@ mod tests {
             "status":{"state":"known","value":"diverged"},
             "severity":"warning","affectsCompletion":false,"dataRef":null,
             "relatedIds":{"reason":"model-mismatch",
-                "requested":"passthrough/ark/seed-evolving",
-                "observed":"ark/seed-evolving"}}});
+                "requested":"passthrough/ark/model-y",
+                "observed":"ark/model-y"}}});
         store
             .append_journal(
                 host.clone(),
@@ -8341,11 +8341,11 @@ mod tests {
         assert_eq!(rows.len(), 1, "replay must not duplicate");
         assert_eq!(
             rows[0].get("requested").and_then(Value::as_str),
-            Some("passthrough/ark/seed-evolving")
+            Some("passthrough/ark/model-y")
         );
         assert_eq!(
             rows[0].get("observed").and_then(Value::as_str),
-            Some("ark/seed-evolving")
+            Some("ark/model-y")
         );
         assert_eq!(
             rows[0].get("observedAt").and_then(Value::as_str),

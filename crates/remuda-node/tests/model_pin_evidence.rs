@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const PIN: &str = "model_hub/es1_orange_o50[1m]";
-const HOST_DEFAULT: &str = "model_hub/es1_orange_o48[1m]";
+const PIN: &str = "acme_hub/model_x_o50[1m]";
+const HOST_DEFAULT: &str = "acme_hub/model_x_o48[1m]";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "evidence capture: prints argv + transcript for the design doc"]

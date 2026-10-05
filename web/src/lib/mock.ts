@@ -117,10 +117,10 @@ const workspaces: Workspace[] = [
   {
     ...meta(workspaceId),
     hostId,
-    label: "sfe-root",
-    rootPath: "/opt/projects/sfe-root",
+    label: "demo-root",
+    rootPath: "/opt/projects/demo-root",
     writePolicy: "workspace-write",
-    canonicalRoot: known("/opt/projects/sfe-root"),
+    canonicalRoot: known("/opt/projects/demo-root"),
   },
 ];
 

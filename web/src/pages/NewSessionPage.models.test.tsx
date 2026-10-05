@@ -153,7 +153,7 @@ it("groups a wide catalog by id prefix and still offers only enabled models", as
 /**
  * gateway-carryover-1: the summary line under 模型来源 must name the model that
  * will actually launch. The screenshot showed the typed
- * `passthrough/ark/seed-evolving` in the model field while the line read
+ * `passthrough/ark/model-y` in the model field while the line read
  * `Doubao AI · claude-opus-4-8` — the profile default — so the page contradicted
  * the run it was about to start.
  */

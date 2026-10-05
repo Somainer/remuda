@@ -433,7 +433,7 @@ mod tests {
                 "fetchedAt": "2026-09-18T10:00:00.000Z",
                 "models": [
                     {"id": "ark/a", "display_name": "A"},
-                    {"id": "model_hub/b"}
+                    {"id": "acme_hub/b"}
                 ]
             })
             .to_string(),
@@ -441,7 +441,7 @@ mod tests {
         .unwrap();
         let info = resolve_catalog(Some(&dir), None, None, &[], Some("opus"));
         assert_eq!(info.source, ModelListSource::GatewayDiscovery);
-        assert_eq!(info.models, vec!["ark/a", "model_hub/b", "opus"]);
+        assert_eq!(info.models, vec!["ark/a", "acme_hub/b", "opus"]);
         let cache = info.cache.expect("cache provenance recorded");
         assert_eq!(cache.scope, ModelCacheScope::ScopedConfigDir);
         assert_eq!(
@@ -515,9 +515,9 @@ mod tests {
         std::fs::write(
             dir.join("settings.json"),
             serde_json::json!({
-                "model": "ark/seed-evolving[1m]",
-                "modelSettings": {"model_hub/es1_orange_o48": {"effortLevel": "medium"}},
-                "env": {"ANTHROPIC_MODEL": "model_hub/es1_orange_o48[1m]"}
+                "model": "ark/model-y[1m]",
+                "modelSettings": {"acme_hub/model_x_o48": {"effortLevel": "medium"}},
+                "env": {"ANTHROPIC_MODEL": "acme_hub/model_x_o48[1m]"}
             })
             .to_string(),
         )
@@ -527,22 +527,19 @@ mod tests {
             None,
             Some(&dir.join("settings.json")),
             &[
-                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "model_hub/h"),
+                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "acme_hub/h"),
                 ("PATH", "/bin"),
             ],
             None,
         );
         assert_eq!(info.source, ModelListSource::Settings);
-        assert!(info.models.contains(&"ark/seed-evolving[1m]".to_string()));
+        assert!(info.models.contains(&"ark/model-y[1m]".to_string()));
+        assert!(info.models.contains(&"acme_hub/model_x_o48".to_string()));
         assert!(
             info.models
-                .contains(&"model_hub/es1_orange_o48".to_string())
+                .contains(&"acme_hub/model_x_o48[1m]".to_string())
         );
-        assert!(
-            info.models
-                .contains(&"model_hub/es1_orange_o48[1m]".to_string())
-        );
-        assert!(info.models.contains(&"model_hub/h".to_string()));
+        assert!(info.models.contains(&"acme_hub/h".to_string()));
         assert!(!info.models.iter().any(|m| m == "/bin"));
         let _ = std::fs::remove_dir_all(&dir);
     }

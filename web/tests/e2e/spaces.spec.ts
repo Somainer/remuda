@@ -89,7 +89,7 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   await page.goto("/sessions");
   await expect(panel).toBeVisible();
   await expect(strip).toHaveCount(0);
-  await openFromList(page, "sfe-root", "空闲会话");
+  await openFromList(page, "demo-root", "空闲会话");
   await expect(panel).toHaveCount(0);
   const firstPath = new URL(page.url()).pathname;
   await expect(tab(page, "空闲会话")).toHaveAttribute("aria-selected", "true");
@@ -98,13 +98,13 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   await expect(tab(page, "空闲会话")).toHaveCount(0);
   await toList(page);
   await expect(space(page, "x-codexdrv")).toHaveAttribute("aria-pressed", "true");
-  await openFromList(page, "sfe-root", "空闲会话");
+  await openFromList(page, "demo-root", "空闲会话");
   expect(new URL(page.url()).pathname).toBe(firstPath);
   await expect(tab(page, "空闲会话")).toHaveAttribute("aria-selected", "true");
   await expect(tab(page, "codex-worker")).toHaveCount(0);
   await toList(page);
-  await expect(space(page, "sfe-root")).toHaveAttribute("aria-pressed", "true");
-  await openFromList(page, "sfe-root", "空闲会话");
+  await expect(space(page, "demo-root")).toHaveAttribute("aria-pressed", "true");
+  await openFromList(page, "demo-root", "空闲会话");
   await expect(tab(page, "空闲会话")).toHaveAttribute("aria-selected", "true");
 
   await strip.getByRole("tab").first().click();
@@ -121,7 +121,7 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   await page.keyboard.press("ControlOrMeta+[");
   await toList(page);
   try {
-    await expect(space(page, "sfe-root")).toHaveAttribute("aria-pressed", "true");
+    await expect(space(page, "demo-root")).toHaveAttribute("aria-pressed", "true");
   } catch (error) {
     const state = await page.evaluate(() => ({
       route: window.location.pathname,
@@ -133,7 +133,7 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   }
 
   // ⌘/Ctrl+B folds the sidebar (prefs.collapsed) on every desktop route.
-  await openFromList(page, "sfe-root", "看 TaskManager spill 这段为啥抖");
+  await openFromList(page, "demo-root", "看 TaskManager spill 这段为啥抖");
   await page.getByTestId("sidebar-toggle").click();
   await expect(sidebar).toHaveAttribute("data-collapsed", "true");
   await page.reload();
@@ -171,7 +171,7 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
 
   // Status and close are distinct: the tab strip carries exactly one × per tab
   // (close), and the status indicator is never one.
-  await openFromList(page, "sfe-root", "空闲会话");
+  await openFromList(page, "demo-root", "空闲会话");
   const firstTab = strip.getByRole("tab").first();
   await firstTab.click();
   const tabRow = strip.locator('[data-active="true"]');

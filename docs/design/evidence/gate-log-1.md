@@ -2,7 +2,7 @@
 
 Date: 2026-09-17. Branch: `wt/c-gatelog/gate-failure-evidence`.
 Context: on 2026-09-17 the first real verification through the Node gate lane
-(`remuda gate wt/c-watchfailed/... --lane sg-lane1`, job
+(`remuda gate wt/c-watchfailed/... --lane lane1`, job
 `gjb_01a0ae4f-077a-73ba-89e4-0cec27ed05e8`) streamed all seventeen steps and
 failed at cargo-test after 39 minutes, but the job and the CLI only recorded
 `cargo-test failed, exit status 101, attempts 2, retried`. Nothing kept the

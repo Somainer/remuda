@@ -90,8 +90,37 @@ describe("useStaleCutoffTick", () => {
     expect(isStaleOffline(host as Host, result.current)).toBe(true);
   });
 
+  it("arms when the cutoff equals the mount instant, and chains two cutoffs 1ms apart", () => {
+    // Host A's cutoff is EXACTLY T0 (lastSeen at T0 - STALE_OFFLINE_MS):
+    // fresh at T0 under the strict > test, but it must still arm a 1ms wake.
+    const hostA = offlineHost(new Date(T0 - STALE_OFFLINE_MS));
+    hostA.id = "a";
+    // Host B's cutoff is one ms later (C and C+1ms pair).
+    const hostB = offlineHost(new Date(T0 - STALE_OFFLINE_MS + 1));
+    hostB.id = "b";
+    const { result } = renderHook(({ list }) => useStaleCutoffTick(list), {
+      initialProps: { list: [hostA, hostB] as StaleClockHost[] },
+    });
+
+    expect(isStaleOffline(hostA as Host, result.current)).toBe(false);
+    expect(isStaleOffline(hostB as Host, result.current)).toBe(false);
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(isStaleOffline(hostA as Host, result.current)).toBe(true);
+    // B needs its own wake; with strict `>` selection it would be dropped now.
+    expect(isStaleOffline(hostB as Host, result.current)).toBe(false);
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(isStaleOffline(hostA as Host, result.current)).toBe(true);
+    expect(isStaleOffline(hostB as Host, result.current)).toBe(true);
+  });
+
   it("needs no timer for online, connecting, or already-stale rows", () => {
-    const hosts: StaleClockHost[] = [
+    const hosts: (StaleClockHost & { id: string })[] = [
       { id: "h-on", state: "online", online: true, ssh: undefined, lastSeenAt: new Date(T0 - 1_000).toISOString() },
       { id: "h-conn", state: "connecting", online: false, ssh: undefined, lastSeenAt: new Date(T0 - 100_000).toISOString() },
       offlineHost(new Date(T0 - 2 * STALE_OFFLINE_MS)),

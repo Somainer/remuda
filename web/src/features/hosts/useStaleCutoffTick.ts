@@ -40,7 +40,12 @@ export function useStaleCutoffTick(hosts: readonly StaleClockHost[]): number {
       if (!isOfflinePending(host)) continue;
       if (!host.lastSeenAt) continue; // already stale; isStaleOffline returns true
       const cutoff = Date.parse(host.lastSeenAt) + STALE_OFFLINE_MS;
-      if (Number.isFinite(cutoff) && cutoff > nowMs) next = Math.min(next, cutoff);
+      // `>=` (not `>`): a cutoff exactly equal to the current instant still
+      // needs the +1ms wake (isStaleOffline is strict `>` and reads the host
+      // fresh AT the cutoff), and two cutoffs C / C+1ms must both arm as each
+      // one fires. A fired host's cutoff is C while nowMs is C+1, so it never
+      // re-arms itself.
+      if (Number.isFinite(cutoff) && cutoff >= nowMs) next = Math.min(next, cutoff);
     }
     if (!Number.isFinite(next)) return;
     // Strictly past the cutoff: isStaleOffline uses `now - at > cutoff`.

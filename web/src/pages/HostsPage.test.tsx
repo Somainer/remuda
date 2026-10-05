@@ -1,10 +1,10 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Id } from "../types/wire";
 import * as store from "../lib/store";
 import { mockDb } from "../lib/mock";
-import { HostDetailPage } from "./HostsPage";
+import { HostDetailPage, HostsPage } from "./HostsPage";
 
 /**
  * The host detail CLI table.
@@ -147,5 +147,94 @@ describe("host detail CLI table", () => {
     expect(cap).toBeTruthy();
     expect(cap).toHaveTextContent("已安装");
     expect(cap).not.toHaveTextContent("未安装");
+  });
+});
+
+describe("HostsPage stale grouping (c-perffu r5-3)", () => {
+  const T0 = new Date("2026-10-05T10:00:00Z").getTime();
+
+  function snapshotWithHosts(hosts: ReturnType<typeof store.hubStore.getSnapshot>["hosts"]) {
+    return { ...store.hubStore.getSnapshot(), hosts, workspaces: [], instances: [] };
+  }
+
+  function offlineHost(id: string, lastSeenAgoMs: number) {
+    const base = mockDb.hosts[0];
+    return {
+      ...base,
+      id: id as Id,
+      label: id,
+      state: "offline" as const,
+      online: false,
+      transport: { mode: "outbound-wss" as const, endpointRef: id as Id },
+      cli: [],
+      lastSeenAt: new Date(T0 - lastSeenAgoMs).toISOString(),
+    };
+  }
+
+  function renderList() {
+    return render(
+      <MemoryRouter initialEntries={["/hosts"]}>
+        <Routes>
+          <Route path="/hosts" element={<HostsPage />} />
+          <Route path="/hosts/:hostId" element={<HostDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function row(id: string): HTMLElement | null {
+    return document.querySelector<HTMLElement>(`[data-testid="host-row"][data-label="${id}"]`);
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("moves hosts into the stale GROUP after each cutoff while polls stay equal", () => {
+    const STALE = 30 * 60 * 1000;
+    // A goes stale at T0+30s, B at T0+120s.
+    vi.mocked(store.useHub).mockReturnValue(
+      snapshotWithHosts([
+        offlineHost("a", STALE - 30_000),
+        offlineHost("b", STALE - 120_000),
+      ]),
+    );
+    renderList();
+    act(() => {
+      vi.advanceTimersByTime(0);
+    });
+
+    // Both in the default (non-stale) group initially; no stale toggle.
+    expect(row("a")?.getAttribute("data-stale")).toBe("0");
+    expect(row("b")?.getAttribute("data-stale")).toBe("0");
+    expect(screen.queryByTestId("hosts-show-stale")).toBeNull();
+
+    // A crosses: it leaves the default group, B stays, toggle shows count 1.
+    act(() => {
+      vi.advanceTimersByTime(31_000);
+    });
+    expect(row("a")).toBeNull();
+    expect(row("b")?.getAttribute("data-stale")).toBe("0");
+    const toggle = screen.getByTestId("hosts-show-stale");
+    expect(toggle.textContent).toContain("显示过期 (1)");
+
+    // Reveal the stale group: A is there, marked stale with the 状态待确认 text.
+    fireEvent.click(toggle);
+    const staleA = row("a");
+    expect(staleA?.getAttribute("data-stale")).toBe("1");
+    expect(staleA?.textContent).toContain("状态待确认");
+
+    // B crosses too: default group empties, toggle count is 2.
+    fireEvent.click(toggle); // hide again
+    act(() => {
+      vi.advanceTimersByTime(90_000);
+    });
+    expect(row("a")).toBeNull();
+    expect(row("b")).toBeNull();
+    expect(screen.getByTestId("hosts-show-stale").textContent).toContain("显示过期 (2)");
   });
 });

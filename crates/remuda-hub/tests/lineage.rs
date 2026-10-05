@@ -847,6 +847,62 @@ async fn owner_resume_of_an_ended_chapter_works_and_offline_refuses_without_writ
     Ok(())
 }
 
+// --- 9. Live chapter without a session is refused, not relaunched blank ---
+
+#[tokio::test]
+async fn a_live_chapter_without_a_native_session_is_refused_and_an_ended_one_relaunches()
+-> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // Deliberately NO session report: the chapter is live but never produced a
+    // native session id. (seat() already drained the forwarded create frame.)
+
+    let refused = ctx.resume(&x, &ctx.human).await?;
+    assert_eq!(refused.status(), 409);
+    let body = refused.text().await?;
+    assert!(
+        body.contains("native session"),
+        "the refusal must name the missing session: {body}"
+    );
+    // No continuation write: still one chapter, generation 1, no fence.
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(lineage["generation"], json!(1));
+    assert_eq!(lineage["chapters"].as_array().unwrap().len(), 1);
+    let x_view = ctx.get_instance(&x, &ctx.human).await?;
+    assert!(x_view["fencedAt"].is_null());
+    let drained = tokio::time::timeout(Duration::from_millis(150), node.next_frame()).await;
+    assert!(drained.is_err(), "a refusal forwards no close/create");
+
+    // Once there is real process-end evidence, the origin-spec fresh launch is
+    // the correct recovery and succeeds (r2-9 is about the LIVE case).
+    node.appends.send((x.clone(), exited()))?;
+    ctx.wait_until(&x, |view| view["lifecycle"] == json!("exited"))
+        .await?;
+    let recovered: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(recovered["instance"]["generation"], json!(2));
+    assert_eq!(recovered["instance"]["chapterCause"], json!("owner-resume"));
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(
+        method, "instance.create",
+        "an ended chapter with no session relaunches fresh"
+    );
+    Ok(())
+}
+
 // --- 3. Concurrent resumes: one successor (generation CAS) ---------------
 
 /// A resume addressed to an already-fenced chapter returns its existing

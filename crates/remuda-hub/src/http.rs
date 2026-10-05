@@ -1930,6 +1930,22 @@ async fn resume_lineage(
             }
         }
     }
+    // ma-lineage round 2: a LIVE chapter with no reported native session is
+    // not safe to continue — relaunching blank from the origin spec would
+    // silently discard the conversation the still-running process holds.
+    // Refuse with a clear 409; the owner retries once the chapter reports a
+    // session (or after real process-end evidence, where the origin-spec
+    // recovery is correct).
+    if recovery_session.is_none() {
+        let process_end = matches!(current.lifecycle.as_str(), "exited" | "closed");
+        if !process_end {
+            return Err(HubError::Conflict(
+                "the current chapter has not reported a native session to continue; \
+                 retry once it has, or close it first"
+                    .into(),
+            ));
+        }
+    }
     let (mut spec, operation) = match recovery_session {
         Some(session_id) => {
             let mut spec = current.spec_for_resume();

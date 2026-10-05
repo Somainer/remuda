@@ -1002,7 +1002,7 @@ async fn fake_node(
                         ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
                         append_n = append_instance_state(
                             &mut ws,
-                        &mut frame_queue,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "ready",
@@ -1026,6 +1026,7 @@ async fn fake_node(
                         model_catalogs.insert(instance_id.clone(), catalog_ids);
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "model",
@@ -1056,7 +1057,7 @@ async fn fake_node(
                             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
                         append_n = append_instance_state(
                             &mut ws,
-                        &mut frame_queue,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "ready",
@@ -1109,7 +1110,7 @@ async fn fake_node(
                         let session_id = format!("mhome-exit-{}", uuid::Uuid::now_v7());
                         append_n = append_instance_state(
                             &mut ws,
-                        &mut frame_queue,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "ready",
@@ -1118,7 +1119,7 @@ async fn fake_node(
                         .await?;
                         append_n = append_instance_exit(
                             &mut ws,
-                        &mut frame_queue,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             &session_id,
@@ -1199,8 +1200,13 @@ async fn fake_node(
                             json!({ "ok": true, "instanceId": instance_id }),
                         )
                         .await?;
-                        append_n =
-                            append_mfix_chrome_combo(&mut ws, &instance_id, append_n).await?;
+                        append_n = append_mfix_chrome_combo(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                        )
+                        .await?;
                         continue;
                     }
                     // UO-6b round 2: a live turn the Hub must settle when the
@@ -1212,7 +1218,13 @@ async fn fake_node(
                             json!({ "ok": true, "instanceId": instance_id }),
                         )
                         .await?;
-                        append_n = append_uo6b_epoch_live(&mut ws, &instance_id, append_n).await?;
+                        append_n = append_uo6b_epoch_live(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                        )
+                        .await?;
                         continue;
                     }
                     // c-inboxfu: `inbox-focus:<n>` parks n pending approval
@@ -1238,7 +1250,7 @@ async fn fake_node(
                         let command_id = params.get("commandId").and_then(Value::as_str);
                         append_n = append_command_user(
                             &mut ws,
-                        &mut frame_queue,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt,
@@ -1314,9 +1326,15 @@ async fn fake_node(
                     // C2: the create prompt is a command, so its user observation
                     // carries the commandId the Hub forwards in params.
                     let command_id = params.get("commandId").and_then(Value::as_str);
-                    append_n =
-                        append_command_user(&mut ws, &mut frame_queue, &instance_id, append_n, prompt, command_id)
-                            .await?;
+                    append_n = append_command_user(
+                        &mut ws,
+                        &mut frame_queue,
+                        &instance_id,
+                        append_n,
+                        prompt,
+                        command_id,
+                    )
+                    .await?;
                     // r-ux-comment: a fenced block to exercise 评论.
                     if let Some(reply) = code_comment_reply(prompt) {
                         append_n =
@@ -1345,9 +1363,15 @@ async fn fake_node(
                     // a known 50% context ring (100k of the 200k Claude window).
                     if prompt.contains("mhome-blocked") {
                         if let Some(usage) = scripted_usage("usage:40000,500,60000,0") {
-                            append_n =
-                                append_event(&mut ws, &instance_id, append_n, "usage", usage)
-                                    .await?;
+                            append_n = append_event(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                "usage",
+                                usage,
+                            )
+                            .await?;
                         }
                         append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
                             .await?;
@@ -1361,9 +1385,14 @@ async fn fake_node(
                     if let Some(scenario) = row_scenario {
                         // Running workflow events follow the working status, so
                         // the row projects a live-run phrase from the journal.
-                        append_n =
-                            append_workflow_scenario(&mut ws, &instance_id, append_n, scenario)
-                                .await?;
+                        append_n = append_workflow_scenario(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            scenario,
+                        )
+                        .await?;
                     }
                     // §9.1 model-sync: the launch snapshot carries the
                     // gateway-discovered catalog and current model for any claude
@@ -1380,6 +1409,7 @@ async fn fake_node(
                         model_catalogs.insert(instance_id.clone(), catalog_ids);
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "model",
@@ -1508,6 +1538,7 @@ async fn fake_node(
                         };
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "effort",
@@ -1532,15 +1563,22 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_command_user(
                             &mut ws,
-                        &mut frame_queue,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt,
                             command_id,
                         )
                         .await?;
-                        append_n =
-                            append_event(&mut ws, &instance_id, append_n, "usage", usage).await?;
+                        append_n = append_event(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            "usage",
+                            usage,
+                        )
+                        .await?;
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -1560,6 +1598,7 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "permission",
@@ -1582,6 +1621,7 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "model",
@@ -1601,15 +1641,26 @@ async fn fake_node(
                     // (exited resumable instance + live hook/tool/status strip).
                     if prompt == "mfix-chrome-combo" {
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                        append_n =
-                            append_mfix_chrome_combo(&mut ws, &instance_id, append_n).await?;
+                        append_n = append_mfix_chrome_combo(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                        )
+                        .await?;
                         continue;
                     }
                     // UO-6b round 2: a live turn the Hub must settle when the
                     // Node restarts (the spec then types TTYNODE_RESTART).
                     if prompt == "uo6b-epoch-live" {
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                        append_n = append_uo6b_epoch_live(&mut ws, &instance_id, append_n).await?;
+                        append_n = append_uo6b_epoch_live(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                        )
+                        .await?;
                         continue;
                     }
                     // r-ux-comment: reply with a fenced code block so the browser
@@ -1619,7 +1670,7 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_command_user(
                             &mut ws,
-                        &mut frame_queue,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt,
@@ -1648,6 +1699,7 @@ async fn fake_node(
                         .await?;
                         append_n = append_toolfold_settle_scenario(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt.contains("mcp"),
@@ -1664,8 +1716,14 @@ async fn fake_node(
                             json!({ "ok": true, "instanceId": instance_id }),
                         )
                         .await?;
-                        append_n =
-                            append_workflow_scenario(&mut ws, &instance_id, append_n, kind).await?;
+                        append_n = append_workflow_scenario(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            kind,
+                        )
+                        .await?;
                         continue;
                     }
                     // c-cua-media: a computer-use MCP call whose result carries
@@ -1679,7 +1737,7 @@ async fn fake_node(
                         .await?;
                         append_n = append_cua_scenario(
                             &mut ws,
-            &mut frame_queue,
+                            &mut frame_queue,
                             addr,
                             host_id.as_id().as_str(),
                             &durable_token,
@@ -1694,9 +1752,15 @@ async fn fake_node(
                     // C2: the journal user node for a composer send carries the
                     // exact commandId the HTTP response returned, so the web folds
                     // optimistic bubble and transcript node into one.
-                    append_n =
-                        append_command_user(&mut ws, &mut frame_queue, &instance_id, append_n, prompt, command_id)
-                            .await?;
+                    append_n = append_command_user(
+                        &mut ws,
+                        &mut frame_queue,
+                        &instance_id,
+                        append_n,
+                        prompt,
+                        command_id,
+                    )
+                    .await?;
                     // D-027: echo the attachment metadata the Hub resolved, so the
                     // e2e can prove staging reached the Node without a real agent.
                     // 2026-09-15: also echo the [Image #n] manifest (index +
@@ -1838,7 +1902,7 @@ async fn fake_node(
                         if let Some(mid) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
-                        &mut frame_queue,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("model-queued:{mid}"),
@@ -1847,7 +1911,7 @@ async fn fake_node(
                         } else if let Some(mid) = requested.strip_prefix("__notfound__:") {
                             append_n = append_configure_status(
                                 &mut ws,
-                        &mut frame_queue,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("model-degraded:{mid}:not-found"),
@@ -1868,7 +1932,7 @@ async fn fake_node(
                             // verdict lands.
                             append_n = append_native_user(
                                 &mut ws,
-                        &mut frame_queue,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("/model {requested_id}"),
@@ -1884,6 +1948,7 @@ async fn fake_node(
                             let selection_path = if listed { "listed" } else { "typed" };
                             append_n = append_event(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 "model",
@@ -1923,7 +1988,7 @@ async fn fake_node(
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
-                        &mut frame_queue,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("effort-queued:{word}"),
@@ -1932,7 +1997,7 @@ async fn fake_node(
                         } else if let Some(word) = requested.strip_prefix("__degrade__:") {
                             append_n = append_configure_status(
                                 &mut ws,
-                        &mut frame_queue,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("effort-degraded:{word}:dialog-kept"),
@@ -1976,6 +2041,7 @@ async fn fake_node(
                             });
                             append_n = append_event(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 "effort",
@@ -1994,7 +2060,7 @@ async fn fake_node(
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
-                        &mut frame_queue,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("permission-queued:{word}"),
@@ -2003,7 +2069,7 @@ async fn fake_node(
                         } else if let Some(word) = requested.strip_prefix("__degrade__:") {
                             append_n = append_configure_status(
                                 &mut ws,
-                        &mut frame_queue,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("permission-degraded:{word}:no-status-line"),
@@ -2012,6 +2078,7 @@ async fn fake_node(
                         } else {
                             append_n = append_event(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 "permission",
@@ -2033,9 +2100,15 @@ async fn fake_node(
                 "instance.close" => {
                     if claude_ptys.contains(&instance_id) {
                         ttys.remove(&instance_id);
-                        append_n =
-                            append_instance_state(&mut ws, &mut frame_queue, &instance_id, append_n, "exited", None)
-                                .await?;
+                        append_n = append_instance_state(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            "exited",
+                            None,
+                        )
+                        .await?;
                     }
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                 }
@@ -2445,8 +2518,14 @@ async fn fake_node(
                         continue;
                     }
                     if let Some(line) = submitted {
-                        append_n =
-                            append_native_user(&mut ws, &mut frame_queue, &instance_id, append_n, &line).await?;
+                        append_n = append_native_user(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            &line,
+                        )
+                        .await?;
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -3250,7 +3329,12 @@ async fn append_instance_exit(
 /// decision in `working` (so Esc 打断 renders), and an 858-output-token usage
 /// snapshot. The web spec asserts the compact keyboard band still shows the
 /// composer and a >=40% transcript.
-async fn append_mfix_chrome_combo(ws: &mut NodeWs, queue: &mut FrameQueue, instance_id: &str, mut n: u64) -> Result<u64> {
+async fn append_mfix_chrome_combo(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    mut n: u64,
+) -> Result<u64> {
     let session_id = format!("mfix-chrome-{}", uuid::Uuid::now_v7());
     let rfc3339 = |t: time::OffsetDateTime| {
         format!(
@@ -3442,7 +3526,12 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, queue: &mut FrameQueue, insta
 /// message and NO `status`), and the strip must settle on that instead of
 /// throwing / keeping the growing timer. The web spec triggers the restart
 /// with `TTYNODE_RESTART` after this fixture lands.
-async fn append_uo6b_epoch_live(ws: &mut NodeWs, queue: &mut FrameQueue, instance_id: &str, mut n: u64) -> Result<u64> {
+async fn append_uo6b_epoch_live(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    mut n: u64,
+) -> Result<u64> {
     let now_at = {
         let t = time::OffsetDateTime::now_utc();
         format!(
@@ -3608,7 +3697,13 @@ async fn append_command_user(
 
 /// A prompt typed natively into the PTY: human origin, no commandId, its own
 /// node (eventId-derived identity through the hub shorthand normaliser).
-async fn append_native_user(ws: &mut NodeWs, queue: &mut FrameQueue, instance_id: &str, n: u64, text: &str) -> Result<u64> {
+async fn append_native_user(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+) -> Result<u64> {
     let seq = n + 1;
     ws.send(Message::Text(
         json!({
@@ -4337,7 +4432,6 @@ async fn append_event(
     append_full_event(
         ws,
         queue,
-        queue,
         instance_id,
         n,
         json!({ "kind": kind, "payload": payload }),
@@ -4555,7 +4649,7 @@ async fn append_toolfold_settle_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "tool_result",
@@ -4752,7 +4846,7 @@ async fn append_workflow_scenario(
         // Decision 6: old daemon — run with a note and no phase/member detail.
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -4770,8 +4864,17 @@ async fn append_workflow_scenario(
     }
 
     if kind == "drill" {
-        return append_drill_scenario(ws, instance_id, n, &workflow_id, &tool_id, &phase, &member)
-            .await;
+        return append_drill_scenario(
+            ws,
+            queue,
+            instance_id,
+            n,
+            &workflow_id,
+            &tool_id,
+            &phase,
+            &member,
+        )
+        .await;
     }
 
     if kind == "live" {
@@ -4780,7 +4883,7 @@ async fn append_workflow_scenario(
         // can be proven to fold the card into the compact summary row.
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -4796,7 +4899,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -4805,7 +4908,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -4814,7 +4917,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4838,7 +4941,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4862,7 +4965,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4886,7 +4989,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4913,7 +5016,7 @@ async fn append_workflow_scenario(
         let bash_id = format!("obj_bash_{tag}");
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "tool_call",
@@ -4936,7 +5039,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "tool_result",
@@ -4957,7 +5060,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "thought",
@@ -4983,7 +5086,7 @@ async fn append_workflow_scenario(
     if kind == "demo-done" {
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5007,7 +5110,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5031,7 +5134,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5055,7 +5158,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5064,7 +5167,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5073,7 +5176,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5094,7 +5197,7 @@ async fn append_workflow_scenario(
         let running_only = kind == "demo-running";
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5110,7 +5213,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5119,7 +5222,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5128,7 +5231,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5152,7 +5255,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5176,7 +5279,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5200,7 +5303,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5228,7 +5331,7 @@ async fn append_workflow_scenario(
         tokio::time::sleep(Duration::from_millis(900)).await;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5252,7 +5355,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5276,7 +5379,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5300,7 +5403,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5309,7 +5412,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5318,7 +5421,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5339,7 +5442,7 @@ async fn append_workflow_scenario(
         // One 20-agent phase: the >12-row quiet tail must fold behind 还有 8 个.
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5355,7 +5458,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5366,7 +5469,7 @@ async fn append_workflow_scenario(
             let state = if i == 0 { "running" } else { "queued" };
             n = append_event(
                 ws,
-        queue,
+                queue,
                 instance_id,
                 n,
                 "workflow.member",
@@ -5401,7 +5504,7 @@ async fn append_workflow_scenario(
         for i in 0..20 {
             n = append_event(
                 ws,
-        queue,
+                queue,
                 instance_id,
                 n,
                 "workflow.member",
@@ -5426,7 +5529,7 @@ async fn append_workflow_scenario(
         }
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5435,7 +5538,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5481,7 +5584,7 @@ async fn append_workflow_scenario(
     for i in 0..14 {
         n = append_event(
             ws,
-        queue,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5669,7 +5772,7 @@ async fn append_cua_scenario(
                 .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
         })
         .unwrap_or_else(|| format!("obj_legacy_{n}"));
-    n = append_user_message(ws, instance_id, n, prompt, command_id, &node).await?;
+    n = append_user_message(ws, queue, instance_id, n, prompt, command_id, &node).await?;
 
     let http_base = format!("http://{addr}");
     let stager = std::sync::Arc::new(CuaStager {

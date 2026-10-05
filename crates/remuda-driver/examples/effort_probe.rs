@@ -14,6 +14,22 @@
 //!
 //! Marks are `T<phase> <ms since boot> <detail>`; channel marks are relative
 //! to the submit CR: ch-* +Nms.
+//!
+//! effort-sync-4 (claude >= 2.1.284, ultracode decoupled from the level) lives
+//! in `effort_probe/decoupled.rs` and is selected by `SCENARIO`:
+//!
+//!   REMUDA_PROBE_MODEL=claude-opus-5-5 SCENARIO=walk \
+//!   PROBE_DIR=/tmp/remuda-c-effortev-walk \
+//!   cargo run -p remuda-driver --example effort_probe
+//!
+//!   REMUDA_PROBE_MODEL=claude-opus-5-5 SCENARIO=launch CASES=a,b,c1,c2 \
+//!   PROBE_DIR=/tmp/remuda-c-effortev-launch \
+//!   cargo run -p remuda-driver --example effort_probe
+//!
+//! `REMUDA_PROBE_MODEL_NO_XHIGH` adds launch case g on that model.
+
+#[path = "effort_probe/decoupled.rs"]
+mod decoupled;
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -321,6 +337,13 @@ fn effort_record_matcher(
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    match std::env::var("SCENARIO").as_deref() {
+        Ok(scenario @ ("walk" | "launch")) => decoupled::run(scenario).await,
+        _ => scenario_v3().await,
+    }
+}
+
+async fn scenario_v3() {
     let dir = PathBuf::from(
         std::env::var("PROBE_DIR").unwrap_or_else(|_| "/tmp/remuda-r-effortsync2-probe3".into()),
     );

@@ -31,17 +31,16 @@ export function WorkflowTree({
         {phases.map((phase) => {
           const phaseMembers = members.filter((m) => m.phaseId === phase.phaseId);
           return (
-            <div key={phase.phaseId} data-testid="workflow-phase">
-              <div className={css.wfPhase}>
-                <span>▾</span>
+            <details key={phase.phaseId} open data-testid="workflow-phase">
+              <summary className={css.wfPhase}>
                 <span>{knowledgeValue(phase.label) ?? phase.phaseId}</span>
-              </div>
+              </summary>
               <ul className={css.wfMembers}>
                 {phaseMembers.map((m) => (
                   <MemberRow key={m.memberId} member={m} />
                 ))}
               </ul>
-            </div>
+            </details>
           );
         })}
         {unphasedMembers(phases, members).length ? (

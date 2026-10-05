@@ -206,7 +206,12 @@
   font-size: var(--text-meta);
   color: var(--fg-body);
   padding: 0 var(--space-3);
+  cursor: pointer;
+  list-style: none;
 }
+.wfPhase::-webkit-details-marker { display: none; }
+.wfPhase::before { content: "▸"; }
+details[open] .wfPhase::before { content: "▾"; }
 
 .wfMembers {
   padding: var(--space-2) var(--space-3) 10px;

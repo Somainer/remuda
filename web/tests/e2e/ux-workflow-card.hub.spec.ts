@@ -201,6 +201,10 @@ test("a failed agent row is never folded", async ({ page }) => {
   await expect(card).toHaveAttribute("data-status", "failed", { timeout: 20_000 });
   // c-wfcard: a failed finished card is open unless dismissed.
   await expect(card.getByTestId("workflow-card-head")).toHaveAttribute("aria-expanded", "true");
+  // c-uifold: failed members are finished — 14 done + 1 failed = 15/15, with
+  // the red 1 已失败 marker next to the progress bar.
+  await expect(card.getByTestId("workflow-rail-count")).toContainText("15/15");
+  await expect(card.getByTestId("workflow-rail-failed")).toContainText("1 已失败");
   await ensurePhaseOpen(page, 0);
   const failed = page.getByTestId("workflow-agent").filter({ hasText: "review:security" });
   await expect(failed).toBeVisible();
@@ -209,6 +213,49 @@ test("a failed agent row is never folded", async ({ page }) => {
   await expect(
     page.locator("[data-testid='workflow-phase'] ul li button").filter({ hasText: /还有 3 个/ }),
   ).toBeVisible();
+});
+
+test("the phase chevron follows its disclosure state (open flips it down, close back right)", async ({ page }) => {
+  await openWorkflowSession(page, "workflow card demo running");
+  await page.getByTestId("composer-input").fill("workflow card demo done");
+  await page.getByTestId("composer-send").click();
+  const card = page.getByTestId("workflow-card").first();
+  await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
+
+  // Completed phases mount collapsed; the chevron rotation is driven by
+  // aria-expanded (right → rotate 90deg → right again on the second click).
+  const head = () => page.locator("[data-testid='workflow-phase'] button").first();
+  // The svg has a 140ms transition: poll the computed transform instead of
+  // reading it at the (still-identity) start of the animation.
+  const chevTransform = async () =>
+    head().locator("svg").evaluate((el) => getComputedStyle(el).transform);
+  await expect(head()).toHaveAttribute("aria-expanded", "false");
+  expect(await chevTransform()).toBe("none");
+
+  await head().click();
+  await expect(head()).toHaveAttribute("aria-expanded", "true");
+  await expect
+    .poll(chevTransform, { timeout: 2_000, intervals: [30] })
+    .toMatch(/matrix\(0(?:\.0+)?, 1(?:\.0+)?, -1(?:\.0+)?, 0/);
+
+  await head().click();
+  await expect(head()).toHaveAttribute("aria-expanded", "false");
+  await expect.poll(chevTransform, { timeout: 2_000, intervals: [30] }).toBe("none");
+});
+
+test("the header is a real progress bar with completed/total, not static dots", async ({ page }) => {
+  await openWorkflowSession(page, "workflow card demo running");
+  const card = page.getByTestId("workflow-card").first();
+  await expect(card).toHaveAttribute("data-status", "running", { timeout: 20_000 });
+  // Running demo: totals 1 terminal of a fixed 4 — 1/4 agents beside the bar.
+  await expect(card.getByTestId("workflow-rail-count")).toContainText("1/4 agents");
+
+  await page.getByTestId("composer-input").fill("workflow card demo done");
+  await page.getByTestId("composer-send").click();
+  await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
+  await expect(card.getByTestId("workflow-rail-count")).toContainText("4/4 agents");
+  // A clean run shows no failed marker.
+  await expect(card.getByTestId("workflow-rail-failed")).toHaveCount(0);
 });
 
 test("at 390px every agent stays on one line; model/tool meta hidden", async ({ page }) => {

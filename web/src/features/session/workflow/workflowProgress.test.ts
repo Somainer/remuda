@@ -350,7 +350,10 @@ describe("phase meta wording", () => {
       ],
     });
     expect(card.phases[0].metaText).toBe("全部排队中");
-    expect(card.phases[0].countText).toBe("0/2");
+    // A queued phase may still spawn agents — its local denominator is
+    // provisional until the phase itself goes terminal.
+    expect(card.phases[0].countText).toBe("0/2+");
+    expect(card.phases[0].provisional).toBe(true);
   });
 
   it("counts running agents and shows the real phase span", () => {
@@ -381,7 +384,9 @@ describe("phase meta wording", () => {
     // Earliest start (0) to the running agent's open end at the hand (222s).
     expect(card.phases[0].metaText).toContain("3m 42s");
     expect(card.phases[0].durationMs).toBe(222_000);
-    expect(card.phases[0].countText).toBe("1/2");
+    // Running phase: denominator can still grow → provisional 1/2+.
+    expect(card.phases[0].countText).toBe("1/2+");
+    expect(card.phases[0].provisional).toBe(true);
   });
 
   it("marks a fully done phase n/n 完成", () => {
@@ -484,7 +489,206 @@ describe("card totals and rail", () => {
       ],
     });
     expect(card.totals.totalKnown).toBe(false);
-    expect(card.railPct).toBe(0);
+    // c-uifold: a dynamic run in flight shows the provisional fill
+    // (2 terminal / 4 spawned), not an empty rail or a fake 100%.
+    expect(card.provisional).toBe(true);
+    expect(card.railPct).toBe(50);
+    expect(card.knownCount).toBe(4);
+  });
+
+  it("loses the provisional mark once the dynamic run finishes", () => {
+    const payload = (state: "running" | "completed") => ({
+      state,
+      totals: {
+        totalKnown: false,
+        agentsTotal: u(4),
+        agentsDone: state === "completed" ? u(4) : u(2),
+        agentsFailed: u(0),
+        agentsKilled: u(0),
+        agentsRunning: state === "completed" ? u(0) : u(2),
+        tokens: u(0),
+        calls: u(0),
+        elapsedMs: u(0),
+      },
+    });
+    const alive = projectWorkflow({
+      run: run(payload("running")),
+      phases: [phase({ phaseId: "p1" })],
+      members: [
+        member({ memberId: "a", state: "completed" }),
+        member({ memberId: "b", state: "completed" }),
+        member({ memberId: "c", state: "running" }),
+        member({ memberId: "d", state: "running" }),
+      ],
+    });
+    expect(alive.provisional).toBe(true);
+    const done = projectWorkflow({
+      run: run(payload("completed")),
+      phases: [phase({ phaseId: "p1", state: "completed" })],
+      members: Array.from({ length: 4 }, (_, i) => member({ memberId: `m${i}`, state: "completed" })),
+    });
+    expect(done.provisional).toBe(false);
+    expect(done.railPct).toBe(100);
+  });
+});
+
+describe("dynamic growing total", () => {
+  /** A running run with no totals block: denominator = members seen so far. */
+  const cardFor = (members: WorkflowMemberPayload[], phases: WorkflowPhasePayload[]) =>
+    projectWorkflow({
+      run: run({ state: "running" }),
+      phases,
+      members,
+    });
+
+  const done = (id: string, phaseId = "p1") => member({ memberId: id, phaseId, state: "completed" });
+
+  it("grows the denominator as agents spawn: 8/8 → 8/12 → 12/12, bar moves back", () => {
+    // First phase: 8 agents all completed, a fresh second phase just seeded.
+    const eightDone = Array.from({ length: 8 }, (_, i) => done(`a${i}`, "p1"));
+    const at88 = cardFor(
+      eightDone,
+      [
+        phase({ phaseId: "p1", label: known("DeepRead"), state: "completed" }),
+        phase({ phaseId: "p2", label: known("Verify"), state: "queued" }),
+      ],
+    );
+    expect(at88.knownCount).toBe(8);
+    expect(at88.railPct).toBe(100);
+    expect(at88.provisional).toBe(true);
+
+    // Four new agents spawn in the second phase, all still running: the bar
+    // legitimately moves backwards to 8/12 — never clamped, never an error.
+    const spawned = [
+      ...eightDone,
+      ...["b0", "b1", "b2", "b3"].map((id) => member({ memberId: id, phaseId: "p2", state: "running" })),
+    ];
+    const at812 = cardFor(
+      spawned,
+      [
+        phase({ phaseId: "p1", label: known("DeepRead"), state: "completed" }),
+        phase({ phaseId: "p2", label: known("Verify"), state: "running" }),
+      ],
+    );
+    expect(at812.knownCount).toBe(12);
+    expect(at812.railPct).toBe(67);
+    expect(at812.provisional).toBe(true);
+    expect(at812.phases[1].countText).toBe("0/4+");
+
+    // All finish: provisional mark off, final 12/12.
+    const final = projectWorkflow({
+      run: run({ state: "completed" }),
+      phases: [
+        phase({ phaseId: "p1", label: known("DeepRead"), state: "completed" }),
+        phase({ phaseId: "p2", label: known("Verify"), state: "completed" }),
+      ],
+      members: [
+        ...eightDone,
+        ...["b0", "b1", "b2", "b3"].map((id) => done(id, "p2")),
+      ],
+    });
+    expect(final.knownCount).toBe(12);
+    expect(final.railPct).toBe(100);
+    expect(final.provisional).toBe(false);
+  });
+
+  it("counts a failed member as finished, painted distinctly", () => {
+    const card = cardFor(
+      [
+        ...Array.from({ length: 7 }, (_, i) => done(`a${i}`)),
+        member({ memberId: "boom", state: "failed" }),
+      ],
+      [phase({ phaseId: "p1", label: known("DeepRead"), state: "failed" })],
+    );
+    expect(card.knownCount).toBe(8);
+    expect(card.railPct).toBe(100);
+    expect(card.donePct).toBe(88);
+    expect(card.failedPct).toBe(13);
+    expect(card.totals.failed).toBe(1);
+  });
+
+  it("keeps a fixed-total script's denominator stable while running (no + mark)", () => {
+    const card = projectWorkflow({
+      run: run({
+        state: "running",
+        totals: {
+          totalKnown: true,
+          agentsTotal: u(8),
+          agentsDone: u(2),
+          agentsFailed: u(0),
+          agentsKilled: u(0),
+          agentsRunning: u(2),
+          tokens: u(0),
+          calls: u(0),
+          elapsedMs: u(0),
+        },
+      }),
+      phases: [phase({ phaseId: "p1", label: known("DeepRead"), state: "running" })],
+      members: [
+        done("a0"),
+        done("a1"),
+        member({ memberId: "a2", state: "running" }),
+        member({ memberId: "a3", state: "running" }),
+      ],
+    });
+    expect(card.knownCount).toBe(8);
+    expect(card.provisional).toBe(false);
+    expect(card.railPct).toBe(25);
+  });
+
+  it("treats a later-added phase with members using phase-local counts", () => {
+    // First phase completed on its own; a second phase only appears later.
+    const card = cardFor(
+      [...Array.from({ length: 8 }, (_, i) => done(`a${i}`, "p1"))],
+      [phase({ phaseId: "p1", label: known("DeepRead"), state: "completed" })],
+    );
+    expect(card.phases[0].countText).toBe("8/8 完成");
+    expect(card.phases[0].provisional).toBe(false);
+
+    const grown = cardFor(
+      [
+        ...Array.from({ length: 8 }, (_, i) => done(`a${i}`, "p1")),
+        member({ memberId: "c0", phaseId: "p2", state: "running" }),
+      ],
+      [
+        phase({ phaseId: "p1", label: known("DeepRead"), state: "completed" }),
+        phase({ phaseId: "p2", label: known("Crosscheck"), state: "running" }),
+      ],
+    );
+    expect(grown.phases[0].countText).toBe("8/8 完成");
+    expect(grown.phases[1].countText).toBe("0/1+");
+    expect(grown.knownCount).toBe(9);
+  });
+
+  it("shows a plain 0/0 for an empty seeded phase, not 0/0+", () => {
+    // The producer seeds queued phase observations before any member exists.
+    const card = cardFor(
+      [],
+      [phase({ phaseId: "p1", label: known("DeepRead"), state: "queued" })],
+    );
+    expect(card.phases[0].countText).toBe("0/0");
+    expect(card.phases[0].provisional).toBe(true);
+  });
+
+  it("treats unphased members in a live run as a provisional phase", () => {
+    // A member arrives before its phase observation (synthetic "unphased"
+    // bucket); a live run may still spawn more into it.
+    const unphasedRunning = member({ memberId: "x", state: "running" });
+    unphasedRunning.phaseId = null;
+    const live = cardFor([unphasedRunning], []);
+    expect(live.phases[0].countText).toBe("0/1+");
+    expect(live.phases[0].provisional).toBe(true);
+
+    // The same bucket on a terminal run is a final count.
+    const unphasedDone = member({ memberId: "x", state: "completed" });
+    unphasedDone.phaseId = null;
+    const finished = projectWorkflow({
+      run: run({ state: "completed" }),
+      phases: [],
+      members: [unphasedDone],
+    });
+    expect(finished.phases[0].countText).toBe("1/1 完成");
+    expect(finished.phases[0].provisional).toBe(false);
   });
 });
 

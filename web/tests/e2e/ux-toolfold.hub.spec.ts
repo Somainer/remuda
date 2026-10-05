@@ -278,6 +278,26 @@ test.describe("with a coarse pointer", () => {
   });
 });
 
+test("the compact tool group collapses again from the same summary row; the caret flips", async ({ page }) => {
+  await openLiveSession(page);
+  const fold = page.getByTestId("compact-fold");
+  const wrap = page.getByTestId("compact-fold-wrap");
+
+  await expect(fold).toHaveAttribute("aria-expanded", "false");
+  await expect(fold).toContainText("▸");
+
+  await fold.click();
+  await expect(fold).toHaveAttribute("aria-expanded", "true");
+  await expect(fold).toContainText("▾");
+  await expect(wrap.getByTestId("tool-card")).toBeVisible();
+
+  // c-uifold: the same summary row is also the collapse affordance.
+  await fold.click();
+  await expect(fold).toHaveAttribute("aria-expanded", "false");
+  await expect(fold).toContainText("▸");
+  await expect(wrap.getByTestId("tool-card")).toHaveCount(0);
+});
+
 test("the desktop default folds settled cards (D-053); collapse-all folds every non-failed card", async ({
   page,
 }) => {

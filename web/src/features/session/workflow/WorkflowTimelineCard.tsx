@@ -30,6 +30,7 @@ import {
   headerElapsed,
   layoutRows,
   projectWorkflow,
+  PROVISIONAL_HINT,
   runStatus,
   type WfAgent,
   type WfCard,
@@ -360,6 +361,9 @@ function FoldToggle({
         aria-controls={folded.map((a) => `fold-${phaseId}-${a.id}`).join(" ")}
         onClick={onToggle}
       >
+        <span className={css.moreCaret} aria-hidden="true">
+          {open ? "▾" : "▸"}
+        </span>
         {foldedLabel(folded, open)}
       </button>
     </li>
@@ -417,7 +421,13 @@ function PhaseBlock({
       >
         <Chevron />
         <span className={css.phaseTitle}>{phase.title}</span>
-        <span className={css.phaseCount}>{phase.countText}</span>
+        <span
+          className={css.phaseCount}
+          data-provisional={phase.provisional ? "1" : undefined}
+          title={phase.provisional ? PROVISIONAL_HINT : undefined}
+        >
+          {phase.countText}
+        </span>
         <span className={css.phaseMeta}>{phase.metaText}</span>
       </button>
       {open ? (
@@ -515,9 +525,10 @@ function DetailedCard({
     snapshotAnchorMs: snapshotAnchorRef.current.at,
   });
 
-  const agentsWord = card.totals.totalKnown
-    ? `${card.totals.done + card.totals.failed + card.totals.killed}/${card.totals.agentsTotal} agents`
-    : `${card.totals.done + card.totals.failed + card.totals.killed} agents`;
+  const terminal = card.totals.done + card.totals.failed + card.totals.killed;
+  // Dynamic run in flight: "8/12+ agents" with a tooltip explaining the count
+  // may grow (the bar can move backwards); terminal runs show the final count.
+  const agentsWord = `${terminal}/${card.knownCount}${card.provisional ? "+" : ""} agents`;
 
   const onKey = (event: React.KeyboardEvent) => {
     if (event.key === "Escape" && open) {
@@ -546,10 +557,47 @@ function DetailedCard({
         </span>
         <Chip status={card.status} />
         <span className={css.meta}>
-          <span className={css.rail} aria-hidden="true">
+          {/* Real progress bar: terminal members fill the rail; the failed
+              slice is painted red (killed muted), so a 7/8 + 1 failed run does
+              not read as a plain 100%. While the total is unknown the fill is
+              terminal/known and hatched, never a fabricated denominator. */}
+          <span
+            className={css.rail}
+            data-total={card.provisional ? "provisional" : "known"}
+            data-testid="workflow-rail"
+            aria-hidden="true"
+          >
             <span className={css.railFill} style={{ width: `${card.railPct}%` }} />
+            {card.failedPct > 0 ? (
+              <span
+                className={css.railFail}
+                style={{ left: `${card.donePct}%`, width: `${card.failedPct}%` }}
+              />
+            ) : null}
+            {card.killedPct > 0 ? (
+              <span
+                className={css.railKill}
+                style={{ left: `${card.donePct + card.failedPct}%`, width: `${card.killedPct}%` }}
+              />
+            ) : null}
           </span>
-          <span>{agentsWord}</span>
+          <span
+            data-testid="workflow-rail-count"
+            data-provisional={card.provisional ? "1" : undefined}
+            title={card.provisional ? PROVISIONAL_HINT : undefined}
+          >
+            {agentsWord}
+          </span>
+          {card.totals.failed > 0 ? (
+            <span className={css.railBad} data-testid="workflow-rail-failed">
+              {card.totals.failed} 已失败
+            </span>
+          ) : null}
+          {card.totals.killed > 0 ? (
+            <span className={css.railMute} data-testid="workflow-rail-killed">
+              {card.totals.killed} 已终止
+            </span>
+          ) : null}
           {elapsedMs > 0 ? <span>{fmtDuration(elapsedMs)}</span> : null}
           {card.totals.tokens > 0 ? (
             <span>

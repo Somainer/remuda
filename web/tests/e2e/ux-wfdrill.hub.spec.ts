@@ -138,10 +138,21 @@ test("subagent tool calls fold under the workflow member, not the main transcrip
 
   // The member row carries a foldable live summary of the subagent's calls.
   const memberRow = page.getByTestId("workflow-agent").filter({ hasText: "review:security" });
-  await expect(memberRow.locator("button").filter({ hasText: /1 tool calls/ })).toBeVisible();
-  await memberRow.locator("button").filter({ hasText: /1 tool calls/ }).click();
+  const toolsToggle = memberRow.locator("button").filter({ hasText: /1 tool calls/ });
+  await expect(toolsToggle).toBeVisible();
+  await expect(toolsToggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toolsToggle).toContainText(/▸/);
+  await toolsToggle.click();
   // The folded Bash row renders inside the member row with its command.
   await expect(memberRow).toContainText("reviewing auth path");
+  await expect(toolsToggle).toHaveAttribute("aria-expanded", "true");
+  await expect(toolsToggle).toContainText(/▾/);
+
+  // c-uifold: clicking the same summary row collapses the group again.
+  await toolsToggle.click();
+  await expect(toolsToggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toolsToggle).toContainText(/▸/);
+  await expect(memberRow).not.toContainText("reviewing auth path");
 });
 
 test("a member drills into its sidechain transcript and returns to the session", async ({ page }) => {

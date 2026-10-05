@@ -147,3 +147,48 @@ describe("useStaleCutoffTick", () => {
     expect(isStaleOffline(host as Host, result.current)).toBe(true);
   });
 });
+
+describe("useStaleCutoffTick online/recent hosts (c-perffu r6 gate flake)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("an online recently-seen host is never stale at mount or after ticks", () => {
+    // The gate-flake hypothesis: e2e fake hosts look stale/offline-unknown.
+    const online: StaleClockHost = {
+      state: "online",
+      online: true,
+      ssh: undefined,
+      lastSeenAt: new Date(T0 - 1_000).toISOString(),
+    };
+    const freshOffline: StaleClockHost = {
+      state: "offline",
+      online: false,
+      ssh: undefined,
+      lastSeenAt: new Date(T0 - 1_000).toISOString(),
+    };
+    const { result, rerender } = renderHook(
+      ({ list }) => useStaleCutoffTick(list),
+      { initialProps: { list: [online, freshOffline] } },
+    );
+    expect(isStaleOffline(online as Host, result.current)).toBe(false);
+    expect(isStaleOffline(freshOffline as Host, result.current)).toBe(false);
+
+    // 30 display minutes worth of ticks with equal references.
+    for (let i = 0; i < 120; i += 1) {
+      act(() => {
+        vi.advanceTimersByTime(15_000);
+      });
+      rerender({ list: [online, freshOffline] });
+    }
+    expect(isStaleOffline(online as Host, result.current)).toBe(false);
+    // Freshly seen offline (lastSeen at T0-1s, now T0+30m) is still inside
+    // the 30-minute window at exactly 30m (strict >) — classification of an
+    // actual stale host is exercised elsewhere; online must NEVER flip.
+    expect(isStaleOffline(online as Host, result.current + 60_000)).toBe(false);
+  });
+});

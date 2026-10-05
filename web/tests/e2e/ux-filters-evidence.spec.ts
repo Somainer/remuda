@@ -91,7 +91,7 @@ async function shot(page: Page, name: string) {
   // The fixture is synthetic; assert none of the default mock inventory — whose
   // host labels and home paths are not publishable — survived into the frame.
   // Matching the fixture's own vocabulary keeps this free of any real identifier.
-  for (const leaked of ["devbox", "sfe-root", "valhalla", "/Users/", "/home/devuser"]) {
+  for (const leaked of ["devbox", "demo-root", "valhalla", "/Users/", "/home/devuser"]) {
     expect(rendered, `${name} must not show default mock inventory`).not.toContain(leaked);
   }
   expect(rendered).toContain("demo-node-");

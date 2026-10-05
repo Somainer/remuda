@@ -1107,7 +1107,7 @@ identity, guard checks and exact commands. Status: `BLOCKED awaiting-caddy-resta
 Device pairing and the cookie session on `https://remuda.<zone>` passed, including
 one-time pairing-code reuse rejection. Authenticated `POST /v1/hosts/enroll-token`
 returned HTTP 405: the deployed `remuda-hub:e3a4133` predates D-018. No Node daemon
-was installed and no SG/bolt persistent change was made under this milestone.
+was installed and no SG/devbox persistent change was made under this milestone.
 The Mac Herdr default isolation fix and remaining acceptance/remote install plan
 are recorded in [intranet-enroll-1.md](./evidence/intranet-enroll-1.md).
 An approved compatible Hub upgrade is required before enrollment can continue.
@@ -1120,7 +1120,7 @@ The new Mac launchd Node uses isolated Herdr defaults and an optimized binary;
 host identity and credential persisted across its binary upgrade. Shell prompt/reply
 and stop passed. A controlled WSS interruption replayed four offline journal events
 from Hub watermark 7 to 11 with the same PID and host ID. Caddy and the existing
-demo remained untouched; no SG/bolt Node was installed.
+demo remained untouched; no SG/devbox Node was installed.
 
 Remaining blocker: `native-claude-sessionstart`. Bounded Claude PTY attempts
 (including 180 seconds on the optimized release) launched Claude but produced no

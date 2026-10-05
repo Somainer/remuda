@@ -4,7 +4,7 @@
 
 对应 owner findings（2026-09-17 14:32，远端 Node，`ssh-stdio` + driver `shell-pty`）：
 在 New Session 选 `模型来源 = 网关`（profile Doubao AI）并输入
-`passthrough/ark/seed-evolving`，Hub instance 记录写着 `delegation gateway` +
+`passthrough/ark/model-y`，Hub instance 记录写着 `delegation gateway` +
 providerProfileId + 该 model，但 Node 的 `launch/settings.json` 落的是**宿主用户自己的
 settings**，会话跑在宿主网关上，等同于选了 `跟随主机`。
 
@@ -74,7 +74,7 @@ user settings.json
 
 | 字段 | 值 |
 |---|---|
-| `model` | `ark/seed-evolving[1m]`（宿主的） |
+| `model` | `ark/model-y[1m]`（宿主的） |
 | `env.ANTHROPIC_BASE_URL` host | `host-native.example` ❌ |
 | `env` KEY NAMES（10） | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_MODEL`, `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_SUBAGENT_MODEL`, `HOST_ONLY` |
 
@@ -82,7 +82,7 @@ user settings.json
 
 | 字段 | 值 |
 |---|---|
-| `model` | `passthrough/ark/seed-evolving` ✅ |
+| `model` | `passthrough/ark/model-y` ✅ |
 | `env.ANTHROPIC_BASE_URL` host | `gateway.example` ✅ |
 | `env` KEY NAMES（10） | 与上表同 —— **宿主的 `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` / `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 全部存活** ❌ |
 
@@ -92,7 +92,7 @@ user settings.json
 
 | 字段 | 值 |
 |---|---|
-| `model` | `passthrough/ark/seed-evolving` ✅ |
+| `model` | `passthrough/ark/model-y` ✅ |
 | `env.ANTHROPIC_BASE_URL` host | `gateway.example` ✅ |
 | `env` KEY NAMES（4） | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`, `HOST_ONLY` |
 | 宿主 model / endpoint 变量 | 6 个全部剥除 ✅ |
@@ -104,7 +104,7 @@ user settings.json
 
 | 字段 | 值 |
 |---|---|
-| `model` | `ark/seed-evolving[1m]`（宿主的）✅ |
+| `model` | `ark/model-y[1m]`（宿主的）✅ |
 | `env.ANTHROPIC_BASE_URL` host | `host-native.example` ✅ |
 | `env` KEY NAMES（10） | 与修复前 (a) 完全一致 —— 原样透传 ✅ |
 
@@ -119,7 +119,7 @@ user settings.json
 | `status` | `overlay` | `host-native` |
 | `related_ids.delegation` | `gateway` | `none` |
 | `related_ids.providerProfileId` | recipe 的 profile id | 同 |
-| `related_ids.effectiveModel` | `passthrough/ark/seed-evolving` | 宿主 model |
+| `related_ids.effectiveModel` | `passthrough/ark/model-y` | 宿主 model |
 | `related_ids.hostSettingsSeeded` | `true` / `false` | 同 |
 
 只有名字和 id：单测断言 `related_ids` 里既不含 `token` 也不含 `gateway.example`
@@ -129,7 +129,7 @@ user settings.json
 
 `web/src/pages/NewSessionPage.tsx` 的摘要行原本插值
 `defaultGateway.defaultModel`（profile 默认），于是截图里 model 输入框是
-`passthrough/ark/seed-evolving`、摘要行却是 `Doubao AI · claude-opus-4-8`，页面与它
+`passthrough/ark/model-y`、摘要行却是 `Doubao AI · claude-opus-4-8`，页面与它
 即将发起的 run 自相矛盾。改为插值 `launchModel` —— 也就是 create 请求真正携带的那个值
 （`gatewayModel ?? model`，同一变量、同一渲染）。页面其余部分未改动。
 

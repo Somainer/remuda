@@ -21,7 +21,7 @@ Hub `127.0.0.1:38080`, Node `127.0.0.1:38787` via `remuda dev` (`REMUDA_COOKIE_S
 | Prompt `Now reply DONE` | assistant **DONE** |
 | Same for kind=codex, worktree `uicodex` | `ins_01a09693-…`; screen `• PONG` then `• DONE` |
 
-Grok 4.6 (xhigh) · `--always-approve`. Codex v0.154.0 gpt-6-astra max · YOLO. Both idle after the second turn. List rows: `running · idle · connected` · `generic-pty`.
+Grok 4.6 (xhigh) · `--always-approve`. Codex v0.154.0 model-z max · YOLO. Both idle after the second turn. List rows: `running · idle · connected` · `generic-pty`.
 
 ## Screenshots
 

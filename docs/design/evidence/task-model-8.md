@@ -33,7 +33,7 @@
    - vitest：同工作区 id 在两主机上是两个不同键；跨主机项目给出 3 行（含 1 个未注册对）与 `["hst_a","hst_b"]` 主机集合。
    - e2e：跨机项目详情 2 个成员行，`data-space-key` 恰为 `JSON.stringify([hostA,wspA])` 与 `JSON.stringify([hostB,wspB])`，集合大小 2；两行各显示自己的 `/tmp/remuda-project-a|b` 根，无「工作区尚未注册」回退。
 4. **BotChannel.defaultProject 仍是有效引用**：
-   - `channels.ts` 一字未动（`"sfe-root"`）；`projectLabel(id, [])` 在目录不含该 id 时逐字返回原串（不置空、不改写），BotsPage 通道详情继续渲染 `默认项目 sfe-root`。vitest 遍历 `BOT_CHANNELS` 断言引用非空且空目录下回退为原串；e2e 在 `/bots/feishu` 的 `bot-defaults` 上断言文本可见。
+   - `channels.ts` 一字未动（`"demo-root"`）；`projectLabel(id, [])` 在目录不含该 id 时逐字返回原串（不置空、不改写），BotsPage 通道详情继续渲染 `默认项目 demo-root`。vitest 遍历 `BOT_CHANNELS` 断言引用非空且空目录下回退为原串；e2e 在 `/bots/feishu` 的 `bot-defaults` 上断言文本可见。
 
 ## 顶栏与 IA
 

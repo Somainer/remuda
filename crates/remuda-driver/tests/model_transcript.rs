@@ -120,32 +120,32 @@ fn first_assistant_model_emits_then_identical_dedupes() {
 fn accepted_switch_settles_from_the_stdout_verdict_without_an_assistant_record() {
     let mut mapper = mapper();
     mapper.map_line(&assistant(Some("a"), 0)).unwrap();
-    mapper.map_line(&user_slash("model_hub/x", 1)).unwrap();
+    mapper.map_line(&user_slash("acme_hub/x", 1)).unwrap();
     let out = mapper
         .map_line(&user_stdout(
-            "Set model to `model_hub/x` and saved as your default for new sessions",
+            "Set model to `acme_hub/x` and saved as your default for new sessions",
             1,
         ))
         .unwrap();
     assert_eq!(
         model_edges(&out),
-        vec![("model_hub/x".to_string(), EffortSource::Slash)]
+        vec![("acme_hub/x".to_string(), EffortSource::Slash)]
     );
     // A later assistant record with that id is deduped.
-    assert!(model_edges(&mapper.map_line(&assistant(Some("model_hub/x"), 2)).unwrap()).is_empty());
+    assert!(model_edges(&mapper.map_line(&assistant(Some("acme_hub/x"), 2)).unwrap()).is_empty());
 }
 
 #[test]
 fn alias_resolution_reports_the_resolved_id_not_the_typed_word() {
     let mut mapper = mapper();
     mapper
-        .map_line(&assistant(Some("model_hub/es1_orange_o48[1m]"), 0))
+        .map_line(&assistant(Some("acme_hub/model_x_o48[1m]"), 0))
         .unwrap();
     mapper.map_line(&user_slash("sonnet", 1)).unwrap();
     // The verdict spells the concrete gateway id the alias resolved to.
     let out = mapper
         .map_line(&user_stdout(
-            "Set model to `model_hub/es1_orange_o48[1m]` and saved as your default for new sessions",
+            "Set model to `acme_hub/model_x_o48[1m]` and saved as your default for new sessions",
             1,
         ))
         .unwrap();
@@ -157,18 +157,18 @@ fn alias_resolution_reports_the_resolved_id_not_the_typed_word() {
 fn env_hint_second_line_does_not_poison_the_resolved_id() {
     let mut mapper = mapper();
     mapper
-        .map_line(&user_slash("model_hub/es1_orange_o50", 1))
+        .map_line(&user_slash("acme_hub/model_x_o50", 1))
         .unwrap();
     let out = mapper
         .map_line(&user_stdout(
-            "Set model to `model_hub/es1_orange_o50` and saved as your default for new sessions\n\
-                 ANTHROPIC_MODEL is set to `model_hub/es1_orange_o48[1m]`",
+            "Set model to `acme_hub/model_x_o50` and saved as your default for new sessions\n\
+                 ANTHROPIC_MODEL is set to `acme_hub/model_x_o48[1m]`",
             1,
         ))
         .unwrap();
     assert_eq!(
         model_edges(&out),
-        vec![("model_hub/es1_orange_o50".to_string(), EffortSource::Slash)]
+        vec![("acme_hub/model_x_o50".to_string(), EffortSource::Slash)]
     );
 }
 
@@ -238,7 +238,7 @@ fn real_walk_observes_the_resolved_gateway_ids() {
     let ids: Vec<&str> = edges.iter().map(|(id, _)| id.as_str()).collect();
     assert!(ids.contains(&"claude-opus-4-8"), "baseline: {ids:?}");
     assert!(
-        ids.contains(&"model_hub/es1_orange_o50"),
+        ids.contains(&"acme_hub/model_x_o50"),
         "gateway id edge: {ids:?}"
     );
 }
@@ -258,20 +258,20 @@ async fn real_walk_switch_resolves_its_bridge_from_the_stdout_verdict() {
         "model-session",
         "2.1.272",
     );
-    let generation = bridge.arm("model_hub/es1_orange_o50");
+    let generation = bridge.arm("acme_hub/model_x_o50");
     let slash = WALK
         .lines()
-        .find(|l| l.contains("<command-args>model_hub/es1_orange_o50</command-args>"))
+        .find(|l| l.contains("<command-args>acme_hub/model_x_o50</command-args>"))
         .expect("o50 slash");
     mapper.map_line(slash).unwrap();
     let stdout = WALK
         .lines()
-        .find(|l| l.contains("Set model to `model_hub/es1_orange_o50`"))
+        .find(|l| l.contains("Set model to `acme_hub/model_x_o50`"))
         .expect("o50 stdout");
     mapper.map_line(stdout).unwrap();
     match bridge.wait(generation, Duration::from_secs(1)).await {
         Some(remuda_driver::model::ModelReadback::Applied(observed)) => {
-            assert_eq!(observed.id, "model_hub/es1_orange_o50");
+            assert_eq!(observed.id, "acme_hub/model_x_o50");
         }
         other => panic!("expected Applied o50, got {other:?}"),
     }

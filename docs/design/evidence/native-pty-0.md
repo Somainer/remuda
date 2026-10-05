@@ -79,7 +79,7 @@ $ AB_CWD=… AB_SETTLE=14 screen_ab claude
 两份快照的**开头**：
 
 ```
-ring     ^[[33m"passthrough/ark/seed-evolving" isn't described by this version's …
+ring     ^[[33m"passthrough/ark/model-y" isn't described by this version's …
 repaint  ^[[!p^[[?1049h^[[?25h^[[m^[[H^[[J
          ^[[38;2;215;119;87m▐▛███▙  ^[[39;49;1mClaude Code^[[C^[[38;2;153;153;153;22mv2.1.270
 ```

@@ -191,35 +191,35 @@ afterEach(() => {
 it("the launch snapshot records the discovered catalog and current model", async () => {
   const ctx = await startFollowing("catalog");
   ctx.receive(
-    modelEvent(2, "ark/seed-evolving[1m]", "launch", {
-      models: ["ark/seed-evolving[1m]", "model_hub/es1_orange_o50", "model_hub/es1_orange_o48"],
+    modelEvent(2, "ark/model-y[1m]", "launch", {
+      models: ["ark/model-y[1m]", "acme_hub/model_x_o50", "acme_hub/model_x_o48"],
       source: "gateway-discovery",
     }),
   );
   const catalog = hubStore.modelCatalogOf(ctx.instance.id);
   expect(catalog?.source).toBe("gateway-discovery");
-  expect(catalog?.models).toContain("model_hub/es1_orange_o50");
+  expect(catalog?.models).toContain("acme_hub/model_x_o50");
   // The picker list includes discovered ids and the current model.
-  expect(hubStore.modelListOf(ctx.instance.id)).toContain("model_hub/es1_orange_o50");
-  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("ark/seed-evolving[1m]");
+  expect(hubStore.modelListOf(ctx.instance.id)).toContain("acme_hub/model_x_o50");
+  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("ark/model-y[1m]");
 });
 
 it("a terminal-side /model moves the picker without posting configure", async () => {
   const ctx = await startFollowing("terminal");
   const configure = vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  ctx.receive(modelEvent(2, "model_hub/base", "launch"));
+  ctx.receive(modelEvent(2, "acme_hub/base", "launch"));
   // Human types /model in the terminal and picks a gateway id.
-  ctx.receive(modelEvent(3, "model_hub/es1_orange_o50", "slash"));
-  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/es1_orange_o50");
-  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/es1_orange_o50");
+  ctx.receive(modelEvent(3, "acme_hub/model_x_o50", "slash"));
+  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("acme_hub/model_x_o50");
+  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("acme_hub/model_x_o50");
   expect(configure).not.toHaveBeenCalled();
 });
 
 it("case (a) launch A / read-back A: chip A, no diagnostic", async () => {
-  const ctx = await startFollowing("chip-a", "model_hub/A");
-  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/A");
-  ctx.receive(modelEvent(2, "model_hub/A", "launch"));
-  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/A");
+  const ctx = await startFollowing("chip-a", "acme_hub/A");
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("acme_hub/A");
+  ctx.receive(modelEvent(2, "acme_hub/A", "launch"));
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("acme_hub/A");
   // Agreeing read-back records no divergence.
   expect(
     allModelPinMismatches(
@@ -232,26 +232,26 @@ it("case (a) launch A / read-back A: chip A, no diagnostic", async () => {
 });
 
 it("case (b) launch A / read-back B: chip B, diagnostic recorded verbatim", async () => {
-  const ctx = await startFollowing("chip-b", "model_hub/A");
-  ctx.receive(modelEvent(2, "model_hub/B", "launch"));
-  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/B");
-  ctx.receive(modelPinMismatchEvent(3, "model_hub/A", "model_hub/B"));
+  const ctx = await startFollowing("chip-b", "acme_hub/A");
+  ctx.receive(modelEvent(2, "acme_hub/B", "launch"));
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("acme_hub/B");
+  ctx.receive(modelPinMismatchEvent(3, "acme_hub/A", "acme_hub/B"));
   const events = (hubStore as unknown as { state: { events: Record<string, Observation[]> } })
     .state.events[ctx.instance.id];
   expect(modelPinMismatches(events)).toEqual([
-    { requested: "model_hub/A", observed: "model_hub/B", observedAt: "2026-09-16T00:03:00Z", eventId: "evt_pin_3" },
+    { requested: "acme_hub/A", observed: "acme_hub/B", observedAt: "2026-09-16T00:03:00Z", eventId: "evt_pin_3" },
   ]);
 });
 
 it("case (c) then /model C: chip C, the launch diagnostic stays as history", async () => {
-  const ctx = await startFollowing("chip-c", "model_hub/A");
-  ctx.receive(modelEvent(2, "model_hub/B", "launch"));
-  ctx.receive(modelPinMismatchEvent(3, "model_hub/A", "model_hub/B"));
-  ctx.receive(modelEvent(4, "model_hub/C", "slash"));
-  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/C");
-  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/C");
+  const ctx = await startFollowing("chip-c", "acme_hub/A");
+  ctx.receive(modelEvent(2, "acme_hub/B", "launch"));
+  ctx.receive(modelPinMismatchEvent(3, "acme_hub/A", "acme_hub/B"));
+  ctx.receive(modelEvent(4, "acme_hub/C", "slash"));
+  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("acme_hub/C");
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("acme_hub/C");
   // The picker moved with the terminal switch without a configure round-trip.
-  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/C");
+  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("acme_hub/C");
   // The launch diagnostic remains in the window as history.
   const events = (hubStore as unknown as { state: { events: Record<string, Observation[]> } })
     .state.events[ctx.instance.id];
@@ -262,21 +262,21 @@ it("the launch divergence diagnostic is recorded verbatim and survives a later /
   // Cases (b)+(c) for run details: the chip shows the running id, and the
   // AUTHORITATIVE Node diagnostic carries requested/observed verbatim. A
   // later switch changes the chip but the diagnostic stays as history.
-  const ctx = await startFollowing("pin-diag", "model_hub/A");
-  ctx.receive(modelEvent(2, "model_hub/B", "launch"));
-  ctx.receive(modelPinMismatchEvent(3, "model_hub/A", "model_hub/B"));
+  const ctx = await startFollowing("pin-diag", "acme_hub/A");
+  ctx.receive(modelEvent(2, "acme_hub/B", "launch"));
+  ctx.receive(modelPinMismatchEvent(3, "acme_hub/A", "acme_hub/B"));
   // Chip says B only...
-  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/B");
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("acme_hub/B");
   // ...run details holds the record verbatim.
   let mismatches = modelPinMismatches((hubStore as unknown as { state: { events: Record<string, Observation[]> } }).state.events[ctx.instance.id] ?? []);
-  expect(mismatches).toEqual([{ requested: "model_hub/A", observed: "model_hub/B", observedAt: "2026-09-16T00:03:00Z", eventId: "evt_pin_3" }]);
+  expect(mismatches).toEqual([{ requested: "acme_hub/A", observed: "acme_hub/B", observedAt: "2026-09-16T00:03:00Z", eventId: "evt_pin_3" }]);
 
   // Operator then switches to C: chip moves, the diagnostic remains.
-  ctx.receive(modelEvent(4, "model_hub/C", "slash"));
-  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/C");
+  ctx.receive(modelEvent(4, "acme_hub/C", "slash"));
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("acme_hub/C");
   mismatches = modelPinMismatches((hubStore as unknown as { state: { events: Record<string, Observation[]> } }).state.events[ctx.instance.id] ?? []);
   expect(mismatches).toHaveLength(1);
-  expect(mismatches[0]).toMatchObject({ requested: "model_hub/A", observed: "model_hub/B" });
+  expect(mismatches[0]).toMatchObject({ requested: "acme_hub/A", observed: "acme_hub/B" });
 });
 
 it("no launch model and a read-back shows the running id and invents nothing", async () => {
@@ -284,14 +284,14 @@ it("no launch model and a read-back shows the running id and invents nothing", a
   const ctx = await startFollowing("chip-d", undefined);
   expect(ctx.instance.model).toBeUndefined();
   expect(hubStore.runningModelOf(ctx.instance.id)).toBeNull();
-  ctx.receive(modelEvent(2, "model_hub/X", "unknown"));
-  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/X");
+  ctx.receive(modelEvent(2, "acme_hub/X", "unknown"));
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("acme_hub/X");
 });
 
 it("a settled configure still folds the picker and clears pending", async () => {
-  const ctx = await startFollowing("configure", "ark/seed-evolving");
+  const ctx = await startFollowing("configure", "ark/model-y");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  ctx.receive(modelEvent(2, "ark/seed-evolving", "launch"));
+  ctx.receive(modelEvent(2, "ark/model-y", "launch"));
   await hubStore.setModel(ctx.instance.id, "e2e/fast");
   // The configure edge stamps requested=e2e/fast, effective=e2e/plain.
   ctx.receive(modelEvent(3, "e2e/plain", "remuda", undefined, "e2e/fast"));
@@ -305,24 +305,24 @@ it("a settled configure still folds the picker and clears pending", async () => 
 it("our pending push-down clears on read-back and reports the resolved id", async () => {
   const ctx = await startFollowing("pending");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  ctx.receive(modelEvent(2, "model_hub/es1_orange_o48[1m]", "launch"));
+  ctx.receive(modelEvent(2, "acme_hub/model_x_o48[1m]", "launch"));
   await hubStore.setModel(ctx.instance.id, "sonnet");
   expect(hubStore.modelPendingOf(ctx.instance.id)?.id).toBe("sonnet");
   // sonnet resolves through the pinned env to the concrete gateway id.
-  ctx.receive(modelEvent(3, "model_hub/es1_orange_o48[1m]", "remuda"));
+  ctx.receive(modelEvent(3, "acme_hub/model_x_o48[1m]", "remuda"));
   expect(hubStore.modelPendingOf(ctx.instance.id)).toBeNull();
-  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/es1_orange_o48[1m]");
+  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("acme_hub/model_x_o48[1m]");
 });
 
 it("a not-found lifecycle clears pending, reverts, and toasts", async () => {
   const ctx = await startFollowing("notfound");
   const configure = vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
   const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
-  ctx.receive(modelEvent(2, "model_hub/base", "launch"));
+  ctx.receive(modelEvent(2, "acme_hub/base", "launch"));
   await hubStore.setModel(ctx.instance.id, "bogus-xyz-123");
   ctx.receive(configureLifecycle(3, "model-degraded:bogus-xyz-123:not-found", ctx.instance.id));
   expect(hubStore.modelPendingOf(ctx.instance.id)).toBeNull();
-  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/base");
+  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("acme_hub/base");
   expect(toast).toHaveBeenCalled();
   expect(configure).toHaveBeenCalledTimes(1);
 });
@@ -331,13 +331,13 @@ it("a rejected instance.configure clears modelPending, reverts and toasts the re
   const ctx = await startFollowing("rejected");
   vi.spyOn(api, "instanceConfigure").mockRejectedValue(new Error("HOST_OFFLINE node down"));
   const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
-  ctx.receive(modelEvent(2, "model_hub/base", "launch"));
+  ctx.receive(modelEvent(2, "acme_hub/base", "launch"));
   // Must not throw: the store is the failure mouth (SessionPage does not void
   // the promise, so a rethrow would be an unhandled rejection).
   await expect(hubStore.setModel(ctx.instance.id, "sonnet")).resolves.toBeUndefined();
   expect(hubStore.modelPendingOf(ctx.instance.id)).toBeNull();
   // Optimistic selection reverted to the last observed effective id.
-  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/base");
+  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("acme_hub/base");
   expect(toast).toHaveBeenCalledTimes(1);
   expect(toast.mock.calls[0][0]).toContain("HOST_OFFLINE node down");
 });
@@ -346,8 +346,8 @@ it("a catalog-only refresh edge never settles an in-flight switch", async () => 
   const ctx = await startFollowing("catalogrefresh");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
   ctx.receive(
-    modelEvent(2, "model_hub/base", "launch", {
-      models: ["model_hub/base"],
+    modelEvent(2, "acme_hub/base", "launch", {
+      models: ["acme_hub/base"],
       source: "gateway-discovery",
     }),
   );
@@ -355,16 +355,16 @@ it("a catalog-only refresh edge never settles an in-flight switch", async () => 
   expect(hubStore.modelPendingOf(ctx.instance.id)?.id).toBe("sonnet");
   // The scoped cache lands a beat later: catalog updates, pending survives.
   ctx.receive(
-    catalogRefreshEvent(3, "model_hub/base", {
-      models: ["model_hub/base", "sonnet", "model_hub/o50"],
+    catalogRefreshEvent(3, "acme_hub/base", {
+      models: ["acme_hub/base", "sonnet", "acme_hub/o50"],
       source: "gateway-discovery",
     }),
   );
   expect(hubStore.modelPendingOf(ctx.instance.id)?.id).toBe("sonnet");
-  expect(hubStore.modelListOf(ctx.instance.id)).toContain("model_hub/o50");
+  expect(hubStore.modelListOf(ctx.instance.id)).toContain("acme_hub/o50");
   // The optimistic selection was not moved back to the stale effective id.
   expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("sonnet");
   // The real verdict then settles normally.
-  ctx.receive(modelEvent(4, "model_hub/o48", "remuda"));
+  ctx.receive(modelEvent(4, "acme_hub/o48", "remuda"));
   expect(hubStore.modelPendingOf(ctx.instance.id)).toBeNull();
 });

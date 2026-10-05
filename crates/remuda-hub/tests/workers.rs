@@ -520,7 +520,7 @@ async fn create_synth_profile(ctx: &Ctx, models: Value) -> (reqwest::StatusCode,
     ctx.request("POST", "/v1/providers", Some(body)).await
 }
 
-const SYNTH_MODELS: &str = "passthrough/synth/seed-evolving";
+const SYNTH_MODELS: &str = "passthrough/synth/model-y";
 
 #[tokio::test]
 async fn dispatch_refuses_unknown_model_pin_without_provisioning() {
@@ -540,13 +540,13 @@ async fn dispatch_refuses_unknown_model_pin_without_provisioning() {
     // The 2026-09-17 shape: pin carries a [1m] tag and lacks the
     // `passthrough/` prefix the catalog id has.
     let mut pinned = ctx.dispatch_body(project_id);
-    pinned["model"] = json!("synth/seed-evolving[1m]");
+    pinned["model"] = json!("synth/model-y[1m]");
     let (status, body) = ctx
         .request("POST", "/v1/workers/dispatch", Some(pinned))
         .await;
     assert_eq!(status, 409, "expected PIN_REFUSED, got {status} {body}");
     assert_eq!(body["code"], json!("PIN_REFUSED"));
-    assert_eq!(body["pin"]["model"], json!("synth/seed-evolving[1m]"));
+    assert_eq!(body["pin"]["model"], json!("synth/model-y[1m]"));
     let suggestions = body["suggestions"].as_array().unwrap();
     assert!(suggestions.len() <= 5);
     assert!(

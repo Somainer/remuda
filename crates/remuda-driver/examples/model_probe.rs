@@ -4,11 +4,17 @@
 //!   PROBE_DIR=/tmp/remuda-c-modelsync-probe1 \
 //!     cargo run -p remuda-driver --example model_probe
 //!
+//! Scenario B needs a real gateway id — this probe talks to a live gateway,
+//! so it never hard-codes one (a fictional id would 404). Set it explicitly;
+//! when the variable is unset, scenario B is skipped with a message:
+//!
+//!   REMUDA_PROBE_GATEWAY_MODEL=acme_hub/<real-gateway-id>
+//!
 //! Scenario (all switches while idle):
 //!   boot  scoped CLAUDE_CONFIG_DIR (onboarding pre-seeded, gateway env inherited)
 //!   base  prompt (baseline assistant record → message.model)
 //!   A     /model sonnet              confirm → prompt   (alias verdict + resolved model)
-//!   B     /model model_hub/es1_orange_o50  confirm → prompt (gateway id verdict)
+//!   B     /model $REMUDA_PROBE_GATEWAY_MODEL confirm → prompt (gateway id verdict; skipped if unset)
 //!   C     /model bogus-xyz                            (error shape)
 //!   D     /model haiku  ESC                           (dismiss: kept verdict?)
 //!   E     /model (bare)                               (picker entries = real list)
@@ -516,21 +522,41 @@ async fn main() {
     }
     Probe::sleep_ms(1_500).await;
 
-    // B: gateway id + confirm + prompt.
-    probe.submit("/model model_hub/es1_orange_o50").await;
-    let b_start = probe.t0.elapsed().as_millis();
-    let confirmed = probe.await_dialog("b").await;
-    probe.mark("b:dialog-confirmed", &confirmed.to_string());
-    probe
-        .race(b_start, 6_000, Some("o50"), "b", &["slash", "stdout"])
-        .await;
-    Probe::sleep_ms(300).await;
-    probe.submit("reply with exactly: ok").await;
-    match probe.wait_message_model(120_000).await {
-        Some((dt, model)) => probe.mark("b:assistant", &format!("+{dt}ms message.model={model}")),
-        None => probe.mark("b:assistant", "MISSING"),
+    // B: gateway id + confirm + prompt. The id must name a model the live
+    // gateway actually serves, so it comes solely from the environment; with
+    // no default there is no way for this probe to request a fictional id.
+    let gateway_model = std::env::var("REMUDA_PROBE_GATEWAY_MODEL")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    match gateway_model.as_deref() {
+        Some(gateway_model) => {
+            // The on-screen verdict echoes the id; match its final path
+            // segment (e.g. `…/o50`) the same way the alias case matches
+            // `sonnet`, so the check survives the gateway's prefix.
+            let needle = gateway_model.rsplit('/').next().unwrap_or(gateway_model);
+            probe.submit(&format!("/model {gateway_model}")).await;
+            let b_start = probe.t0.elapsed().as_millis();
+            let confirmed = probe.await_dialog("b").await;
+            probe.mark("b:dialog-confirmed", &confirmed.to_string());
+            probe
+                .race(b_start, 6_000, Some(needle), "b", &["slash", "stdout"])
+                .await;
+            Probe::sleep_ms(300).await;
+            probe.submit("reply with exactly: ok").await;
+            match probe.wait_message_model(120_000).await {
+                Some((dt, model)) => {
+                    probe.mark("b:assistant", &format!("+{dt}ms message.model={model}"))
+                }
+                None => probe.mark("b:assistant", "MISSING"),
+            }
+            Probe::sleep_ms(1_500).await;
+        }
+        None => {
+            eprintln!("skipping scenario B: set REMUDA_PROBE_GATEWAY_MODEL to a real gateway id");
+            probe.mark("b:skipped", "REMUDA_PROBE_GATEWAY_MODEL unset");
+        }
     }
-    Probe::sleep_ms(1_500).await;
 
     // C: bogus id.
     probe.submit("/model bogus-xyz-123").await;

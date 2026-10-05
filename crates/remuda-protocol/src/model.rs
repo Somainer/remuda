@@ -8,7 +8,7 @@
 //! (`docs/design/evidence/model-sync-1.md`):
 //!
 //! - assistant records carry the resolved model id at `message.model`
-//!   (gateway ids included, e.g. `ark/seed-evolving`);
+//!   (gateway ids included, e.g. `ark/model-y`);
 //! - `/model <id>` is journaled as a `user` record whose message content is
 //!   `<command-name>/model</command-name> … <command-args>id</command-args>`
 //!   followed immediately by a SECOND `user` record carrying the verdict in
@@ -110,11 +110,11 @@ fn resolved_id_after_prefix(rest: &str) -> Option<String> {
 /// Parse the verdict out of a `/model` `<local-command-stdout>` line.
 ///
 /// Measured strings:
-/// - `` Set model to `model_hub/es1_orange_o48[1m]` and saved as your default
+/// - `` Set model to `acme_hub/model_x_o48[1m]` and saved as your default
 ///   for new sessions `` (plus an optional dim second line about
 ///   `ANTHROPIC_MODEL` being set)
-/// - `Set model to \x1b[1mseed-evolving\x1b[22m and saved as your default …`
-/// - `` Kept model as `model_hub/es1_orange_o48[1m]` ``
+/// - `Set model to \x1b[1mmodel-y\x1b[22m and saved as your default …`
+/// - `` Kept model as `acme_hub/model_x_o48[1m]` ``
 /// - `Model 'bogus-xyz-123' not found`
 pub fn parse_model_stdout(text: &str) -> ModelStdout {
     // The env-override hint rides a second dim line and itself contains
@@ -292,7 +292,7 @@ pub enum ModelPinVerdict {
     /// refusal offence.
     Mismatch,
     /// The observation is an upstream resolution of the pin, in a vocabulary
-    /// the pin cannot be compared against (`model_hub/es1_orange_o50[1m]` →
+    /// the pin cannot be compared against (`acme_hub/model_x_o50[1m]` →
     /// `claude-opus-5`). Reported, never refused: measured on a real gateway,
     /// a correct launch and a substituted one look identical here.
     Unresolvable,
@@ -327,7 +327,7 @@ fn is_namespaced(id: &str) -> bool {
 ///   the session is on a model nobody asked for.
 /// - the pin is namespaced and the observation is not → [`Unresolvable`]. This
 ///   is the gateway resolving the pin to a vendor name. A correctly pinned
-///   session records `claude-opus-5` for `model_hub/es1_orange_o50[1m]`, and a
+///   session records `claude-opus-5` for `acme_hub/model_x_o50[1m]`, and a
 ///   substituted one records `claude-opus-4-8`; neither upstream name is in the
 ///   catalog, so this channel cannot tell them apart and must not refuse.
 /// - neither namespaced and different → [`Mismatch`]: two bare aliases
@@ -363,7 +363,7 @@ pub fn compare_model_pin(pin: &str, observed: &str, catalog: &[String]) -> Model
         (true, false) if in_catalog(observed) => ModelPinVerdict::Mismatch,
         (true, false) => ModelPinVerdict::Unresolvable,
         // A bare pin (`sonnet`) against a namespaced observation is the gateway
-        // resolving an alias: `sonnet` → `model_hub/es1_orange_o48`. Not
+        // resolving an alias: `sonnet` → `acme_hub/model_x_o48`. Not
         // comparable either way round.
         (false, true) => ModelPinVerdict::Unresolvable,
         (false, false) => ModelPinVerdict::Mismatch,
@@ -502,24 +502,24 @@ mod tests {
     #[test]
     fn parses_every_measured_accept_shape() {
         match parse_model_stdout(
-            "Set model to `model_hub/es1_orange_o48[1m]` and saved as your default for new sessions",
+            "Set model to `acme_hub/model_x_o48[1m]` and saved as your default for new sessions",
         ) {
-            ModelStdout::Accepted(o) => assert_eq!(o.id, "model_hub/es1_orange_o48[1m]"),
+            ModelStdout::Accepted(o) => assert_eq!(o.id, "acme_hub/model_x_o48[1m]"),
             other => panic!("{other:?}"),
         }
         // The dim ANTHROPIC_MODEL hint rides the second line with more
         // backticked ids — it must not be mistaken for the resolved id.
-        let with_hint = "Set model to `model_hub/es1_orange_o50` and saved as your default for \
-new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`model_hub/es1_orange_o48[1m]`\x1b[22m";
+        let with_hint = "Set model to `acme_hub/model_x_o50` and saved as your default for \
+new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`acme_hub/model_x_o48[1m]`\x1b[22m";
         match parse_model_stdout(with_hint) {
-            ModelStdout::Accepted(o) => assert_eq!(o.id, "model_hub/es1_orange_o50"),
+            ModelStdout::Accepted(o) => assert_eq!(o.id, "acme_hub/model_x_o50"),
             other => panic!("{other:?}"),
         }
         // 2.1.221 bold spelling.
         match parse_model_stdout(
-            "Set model to \x1b[1mseed-evolving\x1b[22m and saved as your default for new sessions",
+            "Set model to \x1b[1mmodel-y\x1b[22m and saved as your default for new sessions",
         ) {
-            ModelStdout::Accepted(o) => assert_eq!(o.id, "seed-evolving"),
+            ModelStdout::Accepted(o) => assert_eq!(o.id, "model-y"),
             other => panic!("{other:?}"),
         }
     }
@@ -527,7 +527,7 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
     #[test]
     fn parses_kept_and_not_found() {
         assert_eq!(
-            parse_model_stdout("Kept model as `model_hub/es1_orange_o48[1m]`"),
+            parse_model_stdout("Kept model as `acme_hub/model_x_o48[1m]`"),
             ModelStdout::Kept
         );
         assert_eq!(
@@ -543,10 +543,10 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
     #[test]
     fn slash_args_shape_kept_raw_including_slashes_and_brackets() {
         let content = "<command-name>/model</command-name>\n<command-message>model</command-message>\n\
-            <command-args>model_hub/es1_orange_o50</command-args>";
+            <command-args>acme_hub/model_x_o50</command-args>";
         assert_eq!(
             slash_model_args(content).as_deref(),
-            Some("model_hub/es1_orange_o50")
+            Some("acme_hub/model_x_o50")
         );
         let bare = "<command-name>/model</command-name>\n<command-args></command-args>";
         assert_eq!(slash_model_args(bare).as_deref(), Some(""));
@@ -562,26 +562,26 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
         assert_eq!(first.1, EffortSource::Launch);
         assert!(tracker.observe(Some("claude-opus-5")).is_none());
         // Verdict accept settles immediately, attributed to the human.
-        tracker.note_slash("model_hub/x", false);
+        tracker.note_slash("acme_hub/x", false);
         let edge = tracker
             .note_stdout(
-                "Set model to `model_hub/x` and saved as your default for new sessions",
+                "Set model to `acme_hub/x` and saved as your default for new sessions",
                 false,
             )
             .expect("edge");
-        assert_eq!(edge.0.id, "model_hub/x");
+        assert_eq!(edge.0.id, "acme_hub/x");
         assert_eq!(edge.1, EffortSource::Slash);
-        assert!(tracker.observe(Some("model_hub/x")).is_none());
+        assert!(tracker.observe(Some("acme_hub/x")).is_none());
     }
 
     #[test]
     fn remuda_awaiting_wins_attribution_even_when_alias_resolves() {
         let mut tracker = ModelTracker::new();
-        tracker.observe(Some("model_hub/es1_orange_o48[1m]"));
+        tracker.observe(Some("acme_hub/model_x_o48[1m]"));
         tracker.note_slash("sonnet", true);
         // `sonnet` resolves through the pinned env back to the same concrete id.
         let edge = tracker.note_stdout(
-            "Set model to `model_hub/es1_orange_o48[1m]` and saved as your default …",
+            "Set model to `acme_hub/model_x_o48[1m]` and saved as your default …",
             true,
         );
         // Same concrete id: no edge, but awaiting attribution is cleared.
@@ -618,13 +618,13 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
                 {"id": "ark/a", "display_name": "A"},
                 {"display_name": "no id"},
                 {"id": "  "},
-                {"id": "model_hub/b"}
+                {"id": "acme_hub/b"}
             ]
         })
         .to_string();
         assert_eq!(
             parse_gateway_models_json(&body),
-            vec!["ark/a".to_string(), "model_hub/b".to_string()]
+            vec!["ark/a".to_string(), "acme_hub/b".to_string()]
         );
         assert!(parse_gateway_models_json("not json").is_empty());
     }
@@ -645,13 +645,13 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
         // Measured: a session correctly pinned to o50 records `claude-opus-5`.
         // Refusing this was the flaw in the equality gate.
         assert_eq!(
-            compare_model_pin("model_hub/es1_orange_o50[1m]", "claude-opus-5", &[]),
+            compare_model_pin("acme_hub/model_x_o50[1m]", "claude-opus-5", &[]),
             ModelPinVerdict::Unresolvable
         );
         // And the substituted case looks identical through this channel, which
         // is precisely why neither may refuse.
         assert_eq!(
-            compare_model_pin("model_hub/es1_orange_o48[1m]", "claude-opus-4-8", &[]),
+            compare_model_pin("acme_hub/model_x_o48[1m]", "claude-opus-4-8", &[]),
             ModelPinVerdict::Unresolvable
         );
     }
@@ -659,19 +659,15 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
     #[test]
     fn the_pin_answering_is_honoured_with_or_without_its_context_suffix() {
         assert_eq!(
-            compare_model_pin("ark/seed-evolving[1m]", "ark/seed-evolving", &[]),
+            compare_model_pin("ark/model-y[1m]", "ark/model-y", &[]),
             ModelPinVerdict::Honoured
         );
         assert_eq!(
-            compare_model_pin("ark/seed-evolving", "ark/seed-evolving[1m]", &[]),
+            compare_model_pin("ark/model-y", "ark/model-y[1m]", &[]),
             ModelPinVerdict::Honoured
         );
         assert_eq!(
-            compare_model_pin(
-                "model_hub/es1_orange_o50[1m]",
-                "model_hub/es1_orange_o50[1m]",
-                &[]
-            ),
+            compare_model_pin("acme_hub/model_x_o50[1m]", "acme_hub/model_x_o50[1m]", &[]),
             ModelPinVerdict::Honoured
         );
     }
@@ -681,11 +677,7 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
     #[test]
     fn a_different_id_in_the_pins_namespace_is_a_mismatch() {
         assert_eq!(
-            compare_model_pin(
-                "model_hub/es1_orange_o50[1m]",
-                "model_hub/es1_orange_o48[1m]",
-                &[]
-            ),
+            compare_model_pin("acme_hub/model_x_o50[1m]", "acme_hub/model_x_o48[1m]", &[]),
             ModelPinVerdict::Mismatch
         );
         // Two bare aliases are also one vocabulary.
@@ -699,14 +691,14 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
     /// vocabulary, which upgrades an otherwise unresolvable pair to a mismatch.
     #[test]
     fn a_catalog_hit_makes_an_unnamespaced_observation_comparable() {
-        let catalog = vec!["es1_orange_o48".to_owned(), "es1_orange_o50".to_owned()];
+        let catalog = vec!["model_x_o48".to_owned(), "model_x_o50".to_owned()];
         assert_eq!(
-            compare_model_pin("model_hub/es1_orange_o50[1m]", "es1_orange_o48", &catalog),
+            compare_model_pin("acme_hub/model_x_o50[1m]", "model_x_o48", &catalog),
             ModelPinVerdict::Mismatch
         );
         // Not in the catalog: still an upstream name we cannot reason about.
         assert_eq!(
-            compare_model_pin("model_hub/es1_orange_o50[1m]", "claude-opus-5", &catalog),
+            compare_model_pin("acme_hub/model_x_o50[1m]", "claude-opus-5", &catalog),
             ModelPinVerdict::Unresolvable
         );
     }
@@ -715,7 +707,7 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
     #[test]
     fn an_alias_pin_resolving_to_a_gateway_id_is_not_a_mismatch() {
         assert_eq!(
-            compare_model_pin("sonnet", "model_hub/es1_orange_o48", &[]),
+            compare_model_pin("sonnet", "acme_hub/model_x_o48", &[]),
             ModelPinVerdict::Unresolvable
         );
     }
@@ -728,7 +720,7 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
             ModelPinVerdict::Honoured
         );
         assert_eq!(
-            compare_model_pin("model_hub/es1_orange_o50[1m]", "   ", &[]),
+            compare_model_pin("acme_hub/model_x_o50[1m]", "   ", &[]),
             ModelPinVerdict::Honoured
         );
     }

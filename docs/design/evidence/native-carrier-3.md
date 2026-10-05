@@ -3,7 +3,7 @@
 - **When:** 2026-09-15/16
 - **Where:** task worktree `/tmp/remuda-agents/wt/r-native2` (branch `wt/r-native2/native-carrier-journal-and-reap`)
 - **Agent:** r-native2
-- **Host:** bolt-devbox-sg (Linux), claude **2.1.221** installed (coordinator's macOS demo pinned 2.1.272; the defects and fixes are harness-version independent)
+- **Host:** devbox-sg (Linux), claude **2.1.221** installed (coordinator's macOS demo pinned 2.1.272; the defects and fixes are harness-version independent)
 - **Predecessors:** `native-pty-2c.md` (fast durable accept + zombie-aware stop ladder), D-028 §4.2/§5.1/§5.3/§5.5
 - **Flags under test:** `REMUDA_PTY_CARRIER=native REMUDA_PTY_EMULATOR=1 REMUDA_PTY_HOOKS=1`
 

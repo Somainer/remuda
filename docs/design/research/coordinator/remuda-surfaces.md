@@ -206,7 +206,7 @@ know. From `remote-spawn.sh`, `spawn-claude.sh`, `rgate3.sh`, `remote-gate.sh`, 
 | 2 | **Per-host workspace path for the same repo** | local `<repo>` vs remote `<remote-agents>/repo` | hardcoded (`remote-spawn.sh:7`, `spawn-claude.sh:6`) |
 | 3 | Worktree root + branch naming | `remuda-wt/<name>` / `<remote-agents>/wt/<name>`, branch `wt/<agent>/<topic>` | `path_guard.rs` pins the local root; the remote root is script-local |
 | 4 | Per-agent build env | `CARGO_TARGET_DIR=/tmp/…-target-<name>`, `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=16`, `OPENSSL_DIR`, `RUSTFLAGS` | `--env` flags in `remote-spawn.sh` |
-| 5 | **Model profile per role** | `spawn-claude.sh` flavors `opus → claude-opus-5[1m]` vs `seed → passthrough/<gateway-model-B>[1m]`; `remote-spawn.sh` flavors `es1 → <gateway-model-A>[1m]` vs `seed → <gateway-model-B>[1m]` | a bash `case` statement |
+| 5 | **Model profile per role** | `spawn-claude.sh` flavors `opus → claude-opus-5[1m]` vs `seed → passthrough/<gateway-model-B>[1m]`; `remote-spawn.sh` flavors `model_x → <gateway-model-A>[1m]` vs `seed → <gateway-model-B>[1m]` | a bash `case` statement |
 | 6 | Provider/settings binding | `--settings $HOME/.claude/settings.relay.json` on the local relay path only | hardcoded per script |
 | 7 | Gate lane + serialization | two lanes with `mkdir` lockdirs `/tmp/coord-queue-lane{1,2}.lock` and a shared land lock `/tmp/coord-land.lock`, CAS retry when main moves (`rgate3.sh`) | bash |
 | 8 | Completion protocol | `grep -E '^\s*(●|•)?\s*(DONE|BLOCKED)[ -]'` with echo-suppression (`poll-all.sh`) | bash, duplicated by `wait --until 'line:'` |
@@ -322,7 +322,7 @@ declaration, different resolved model.
 | Poll N agents for the first `DONE`/`BLOCKED` | `poll-all.sh` | `remuda instance wait --until 'line:(?m)^DONE'` with the bullet-tolerant matcher — **but there is no multi-instance wait**; the script's "first among N" has no equivalent |
 | Per-lane remote gate with lock dirs, CAS onto main, retry when main moved | `rgate3.sh`, `remote-gate.sh` | `remuda merge <branch> --gate` does isolated-merge + shared gate + CAS + push (exit 3 = lost CAS). **No lane/queue serialization** — the lock dirs are pure T2 scheduling and have no product equivalent |
 | Choose which of two lanes / which host a branch is gated on | `rgate3.sh` `$LANE` → `<remote-host>` | **GAP** |
-| Pick `es1_orange_o50[1m]` vs `<gateway-model-B>[1m]` vs `claude-opus-5[1m]` per worker | bash `case` | **GAP** — this is the model-profiling feature, in its entirety |
+| Pick `model_x_o50[1m]` vs `<gateway-model-B>[1m]` vs `claude-opus-5[1m]` per worker | bash `case` | **GAP** — this is the model-profiling feature, in its entirety |
 
 ---
 

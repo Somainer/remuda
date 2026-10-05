@@ -530,6 +530,27 @@ pub async fn answer_interaction(
         }
     };
     let in_memory_grant_instance = if stored.is_none() {
+        // c-cardsettle r2 item 2: the live row may be gone because the
+        // instance was deleted, but its terminal state was retained as a
+        // tombstone. Reject by that state BEFORE the in-memory CAS and any
+        // Node fan-out — a missing row must never become an interaction.answer
+        // broadcast to every connected Node (a still-connected node whose
+        // purge failed would otherwise release the allow).
+        if let Some(tombstone) = state
+            .store
+            .get_interaction_tombstone(interaction_id.as_id().to_string())
+            .await?
+        {
+            return Err(match tombstone.state.as_str() {
+                "expired" => HubError::Expired,
+                "answer-committed" | "resolved" => HubError::Superseded {
+                    winner: String::new(),
+                },
+                // invalidated / a card still pending at delete time: the
+                // owning entity no longer exists.
+                _ => HubError::NotFound,
+            });
+        }
         let interaction_id_str = interaction_id.as_id().as_str();
         state
             .agent_approvals

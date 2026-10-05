@@ -1157,6 +1157,21 @@ pub struct InteractionRecord {
     pub updated_at: String,
 }
 
+/// Terminal state retained for an interaction after its owning instance was
+/// deleted (c-cardsettle r2 item 2), so a late answer gets the state-derived
+/// rejection instead of a fan-out to every connected Node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InteractionTombstone {
+    /// `int_…`.
+    pub interaction_id: String,
+    /// Deleted owning instance.
+    pub instance_id: String,
+    /// Owning host at delete time.
+    pub host_id: String,
+    /// Durable interaction state at delete (`invalidated` / `expired` / …).
+    pub state: String,
+}
+
 /// Hub registry row for a gateway/direct provider profile. Secret bytes stay in the vault.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2365,6 +2380,17 @@ impl Store {
                 )));
             }
             let tx = conn.transaction()?;
+            // c-cardsettle r2 item 2: retain the terminal state of this
+            // instance's interactions before their rows are deleted, so a late
+            // answer after the delete gets the state-derived rejection instead
+            // of fanning out to all connected Nodes.
+            tx.execute(
+                "INSERT OR IGNORE INTO interaction_tombstones
+                    (id, instance_id, host_id, state, created_at, updated_at)
+                 SELECT id, instance_id, host_id, state, created_at, updated_at
+                 FROM interactions WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
             tx.execute(
                 "DELETE FROM journal WHERE instance_id = ?1",
                 params![&instance_id],
@@ -4134,6 +4160,33 @@ impl Store {
         .await
     }
 
+    /// c-cardsettle r2 item 2: terminal state retained for an interaction whose
+    /// owning instance was deleted. Consulted by the answer path when no live
+    /// row exists, so a late answer after delete is rejected by state instead
+    /// of fanning `interaction.answer` out to every connected Node.
+    pub async fn get_interaction_tombstone(
+        &self,
+        interaction_id: String,
+    ) -> Result<Option<InteractionTombstone>, StoreError> {
+        self.run_named("get_interaction_tombstone", move |conn| {
+            conn.query_row(
+                "SELECT id, instance_id, host_id, state FROM interaction_tombstones WHERE id = ?1",
+                params![interaction_id],
+                |row| {
+                    Ok(InteractionTombstone {
+                        interaction_id: row.get(0)?,
+                        instance_id: row.get(1)?,
+                        host_id: row.get(2)?,
+                        state: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+        .await
+    }
+
     /// Mirror a successful Node answer ACK; never decide a winner in the Hub.
     pub async fn record_interaction_answer(
         &self,
@@ -5165,6 +5218,19 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS interactions_instance ON interactions(instance_id);
         CREATE INDEX IF NOT EXISTS interactions_host_state ON interactions(host_id, state);
+        -- c-cardsettle r2 item 2: terminal state of interactions whose
+        -- instance was deleted. The live rows go away with the instance, but a
+        -- late answer must still get the state-derived rejection (invalidated
+        -- -> 404, expired -> 410, answered/resolved -> 409) instead of a
+        -- missing-row miss that fans interaction.answer out to every Node.
+        CREATE TABLE IF NOT EXISTS interaction_tombstones (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS provider_profiles (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -8171,6 +8237,51 @@ mod tests {
         let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "invalidated");
         assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
+    /// c-cardsettle r2 item 2: deleting a terminal instance removes the live
+    /// interaction rows but retains their terminal state as tombstones, so a
+    /// late answer can be rejected without fanning out to Nodes.
+    #[tokio::test]
+    async fn delete_instance_retains_terminal_interactions_as_tombstones() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-tombstone").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        let (changed, _) = store
+            .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
+            .await
+            .expect("settle");
+        assert!(changed);
+        assert!(
+            store
+                .delete_instance(instance.instance_id.clone())
+                .await
+                .expect("delete")
+        );
+
+        // The live row is gone with the instance…
+        assert!(
+            store
+                .get_interaction(int_id.clone())
+                .await
+                .expect("get")
+                .is_none(),
+            "the interaction row is deleted with the instance"
+        );
+        // …but the terminal state survives as a tombstone.
+        let tombstone = store
+            .get_interaction_tombstone(int_id.clone())
+            .await
+            .expect("get tombstone")
+            .expect("tombstone retained");
+        assert_eq!(tombstone.interaction_id, int_id);
+        assert_eq!(tombstone.instance_id, instance.instance_id);
+        assert_eq!(tombstone.state, "invalidated");
         store.close().await;
     }
 

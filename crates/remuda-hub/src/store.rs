@@ -8375,7 +8375,7 @@ mod tests {
                     "severity":"warning","affectsCompletion":false,
                     "status":{"state":"known","value":"idle"},
                     "relatedIds":{
-                        "agentId":"a77755a5a987d3e0c","agentType":"workflow-subagent",
+                        "agentId":"agent0sub0agent000","agentType":"workflow-subagent",
                         "outcome":"failed","phase":"turn-ended"}}}),
             ),
             // severity=error API/hook diagnostic.

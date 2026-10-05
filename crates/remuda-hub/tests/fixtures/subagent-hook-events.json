@@ -1,11 +1,11 @@
 [
  {
   "schemaVersion": 1,
-  "eventId": "evt_01a10b71-d453-7774-a52b-b23a64a25a3c",
-  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
-  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
-  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
-  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "eventId": "evt_00000000-0000-4000-8000-000000000000",
+  "journalId": "obj_00000000-0000-4000-8000-000000000000",
+  "instanceId": "ins_00000000-0000-4000-8000-000000000000",
+  "runId": "run_00000000-0000-4000-8000-000000000000",
+  "hostId": "hst_00000000-0000-4000-8000-000000000000",
   "processGeneration": "1",
   "runGeneration": "1",
   "seq": "1981",
@@ -23,7 +23,7 @@
    "delivery": "live",
    "nativeSessionId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "nativeTurnId": {
     "state": "not-applicable"
@@ -42,7 +42,7 @@
    },
    "sourceCursor": {
     "type": "runtime",
-    "ledgerRevision": "1744"
+    "ledgerRevision": "1000"
    }
   },
   "completeness": "structured",
@@ -55,26 +55,26 @@
    "nativeName": "StopFailure",
    "nativeId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "status": {
     "state": "known",
     "value": "idle"
    },
    "relatedIds": {
-    "agentId": "a77755a5a987d3e0c",
+    "agentId": "agent0sub0agent000",
     "agentType": "workflow-subagent",
     "completeness": "structured",
-    "cwd": "<projects>/astergate",
+    "cwd": "<projects>/example",
     "outcome": "failed",
     "phase": "turn-ended",
-    "ppid": "49330",
-    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
+    "ppid": "10000",
+    "promptId": "00000000-0000-4000-8000-000000000000",
     "provision": "native",
     "remudaActivity": "idle",
     "since": "2026-10-05T09:42:51.730Z",
     "tier": "hook",
-    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_00000000-0000-4000-8000-000000000000/native-home/projects/-Example-Project/00000000-0000-4000-8000-000000000000.jsonl"
    },
    "dataRef": null,
    "severity": "warning",
@@ -83,11 +83,11 @@
  },
  {
   "schemaVersion": 1,
-  "eventId": "evt_01a10b75-1eff-776a-83cb-f2e9007f4f61",
-  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
-  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
-  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
-  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "eventId": "evt_00000000-0000-4000-8000-000000000000",
+  "journalId": "obj_00000000-0000-4000-8000-000000000000",
+  "instanceId": "ins_00000000-0000-4000-8000-000000000000",
+  "runId": "run_00000000-0000-4000-8000-000000000000",
+  "hostId": "hst_00000000-0000-4000-8000-000000000000",
   "processGeneration": "1",
   "runGeneration": "1",
   "seq": "2246",
@@ -105,7 +105,7 @@
    "delivery": "live",
    "nativeSessionId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "nativeTurnId": {
     "state": "not-applicable"
@@ -137,24 +137,24 @@
    "nativeName": "SubagentStop",
    "nativeId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "status": {
     "state": "known",
     "value": "observed"
    },
    "relatedIds": {
-    "agentId": "aac4b44de81e78e29",
-    "agentTranscriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b/subagents/workflows/wf_example000/agent-aac4b44de81e78e29.jsonl",
+    "agentId": "agent0000000000000001",
+    "agentTranscriptPath": "<data-dir>/dev-hub/node/instances/ins_00000000-0000-4000-8000-000000000000/native-home/projects/-Example-Project/00000000-0000-4000-8000-000000000000/subagents/workflows/wf_example000/agent-agent0000000000000001.jsonl",
     "agentType": "workflow-subagent",
     "backgroundTaskId": "wag881flv",
     "backgroundTaskName": "example-research-task",
     "backgroundTaskStatus": "running",
-    "cwd": "<projects>/astergate",
+    "cwd": "<projects>/example",
     "permissionMode": "bypassPermissions",
-    "ppid": "49330",
-    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
-    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+    "ppid": "10000",
+    "promptId": "00000000-0000-4000-8000-000000000000",
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_00000000-0000-4000-8000-000000000000/native-home/projects/-Example-Project/00000000-0000-4000-8000-000000000000.jsonl"
    },
    "dataRef": null,
    "severity": "info",
@@ -163,11 +163,11 @@
  },
  {
   "schemaVersion": 1,
-  "eventId": "evt_01a10b75-21b0-7230-bf00-a75d2351fcb7",
-  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
-  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
-  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
-  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "eventId": "evt_00000000-0000-4000-8000-000000000000",
+  "journalId": "obj_00000000-0000-4000-8000-000000000000",
+  "instanceId": "ins_00000000-0000-4000-8000-000000000000",
+  "runId": "run_00000000-0000-4000-8000-000000000000",
+  "hostId": "hst_00000000-0000-4000-8000-000000000000",
   "processGeneration": "1",
   "runGeneration": "1",
   "seq": "2252",
@@ -185,7 +185,7 @@
    "delivery": "live",
    "nativeSessionId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "nativeTurnId": {
     "state": "not-applicable"
@@ -217,19 +217,19 @@
    "nativeName": "SubagentStart",
    "nativeId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "status": {
     "state": "known",
     "value": "observed"
    },
    "relatedIds": {
-    "agentId": "a6866168bc7ba361f",
+    "agentId": "agent0000000000000002",
     "agentType": "workflow-subagent",
-    "cwd": "<projects>/astergate",
-    "ppid": "49330",
-    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
-    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+    "cwd": "<projects>/example",
+    "ppid": "10000",
+    "promptId": "00000000-0000-4000-8000-000000000000",
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_00000000-0000-4000-8000-000000000000/native-home/projects/-Example-Project/00000000-0000-4000-8000-000000000000.jsonl"
    },
    "dataRef": null,
    "severity": "info",
@@ -238,11 +238,11 @@
  },
  {
   "schemaVersion": 1,
-  "eventId": "evt_01a10b76-1596-729e-8355-e66111be0324",
-  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
-  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
-  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
-  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "eventId": "evt_00000000-0000-4000-8000-000000000000",
+  "journalId": "obj_00000000-0000-4000-8000-000000000000",
+  "instanceId": "ins_00000000-0000-4000-8000-000000000000",
+  "runId": "run_00000000-0000-4000-8000-000000000000",
+  "hostId": "hst_00000000-0000-4000-8000-000000000000",
   "processGeneration": "1",
   "runGeneration": "1",
   "seq": "2410",
@@ -260,7 +260,7 @@
    "delivery": "live",
    "nativeSessionId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "nativeTurnId": {
     "state": "not-applicable"
@@ -292,24 +292,24 @@
    "nativeName": "SubagentStop",
    "nativeId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "status": {
     "state": "known",
     "value": "observed"
    },
    "relatedIds": {
-    "agentId": "a687eba352661cdda",
-    "agentTranscriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b/subagents/workflows/wf_example000/agent-a687eba352661cdda.jsonl",
+    "agentId": "agent0000000000000003",
+    "agentTranscriptPath": "<data-dir>/dev-hub/node/instances/ins_00000000-0000-4000-8000-000000000000/native-home/projects/-Example-Project/00000000-0000-4000-8000-000000000000/subagents/workflows/wf_example000/agent-agent0000000000000003.jsonl",
     "agentType": "workflow-subagent",
     "backgroundTaskId": "wag881flv",
     "backgroundTaskName": "example-research-task",
     "backgroundTaskStatus": "running",
-    "cwd": "<projects>/astergate",
+    "cwd": "<projects>/example",
     "permissionMode": "bypassPermissions",
-    "ppid": "49330",
-    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
-    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+    "ppid": "10000",
+    "promptId": "00000000-0000-4000-8000-000000000000",
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_00000000-0000-4000-8000-000000000000/native-home/projects/-Example-Project/00000000-0000-4000-8000-000000000000.jsonl"
    },
    "dataRef": null,
    "severity": "info",
@@ -318,11 +318,11 @@
  },
  {
   "schemaVersion": 1,
-  "eventId": "evt_01a10b76-175f-7065-af8f-31e80e55c685",
-  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
-  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
-  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
-  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "eventId": "evt_00000000-0000-4000-8000-000000000000",
+  "journalId": "obj_00000000-0000-4000-8000-000000000000",
+  "instanceId": "ins_00000000-0000-4000-8000-000000000000",
+  "runId": "run_00000000-0000-4000-8000-000000000000",
+  "hostId": "hst_00000000-0000-4000-8000-000000000000",
   "processGeneration": "1",
   "runGeneration": "1",
   "seq": "2411",
@@ -340,7 +340,7 @@
    "delivery": "live",
    "nativeSessionId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "nativeTurnId": {
     "state": "not-applicable"
@@ -372,19 +372,19 @@
    "nativeName": "SubagentStart",
    "nativeId": {
     "state": "known",
-    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+    "value": "00000000-0000-4000-8000-000000000000"
    },
    "status": {
     "state": "known",
     "value": "observed"
    },
    "relatedIds": {
-    "agentId": "a6deb80621dd920ca",
+    "agentId": "agent0000000000000004",
     "agentType": "workflow-subagent",
-    "cwd": "<projects>/astergate",
-    "ppid": "49330",
-    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
-    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+    "cwd": "<projects>/example",
+    "ppid": "10000",
+    "promptId": "00000000-0000-4000-8000-000000000000",
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_00000000-0000-4000-8000-000000000000/native-home/projects/-Example-Project/00000000-0000-4000-8000-000000000000.jsonl"
    },
    "dataRef": null,
    "severity": "info",

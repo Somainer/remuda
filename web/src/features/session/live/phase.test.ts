@@ -228,7 +228,7 @@ describe("subagent-scoped phases (c-cardsettle r3 item 8)", () => {
       2,
       phase("turn-ended", T0, {
         outcome: "failed",
-        agentId: "a77755a5a987d3e0c",
+        agentId: "agent0sub0agent000",
         agentType: "workflow-subagent",
       }),
       "2026-10-05T00:00:05.000Z",

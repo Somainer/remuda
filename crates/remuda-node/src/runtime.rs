@@ -3513,7 +3513,7 @@ mod tests {
                 name,
                 "not-applicable",
                 &[
-                    ("agentId", "a77755a5a987d3e0c"),
+                    ("agentId", "agent0sub0agent000"),
                     ("agentType", "workflow-subagent"),
                 ],
                 severity,
@@ -3842,7 +3842,7 @@ mod tests {
             "StopFailure",
             "not-applicable",
             &[
-                ("agentId", "a77755a5a987d3e0c"),
+                ("agentId", "agent0sub0agent000"),
                 ("agentType", "workflow-subagent"),
                 ("outcome", "failed"),
                 ("phase", "turn-ended"),
@@ -3855,8 +3855,8 @@ mod tests {
         .unwrap();
         // …and subagent start/stop markers for other workflow members.
         for (name, agent) in [
-            ("SubagentStop", "aac4b44de81e78e29"),
-            ("SubagentStart", "a6866168bc7ba361f"),
+            ("SubagentStop", "agent0000000000000001"),
+            ("SubagentStart", "agent0000000000000002"),
         ] {
             tx.send(native_lifecycle_full(
                 remuda_protocol::LifecycleTopic::Diagnostic,

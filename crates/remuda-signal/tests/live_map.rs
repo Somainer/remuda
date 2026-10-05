@@ -309,7 +309,7 @@ fn subagent_scoped_stop_failure_never_opens_the_root_turn_phase() {
             "StopFailure",
             1,
             serde_json::json!({
-                "agent_id": "a77755a5a987d3e0c",
+                "agent_id": "agent0sub0agent000",
                 "agent_type": "workflow-subagent",
             }),
         ),

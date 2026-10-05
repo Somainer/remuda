@@ -378,3 +378,43 @@ async fn real_21273_four_consecutive_switches_each_resolve_their_own_generation(
         );
     }
 }
+
+// ───────── Real claude 2.1.289 recordings (ultracode decoupled), shape only ──
+
+#[test]
+fn real_21289_recordings_are_jsonl_with_an_effort_slash_and_a_verdict() {
+    // effort-sync-4: every recording is valid JSONL with at least one
+    // `/effort` slash record and one `<local-command-stdout>` verdict, and its
+    // remuda-journal mirror is byte-identical. Behaviour assertions on these
+    // recordings belong to the effort tasks that consume them.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join("tests/fixtures/effort-21289");
+    let mirror = root.join("../remuda-journal/tests/fixtures/effort-21289");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("effort-21289 fixture dir")
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".jsonl"))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names.len(),
+        9,
+        "walk + launch a b c1 c2 d e f2 g: {names:?}"
+    );
+    for name in &names {
+        let body = std::fs::read_to_string(dir.join(name)).expect("read fixture");
+        let (mut slash, mut verdict) = (0, 0);
+        for (n, line) in body.lines().enumerate() {
+            let record: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("{name}:{} is not JSON: {err}", n + 1));
+            if let Some(serde_json::Value::String(text)) = record.pointer("/message/content") {
+                slash += usize::from(text.contains("<command-name>/effort</command-name>"));
+                verdict += usize::from(text.starts_with("<local-command-stdout>"));
+            }
+        }
+        assert!(slash >= 1, "{name}: no /effort slash record");
+        assert!(verdict >= 1, "{name}: no verdict record");
+        let mirrored = std::fs::read_to_string(mirror.join(name)).expect("journal mirror");
+        assert!(mirrored == body, "{name}: journal mirror differs");
+    }
+}

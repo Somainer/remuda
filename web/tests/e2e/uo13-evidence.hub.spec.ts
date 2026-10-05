@@ -153,14 +153,14 @@ for (const width of WIDTHS) {
     await expect(botDetail).toBeVisible();
 
     // Demo-inventory hygiene: the static channel fixture prints real-looking
-    // host/project labels (devbox-sg / sfe-root). They are fixture values, not
+    // host/project labels (devbox-sg / demo-root). They are fixture values, not
     // evidence: replace them with generic demo labels in the rendered DOM
     // before capturing (mirrors tabs-semantics' applyDemoInventory), then
     // grep the rendered text so neither can leak into a committed frame.
     await botDetail.evaluate((el) => {
       const replacements: [RegExp, string][] = [
         [/devbox-sg/g, "demo-node-1"],
-        [/sfe-root/g, "demo-project-1"],
+        [/demo-root/g, "demo-project-1"],
       ];
       const walker = el.ownerDocument.createTreeWalker(el, NodeFilter.SHOW_TEXT);
       const nodes: Text[] = [];
@@ -172,12 +172,12 @@ for (const width of WIDTHS) {
       }
     });
     await expect(botDetail).not.toContainText("devbox-sg");
-    await expect(botDetail).not.toContainText("sfe-root");
+    await expect(botDetail).not.toContainText("demo-root");
     for (const mode of MODES) {
       await setMode(page, mode);
       await page.evaluate(() => document.fonts.ready.then(() => undefined));
       await expect(botDetail).not.toContainText("devbox-sg");
-      await expect(botDetail).not.toContainText("sfe-root");
+      await expect(botDetail).not.toContainText("demo-root");
       await shoot(page, "bot-detail", mode, width);
     }
   });

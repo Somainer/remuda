@@ -1,0 +1,60 @@
+===== 01 boot =====
+ ▐▛███▛█▄╱✦  Claude Code v2.1.289
+▝▜██████▘    Opus 5.5 with xhigh effort · API Usage Billing
+ ▝▝   ▝▝     /tmp/remuda-c-effortev/b/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                    ◉ xhigh · ultracode · /effort
+
+===== 02 prompt — after turn =====
+ ▐▛███▛█▄╱✦  Claude Code v2.1.289
+▝▜██████▘    Opus 5.5 with xhigh effort · API Usage Billing
+ ▝▝   ▝▝     /tmp/remuda-c-effortev/b/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:30 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                    ◉ xhigh · ultracode · /effort
+
+===== 03 /effort status — after verdict =====
+ ▐▛███▛█▄╱✦  Claude Code v2.1.289
+▝▜██████▘    Opus 5.5 with xhigh effort · API Usage Billing
+ ▝▝   ▝▝     /tmp/remuda-c-effortev/b/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:30 PM
+
+❯ /effort status
+  ⎿  Current effort level: xhigh (Deeper reasoning than high, just below maximum (on supported models)) · Ultracode on
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── ultracode ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                    ◉ xhigh · ultracode · /effort
+

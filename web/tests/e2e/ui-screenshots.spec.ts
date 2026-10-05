@@ -43,7 +43,7 @@ test.describe("ui screenshots 1440 / 390", () => {
           items: [
             {
               id: "prj_sfe",
-              name: "sfe-root",
+              name: "demo-root",
               defaultBaseBranch: "main",
               branchPattern: "wt/{worker}/{topic}",
               members: [{ hostId: "hst_devbox", workspaceId: "wsp_sfe", role: "member" }],

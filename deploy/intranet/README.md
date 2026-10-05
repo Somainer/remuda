@@ -10,7 +10,7 @@ for the current workspace and PTY evidence,
 [intranet-enroll-1.md](../../docs/design/evidence/intranet-enroll-1.md) for the
 Hub upgrade, pairing, Node isolation and earlier blocked attempts, and
 [intranet-hub-1.md](../../docs/design/evidence/intranet-hub-1.md) for approved
-Caddy activation. No SG/bolt Node installation has been performed by these runs.
+Caddy activation. No SG/devbox Node installation has been performed by these runs.
 
 This is the only supported [D-031](../../docs/design/decisions.md) deployment
 path. Run Hub on the SG host, join its existing `deploy_default` network,

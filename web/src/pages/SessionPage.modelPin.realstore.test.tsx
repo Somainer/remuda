@@ -309,44 +309,44 @@ describe("model-pin rendered through the real store (cases a-d)", () => {
 
   it("(a) launch A / read-back A: chip A, no diagnostic", async () => {
     const ctx = await setupRealSession(
-      wireRecord({ instanceId: "ins_pin_a", model: "model_hub/A", kind: "claude" }),
+      wireRecord({ instanceId: "ins_pin_a", model: "acme_hub/A", kind: "claude" }),
     );
     renderPage(ctx.id);
     await openModelChip();
-    expect(screen.getByTestId("effort-model")).toHaveTextContent("model_hub/A");
-    await ctx.deliver(modelEvent(2, "model_hub/A", "launch"));
-    expect(screen.getByTestId("effort-model")).toHaveTextContent("model_hub/A");
+    expect(screen.getByTestId("effort-model")).toHaveTextContent("acme_hub/A");
+    await ctx.deliver(modelEvent(2, "acme_hub/A", "launch"));
+    expect(screen.getByTestId("effort-model")).toHaveTextContent("acme_hub/A");
     expect(screen.queryAllByTestId("run-details-model-pin")).toHaveLength(0);
   });
 
   it("(b) launch A / read-back B: chip B, run details records requested A / observed B", async () => {
     const ctx = await setupRealSession(
-      wireRecord({ instanceId: "ins_pin_b", model: "model_hub/A", kind: "claude" }),
+      wireRecord({ instanceId: "ins_pin_b", model: "acme_hub/A", kind: "claude" }),
     );
     renderPage(ctx.id);
     await openModelChip();
-    await ctx.deliver(modelEvent(2, "model_hub/B", "launch"));
-    await ctx.deliver(mismatchEvent(3, "model_hub/A", "model_hub/B"));
-    expect(screen.getByTestId("effort-model")).toHaveTextContent("model_hub/B");
+    await ctx.deliver(modelEvent(2, "acme_hub/B", "launch"));
+    await ctx.deliver(mismatchEvent(3, "acme_hub/A", "acme_hub/B"));
+    expect(screen.getByTestId("effort-model")).toHaveTextContent("acme_hub/B");
     const pin = screen.getByTestId("run-details-model-pin");
-    expect(pin).toHaveTextContent("请求模型 model_hub/A，实际运行 model_hub/B");
-    expect(pin).toHaveAttribute("data-requested", "model_hub/A");
-    expect(pin).toHaveAttribute("data-observed", "model_hub/B");
+    expect(pin).toHaveTextContent("请求模型 acme_hub/A，实际运行 acme_hub/B");
+    expect(pin).toHaveAttribute("data-requested", "acme_hub/A");
+    expect(pin).toHaveAttribute("data-observed", "acme_hub/B");
   });
 
   it("(c) then /model C: chip C, the launch diagnostic stays in run details", async () => {
     const ctx = await setupRealSession(
-      wireRecord({ instanceId: "ins_pin_c", model: "model_hub/A", kind: "claude" }),
+      wireRecord({ instanceId: "ins_pin_c", model: "acme_hub/A", kind: "claude" }),
     );
     renderPage(ctx.id);
     await openModelChip();
-    await ctx.deliver(modelEvent(2, "model_hub/B", "launch"));
-    await ctx.deliver(mismatchEvent(3, "model_hub/A", "model_hub/B"));
-    await ctx.deliver(modelEvent(4, "model_hub/C", "slash"));
-    expect(screen.getByTestId("effort-model")).toHaveTextContent("model_hub/C");
+    await ctx.deliver(modelEvent(2, "acme_hub/B", "launch"));
+    await ctx.deliver(mismatchEvent(3, "acme_hub/A", "acme_hub/B"));
+    await ctx.deliver(modelEvent(4, "acme_hub/C", "slash"));
+    expect(screen.getByTestId("effort-model")).toHaveTextContent("acme_hub/C");
     // The launch divergence remains as history.
     const pin = screen.getByTestId("run-details-model-pin");
-    expect(pin).toHaveTextContent("请求模型 model_hub/A，实际运行 model_hub/B");
+    expect(pin).toHaveTextContent("请求模型 acme_hub/A，实际运行 acme_hub/B");
   });
 
   it("(d) no launch model / read-back X: chip X, no invented default, no diagnostic", async () => {
@@ -358,9 +358,9 @@ describe("model-pin rendered through the real store (cases a-d)", () => {
     // Before read-back: a model-axis session with no launch model shows empty,
     // never an invented "opus".
     expect(screen.getByTestId("effort-model").textContent).toBe("");
-    await ctx.deliver(modelEvent(2, "model_hub/X", "unknown"));
+    await ctx.deliver(modelEvent(2, "acme_hub/X", "unknown"));
     await waitFor(() =>
-      expect(screen.getByTestId("effort-model")).toHaveTextContent("model_hub/X"),
+      expect(screen.getByTestId("effort-model")).toHaveTextContent("acme_hub/X"),
     );
     expect(screen.queryAllByTestId("run-details-model-pin")).toHaveLength(0);
   });
@@ -384,12 +384,12 @@ describe("model-pin rendered through the real store (cases a-d)", () => {
     const ctx = await setupRealSession(
       wireRecord({
         instanceId: "ins_pin_proj",
-        model: "model_hub/es1_orange_o50[1m]",
+        model: "acme_hub/model_x_o50[1m]",
         kind: "claude",
         modelPinMismatches: [
           {
-            requested: "model_hub/es1_orange_o50[1m]",
-            observed: "model_hub/es1_orange_o48[1m]",
+            requested: "acme_hub/model_x_o50[1m]",
+            observed: "acme_hub/model_x_o48[1m]",
             observedAt: "2026-09-24T00:00:00.000Z",
           },
         ],
@@ -399,7 +399,7 @@ describe("model-pin rendered through the real store (cases a-d)", () => {
     renderPage(ctx.id);
     const pin = await screen.findByTestId("run-details-model-pin");
     expect(pin).toHaveTextContent(
-      "请求模型 model_hub/es1_orange_o50[1m]，实际运行 model_hub/es1_orange_o48[1m]",
+      "请求模型 acme_hub/model_x_o50[1m]，实际运行 acme_hub/model_x_o48[1m]",
     );
     // Still one line even though no diagnostic event exists in the window.
     expect(screen.getAllByTestId("run-details-model-pin")).toHaveLength(1);
@@ -409,13 +409,13 @@ describe("model-pin rendered through the real store (cases a-d)", () => {
 describe("model-pin real SessionList rows (real store)", () => {
   it("(list) launch A / read-back B: the row chip shows running B, not a pair", async () => {
     const ctx = await setupRealSession(
-      wireRecord({ instanceId: "ins_pin_list_b", model: "model_hub/A", kind: "claude" }),
+      wireRecord({ instanceId: "ins_pin_list_b", model: "acme_hub/A", kind: "claude" }),
     );
-    await ctx.deliver(modelEvent(2, "model_hub/B", "launch"));
+    await ctx.deliver(modelEvent(2, "acme_hub/B", "launch"));
     renderSessionsGlobal();
     await screen.findByTestId("session-list");
     const chip = screen.getAllByTestId("session-model")[0];
-    expect(chip.textContent).toBe("model_hub/B");
+    expect(chip.textContent).toBe("acme_hub/B");
     expect(chip).not.toHaveTextContent("⇐");
   });
 
@@ -423,11 +423,11 @@ describe("model-pin real SessionList rows (real store)", () => {
     const ctx = await setupRealSession(
       wireRecord({ instanceId: "ins_pin_list_d", kind: "claude" }),
     );
-    await ctx.deliver(modelEvent(2, "model_hub/X", "unknown"));
+    await ctx.deliver(modelEvent(2, "acme_hub/X", "unknown"));
     renderSessionsGlobal();
     await screen.findByTestId("session-list");
     const chip = screen.getAllByTestId("session-model")[0];
-    expect(chip.textContent).toBe("model_hub/X");
+    expect(chip.textContent).toBe("acme_hub/X");
     expect(chip).not.toHaveTextContent("opus");
   });
 

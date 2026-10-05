@@ -632,25 +632,25 @@ mod tests {
     fn the_model_cell_reports_the_effective_id_and_marks_a_divergence() {
         // Agreement (or no observation yet): just the requested id.
         assert_eq!(
-            model_label(&serde_json::json!({"model": "model_hub/es1_orange_o50[1m]"})),
-            "model_hub/es1_orange_o50[1m]"
+            model_label(&serde_json::json!({"model": "acme_hub/model_x_o50[1m]"})),
+            "acme_hub/model_x_o50[1m]"
         );
         assert_eq!(
             model_label(&serde_json::json!({
-                "model": "ark/seed-evolving[1m]",
-                "modelEffective": "ark/seed-evolving[1m]",
+                "model": "ark/model-y[1m]",
+                "modelEffective": "ark/model-y[1m]",
             })),
-            "ark/seed-evolving[1m]"
+            "ark/model-y[1m]"
         );
         // The regression: asked for one model in the same namespace, another
         // answered. Observed is FIRST so head-truncation cannot cut the one
         // thing this column exists to show; the requested pin still follows.
         assert_eq!(
             model_label(&serde_json::json!({
-                "model": "model_hub/es1_orange_o50[1m]",
-                "modelEffective": "model_hub/es1_orange_o48[1m]",
+                "model": "acme_hub/model_x_o50[1m]",
+                "modelEffective": "acme_hub/model_x_o48[1m]",
             })),
-            "model_hub/es1_orange_o48[1m] ⇐ model_hub/es1_orange_o50[1m]"
+            "acme_hub/model_x_o48[1m] ⇐ acme_hub/model_x_o50[1m]"
         );
         // An observation with no recorded request still reports honestly.
         assert_eq!(
@@ -670,12 +670,12 @@ mod tests {
     #[test]
     fn truncation_keeps_the_observed_id() {
         let row = serde_json::json!({
-            "model": "model_hub/es1_orange_o50[1m]",
-            "modelEffective": "model_hub/es1_orange_o48[1m]",
+            "model": "acme_hub/model_x_o50[1m]",
+            "modelEffective": "acme_hub/model_x_o48[1m]",
         });
         let cell = truncate(model_label(&row), 48);
         assert!(
-            cell.contains("model_hub/es1_orange_o48"),
+            cell.contains("acme_hub/model_x_o48"),
             "the observed id must remain in a 48-char cell: {cell}"
         );
     }

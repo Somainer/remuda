@@ -10,7 +10,7 @@ both gaps.
 
 Measured on the installed **Claude Code 2.1.272** binary against this host's
 gateway relay (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`,
-`ANTHROPIC_MODEL=model_hub/es1_orange_o48[1m]`), with a throwaway scoped
+`ANTHROPIC_MODEL=acme_hub/model_x_o48[1m]`), with a throwaway scoped
 `CLAUDE_CONFIG_DIR`; earlier 2.1.221 verdicts were re-measured from
 `~/.claude/projects/…` transcripts. Live probe:
 `crates/remuda-driver/examples/model_probe.rs`
@@ -29,7 +29,7 @@ gateway env mirrored into its `settings.json`. The probe types, all while idle:
 | --- | --- | --- |
 | base | `reply …: ok` | baseline assistant `message.model` |
 | A | `/model sonnet` ⏎ | alias resolves to the pinned concrete id |
-| B | `/model model_hub/es1_orange_o50` ⏎ | a gateway id, this one not pinned |
+| B | `/model acme_hub/model_x_o50` ⏎ | a gateway id, this one not pinned |
 | C | `/model bogus-xyz-123` ⏎ | unknown id error |
 | D | `/model haiku` then **Esc** | dismissed dialog/picker |
 | E | bare `/model` | the picker (real list) |
@@ -46,9 +46,9 @@ o50, bogus, kept):
 
 ```jsonc
 // type:"user" record
-{"message":{"content":"<command-name>/model</command-name>\n  …\n  <command-args>model_hub/es1_orange_o50</command-args>"}}
+{"message":{"content":"<command-name>/model</command-name>\n  …\n  <command-args>acme_hub/model_x_o50</command-args>"}}
 // same timestamp, type:"user" record
-{"message":{"content":"<local-command-stdout>Set model to `model_hub/es1_orange_o50` and saved as your default for new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`model_hub/es1_orange_o48[1m]`\x1b[22m — new sessions use that while it is set\x1b[22m</local-command-stdout>"}}
+{"message":{"content":"<local-command-stdout>Set model to `acme_hub/model_x_o50` and saved as your default for new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`acme_hub/model_x_o48[1m]`\x1b[22m — new sessions use that while it is set\x1b[22m</local-command-stdout>"}}
 ```
 
 The driver keeps the screen gate anyway (`Switch model?` / `Yes, switch to …`
@@ -81,7 +81,7 @@ Two parse hazards the mapper handles:
 
 `/model sonnet` in the pinned env did **not** switch to anything named
 "sonnet"; the verdict read
-`` Set model to `model_hub/es1_orange_o48[1m]` `` — the alias resolved to the
+`` Set model to `acme_hub/model_x_o48[1m]` `` — the alias resolved to the
 id the `ANTHROPIC_DEFAULT_SONNET_MODEL`/pinned env points at. The picker must
 mark the **resolved** id current; the typed word is only `requested`. The
 follow-up assistant record corroborates this at `message.model`:
@@ -89,11 +89,11 @@ follow-up assistant record corroborates this at `message.model`:
 - baseline assistant record: `message.model = "claude-opus-4-8"` (no `--model`
   pin; the top-level record has no `model` field — it lives at
   `message.model`, unlike effort which is a top-level `effort` field);
-- gateway sessions record the gateway id there (`ark/seed-evolving` on the
+- gateway sessions record the gateway id there (`ark/model-y` on the
   live relay).
 
-`/model model_hub/es1_orange_o50` (an id the env does not pin) read back
-verbatim as `model_hub/es1_orange_o50`, and the next prompt's
+`/model acme_hub/model_x_o50` (an id the env does not pin) read back
+verbatim as `acme_hub/model_x_o50`, and the next prompt's
 `message.model` is that id.
 
 ### 2.4 End-to-end timing
@@ -120,7 +120,7 @@ On a gateway-configured host Claude Code writes
 ```
 
 22 discovered ids on this host, including `ark/*`, `auto_model/*`,
-`model_hub/es1_orange_o47|o48|o50` and their `[1m]` long-context spellings.
+`acme_hub/model_x_o47|o48|o50` and their `[1m]` long-context spellings.
 (The scoped probe config fetched the changelog into `cache/` but the models
 cache lands on the relay's own refresh cadence, so discovery falls back to the
 operator's conventional `~/.claude` cache for the scoped dir — the same relay

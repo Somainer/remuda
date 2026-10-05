@@ -488,8 +488,8 @@ mod tests {
     #[test]
     fn request_validation() {
         assert_eq!(
-            ModelRequest::new("  model_hub/es1_orange_o50 ").unwrap().id,
-            "model_hub/es1_orange_o50"
+            ModelRequest::new("  acme_hub/model_x_o50 ").unwrap().id,
+            "acme_hub/model_x_o50"
         );
         assert!(ModelRequest::new("").is_none());
         assert!(ModelRequest::new("   ").is_none());
@@ -590,7 +590,7 @@ mod tests {
         io.idle.store(true, Ordering::SeqCst);
         *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
         let outcome = perform_model_switch(
-            ModelRequest::new("model_hub/es1_orange_o50").unwrap(),
+            ModelRequest::new("acme_hub/model_x_o50").unwrap(),
             &bridge,
             io.as_ref(),
         )
@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(
             *io.writes.lock().unwrap(),
             vec![
-                "body:/model model_hub/es1_orange_o50".to_string(),
+                "body:/model acme_hub/model_x_o50".to_string(),
                 "cr".to_string(),
             ]
         );

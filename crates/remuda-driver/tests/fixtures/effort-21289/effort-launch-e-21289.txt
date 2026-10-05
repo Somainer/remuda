@@ -1,0 +1,87 @@
+===== 01 boot =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/e/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                               ◐ medium · /effort
+
+===== 02 /effort max — after verdict =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/e/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ /effort max
+  ⎿  Effort 'max' exceeds the cap for claude-opus-5-5 set by your settings or organization; set to 'high' instead (this
+     session only): Comprehensive implementation with extensive testing and documentation
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+
+===== 03 prompt — after turn =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/e/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ /effort max
+  ⎿  Effort 'max' exceeds the cap for claude-opus-5-5 set by your settings or organization; set to 'high' instead (this
+     session only): Comprehensive implementation with extensive testing and documentation
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 2s · done 3:31 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+
+===== 04 /effort status — after verdict =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 with high effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/e/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ /effort max
+  ⎿  Effort 'max' exceeds the cap for claude-opus-5-5 set by your settings or organization; set to 'high' instead (this
+     session only): Comprehensive implementation with extensive testing and documentation
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Baked for 2s · done 3:31 PM
+
+❯ /effort status
+  ⎿  Current effort level: high (Comprehensive implementation with extensive testing and documentation)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+

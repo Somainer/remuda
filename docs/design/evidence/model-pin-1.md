@@ -37,9 +37,9 @@ seeded host settings layer that names a *different* model:
 |---|---|
 | driver / kind | `shell-pty` / `claude` |
 | delegation | `none` (native profile) |
-| requested pin | `model_hub/es1_orange_o50[1m]` |
-| host `settings.json` `model` | `model_hub/es1_orange_o48[1m]` |
-| host `settings.json` `env.ANTHROPIC_MODEL` | `model_hub/es1_orange_o48[1m]` |
+| requested pin | `acme_hub/model_x_o50[1m]` |
+| host `settings.json` `model` | `acme_hub/model_x_o48[1m]` |
+| host `settings.json` `env.ANTHROPIC_MODEL` | `acme_hub/model_x_o48[1m]` |
 
 ### 1.1 The argv the recipe builds
 
@@ -47,8 +47,8 @@ From `materialize_shell_pty_agent`, the pinned spec above
 (`cargo test -p remuda-driver --test materializer`):
 
 ```
-ARGV=["--model", "model_hub/es1_orange_o50[1m]"]
-MODEL_REQUESTED=model_hub/es1_orange_o50[1m]
+ARGV=["--model", "acme_hub/model_x_o50[1m]"]
+MODEL_REQUESTED=acme_hub/model_x_o50[1m]
 ```
 
 The token is present and byte-identical to the request, `[1m]` suffix included.
@@ -63,7 +63,7 @@ Captured from the live launch (`model_pin_evidence.rs`, the 0600 instance
 overlay the PTY passed as `--settings`):
 
 ```
-model key           = "model_hub/es1_orange_o50[1m]"
+model key           = "acme_hub/model_x_o50[1m]"
 env.ANTHROPIC_MODEL = null
 ```
 
@@ -79,7 +79,7 @@ echoes it into the records it writes, so its transcript is evidence about the
 process rather than about our intent:
 
 ```
-assistant record: message.model = model_hub/es1_orange_o50[1m]
+assistant record: message.model = acme_hub/model_x_o50[1m]
 instance lifecycle = Ready
 last_error = None
 ```
@@ -115,8 +115,8 @@ even applied — so they are split:
 
 | Document | Lines | Class |
 |---|---|---|
-| `docs/design/evidence/dispatch-onboarding-1.md` | 8–9 | **native shell-pty** (`--driver shell-pty`, native profile, delegation none): the argv hole applied directly. The dispatch `--model ark/seed-evolving[1m]` reached no model token. Any claim about which model answered must be re-verified. |
-| `docs/design/evidence/self-host-1.md` | 28, 63, 78, 80 | **native shell-pty**, same class: profile `defaultModel: ark/seed-evolving[1m]`; two dispatches `--model ark/seed-evolving[1m]`; the roster row at :80 echoes `'model': 'ark/seed-evolving[1m]'`. That row is the clearest instance of the failure — the Hub wrote the *request* into it. |
+| `docs/design/evidence/dispatch-onboarding-1.md` | 8–9 | **native shell-pty** (`--driver shell-pty`, native profile, delegation none): the argv hole applied directly. The dispatch `--model ark/model-y[1m]` reached no model token. Any claim about which model answered must be re-verified. |
+| `docs/design/evidence/self-host-1.md` | 28, 63, 78, 80 | **native shell-pty**, same class: profile `defaultModel: ark/model-y[1m]`; two dispatches `--model ark/model-y[1m]`; the roster row at :80 echoes `'model': 'ark/model-y[1m]'`. That row is the clearest instance of the failure — the Hub wrote the *request* into it. |
 | `docs/design/evidence/dispatch-onboarding-1.md` | 74 | **gateway profile, different class — NOT affected by this bug.** That run used the real binary via a *gateway* provider profile. The generated gateway overlay carried the model in its `model` key, and the gateway strip ran (it was gated on delegation `gateway`/`direct`). The argv was still absent, but the overlay channel the gateway path relied on was present. No re-verification owed on the model. |
 
 These docs are not necessarily wrong about their own subjects — onboarding
@@ -165,15 +165,15 @@ Measurements on this host's real gateway and its `cache/gateway-models.json`:
 
 | pin (requested) | observed `message.model` | same after normalising? |
 |---|---|---|
-| `model_hub/es1_orange_o50[1m]` | `claude-opus-5` | no — **and this launch was correct** |
-| `model_hub/es1_orange_o48[1m]` | `claude-opus-4-8` | no — this is the demo bug |
-| `ark/seed-evolving[1m]` | `ark/seed-evolving` | yes |
+| `acme_hub/model_x_o50[1m]` | `claude-opus-5` | no — **and this launch was correct** |
+| `acme_hub/model_x_o48[1m]` | `claude-opus-4-8` | no — this is the demo bug |
+| `ark/model-y[1m]` | `ark/model-y` | yes |
 
 Row 1 is a correctly pinned session (it is, in fact, the session this doc was
-written in): the gateway resolves a `model_hub/…` catalog id to an upstream
+written in): the gateway resolves a `acme_hub/…` catalog id to an upstream
 vendor name, so the transcript records something that is not the pin and never
 will be. Rows 1 and 2 are **indistinguishable by `message.model`** — neither
-`claude-opus-5` nor `claude-opus-4-8` is in the catalog, while both `model_hub/…`
+`claude-opus-5` nor `claude-opus-4-8` is in the catalog, while both `acme_hub/…`
 pins are. A byte/trimmed/namespace-equality gate would refuse nearly every
 correct gateway launch *and still miss* the substitution.
 
@@ -188,16 +188,16 @@ and assistant records "corroborate the verdict but never resolve a live switch".
 `web/src/features/session/modelEffective.ts::compareModelPin`) returns one of:
 
 - **Honoured** — equal, or equal apart from a `[1m]` context suffix
-  (`ark/seed-evolving[1m]` ↔ `ark/seed-evolving`);
+  (`ark/model-y[1m]` ↔ `ark/model-y`);
 - **Mismatch** — a different id **in the pin's own vocabulary**: two namespaced
-  ids that differ (`model_hub/…o50[1m]` vs `model_hub/…o48[1m]`), or two bare
+  ids that differ (`acme_hub/…o50[1m]` vs `acme_hub/…o48[1m]`), or two bare
   aliases that differ (`sonnet` vs `haiku`). This is decidable because both the
   pin and a `/model` verdict speak the catalog namespace;
 - **Unresolvable** — the pin is namespaced and the observation is an upstream
   vendor name. Reported silently, **never** refused or flagged as a divergence,
   because a correct launch and a substituted one are identical there.
 
-A catalog hit upgrades an un-namespaced observation (`es1_orange_o48` listed in
+A catalog hit upgrades an un-namespaced observation (`model_x_o48` listed in
 the discovered catalog) to comparable, hence `Mismatch`.
 
 ### 3.3 What the gate judges — and the unfalsifiable snapshot
@@ -280,7 +280,7 @@ vocabulary difference is.
 ## 5. Owner ruling 2026-09-23: record, never stop
 
 The 2026-09-23 incident that triggered this review was a *false* kill: the pin
-`passthrough/ark/seed-evolving` was answered as `ark/seed-evolving` (the
+`passthrough/ark/model-y` was answered as `ark/model-y` (the
 gateway's routing prefix is stripped on forwarding), and the §3 namespaced
 pair rule judged the one-turn-old session failed. Reviewing the *true-positive*
 half of the rule, the owner ruled that the whole enforcement was the harness
@@ -378,7 +378,7 @@ all, and a later human/Remuda switch is out of scope by source attribution.
 | `web .../api.modelPin.test.ts` | the public InstanceRecord JSON maps through `mapInstance` to `instance.modelPinMismatches`; null/absent → null, malformed rows dropped — the wire boundary the browser actually receives |
 | `web .../SessionPage.modelPin.realstore.test.tsx` | rendered through the REAL store only (raw wire InstanceRecord → global fetch → `instanceGet`/`mapInstance`, real `hubStore.follow` + `useHub`, observations delivered on the real subscription; no literal props / mocked `runningModelOf` / hand-injected hub state): real SessionPage chip text + run-details line for **(a)** A/A zero diagnostics, **(b)** A/B chip B + verbatim requested/observed, **(c)** then `/model` C chip C with the launch line still present, **(d)** no-launch X chip X nothing invented; codex empty chip; the projected diagnostic rendered from the public record with an EMPTY event window; and real SessionsPage global-scope row chips for running B / running X / omitted empty slot |
 | `web .../store.model.test.ts` (real observation→store path) + literal-prop component tests | the four cases at the accessor (`runningModelOf` + `allModelPinMismatches`): **(a)** asserts zero diagnostics explicitly, **(b)** chip B + the `model_pin_mismatch` record ("requested A, observed B"), **(c)** `/model` C leaves the record, **(d)** no-launch X, nothing invented; plus picker fold / pending / rejected-switch behaviour. Literal-prop rendered coverage: `EffortSlider.test.tsx` (claude + codex effective/launch/absent incl. tooltip wording, effort-only stop description), `SessionList.test.tsx` (chip text + tooltip + omitted empty slot), `SessionPage.chrome.test.tsx` (run-details from the real mapper with an EMPTY window, projection+in-window dedupe) |
-| `web .../SessionList.test.tsx` | the row chip shows the launch spec before read-back (tooltip says "尚未从会话回读", not "实际"), then only the running id verbatim — including the incident running id `ark/seed-evolving` in full (no shortening, no `⇐` pair) — and omits the separator/span entirely when neither a launch model nor a read-back exists |
+| `web .../SessionList.test.tsx` | the row chip shows the launch spec before read-back (tooltip says "尚未从会话回读", not "实际"), then only the running id verbatim — including the incident running id `ark/model-y` in full (no shortening, no `⇐` pair) — and omits the separator/span entirely when neither a launch model nor a read-back exists |
 | `web .../EffortSlider.test.tsx` | the session-page chip for claude AND codex shows the launch spec verbatim pre-readback (marked not-yet-read-back) and the running id verbatim post-readback (even when it differs or ends in the same segment, tooltip `实际 …`), nothing for a model-axis launch with neither value, and moves straight to a later `/model` id; an effort-only slider (no `model` prop: New Session, agy) keeps the tier stop description; no `data-model-different` / `model-option-different` surface exists |
 | `web .../ux-modelsync.hub.spec.ts` | after a configure resolves to a different id, the chip shows only the running `e2e/plain` verbatim (collapsed text is not a pair), with no divergence note, and the same after a full reload |
 

@@ -691,6 +691,8 @@ test("a parked journal gate never blocks the node RPC loop and teardown releases
   const bubbleA = page.locator('[data-testid="optimistic-bubble"]').first();
   const commandA = await bubbleA.getAttribute("data-command-id");
   expect(commandA).toBeTruthy();
+  await rm(journalGatePath(commandA!), { force: true });
+  registerJournalGate(commandA!);
   expect(pendingJournalGates.has(commandA!)).toBe(true);
   await expect(bubbleA).toContainText("已受理", { timeout: 15_000 });
 

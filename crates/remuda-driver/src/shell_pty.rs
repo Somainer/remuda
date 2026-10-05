@@ -505,6 +505,10 @@ pub struct ShellPtyDriver {
     seq: Arc<AtomicU64>,
 }
 
+/// Master endpoint plus its dup'd writer, carried only between spawn and the
+/// [`PtyState`] so a launch failure in that window can hang the slave up.
+type PtyEndpoints = (Box<dyn MasterPty + Send>, Option<Box<dyn io::Write + Send>>);
+
 impl ShellPtyDriver {
     /// Build an unstarted driver.
     #[must_use]
@@ -1646,7 +1650,7 @@ impl ShellPtyDriver {
     async fn abort_failed_launch(
         mut child: Box<dyn portable_pty::Child + Send + Sync>,
         pgid: Option<i32>,
-        mut pty: Option<(Box<dyn MasterPty + Send>, Option<Box<dyn io::Write + Send>>)>,
+        mut pty: Option<PtyEndpoints>,
     ) {
         let mut close = move || {
             if let Some((master, writer)) = pty.take() {

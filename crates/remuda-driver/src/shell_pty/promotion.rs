@@ -1810,6 +1810,7 @@ struct Hydrator {
 impl Hydrator {
     /// Start replay at byte 0 of the bound transcript, or at its current end
     /// for a `--resume` launch (D-056 (4): only this process's records count).
+    #[allow(clippy::too_many_arguments)]
     fn open(
         ctx: &PromoteCtx,
         binding: &TranscriptBinding,

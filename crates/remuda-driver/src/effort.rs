@@ -131,6 +131,39 @@ fn grok_reasoning_value(name: EffortName) -> DriverResult<&'static str> {
     }
 }
 
+/// D-056 (2) launch gate for the Claude ultracode flag.
+///
+/// Refuse `ultracode: true` unless the PINNED binary is a build that has the
+/// feature: coupled `2.1.203–2.1.283` or decoupled `≥ 2.1.284`. A build below
+/// `2.1.203` prints `Unknown --effort value 'ultracode'` and starts at the
+/// default level, and a version that cannot be determined fails closed rather
+/// than guessing. Plain levels (`ultracode: false`) are unaffected at any
+/// version. `pinned_version` is the first line of the binary's `--version`
+/// (e.g. `2.1.277 (Claude Code)`).
+pub fn ensure_claude_ultracode_version(
+    pinned_version: &str,
+    effort: Option<EffortSelection>,
+) -> DriverResult<()> {
+    if !effort.is_some_and(|selection| selection.ultracode) {
+        return Ok(());
+    }
+    let supported = remuda_protocol::parse_effort_version(pinned_version)
+        .map(remuda_protocol::ultracode_supported)
+        .unwrap_or(false);
+    if supported {
+        return Ok(());
+    }
+    Err(DriverError::InvalidLaunchSpec(format!(
+        "ultracode requires Claude Code 2.1.203–2.1.283 (coupled) or 2.1.284+ (decoupled); the \
+         pinned binary reports {} and does not accept it",
+        if pinned_version.trim().is_empty() {
+            "an undetermined version"
+        } else {
+            pinned_version.trim()
+        }
+    )))
+}
+
 /// Reject effort flags a caller smuggled through `spec.args`: the materializer
 /// owns this axis per-kind, and a hand-written flag would either repeat the
 /// emitted token or use the wrong vocabulary (codex parses no `--effort` at
@@ -917,6 +950,43 @@ mod argv_tests {
                 Err(DriverError::InvalidLaunchSpec(_))
             ));
         }
+    }
+
+    #[test]
+    fn launch_ultracode_version_gate_refuses_below_the_floor_or_unknown() {
+        // D-056 (2): only 2.1.203–2.1.283 (coupled) and >=2.1.284 (decoupled)
+        // pinned builds accept the ultracode flag at launch.
+        let on = Some(sel(EffortName::Xhigh, true));
+        for version in [
+            "2.1.289",
+            "2.1.289 (Claude Code)",
+            "2.1.284",
+            "2.1.283",
+            "2.1.277",
+        ] {
+            assert!(
+                ensure_claude_ultracode_version(version, on).is_ok(),
+                "{version} supports ultracode"
+            );
+        }
+        for version in ["2.1.202", "2.1.180", "stub", "", "unpinned"] {
+            assert!(
+                matches!(
+                    ensure_claude_ultracode_version(version, on),
+                    Err(DriverError::InvalidLaunchSpec(_))
+                ),
+                "{version:?} must refuse ultracode"
+            );
+        }
+        // Plain levels are never gated, even below the floor.
+        for version in ["2.1.180", "stub", ""] {
+            assert!(
+                ensure_claude_ultracode_version(version, Some(sel(EffortName::High, false)))
+                    .is_ok(),
+                "plain high on {version:?} must launch"
+            );
+        }
+        assert!(ensure_claude_ultracode_version("2.1.180", None).is_ok());
     }
 
     #[test]

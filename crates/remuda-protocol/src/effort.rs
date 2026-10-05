@@ -121,7 +121,16 @@ pub enum EffortSemantics {
 /// Accepts the shapes transcript records actually carry, e.g. `2.1.289` and
 /// `2.1.277 (Claude Code)`: a leading dotted-numeric head of at least
 /// major.minor is required. A missing patch component reads as 0. Unparseable
-/// input yields [`EffortSemantics::Unknown`] via `None`.
+/// input yields `None`.
+///
+/// The version map (D-056): `≥ 2.1.284` is [`EffortSemantics::Decoupled`],
+/// `2.1.203–2.1.283` is [`EffortSemantics::Coupled`], and anything BELOW
+/// `2.1.203` reads as [`EffortSemantics::Unknown`] — those builds have no
+/// ultracode at all, so like an unparseable version they refuse the flag
+/// rather than being treated as coupled. [`EffortSemantics::Unknown`] is
+/// returned rather than `None` so a record carrying a real but-too-old version
+/// still seeds the gate; `None` is reserved for a string that is not a
+/// version.
 pub fn parse_effort_version(raw: &str) -> Option<EffortSemantics> {
     let head: String = raw
         .trim()
@@ -137,9 +146,23 @@ pub fn parse_effort_version(raw: &str) -> Option<EffortSemantics> {
     let patch = parts.next().unwrap_or(0);
     Some(if (major, minor, patch) >= (2, 1, 284) {
         EffortSemantics::Decoupled
-    } else {
+    } else if (major, minor, patch) >= (2, 1, 203) {
         EffortSemantics::Coupled
+    } else {
+        EffortSemantics::Unknown
     })
+}
+
+/// Whether a build with `semantics` accepts the ultracode workflow flag at
+/// all (D-056). Only coupled (2.1.203–2.1.283) and decoupled (≥ 2.1.284)
+/// builds do; a pre-2.1.203 build, or a version that could not be determined,
+/// must refuse `ultracode: true` — fail closed, never guess.
+#[must_use]
+pub fn ultracode_supported(semantics: EffortSemantics) -> bool {
+    matches!(
+        semantics,
+        EffortSemantics::Coupled | EffortSemantics::Decoupled
+    )
 }
 
 /// Parse one of Claude's five plain effort levels (`low…max`). The input
@@ -533,11 +556,15 @@ impl EffortTracker {
     }
 
     /// Learn the semantics from one transcript record's `version` field. A
-    /// later record cannot move a known gate back to unknown. All records of a
-    /// process carry one version, so the order they are fed in does not
-    /// matter.
+    /// later record cannot move a known gate back to unknown: a pre-2.1.203
+    /// version now parses to [`EffortSemantics::Unknown`], and adopting it
+    /// would wrongly reopen a gate an in-process record already settled. All
+    /// records of a process carry one version, so the order they are fed in
+    /// otherwise does not matter.
     pub fn note_version(&mut self, version: &str) {
-        if let Some(found) = parse_effort_version(version) {
+        if let Some(found) = parse_effort_version(version)
+            && found != EffortSemantics::Unknown
+        {
             self.semantics = found;
         }
     }
@@ -898,9 +925,46 @@ mod tests {
             parse_effort_version("2.1.203"),
             Some(EffortSemantics::Coupled)
         );
+        // Below the coupled floor the build has no ultracode; it reads Unknown
+        // (refuse the flag), NOT Coupled.
+        assert_eq!(
+            parse_effort_version("2.1.202"),
+            Some(EffortSemantics::Unknown)
+        );
+        assert_eq!(
+            parse_effort_version("2.1.180"),
+            Some(EffortSemantics::Unknown)
+        );
+        assert_eq!(
+            parse_effort_version("2.0.0"),
+            Some(EffortSemantics::Unknown)
+        );
+        // A missing patch is 0, so "2.1" is below the 2.1.203 floor.
+        assert_eq!(parse_effort_version("2.1"), Some(EffortSemantics::Unknown));
         assert_eq!(parse_effort_version("2"), None);
         assert_eq!(parse_effort_version(""), None);
         assert_eq!(parse_effort_version("fixture"), None);
+    }
+
+    #[test]
+    fn ultracode_is_refused_below_the_coupled_floor_or_when_unknown() {
+        assert!(ultracode_supported(EffortSemantics::Coupled));
+        assert!(ultracode_supported(EffortSemantics::Decoupled));
+        assert!(!ultracode_supported(EffortSemantics::Unknown));
+        // A pre-2.1.203 record must not downgrade a gate a current record set.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        assert_eq!(tracker.semantics(), EffortSemantics::Decoupled);
+        tracker.note_version("2.1.180");
+        assert_eq!(
+            tracker.semantics(),
+            EffortSemantics::Decoupled,
+            "a too-old version must not move a known gate back to unknown"
+        );
+        // A tracker that only ever saw a too-old version stays Unknown.
+        let mut old = EffortTracker::new();
+        old.note_version("2.1.180");
+        assert_eq!(old.semantics(), EffortSemantics::Unknown);
     }
 
     #[test]

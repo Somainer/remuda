@@ -553,6 +553,70 @@ async fn owner_resume_of_a_live_chapter_fences_it_and_copies_the_delegation() ->
     Ok(())
 }
 
+/// D-057 OA6: a chapter marked `failed` by a retryable SDK turn error still
+/// has a live process. `failed` is turn-level, not process termination, so a
+/// continuation MUST close the predecessor — otherwise two live chapters
+/// coexist. Only process-end evidence (exited/closed) skips the close.
+#[tokio::test]
+async fn a_failed_but_alive_chapter_is_closed_when_the_lineage_continues() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // The chapter reports its native session and stays RUNNING; the Hub
+    // projection then records a turn-level failure (the ma-sdk-state
+    // projection keeps lifecycle running, but older rows may already carry
+    // `failed` — either way this row has no process-end evidence).
+    ctx.report_session(&node, &x, false).await?;
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE instances SET lifecycle = 'failed', last_error = 'api-error: 429'
+             WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+    }
+
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = response["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(x, y);
+
+    // OA6: the failed-but-alive predecessor is closed FIRST...
+    let (method, close_params) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    assert_eq!(close_params["instanceId"], json!(x));
+    // ...then the successor launches — the predecessor's process cannot still
+    // be running beside it.
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    // Only one close was forwarded (exactly one predecessor), and the lineage
+    // moved to the successor.
+    let duplicate = tokio::time::timeout(Duration::from_millis(150), node.next_frame()).await;
+    assert!(
+        duplicate.is_err(),
+        "only the predecessor close plus the successor create are forwarded"
+    );
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(lineage["generation"], json!(2));
+    Ok(())
+}
+
 // --- 2. Ended chapter + host offline ------------------------------------
 
 #[tokio::test]

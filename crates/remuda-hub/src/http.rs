@@ -2066,9 +2066,17 @@ async fn resume_lineage(
             (resumed.fenced, resumed.successor, resumed.command)
         }
     };
-    let fenced_live = state.nodes.kind_of(&fenced.host_id).await.is_some()
-        && !matches!(fenced.lifecycle.as_str(), "exited" | "failed" | "closed");
-    if fenced_live {
+    // D-057 OA6 (ma-lineage round 2): `failed` is turn-level, not process
+    // termination — a live predecessor after a retryable SDK turn error is
+    // still running its process, and fencing it without closing the process
+    // would leave two live chapters. Only genuine process-end evidence
+    // (exited/closed) means there is nothing to stop, so close unless that
+    // evidence exists. A `failed` chapter on a host with a live link MUST be
+    // closed; a `requested`/`starting` chapter that never started is not
+    // process-end either, but closing it is harmless and idempotent.
+    let host_live = state.nodes.kind_of(&fenced.host_id).await.is_some();
+    let has_process_end_evidence = matches!(fenced.lifecycle.as_str(), "exited" | "closed");
+    if host_live && !has_process_end_evidence {
         // Until ma-fence lands, the old process loses Hub authority through
         // its deleted launch credential; the Hub still forwards the existing
         // instance.close so the live process stops.

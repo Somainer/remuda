@@ -349,6 +349,28 @@ async fn unregister_is_refused_while_a_session_is_live_and_settles_after_it_ends
         fixture.node.recorded()
     );
 
+    // A lexical canonical alias for the same busy root must not slip past the
+    // occupancy guard (exact-string lookup would miss it).
+    let (status, body) = json_request(
+        fixture.hub.addr,
+        "DELETE",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        Some(&json!({"path": "/srv/./remuda-e2e/../remuda-e2e/"}).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("live session"), "{body}");
+    assert!(
+        !fixture
+            .node
+            .recorded()
+            .iter()
+            .any(|method| method == "workspace.unregister"),
+        "the aliased refusal must never reach the Node: {:?}",
+        fixture.node.recorded()
+    );
+
     // Ended sessions keep their history row but no longer block removal.
     fixture
         .hub

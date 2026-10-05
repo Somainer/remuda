@@ -231,7 +231,11 @@ async fn workspace_id_for_path(
     path: &str,
 ) -> Result<Option<String>, HubError> {
     let host = host_id.to_owned();
-    let path = path.to_owned();
+    // Lexically normalize the request (no filesystem: the path lives on the
+    // Node) so a `/a/./b` or `/a/x/../b` alias of a canonical snapshot root
+    // cannot skip the occupancy guard. Snapshot roots are already canonical,
+    // and the Node canonicalizes the same alias again at prepare.
+    let normalized = normalize_absolute(path);
     let (_, workspaces) = state
         .store
         .run_named("workspace_id_for_path", move |conn| {
@@ -240,8 +244,40 @@ async fn workspace_id_for_path(
         .await?;
     Ok(workspaces
         .iter()
-        .find(|workspace| workspace["root"].as_str() == Some(path.as_str()))
+        .find(|workspace| {
+            workspace["root"]
+                .as_str()
+                .map(|root| normalize_absolute(root) == normalized)
+                .unwrap_or(false)
+        })
         .and_then(|workspace| workspace["workspaceId"].as_str().map(str::to_owned)))
+}
+
+/// Lexically normalize an absolute path the way the Node's `canonicalize`
+/// treats non-symlink aliases: empty/`.` segments collapse, `..` pops, with
+/// no filesystem access (symlink components are not resolvable Hub-side).
+/// Returns None for a relative or unrepresentable path.
+fn normalize_absolute(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            name => stack.push(name),
+        }
+    }
+    if stack.is_empty() {
+        Some("/".to_owned())
+    } else {
+        let mut out = String::from('/');
+        out.push_str(&stack.join("/"));
+        Some(out)
+    }
 }
 
 async fn mutate(
@@ -580,6 +616,22 @@ mod tests {
             count_workspace_users(&conn, "hst_a", "wsp_other").unwrap(),
             (1, 0)
         );
+    }
+
+    #[test]
+    fn normalizes_absolute_aliases_and_rejects_relative() {
+        assert_eq!(
+            normalize_absolute("/srv/app/./src/../app").as_deref(),
+            Some("/srv/app/app")
+        );
+        assert_eq!(
+            normalize_absolute("/srv//app/").as_deref(),
+            Some("/srv/app")
+        );
+        assert_eq!(normalize_absolute("/..").as_deref(), Some("/"));
+        assert_eq!(normalize_absolute("/").as_deref(), Some("/"));
+        assert_eq!(normalize_absolute("srv/app"), None);
+        assert_eq!(normalize_absolute("../srv"), None);
     }
 
     #[test]

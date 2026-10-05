@@ -148,7 +148,7 @@ describe("useStaleCutoffTick", () => {
   });
 });
 
-describe("useStaleCutoffTick online/recent hosts (c-perffu r6 gate flake)", () => {
+describe("useStaleCutoffTick drives the real host-status path (c-perffu r7)", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
@@ -157,38 +157,56 @@ describe("useStaleCutoffTick online/recent hosts (c-perffu r6 gate flake)", () =
     vi.useRealTimers();
   });
 
-  it("an online recently-seen host is never stale at mount or after ticks", () => {
-    // The gate-flake hypothesis: e2e fake hosts look stale/offline-unknown.
+  it("the hook clock is what flips a fresh-offline row stale, while an online row never is", () => {
+    // r6 test bypassed the clock for the online row, so it passed with a
+    // frozen/zero nowMs. Both assertions here must come from the hook's
+    // emitted nowMs (the same value HostsPage feeds statusText/grouping),
+    // advancing through the real setTimeout chain.
     const online: StaleClockHost = {
       state: "online",
       online: true,
       ssh: undefined,
       lastSeenAt: new Date(T0 - 1_000).toISOString(),
     };
-    const freshOffline: StaleClockHost = {
+    // Offline row whose cutoff is T0+1ms: at the hook's initial nowMs it is
+    // fresh, and the classification can flip ONLY because the hook ticks.
+    const offlineAtCutoff: StaleClockHost = {
       state: "offline",
       online: false,
       ssh: undefined,
-      lastSeenAt: new Date(T0 - 1_000).toISOString(),
+      lastSeenAt: new Date(T0 - (STALE_OFFLINE_MS - 1)).toISOString(),
     };
-    const { result, rerender } = renderHook(
-      ({ list }) => useStaleCutoffTick(list),
-      { initialProps: { list: [online, freshOffline] } },
-    );
-    expect(isStaleOffline(online as Host, result.current)).toBe(false);
-    expect(isStaleOffline(freshOffline as Host, result.current)).toBe(false);
+    const hosts = [online, offlineAtCutoff];
+    const { result, rerender } = renderHook(({ list }) => useStaleCutoffTick(list), {
+      initialProps: { list: hosts },
+    });
 
-    // 30 display minutes worth of ticks with equal references.
-    for (let i = 0; i < 120; i += 1) {
-      act(() => {
-        vi.advanceTimersByTime(15_000);
-      });
-      rerender({ list: [online, freshOffline] });
-    }
-    expect(isStaleOffline(online as Host, result.current)).toBe(false);
-    // Freshly seen offline (lastSeen at T0-1s, now T0+30m) is still inside
-    // the 30-minute window at exactly 30m (strict >) — classification of an
-    // actual stale host is exercised elsewhere; online must NEVER flip.
-    expect(isStaleOffline(online as Host, result.current + 60_000)).toBe(false);
+    // At mount the hook's clock reads T0; the offline row is 1ms inside the
+    // window and the online row is online — both fresh.
+    expect(result.current).toBe(T0);
+    expect(isStaleOffline(hosts[0] as Host, result.current)).toBe(false);
+    expect(isStaleOffline(hosts[1] as Host, result.current)).toBe(false);
+
+    // With the timers NOT advanced, a frozen clock keeps the offline row
+    // fresh forever (a zero/frozen clock would never group it): re-render
+    // alone does nothing.
+    rerender({ list: hosts });
+    expect(isStaleOffline(hosts[1] as Host, result.current)).toBe(false);
+
+    // Advancing the hook's timer past the cutoff updates the emitted nowMs;
+    // the offline row flips stale (proving the clock drives the decision)…
+    act(() => {
+      vi.advanceTimersByTime(2);
+    });
+    expect(result.current).toBeGreaterThan(T0);
+    expect(isStaleOffline(hosts[1] as Host, result.current)).toBe(true);
+    // …and the online row, at the SAME clock instant and after a further full
+    // hour of ticks, is never stale.
+    expect(isStaleOffline(hosts[0] as Host, result.current)).toBe(false);
+    act(() => {
+      vi.advanceTimersByTime(60 * 60_000);
+    });
+    expect(isStaleOffline(hosts[0] as Host, result.current)).toBe(false);
+    expect(isStaleOffline(hosts[1] as Host, result.current)).toBe(true);
   });
 });

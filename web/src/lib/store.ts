@@ -117,6 +117,15 @@ export type EffortPending = {
    * push-down; an equal/older projection leaves a queued push pending.
    */
   baselineObservedAt: string | null;
+  /**
+   * `observedAt` of the configure lifecycle that put the switch in the
+   * queue. A queued switch must be cleared ONLY by an effective read-back at
+   * least as new as the queued REQUEST: a projection newer than the old
+   * baseline but older than the request (a stale in-flight poll) must not
+   * settle it. Null for an optimistic setEffort that has not been journaled
+   * yet (falls back to the baseline rule).
+   */
+  requestObservedAt: string | null;
 };
 
 /** Pending entries older than this without a verdict are dropped. */
@@ -759,9 +768,17 @@ class HubStore {
       // still carries pending: an identical poll must then clear pending even
       // though the effective map does not change.
       const pending = this.state.effortPending[instance.id];
+      // Clear a queued switch only on a read-back at least as new as the
+      // queued request (c-perffu r7): a projection newer than the pre-switch
+      // baseline but older than the configure request is a stale poll and must
+      // leave the pending switch in place. An optimistic (unjournaled)
+      // pending with no request timestamp keeps the baseline-only rule.
       const settlesPending =
         pending != null &&
-        (!pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt);
+        (pending.requestObservedAt != null
+          ? view.observedAt >= pending.requestObservedAt &&
+            (!pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt)
+          : !pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt);
       if (foldsEffective) {
         // Fold only on a strictly newer observation, or an equal-timestamp
         // record whose content actually changed — an identical fold is not an
@@ -1046,6 +1063,11 @@ class HubStore {
         queued: true,
         at: pending[instanceId]?.at ?? Date.now(),
         baselineObservedAt: pending[instanceId]?.baselineObservedAt ?? null,
+        // Stamp the request with THIS configure event's time; keep the
+        // earliest one if a queued switch re-announces. Settlement requires a
+        // read-back no older than the request.
+        requestObservedAt:
+          pending[instanceId]?.requestObservedAt ?? observation.observedAt,
       };
       this.emit({ effortPending: pending });
       return;
@@ -3425,6 +3447,9 @@ class HubStore {
           queued: busy,
           at: Date.now(),
           baselineObservedAt: this.state.effortEffective[instanceId]?.observedAt ?? null,
+          // Optimistic entry before the configure is journaled: no request
+          // timestamp yet; the queued lifecycle event stamps it on arrival.
+          requestObservedAt: this.state.effortPending[instanceId]?.requestObservedAt ?? null,
         },
       },
     });

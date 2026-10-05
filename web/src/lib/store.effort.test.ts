@@ -475,7 +475,10 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
   expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
 
-  // An IDENTICAL durable projection then settles the queued push-down.
+  // A stale poll carrying a read-back OLDER than the queued configure
+  // (00:05 < the seq-4 queued request at 00:14) must NOT clear the switch
+  // (c-perffu r7: settlement needs an observation at least as new as the
+  // queued request).
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
       {
@@ -490,6 +493,67 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
     ],
   } as never);
   await hubStore.refresh();
+  expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
+
+  // A current read-back at/after the queued request (00:14) settles it.
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      {
+        ...instance,
+        effortEffective: {
+          name: "max",
+          ultracode: false,
+          source: "remuda",
+          observedAt: "2026-09-16T00:14:00Z",
+        },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
   expect(hubStore.effortPendingOf(id)).toBeNull();
-  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
+});
+
+it("a stale effort poll older than the queued configure leaves the queued switch pending (c-perffu r7-3)", async () => {
+  // Same fixture shape, isolated: baseline read-back t1, queued configure
+  // journaled at t2, then a poll returns an effective at t1.5 (newer than the
+  // baseline, older than the request) — pending must survive.
+  const ctx = await startFollowing("poll-queued-stale", { state: "known", value: "idle" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const t1 = "2026-09-16T00:10:00Z";
+  const t15 = "2026-09-16T00:10:30Z";
+  const t2 = "2026-09-16T00:11:00Z";
+  const list = vi.spyOn(api, "instanceList");
+
+  // Baseline effective t1.
+  list.mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: { name: "high", ultracode: null, source: "launch", observedAt: t1 } }],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(t1);
+
+  // User queues a max switch: baseline t1.
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+
+  // Live delivery: the queued configure is journaled at t2.
+  const queued = {
+    ...configureLifecycle(2, "effort-queued:max", ctx.instance.id),
+    observedAt: t2,
+  };
+  ctx.receive(queued);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // A stale poll: t1.5 is newer than baseline t1 but older than the request t2.
+  list.mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: { name: "high", ultracode: null, source: "launch", observedAt: t15 } }],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // A current read-back (t2) settles.
+  list.mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: t2 } }],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });

@@ -269,26 +269,75 @@ async function rowOffset(scroller: Locator, n: number): Promise<number | null> {
 }
 
 /**
- * The restore has quiesced: the anchor row's scroller-relative offset is the
- * same across two animation frames. This is the synchronisation point for a
- * font released strictly AFTER the restore — an event, not a guessed delay.
+ * The restore has quiesced: the anchor row's scroller-relative offset has
+ * stayed put across several ResizeObserver MEASUREMENT cycles, not merely two
+ * animation frames (two rAFs can elapse with no size commit at all, so the
+ * font could be released while the restore is still correcting). The
+ * transcript's list element resizes whenever rows re-measure (mount heights,
+ * the padTop estimate, the font swap); we observe it and require the offset
+ * unchanged across consecutive cycles, with a quiet-period fallback and a
+ * bounded wait. This is the synchronisation point for a font released
+ * strictly around the restore — an event, not a guessed delay.
  */
-async function waitAnchorStable(page: Page, scroller: Locator, anchor: number): Promise<number> {
-  await expect
-    .poll(
-      async () => {
-        const first = await rowOffset(scroller, anchor);
-        await page.evaluate(
-          () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))),
-        );
-        const next = await rowOffset(scroller, anchor);
-        if (first === null || next === null) return "missing";
-        return Math.abs(first - next) <= 1 ? `stable:${next}` : "moving";
-      },
-      { timeout: 10_000, message: "the restored anchor never settled while the font was held" },
-    )
-    .toMatch(/^stable:/);
-  return (await rowOffset(scroller, anchor))!;
+async function waitAnchorStable(
+  page: Page,
+  scroller: Locator,
+  anchor: number,
+  { timeout = 15_000 }: { timeout?: number } = {},
+): Promise<number> {
+  const result = await scroller.evaluate(
+    (el, { label, deadlineMs }) =>
+      new Promise<string>((resolve) => {
+        // scroller > .list (spacer + every rendered row): its border box grows
+        // with each measured height and each padTop estimate commit.
+        const list = el.firstElementChild;
+        const offset = (): number | null => {
+          const re = new RegExp(`journal_burst_* event ${label}\\b`);
+          const row = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']")).find(
+            (candidate) => re.test(candidate.textContent ?? ""),
+          );
+          if (!row) return null;
+          return row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+        };
+        const REQUIRED = 3;
+        let last = offset();
+        let stable = 0;
+        let cycles = 0;
+        let settled: string | null = null;
+        const sample = (source: "ro" | "quiet") => {
+          if (source === "ro") cycles += 1;
+          // No settling on a timer before at least one real measurement cycle.
+          if (source === "quiet" && cycles === 0) return;
+          const next = offset();
+          if (next === null) return;
+          if (last !== null && Math.abs(next - last) <= 1) stable += 1;
+          else stable = 0;
+          last = next;
+          if (stable >= REQUIRED) settled = `stable:${next}`;
+        };
+        const ro = new ResizeObserver(() => sample("ro"));
+        if (list) ro.observe(list);
+        // Also sample on a short timer: once size commits stop, the RO simply
+        // goes quiet and that itself has to finish the wait.
+        const quiet = window.setInterval(() => sample("quiet"), 100);
+        const timer = window.setTimeout(() => {
+          window.clearInterval(quiet);
+          ro.disconnect();
+          resolve(settled ?? (last === null ? "missing" : "moving"));
+        }, deadlineMs);
+        const check = window.setInterval(() => {
+          if (settled === null) return;
+          window.clearInterval(check);
+          window.clearInterval(quiet);
+          window.clearTimeout(timer);
+          ro.disconnect();
+          resolve(settled);
+        }, 30);
+      }),
+    { label: anchor, deadlineMs: timeout },
+  );
+  expect(result, "the restored anchor never settled across measurement cycles").toMatch(/^stable:/);
+  return Number(result.slice("stable:".length));
 }
 
 /** Rendered rows never overlap once the new metrics are measured. */
@@ -446,7 +495,7 @@ async function savedPositionSurvivesSwap(
     beforeSwap = await waitAnchorStable(page, scroller, anchor);
     fontGate.release();
     await afterSwap(page);
-    settled = (await rowOffset(scroller, anchor))!;
+    settled = await waitAnchorStable(page, scroller, anchor);
   } else {
     // The swap lands BEFORE the restore. Rows only exist once the REST seed
     // returns (the follow socket is opened after the seed), so hold that one

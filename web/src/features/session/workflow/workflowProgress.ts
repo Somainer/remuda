@@ -373,7 +373,6 @@ function projectPhase(
   title: string,
   agents: WfAgent[],
   nowMs: number | undefined,
-  phaseState: string | undefined,
   runLive: boolean,
 ): WfPhaseView {
   const counts = countState(agents);
@@ -412,15 +411,15 @@ function projectPhase(
   // While the RUN is alive every count is provisional, even for a phase whose
   // own observation says completed: in a dynamic run a phase can show the
   // final N/N between spawning iterations (or while members with a null
-  // phaseId all completed), and the run may still spawn into it. The count is
-  // final only once the run is terminal. An empty seeded phase has nothing
-  // spawned yet: plain 0/0, no `+`.
-  const provisional =
-    runLive || phaseState === "running" || phaseState === "queued";
+  // phaseId all completed), and the run may still spawn into it or into the
+  // synthetic "unphased" bucket. The count is final only once the run is
+  // terminal — the phase's own state does not get a vote. An empty seeded
+  // phase has nothing spawned yet: plain 0/0, no `+`.
+  const provisional = runLive;
   const countText =
     !runLive && fullyDone
       ? `${total}/${total} 完成`
-      : `${terminal}/${total}${provisional && total > 0 ? "+" : ""}`;
+      : `${terminal}/${total}${runLive && total > 0 ? "+" : ""}`;
 
   return {
     id,
@@ -559,17 +558,15 @@ export function projectWorkflow({ run, phases, members, phaseOrder, nowMs }: Pro
   };
 
   const runLive = status === "running" || status === "paused";
-  const phaseViews = order.map((id, index) => {
-    const payloadPhase = phases.find((p) => p.phaseId === id);
-    return projectPhase(
+  const phaseViews = order.map((id, index) =>
+    projectPhase(
       id,
       titleOf(id, index),
       byPhase.get(id) ?? [],
       nowMs,
-      payloadPhase?.state,
       runLive,
-    );
-  });
+    ),
+  );
 
   const allAgents: WfAgent[] = phaseViews.flatMap((p) => [...p.pinned, ...p.head, ...p.folded]);
   const totalsPayload = run.totals;

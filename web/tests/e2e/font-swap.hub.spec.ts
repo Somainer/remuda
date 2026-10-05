@@ -612,29 +612,44 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
   test.setTimeout(120_000);
   await page.setViewportSize({ width: 390, height: 844 });
   const instanceId = await seedSession(page);
-  // Gate the woff2 instead of delaying it: the rows render on the fallback
-  // face and stay pinned, then the swap is released at a known point.
-  const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/);
-
-  await page.goto(`/s/${instanceId}`);
   const scroller = page.getByTestId("transcript-scroller");
-  await loaded(page);
-  await fontGate.waitArrival();
-  expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
-  fontGate.release();
-  await afterSwap(page);
-  await scroller.evaluate((el) => {
-    el.scrollTop = el.scrollHeight;
-    el.dispatchEvent(new Event("scroll", { bubbles: true }));
-  });
-  await page.waitForTimeout(300);
+  const bottomGap = () => scroller.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
+  const assertPinned = (when: string) =>
+    expect.poll(bottomGap, { timeout: 10_000, message: `${when}: pinned without any manual scroll` }).toBeLessThan(64);
 
+  // First visit, fresh document: a CLOSED woff2 gate installed before the
+  // goto. Rows render on the fallback face; the transcript must be pinned on
+  // its own (pin re-pins on every size commit) — no manual scroll anywhere.
+  const firstGate = await gateRoute(page, /\.woff2(?:\?|$)/);
+  await page.goto(`/s/${instanceId}`);
+  await loaded(page);
+  await firstGate.waitArrival();
+  expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
+  await assertPinned("before the first swap");
+  await expect(page.getByTestId("jump-latest"), "pinned transcript shows no jump-latest chip").not.toBeVisible();
+  firstGate.release();
+  await afterSwap(page);
+  await assertPinned("after the first swap");
+  await expect(page.getByTestId("jump-latest")).not.toBeVisible();
+  await firstGate.dispose();
+
+  // Leave and come back. The final visit gets its OWN fresh closed gate (the
+  // first document cached the woff2, so force revalidation): verify the font
+  // is genuinely unloaded AND the transcript is already pinned on fallback
+  // before release, then verify it stays pinned after the swap — again with
+  // no manual scroll to hide a failure.
   await page.goto("/sessions");
+  await expect(page.getByTestId("session-list")).toBeVisible();
+  const finalGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
   await page.goto(`/s/${instanceId}`);
   await expect(page.getByTestId("transcript-row")).not.toHaveCount(0, { timeout: 15_000 });
+  await finalGate.waitArrival();
+  expect(await monoLoaded(page), "the final visit must start with the font unloaded").toBe(false);
+  await assertPinned("the final visit before the swap");
+  await expect(page.getByTestId("jump-latest")).not.toBeVisible();
+  finalGate.release();
   await afterSwap(page);
-  const gap = await scroller.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
-  expect(gap, "pinned transcript lost the bottom after the swap").toBeLessThan(64);
+  await assertPinned("the final visit after the swap");
   await expect(page.getByTestId("jump-latest")).not.toBeVisible();
   await assertRowsStacked(scroller);
 });

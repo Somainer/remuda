@@ -1974,6 +1974,110 @@ async fn restart_policy_from_agent_or_bot_origin_is_forbidden() -> Result<()> {
 
 // --- 10. Pre-ma-lineage grant holders are backfilled on open ---------------
 
+/// r3 item 1: a reopened database with a continuation (root X + successor Y
+/// carrying copied grants) must backfill exactly ONE lineage, keyed by the
+/// stamped lineage id X — never a phantom lineage for the successor Y.
+#[tokio::test]
+async fn reopening_a_continued_lineage_backfills_no_phantom_successor_lineage() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let node_token = node_token.context("nodeToken")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // Continue X -> Y.
+    let resumed: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = resumed["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (_close, _) = node.next_frame().await?;
+    let (_method, _) = node.next_frame().await?;
+    assert_eq!(resumed["instance"]["lineageId"], json!(x));
+    ctx.report_session(&node, &y, false).await?;
+
+    let data_dir = ctx._dir.path().to_owned();
+    let (human, host) = (ctx.human.clone(), ctx.host.clone());
+    let Ctx {
+        _dir,
+        hub,
+        http,
+        human: _h,
+        host: _hh,
+        db_path,
+    } = ctx;
+    hub.shutdown().await;
+
+    // Reopen twice: the migration must never add a lineage keyed by Y.
+    for _ in 0..2 {
+        let hub = spawn(HubConfig::for_test(data_dir.join("data"))).await?;
+        let (total, for_x, for_y): (i64, i64, i64) = {
+            let db = rusqlite::Connection::open(&db_path)?;
+            (
+                db.query_row("SELECT COUNT(*) FROM lineages", [], |row| row.get(0))?,
+                db.query_row(
+                    "SELECT COUNT(*) FROM lineages WHERE lineage_id = ?1",
+                    rusqlite::params![x],
+                    |row| row.get(0),
+                )?,
+                db.query_row(
+                    "SELECT COUNT(*) FROM lineages WHERE lineage_id = ?1",
+                    rusqlite::params![y],
+                    |row| row.get(0),
+                )?,
+            )
+        };
+        assert_eq!(
+            (total, for_x, for_y),
+            (1, 1, 0),
+            "no phantom successor lineage"
+        );
+        hub.shutdown().await;
+    }
+
+    // And over HTTP: Y is a chapter, not a lineage root.
+    let hub = spawn(HubConfig::for_test(data_dir.join("data"))).await?;
+    let node = FakeNode::connect_with_token(&hub, &host, &node_token).await?;
+    let ctx = Ctx {
+        _dir,
+        hub,
+        http,
+        human,
+        host,
+        db_path,
+    };
+    let y_lineage = ctx
+        .http
+        .get(format!("{}/v1/lineages/{y}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?;
+    assert_eq!(
+        y_lineage.status(),
+        404,
+        "a successor chapter is not its own lineage root"
+    );
+    let x_lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(x_lineage["generation"], json!(2));
+    assert_eq!(x_lineage["chapters"].as_array().unwrap().len(), 2);
+    drop(node);
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_existing_grant_holder_gets_a_backfilled_lineage_and_then_resumes_as_a_continuation()
 -> Result<()> {

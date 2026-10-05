@@ -5852,15 +5852,21 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // D-057 §5 (ma-lineage round 2): rows written before ma-lineage got their
     // lineage_id stamped above but no lineage ROW, so a holder's resume fell
     // back to the plain D-026 path and dropped every continuity property.
-    // Backfill one lineage per existing continuity instance — one that holds
-    // any grant or carries a restart policy — with the instance itself as the
-    // first chapter. Idempotent: runs on every open but never duplicates
-    // (NOT EXISTS guard), and never touches rows created with the table.
+    // Backfill one lineage per existing continuity ROOT — an instance that
+    // holds any grant or carries a restart policy and is itself the FIRST
+    // chapter of its lineage. Only true roots qualify: a row with no stamped
+    // lineage_id (a pre-ma-lineage row) or one whose lineage_id equals its own
+    // id (a lineage root created by current code). A SUCCESSOR chapter carries
+    // lineage_id = its predecessor's id together with copied grants/restart;
+    // selecting it by its own id and inserting a lineage keyed by that id
+    // would manufacture a phantom second lineage for one continuation. The
+    // NOT EXISTS guard therefore checks the STAMPED lineage id. Idempotent on
+    // every open.
     conn.execute(
         "INSERT INTO lineages
             (lineage_id, current_instance_id, generation, state,
              paused_by_json, paused_at, restart_json, origin_spec_ref, updated_at)
-         SELECT i.id, i.id, 1,
+         SELECT COALESCE(i.lineage_id, i.id), i.id, 1,
                 CASE WHEN i.lifecycle IN ('requested','preparing','starting')
                      THEN 'starting' ELSE 'running' END,
                 NULL, NULL, i.restart_json,
@@ -5872,8 +5878,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
            FROM instances i
           WHERE (i.restart_json IS NOT NULL
                  OR (i.grants_json IS NOT NULL AND i.grants_json != '[]'))
+            AND (i.lineage_id IS NULL OR i.lineage_id = i.id)
             AND NOT EXISTS (
-                SELECT 1 FROM lineages l WHERE l.lineage_id = i.id
+                SELECT 1 FROM lineages l
+                 WHERE l.lineage_id = COALESCE(i.lineage_id, i.id)
             )",
         [],
     )?;

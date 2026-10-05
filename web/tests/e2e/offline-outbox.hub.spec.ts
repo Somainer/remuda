@@ -447,3 +447,73 @@ test("a committed POST whose browser response is lost retries with replayed:true
   await expect.poll(() => hubJournalMessageCount(api, instanceId, commandId!)).toBe(1);
   await expectDelivered(page, commandId);
 });
+
+/**
+ * c-hubfakeack: the fake Node must never swallow a Hub->Node RPC while waiting
+ * for a journal.append ack. After appending a delivered command's user turn it
+ * used to do `let _ = timeout(2s, ws.next())` and discard whatever frame
+ * arrived. The Hub pipelines instance.send RPCs over the one Node link (many
+ * in-flight slots), so when a burst of POSTs lands the later RPC frames are
+ * already buffered by the time the first append waits for its ack: the discard
+ * ate the SECOND send (never answered, never journaled). The fake now matches
+ * its own j{seq} ack and queues every other frame for the dispatch loop, so a
+ * whole burst is answered and journaled. This fails on origin/main, where the
+ * burst journals one message short and one POST is never answered.
+ */
+test("a pipelined burst of sends is all answered and journaled — no RPC swallowed behind an append ack", async ({
+  page,
+}) => {
+  const instanceId = await createSession(page, "ack-hole seed");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const api = await hubApi(page);
+
+  const BURST = 6;
+  // No client commandId: the Hub mints a canonical cmd_+UUIDv7 and forwards it
+  // to the Node. Fire the whole burst concurrently so the Hub pipelines every
+  // instance.send over the link (many in-flight slots) before the Node finishes
+  // appending the first turn — precisely the window in which the old fake
+  // discarded the next frame.
+  const settled = await Promise.all(
+    Array.from({ length: BURST }, (_, i) =>
+      api
+        .post(`/v1/instances/${instanceId}/commands`, {
+          data: {
+            operation: "instance.send",
+            payload: { prompt: `ack-hole message ${i}` },
+          },
+        })
+        .then(async (res) => {
+          const body = (await res.json().catch(() => ({}))) as {
+            command?: { commandId?: string };
+          };
+          return { status: res.status(), commandId: body.command?.commandId ?? null };
+        })
+        .catch((err: unknown) => ({ status: -1, commandId: null as string | null, error: String(err) })),
+    ),
+  );
+
+  // Every POST was answered 200 — the Node replied to every forwarded RPC.
+  const failed = settled.filter((r) => r.status !== 200 || !r.commandId);
+  expect(
+    failed,
+    `unanswered/failed sends in burst: ${JSON.stringify(failed)}`,
+  ).toHaveLength(0);
+  const commandIds = settled.map((r) => r.commandId!);
+  expect(new Set(commandIds).size, "every send minted a distinct commandId").toBe(BURST);
+
+  // Authoritative proof: every command reaches the journal as exactly one user
+  // message. A swallowed RPC never runs its handler, so its user turn is absent
+  // on the buggy fake and this poll exhausts its timeout.
+  for (const commandId of commandIds) {
+    await expect
+      .poll(() => hubJournalMessageCount(api, instanceId, commandId), { timeout: 40_000 })
+      .toBe(1);
+  }
+
+  // Exactly one command row per id — the swallowed RPC must not leave a missing
+  // ledger row (and the fix must not duplicate one).
+  const rows = await hubCommands(api, instanceId);
+  for (const commandId of commandIds) {
+    expect(rows.filter((c) => c.operation === "instance.send" && c.id === commandId)).toHaveLength(1);
+  }
+});

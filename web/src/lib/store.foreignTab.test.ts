@@ -170,3 +170,51 @@ it("a row another tab retracts before the inflight claim commits is never POSTed
   expect(send).not.toHaveBeenCalled();
   hubStore.logout();
 });
+
+it("a retracted first row does not strand the next queued row of the instance (drain continues)", async () => {
+  // c-reconnfu round 4 item 1: rows [A, B] are read deliverable inside one
+  // lock turn; A is retracted inside its inflight claim (null claim → no POST).
+  // The drain must distinguish a skipped/deleted row from a failed delivery and
+  // continue to B in the SAME bounded turn — the old code returned null from
+  // deliverOneRow, the flush broke with deliveredNew=false, and B sat pending
+  // with no retry timer.
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore);
+
+  const base = Date.now();
+  localStorage.setItem(
+    OUTBOX_LS_KEY,
+    JSON.stringify([
+      row({ commandId: "cmd_a_retracted", clientRequestId: "local_a", createdAt: base - 2_000 }),
+      row({ commandId: "cmd_b_delivered", clientRequestId: "local_b", createdAt: base - 1_000 }),
+    ]),
+  );
+  const send = vi
+    .spyOn(api, "instanceSend")
+    .mockResolvedValue({
+      relatedCommandIds: [],
+      command: {
+        commandId: "cmd_b_delivered",
+        id: "cmd_b_delivered",
+        state: "accepted",
+        revision: "1",
+        dispatch: "native-acknowledged",
+        resolution: "clear",
+      } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
+    });
+
+  // Only A is retracted inside its claim window; B's claim must commit normally.
+  const box = (hubStore as unknown as { outbox: import("./outbox").Outbox }).outbox;
+  const realPatch = box.patch.bind(box);
+  vi.spyOn(box, "patch").mockImplementation(async (id, patch) => {
+    if (id === "cmd_a_retracted" && patch.state === "inflight") await box.remove(id);
+    return realPatch(id, patch);
+  });
+
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  // B POSTed exactly once, A never did.
+  expect(send.mock.calls[0]?.[4]).toBe("cmd_b_delivered");
+  expect(send.mock.calls.some((c) => c[4] === "cmd_a_retracted")).toBe(false);
+  hubStore.logout();
+});

@@ -1590,42 +1590,49 @@ class HubStore {
   }
 
   /**
-   * Deliver ONE authoritative row (the first fresh one), re-reading its mode
-   * from the box so a just-landed steer promotion takes effect. Runs inside the
-   * single-deliverer lock. Returns the POSTed row's commandId (added to the
-   * flush's attempted set) or null when nothing was POSTed.
+   * Deliver the first POSTable row of one lock turn, re-reading each mode from
+   * the box so a just-landed steer promotion takes effect. Runs inside the
+   * single-deliverer lock. A candidate that is no longer deliverable or whose
+   * claim did not run a POST (retracted/deleted by another tab, a terminal
+   * done, an aborted claim, an exhausted retry window) is SKIPPED and the
+   * bounded drain continues to the NEXT candidate in the same turn — returning
+   * null for the skipped first row used to break the whole flush and strand
+   * every later queued row of the instance with no retry timer.
+   * Returns the POSTed row's commandId (added to the flush's attempted set)
+   * or null when no candidate POSTed.
    */
   private async deliverOneRow(instanceId: Id, deliverable: OutboxRecord[]): Promise<Id | null> {
     const box = this.outbox;
     if (!box) return null;
-    const rec = deliverable[0];
-    if (!rec) return null;
-    const fresh = box.get(rec.commandId) ?? rec;
-    if (!isDeliverableOutbox(fresh, Date.now())) return null;
-    const attemptedPost = await this.deliverOutboxRecord(fresh);
-    if (!attemptedPost) return null;
-    // If that drained the instance, run the post-delivery resync/screen chain
-    // exactly once.
-    if (!box.pendingFor(instanceId).length) {
-      await this.chainReconcile(instanceId, async () => {
-        const client = this.journals.get(
-          this.state.instances.find((i) => i.id === instanceId)?.journalId ?? "",
-        );
-        try {
-          await client?.resumeAfterReconnect();
-        } catch {
-          /* machine owns the failure */
-        }
-        const events = this.state.events[instanceId] ?? [];
-        this.settleFromJournal(instanceId, events);
-        try {
-          await this.refreshScreen(instanceId);
-        } catch (err) {
-          if (!isScreenNodeBusy(err)) this.reconcileToast(err, "屏幕同步");
-        }
-      });
+    for (const rec of deliverable) {
+      const fresh = box.get(rec.commandId) ?? rec;
+      if (!isDeliverableOutbox(fresh, Date.now())) continue;
+      const attemptedPost = await this.deliverOutboxRecord(fresh);
+      if (!attemptedPost) continue;
+      // If that drained the instance, run the post-delivery resync/screen chain
+      // exactly once.
+      if (!box.pendingFor(instanceId).length) {
+        await this.chainReconcile(instanceId, async () => {
+          const client = this.journals.get(
+            this.state.instances.find((i) => i.id === instanceId)?.journalId ?? "",
+          );
+          try {
+            await client?.resumeAfterReconnect();
+          } catch {
+            /* machine owns the failure */
+          }
+          const events = this.state.events[instanceId] ?? [];
+          this.settleFromJournal(instanceId, events);
+          try {
+            await this.refreshScreen(instanceId);
+          } catch (err) {
+            if (!isScreenNodeBusy(err)) this.reconcileToast(err, "屏幕同步");
+          }
+        });
+      }
+      return fresh.commandId;
     }
-    return fresh.commandId;
+    return null;
   }
 
   /**

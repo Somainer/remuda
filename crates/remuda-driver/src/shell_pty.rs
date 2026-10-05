@@ -837,7 +837,7 @@ impl ShellPtyDriver {
         let Some(request) = crate::effort::EffortRequest::from_level(level) else {
             return Err(DriverError::CapabilityUnsupported(format!(
                 "claude /effort does not accept {level:?} in-session; \
-                 valid: low, medium, high, xhigh, max, ultracode"
+                 valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
             )));
         };
         let state = self.state().await?;
@@ -1105,10 +1105,7 @@ impl ShellPtyDriver {
         // adopts the previous bridge afterwards when a switch was in flight.
         let effort_bridge = Arc::new(crate::effort::EffortBridge::new());
         if let Some(effort) = spec.and_then(|spec| spec.effort) {
-            effort_bridge.note_launch_request(crate::effort::EffortRequest {
-                name: effort.name,
-                ultracode: effort.ultracode,
-            });
+            effort_bridge.note_launch_request(crate::effort::EffortRequest::from_selection(effort));
         }
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(ShellEffortIo {
             state: Arc::clone(&state),

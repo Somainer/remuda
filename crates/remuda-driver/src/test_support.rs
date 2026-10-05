@@ -41,9 +41,17 @@ impl Bridge {
     }
 
     /// Arm an arbitrary `/effort <word>` switch; returns its generation.
+    /// Accepts level words, the bare `ultracode`, and `ultracode on|off`.
     pub fn arm_word(&self, word: &str) -> u64 {
         self.inner
             .arm(EffortRequest::from_level(word).expect("level"))
+    }
+
+    /// Arm a switch from raw slash args; `None` for words Remuda cannot send
+    /// (`auto`, `status`, `bogus`, `ultracode bogus`).
+    #[must_use]
+    pub fn arm_args(&self, args: &str) -> Option<u64> {
+        EffortRequest::from_level(args).map(|request| self.inner.arm(request))
     }
 
     /// Whether a switch is still awaiting its verdict.

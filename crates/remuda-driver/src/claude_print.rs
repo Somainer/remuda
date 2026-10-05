@@ -2591,6 +2591,10 @@ impl TranscriptMapper {
         session_id: String,
         binary_version: String,
     ) -> Self {
+        // D-056: seed the effort version gate from the pinned binary; the
+        // transcript's own `version` records correct it as needed.
+        let mut effort = remuda_protocol::EffortTracker::new();
+        effort.seed_version(&binary_version);
         Self {
             mapper: Mapper {
                 stream: stream::StreamState::default(),
@@ -2613,7 +2617,7 @@ impl TranscriptMapper {
             group: records::Group::default(),
             seen_prompts: std::collections::HashSet::new(),
             seen_uuids: std::collections::HashSet::new(),
-            effort: remuda_protocol::EffortTracker::new(),
+            effort,
             effort_bridge: None,
             effort_generation: None,
             model: remuda_protocol::ModelTracker::new(),
@@ -2821,6 +2825,11 @@ impl TranscriptMapper {
         {
             self.mapper.session_id = session.to_owned();
         }
+        // D-056: every transcript record names its Claude Code version; the
+        // effort gate (coupled vs decoupled ultracode) follows it.
+        if let Some(version) = value.get("version").and_then(Value::as_str) {
+            self.effort.note_version(version);
+        }
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         let mut extra = Vec::new();
         if kind == "assistant" {
@@ -2857,70 +2866,111 @@ impl TranscriptMapper {
     /// §9.1: the `/effort` command writes TWO user records — the slash markup
     /// and its `<local-command-stdout>` verdict. The slash record only arms
     /// attribution (on 2.1.272 it lands even for a dismissed dialog); the
-    /// verdict settles the level and resolves or rejects the switch bridge.
-    /// Returns an effort edge observation when the verdict changes the level.
+    /// verdict settles the level/toggle and resolves or rejects the switch
+    /// bridge. Returns effort edge observations when the verdict changes the
+    /// effective level or flag.
     fn note_effort_user(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
         let Some(message) = value.get("message") else {
             return Ok(Vec::new());
         };
         let text = records::record_text(message);
         if text.contains("<command-name>/effort</command-name>") {
-            let Some(word) = remuda_protocol::slash_effort_word(&text) else {
+            let Some(args) = remuda_protocol::slash_effort_args(&text) else {
                 return Ok(Vec::new());
             };
             let from_remuda = self
                 .effort_bridge
                 .as_ref()
                 .and_then(|bridge| bridge.pending())
-                .is_some_and(|request| request.command_word() == word);
+                .is_some_and(|request| request.command_word() == args);
             if from_remuda
                 && let Some(bridge) = &self.effort_bridge
                 && let Some((generation, request)) = bridge.pending_with_gen()
             {
                 self.effort_generation = Some(generation);
-                self.effort.arm_awaiting(request.observed_name());
+                // A decoupled flag toggle does not move the level, so its
+                // verdict settles without a level await.
+                if let Some(name) = request.awaits_level(self.effort.semantics()) {
+                    self.effort.arm_awaiting(name);
+                }
             }
-            self.effort.note_slash(&word, from_remuda);
+            self.effort.note_slash(&args, from_remuda);
             return Ok(Vec::new());
         }
         if text.contains("<local-command-stdout>") {
             let stdout = extract_local_stdout(&text);
-            let verdict = remuda_protocol::parse_effort_stdout(&stdout);
-            let from_remuda = self
-                .effort_bridge
-                .as_ref()
-                .and_then(|bridge| bridge.pending())
-                .is_some();
-            if matches!(verdict, remuda_protocol::EffortStdout::Accepted(_)) {
-                if let Some((observed, source)) = self.effort.note_stdout(&stdout, from_remuda) {
-                    if let Some(generation) = self.effort_generation.take()
-                        && let Some(bridge) = &self.effort_bridge
-                    {
-                        bridge.resolve(generation, observed);
-                    }
-                    return self.effort_observation(observed, source, Some(stdout));
-                }
-                // Non-edge accept: still resolve the switch (a switch to the
-                // level already in effect is accepted), carrying the flag.
+            let verdict = remuda_protocol::parse_effort_stdout(&stdout, self.effort.semantics());
+            return self.settle_effort_stdout(value, stdout, verdict);
+        }
+        Ok(Vec::new())
+    }
+
+    /// Settle one parsed `/effort` verdict: accept/status edges carry the
+    /// deterministic per-record event ids (parity with the journal tailer),
+    /// and an armed bridge generation resolves or rejects with the stable
+    /// reason code. Status output never touches the bridge.
+    fn settle_effort_stdout(
+        &mut self,
+        value: &Value,
+        stdout: String,
+        verdict: remuda_protocol::EffortStdout,
+    ) -> DriverResult<Vec<Observation>> {
+        let from_remuda = self
+            .effort_bridge
+            .as_ref()
+            .and_then(|bridge| bridge.pending())
+            .is_some();
+        match verdict {
+            remuda_protocol::EffortStdout::Accepted(parsed) => {
+                let edge = self.effort.note_stdout(&stdout, from_remuda);
                 if let Some(generation) = self.effort_generation.take()
                     && let Some(bridge) = &self.effort_bridge
-                    && let remuda_protocol::EffortStdout::Accepted(observed) = verdict
                 {
-                    bridge.resolve(generation, observed);
+                    // A switch to the state already in effect is accepted too:
+                    // carry the post-latch observation even without an edge.
+                    let settled = edge
+                        .map(|(observed, _)| observed)
+                        .unwrap_or(self.effort.last_observed().unwrap_or(parsed));
+                    bridge.resolve(generation, settled);
                 }
-            } else if matches!(
-                verdict,
-                remuda_protocol::EffortStdout::Kept | remuda_protocol::EffortStdout::Invalid
-            ) && let Some(generation) = self.effort_generation.take()
-                && let Some(bridge) = &self.effort_bridge
-            {
-                let reason = if verdict == remuda_protocol::EffortStdout::Kept {
-                    "dialog-kept"
-                } else {
-                    "invalid-argument"
-                };
-                bridge.reject(generation, reason);
+                if let Some((observed, source)) = edge {
+                    return self.effort_observation(
+                        value,
+                        observed,
+                        source,
+                        Some(stdout),
+                        remuda_protocol::EFFORT_STDOUT_NATIVE,
+                    );
+                }
             }
+            remuda_protocol::EffortStdout::Status(_) => {
+                // Observation only: it never resolves/rejects an armed switch.
+                if let Some((observed, source)) = self.effort.note_stdout(&stdout, from_remuda) {
+                    return self.effort_observation(
+                        value,
+                        observed,
+                        source,
+                        Some(stdout),
+                        remuda_protocol::EFFORT_STATUS_NATIVE,
+                    );
+                }
+            }
+            remuda_protocol::EffortStdout::Kept
+            | remuda_protocol::EffortStdout::Invalid
+            | remuda_protocol::EffortStdout::WorkflowsDisabled
+            | remuda_protocol::EffortStdout::UnavailableForModel
+            | remuda_protocol::EffortStdout::EnvOverride => {
+                // Clears the awaiting attribution; refuses the armed switch
+                // (if any) with the verdict's stable reason code.
+                self.effort.note_stdout(&stdout, from_remuda);
+                if let Some(generation) = self.effort_generation.take()
+                    && let Some(bridge) = &self.effort_bridge
+                    && let Some(reason) = verdict.reject_reason()
+                {
+                    bridge.reject(generation, reason);
+                }
+            }
+            remuda_protocol::EffortStdout::Other => {}
         }
         Ok(Vec::new())
     }
@@ -2939,30 +2989,33 @@ impl TranscriptMapper {
     }
 
     /// §9.1: 2.1.272 rides an `ultra_effort_enter|exit` attachment on the next
-    /// prompt; it corroborates the stdout verdict's ultracode flag.
+    /// prompt; on 2.1.289 a sparse enter is just a re-reminder while the toggle
+    /// stays on. It corroborates the verdict's ultracode flag.
     fn note_effort_attachment(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
-        match value.pointer("/attachment/type").and_then(Value::as_str) {
-            Some("ultra_effort_enter") => {
-                if let Some((observed, source)) = self.effort.note_ultra_attachment(true) {
-                    return self.effort_observation(observed, source, None);
-                }
+        if let Some(label @ ("ultra_effort_enter" | "ultra_effort_exit")) =
+            value.pointer("/attachment/type").and_then(Value::as_str)
+        {
+            let enters = label == "ultra_effort_enter";
+            if let Some((observed, source)) = self.effort.note_ultra_attachment(enters) {
+                // The attachment type is the native-key label, exactly like
+                // the journal tailer, so both channels derive one event id.
+                return self.effort_observation(value, observed, source, None, label);
             }
-            Some("ultra_effort_exit") => {
-                if let Some((observed, source)) = self.effort.note_ultra_attachment(false) {
-                    return self.effort_observation(observed, source, None);
-                }
-            }
-            _ => {}
         }
         Ok(Vec::new())
     }
 
-    /// Build the §9.1 effort observation for one edge.
+    /// Build the §9.1 effort observation for one edge. `native_label` selects
+    /// the deterministic event-id key (assistant message id vs
+    /// `/effort`-stdout/status/attachment record uuid) so the live mapper and
+    /// the journal tailer mint the same id for the same native edge.
     fn effort_observation(
         &mut self,
+        value: &Value,
         observed: remuda_protocol::ObservedEffort,
         source: remuda_protocol::EffortSource,
         raw: Option<String>,
+        native_label: &str,
     ) -> DriverResult<Vec<Observation>> {
         let requested = self
             .effort_bridge
@@ -2982,11 +3035,34 @@ impl TranscriptMapper {
             },
             raw,
         }));
-        Ok(vec![self.mapper.observation(
-            Completeness::Structured,
-            NativeRequestKey::None,
-            payload,
-        )?])
+        let mut obs =
+            self.mapper
+                .observation(Completeness::Structured, NativeRequestKey::None, payload)?;
+        obs.event_id = self.effort_event_id(value, observed.name, native_label);
+        Ok(vec![obs])
+    }
+
+    /// Deterministic event id for one effort edge, matching the journal
+    /// tailer's key: the assistant message id for assistant edges, or
+    /// `<label>:<record uuid>` for verdict/attachment edges.
+    fn effort_event_id(
+        &self,
+        value: &Value,
+        name: remuda_protocol::EffortName,
+        native_label: &str,
+    ) -> EventId {
+        let scope = self.mapper.instance_id.as_id().as_str();
+        if native_label.is_empty() {
+            let native = value
+                .pointer("/message/id")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("uuid").and_then(Value::as_str))
+                .unwrap_or("");
+            remuda_protocol::effort_event_id(scope, native, name)
+        } else {
+            let native = value.get("uuid").and_then(Value::as_str).unwrap_or("");
+            remuda_protocol::effort_record_event_id(scope, native_label, native, name)
+        }
     }
 
     /// §9.1: read `effort` / `perTurnEffort` off an assistant record and emit
@@ -3003,7 +3079,7 @@ impl TranscriptMapper {
             .filter(|value| !value.is_empty())
             .or(per_turn.filter(|value| !value.is_empty()))
             .map(str::to_owned);
-        self.effort_observation(observed, source, raw)
+        self.effort_observation(value, observed, source, raw, "")
     }
 
     // ───────── §9.1 model read-back (same verdict pattern as effort) ─────────
@@ -3096,7 +3172,7 @@ impl TranscriptMapper {
             return Ok(Vec::new());
         }
         if text.contains("<local-command-stdout>") {
-            return self.settle_model_stdout(&extract_local_stdout(&text));
+            return self.settle_model_stdout(value, &extract_local_stdout(&text));
         }
         Ok(Vec::new())
     }
@@ -3131,13 +3207,17 @@ impl TranscriptMapper {
             return Ok(Vec::new());
         }
         if text.contains("<local-command-stdout>") {
-            return self.settle_model_stdout(&extract_local_stdout(text));
+            return self.settle_model_stdout(value, &extract_local_stdout(text));
         }
         Ok(Vec::new())
     }
 
     /// Shared verdict handling for `user` and `system` stdout records.
-    fn settle_model_stdout(&mut self, stdout: &str) -> DriverResult<Vec<Observation>> {
+    fn settle_model_stdout(
+        &mut self,
+        value: &Value,
+        stdout: &str,
+    ) -> DriverResult<Vec<Observation>> {
         let verdict = remuda_protocol::parse_model_stdout(stdout);
         let from_remuda = self.model_generation.is_some()
             || self
@@ -3146,16 +3226,41 @@ impl TranscriptMapper {
                 .and_then(|bridge| bridge.pending())
                 .is_some();
         match verdict {
-            remuda_protocol::ModelStdout::Accepted(observed) => {
+            remuda_protocol::ModelStdout::Accepted { model, effort } => {
+                let mut out = Vec::new();
+                // D-056 §4: a trailing ` with `<level>` effort` clause is an
+                // effort observation, attributed like the model switch. It
+                // never settles an effort bridge.
+                if let Some(name) = effort {
+                    let source = if from_remuda {
+                        EffortSource::Remuda
+                    } else {
+                        EffortSource::Slash
+                    };
+                    if let Some((observed, source)) = self.effort.observe_level(name, source) {
+                        out.extend(self.effort_observation(
+                            value,
+                            observed,
+                            source,
+                            Some(stdout.to_owned()),
+                            remuda_protocol::EFFORT_MODEL_NATIVE,
+                        )?);
+                    }
+                }
                 let edge = self.model.note_stdout(stdout, from_remuda);
                 if let Some(generation) = self.model_generation.take()
                     && let Some(bridge) = &self.model_bridge
                 {
-                    bridge.resolve(generation, observed.clone());
+                    bridge.resolve(generation, model.clone());
                 }
                 if let Some((observed, source)) = edge {
-                    return self.model_observation(observed, source, Some(stdout.to_owned()));
+                    out.extend(self.model_observation(
+                        observed,
+                        source,
+                        Some(stdout.to_owned()),
+                    )?);
                 }
+                return Ok(out);
             }
             remuda_protocol::ModelStdout::Kept | remuda_protocol::ModelStdout::NotFound => {
                 self.model.note_stdout(stdout, from_remuda);

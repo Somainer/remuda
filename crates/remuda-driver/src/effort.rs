@@ -15,7 +15,13 @@
 //! * **Live two-way sync** — below the launch section: Remuda → Claude writes
 //!   `/effort <level>` and waits for transcript read-back; Claude → Remuda
 //!   feeds assistant records through `remuda_protocol::EffortTracker`.
-//!   Measured on claude 2.1.221 (`docs/design/evidence/effort-sync-1.md`).
+//!   Measured on claude 2.1.221 (`docs/design/evidence/effort-sync-1.md`) and
+//!   re-measured on 2.1.272/2.1.273 (coupled) and 2.1.289 (decoupled
+//!   ultracode, `effort-sync-2.md`…`effort-sync-4.md`, ADR D-056). On
+//!   ≥ 2.1.284 the toggle is its own `/effort ultracode on|off` command and
+//!   its verdict ("Effort stays <level>") settles the bridge without a level
+//!   await; on coupled builds the bare `/effort ultracode` is the xhigh
+//!   level-plus-flag command.
 //!
 //! One rule for the live direction: the transcript is the only authority on
 //! what is actually in effect.
@@ -188,9 +194,15 @@ pub(crate) const IN_SESSION_LEVELS: &[&str] =
 /// What the switch was asked to change to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EffortRequest {
-    /// Level to type (`ultracode` spelled out so `/effort ultracode` works).
+    /// Level to type. For a decoupled flag-only switch this is unused on the
+    /// wire (the toggle keeps the current level); the configure writer is
+    /// expected to send the current level alongside in real use (D-056).
     pub(crate) name: EffortName,
+    /// Desired ultracode flag state for a flag toggle.
     pub(crate) ultracode: bool,
+    /// Exact argument word(s) after `/effort `: a level word, the bare
+    /// `ultracode`, or `ultracode on` / `ultracode off`.
+    pub(crate) word: &'static str,
 }
 
 impl EffortRequest {
@@ -199,49 +211,71 @@ impl EffortRequest {
             "low" => Some(Self {
                 name: EffortName::Low,
                 ultracode: false,
+                word: "low",
             }),
             "medium" => Some(Self {
                 name: EffortName::Medium,
                 ultracode: false,
+                word: "medium",
             }),
             "high" => Some(Self {
                 name: EffortName::High,
                 ultracode: false,
+                word: "high",
             }),
             "xhigh" => Some(Self {
                 name: EffortName::Xhigh,
                 ultracode: false,
+                word: "xhigh",
             }),
             "max" => Some(Self {
                 name: EffortName::Max,
                 ultracode: false,
+                word: "max",
             }),
+            // Coupled input alias AND the decoupled bare toggle. The version
+            // gate decides what the word means (see `awaits_level`).
             "ultracode" => Some(Self {
                 name: EffortName::Xhigh,
                 ultracode: true,
+                word: "ultracode",
+            }),
+            "ultracode on" => Some(Self {
+                name: EffortName::Xhigh,
+                ultracode: true,
+                word: "ultracode on",
+            }),
+            "ultracode off" => Some(Self {
+                name: EffortName::Xhigh,
+                ultracode: false,
+                word: "ultracode off",
             }),
             _ => None,
         }
     }
 
-    /// The native spelling to type after `/effort ` — `ultracode` is its own
-    /// word; the five levels spell themselves.
-    pub(crate) fn command_word(&self) -> &'static str {
-        if self.ultracode {
-            "ultracode"
-        } else {
-            match self.name {
-                EffortName::Low => "low",
-                EffortName::Medium => "medium",
-                EffortName::High => "high",
-                EffortName::Xhigh => "xhigh",
-                EffortName::Max => "max",
-                // Neither the legacy `minimal` nor Codex `ultra` is a Claude
-                // `/effort` level; EffortRequest::from_level produces neither.
-                EffortName::Minimal => "minimal",
-                EffortName::Ultra => "ultra",
-            }
+    /// Whether this switch is the decoupled flag-only toggle
+    /// (`/effort ultracode on|off`, or the bare word on ≥ 2.1.284).
+    fn is_flag_only(&self, semantics: remuda_protocol::EffortSemantics) -> bool {
+        if semantics == remuda_protocol::EffortSemantics::Coupled {
+            // On coupled builds the bare word is the xhigh level command.
+            return false;
         }
+        self.ultracode || self.word == "ultracode off"
+    }
+
+    /// Build the launch-time request from a protocol [`EffortSelection`]. The
+    /// launch word is the native `--effort` flag value (`ultracode` carries the
+    /// flag on every version; ≥2.1.284 additionally accepts it via overlay).
+    pub(crate) fn from_selection(selection: EffortSelection) -> Self {
+        Self::from_level(selection.flag_value())
+            .expect("EffortSelection only carries launchable Claude words")
+    }
+
+    /// The native spelling to type after `/effort ` — a level word,
+    /// `ultracode`, or `ultracode on` / `ultracode off`.
+    pub(crate) fn command_word(&self) -> &'static str {
+        self.word
     }
 
     /// The whole slash command body, without the submitting CR.
@@ -271,11 +305,13 @@ impl EffortRequest {
     }
 
     /// Level the transcript must report for this switch to count as observed.
-    ///
-    /// `ultracode` reads back as `xhigh` — Claude does not repeat the workflow
-    /// flag on assistant records.
-    pub(crate) fn observed_name(&self) -> EffortName {
-        self.name
+    /// On coupled builds the bare `ultracode` word is the xhigh level command,
+    /// so it awaits xhigh; decoupled flag toggles await no level.
+    pub(crate) fn awaits_level(
+        &self,
+        semantics: remuda_protocol::EffortSemantics,
+    ) -> Option<EffortName> {
+        (!self.is_flag_only(semantics)).then_some(self.name)
     }
 }
 
@@ -313,10 +349,11 @@ impl SwitchOutcome {
 pub enum Readback {
     /// The stdout verdict accepted the level; this is what is now in effect.
     Applied(remuda_protocol::ObservedEffort),
-    /// Claude refused the switch (dialog dismissed with Esc, invalid argument)
-    /// and the journaled reason names why.
+    /// Claude refused the switch and the journaled reason names why:
+    /// `dialog-kept`, `invalid-argument`, `ultracode-workflows-disabled`,
+    /// `ultracode-unavailable-for-model`, or `env-override` (D-056).
     Rejected {
-        /// Stable reason code (`dialog-kept`, `invalid-argument`).
+        /// Stable reason code.
         reason: String,
     },
 }
@@ -962,11 +999,44 @@ mod sync_tests {
         ] {
             let request = EffortRequest::from_level(level).expect(level);
             assert_eq!(request.command_body(), word);
-            assert_eq!(request.observed_name(), observed);
+            assert_eq!(request.name, observed);
+        }
+        for (word, body) in [
+            ("ultracode on", "/effort ultracode on"),
+            ("ultracode off", "/effort ultracode off"),
+        ] {
+            let request = EffortRequest::from_level(word).expect(word);
+            assert_eq!(request.command_body(), body);
         }
         assert!(EffortRequest::from_level("bogus").is_none());
         assert!(EffortRequest::from_level("auto").is_none());
         assert!(EffortRequest::from_level("ultra").is_none());
+    }
+
+    #[test]
+    fn flag_toggles_await_no_level_when_decoupled() {
+        use remuda_protocol::EffortSemantics::{Coupled, Decoupled};
+        // Levels await in both eras.
+        let high = EffortRequest::from_level("high").unwrap();
+        assert_eq!(high.awaits_level(Decoupled), Some(EffortName::High));
+        assert_eq!(high.awaits_level(Coupled), Some(EffortName::High));
+        // The bare word awaits xhigh only on coupled builds.
+        let bare = EffortRequest::from_level("ultracode").unwrap();
+        assert_eq!(bare.awaits_level(Coupled), Some(EffortName::Xhigh));
+        assert_eq!(bare.awaits_level(Decoupled), None);
+        // Explicit on/off never await a level.
+        assert_eq!(
+            EffortRequest::from_level("ultracode on")
+                .unwrap()
+                .awaits_level(Decoupled),
+            None
+        );
+        assert_eq!(
+            EffortRequest::from_level("ultracode off")
+                .unwrap()
+                .awaits_level(Decoupled),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1081,7 +1151,11 @@ mod switch_tests {
                 bridge.resolve(
                     generation,
                     remuda_protocol::ObservedEffort {
-                        name: request.observed_name(),
+                        // These mock switches model the coupled (2.1.272)
+                        // dialog behaviour the switch tests exercise.
+                        name: request
+                            .awaits_level(remuda_protocol::EffortSemantics::Coupled)
+                            .unwrap_or(request.name),
                         ultracode: None,
                     },
                 );

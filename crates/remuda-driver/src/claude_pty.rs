@@ -547,10 +547,7 @@ impl ClaudePtyDriver {
         // through the same transcript pump below.
         let effort_bridge = Arc::new(crate::effort::EffortBridge::new());
         if let Some(effort) = spec.effort {
-            effort_bridge.note_launch_request(crate::effort::EffortRequest {
-                name: effort.name,
-                ultracode: effort.ultracode,
-            });
+            effort_bridge.note_launch_request(crate::effort::EffortRequest::from_selection(effort));
         }
         let effort_queue = Arc::new(crate::effort::EffortQueue::new());
         // §9.1: /model switches share the pane I/O and transcript pump but
@@ -726,7 +723,7 @@ impl ClaudePtyDriver {
             // and hoped about). The Node surfaces the rejection in the UI.
             return Err(DriverError::CapabilityUnsupported(format!(
                 "claude /effort does not accept {level:?} in-session; \
-                 valid: low, medium, high, xhigh, max, ultracode"
+                 valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
             )));
         };
         let (pane_id, session_id, queue, ready, io) = {

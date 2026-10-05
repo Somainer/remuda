@@ -285,6 +285,11 @@ pub(crate) fn map_claude_value(
     line: &[u8],
     cursor: &FileCursor,
 ) -> Result<Vec<Envelope>, Error> {
+    // §9.1 (D-056): effort semantics are gated by the record's Claude Code
+    // version; every user/assistant/attachment/system record carries one.
+    if let Some(version) = value.get("version").and_then(Value::as_str) {
+        ids.effort.note_version(version);
+    }
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "keep_alive" {
         return Ok(Vec::new());
@@ -457,18 +462,27 @@ fn map_user(
     if text.contains("<command-name>/plan</command-name>") {
         ids.permission.note_slash();
     }
-    if let Some(word) = remuda_protocol::slash_effort_word(&text) {
-        ids.effort.note_slash(&word, false);
+    if text.contains("<command-name>/effort</command-name>") {
+        if let Some(args) = remuda_protocol::slash_effort_args(&text) {
+            ids.effort.note_slash(&args, false);
+        }
     } else if text.contains("<local-command-stdout>") {
         let stdout = extract_local_stdout(&text);
+        let verdict = remuda_protocol::parse_effort_stdout(&stdout, ids.effort.semantics());
         if let Some((observed, source)) = ids.effort.note_stdout(&stdout, false) {
+            // A `/effort status` observation uses its own native-key label so
+            // live and journal derive the same event id.
+            let label = match verdict {
+                remuda_protocol::EffortStdout::Status(_) => remuda_protocol::EFFORT_STATUS_NATIVE,
+                _ => remuda_protocol::EFFORT_STDOUT_NATIVE,
+            };
             out.push(effort_edge_envelope(
                 ctx,
                 ids,
                 value,
                 line,
                 cursor,
-                "effort-stdout",
+                label,
                 observed,
                 source,
                 Some(&stdout),
@@ -481,18 +495,8 @@ fn map_user(
         ids.model.note_slash(&args, false);
     } else if text.contains("<local-command-stdout>") && text.to_lowercase().contains("model") {
         let stdout = extract_local_stdout(&text);
-        if let Some((observed, source)) = ids.model.note_stdout(&stdout, false) {
-            out.push(model_edge_envelope(
-                ctx,
-                ids,
-                value,
-                line,
-                cursor,
-                "model-stdout",
-                observed,
-                source,
-                Some(&stdout),
-            )?);
+        if let Some(edges) = model_switch_edges(ctx, ids, value, line, cursor, &stdout)? {
+            out.extend(edges);
         }
     }
     match content {
@@ -691,6 +695,62 @@ fn model_edge_envelope(
     model_envelope(
         ctx, ids, value, line, cursor, &native, observed, source, raw,
     )
+}
+
+/// Settle a `/model` stdout verdict, emitting an effort edge first when the
+/// verdict ends `` with `<level>` effort`` (D-056 §4), then the model edge.
+/// Returns `None` for a non-`/model` stdout (caller falls through to normal
+/// mapping); kept/not-found verdicts settle attribution with no envelopes.
+/// The journal cannot know Remuda armed the switch, so both edges attribute
+/// to the terminal slash like the model switch.
+#[allow(clippy::too_many_arguments)]
+fn model_switch_edges(
+    ctx: &MapContext,
+    ids: &mut NativeIds,
+    value: &Value,
+    line: &[u8],
+    cursor: &FileCursor,
+    stdout: &str,
+) -> Result<Option<Vec<Envelope>>, Error> {
+    let verdict = remuda_protocol::parse_model_stdout(stdout);
+    if verdict == remuda_protocol::ModelStdout::Other {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    if let remuda_protocol::ModelStdout::Accepted {
+        effort: Some(name), ..
+    } = verdict
+        && let Some((observed, source)) = ids
+            .effort
+            .observe_level(name, remuda_protocol::EffortSource::Slash)
+    {
+        out.push(effort_edge_envelope(
+            ctx,
+            ids,
+            value,
+            line,
+            cursor,
+            remuda_protocol::EFFORT_MODEL_NATIVE,
+            observed,
+            source,
+            Some(stdout),
+        )?);
+    }
+    // Kept/not-found clear attribution; an accept emits its model edge.
+    if let Some((observed, source)) = ids.model.note_stdout(stdout, false) {
+        out.push(model_edge_envelope(
+            ctx,
+            ids,
+            value,
+            line,
+            cursor,
+            "model-stdout",
+            observed,
+            source,
+            Some(stdout),
+        )?);
+    }
+    Ok(Some(out))
 }
 /// Effective permission-mode envelope for a `permission-mode` record edge.
 #[allow(clippy::too_many_arguments)]
@@ -906,29 +966,8 @@ fn map_system(
         }
         if text.contains("<local-command-stdout>") && text.to_lowercase().contains("model") {
             let stdout = extract_local_stdout(text);
-            match remuda_protocol::parse_model_stdout(&stdout) {
-                remuda_protocol::ModelStdout::Other => {
-                    // Mentions "model" but is not a /model verdict: fall through
-                    // to the normal local_command lifecycle mapping.
-                }
-                _ => {
-                    // Kept/not-found clear attribution; a defensive accept here
-                    // still emits the edge.
-                    if let Some((observed, source)) = ids.model.note_stdout(&stdout, false) {
-                        return Ok(vec![model_edge_envelope(
-                            ctx,
-                            ids,
-                            value,
-                            line,
-                            cursor,
-                            "model-stdout",
-                            observed,
-                            source,
-                            Some(&stdout),
-                        )?]);
-                    }
-                    return Ok(Vec::new());
-                }
+            if let Some(edges) = model_switch_edges(ctx, ids, value, line, cursor, &stdout)? {
+                return Ok(edges);
             }
         }
     }

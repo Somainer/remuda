@@ -27,7 +27,7 @@
 
 ⏺ ok
 
-✻ Sautéed for 1s · done 3:32 PM
+✻ Worked for 2s · done 3:37 PM
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯
@@ -48,7 +48,7 @@
 
 ⏺ ok
 
-✻ Sautéed for 1s · done 3:32 PM
+✻ Worked for 2s · done 3:37 PM
 
 ❯ /effort ultracode
   ⎿  Ultracode isn't available on claude-sonnet-4-6. Valid options are: low, medium, high, xhigh, max, auto
@@ -72,7 +72,7 @@
 
 ⏺ ok
 
-✻ Sautéed for 1s · done 3:32 PM
+✻ Worked for 2s · done 3:37 PM
 
 ❯ /effort ultracode
   ⎿  Ultracode isn't available on claude-sonnet-4-6. Valid options are: low, medium, high, xhigh, max, auto
@@ -81,16 +81,16 @@
 
 ⏺ ok
 
-✻ Worked for 1s · done 3:32 PM
+✻ Worked for 2s · done 3:37 PM
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
 
-===== 05 /effort status — after verdict =====
+===== 05 /effort xhigh — after verdict =====
  ▐▛███▛█   Claude Code v2.1.289
-▝▜██████▀  Sonnet 4.6 · API Usage Billing
+▝▜██████▀  Sonnet 4.6 with high effort · API Usage Billing
  ▝▝   ▝▝   /tmp/remuda-c-effortev/g/ws
 
 ▎ Auto mode is now Claude Code's default permission mode.
@@ -102,7 +102,7 @@
 
 ⏺ ok
 
-✻ Sautéed for 1s · done 3:32 PM
+✻ Worked for 2s · done 3:37 PM
 
 ❯ /effort ultracode
   ⎿  Ultracode isn't available on claude-sonnet-4-6. Valid options are: low, medium, high, xhigh, max, auto
@@ -111,10 +111,92 @@
 
 ⏺ ok
 
-✻ Worked for 1s · done 3:32 PM
+✻ Worked for 2s · done 3:37 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+
+===== 06 prompt — after turn =====
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Sonnet 4.6 with high effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/g/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:37 PM
+
+❯ /effort ultracode
+  ⎿  Ultracode isn't available on claude-sonnet-4-6. Valid options are: low, medium, high, xhigh, max, auto
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:37 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Sautéed for 2s · done 3:37 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                 ● high · /effort
+
+===== 07 /effort status — after verdict =====
+ ▝▝   ▝▝   /tmp/remuda-c-effortev/g/ws
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and
+▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:37 PM
+
+❯ /effort ultracode
+  ⎿  Ultracode isn't available on claude-sonnet-4-6. Valid options are: low, medium, high, xhigh, max, auto
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Worked for 2s · done 3:37 PM
+
+❯ /effort xhigh
+  ⎿  Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum
+     (on supported models)
+
+❯ reply with exactly the two characters: ok
+
+⏺ ok
+
+✻ Sautéed for 2s · done 3:37 PM
 
 ❯ /effort status
-  ⎿  Effort level: auto (currently high)
+  ⎿  Current effort level: xhigh (Deeper reasoning than high, just below maximum (on supported models))
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯

@@ -244,6 +244,8 @@ fn launch_cases(ctx: &Ctx) -> Vec<Case> {
         },
     ];
     if let Ok(model) = std::env::var("REMUDA_PROBE_MODEL_NO_XHIGH") {
+        // `/effort xhigh` after the refusal shows whether this model really
+        // lacks xhigh, or only ultracode.
         cases.push(Case {
             id: "g",
             dir: "g",
@@ -252,6 +254,8 @@ fn launch_cases(ctx: &Ctx) -> Vec<Case> {
             actions: vec![
                 Action::Prompt,
                 Action::Cmd("/effort ultracode".into()),
+                Action::Prompt,
+                Action::Cmd("/effort xhigh".into()),
                 Action::Prompt,
                 status(),
             ],

@@ -526,8 +526,9 @@ function DetailedCard({
   });
 
   const terminal = card.totals.done + card.totals.failed + card.totals.killed;
-  // Dynamic run in flight: "8/12+ agents" with a tooltip explaining the count
-  // may grow (the bar can move backwards); terminal runs show the final count.
+  // Run alive: "4/4+ agents" (even with all current members done — another
+  // iteration may spawn), and a dynamic run's denominator can grow so the bar
+  // moves backwards; terminal runs show the final count with no +.
   const agentsWord = `${terminal}/${card.knownCount}${card.provisional ? "+" : ""} agents`;
 
   const onKey = (event: React.KeyboardEvent) => {

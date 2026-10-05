@@ -116,8 +116,10 @@ export interface WfPhaseView {
   /** Right-aligned meta, e.g. `1 运行中 · 3m 42s` / `全部排队中`. */
   metaText: string;
   /**
-   * Phase-local denominator is still moving (phase queued/running): the count
-   * carries the provisional `+`; a completed/failed phase shows its final count.
+   * While the run is alive every phase count is provisional (the run can
+   * still spawn into the phase, even one that already reports completed):
+   * the count carries the provisional `+` and never says 完成. Final only
+   * once the run itself is terminal.
    */
   provisional: boolean;
   /** Expanded on first paint while the run is alive. */
@@ -149,9 +151,10 @@ export interface WfCard {
    */
   knownCount: number;
   /**
-   * Running with a dynamic total: the count shows `N/M+` and the bar may move
-   * backwards when the denominator grows (8/8 → 8/12). False for fixed-total
-   * scripts and for every terminal run.
+   * The run is still alive: the count shows `N/M+` and a dynamic run's bar
+   * may move backwards when the denominator grows (8/8 → 8/12). A run that
+   * reports totalKnown is provisional too — all CURRENT members may be done
+   * while the run keeps spawning. False for every terminal run.
    */
   provisional: boolean;
   /** 「当前 <phase>: <agent>」 while running. */
@@ -406,18 +409,18 @@ function projectPhase(
   }
 
   const fullyDone = total > 0 && counts.done === total;
-  // Phase-local denominator: the members spawned in this phase so far. While
-  // the phase itself is still alive it can keep spawning — mark it `+`; once
-  // the phase is terminal (completed/failed/cancelled) the count is final.
-  // A running run may still spawn members into a phase that has no phase
-  // observation yet (synthetic "unphased" bucket): treat it like a live
-  // phase, not a completed one, so its denominator stays provisional. An
-  // empty seeded phase has nothing spawned yet: plain 0/0, no `+`.
+  // While the RUN is alive every count is provisional, even for a phase whose
+  // own observation says completed: in a dynamic run a phase can show the
+  // final N/N between spawning iterations (or while members with a null
+  // phaseId all completed), and the run may still spawn into it. The count is
+  // final only once the run is terminal. An empty seeded phase has nothing
+  // spawned yet: plain 0/0, no `+`.
   const provisional =
-    phaseState === "running" || phaseState === "queued" || (phaseState === undefined && runLive);
-  const countText = fullyDone
-    ? `${total}/${total} 完成`
-    : `${terminal}/${total}${provisional && total > 0 ? "+" : ""}`;
+    runLive || phaseState === "running" || phaseState === "queued";
+  const countText =
+    !runLive && fullyDone
+      ? `${total}/${total} 完成`
+      : `${terminal}/${total}${provisional && total > 0 ? "+" : ""}`;
 
   return {
     id,
@@ -598,11 +601,14 @@ export function projectWorkflow({ run, phases, members, phaseOrder, nowMs }: Pro
     : totalsFrom(allAgents, 0, totalKnown, agentsTotal);
 
   const terminal = totals.done + totals.failed + totals.killed;
-  // Provisional while a dynamic run is alive (running or paused, which can
-  // resume): the rail is terminal/spawned and may move BACKWARDS when new
-  // agents spawn (8/8 → 8/12) — that is expected, not an error. A
-  // fixed-total script keeps its real denominator while alive.
-  const provisional = runLive && !totalKnown;
+  // Provisional while the run is alive (running or paused, which can resume):
+  // every count is interim, including a run that reports totalKnown with all
+  // current members done — a dynamic run can still spawn more agents. The
+  // fixed denominator stays stable (the rail keeps using agentsTotal), it is
+  // only marked provisional; finality comes once the run is terminal. A
+  // terminal/spawned fill may also move BACKWARDS when new agents spawn
+  // (8/8 → 8/12) while totalKnown is false — that is expected, not an error.
+  const provisional = runLive;
   // While the total is unknown the rail is provisional: terminal over the
   // slots observed so far, visibly marked as provisional by the card.
   const denom = Math.max(1, totalKnown ? agentsTotal : knownCount);

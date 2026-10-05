@@ -142,6 +142,31 @@ describe("WorkflowTimelineCard", () => {
     expect(head()).toHaveAttribute("aria-expanded", "true");
   });
 
+  it("marks an all-done live run 4/4+ provisional, never a final 完成 count", () => {
+    // Dynamic run between spawning iterations: every current member completed
+    // while the run itself is still running. The head count must stay
+    // provisional (4/4+) so it can neither read as finished nor freeze at 100%.
+    renderCard(
+      <WorkflowTimelineCard
+        run={run({ state: "running" })}
+        phases={[phase("p1", "Review", "completed")]}
+        members={[
+          member({ memberId: "a", state: "completed" }),
+          member({ memberId: "b", state: "completed" }),
+          member({ memberId: "c", state: "completed" }),
+          member({ memberId: "d", state: "completed" }),
+        ]}
+      />,
+    );
+    const count = screen.getByTestId("workflow-rail-count");
+    expect(count).toHaveAttribute("data-provisional", "1");
+    expect(count.textContent).toBe("4/4+ agents");
+    expect(count.textContent).not.toContain("完成");
+    expect(screen.getByTestId("workflow-rail")).toHaveAttribute("data-total", "provisional");
+    // The completed-looking phase is provisional on the same rule.
+    expect(screen.getByText("4/4+")).toBeTruthy();
+  });
+
   it("renders per-agent duration, idle, queue and tokens with a live clock", async () => {
     const t = new Date("2026-09-18T12:00:40.000Z").getTime();
     vi.useFakeTimers();

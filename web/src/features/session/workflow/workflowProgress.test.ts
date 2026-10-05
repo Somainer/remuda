@@ -398,6 +398,21 @@ describe("phase meta wording", () => {
     expect(card.phases[0].countText).toBe("2/2 完成");
   });
 
+  it("keeps a completed-looking phase provisional while the run is still alive", () => {
+    // Dynamic run between iterations: the phase says completed and every
+    // spawned member is done, but the run itself has not terminated. The count
+    // reads 2/2+, never 2/2 完成 — another iteration may still spawn.
+    const card = projectWorkflow({
+      run: run({ state: "running" }),
+      phases: [phase({ phaseId: "p1", state: "completed" })],
+      members: [member({ memberId: "a", state: "completed" }), member({ memberId: "b", state: "completed" })],
+    });
+    expect(card.phases[0].countText).toBe("2/2+");
+    expect(card.phases[0].provisional).toBe(true);
+    // The run-level count is provisional on the same rule.
+    expect(card.provisional).toBe(true);
+  });
+
   it("reports killed agents with 已终止 in phase meta", () => {
     const card = projectWorkflow({
       run: run({ state: "cancelled" }),
@@ -530,6 +545,66 @@ describe("card totals and rail", () => {
     expect(done.provisional).toBe(false);
     expect(done.railPct).toBe(100);
   });
+
+  it("still marks a live run with totalKnown provisional when all current members are done", () => {
+    // Between dynamic iterations the producer can report totalKnown with every
+    // spawned member completed while the run is still running: 4/4 must read
+    // as provisional (4/4+), never as a final/完成 100%.
+    const card = projectWorkflow({
+      run: run({
+        state: "running",
+        totals: {
+          totalKnown: true,
+          agentsTotal: u(4),
+          agentsDone: u(4),
+          agentsFailed: u(0),
+          agentsKilled: u(0),
+          agentsRunning: u(0),
+          tokens: u(0),
+          calls: u(0),
+          elapsedMs: u(0),
+        },
+      }),
+      phases: [phase({ phaseId: "p1", state: "running" })],
+      members: [
+        member({ memberId: "a", state: "completed" }),
+        member({ memberId: "b", state: "completed" }),
+        member({ memberId: "c", state: "completed" }),
+        member({ memberId: "d", state: "completed" }),
+      ],
+    });
+    expect(card.totals.totalKnown).toBe(true);
+    expect(card.provisional).toBe(true);
+    expect(card.knownCount).toBe(4);
+    expect(card.railPct).toBe(100);
+    expect(card.totals.queued).toBe(0);
+
+    // The same projection once the run ends is final.
+    const finished = projectWorkflow({
+      run: run({
+        state: "completed",
+        totals: {
+          totalKnown: true,
+          agentsTotal: u(4),
+          agentsDone: u(4),
+          agentsFailed: u(0),
+          agentsKilled: u(0),
+          agentsRunning: u(0),
+          tokens: u(0),
+          calls: u(0),
+          elapsedMs: u(0),
+        },
+      }),
+      phases: [phase({ phaseId: "p1", state: "completed" })],
+      members: [
+        member({ memberId: "a", state: "completed" }),
+        member({ memberId: "b", state: "completed" }),
+        member({ memberId: "c", state: "completed" }),
+        member({ memberId: "d", state: "completed" }),
+      ],
+    });
+    expect(finished.provisional).toBe(false);
+  });
 });
 
 describe("dynamic growing total", () => {
@@ -607,7 +682,7 @@ describe("dynamic growing total", () => {
     expect(card.totals.failed).toBe(1);
   });
 
-  it("keeps a fixed-total script's denominator stable while running (no + mark)", () => {
+  it("keeps a fixed-total script's denominator stable while running, but marks the count provisional", () => {
     const card = projectWorkflow({
       run: run({
         state: "running",
@@ -632,18 +707,22 @@ describe("dynamic growing total", () => {
       ],
     });
     expect(card.knownCount).toBe(8);
-    expect(card.provisional).toBe(false);
+    // A live run is provisional even with a known total; the denominator
+    // itself does not move, only the + mark changes.
+    expect(card.provisional).toBe(true);
     expect(card.railPct).toBe(25);
   });
 
   it("treats a later-added phase with members using phase-local counts", () => {
     // First phase completed on its own; a second phase only appears later.
+    // The run is still alive, so even the completed-looking first phase stays
+    // provisional (it may spawn another iteration): 8/8+, never 完成.
     const card = cardFor(
       [...Array.from({ length: 8 }, (_, i) => done(`a${i}`, "p1"))],
       [phase({ phaseId: "p1", label: known("DeepRead"), state: "completed" })],
     );
-    expect(card.phases[0].countText).toBe("8/8 完成");
-    expect(card.phases[0].provisional).toBe(false);
+    expect(card.phases[0].countText).toBe("8/8+");
+    expect(card.phases[0].provisional).toBe(true);
 
     const grown = cardFor(
       [
@@ -655,9 +734,26 @@ describe("dynamic growing total", () => {
         phase({ phaseId: "p2", label: known("Crosscheck"), state: "running" }),
       ],
     );
-    expect(grown.phases[0].countText).toBe("8/8 完成");
+    expect(grown.phases[0].countText).toBe("8/8+");
     expect(grown.phases[1].countText).toBe("0/1+");
     expect(grown.knownCount).toBe(9);
+
+    // The same phases on the terminal run are final.
+    const finished = projectWorkflow({
+      run: run({ state: "completed" }),
+      phases: [
+        phase({ phaseId: "p1", label: known("DeepRead"), state: "completed" }),
+        phase({ phaseId: "p2", label: known("Crosscheck"), state: "completed" }),
+      ],
+      members: [
+        ...Array.from({ length: 8 }, (_, i) => done(`a${i}`, "p1")),
+        done("c0", "p2"),
+      ],
+    });
+    expect(finished.phases[0].countText).toBe("8/8 完成");
+    expect(finished.phases[0].provisional).toBe(false);
+    expect(finished.phases[1].countText).toBe("1/1 完成");
+    expect(finished.phases[1].provisional).toBe(false);
   });
 
   it("shows a plain 0/0 for an empty seeded phase, not 0/0+", () => {

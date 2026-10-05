@@ -2570,6 +2570,17 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
     let LifecyclePayload::Native(native) = payload.as_ref() else {
         return None;
     };
+    // c-cardsettle r3 item 1: a failed LIVE configure switch (model/effort/
+    // permission) is not a process death. The driver reports it on
+    // topic=configuration with affectsCompletion=false even at severity=error;
+    // folding that into record_task_exit would journal a FAILED entity and the
+    // Hub would invalidate a live session's pending approval while the PTY is
+    // still running. Real deaths carry topic=session + affectsCompletion=true
+    // (see failure_lifecycle in the driver).
+    if native.topic == remuda_protocol::LifecycleTopic::Configuration || !native.affects_completion
+    {
+        return None;
+    }
     let name = native.native_name.to_ascii_lowercase();
     let failed = native.severity == remuda_protocol::Severity::Error
         || name.contains("error")
@@ -3270,6 +3281,28 @@ mod tests {
         native_id: &str,
         related: &[(&str, &str)],
     ) -> remuda_protocol::Observation {
+        native_lifecycle_full(
+            topic,
+            name,
+            native_id,
+            related,
+            remuda_protocol::Severity::Info,
+            false,
+            "started",
+        )
+    }
+
+    /// c-cardsettle r3 item 1: configurable builder for the failure-classifier
+    /// tests (severity / affectsCompletion / status vary).
+    fn native_lifecycle_full(
+        topic: remuda_protocol::LifecycleTopic,
+        name: &str,
+        native_id: &str,
+        related: &[(&str, &str)],
+        severity: remuda_protocol::Severity,
+        affects_completion: bool,
+        status: &str,
+    ) -> remuda_protocol::Observation {
         let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
             remuda_protocol::NativeLifecycle {
                 topic,
@@ -3278,15 +3311,15 @@ mod tests {
                     value: native_id.to_owned(),
                 },
                 status: Knowledge::Known {
-                    value: "started".to_owned(),
+                    value: status.to_owned(),
                 },
                 related_ids: related
                     .iter()
                     .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
                     .collect(),
                 data_ref: None,
-                severity: remuda_protocol::Severity::Info,
-                affects_completion: false,
+                severity,
+                affects_completion,
             },
         ))));
         remuda_protocol::Observation {
@@ -3316,6 +3349,75 @@ mod tests {
             evidence_event_ids: Vec::new(),
             body: payload,
         }
+    }
+
+    /// c-cardsettle r3 item 1: a severity=error configure observation on a live
+    /// PTY (model/effort/permission switch failed) is NOT classified as a task
+    /// exit — otherwise the Node journals a FAILED entity and the Hub kills the
+    /// session's pending card while the process is alive.
+    #[test]
+    fn configure_error_is_not_a_native_failure() {
+        for status in [
+            "model-control-unavailable:write failed",
+            "effort-control-unavailable:submit failed",
+            "permission-control-unavailable:cycle failed",
+        ] {
+            let obs = native_lifecycle_full(
+                remuda_protocol::LifecycleTopic::Configuration,
+                "instance.configure",
+                "not-applicable",
+                &[],
+                remuda_protocol::Severity::Error,
+                false,
+                status,
+            );
+            assert_eq!(
+                native_failure_reason(&obs),
+                None,
+                "a live configure failure ({status}) must not record a task exit"
+            );
+            assert!(
+                native_exit(&obs).is_none(),
+                "a configure observation is never a native exit"
+            );
+        }
+    }
+
+    /// c-cardsettle r3 item 1: an explicit `affectsCompletion=false` error on
+    /// any other native topic is likewise non-terminal.
+    #[test]
+    fn non_completion_error_is_not_a_native_failure() {
+        let obs = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Session,
+            "some_transient_error",
+            "not-applicable",
+            &[],
+            remuda_protocol::Severity::Error,
+            false,
+            "transient",
+        );
+        assert_eq!(native_failure_reason(&obs), None);
+    }
+
+    /// c-cardsettle r3 item 1: a REAL process death (topic=session,
+    /// affectsCompletion=true, severity=error) is still classified as a
+    /// failure, so genuine exits keep ending the instance.
+    #[test]
+    fn real_process_failure_is_still_a_native_failure() {
+        let obs = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Session,
+            "exit",
+            "not-applicable",
+            &[("lastError", "pane exited; agent process is gone")],
+            remuda_protocol::Severity::Error,
+            true,
+            "pane exited; agent process is gone",
+        );
+        assert_eq!(
+            native_failure_reason(&obs).as_deref(),
+            Some("pane exited; agent process is gone"),
+            "a real pane exit must still end the instance"
+        );
     }
 
     /// A live claude-print run emits several hook lifecycles after its session
@@ -3358,6 +3460,108 @@ mod tests {
             evidence.transcript_path.as_deref(),
             Some("/tmp/session.jsonl")
         );
+    }
+
+    /// c-cardsettle r3 item 1 — the REAL producer sequence. When a model/
+    /// effort/permission switch fails on a live PTY, the driver journals an
+    /// `instance.configure` lifecycle (topic=configuration, severity=error,
+    /// affectsCompletion=false). The Node's severity classifier must NOT call
+    /// record_task_exit for it, so a pending approval on the live session is
+    /// not killed — the instance stays Ready/Running. A subsequent REAL process
+    /// death (topic=session, affectsCompletion=true) still fails it.
+    #[tokio::test]
+    async fn configure_error_pump_keeps_the_live_instance_running_then_real_exit_fails() {
+        use remuda_protocol::{Activity, DriverKind, Knowledge};
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudePty,
+        )
+        .unwrap();
+        let id = instance.meta.id.clone();
+        store.insert_instance(instance).unwrap();
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+        );
+
+        // Exactly what claude_pty::journal emits for a failed live switch
+        // (model.rs / effort.rs / permission.rs → claude_pty.rs journal()).
+        tx.send(native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Configuration,
+            "instance.configure",
+            "not-applicable",
+            &[],
+            remuda_protocol::Severity::Error,
+            false,
+            "model-control-unavailable:could not write to control",
+        ))
+        .await
+        .unwrap();
+        tx.send(native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Configuration,
+            "instance.configure",
+            "not-applicable",
+            &[],
+            remuda_protocol::Severity::Error,
+            false,
+            "effort-control-unavailable:submit failed",
+        ))
+        .await
+        .unwrap();
+
+        // Give the pump time to process both; it must not have folded to failed
+        // (no notification could ever prove the negative, so poll a few ticks).
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let after_configure = store.get_instance(&id).unwrap();
+        assert!(
+            matches!(after_configure.lifecycle, InstanceLifecycle::Ready),
+            "a live configure error must not end the session: {:?}",
+            after_configure.lifecycle
+        );
+        assert!(
+            !matches!(
+                after_configure.activity,
+                Knowledge::Known {
+                    value: Activity::WaitingInteraction
+                }
+            ),
+            "the switch error does not block the live session"
+        );
+
+        // A REAL process death still ends the instance.
+        tx.send(native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Session,
+            "exit",
+            "not-applicable",
+            &[("lastError", "pane exited; agent process is gone")],
+            remuda_protocol::Severity::Error,
+            true,
+            "pane exited; agent process is gone",
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.get_instance(&id).unwrap().lifecycle == InstanceLifecycle::Failed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("a genuine exit still fails the instance");
+
+        drop(tx);
+        pump.await.unwrap();
     }
 
     #[tokio::test]

@@ -8147,6 +8147,52 @@ mod tests {
                 "a configure error settles no cards ({outcome})"
             );
         }
+        // r3 item 1: even a native status LITERALLY reporting "failed"/"error"
+        // on a non-completion configuration observation must not map the row to
+        // failed (the herdr-status mapping shared that bug with the
+        // start-failure classifier).
+        for status_value in ["failed", "error"] {
+            let appended = store
+                .append_journal(
+                    host.clone(),
+                    instance.instance_id.clone(),
+                    None,
+                    json!({"kind":"lifecycle","payload":{
+                        "type":"native",
+                        "topic":"configuration",
+                        "nativeName":"instance.configure",
+                        "status":{"state":"known","value":status_value},
+                        "severity":"error",
+                        "affectsCompletion":false,
+                        "relatedIds":{}
+                    }}),
+                )
+                .await
+                .expect("append literal failed status");
+            assert!(
+                appended.settlement.is_empty(),
+                "a non-completion {status_value} status settles no cards"
+            );
+        }
+        // And affectsCompletion=false alone (different topic) is equally
+        // non-terminal.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native",
+                    "topic":"session",
+                    "nativeName":"transient_runtime_error",
+                    "status":{"state":"known","value":"error"},
+                    "severity":"error",
+                    "affectsCompletion":false,
+                    "relatedIds":{}
+                }}),
+            )
+            .await
+            .expect("append non-completion session error");
 
         let row = store
             .get_instance(instance.instance_id)
@@ -9849,6 +9895,13 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         || payload_type == "native"
         || payload.get("entityType").and_then(Value::as_str) == Some("instance");
     if herdr_idle_proof && let Some(status) = status {
+        // c-cardsettle r3 item 1: same configure exclusion here — a native
+        // status value of failed/error on a non-terminal configuration
+        // observation (affectsCompletion=false / topic=configuration) must not
+        // map the still-running PTY session to failed.
+        let nonterminal_native = payload_type == "native"
+            && (payload.get("topic").and_then(Value::as_str) == Some("configuration")
+                || payload.get("affectsCompletion").and_then(Value::as_bool) == Some(false));
         match status {
             "starting" | "started" => {
                 lifecycle = Some(if status == "starting" {
@@ -9862,7 +9915,7 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
                 activity = normalize_activity(status);
             }
             "exited" => lifecycle = Some("exited"),
-            "failed" | "error" => lifecycle = Some("failed"),
+            "failed" | "error" if !nonterminal_native => lifecycle = Some("failed"),
             _ => {}
         }
     }

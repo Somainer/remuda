@@ -126,12 +126,24 @@ it("an older in-flight poll resolving after the settlement frame cannot resurrec
   const oldRefresh = hubStore.refresh();
   await vi.waitFor(() => expect(listCalls).toBeGreaterThanOrEqual(2));
 
-  // The Hub settlement frame arrives. The local row flips immediately.
+  // The Hub settlement frame arrives. The local row flips immediately — and
+  // the IMMEDIATE projection already carries generation-ended (r3 item 7), so
+  // the desktop wording is correct even before (or if) the refresh settles.
   settlementCallback!(INTERACTION);
+  const immediate = hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION);
+  expect(immediate?.state, "the frame flips the row before its refresh resolves").toBe(
+    "invalidated",
+  );
   expect(
-    hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
-    "the frame flips the local row before its follow-up refresh resolves",
-  ).toBe("invalidated");
+    immediate?.answerable,
+    "the immediate projection is not answerable",
+  ).toBe(false);
+  expect(
+    immediate?.resolution.state === "known"
+      ? immediate.resolution.value.reason
+      : "missing",
+    "the immediate projection stamps generation-ended (r3 item 7)",
+  ).toBe("generation-ended");
 
   // The store's trailing refresh (300 ms) completes first with the durable
   // invalidated row.
@@ -158,4 +170,57 @@ it("an older in-flight poll resolving after the settlement frame cannot resurrec
   await vi.waitFor(() => expect(pins.has(INTERACTION)).toBe(false));
 
   hubStore.logout();
+});
+
+/**
+ * c-cardsettle r3 item 7: when the settlement frame's follow-up refresh
+ * REJECTS, the immediate projection still carries generation-ended — the card
+ * must not fall back to the generic invalidated wording (「已在其它设备处理」)
+ * while it awaits the next authoritative list.
+ */
+it("the immediate settlement projection keeps generation-ended when its refresh rejects", async () => {
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    let settlementCallback: ((interactionId: string) => void) | null = null;
+    vi.spyOn(api, "settlementSubscribe").mockImplementation((callback) => {
+      settlementCallback = callback;
+      return () => undefined;
+    });
+    vi.spyOn(api, "hello").mockResolvedValue({} as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null });
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null });
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] });
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    let listCalls = 0;
+    vi.spyOn(api, "interactionList").mockImplementation(async () => {
+      const n = ++listCalls;
+      if (n === 1) return [card("pending")];
+      // Every post-settlement refresh rejects.
+      throw new Error("list down");
+    });
+    await hubStore.bootstrap();
+    expect(
+      hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+    ).toBe("pending");
+
+    settlementCallback!(INTERACTION);
+    // Flush the trailing settlement refresh (300 ms); it rejects and must not
+    // revert the immediate projection.
+    await vi.advanceTimersByTimeAsync(500);
+
+    const row = hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION);
+    expect(row?.state).toBe("invalidated");
+    expect(
+      row?.resolution.state === "known" ? row.resolution.value.reason : "missing",
+    ).toBe("generation-ended");
+    expect(row?.answerable).toBe(false);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
 });

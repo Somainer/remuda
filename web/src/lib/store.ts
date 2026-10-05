@@ -3585,16 +3585,26 @@ class HubStore {
     });
     if (this.state.interactions.some((row) => row.id === interactionId)) {
       this.emit({
-        interactions: this.state.interactions.map((row) =>
-          row.id === interactionId
-            ? {
-                ...row,
-                state: "invalidated" as const,
-                answerable: false,
-                blocking: false,
-              }
-            : row,
-        ),
+        interactions: this.state.interactions.map((row) => {
+          if (row.id !== interactionId) return row;
+          // c-cardsettle r3 item 7: stamp generation-ended on the immediate
+          // projection too, not just state=invalidated. Keeping the old
+          // resolution made the desktop label the row 已在其它设备处理 if the
+          // follow-up refresh rejected/lagged. The frame's reason is the
+          // generation-ended settle; the authoritative list confirms later.
+          const now = new Date().toISOString();
+          return {
+            ...row,
+            state: "invalidated" as const,
+            answerable: false,
+            blocking: false,
+            updatedAt: now,
+            resolution: {
+              state: "known" as const,
+              value: { reason: "generation-ended" as const, eventIds: [] },
+            },
+          };
+        }),
       });
     }
   }

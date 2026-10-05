@@ -248,14 +248,29 @@ test("a level switch reaches the fake node and the read-back drives the chip", a
   await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-mismatch", "0");
 });
 
-test("a clamped level reads back 请求 → 实际 on the level axis only", async ({ page }) => {
-  const instanceId = await createSession(page, "effort clamp");
+test("plain max clamps to xhigh while max+ultracode stays on max (D-056)", async ({ page }) => {
+  const instanceId = await createSession(page, "effort clamp vs switch");
   await clearApprovals(page, instanceId);
-  await postEffortConfigure(page, instanceId, { name: "__clamp__", ultracode: false, index: 4 });
+  // LEVEL to max with the switch OFF: the fake model lacks xhigh, so it
+  // clamps to xhigh and the mismatch line renders.
+  await moveSlider(page, "End");
   await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", { timeout: 15_000 });
   const mismatch = page.getByTestId("model-effort-mismatch");
   await expect(mismatch).toBeVisible();
+  expect(await mismatch.textContent()).toContain("请求 max");
   expect(await mismatch.textContent()).toContain("实际 xhigh");
+
+  // Now turn the SWITCH on at max: D-056 keeps the level at max even when the
+  // model would otherwise clamp — the read-back is {max, ultracode:on}.
+  const onRequest = page.waitForRequest(
+    (r) =>
+      r.postDataJSON()?.payload?.effort?.name === "max"
+      && r.postDataJSON()?.payload?.effort?.ultracode === true,
+  );
+  await setSwitch(page, true);
+  await onRequest;
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("max", { timeout: 15_000 });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ultracode-effective", "on");
 });
 
 test("the orthogonal switch turns ultracode on at max without moving the slider", async ({ page }) => {

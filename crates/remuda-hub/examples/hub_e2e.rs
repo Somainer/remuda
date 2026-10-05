@@ -1951,11 +1951,16 @@ async fn fake_node(
                             let want_ultra =
                                 effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)
                                     || requested == "ultracode";
-                            // D-056 normal behavior echoes the level unchanged.
-                            // "__clamp__" opts into the old model-cap clamp
-                            // fixture (reported tier xhigh); the legacy
-                            // "ultracode" name also parks on xhigh.
-                            let clamp_word = requested == "__clamp__" || requested == "ultracode";
+                            // "__clamp__" opts into the clamp explicitly; a
+                            // plain Claude max with the switch OFF also clamps
+                            // (the 2.1.289 case-g model without xhigh), but
+                            // max WITH ultracode on stays on max (D-056).
+                            let clamp_word = requested == "__clamp__"
+                                || requested == "ultracode"
+                                || (requested == "max"
+                                    && instance_kinds.get(&instance_id).map(String::as_str)
+                                        == Some("claude")
+                                    && !want_ultra);
                             let tier = if clamp_word { "xhigh" } else { requested };
                             let observed_at = monotonic_effort_observed_at();
                             // The flag is its OWN axis. On is positively
@@ -1964,7 +1969,7 @@ async fn fake_node(
                             // leaves the flag unconfirmed (null).
                             let flag: serde_json::Value = if want_ultra {
                                 serde_json::Value::Bool(true)
-                            } else if requested == "__clamp__" {
+                            } else if clamp_word {
                                 serde_json::Value::Null
                             } else {
                                 serde_json::Value::Bool(false)

@@ -8,37 +8,132 @@
 //!
 //! Hard rules:
 //! - Human-origin callers only; the Hub refuses Bot/Agent before proxying.
-//! - Directories only. Symlinks are never followed or listed, so a link
-//!   cannot point the walk outside the allowlist the way `..` could.
-//! - Containment is enforced on *opened file descriptors* (unix): the target
-//!   directory is opened once via an `O_NOFOLLOW` walk rooted at an allowed
-//!   root fd and enumerated from that same fd, so a pathname swapped for a
-//!   symlink between check and open cannot redirect the listing.
-//! - One reply is capped in entry count (and scan effort); overflow is
-//!   reported as `truncated`, never paginated into an unbounded walk.
+//! - Directories only. Every component is opened `O_NOFOLLOW` from the
+//!   allowlist root fd, so a symlinked ancestor or component can never
+//!   redirect the walk; entries are classified with no-follow `fstatat`
+//!   (no descriptor is opened for an entry).
+//! - Containment is lexical first (pure normalization, no filesystem
+//!   access) and enforced on *opened file descriptors*: the root is pinned
+//!   by (dev, ino) at policy init and re-walked component-by-component from
+//!   `/` per request, so a root parent swapped for a symlink or another
+//!   real directory after startup is refused.
+//! - Outside, missing, not-a-directory and symlink-escape all return one
+//!   path-free error, giving no existence/type oracle.
+//! - One reply is capped in shortcut count, entry count and scan effort;
+//!   overflow is reported as `truncated`, never paginated into an
+//!   unbounded walk.
 
 use crate::{DevNode, NodeError};
 use remuda_protocol::hubnode::{
     HostDirEntry, HostDirsListParams, HostDirsListResult, METHOD_HOST_DIRS_LIST,
 };
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Maximum directories returned in one reply.
 pub(crate) const HOST_DIRS_MAX_ENTRIES: usize = 4096;
 /// Hard stop on directory entries inspected for one reply, so a directory
 /// with tens of thousands of entries cannot turn the RPC into a full scan.
 pub(crate) const HOST_DIRS_MAX_SCANNED: usize = 16_384;
-/// Bound on `..` climbs while proving an opened fd is still under a root.
-const MAX_ANCESTOR_CLIMBS: usize = 64;
+/// Cap on the shortcut arrays (allowed roots, registered roots).
+pub(crate) const HOST_DIRS_MAX_SHORTCUTS: usize = 64;
+
+/// One path-free refusal for every unreadable/out-of-policy browse target,
+/// so the endpoint cannot act as an existence or type oracle.
+pub(crate) const DIR_NOT_ALLOWED: &str = "the browsed path is outside the directories this Node allows workspaces in, \
+     or is not an accessible directory";
 
 /// `host.dirs.list` is the only method handled here.
 pub(crate) fn is_host_dirs_method(method: &str) -> bool {
     method == METHOD_HOST_DIRS_LIST
 }
 
-fn refused(message: impl Into<String>) -> NodeError {
-    NodeError::InvalidRequest(message.into())
+fn refused() -> NodeError {
+    NodeError::InvalidRequest(DIR_NOT_ALLOWED.to_owned())
+}
+
+/// A configured allowlist root: canonical path plus the (dev, ino) identity
+/// pinned when the workspace policy was loaded. The identity lets a
+/// request-time walk detect an ancestor that became a symlink or a different
+/// real directory after Node startup (c-dirpicker round 3).
+#[derive(Clone)]
+pub(crate) struct AllowedRoot {
+    /// Canonical path of the root.
+    pub(crate) path: PathBuf,
+    /// Pinned inode identity on unix; absent where inode identity is not
+    /// available (non-unix fallback builds).
+    #[cfg(unix)]
+    pub(crate) identity: Option<RootIdentity>,
+}
+
+/// Pinned root identity for an [`AllowedRoot`].
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootIdentity {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+impl AllowedRoot {
+    #[cfg(not(unix))]
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn new(path: PathBuf) -> Self {
+        let identity = std::fs::metadata(&path).ok().map(|metadata| RootIdentity {
+            dev: std::os::unix::fs::MetadataExt::dev(&metadata),
+            ino: std::os::unix::fs::MetadataExt::ino(&metadata),
+        });
+        Self { path, identity }
+    }
+}
+
+/// Lexically normalize an absolute path: collapse empty and `.` segments and
+/// apply `..` lexically (clamped at `/`), with no filesystem access. Returns
+/// None for a relative path. Because every `..` is consumed before any open
+/// syscall, normalization cannot touch a directory outside the allowlist.
+fn lexical_normalize(raw: &str) -> Option<PathBuf> {
+    if !raw.starts_with('/') {
+        return None;
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            name => stack.push(name),
+        }
+    }
+    if stack.is_empty() {
+        Some(PathBuf::from("/"))
+    } else {
+        let mut path = String::from('/');
+        path.push_str(&stack.join("/"));
+        Some(PathBuf::from(path))
+    }
+}
+
+/// Whether `normalized` is the root or a component-wise descendant of it.
+/// `/` as a root contains every absolute path; `/foo` never matches
+/// `/foobar`.
+fn is_within(normalized: &Path, root: &Path) -> bool {
+    normalized == root || root == Path::new("/") || normalized.starts_with(root.join(""))
+}
+
+/// Sort, dedupe and cap a shortcut array, flagging truncation.
+fn cap_shortcuts(items: Vec<String>, truncated: &mut bool) -> Vec<String> {
+    let mut items = items;
+    items.sort();
+    items.dedup();
+    if items.len() > HOST_DIRS_MAX_SHORTCUTS {
+        items.truncate(HOST_DIRS_MAX_SHORTCUTS);
+        *truncated = true;
+    }
+    items
 }
 
 impl DevNode {
@@ -49,7 +144,9 @@ impl DevNode {
         params: Value,
     ) -> Result<Value, NodeError> {
         if method != METHOD_HOST_DIRS_LIST {
-            return Err(refused(format!("unknown host directories method {method}")));
+            return Err(NodeError::InvalidRequest(format!(
+                "unknown host directories method {method}"
+            )));
         }
         let request: HostDirsListParams = serde_json::from_value(params)?;
         let roots = self.allowed_workspace_roots()?;
@@ -65,8 +162,8 @@ impl DevNode {
         Ok(serde_json::to_value(result)?)
     }
 
-    /// The canonical allowlist roots workspace registration is confined to.
-    pub(crate) fn allowed_workspace_roots(&self) -> Result<Vec<PathBuf>, NodeError> {
+    /// The pinned allowlist roots workspace registration is confined to.
+    pub(crate) fn allowed_workspace_roots(&self) -> Result<Vec<AllowedRoot>, NodeError> {
         Ok(self
             .inner
             .workspace_registry
@@ -77,14 +174,14 @@ impl DevNode {
     }
 }
 
-// ── unix: fd-rooted, symlink-proof containment ─────────────────────────────
+// ── unix: fd-rooted, no-follow component walk with pinned root identity ────
 
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use nix::fcntl::{OFlag, openat};
-    use nix::sys::stat::fstat;
-    use std::ffi::CStr;
+    use nix::fcntl::{AtFlags, OFlag, openat};
+    use nix::sys::stat::{SFlag, fstat, fstatat};
+    use std::ffi::CString;
     use std::os::fd::RawFd;
 
     /// Owned raw fd closed on drop. The crate forbids `unsafe`, so this takes
@@ -92,42 +189,41 @@ mod imp {
     /// returning a fresh descriptor, and Drop closes exactly that one.
     struct Fd(RawFd);
 
-    impl Fd {
-        fn raw(&self) -> RawFd {
-            self.0
-        }
-    }
-
     impl Drop for Fd {
         fn drop(&mut self) {
-            // Best effort: the descriptor is invalid only after close races
-            // within this single owner, which cannot happen.
             let _ = nix::unistd::close(self.0);
         }
     }
 
+    /// The directory opened for one request: fd plus its kernel-resolved path.
+    struct OpenedDir {
+        fd: Fd,
+        path: String,
+    }
+
     pub(super) fn list(
-        roots: &[PathBuf],
+        roots: &[AllowedRoot],
         registered_roots: &[PathBuf],
         request: HostDirsListParams,
     ) -> Result<HostDirsListResult, NodeError> {
-        let root_fds = open_roots(roots)?;
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let home_canonical = home
-            .as_ref()
-            .and_then(|home| std::fs::canonicalize(home).ok());
-        let target = match request.path.as_deref().filter(|value| !value.is_empty()) {
-            None => Ok(default_start(&root_fds, home_canonical.clone())?),
-            Some(raw) => open_requested(&root_fds, raw),
-        }?;
-        let target_path = fd_canonical_path(target.fd())?;
-        let parent = contained_parent(&root_fds, target.fd())?;
-        let mut names = Vec::new();
         let mut truncated = false;
+        // Pinned root fds, opened per request by a no-follow walk from "/".
+        let root_fds = open_roots(roots)?;
+        let home_canonical = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|home| std::fs::canonicalize(&home).ok());
+        let target = match request.path.as_deref().filter(|value| !value.is_empty()) {
+            None => default_start(&root_fds, home_canonical.clone())?,
+            Some(raw) => open_requested(&root_fds, raw)?,
+        };
+        let parent = contained_parent(&root_fds, &target.path)?;
+
+        let mut names = Vec::new();
         let mut scanned = 0usize;
-        // Enumerate from a dup of the verified fd: the directory was opened
-        // once, and nix::Dir takes ownership of the fd it fdopendir()s.
-        let dir_fd = nix::unistd::dup(target.fd()).map_err(nix_err)?;
+        // Enumerate from a dup of the verified fd: nix::Dir takes ownership of
+        // the fd it fdopendir()s; the verified `target` fd stays open for
+        // fstatat classification and parent resolution.
+        let dir_fd = nix::unistd::dup(target.fd.0).map_err(nix_err)?;
         let mut directory = nix::dir::Dir::from_fd(dir_fd).map_err(nix_err)?;
         for entry in directory.iter() {
             let Ok(entry) = entry else { continue };
@@ -141,10 +237,10 @@ mod imp {
             if bytes == b"." || bytes == b".." {
                 continue;
             }
-            // Classify via an O_PATH|O_NOFOLLOW openat on the directory fd:
-            // a symlink fails with ELOOP and never becomes a row; a
-            // non-directory fails with ENOTDIR; nothing is followed.
-            if !is_real_subdir(target.fd(), file_name) {
+            // fstatat with AT_SYMLINK_NOFOLLOW classifies the entry without
+            // opening it: no descriptor is created (so no leak), a symlink
+            // never becomes a row, and a non-directory is skipped.
+            if !entry_is_dir(target.fd.0, file_name) {
                 continue;
             }
             let name = String::from_utf8_lossy(bytes).into_owned();
@@ -159,24 +255,36 @@ mod imp {
             names.truncate(HOST_DIRS_MAX_ENTRIES);
             truncated = true;
         }
-        let home_path = home_canonical
-            .filter(|canonical| root_for(&canonical.display().to_string(), &root_fds).is_some())
-            .map(|canonical| canonical.display().to_string());
-        let mut workspaces: Vec<String> = registered_roots
-            .iter()
-            .filter(|root| roots.iter().any(|allowed| root.starts_with(allowed)))
-            .map(|root| root.display().to_string())
-            .collect();
-        workspaces.sort();
-        workspaces.dedup();
-        Ok(HostDirsListResult {
-            path: target_path,
-            parent,
-            home: home_path,
-            roots: roots
+
+        let roots_view = cap_shortcuts(
+            roots
                 .iter()
+                .map(|root| root.path.display().to_string())
+                .collect(),
+            &mut truncated,
+        );
+        let mut workspaces = cap_shortcuts(
+            registered_roots
+                .iter()
+                .filter(|root| roots.iter().any(|allowed| is_within(root, &allowed.path)))
                 .map(|root| root.display().to_string())
                 .collect(),
+            &mut truncated,
+        );
+        workspaces.retain(|root| !root.is_empty());
+        let home = home_canonical
+            .map(|home| home.display().to_string())
+            .filter(|home| {
+                root_fds
+                    .iter()
+                    .any(|root| is_within(Path::new(home), &root.pin.path))
+            });
+
+        Ok(HostDirsListResult {
+            path: target.path,
+            parent,
+            home,
+            roots: roots_view,
             workspaces,
             dirs: names
                 .into_iter()
@@ -186,229 +294,214 @@ mod imp {
         })
     }
 
-    /// An allowed root held open for the whole listing.
-    pub(super) struct RootFd {
-        path: PathBuf,
+    /// An [`AllowedRoot`] plus its per-request verified fd.
+    struct RootFd {
+        pin: AllowedRoot,
         fd: Fd,
     }
 
-    impl RootFd {
-        pub(super) fn fd(&self) -> RawFd {
-            self.fd.raw()
-        }
+    /// Open every pinned root by walking from `/` without following symlinks
+    /// and verifying the pinned (dev, ino). Any root whose ancestry was
+    /// replaced after policy init makes the whole listing fail closed.
+    fn open_roots(pins: &[AllowedRoot]) -> Result<Vec<RootFd>, NodeError> {
+        pins.iter().map(open_root).collect()
     }
 
-    fn open_roots(roots: &[PathBuf]) -> Result<Vec<RootFd>, NodeError> {
-        roots
-            .iter()
-            .map(|path| {
-                // Roots are canonical, absolute and validated at registry
-                // open; O_NOFOLLOW pins the directory inode itself.
-                let cstr = std::ffi::CString::new(path.to_string_lossy().as_bytes())
-                    .map_err(|_| refused("invalid allowed root path"))?;
-                let raw = openat(
-                    None,
-                    &*cstr,
-                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-                    nix::sys::stat::Mode::empty(),
-                )
-                .map_err(nix_err)?;
-                Ok(RootFd {
-                    path: path.clone(),
-                    fd: Fd(raw),
-                })
-            })
-            .collect()
-    }
-
-    /// Open a no-follow O_DIRECTORY fd at `relative` from `dirfd`.
-    /// `path_query` adds O_PATH when the fd is only needed as a walk anchor.
-    fn open_dir_nofollow(
-        dirfd: Option<RawFd>,
-        relative: &CStr,
-        path_query: bool,
-    ) -> nix::Result<Fd> {
-        let mut flags = OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY;
-        flags.set(OFlag::O_PATH, path_query);
-        flags.set(OFlag::O_RDONLY, !path_query);
-        Ok(Fd(openat(
-            dirfd,
-            relative,
-            flags,
-            nix::sys::stat::Mode::empty(),
-        )?))
-    }
-
-    /// An opened target directory.
-    struct OpenedDir {
-        fd: Fd,
-    }
-
-    impl OpenedDir {
-        fn fd(&self) -> RawFd {
-            self.fd.raw()
-        }
-    }
-
-    /// Lexical root choice for a requested absolute path: the longest root
-    /// whose canonical path is a component-wise prefix (so `/foo` does not
-    /// match `/foobar`).
-    fn root_for<'a>(raw: &str, roots: &'a [RootFd]) -> Option<&'a RootFd> {
-        let requested = Path::new(raw);
-        roots
-            .iter()
-            .filter(|root| {
-                requested == root.path
-                    // root.join("") is "<root>/"; for root "/" it stays "/",
-                    // which every absolute path starts with.
-                    || requested.starts_with(root.path.join(""))
-            })
-            .max_by_key(|root| root.path.as_os_str().len())
-    }
-
-    /// Walk `raw` openat-style from the chosen root fd, never following a
-    /// symlink, then prove via `..` climbs that the resulting fd is still
-    /// under that root. Returns the O_RDONLY directory fd.
-    fn open_requested(roots: &[RootFd], raw: &str) -> Result<OpenedDir, NodeError> {
-        let path = Path::new(raw);
-        if !path.is_absolute() {
-            return Err(refused(
-                "browsed path must be absolute on the Node filesystem",
-            ));
-        }
-        let Some(root) = root_for(raw, roots) else {
-            return Err(refused(
-                "path is outside the directories this Node allows workspaces in",
-            ));
-        };
-        // Components relative to the chosen root, walked one openat at a time
-        // with O_NOFOLLOW. "." is skipped; ".." is opened as a real directory
-        // entry and then neutralised by the ancestor proof below.
-        let mut anchor = dup_owned(root.fd())?;
-        for component in path.strip_prefix(&root.path).unwrap_or(path).components() {
-            use std::path::Component;
-            let cstr: &CStr = match component {
-                Component::Normal(name) => &std::ffi::CString::new(name.as_encoded_bytes())
-                    .map_err(|_| refused("invalid path component"))?,
-                Component::CurDir | Component::RootDir | Component::Prefix(_) => continue,
-                Component::ParentDir => c"..",
-            };
-            anchor = match open_dir_nofollow(Some(anchor.raw()), cstr, true) {
-                Ok(fd) => fd,
-                Err(_) => {
-                    return Err(refused(format!(
-                        "{raw} is not an accessible allowed directory"
-                    )));
-                }
-            };
-        }
-        // Reopen the reached O_PATH anchor as O_RDONLY ("." can never be a
-        // symlink) so readdir works on the verified inode.
-        let fd = open_dir_nofollow(Some(anchor.raw()), c".", false)
-            .map_err(|_| refused(format!("{raw} is not an accessible allowed directory")))?;
-        if !is_under_root(fd.raw(), root).map_err(nix_err)? {
-            return Err(refused(
-                "path is outside the directories this Node allows workspaces in",
-            ));
-        }
-        Ok(OpenedDir { fd })
-    }
-
-    /// Default start: the user's home when it provably lies under an allowed
-    /// root, else the first root. The caller canonicalizes the home once; no
-    /// process environment is read inside.
-    fn default_start(
-        roots: &[RootFd],
-        home_canonical: Option<PathBuf>,
-    ) -> Result<OpenedDir, NodeError> {
-        if let Some(canonical) = home_canonical {
-            let raw = canonical.display().to_string();
-            if let Ok(opened) = open_requested(roots, &raw) {
-                return Ok(opened);
+    fn open_root(pin: &AllowedRoot) -> Result<RootFd, NodeError> {
+        let mut anchor = open_component(None, c"/")?;
+        for component in pin.path.components() {
+            if let Component::Normal(name) = component {
+                let cstr = CString::new(name.as_encoded_bytes()).map_err(|_| refused())?;
+                test_seam_fire(&pin.path, 0);
+                anchor = open_component(Some(anchor.0), &cstr)?;
             }
         }
-        let Some(root) = roots.first() else {
-            return Err(refused(
-                "no allowed directory is accessible on this Node; configure workspace_roots",
-            ));
-        };
-        Ok(OpenedDir {
-            fd: dup_owned(root.fd())?,
+        if let Some(identity) = &pin.identity {
+            let stat = fstat(anchor.0).map_err(nix_err)?;
+            if stat.st_dev != identity.dev || stat.st_ino != identity.ino {
+                return Err(refused());
+            }
+        }
+        // RootFd needs an owned pin; the caller borrowed it. The pin is small
+        // and only roots configured for this Node are cloned.
+        Ok(RootFd {
+            pin: AllowedRoot {
+                path: pin.path.clone(),
+                identity: pin.identity,
+            },
+            fd: anchor,
         })
     }
 
-    fn dup_owned(fd: RawFd) -> Result<Fd, NodeError> {
-        Ok(Fd(nix::unistd::dup(fd).map_err(nix_err)?))
-    }
-
-    /// Prove `fd` is `root` or under it by climbing ".." with no-follow
-    /// opens and comparing (dev, ino) to the root stat. Defends against
-    /// ".." segments that escaped through a rename during the walk.
-    fn is_under_root(fd: RawFd, root: &RootFd) -> nix::Result<bool> {
-        let root_stat = fstat(root.fd())?;
-        let mut current = Fd(nix::unistd::dup(fd)?);
-        for _ in 0..=MAX_ANCESTOR_CLIMBS {
-            let stat = fstat(current.raw())?;
-            if stat.st_dev == root_stat.st_dev && stat.st_ino == root_stat.st_ino {
-                return Ok(true);
-            }
-            let parent = openat(
-                Some(current.raw()),
-                c"..",
-                OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_DIRECTORY,
-                nix::sys::stat::Mode::empty(),
-            )?;
-            let parent_stat = fstat(parent)?;
-            // Reached the filesystem root without a match.
-            if parent_stat.st_dev == stat.st_dev && parent_stat.st_ino == stat.st_ino {
-                let _ = nix::unistd::close(parent);
-                return Ok(false);
-            }
-            current = Fd(parent);
-        }
-        Ok(false)
-    }
-
-    /// The contained parent's canonical path, or None at the allowlist edge.
-    fn contained_parent(roots: &[RootFd], target: RawFd) -> Result<Option<String>, NodeError> {
-        let parent = openat(
-            Some(target),
-            c"..",
+    fn open_component(dirfd: Option<RawFd>, name: &std::ffi::CStr) -> Result<Fd, NodeError> {
+        // O_RDONLY (no O_PATH: that flag is Linux-specific) is enough for a
+        // directory anchor and for readdir on every unix target; O_NOFOLLOW
+        // refuses a symlink at the named component.
+        match openat(
+            dirfd,
+            name,
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             nix::sys::stat::Mode::empty(),
-        )
-        .map_err(nix_err)?;
-        let parent = Fd(parent);
-        let under = roots
+        ) {
+            Ok(raw) => Ok(Fd(raw)),
+            Err(_) => Err(refused()),
+        }
+    }
+
+    /// Lexically normalize and verify containment before touching the
+    /// filesystem, then walk each remaining component from the pinned root
+    /// fd with O_NOFOLLOW. Every failure is the same path-free refusal.
+    fn open_requested(root_fds: &[RootFd], raw: &str) -> Result<OpenedDir, NodeError> {
+        let Some(normalized) = lexical_normalize(raw) else {
+            return Err(NodeError::InvalidRequest(
+                "browsed path must be absolute on the Node filesystem".to_owned(),
+            ));
+        };
+        let root = root_fds
             .iter()
-            .any(|root| is_under_root(parent.raw(), root).unwrap_or(false));
-        if !under {
+            .filter(|root| is_within(&normalized, &root.pin.path))
+            .max_by_key(|root| root.pin.path.as_os_str().len())
+            .ok_or_else(refused)?;
+
+        let mut anchor = nix::unistd::dup(root.fd.0).map(Fd).map_err(nix_err)?;
+        let relative = normalized
+            .strip_prefix(&root.pin.path)
+            .unwrap_or(&normalized);
+        for (index, component) in relative.components().enumerate() {
+            if let Component::Normal(name) = component {
+                let cstr = CString::new(name.as_encoded_bytes()).map_err(|_| refused())?;
+                test_seam_fire(&normalized, index + 1);
+                anchor = open_component(Some(anchor.0), &cstr)?;
+            }
+        }
+        let path = fd_canonical_path(anchor.0)?;
+        Ok(OpenedDir { fd: anchor, path })
+    }
+
+    fn default_start(
+        root_fds: &[RootFd],
+        home_canonical: Option<PathBuf>,
+    ) -> Result<OpenedDir, NodeError> {
+        if let Some(home) = home_canonical
+            .map(|home| home.display().to_string())
+            .filter(|home| {
+                root_fds
+                    .iter()
+                    .any(|root| is_within(Path::new(home), &root.pin.path))
+            })
+            && let Ok(opened) = open_requested(root_fds, &home)
+        {
+            return Ok(opened);
+        }
+        let root = root_fds.first().ok_or_else(|| {
+            NodeError::InvalidRequest(
+                "no allowed directory is accessible on this Node; configure workspace_roots"
+                    .to_owned(),
+            )
+        })?;
+        Ok(OpenedDir {
+            fd: nix::unistd::dup(root.fd.0).map(Fd).map_err(nix_err)?,
+            path: root.pin.path.display().to_string(),
+        })
+    }
+
+    /// The contained parent path, or None at the pinned root. Resolved
+    /// through the same no-follow walk, so an unreadable parent yields no
+    /// shortcut.
+    fn contained_parent(
+        root_fds: &[RootFd],
+        target_path: &str,
+    ) -> Result<Option<String>, NodeError> {
+        let normalized = lexical_normalize(target_path).ok_or_else(refused)?;
+        let root = root_fds
+            .iter()
+            .filter(|root| is_within(&normalized, &root.pin.path))
+            .max_by_key(|root| root.pin.path.as_os_str().len())
+            .ok_or_else(refused)?;
+        if normalized == root.pin.path {
             return Ok(None);
         }
-        Ok(Some(fd_canonical_path(parent.raw())?))
+        let Some(parent) = normalized.parent() else {
+            return Ok(None);
+        };
+        if !is_within(parent, &root.pin.path) {
+            return Ok(None);
+        }
+        Ok(Some(parent.display().to_string()))
     }
 
-    /// Canonical path of an opened fd via /proc/self/fd (kernel-resolved; the
-    /// descriptor is already verified, so this read adds no TOCTOU).
+    /// Kernel-resolved path of an opened directory fd. Linux exposes
+    /// `/proc/self/fd/N`; macOS resolves `/dev/fd/N` (both are safe symlinks
+    /// provided by the kernel; the fd was already containment-verified, so
+    /// reading its link adds no TOCTOU).
     fn fd_canonical_path(fd: RawFd) -> Result<String, NodeError> {
-        let path = format!("/proc/self/fd/{fd}");
-        std::fs::read_link(&path)
+        #[cfg(target_os = "linux")]
+        let link = format!("/proc/self/fd/{fd}");
+        #[cfg(target_os = "macos")]
+        let link = format!("/dev/fd/{fd}");
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let link = format!("/dev/fd/{fd}");
+        std::fs::read_link(&link)
             .map(|path| path.display().to_string())
-            .map_err(|error| refused(format!("cannot resolve opened directory: {error}")))
+            .map_err(|_| refused())
     }
 
-    fn is_real_subdir(dir: RawFd, name: &CStr) -> bool {
-        openat(
-            Some(dir),
-            name,
-            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            nix::sys::stat::Mode::empty(),
-        )
-        .is_ok()
+    fn entry_is_dir(dir: RawFd, name: &std::ffi::CStr) -> bool {
+        match fstatat(Some(dir), name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => (stat.st_mode & SFlag::S_IFMT.bits()) == SFlag::S_IFDIR.bits(),
+            Err(_) => false,
+        }
     }
 
     fn nix_err(error: nix::Error) -> NodeError {
         NodeError::Driver(error.to_string())
+    }
+
+    /// Test-only seam: fired immediately before a no-follow component open,
+    /// with the normalized absolute directory being entered and its
+    /// component index (0 = first root component). Lets a regression test
+    /// swap a verified directory for a symlink *after* the lexical check but
+    /// *before* its open, exercising the TOCTOU defence deterministically.
+    #[cfg(test)]
+    fn test_seam_fire(_normalized: &Path, _component: usize) {
+        super::test_seam::fire(_normalized, _component);
+    }
+
+    #[cfg(not(test))]
+    fn test_seam_fire(_normalized: &Path, _component: usize) {}
+}
+
+// ── Test seam for mid-walk directory swaps ──────────────────────────────────
+
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+
+    type SeamHook = Box<dyn Fn(&Path, usize) + Send + Sync>;
+
+    static HOOK: OnceLock<Mutex<Option<SeamHook>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<SeamHook>> {
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Install a hook fired before each component open during one test.
+    pub(crate) fn set<F>(hook: F)
+    where
+        F: Fn(&Path, usize) + Send + Sync + 'static,
+    {
+        *slot().lock().unwrap() = Some(Box::new(hook));
+    }
+
+    pub(crate) fn clear() {
+        *slot().lock().unwrap() = None;
+    }
+
+    pub(crate) fn fire(normalized: &Path, component: usize) {
+        if let Some(hook) = slot().lock().unwrap().as_ref() {
+            hook(normalized, component);
+        }
     }
 }
 
@@ -419,7 +512,7 @@ mod imp {
     use super::*;
 
     pub(super) fn list(
-        roots: &[PathBuf],
+        roots: &[AllowedRoot],
         registered_roots: &[PathBuf],
         request: HostDirsListParams,
     ) -> Result<HostDirsListResult, NodeError> {
@@ -428,28 +521,26 @@ mod imp {
             None => std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .filter(|home| {
-                    std::fs::canonicalize(home)
-                        .is_ok_and(|canonical| roots.iter().any(|root| canonical.starts_with(root)))
+                    std::fs::canonicalize(home).is_ok_and(|canonical| {
+                        roots.iter().any(|root| canonical.starts_with(&root.path))
+                    })
                 })
-                .or_else(|| roots.first().cloned())
+                .or_else(|| roots.first().map(|root| root.path.clone()))
                 .ok_or_else(|| {
-                    refused(
-                        "no allowed directory is accessible on this Node; configure workspace_roots",
+                    NodeError::InvalidRequest(
+                        "no allowed directory is accessible on this Node; configure workspace_roots"
+                            .to_owned(),
                     )
                 })?,
             Some(raw) => {
-                let path = Path::new(raw);
-                if !path.is_absolute() {
-                    return Err(refused(
-                        "browsed path must be absolute on the Node filesystem",
-                    ));
-                }
-                let canonical = std::fs::canonicalize(path)
-                    .map_err(|error| refused(format!("{raw} cannot be resolved: {error}")))?;
-                if !roots.iter().any(|root| canonical.starts_with(root)) {
-                    return Err(refused(
-                        "{raw} is outside the directories this Node allows workspaces in",
-                    ));
+                let normalized = lexical_normalize(raw).ok_or_else(|| {
+                    NodeError::InvalidRequest(
+                        "browsed path must be absolute on the Node filesystem".to_owned(),
+                    )
+                })?;
+                let canonical = std::fs::canonicalize(&normalized).map_err(|_| refused())?;
+                if !roots.iter().any(|root| is_within(&canonical, &root.path)) {
+                    return Err(refused());
                 }
                 canonical
             }
@@ -457,9 +548,7 @@ mod imp {
         let mut names = Vec::new();
         let mut scanned = 0usize;
         let mut truncated = false;
-        for entry in std::fs::read_dir(&target)
-            .map_err(|error| refused(format!("{} cannot be listed: {error}", target.display())))?
-        {
+        for entry in std::fs::read_dir(&target).map_err(|_| refused())? {
             let Ok(entry) = entry else { continue };
             scanned += 1;
             if scanned > HOST_DIRS_MAX_SCANNED {
@@ -485,13 +574,21 @@ mod imp {
             names.truncate(HOST_DIRS_MAX_ENTRIES);
             truncated = true;
         }
-        let mut workspaces: Vec<String> = registered_roots
-            .iter()
-            .filter(|root| roots.iter().any(|allowed| root.starts_with(allowed)))
-            .map(|root| root.display().to_string())
-            .collect();
-        workspaces.sort();
-        workspaces.dedup();
+        let roots_view = cap_shortcuts(
+            roots
+                .iter()
+                .map(|root| root.path.display().to_string())
+                .collect(),
+            &mut truncated,
+        );
+        let workspaces = cap_shortcuts(
+            registered_roots
+                .iter()
+                .filter(|root| roots.iter().any(|allowed| is_within(root, &allowed.path)))
+                .map(|root| root.display().to_string())
+                .collect(),
+            &mut truncated,
+        );
         Ok(HostDirsListResult {
             path: target.display().to_string(),
             parent: target.parent().map(|parent| parent.display().to_string()),
@@ -499,10 +596,7 @@ mod imp {
                 .map(PathBuf::from)
                 .and_then(|home| std::fs::canonicalize(home).ok())
                 .map(|path| path.display().to_string()),
-            roots: roots
-                .iter()
-                .map(|root| root.display().to_string())
-                .collect(),
+            roots: roots_view,
             workspaces,
             dirs: names
                 .into_iter()
@@ -515,7 +609,7 @@ mod imp {
 
 #[cfg(unix)]
 fn list_directories(
-    roots: &[PathBuf],
+    roots: &[AllowedRoot],
     registered_roots: &[PathBuf],
     request: HostDirsListParams,
 ) -> Result<HostDirsListResult, NodeError> {
@@ -524,7 +618,7 @@ fn list_directories(
 
 #[cfg(not(unix))]
 fn list_directories(
-    roots: &[PathBuf],
+    roots: &[AllowedRoot],
     registered_roots: &[PathBuf],
     request: HostDirsListParams,
 ) -> Result<HostDirsListResult, NodeError> {
@@ -543,6 +637,10 @@ mod tests {
         }
     }
 
+    fn roots_for(dir: &tempfile::TempDir) -> Vec<AllowedRoot> {
+        vec![AllowedRoot::new(fs::canonicalize(dir.path()).unwrap())]
+    }
+
     #[test]
     fn lists_real_subdirectories_within_the_allowlist_and_hides_dotdirs() {
         let root = tempfile::tempdir().unwrap();
@@ -550,7 +648,7 @@ mod tests {
         fs::create_dir_all(root.path().join("alpha/sub")).unwrap();
         fs::write(root.path().join("file.txt"), b"x").unwrap();
         fs::create_dir_all(root.path().join(".secret")).unwrap();
-        let roots = vec![fs::canonicalize(root.path()).unwrap()];
+        let roots = roots_for(&root);
 
         let result = list_directories(&roots, &[], request(None, false)).unwrap();
         let names: Vec<&str> = result
@@ -560,7 +658,7 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["alpha", "beta"]);
         assert!(!result.truncated);
-        assert_eq!(result.path, roots[0].display().to_string());
+        assert_eq!(result.path, roots[0].path.display().to_string());
         assert_eq!(result.parent, None);
         assert_eq!(result.roots.len(), 1);
 
@@ -568,7 +666,10 @@ mod tests {
         let child = list_directories(
             &roots,
             &[],
-            request(Some(&roots[0].join("alpha").display().to_string()), false),
+            request(
+                Some(&roots[0].path.join("alpha").display().to_string()),
+                false,
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -579,7 +680,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["sub".to_string()]
         );
-        assert_eq!(child.parent, Some(roots[0].display().to_string()));
+        assert_eq!(child.parent, Some(roots[0].path.display().to_string()));
 
         // Hidden directories appear only when explicitly requested.
         let shown = list_directories(&roots, &[], request(None, true)).unwrap();
@@ -587,100 +688,207 @@ mod tests {
     }
 
     #[test]
-    fn refuses_paths_outside_the_allowlist_relative_paths_and_files() {
+    fn lexical_normalization_collapses_dots_without_filesystem_access() {
+        assert_eq!(
+            lexical_normalize("/a/./b//c").as_deref(),
+            Some(Path::new("/a/b/c"))
+        );
+        assert_eq!(lexical_normalize("/..").as_deref(), Some(Path::new("/")));
+        assert_eq!(
+            lexical_normalize("/a/../../b").as_deref(),
+            Some(Path::new("/b"))
+        );
+        assert_eq!(lexical_normalize("a/b"), None);
+        assert!(is_within(Path::new("/foo"), Path::new("/foo")));
+        assert!(is_within(Path::new("/foo/bar"), Path::new("/foo")));
+        assert!(is_within(Path::new("/foobar"), Path::new("/")));
+        assert!(!is_within(Path::new("/foobar"), Path::new("/foo")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn four_unreadable_cases_return_one_byte_identical_path_free_error() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(root.path().join("file"), b"x").unwrap();
-        let roots = vec![fs::canonicalize(root.path()).unwrap()];
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        let roots = roots_for(&root);
 
-        let error = list_directories(&roots, &[], request(Some("../etc"), false))
+        // Relative: a distinct malformed-request error.
+        let rel = list_directories(&roots, &[], request(Some("../etc"), false))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("must be absolute"), "{error}");
+        assert!(rel.contains("must be absolute"), "{rel}");
 
-        let error = list_directories(
+        // Outside (lexical containment, no openat attempted).
+        let outside_err = list_directories(
             &roots,
             &[],
             request(Some(outside.path().to_str().unwrap()), false),
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("outside the directories"), "{error}");
-
-        let error = list_directories(
+        // Missing component.
+        let missing_err = list_directories(
+            &roots,
+            &[],
+            request(Some(&root.path().join("nope").display().to_string()), false),
+        )
+        .unwrap_err()
+        .to_string();
+        // Existing non-directory.
+        let file_err = list_directories(
             &roots,
             &[],
             request(Some(&root.path().join("file").display().to_string()), false),
         )
         .unwrap_err()
         .to_string();
-        assert!(
-            error.contains("not an accessible allowed directory"),
-            "{error}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_that_escapes_the_allowlist_is_never_navigable() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        fs::create_dir_all(outside.path().join("target")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
-        let roots = vec![fs::canonicalize(root.path()).unwrap()];
-
-        // The symlink is absent from the directory rows even when it points at
-        // a real directory.
-        let result = list_directories(&roots, &[], request(None, false)).unwrap();
-        assert!(result.dirs.is_empty(), "{:?}", result.dirs);
-
-        // Following it by name is refused at the no-follow walk, regardless
-        // of what it points at.
-        let error = list_directories(
+        // Symlink escape.
+        let link_err = list_directories(
             &roots,
             &[],
             request(Some(&root.path().join("link").display().to_string()), false),
         )
         .unwrap_err()
         .to_string();
+
+        assert_eq!(outside_err, missing_err);
+        assert_eq!(outside_err, file_err);
+        assert_eq!(outside_err, link_err);
+        // All four are the same path-free refusal (the NodeError display
+        // prefix is constant), byte-for-byte.
+        for error in [&outside_err, &missing_err, &file_err, &link_err] {
+            assert!(error.contains(DIR_NOT_ALLOWED), "{error}");
+            assert!(!error.contains("nope"));
+            assert!(!error.contains("link"));
+            assert!(!error.contains("file"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_swapped_after_the_lexical_check_is_refused_at_open() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("a/inside")).unwrap();
+        fs::create_dir_all(outside.path().join("stolen")).unwrap();
+        let canonical = fs::canonicalize(root.path()).unwrap();
+        let target = canonical.join("a");
+        let roots = vec![AllowedRoot::new(canonical.clone())];
+
+        // Swap the verified directory for a symlink AFTER the lexical
+        // containment check but BEFORE its component open (test seam).
+        let target_for_hook = target.clone();
+        let live_for_hook = root.path().join("a");
+        let backup_for_hook = root.path().join("a-real");
+        let outside_for_hook = outside.path().to_path_buf();
+        test_seam::set(move |normalized, _component| {
+            if normalized == target_for_hook && live_for_hook.is_dir() {
+                fs::rename(&live_for_hook, &backup_for_hook).unwrap();
+                std::os::unix::fs::symlink(&outside_for_hook, &live_for_hook).unwrap();
+            }
+        });
+        let error = list_directories(
+            &roots,
+            &[],
+            request(Some(&target.display().to_string()), false),
+        )
+        .unwrap_err()
+        .to_string();
+        test_seam::clear();
+        assert!(error.contains(DIR_NOT_ALLOWED), "{error}");
+        // Restore the directory so the root opens again; then prove the
+        // swapped-in outside tree was never listed.
+        let live = root.path().join("a");
+        fs::remove_file(&live).unwrap();
+        fs::rename(root.path().join("a-real"), &live).unwrap();
+        let result = list_directories(&roots, &[], request(None, false)).unwrap();
         assert!(
-            error.contains("outside the directories")
-                || error.contains("not an accessible allowed directory"),
-            "{error}"
+            !result.dirs.iter().any(|entry| entry.name == "stolen"),
+            "outside tree must never be listed"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_symlink_swapped_in_after_the_root_opens_cannot_redirect_the_listing() {
-        let root = tempfile::tempdir().unwrap();
+    fn a_root_parent_replaced_by_a_symlink_after_startup_is_refused() {
+        let base = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join("real")).unwrap();
-        fs::create_dir_all(outside.path().join("stolen")).unwrap();
-        // The requested directory is a real directory at check time.
-        let target = root.path().join("swap");
-        fs::create_dir_all(&target).unwrap();
-        let roots = vec![fs::canonicalize(root.path()).unwrap()];
-        // Swap it for a symlink right before enumeration: an O_NOFOLLOW walk
-        // refuses the link instead of listing the outside tree.
-        std::os::unix::fs::symlink(outside.path(), root.path().join("swap-link")).unwrap();
-        let via_link = root.path().join("swap-link").display().to_string();
-        let error = list_directories(&roots, &[], request(Some(&via_link), false))
+        fs::create_dir_all(base.path().join("parent/root/child")).unwrap();
+        fs::create_dir_all(outside.path().join("elsewhere")).unwrap();
+        let canonical = fs::canonicalize(base.path().join("parent/root")).unwrap();
+        // Pin the identity at policy load.
+        let roots = vec![AllowedRoot::new(canonical.clone())];
+        // Baseline listing works.
+        assert!(list_directories(&roots, &[], request(None, false)).is_ok());
+        // Replace the root's PARENT with a symlink to an outside tree.
+        let live_parent = base.path().join("parent");
+        let backup = base.path().join("parent-real");
+        fs::rename(&live_parent, &backup).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &live_parent).unwrap();
+        // Rebuild the same outside tree shape so the bare path would resolve
+        // if the walk naively followed the ancestor; the pinned identity must
+        // refuse it.
+        fs::create_dir_all(outside.path().join("root")).unwrap();
+        let error = list_directories(&roots, &[], request(None, false))
             .unwrap_err()
             .to_string();
+        assert!(error.contains(DIR_NOT_ALLOWED), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn enumeration_does_not_leak_file_descriptors_under_repeated_load() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        // The fstatat classification opens no descriptor by design; prove it
+        // under sustained concurrent load, where a leak accumulates into a
+        // steady-state rise rather than a one-off fd-cache fluctuation.
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..40 {
+            fs::create_dir_all(root.path().join(format!("sub-{index:02}"))).unwrap();
+        }
+        let roots = roots_for(&root);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let roots = roots.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let result = list_directories(&roots, &[], request(None, false)).unwrap();
+                    assert_eq!(result.dirs.len(), 40);
+                }
+            }));
+        }
+        let open_fds = || {
+            fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter(Result::is_ok)
+                .count()
+        };
+        // Warm up lazy fds.
+        for _ in 0..10 {
+            list_directories(&roots, &[], request(None, false)).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let early = open_fds();
+        std::thread::sleep(Duration::from_millis(900));
+        let late = open_fds();
+        stop.store(true, Ordering::Relaxed);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        // A leaked fd accumulates continuously under load; allow a small
+        // scheduler tolerance, never the growth of hundreds of leaked opens.
         assert!(
-            error.contains("outside the directories")
-                || error.contains("not an accessible allowed directory"),
-            "{error}"
+            late <= early + 4,
+            "fd count grew under load: {early} -> {late}"
         );
-        // The real directory still lists exactly its own entries.
-        let result = list_directories(
-            &roots,
-            &[],
-            request(Some(&target.display().to_string()), false),
-        )
-        .unwrap();
-        assert!(result.dirs.is_empty());
     }
 
     #[test]
@@ -689,27 +897,23 @@ mod tests {
         for index in 0..(HOST_DIRS_MAX_ENTRIES + 25) {
             fs::create_dir_all(root.path().join(format!("d-{index:06}"))).unwrap();
         }
-        let roots = vec![fs::canonicalize(root.path()).unwrap()];
+        let roots = roots_for(&root);
         let result = list_directories(&roots, &[], request(None, false)).unwrap();
         assert_eq!(result.dirs.len(), HOST_DIRS_MAX_ENTRIES);
         assert!(result.truncated);
-        // The cap keeps the lexicographically first names, deterministically.
         assert_eq!(result.dirs[0].name, "d-000000");
     }
 
     #[test]
     fn the_scan_bound_counts_every_entry_not_just_directories() {
         let root = tempfile::tempdir().unwrap();
-        // More plain files than the scan cap: they are never rows, but the
-        // walk must still stop and report truncation rather than scan all.
         for index in 0..(HOST_DIRS_MAX_SCANNED + 8) {
             fs::write(root.path().join(format!("f-{index:06}")), b"x").unwrap();
         }
         fs::create_dir_all(root.path().join("the-only-dir")).unwrap();
-        let roots = vec![fs::canonicalize(root.path()).unwrap()];
+        let roots = roots_for(&root);
         let result = list_directories(&roots, &[], request(None, false)).unwrap();
         assert!(result.truncated);
-        // At most the single real directory can appear; files never do.
         assert!(result.dirs.len() <= 1);
         assert!(
             result
@@ -720,25 +924,18 @@ mod tests {
     }
 
     #[test]
-    fn default_start_is_home_when_home_is_an_allowed_root() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join("project")).unwrap();
-        let roots = vec![fs::canonicalize(root.path()).unwrap()];
-        // With the home anchored at the allowlist root, the empty selector
-        // opens home and the reply carries the quick-jump home. The home
-        // anchor is exercised directly through the fd walk on unix; here we
-        // only assert the structural fallback for the roots themselves.
-        let result = list_directories(
-            &roots,
-            &[],
-            request(Some(roots[0].to_str().unwrap()), false),
-        )
-        .unwrap();
-        assert_eq!(result.path, roots[0].display().to_string());
-        assert!(
-            result.workspaces.is_empty(),
-            "registered roots are reported separately"
-        );
+    fn shortcut_arrays_are_capped_and_flag_truncated() {
+        let base = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..(HOST_DIRS_MAX_SHORTCUTS + 5) {
+            let dir = base.path().join(format!("w-{index:03}"));
+            fs::create_dir_all(&dir).unwrap();
+            paths.push(fs::canonicalize(&dir).unwrap());
+        }
+        let root = vec![AllowedRoot::new(fs::canonicalize(base.path()).unwrap())];
+        let result = list_directories(&root, &paths, request(None, false)).unwrap();
+        assert_eq!(result.workspaces.len(), HOST_DIRS_MAX_SHORTCUTS);
+        assert!(result.truncated);
     }
 
     #[test]
@@ -747,7 +944,7 @@ mod tests {
         fs::create_dir_all(root.path().join("one")).unwrap();
         let canonical_root = fs::canonicalize(root.path()).unwrap();
         let registered = vec![canonical_root.join("one")];
-        let roots = vec![canonical_root];
+        let roots = vec![AllowedRoot::new(canonical_root.clone())];
         let result = list_directories(&roots, &registered, request(None, false)).unwrap();
         assert_eq!(result.workspaces, vec![registered[0].display().to_string()]);
     }

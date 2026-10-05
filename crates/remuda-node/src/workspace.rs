@@ -41,7 +41,7 @@ struct Mutation {
 pub(crate) struct WorkspaceRegistry {
     state: RegistryState,
     file: Option<PathBuf>,
-    roots: Vec<PathBuf>,
+    roots: Vec<crate::dir_browser::AllowedRoot>,
     host_id: HostId,
 }
 
@@ -56,9 +56,12 @@ impl WorkspaceRegistry {
         if configured_roots.is_empty() {
             return Err(NodeError::InvalidConfig("workspace_roots is empty and HOME is unavailable; configure an absolute allowed directory".into()));
         }
+        // Canonicalize once at policy load and pin each root's identity; a
+        // later symlinked/replaced ancestor is refused by the directory
+        // browser (c-dirpicker round 3).
         let roots = configured_roots
             .iter()
-            .map(|root| canonical_directory(root))
+            .map(|root| canonical_directory(root).map(crate::dir_browser::AllowedRoot::new))
             .collect::<Result<Vec<_>, _>>()?;
         let file = config
             .workspace_registry
@@ -98,9 +101,9 @@ impl WorkspaceRegistry {
         self.state.workspaces.clone()
     }
 
-    /// Canonical allowlist roots workspace registration (and the directory
-    /// browser, c-dirpicker) are confined to.
-    pub(crate) fn allowed_roots(&self) -> &[PathBuf] {
+    /// Canonical allowlist roots (with pinned identities) workspace
+    /// registration and the directory browser (c-dirpicker) are confined to.
+    pub(crate) fn allowed_roots(&self) -> &[crate::dir_browser::AllowedRoot] {
         &self.roots
     }
 
@@ -112,11 +115,15 @@ impl WorkspaceRegistry {
 
     fn validate(&self, path: &Path) -> Result<PathBuf, NodeError> {
         let canonical = canonical_directory(path)?;
-        if !self.roots.iter().any(|root| canonical.starts_with(root)) {
+        if !self
+            .roots
+            .iter()
+            .any(|root| canonical.starts_with(&root.path))
+        {
             return Err(NodeError::InvalidRequest(format!(
                 "workspace {} is outside allowed workspace_roots: {}",
                 canonical.display(),
-                display_roots(self.roots.iter().map(PathBuf::as_path))
+                display_roots(self.roots.iter().map(|root| root.path.as_path()))
             )));
         }
         for workspace in &self.state.workspaces {

@@ -557,12 +557,12 @@ impl DevNode {
             .items
             .iter()
             .filter(|instance| {
+                // Only process-end evidence frees the directory: `exited` is
+                // set when the driver process actually ends. A `failed`
+                // session is retriable in place and its process may still be
+                // alive, so it keeps blocking (owner rule).
                 instance.workspace_id == workspace_id
-                    && !matches!(
-                        instance.lifecycle,
-                        remuda_protocol::InstanceLifecycle::Exited
-                            | remuda_protocol::InstanceLifecycle::Failed
-                    )
+                    && instance.lifecycle != remuda_protocol::InstanceLifecycle::Exited
             })
             .count();
         if live > 0 {

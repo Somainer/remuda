@@ -2545,4 +2545,105 @@ describe("load-earlier anchor lifecycle round 5", () => {
       await expectGrowthHolds(geo);
     });
   });
+
+  // UO-6a round 6 item 1: the held post-prepend repin must end even when
+  // measurement commits STOP before the stable-pass count — either after the
+  // quiet window, or immediately on a genuine reader scroll — so it can never
+  // re-jump and undo a later scroll.
+  describe("round 6 item 1: the held restore has a definite end", () => {
+    type Page = ReturnType<typeof pageOf>;
+
+    function fixture(instanceId: string) {
+      const tail: Observation[] = [];
+      for (let i = 0; i < 20; i += 1) tail.push(m(31 + i, i % 2 === 0 ? "user" : "assistant", instanceId));
+      const older: Observation[] = [];
+      for (let seq = 1; seq <= 30; seq += 1) older.push(m(seq, seq % 2 ? "user" : "assistant", instanceId));
+      return { tail, older };
+    }
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("releases after a quiet window and never undoes a later reader scroll", async () => {
+      const user = userEvent.setup();
+      const geo = installGeo(50);
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const { tail, older } = fixture("insQuiet");
+      const g = gate<Page>();
+      makeClient(reg, "insQuiet", tail, () => g.promise, "31", "50");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        return result;
+      });
+      render(
+        <MemoryRouter initialEntries={["/s/insQuiet"]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+
+      // Freeze before the prepend commits so the settle quiet timer is faked;
+      // the page lands and corrections stop long before the stable passes.
+      vi.useFakeTimers();
+      await act(async () => {
+        g.resolve(pageOf(older, true));
+        await Promise.resolve();
+      });
+      act(() => {
+        vi.advanceTimersByTime(850);
+      });
+      vi.useRealTimers();
+
+      // Measurements stay quiet; the reader now scrolls and owns the
+      // position. A restore that stayed armed would re-jump on the next
+      // growth commit and disable growth anchoring (the probe below).
+      geo.scrollTo(25 * ROW);
+      await act(async () => {});
+      const before = geo.top();
+      geo.growRow(4, ROW + 40);
+      expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+    });
+
+    it("a genuine reader scroll releases the settling restore immediately", async () => {
+      const user = userEvent.setup();
+      const geo = installGeo(50);
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const { tail, older } = fixture("insGesture");
+      const g = gate<Page>();
+      makeClient(reg, "insGesture", tail, () => g.promise, "31", "50");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        return result;
+      });
+      render(
+        <MemoryRouter initialEntries={["/s/insGesture"]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+      await act(async () => {
+        g.resolve(pageOf(older, true));
+        await Promise.resolve();
+      });
+
+      // The page landed (request done) but the stable passes have not
+      // accumulated: a genuine gesture must release the hold immediately.
+      geo.scrollTo(25 * ROW);
+      await act(async () => {});
+      const before = geo.top();
+      geo.growRow(4, ROW + 40);
+      expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+    });
+  });
 });

@@ -64,6 +64,16 @@ const ORIGIN_LABEL: Record<Exclude<MessageOrigin, "human">, string> = {
 };
 
 /**
+ * Bounds for a load-earlier restore's post-prepend repin. The anchor must
+ * have a DEFINITE end even when measurement commits stop before the stable
+ * pass count is reached: a quiet window since the last settle commit, an
+ * absolute deadline, and a correction budget, whichever comes first.
+ */
+const PREPEND_SETTLE_QUIET_MS = 800;
+const PREPEND_SETTLE_DEADLINE_MS = 5000;
+const PREPEND_SETTLE_MAX_CORRECTIONS = 40;
+
+/**
  * Whether this node is text the human actually wrote.
  *
  * Assistant and system messages are never injections — only `user`-role
@@ -301,6 +311,12 @@ function TranscriptInner({
    */
   const restoreEchoRef = useRef<{ top: number; seq: number } | null>(null);
   const restoreEchoSeqRef = useRef(0);
+  /**
+   * Quiet-window timer that ends a held load-earlier restore after the last
+   * settle commit, so a restore whose measurements went QUIET before the
+   * stable-pass count cannot stay armed for the session.
+   */
+  const prependSettleTimerRef = useRef<number | null>(null);
   const saveTimer = useRef<number | null>(null);
   const pendingScroll = useRef<
     | { kind: "index"; index: number; offset: number; tries: number }
@@ -326,10 +342,14 @@ function TranscriptInner({
   >(null);
   // Held anchor for a load-earlier prepend; repinned across post-prepend
   // estimate/size changes (see the effect near the scroll math).
-  const prependAnchorRef = useRef<{
+  type PrependAnchor = {
     anchorId: string;
     offset: number;
     tries: number;
+    /** Total corrections applied since the prepend landed; bounded release. */
+    corrections: number;
+    /** Absolute settle deadline (ms), stamped when the prepend first lands. */
+    deadline: number;
     armedIndex: number;
     reqId: number;
     /**
@@ -339,7 +359,8 @@ function TranscriptInner({
      * index.
      */
     prevNodes: TranscriptNode[];
-  } | null>(null);
+  };
+  const prependAnchorRef = useRef<PrependAnchor | null>(null);
   /**
    * Identity of the in-flight load-earlier click. The Transcript stays mounted
    * across session routes, so a late `finally` from session A must not clear
@@ -365,6 +386,10 @@ function TranscriptInner({
     restoringRef.current = false;
     restoreEchoRef.current = null;
     restoreEchoSeqRef.current = 0;
+    if (prependSettleTimerRef.current !== null) {
+      window.clearTimeout(prependSettleTimerRef.current);
+      prependSettleTimerRef.current = null;
+    }
     steeringRef.current.clear();
     setLoadingEarlier(false);
     setRowHeights(new Map());
@@ -446,6 +471,44 @@ function TranscriptInner({
     el.scrollTop = top;
     scrollTopRef.current = top;
   }, []);
+  /**
+   * Retire a held load-earlier anchor: clear its quiet timer, the pending
+   * restore for the same request (its estimate freeze and correction loop end
+   * with the anchor) and, when its request has already finished, the request
+   * identity. An in-flight request is left for the click's finally to
+   * finalize (it owns the loading button state).
+   */
+  const releasePrependAnchor = useCallback((held: PrependAnchor) => {
+    if (prependSettleTimerRef.current !== null) {
+      window.clearTimeout(prependSettleTimerRef.current);
+      prependSettleTimerRef.current = null;
+    }
+    if (prependAnchorRef.current !== held) return;
+    prependAnchorRef.current = null;
+    const pending = pendingScroll.current;
+    if (pending?.kind === "restore" && pending.reqId === held.reqId) {
+      pendingScroll.current = null;
+      restoringRef.current = false;
+    }
+    const req = loadReqRef.current;
+    if (req?.reqId === held.reqId && req.done) loadReqRef.current = null;
+  }, []);
+  /**
+   * Arm (or re-arm) the quiet-window release: when measurement/size commits
+   * stop for PREPEND_SETTLE_QUIET_MS the anchor is retired even though the
+   * stable-pass count was never reached, so a restore that went quiet cannot
+   * stay armed for the session and undo a later reader scroll.
+   */
+  const armPrependQuiet = useCallback(
+    (held: PrependAnchor) => {
+      if (prependSettleTimerRef.current !== null) window.clearTimeout(prependSettleTimerRef.current);
+      prependSettleTimerRef.current = window.setTimeout(() => {
+        prependSettleTimerRef.current = null;
+        releasePrependAnchor(held);
+      }, PREPEND_SETTLE_QUIET_MS);
+    },
+    [releasePrependAnchor],
+  );
   // Latest scroll offset in a ref: passive-effect cleanup runs after refs are
   // detached on unmount, so the leave-session flush cannot read the DOM.
   const viewportRef = useRef(720);
@@ -594,7 +657,18 @@ function TranscriptInner({
       pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0, awaitIndex: armedIndex, reqId, prevNodes };
       // Keep repinning as the prepended (unmeasured) rows settle; the
       // one-shot restore effect alone stops before the average converges.
-      prependAnchorRef.current = { anchorId, offset, tries: 0, armedIndex, reqId, prevNodes };
+      prependAnchorRef.current = {
+        anchorId,
+        offset,
+        tries: 0,
+        corrections: 0,
+        // Stamped on the first post-landing commit; the fetch itself may take
+        // arbitrarily long and must not eat into the settle budget.
+        deadline: 0,
+        armedIndex,
+        reqId,
+        prevNodes,
+      };
     }
     setLoadingEarlier(true);
     setLoadTick((n) => n + 1);
@@ -610,22 +684,28 @@ function TranscriptInner({
         setLoadingEarlier(false);
         setLoadTick((n) => n + 1);
         if (req.cancelled || !result || !result.prepended) {
-          // Cancelled by a user scroll, a failed read, or a duplicate-only /
-          // empty page (nothing to anchor). A page that PREPENDED keeps the
-          // anchors until the mounted anchor settles — including the final
-          // history page (result.end), whose rows still have to mount and
-          // measure before the held offset is correct.
-          if (prependAnchorRef.current?.reqId === reqId) prependAnchorRef.current = null;
+          // Cancelled by a reader scroll/navigation, a failed read, or a
+          // duplicate-only / empty page (nothing to anchor). A page that
+          // PREPENDED keeps the anchors until the mounted anchor settles —
+          // including the final history page (result.end), whose rows still
+          // have to mount and measure before the held offset is correct.
+          const held = prependAnchorRef.current;
+          if (held?.reqId === reqId) releasePrependAnchor(held);
           const pending = pendingScroll.current;
           if (pending?.kind === "restore" && pending.reqId === reqId) {
             pendingScroll.current = null;
             restoringRef.current = false;
           }
           loadReqRef.current = null;
+        } else if (prependAnchorRef.current?.reqId !== reqId) {
+          // The prepend landed but the settle bounds (or a navigation)
+          // already retired the anchor: nothing is holding the request
+          // identity anymore.
+          loadReqRef.current = null;
         }
       }
     }
-  }, [instanceId, loadingEarlier, canLoadEarlier, range.start]);
+  }, [instanceId, loadingEarlier, canLoadEarlier, range.start, releasePrependAnchor]);
 
   // Reading anchor: the first row in view, its offset from the scroller top,
   // and the scrollTop it was sampled at (on every scroll). A row above it that
@@ -707,7 +787,10 @@ function TranscriptInner({
   // math it uses): the prepended window is mostly UNMEASURED rows rendered at
   // `estimate` height. When the average later converges, padTop for thousands
   // of rows shifts after the one-shot DOM restore finished — keep re-pinning
-  // the held anchor until sizes stop changing.
+  // the held anchor while sizes settle. The hold has a DEFINITE END: a few
+  // stable passes, a quiet window after the last settle commit, an absolute
+  // deadline, or a correction budget, whichever comes first — the commits can
+  // simply stop, so stable passes alone are not enough.
   useLayoutEffect(() => {
     const held = prependAnchorRef.current;
     const el = scrollerRef.current;
@@ -739,37 +822,45 @@ function TranscriptInner({
       // floor), retire — otherwise the anchors stay set for the whole session,
       // growth anchoring and estimate convergence stay disabled.
       const req = loadReqRef.current;
-      if (req && req.reqId === held.reqId && req.done) {
-        prependAnchorRef.current = null;
-        const pending = pendingScroll.current;
-        if (pending?.kind === "restore" && pending.reqId === held.reqId) {
-          pendingScroll.current = null;
-          restoringRef.current = false;
-        }
-        loadReqRef.current = null;
-      }
+      if (req && req.reqId === held.reqId && req.done) releasePrependAnchor(held);
+      return;
+    }
+    if (held.deadline === 0) held.deadline = Date.now() + PREPEND_SETTLE_DEADLINE_MS;
+    // Absolute backstop even when commits keep arriving with corrections.
+    if (Date.now() >= held.deadline) {
+      releasePrependAnchor(held);
       return;
     }
     const rowEl = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.anchorId)}"]`);
     if (!rowEl) {
       // Anchor not mounted yet (the pendingScroll restore runs after this
-      // effect and brings it in): do not burn the stable-pass budget.
+      // effect and brings it in): do not burn the stable-pass budget, but the
+      // quiet timer still has to run — a window that stops committing before
+      // the anchor mounts must retire the hold instead of leaking it.
+      armPrependQuiet(held);
       return;
     }
     const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) > 1) {
+      held.corrections += 1;
+      if (held.corrections >= PREPEND_SETTLE_MAX_CORRECTIONS) {
+        releasePrependAnchor(held);
+        return;
+      }
       programmaticScroll(el, el.scrollTop + delta, true);
       held.tries = 0;
+      armPrependQuiet(held);
       return;
     }
     held.tries += 1;
     // Sizes/events arrive on separate commits; release after a few stable
     // passes with no correction needed.
     if (held.tries >= 4) {
-      prependAnchorRef.current = null;
-      if (loadReqRef.current?.reqId === held.reqId) loadReqRef.current = null;
+      releasePrependAnchor(held);
+      return;
     }
-  }, [sizes, nodes, estimate, loadTick]);
+    armPrependQuiet(held);
+  }, [sizes, nodes, estimate, loadTick, programmaticScroll, releasePrependAnchor, armPrependQuiet]);
 
   useLayoutEffect(() => {
     const el = scrollerRef.current;
@@ -891,7 +982,8 @@ function TranscriptInner({
         pendingScroll.current = null;
         restoringRef.current = false;
         if (pending.kind === "restore" && pending.reqId !== undefined) {
-          if (prependAnchorRef.current?.reqId === pending.reqId) prependAnchorRef.current = null;
+          const held = prependAnchorRef.current;
+          if (held?.reqId === pending.reqId) releasePrependAnchor(held);
           if (loadReqRef.current?.reqId === pending.reqId) loadReqRef.current = null;
         }
       }
@@ -904,7 +996,7 @@ function TranscriptInner({
       return;
     }
     pending.tries += 1;
-  }, [sizes, nodes, estimate, applyOffset, loadTick]);
+  }, [sizes, nodes, estimate, applyOffset, loadTick, releasePrependAnchor]);
 
   // A commit that moves rows above the anchor (padTop re-estimated, a row
   // inserted above) holds the reader the same way a measured growth does. A
@@ -963,6 +1055,7 @@ function TranscriptInner({
   useEffect(() => {
     return () => {
       if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+      if (prependSettleTimerRef.current !== null) window.clearTimeout(prependSettleTimerRef.current);
       flushPosition(scrollTopRef.current);
     };
   }, [flushPosition]);
@@ -1219,27 +1312,33 @@ function TranscriptInner({
           setScrollTop(el.scrollTop);
           scrollTopRef.current = el.scrollTop;
           pinRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
-          // A reader who navigates manually WHILE an older page is in flight
-          // owns the position: cancel that click's held anchors so the prepend
-          // cannot restore them back to the click-time row. The restore's OWN
-          // programmatic scrollTop writes record their target, so only an
-          // event landing at that target is the echo of our math; an
-          // intentional programmatic navigation (j/k, a search hit, 跳到最新)
-          // invalidated the record before its event and cancels like a
-          // gesture, so it is never swallowed by the restore.
+          // A reader who navigates manually while an older page is in flight
+          // OR while its restore is still settling owns the position: release
+          // that click's held anchors immediately so neither the pending
+          // prepend nor a later measurement commit can restore them back to
+          // the click-time row. The restore's OWN programmatic scrollTop
+          // writes record their target, so only an event landing at that
+          // target is the echo of our math; an intentional programmatic
+          // navigation (j/k, a search hit, 跳到最新) invalidated the record
+          // before its event and releases like a gesture, so it is never
+          // swallowed by the restore.
           const echo = restoreEchoRef.current;
           restoreEchoRef.current = null;
           const ownEcho = echo !== null && Math.abs(el.scrollTop - echo.top) <= 2;
           if (!ownEcho) {
             const req = loadReqRef.current;
-            if (req && !req.done && !req.cancelled) {
-              req.cancelled = true;
+            if (req && !req.cancelled) {
+              if (!req.done) req.cancelled = true;
+              const held = prependAnchorRef.current;
+              if (held?.reqId === req.reqId) releasePrependAnchor(held);
               const pending = pendingScroll.current;
               if (pending?.kind === "restore" && pending.reqId === req.reqId) {
                 pendingScroll.current = null;
                 restoringRef.current = false;
               }
-              if (prependAnchorRef.current?.reqId === req.reqId) prependAnchorRef.current = null;
+              // A finished request's identity is released now; an in-flight
+              // one is finalized by its click's finally.
+              if (req.done && loadReqRef.current === req) loadReqRef.current = null;
             }
           }
           sampleReadingAnchor();

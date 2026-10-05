@@ -1018,44 +1018,14 @@ pub(crate) fn validate_child_delegation(
         )));
     }
     if let Some(pid) = parent_id {
-        // D-057 §5: the parent may be one chapter of a lineage. Earlier
-        // chapters created the same workers, and a continuation chapter adds
-        // no delegation edge (its parent is its predecessor's parent), so
-        // active children are counted across EVERY chapter of the lineage.
-        // Continuation rows themselves (`chapter_cause` set) are never
-        // children, regardless of what their copied parent edge looks like.
-        let mut chapter_stmt = conn.prepare(
-            "SELECT id FROM instances
-             WHERE COALESCE(lineage_id, id) =
-                   (SELECT COALESCE(lineage_id, id) FROM instances WHERE id = ?1)",
-        )?;
-        let chapter_ids: Vec<String> = chapter_stmt
-            .query_map(params![pid], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        drop(chapter_stmt);
-        let parent_clauses = chapter_ids
-            .iter()
-            .map(|chapter| format!("%\"parentInstanceId\":\"{chapter}\"%"))
-            .collect::<Vec<_>>();
-        let mut sql = String::from(
-            "SELECT COUNT(*) FROM instances
-             WHERE lifecycle NOT IN ('exited', 'failed', 'closed')
-               AND chapter_cause IS NULL AND (",
-        );
-        sql.push_str(
-            &parent_clauses
-                .iter()
-                .map(|_| "spec_json LIKE ?")
-                .collect::<Vec<_>>()
-                .join(" OR "),
-        );
-        sql.push(')');
-        let active_children: i64 = conn.query_row(
-            &sql,
-            rusqlite::params_from_iter(parent_clauses.iter()),
-            |row| row.get(0),
-        )?;
-        if u32::try_from(active_children).unwrap_or(0) >= limits.fan_out {
+        // D-057 §5: one shared lineage resolver backs every parent edge —
+        // `owns()`, the D-051 routed-decision edge and this fan-out count — so
+        // they can never disagree. Children are counted per child LINEAGE
+        // across every chapter: a worker that itself continued (predecessor
+        // ended, successor live) still occupies one slot, and a continuation
+        // chapter of the parent's own lineage never counts as a child.
+        let active_children = count_active_lineage_children(conn, pid)?;
+        if active_children >= limits.fan_out {
             return Err(StoreError::Conflict(format!(
                 "parent {pid} already has {active_children} active children; fan-out limit is {}",
                 limits.fan_out
@@ -1110,7 +1080,8 @@ pub(crate) fn lineage_id_of(conn: &Connection, id: &str) -> Result<Option<String
     .map_err(StoreError::from)
 }
 
-/// D-057 §5: the single lineage edge every parent-edge rule reads.
+/// D-057 §5: the single lineage edge every parent-edge rule reads
+/// (`owns()`, the D-051 routed-decision edge, fan-out).
 ///
 /// A caller owns a target when the target is a chapter in the caller's
 /// lineage, or the target's parent is. Successor chapters therefore keep
@@ -1131,21 +1102,64 @@ pub(crate) fn lineage_owns_conn(
     if target_lineage == caller_lineage {
         return Ok(true);
     }
+    Ok(parent_lineage_of(conn, target_id)? == Some(caller_lineage))
+}
+
+/// Stamped lineage id of `id`'s parent edge, when the edge names an existing
+/// instance. The shared half of the lineage resolver: every parent-edge rule
+/// ultimately compares this value against a caller lineage.
+pub(crate) fn parent_lineage_of(conn: &Connection, id: &str) -> Result<Option<String>, StoreError> {
     let parent: Option<String> = conn
         .query_row(
             "SELECT json_extract(spec_json, '$.parentInstanceId')
              FROM instances WHERE id = ?1",
-            params![target_id],
+            params![id],
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()?
         .flatten();
-    if let Some(parent) = parent
-        && lineage_id_of(conn, &parent)? == Some(caller_lineage)
-    {
-        return Ok(true);
+    match parent {
+        Some(parent) => Ok(lineage_id_of(conn, &parent)?),
+        None => Ok(None),
     }
-    Ok(false)
+}
+
+/// Count the parent lineage's **active child lineages** — the fan-out resolver
+/// (D-057 §5), expressed with the same lineage edge [`lineage_owns_conn`] uses.
+///
+/// Each distinct child lineage with at least one non-terminal, non-fenced
+/// chapter counts once: a worker that itself continued (its predecessor
+/// exited and its successor chapter is live) still occupies one slot, which
+/// the earlier per-row `chapter_cause IS NULL` count dropped. The parent's own
+/// continuation chapters are excluded: a chapter of the parent lineage is not
+/// a child.
+pub(crate) fn count_active_lineage_children(
+    conn: &Connection,
+    parent_id: &str,
+) -> Result<u32, StoreError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT COALESCE(child.lineage_id, child.id))
+         FROM instances child
+         WHERE child.lifecycle NOT IN ('exited', 'failed', 'closed')
+           AND child.fenced_at IS NULL
+           AND COALESCE(child.lineage_id, child.id) <>
+               (SELECT COALESCE(lineage_id, id) FROM instances WHERE id = ?1)
+           AND EXISTS (
+               SELECT 1 FROM instances edge
+               WHERE COALESCE(edge.lineage_id, edge.id)
+                     = COALESCE(child.lineage_id, child.id)
+                 AND json_extract(edge.spec_json, '$.parentInstanceId') IS NOT NULL
+                 AND (SELECT COALESCE(parent.lineage_id, parent.id)
+                        FROM instances parent
+                       WHERE parent.id
+                             = json_extract(edge.spec_json, '$.parentInstanceId'))
+                     = (SELECT COALESCE(lineage_id, id)
+                          FROM instances WHERE id = ?1)
+           )",
+        params![parent_id],
+        |row| row.get(0),
+    )?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 /// Inputs to the ma-lineage continuation-resume transaction.

@@ -991,6 +991,17 @@ async fn delegated_question_created_under_a_predecessor_reaches_the_successor() 
 
 // --- 6. Fan-out across chapters and equal depth --------------------------
 
+/// Drain forwarded frames until `instanceId == id` and the method matches.
+async fn drain_frame(node: &mut FakeNode, method: &str, id: &str) -> Result<Value> {
+    for _ in 0..8 {
+        let (got_method, params) = node.next_frame().await?;
+        if got_method == method && params["instanceId"] == json!(id) {
+            return Ok(params);
+        }
+    }
+    anyhow::bail!("never saw {method} for {id}")
+}
+
 #[tokio::test]
 async fn fan_out_counts_across_chapters_and_continuation_adds_no_depth() -> Result<()> {
     let ctx = Ctx::boot().await?;
@@ -1058,6 +1069,162 @@ async fn fan_out_counts_across_chapters_and_continuation_adds_no_depth() -> Resu
         db.execute(
             "UPDATE instances SET lifecycle = 'closed' WHERE id = ?1",
             rusqlite::params![w1],
+        )?;
+    }
+    let w3 = ctx.agent_child(&y_token, &mut node).await?;
+    assert_ne!(w3, w2);
+    Ok(())
+}
+
+/// A child lineage that continued — its first chapter ended and its successor
+/// chapter is the live one — still occupies one fan-out slot. The pre-round-2
+/// per-row count dropped continuation rows (`chapter_cause IS NULL`), so a
+/// resumed worker silently stopped counting.
+#[tokio::test]
+async fn a_resumed_child_lineage_still_counts_against_fan_out() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+
+    let project: Value = ctx
+        .http
+        .post(format!("{}/v1/projects", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "name": "fanout-resumed-child",
+            "policy": { "configurable": { "coordinatorFanOut": 2, "maxDelegationDepth": 3 } }
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let project_id = project["id"].as_str().context("project id")?.to_owned();
+    // Seat carrying `land` as well: the child needs a grant that makes it a
+    // continuity lineage without colliding with the seat's per-project
+    // `dispatch` or the hub-wide `address-owner` uniqueness.
+    let mut seat_body = json!({
+        "hostId": ctx.host,
+        "kind": "claude",
+        "driver": "claude-sdk",
+        "name": "main",
+        "title": "Main",
+        "grants": ["address-owner", "dispatch", "land"],
+        "permissionMode": "manual",
+        "restart": Ctx::restart_on(),
+        "prompt": "seat brief",
+        "scope": { "projectIds": [project_id] },
+    });
+    let _ = &mut seat_body;
+    let created: Value = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&seat_body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let x = created["instance"]["instanceId"]
+        .as_str()
+        .context("seat id")?
+        .to_owned();
+    let (_method, create_params) = node.next_frame().await?;
+    assert_eq!(_method, "instance.create");
+    let x_token = create_params["agentCredential"]["token"]
+        .as_str()
+        .context("launch token")?
+        .to_owned();
+    ctx.report_session(&node, &x, false).await?;
+
+    // W1 is a continuity worker (holds land, so it has a lineage and can
+    // continue); W2 is a plain worker.
+    let w1: Value = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&x_token)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-print",
+            "permissionMode": "manual",
+            "grants": ["land"],
+            "scope": { "projectIds": [project_id] },
+            "prompt": "continuity worker"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let w1 = w1["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let _ = node.next_frame().await?;
+    let w2 = ctx.agent_child(&x_token, &mut node).await?;
+    ctx.report_session(&node, &w1, false).await?;
+
+    // Continue the W1 lineage: W1 ends, W1B is the live successor chapter.
+    let resumed: Value = ctx
+        .resume(&w1, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let w1b = resumed["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(w1b, w1);
+    drain_frame(&mut node, "instance.close", &w1).await?;
+    drain_frame(&mut node, "instance.resume", &w1b).await?;
+    // W1 genuinely ends (process-end evidence); only W1B stays live.
+    node.appends.send((w1.clone(), exited()))?;
+    ctx.wait_until(&w1, |view| view["lifecycle"] == json!("exited"))
+        .await?;
+    ctx.report_session(&node, &w1b, false).await?;
+
+    // Continue the seat lineage as well; fan-out is checked from the
+    // successor chapter Y against the SAME shared lineage resolver.
+    let _: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    drain_frame(&mut node, "instance.close", &x).await?;
+    let y_params = loop {
+        let (method, params) = node.next_frame().await?;
+        if method == "instance.resume" {
+            break params;
+        }
+    };
+    let y_token = y_params["agentCredential"]["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Resolved through the Agent dispatch path: W1B + W2 fill the budget of 2,
+    // so the successor chapter cannot delegate a third worker.
+    let refused = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&y_token)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-print",
+            "permissionMode": "manual", "prompt": "third"
+        }))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), 409);
+    assert!(
+        refused.text().await?.contains("fan-out"),
+        "the resumed child lineage must still occupy a fan-out slot"
+    );
+
+    // Ending the successor chapter releases the W1 lineage slot; a third
+    // dispatch then fits (W2 is the only active child).
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE instances SET lifecycle = 'closed' WHERE id = ?1",
+            rusqlite::params![w1b],
         )?;
     }
     let w3 = ctx.agent_child(&y_token, &mut node).await?;

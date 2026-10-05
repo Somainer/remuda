@@ -599,7 +599,7 @@ type InstanceSpec = {
     | {mode: "create"; worktreeId: Id; baseOid: string; branch: string};
   providerProfile: {id: Id; revision: U64};
   modelId: string|null; // null 请求 owning profile 的显式默认解析。
-  effort?: {name: "low"|"medium"|"high"|"xhigh"|"max"; ultracode: boolean};
+  effort?: {name: "low"|"medium"|"high"|"xhigh"|"max"; ultracode: boolean}; // 两条独立的轴；ultracode 是否蕴含 xhigh 按版本定，见下文与 D-056
   permissionMode: PermissionMode;
   env: Record<string, EnvBinding>;
   args: string[];
@@ -636,11 +636,27 @@ type MaterializedLaunch = {
 };
 ~~~
 
-**Claude effort（D-028 §9.1）。** 五档 `low` / `medium` / `high` / `xhigh` / `max`，默认 `high`（成本基准 1.0）。`ultracode` **不是第六档**，是正交 boolean（等价 `xhigh` + dynamic workflow），session-only、永不持久化为档名。落地为 argv 上的**一个** flag：`--effort <档名>`，置了 ultracode 时为 `--effort ultracode`（原生 flag 只收一个值）。`effort` 缺省表示「交给 harness 决定」，materializer **不发** `--effort`——这与请求默认档不是一回事。
+**Claude effort（D-028 §9.1、D-056）。** 五档 `low` / `medium` / `high` / `xhigh` / `max`。默认档**按模型**定，没有通用默认：官方文档给出 Opus 5.5 与 Sonnet 5.5 为 `medium`，Opus 4.7 为 `xhigh`，其余支持 effort 的模型为 `high`；组织默认与 per-model 保存的档都可以覆盖它。`high` 仍是成本基准 1.0。
 
-历史档名按**名字**归一，绝不按 index：`default→low`、`think→high`、`think-hard→xhigh`、`ultracode→xhigh + ultracode:true`，无法识别的名字落到 `high`（一个过期的 UI 字符串不该让启动失败）。按 index 归一会出错，因为旧表是 per-harness 且长度不同——claude 的 index 3 是 `ultracode`，codex 的 index 3 是 `ultra`。旧客户端发来的 `{index, name}` 仍然接受，`index` 在读取时被忽略、也不写回。
+`effort.ultracode` **不是第六档**，是与档位正交的会话开关：只在本会话有效，永不持久化为档名。它的语义按 Claude Code 版本门控，版本取 pinned binary 的 `--version`（即上面的 `binaryVersion`）：
 
-**Codex effort（codex-cli 0.154.0）。** 六档按原生 picker 顺序展示，默认 `medium`。`max` 和 `ultra` 原样持久化并传入 `-c model_reasoning_effort="<v>"`；历史输入 `minimal` 归一为 `low`，未知名字回落到默认档。`ultra` 是 Codex 的真实档位，Claude/agy/Grok 拒绝它；`ultracode` 仍是 Claude-only workflow flag。跨 harness 历史名字只按名字读取，不按旧 index 推测。
+- **≥ 2.1.284**：任意档都可以开，`ultracode: true` **不蕴含** `xhigh`。argv 发 `--effort <档名>`；开关写进本次 launch 已有的那份 per-launch settings overlay，键为 `"ultracode": true`。不另加第二个 `--settings`：两个 `--settings` 不合并，后出现的整份胜出。
+- **2.1.203–2.1.283（耦合）**：开 ultracode 即 `xhigh`。只有 `{name: "xhigh", ultracode: true}` 能落地，形式是 argv 上的一个 `--effort ultracode`；其余 `ultracode: true` 组合返回 `INVALID_LAUNCH_SPEC`，消息点名版本。
+- **< 2.1.203，或版本读不出**：`ultracode: true` 一律返回 `INVALID_LAUNCH_SPEC`。
+
+~~~text
+≥ 2.1.284, {name: "max", ultracode: true}:
+  argv     … --settings <per-launch overlay> --effort max
+  overlay  { …hooks, "tui": …, "ultracode": true }
+2.1.203–2.1.283, {name: "xhigh", ultracode: true}:
+  argv     … --settings <per-launch overlay> --effort ultracode
+~~~
+
+`--resume` 不恢复 ultracode，resume launch 按上面同一规则再带一次。`effort` 缺省表示「交给 harness 决定」，materializer **不发** `--effort`——这与请求某一档不是一回事。实测见 [effort-sync-4](evidence/effort-sync-4.md)。
+
+历史档名按**名字**归一，绝不按 index：`default→low`、`think→high`、`think-hard→xhigh`，无法识别的名字落到 `high`（一个过期的 UI 字符串不该让启动失败；这是归一兜底，不是默认档）。旧名 `ultracode` 是**只用于输入**的别名：读入时归一为 `{name: "xhigh", ultracode: true}`，不写回，客户端也不再写出它——要表达 `{max, true}` 这类组合只能用 `ultracode` 字段。按 index 归一会出错，因为旧表是 per-harness 且长度不同——claude 的 index 3 是 `ultracode`，codex 的 index 3 是 `ultra`。旧客户端发来的 `{index, name}` 仍然接受，`index` 在读取时被忽略、也不写回。
+
+**Codex effort（codex-cli 0.154.0）。** 六档按原生 picker 顺序展示，默认 `medium`。`max` 和 `ultra` 原样持久化并传入 `-c model_reasoning_effort="<v>"`；历史输入 `minimal` 归一为 `low`，未知名字回落到默认档。`ultra` 是 Codex 的真实档位，Claude/agy/Grok 拒绝它；`ultracode` 仍是 Claude 专属的会话开关。跨 harness 历史名字只按名字读取，不按旧 index 推测。
 
 | wire value | picker name | subtitle / tooltip |
 | --- | --- | --- |
@@ -651,7 +667,7 @@ type MaterializedLaunch = {
 | `max` | Max | For difficult problems when quality matters more than speed · higher usage |
 | `ultra` | Ultra | For demanding work using multiple agents · highest usage |
 
-Max 使用与 Claude max 相同的静态强调；Ultra 使用最强的 ember 效果，与 Claude ultracode 共用视觉效果但不设置其 flag。验证边界及 390/1440 截图见 [effort-codex-tiers-1](evidence/effort-codex-tiers-1.md)。
+Max 使用与 Claude max 相同的静态强调；Ultra 使用最强的 ember 效果，与 Claude ultracode 开关共用视觉效果但不设置其 flag（Claude 侧的 ember 跟随开关状态、不跟随档位，D-056）。验证边界及 390/1440 截图见 [effort-codex-tiers-1](evidence/effort-codex-tiers-1.md)。
 
 **绝不使用 `CLAUDE_CODE_EFFORT_LEVEL`**：它的优先级高于会话内 `/effort`，会把 PTY 的实时改档钉死。反向地，`child_env` 必须从子进程环境中**剥离**宿主继承的该变量，否则外部环境静默覆盖一切。
 
@@ -1454,7 +1470,7 @@ Hub 生成 ownerFence，Node 在本地 durable store 单调保存；旧 fence �
 | `instance.open_terminal` | Hub→Node | `{instanceId,backgroundJobId,allowWake:true,carrier:{backend:"herdr",server:HerdrServer,session}}` → Command；只允许经认证的人类显式动作，可能 wake native job。使用同一 Command wrapper、digest、expected generation/fence 与持久 dispatch intent；不创建 Run、不含 prompt |
 | `instance.resume` | Hub→Node | `{instanceId,nativeRef,providerProfileRevision,expectedPreviousGeneration}` → Command；不含 prompt，后续输入另发 |
 | `instance.send` | Hub→Node | `{instanceId,runId,input:prompt\|steer,completionScope}` → Command；input 使用 DriverInput 对应分支，model-switch 只能经 configure；steer 必须指定既有 runId，不创建新 Run。prompt 分支的 `mode` 三选一（§3.1）：`new-turn` 开新回合、`steer` 插入当前回合、`queue` 明确排队。三者能力分别由 capability `steer` / `queue` 上报，未实测时为 `unknown`，调用返回 `CAPABILITY_UNKNOWN` 而不是假装不支持 |
-| `instance.configure` | Hub→Node | `{instanceId,modelId,effective:"next-turn",effort?}` → Command；仅能力支持且无活 foreground Run 时，转 Driver.send(model-switch)。`effort` 用 §4.1 的 `{name, ultracode}`；历史档名按名字归一后再存，Hub 不保存两种拼法 |
+| `instance.configure` | Hub→Node | `{instanceId,modelId,effective:"next-turn",effort?}` → Command；仅能力支持且无活 foreground Run 时，转 Driver.send(model-switch)。`effort` 携带 `{name, ultracode, index}`：即 §4.1 的 `EffortSelection` 加旧客户端的 `index`（读时忽略、不写回）；旧名 `ultracode` 只作输入别名，归一为 `{xhigh, true}` 后再存，Hub 不保存两种拼法。driver 的切换请求把档位与开关分开携带，按 D-056 的版本门生成至多两条 `/effort` 命令，档位在前（≥ 2.1.284：`/effort <level>`、`/effort ultracode on\|off`；耦合版本：开 = `/effort ultracode`，仅限 xhigh，关 = `/effort <level>`）。两条轴各自结算、各自回读；拒绝带稳定 reason（`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`），被 clamp 的 accept 报 clamp 之后的档。见 [effort-sync-4](evidence/effort-sync-4.md) |
 | `instance.fork` | Hub→Node | `{sourceInstanceId,newInstanceId,nativeBoundary:{type:"latest-terminal"},newSpec}` → Command；expected 校验 source instance revision；原生 fork 返回新 native ID，不支持任意历史切点 |
 | `instance.cancel` | Hub→Node | `{instanceId,runId}` → Command；expected 中必须含 processGeneration/runGeneration |
 | `instance.close` | Hub→Node | `{instanceId,mode:"terminate",retainNativeSession:true}` → Command；不接受清除 transcript 的隐含请求 |

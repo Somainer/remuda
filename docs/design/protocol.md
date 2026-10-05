@@ -373,7 +373,7 @@ MCP `call_tool` 在副作用前决定范围，并把需审批动作送到 Hub br
 **Agent create 的权限档位：子不超父（2026-10-05，D-057）。** Agent 创建的子实例，只有当它的 Agent 创建者自身运行在关闭 harness 控制的档位时，才可以使用关闭控制的档位（Claude `bypassPermissions`/`dontAsk`、Codex `never`、Grok `always-approve`、Agy `always-proceed`）；否则可以使用任何保留 harness 控制的档位。省略权限模式时，子实例继承创建者自己的档位，框架不另选档位，也不跨 driver 翻译（§6.4）；创建者的档位不是子实例 harness 词表里的值时，create 被拒并说明原因，由调用者显式指定。「创建者的档位」是 Hub 依据创建者章节上记录的生效档位、盖章在转发 create 上的 `creatorPermissionMode`（§7.2），绝不取自请求体。Hub 的 `restrict_permission` 与 Node 侧每一处执行 Agent 来源规则的位置一起改为这条规则：
 - 物化器 `permission_plan`：Agent 来源请求关闭控制的档位时，只有 `creatorPermissionMode` 同样是关闭控制的档位才放行，否则拒绝；
 - generic-pty：Agent create 的 bypass/dontAsk 只在创建者自身关闭控制时保留，否则在 materialize 前降为 asking mode，得到非 yolo argv；
-- preset bypass flags（下文 §4.3 的 yolo argv）只在 spec 的档位为 `bypassPermissions`（显式请求，或按上面的规则继承）时合并，并且来源为 Human/Bot，或来源为 Agent 且其 Agent 创建者自身关闭控制；默认模式绝不追加。
+- preset bypass flags（§4.3 表里各 harness 的 yolo argv）逐 harness 判定，只在两条同时成立时合并：子实例解析后的档位（显式请求，或按上面的规则继承）正是该行 yolo argv 所实现的关闭控制档位；并且来源为 Human/Bot，或来源为 Agent 且其 Agent 创建者自身关闭控制。显式请求的保留控制档位永远不得到 yolo argv；默认模式绝不追加。
 
 D-011 的 Bot materializer 拒绝 bypass/dontAsk 规则继续存在，Bot 来源不变，上面的条件不授予 Bot 额外豁免。这是第一阶段唯一改动既有 Agent 来源权限规则的地方。它取代此前的规则：Agent create 的 generic-pty 一律降级，preset bypass flags 仅限 Human/Bot，Agent 的结构化 Claude create 显式请求 bypass/dontAsk 被拒绝，省略权限模式则采用 manual。实现随 `ma-admission` 落地。
 
@@ -744,14 +744,20 @@ Herdr 负责 pane 生存，Node 负责 Instance/native session 对应；runtime 
 
 **agent-in-native-pty（`shell-pty` + agent kind，D-028 §5.1）：**Remuda 自持 PTY 里跑 agent CLI，与 D-025 promote 的终端**同一条路径**。argv 来自 per-kind recipe，不是把 `spec.args` 原样交给 `CommandBuilder`；`flags.rs` 的 BANNED / RESERVED / EXTRA allowlist 在这条路径上同样生效（此前 shell-pty 完全绕过它）。
 
-| kind | argv 模板 | 配置注入 | yolo argv（仅当档位为 bypass，且来源为 Human/Bot，或为 Agent 且其 Agent 创建者自身关闭 harness 控制；D-057） |
-| --- | --- | --- | --- |
-| `claude` | `--setting-sources user,project,local` [`--settings <overlay>`] [`--effort <v>`] | argv 上的 settings overlay | `--dangerously-skip-permissions` |
-| `codex` | [`-c model_reasoning_effort="<v>"`] | env `CODEX_HOME` 指向影子目录 | `--dangerously-bypass-approvals-and-sandbox` |
-| `grok` | [`--effort <v>`] | env `GROK_HOME` 指向影子目录 | `--always-approve` |
-| `agy` | [`--effort <v>`] | 无 | `--yolo` |
+| kind | argv 模板 | 配置注入 | yolo argv | 该 yolo argv 实现的关闭控制档位 |
+| --- | --- | --- | --- | --- |
+| `claude` | `--setting-sources user,project,local` [`--settings <overlay>`] [`--effort <v>`] | argv 上的 settings overlay | `--dangerously-skip-permissions` | `bypassPermissions`（不是 `dontAsk`） |
+| `codex` | [`-c model_reasoning_effort="<v>"`] | env `CODEX_HOME` 指向影子目录 | `--dangerously-bypass-approvals-and-sandbox` | 审批策略 `never`，且 sandbox 为 `danger-full-access`（这个 argv 同时关闭审批与 sandbox） |
+| `grok` | [`--effort <v>`] | env `GROK_HOME` 指向影子目录 | `--always-approve` | `always-approve` |
+| `agy` | [`--effort <v>`] | 无 | `--yolo` | `always-proceed` |
 
-新建 session **不**钉 `--session-id`：id 由 harness 回报（SessionStart hook / `session_index.jsonl` / `active_sessions.json`），自己造一个只会多出一个要对账的身份。resume 走 `--resume <sid>`，与 §5.6 同路径。`LaunchRecipe` 必须真填 `settings_digest`、`env_allowlist`、provider kind——旧的 shell-pty stub 发的是空白名单加硬编码 provider，D-028 §5.1 步骤 4 把它们列为审计要求。**D-011 / D-017 的授权规则随表一起搬家**；其中 Agent 来源的部分自 2026-10-05 起按 D-057「子不超父」（§Origin）：Agent 创建的子实例，只有当它的 Agent 创建者自身关闭 harness 控制时才使用 yolo preset，否则使用非 yolo preset；省略档位时继承创建者的档位，框架不另选。bot dispatcher 不自动 bypass。
+**yolo argv 的合并条件（2026-10-05，D-057，与 §Origin 同一合取，逐 harness）**：某一行的 yolo argv 只在下面两条同时成立时合并：
+1. 子实例解析后的档位（显式请求，或按 §Origin 继承）**正是该行 yolo argv 所实现的那个关闭控制档位**（上表最后一列）；
+2. 来源为 Human/Bot，或来源为 Agent 且其 Agent 创建者自身运行在关闭 harness 控制的档位（以 Hub 盖章的 `creatorPermissionMode` 为准）。
+
+只满足其中一条都不合并。显式请求的保留控制档位（例如 Claude `manual`/`acceptEdits`/`auto`/`plan`、Codex `untrusted`/`on-request`、Grok `native-prompt`/`auto`、Agy `native`/`accept-edits`/`plan`）永远不得到 yolo argv，即使创建者自身关闭了控制；不是该行 argv 所实现的关闭控制档位（例如 Claude `dontAsk`，或 Codex `never` 配更窄的 sandbox）也不得到它。默认模式绝不追加。
+
+新建 session **不**钉 `--session-id`：id 由 harness 回报（SessionStart hook / `session_index.jsonl` / `active_sessions.json`），自己造一个只会多出一个要对账的身份。resume 走 `--resume <sid>`，与 §5.6 同路径。`LaunchRecipe` 必须真填 `settings_digest`、`env_allowlist`、provider kind——旧的 shell-pty stub 发的是空白名单加硬编码 provider，D-028 §5.1 步骤 4 把它们列为审计要求。**D-011 / D-017 的授权规则随表一起搬家**；其中 Agent 来源的部分自 2026-10-05 起按 D-057「子不超父」（§Origin）与上面的合并条件：Agent 创建的子实例只有在解析后的档位正是该行 yolo argv 所实现的关闭控制档位、并且它的 Agent 创建者自身关闭 harness 控制时，才使用 yolo preset；否则使用非 yolo preset。省略档位时继承创建者的档位，框架不另选。bot dispatcher 不自动 bypass。
 
 **codex-appserver：**
 

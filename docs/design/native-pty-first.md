@@ -368,7 +368,13 @@ Claude 的默认档**按模型**定（官方 model-config；组织默认与 per-
 - **effective vs requested**：record 上拆成两个字段，`effortRequested` 与 `effortEffective{name, ultracode, source, observedAt} | null`，两条轴各自回读。
   - **档位**：从 transcript 每条 assistant 记录的 `effort` / `perTurnEffort` 回读。`auto` 回读为它解析出的档。
   - **ultracode**：**从不**出现在 assistant 记录上，只从 `/effort` verdict 与 `ultra_effort_enter` / `ultra_effort_exit` 附件回读，footer 只作 Screen 层兜底。≥ 2.1.284 上开关在任意档锁存。只认本进程的记录：`--resume` 追加到同一个 transcript，上一个进程重放的「Ultracode on」verdict 不代表当前状态（effort-sync-4 (f) 中 resume 后实际为关，首个 prompt 带 `ultra_effort_exit`），回读游标从本进程 spawn 时的文件末尾开始；新进程（含 resume）在本进程第一条证据出现之前为未知。
-  - **版本**：从记录的 `version` 回读。
+  - **版本**：从每条 transcript 记录的顶层 `version` 回读（live mapper 另以 pinned binary 的 `--version` 预播种子），门控整个 verdict 解析：耦合区间（2.1.203–2.1.283）的 `Set effort level to ultracode …` = xhigh+开、普通档位 accept 正报关；≥ 2.1.284 的 `Ultracode on|off … Effort stays <level>` 是只动开关的 accept，普通档位 verdict 不动 flag；版本读不出时按「未知」处理——普通档位 verdict 不改 flag，`ultracode` 也不当档位。
+  - **回读实现（c-effortread，2026-10-05）**：driver 的 live mapper 与 journal tailer 共用 `remuda-protocol` 里的同一个 `EffortTracker` 与同一批逐字 verdict 解析规则，两条通道对同一记录派生同一个确定性事件 id（assistant 记录用 message id，verdict/附件用 `effort-stdout` / `effort-status` / `effort-model-stdout` / 附件类型 + 记录 uuid）。其余细节：
+    - `/effort status|current`（`Current effort level: …` 与 `Effort level: auto (currently …)`）只是观察、不结算任何待决切换；缺 ` · Ultracode on` 后缀即开关正报关；档位以 assistant 记录为准（g 例 verdict 说 xhigh、实际跑 high，二者不一致时不覆盖）。
+    - 滑杆 verdict 用 ` · Ultracode on|off` 把两条轴连在一起；cap clamp（`Effort '<x>' exceeds the cap … set to '<y>' instead …`）按 clamp 后的档结算 Applied。
+    - `ultra_effort_enter`（full 与 sparse 同义：sparse 重复提示不是边）置位，`ultra_effort_exit` 清位；附件先于任何档位到达时只锁存，flag 随第一条已知档位一起发出。
+    - 拒绝立即结算 bridge：`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`（两种参数顺序 `bogus` 与 `ultracode bogus` 都测）。`CLAUDE_CODE_EFFORT_LEVEL` 的 2.1.289 原文仍是 D-056 开放问题 3；2.1.277 实测到两条（`Not applied: CLAUDE_CODE_EFFORT_LEVEL=<l> overrides …`、`CLAUDE_CODE_EFFORT_LEVEL=<l> overrides this session — …`），解析以稳定环境变量名与 "overrides" 为枢轴。
+    - `/model` verdict 末尾若带 `` with `<level>` effort``，作为一条 effort 观察、归属同 `/model` 切换（2.1.289 实测无此后缀，故解析不依赖它）。
   - **显示**：UI 一律显示 effective。回读不到时显示 `?` 并置灰，**绝不回落成请求值**。不一致时逐轴显示「请求 max → 实际 high」「请求 ultracode → 实际关」，这正是 clamp、org cap、模型不支持、resume 丢失开关的可见出口。
   - **拒绝**：映射为稳定 reason（`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`）。被 clamp 的 accept 报 clamp 之后的档。
   - **超时**：改档命令超时仍未回读到变化时，journal 记 `degraded`，不谎报 applied。

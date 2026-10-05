@@ -1,0 +1,18 @@
+[package]
+name = "remuda-fdsafe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Descriptor-relative, symlink-rejecting filesystem walks for untrusted transcript trees."
+
+# NOTE: deliberately does NOT inherit `workspace.lints` (which forbids
+# unsafe_code). Owning a descriptor returned by openat(2) requires the one
+# `File::from_raw_fd` transfer in `own_fd`; the unsafe is local, audited and
+# covered by the crate's tests.
+[dependencies]
+nix = { version = "0.28", features = ["fs", "dir"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -3263,6 +3263,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "remuda-fdsafe"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "tempfile",
+]
+
+[[package]]
 name = "remuda-feishu"
 version = "0.1.0"
 dependencies = [

@@ -693,7 +693,22 @@ class HubStore {
   }
   /** Screen-read scheduler: queue, single-flight set, in-flight counter. */
   private screenQueue: Id[] = [];
+  /**
+   * The row occupies a scheduler slot: pump-queued or actively reading. An id
+   * is admitted at most once at any time, which bounds both the list-poll
+   * fan-out and the post-delivery kicks to ONE active read per instance.
+   */
   private screenPending = new Set<Id>();
+  /** Subset of {@link screenPending} whose RPC is actually in flight. */
+  private screenActive = new Set<Id>();
+  /**
+   * Exactly ONE coalesced follow-up demand per instance, recorded by a
+   * post-delivery kick that landed while a read was active. Any number of
+   * drained sends collapses to this single flag; it is re-armed once when the
+   * active read settles. So while /screen is slow the per-instance bound is
+   * one active read plus at most one pending refresh, however many sends land.
+   */
+  private screenCoalesced = new Set<Id>();
   private screenInFlight = 0;
   /** Per-row NODE_BUSY back-off: don't re-enqueue before this timestamp. */
   private screenBackoffUntil = new Map<Id, number>();
@@ -1651,11 +1666,12 @@ class HubStore {
           const events = this.state.events[instanceId] ?? [];
           this.settleFromJournal(instanceId, events);
         });
-        void this
-          .chainScreenRead(instanceId, () => this.refreshScreen(instanceId))
-          .catch((err) => {
-            if (!isScreenNodeBusy(err)) this.reconcileToast(err, "屏幕同步");
-          });
+        // The screen refresh rides the list scheduler (single-flight +
+        // NODE_BUSY back-off) with COALESCING: a slow /screen while sends keep
+        // completing can accumulate at most one active read plus one pending
+        // follow-up per instance. runScreenRead still enters through the screen
+        // chain, so every actual read waits behind the journal barrier above.
+        this.kickScreenRefresh(instanceId);
       }
       return fresh.commandId;
     }
@@ -3614,11 +3630,48 @@ class HubStore {
     for (const id of instanceIds) {
       if (this.screenPending.has(id)) continue;
       if (now < (this.screenBackoffUntil.get(id) ?? 0)) continue;
-      const instance = this.state.instances.find((row) => row.id === id);
-      if (!instance || SCREEN_SKIP_LIFECYCLES.has(instance.lifecycle)) continue;
-      this.screenPending.add(id);
-      this.screenQueue.push(id);
+      this.admitScreenRead(id);
     }
+  }
+
+  /**
+   * Post-delivery screen refresh: the coalescing counterpart of the list
+   * poll's {@link refreshScreens}. Every drained delivery used to append
+   * another serialized screen job, so while /screen was slow (a saturated Node
+   * parks the RPC for its REST timeout + NODE_BUSY back-off) pending screen
+   * work grew one entry per send. Instead:
+   *
+   * - no read active/queued and not backed off → admit one now;
+   * - a read is ACTIVE → collapse the demand to the single
+   *   {@link screenCoalesced} flag: any number of sends yields ONE follow-up,
+   *   re-armed in the read's completion callback;
+   * - already pump-queued (not started) → nothing: its start-time basis is
+   *   captured at execution and already covers the just-settled send;
+   * - inside a NODE_BUSY back-off window → nothing: the back-off timer's own
+   *   {@link refreshScreens} re-arm is the follow-up.
+   *
+   * The admitted read still runs via {@link chainScreenRead}, so the journal
+   * barrier (no overtaking a fresher resync) stands for every actual read.
+   */
+  private kickScreenRefresh(instanceId: Id) {
+    if (Date.now() < (this.screenBackoffUntil.get(instanceId) ?? 0)) return;
+    if (this.screenActive.has(instanceId)) {
+      this.screenCoalesced.add(instanceId);
+      return;
+    }
+    if (this.screenPending.has(instanceId)) return;
+    this.admitScreenRead(instanceId);
+  }
+
+  /**
+   * Admit one row into the scheduler queue (single-flight guard + lifecycle
+   * skip) and pump. Shared by the list poll and the post-delivery kick.
+   */
+  private admitScreenRead(id: Id) {
+    const instance = this.state.instances.find((row) => row.id === id);
+    if (!instance || SCREEN_SKIP_LIFECYCLES.has(instance.lifecycle)) return;
+    this.screenPending.add(id);
+    this.screenQueue.push(id);
     this.pumpScreenReads();
   }
 
@@ -3638,12 +3691,21 @@ class HubStore {
         continue;
       }
       this.screenInFlight += 1;
+      this.screenActive.add(id);
       void this
         .runScreenRead(id)
         .catch(() => undefined)
         .finally(() => {
           this.screenInFlight -= 1;
+          this.screenActive.delete(id);
           this.screenPending.delete(id);
+          // Realise the single coalesced post-delivery demand as exactly ONE
+          // follow-up read. A NODE_BUSY answer armed screenBackoffUntil plus a
+          // retry timer; that timer's refreshScreens is the follow-up, so the
+          // busy Node is not hammered immediately.
+          if (this.screenCoalesced.delete(id) && Date.now() >= (this.screenBackoffUntil.get(id) ?? 0)) {
+            this.admitScreenRead(id);
+          }
           this.pumpScreenReads();
         });
     }

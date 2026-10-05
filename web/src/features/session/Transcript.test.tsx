@@ -1575,25 +1575,46 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
     vi.stubGlobal("ResizeObserver", GeometryRO);
 
     const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
+    // Browser-like scroll model: the value clamps to [0, scrollHeight -
+    // clientHeight], writing the same value dispatches NO event, and a
+    // programmatic write's scroll event is delivered on the next animation
+    // frame (coalesced: multiple writes in one frame fire once).
+    let queued = false;
+    const maxScroll = () => Math.max(0, listHeight() - VIEW);
+    const dispatchScroll = () => {
+      queued = false;
+      fireEvent.scroll(scroller());
+    };
     const defineScroll = () => {
       const el = scroller();
       Object.defineProperty(el, "scrollTop", {
         configurable: true,
         get: () => top,
         set: (v: number) => {
-          const changed = v !== top;
-          top = v;
+          const clamped = Math.max(0, Math.min(v, maxScroll()));
+          if (clamped === top) return;
+          top = clamped;
           // Simulate a browser delivering the programmatic scroll's own event
-          // while the fetch promise is still settling (real scroll events are
-          // queued, not microtask-ordered against the click's finally).
-          if (opts.echoOnWrite && changed) fireEvent.scroll(el);
+          // queued on the next frame (real scroll events are coalesced, not
+          // microtask-ordered against the click's finally).
+          if (opts.echoOnWrite && !queued) {
+            queued = true;
+            requestAnimationFrame(dispatchScroll);
+          }
         },
       });
     };
+    // An explicit reader gesture: clamped like the browser and dispatched
+    // synchronously by the test.
     const scrollTo = (value: number) => {
-      top = value;
+      top = Math.max(0, Math.min(value, maxScroll()));
       fireEvent.scroll(scroller());
     };
+    /** Flush the setter's coalesced next-frame scroll event(s). */
+    const nextFrame = () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
     const growMountedRow = (ordinal: number, height: number) => {
       const el = scroller().querySelectorAll<HTMLElement>("[data-anchor]")[ordinal];
       if (!el) throw new Error(`mounted row ${ordinal} not found`);
@@ -1601,7 +1622,7 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
       observerCbs.get(el)?.();
     };
     const scrollTopNow = () => top;
-    return { scroller, defineScroll, scrollTo, growMountedRow, scrollTopNow };
+    return { scroller, defineScroll, scrollTo, growMountedRow, scrollTopNow, nextFrame };
   }
 
   function gate<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -2070,23 +2091,42 @@ describe("load-earlier anchor lifecycle round 5", () => {
     }
     vi.stubGlobal("ResizeObserver", GeoRO);
     const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
+    // Browser-like scroll model: clamp to [0, scrollHeight - clientHeight],
+    // no event when the value does not change, and a programmatic write's
+    // scroll event is delivered next frame (coalesced).
+    let queued = false;
+    const maxScroll = () => Math.max(0, dynamicTotal * ROW - VIEW);
+    const dispatchScroll = () => {
+      queued = false;
+      fireEvent.scroll(scroller());
+    };
     const defineScroll = () => {
       const el = scroller();
       Object.defineProperty(el, "scrollTop", {
         configurable: true,
         get: () => top,
         set: (v: number) => {
-          const changed = v !== top;
-          top = v;
-          opts.onWrite?.(v);
-          if (echoOnWrite && changed) fireEvent.scroll(el);
+          const clamped = Math.max(0, Math.min(v, maxScroll()));
+          if (clamped === top) return;
+          top = clamped;
+          opts.onWrite?.(clamped);
+          if (echoOnWrite && !queued) {
+            queued = true;
+            requestAnimationFrame(dispatchScroll);
+          }
         },
       });
     };
+    // An explicit reader gesture: clamped and dispatched synchronously.
     const scrollTo = (value: number) => {
-      top = value;
+      top = Math.max(0, Math.min(value, maxScroll()));
       fireEvent.scroll(scroller());
     };
+    /** Flush the setter's coalesced next-frame scroll event(s). */
+    const nextFrame = () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
     const growRow = (ordinal: number, height: number) => {
       const el = scroller().querySelectorAll<HTMLElement>("[data-anchor]")[ordinal];
       if (!el) throw new Error(`mounted row ${ordinal} not found`);
@@ -2096,7 +2136,7 @@ describe("load-earlier anchor lifecycle round 5", () => {
     const setTotal = (n: number) => {
       dynamicTotal = n;
     };
-    return { scroller: () => scroller(), defineScroll, scrollTo, growRow, top: () => top, setTotal };
+    return { scroller: () => scroller(), defineScroll, scrollTo, growRow, top: () => top, setTotal, nextFrame };
   }
 
   /**
@@ -2173,6 +2213,10 @@ describe("load-earlier anchor lifecycle round 5", () => {
     await act(async () => {
       await Promise.resolve();
     });
+    // Deliver the restore write's coalesced next-frame echo while the click
+    // continuation is still held open on `done` — the event genuinely lands
+    // mid-flight.
+    await geo.nextFrame();
     expect(geo.top()).toBe(31 * ROW);
 
     // Mounted rows at the target window measure a very different real height
@@ -2496,7 +2540,10 @@ describe("load-earlier anchor lifecycle round 5", () => {
       return { user, geo, g, writes, older };
     }
 
-    async function land(g: ReturnType<typeof setup>["g"], older: Observation[]) {
+    async function land(geo: ReturnType<typeof setup>["geo"], g: ReturnType<typeof setup>["g"], older: Observation[]) {
+      // Deliver the navigation's coalesced next-frame scroll event (its
+      // cancellation) BEFORE the held page prepends.
+      await geo.nextFrame();
       await act(async () => {
         g.resolve(pageOf(older));
         await Promise.resolve();
@@ -2522,7 +2569,7 @@ describe("load-earlier anchor lifecycle round 5", () => {
       // First press selects turn 0 (already at top: no write/no event); the
       // second jumps to turn 1 — its echo is an intentional navigation.
       await user.keyboard("jj");
-      await land(g, older);
+      await land(geo, g, older);
       // The prepend would restore the click-time row to 100*ROW; the cancelled
       // restore never writes it and the j target survives the prepend.
       expect(writes).not.toContain(100 * ROW);
@@ -2535,9 +2582,11 @@ describe("load-earlier anchor lifecycle round 5", () => {
       const { user, geo, g, writes, older } = setup("insLatest");
       await user.click(screen.getByTestId("load-earlier"));
       await user.click(screen.getByTestId("jump-latest"));
-      await land(g, older);
+      await land(geo, g, older);
       expect(writes).not.toContain(100 * ROW);
-      expect(geo.top()).toBe(50 * ROW);
+      // Pinned to the bottom: the browser clamps scrollTop to
+      // scrollHeight - clientHeight, not scrollHeight.
+      expect(geo.top()).toBe(50 * ROW - VIEW);
     });
 
     it("a search jump during the fetch cancels the restore and stays on its hit", async () => {
@@ -2546,7 +2595,7 @@ describe("load-earlier anchor lifecycle round 5", () => {
       await user.click(screen.getByTestId("transcript-search-open"));
       await user.type(screen.getByTestId("transcript-search-input"), "insSearch-m1035");
       await user.keyboard("[Enter]");
-      await land(g, older);
+      await land(geo, g, older);
       // The prepend would restore the click-time row (100*ROW); the cancelled
       // restore never writes it and the scroller stays at the search target.
       expect(writes).not.toContain(100 * ROW);
@@ -2752,9 +2801,9 @@ describe("load-earlier anchor lifecycle round 5", () => {
       // loadingEarlier reset: B's own pager is enabled, not stuck on A's click.
       expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
       // pinRef reset: a fresh B session pins to the tail, which writes the
-      // mount scrollHeight right here (A's click had left pinRef false — a
-      // leak suppresses the pin write and the cleared log stays empty).
-      expect(writes).toContain(200 * ROW);
+      // mount scrollHeight (clamped to scrollHeight - clientHeight) right
+      // here — a leak suppresses the pin write and the cleared log is empty.
+      expect(writes).toContain(200 * ROW - VIEW);
 
       // Past A's settle deadline: no late correction toward A's anchor (30
       // rows deep) may land on B, and no timer is ever re-armed.

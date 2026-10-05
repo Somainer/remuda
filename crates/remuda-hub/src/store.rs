@@ -8622,6 +8622,17 @@ fn knowledge_value(value: Option<&Value>) -> Option<&str> {
         .or_else(|| value.get("value").and_then(Value::as_str))
 }
 
+/// D-057 OA6 / c-cardsettle r4: a native observation attributed to a SUBAGENT
+/// (a non-empty `relatedIds.agentId`; `agentType` is optional) is that
+/// subagent's own turn. It must never move the ROOT session's turn/activity or
+/// fail its lifecycle. Root observations carry no agentId.
+fn native_event_is_subagent(payload: &Value) -> bool {
+    payload
+        .pointer("/relatedIds/agentId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+}
+
 fn lifecycle_rank(state: &str) -> i32 {
     match state {
         "requested" => 0,
@@ -8711,27 +8722,29 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         .or_else(|| knowledge_value(payload.pointer("/entity/activity")))
         .or_else(|| event.get("activity").and_then(Value::as_str));
 
-    // D-057 OA6 (ma-sdk-state): the claude-print / claude-sdk engine's root
-    // turn evidence (topic `turn`). A turn is turn-level, never process-level:
+    // D-057 OA6 (ma-sdk-state; same three-way rule as c-cardsettle r4): the
+    // claude-print / claude-sdk engine's root-turn evidence (topic `turn`) is
+    // ACTIVITY evidence only and never sets lifecycle — a turn is not process
+    // end. Terminal lifecycle comes solely from the separate topic=session
+    // process-exit/EOF event (or a start failure), projected below.
     //
     // * `turn_started`/working (emitted when the user frame is written) sets
-    //   activity `working`;
+    //   activity `working` (lifecycle left as-is: the session lifecycle event
+    //   independently reaches `running`);
     // * a settled `result`/`turn_done` sets activity `idle`;
     // * a settled `result`/`error` (an API error such as 429) also sets
     //   activity `idle` and leaves lifecycle untouched, so the instance keeps
     //   running with all its grants and can be retried in place. The additive
     //   `lastTurnError` marker is applied in `apply_instance_lifecycle`.
     //
-    // This arm must precede the start-failure fold below, whose generic
-    // `status == "error"` rule otherwise marks the instance `failed` and drops
-    // its seat while the process is still alive.
-    //
     // "Settled" mirrors `map_result` in the driver: nothing further queued, and
-    // a successful result is the process's terminal result
-    // (`affectsCompletion`). A Workflow's intermediate result and a turn with
-    // another prompt already queued prove neither idle nor an end.
+    // a successful result is the process's terminal result frame
+    // (`affectsCompletion`). Even that frame is NOT process-end here; a
+    // Workflow's intermediate result and a queued follow-up turn prove neither
+    // idle nor an end.
     if payload_type == "native"
         && payload.get("topic").and_then(Value::as_str) == Some("turn")
+        && !native_event_is_subagent(payload)
     {
         let queued = payload
             .pointer("/relatedIds/queuedTurnCount")
@@ -8748,7 +8761,7 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
                 _ => false,
             };
         if (native_name, status) == ("turn_started", Some("working")) {
-            return (Some("running"), Some("working"));
+            return (None, Some("working"));
         }
         if settled_end {
             return (None, Some("idle"));
@@ -8760,11 +8773,22 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         }
     }
 
-    let start_failed = reason == "native-driver-start-failed"
-        || native_name == "native-driver-start-failed"
-        || native_name.contains("start-fail")
-        || status.is_some_and(|s| s == "failed" || s == "error")
-        || entity_state == Some("failed");
+    // c-cardsettle r4 (same semantics as ma-sdk-state): a TURN result failure
+    // is never process-end. This generic fold must only catch real start
+    // failures; topic=turn (handled above) and other non-session topics are
+    // excluded so a literal status `error` cannot mark a live instance failed.
+    let turn_topic = payload_type == "native"
+        && payload.get("topic").and_then(Value::as_str) == Some("turn");
+    let start_failed = !turn_topic
+        && !native_event_is_subagent(payload)
+        && (reason == "native-driver-start-failed"
+            || native_name == "native-driver-start-failed"
+            || native_name.contains("start-fail")
+            || (!matches!(
+                payload.get("topic").and_then(Value::as_str),
+                Some("turn" | "hook" | "task" | "plan" | "configuration" | "diagnostic")
+            ) && status.is_some_and(|s| s == "failed" || s == "error"))
+            || entity_state == Some("failed"));
     if start_failed && (kind == "lifecycle" || payload_type == "native" || payload_type == "entity")
     {
         return (Some("failed"), None);

@@ -465,7 +465,8 @@ export type HelloResult = {
   features: string[];
 };
 
-export type EffortRef = { index: number; name: string };
+/** D-056 configure payload: native level word + orthogonal ultracode boolean. */
+export type EffortRef = { index: number; name: string; ultracode?: boolean };
 
 export type InstanceCreateSpec = {
   hostId: Id;
@@ -494,6 +495,8 @@ export type InstanceCreateSpec = {
   /** Composer/New Session effort. Stored in UI state; Hub ignores unknown create fields. */
   effortIndex?: number;
   effortName?: string;
+  /** D-056 orthogonal switch for launch (ultracode rides the same alias set). */
+  effortUltracode?: boolean;
   /**
    * D-047 per-dispatch delivery override: a proxy host id, `self` for the Hub
    * host, or `none` to force direct. A target the Hub cannot honour refuses
@@ -670,6 +673,18 @@ export type HubApi = {
   providerTest(id: string): Promise<ProviderTestResult>;
   /** Probe a gateway's `/v1/models` before the profile is saved. */
   providerDiscover(body: ProviderDiscoverBody): Promise<ProviderTestResult>;
+  /** D-056 static capability catalog (per-model default effort + ultracode). */
+  supplyCatalog(): Promise<{
+    revision?: number;
+    updated?: string;
+    models: Array<{
+      id: string;
+      aliases?: string[];
+      defaultEffort?: string | null;
+      ultracodeCapable?: boolean | null;
+      effortLevels?: readonly string[];
+    }>;
+  }>;
   eventsRead: JournalRead;
   eventsSubscribe(
     journalId: Id,
@@ -974,6 +989,7 @@ function createMockApi(): HubApi {
       if (spec.effortName != null) {
         instance.effortName = spec.effortName;
         instance.effortIndex = spec.effortIndex ?? 0;
+        instance.effortUltracode = spec.kind === "claude" ? spec.effortUltracode === true : null;
       }
       return {
         instance,
@@ -1225,6 +1241,18 @@ function createMockApi(): HubApi {
         models,
       };
     },
+    async supplyCatalog() {
+      // Demo/offline mode: mirror the Hub catalog's Claude rows (D-056 §6).
+      return {
+        revision: 3,
+        models: [
+          { id: "claude-opus-5", aliases: ["opus"], defaultEffort: "medium", ultracodeCapable: true },
+          { id: "claude-sonnet-5", aliases: ["sonnet"], defaultEffort: "medium", ultracodeCapable: true },
+          { id: "claude-fable-5", aliases: ["fable"], defaultEffort: "high", ultracodeCapable: true },
+          { id: "claude-haiku-4-5", aliases: ["haiku"], defaultEffort: "high", ultracodeCapable: true },
+        ],
+      };
+    },
     async workspaceList(hostId) {
       const items = hostId ? mockDb.workspaces.filter((w) => w.hostId === hostId) : mockDb.workspaces;
       return mockPage(items);
@@ -1469,7 +1497,15 @@ function createLiveApi(): HubApi {
         body: JSON.stringify({
           ...body,
           ...(spec.effortName != null
-            ? { effort: { name: spec.effortName, index: spec.effortIndex ?? 0, kind: spec.kind } }
+            ? {
+                effort: {
+                  name: spec.effortName,
+                  index: spec.effortIndex ?? 0,
+                  kind: spec.kind,
+                  // D-056: the switch rides launch as its own boolean.
+                  ...(spec.kind === "claude" ? { ultracode: spec.effortUltracode === true } : {}),
+                },
+              }
             : {}),
         }),
       });
@@ -1713,6 +1749,18 @@ function createLiveApi(): HubApi {
     },
     async providerDiscover(body) {
       return rest<ProviderTestResult>("/v1/providers/discover", { method: "POST", body: JSON.stringify(body) });
+    },
+    async supplyCatalog() {
+      return rest<{
+        revision?: number;
+        updated?: string;
+        models: Array<{
+          id: string;
+          aliases?: string[];
+          defaultEffort?: string | null;
+          ultracodeCapable?: boolean | null;
+        }>;
+      }>("/v1/supply/catalog");
     },
     async workspaceList(hostId) {
       const listed = hostId ? [await this.hostGet(hostId)] : (await this.hostList()).items;

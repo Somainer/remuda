@@ -27,6 +27,10 @@ import { readDeviceSettings } from "../features/settings";
 import { useNewSessionSpaceDefaults } from "../features/spaces/useNewSessionSpaceDefaults";
 import { spaceKey, spaceStore } from "../features/spaces/store";
 import {
+  CLAUDE_XHIGH_INDEX,
+  claudeDefaultTier,
+  claudeVersionGate,
+  defaultEffortIndex,
   effortAt,
   effortCaps,
   effortWireName,
@@ -52,6 +56,7 @@ import { cliSummary, isStaleOffline, sortHostsOnlineFirst, supportedHarnessKinds
 import {
   defaultDriver,
   DRIVER_LABELS,
+  hostClaudeVersion,
   launchPreview,
   legacyDrivers,
   shellPtyAllowed,
@@ -157,13 +162,15 @@ export function NewSessionPage() {
   // Codex's second axis: the sandbox mode paired with the approval policy.
   const [codexSandbox, setCodexSandbox] = useState<string>("workspace-write");
   const [yoloAck, setYoloAck] = useState(false);
-  const [effort, setEffort] = useState<EffortSelection>(() => {
-    // Remembered tier names predate the real --effort levels; map them by name.
+  // D-056: `null` = unpinned ("follow the model default"); a remembered
+  // legacy/draft selection migrates and becomes a pinned draft. The slider
+  // displays the per-model default while unpinned and writes nothing on create.
+  const [effort, setEffort] = useState<EffortSelection | null>(() => {
     if (prefs.effortName) {
       const norm = normalizeClaudeName(prefs.effortName);
-      return effortAt("claude", norm.index, norm.ultracode);
+      return effortAt("claude", norm.index, norm.ultracode || prefs.effortUltracode === true);
     }
-    return effortAt("claude", device.defaultEffortIndex);
+    return null;
   });
   const [delegation, setDelegation] = useState<DelegationId>(normalizeDelegation(prefs.delegation));
   const [kind, setKind] = useState<CreateKind>("claude");
@@ -349,15 +356,56 @@ export function NewSessionPage() {
         { id: "shell-pty", allowed: shellPtyAllowed(hostMatrix, activeKind as AgentKindId) },
         ...legacy.map((id) => ({ id, allowed: true })),
       ];
-  const sessionEffort = effort.kind === activeKind ? effort : mapEffort(effort, activeKind as EffortKind);
+  // D-056: the catalog supplies the per-model default marker (Hub when
+  // reachable, built-in rows otherwise). Loaded once.
+  const catalogRows = hubStore.supplyCatalogRows();
+  useEffect(() => {
+    void hubStore.loadSupplyCatalog();
+  }, []);
+  const modelDefault = claudeDefaultTier(model ?? null, catalogRows);
+  const claudeVersion = hostClaudeVersion(hostMatrix);
+  const versionGate = claudeVersionGate(claudeVersion);
+  const isCoupled = (activeKind as string) === "claude" && versionGate === "coupled";
+
+  const mappedEffort: EffortSelection = effort
+    ? effort.kind === activeKind
+      ? effort
+      : mapEffort(effort, activeKind as EffortKind)
+    : (activeKind as string) === "claude"
+      ? effortAt("claude", modelDefault?.index ?? 2, false)
+      : effortAt(activeKind as EffortKind, defaultEffortIndex(activeKind));
+  // What the form shows/sends: a pinned draft, else the model default
+  // (unpinned — no effort fields on create).
+  const sessionEffort = mappedEffort;
+  const effortPinned = effort !== null;
+  // Switching harness is an explicit interaction: the kind button carries the
+  // displayed tier onto the new table by ratio (pins the draft for the new
+  // kind); an untouched default-kind form stays unpinned.
+  const onEffortKind = (k: EffortKind) => setEffort(mapEffort(sessionEffort, k));
+  const onEffortTier = (next: EffortSelection) => {
+    if (isCoupled && sessionEffort.ultracode === true && next.index !== CLAUDE_XHIGH_INDEX) {
+      setEffort({ ...next, ultracode: false });
+      return;
+    }
+    setEffort(next);
+  };
+  const onEffortFlag = (on: boolean) => {
+    if ((activeKind as string) === "claude" && versionGate === "coupled" && on) {
+      setEffort({ ...sessionEffort, index: CLAUDE_XHIGH_INDEX, name: "xhigh", ultracode: true });
+      return;
+    }
+    setEffort({ ...sessionEffort, ultracode: on });
+  };
   // Read-only preview of the launch the Node will prefill into the PTY. The
   // materialized recipe is Node-side (flags whitelist); until the Hub exposes
-  // it, show the honest kind + flags summary (D-028 §5.1).
+  // it, show the honest kind + flags summary (D-028 §5.1, D-056 version argv).
   const preview = plainTerminal
     ? launchPreview({ kind: "terminal" })
     : launchPreview({
         kind: activeKind as AgentKindId,
         effortName: effortWireName(sessionEffort),
+        ultracode: sessionEffort.ultracode === true,
+        claudeVersion,
         yolo: yoloModeActive,
       });
   // Launch and remember what the picker shows, not a remembered id the
@@ -385,8 +433,13 @@ export function NewSessionPage() {
       if (draft.cwdMode === "existing" || draft.cwdMode === "worktree") setCwdMode(draft.cwdMode);
       if (draft.cwdPath !== undefined) setCwdPath(draft.cwdPath);
       if (draft.worktreeName !== undefined) setWorktreeName(draft.worktreeName);
+      // An effort-bearing draft is a pinned choice. Legacy drafts that stored
+      // the sixth stop (index 3 + flag) already load as {xhigh,on}; drafts
+      // without the flag stay on their tier (D-056 input migration).
       if (draft.effortKind && draft.effortIndex !== undefined && KINDS.some((item) => item.id === draft.effortKind)) {
         setEffort(effortAt(draft.effortKind as EffortKind, draft.effortIndex, draft.effortUltracode === true));
+      } else {
+        setEffort(null);
       }
     } else {
       // Switching into a context that has no draft must not silently carry
@@ -416,9 +469,14 @@ export function NewSessionPage() {
       cwdMode,
       cwdPath,
       worktreeName,
-      effortKind: effort.kind,
-      effortIndex: effort.index,
-      effortUltracode: effort.ultracode === true,
+      // Unpinned: omit the effort axes so a restored draft stays unpinned.
+      ...(effort
+        ? {
+            effortKind: effort.kind,
+            effortIndex: effort.index,
+            effortUltracode: effort.ultracode === true,
+          }
+        : {}),
     });
   }, [
     restoredKey,
@@ -511,8 +569,15 @@ export function NewSessionPage() {
                 binaryPath: binaryPath.trim() || undefined,
                 tui: activeKind === "claude" ? tui : undefined,
                 name: name || worktree || (plainTerminal ? "terminal" : undefined),
-                effortIndex: sessionEffort.index,
-                effortName: effortWireName(sessionEffort),
+                // D-056: an unpinned draft sends NO effort — the Node applies
+                // the model default and writes no stored tier.
+                ...(effortPinned
+                  ? {
+                      effortIndex: sessionEffort.index,
+                      effortName: effortWireName(sessionEffort),
+                      effortUltracode: sessionEffort.ultracode === true,
+                    }
+                  : {}),
                 ...(apiVia
                   ? { apiVia, apiRoute: apiVia === "none" ? undefined : apiRouteMode }
                   : {}),
@@ -526,8 +591,14 @@ export function NewSessionPage() {
                 permissionMode,
                 driver,
                 delegation,
-                effortIndex: sessionEffort.index,
-                effortName: effortWireName(sessionEffort),
+                // Remember the effort only when the operator pinned one.
+                ...(effortPinned
+                  ? {
+                      effortIndex: sessionEffort.index,
+                      effortName: effortWireName(sessionEffort),
+                      effortUltracode: sessionEffort.ultracode === true,
+                    }
+                  : { effortIndex: 2, effortName: "", effortUltracode: false }),
                 // Args are remembered; the executable deliberately is not. A
                 // path silently restored into a later session is the kind of
                 // thing you would not think to check before starting a run.
@@ -711,7 +782,8 @@ export function NewSessionPage() {
                     onClick={() => {
                       if (!kindEnabled(k.id)) return;
                       setKind(k.id);
-                      setEffort((prev) => mapEffort(prev, k.id as EffortKind));
+                      // Carry the displayed tier onto the new table (pins it).
+                      onEffortKind(k.id as EffortKind);
                     }}
                   >
                     {k.label}
@@ -837,24 +909,31 @@ export function NewSessionPage() {
               data-harness={activeKind}
               data-effort={effortWireName(sessionEffort)}
               data-ultracode={sessionEffort.ultracode ? "1" : "0"}
+              data-pinned={effortPinned ? "1" : "0"}
             >
               {/*
                * Layout A: no card. The label row, the dotted pill spanning the
-               * same column as the 权限 row, the tick labels and the helper
-               * all use the form's own tokens. Remounting on the harness
-               * drops the drag draft, so the pill re-snaps onto the new table
-               * instead of showing the stop the pointer left behind.
+               * same column as the 权限 row, the tick labels, the D-056
+               * ultracode switch and the helper all use the form's own
+               * tokens. Remounting on the harness drops the drag draft.
                */}
               <EffortSlider
                 key={activeKind}
                 kind={activeKind}
                 index={sessionEffort.index}
                 ultracode={sessionEffort.ultracode === true}
+                onUltracodeChange={activeKind === "claude" ? onEffortFlag : undefined}
+                ultraGate={activeKind === "claude" ? versionGate : undefined}
+                defaultIndex={(activeKind as string) === "claude" ? (modelDefault?.index ?? null) : null}
                 variant="inline"
                 idPrefix="new-session-effort"
                 label="effort"
-                footer={EFFORT_HELP}
-                onChange={(next) => setEffort(next)}
+                footer={
+                  effortPinned
+                    ? EFFORT_HELP
+                    : "未固定：跟随模型默认；拨开关或拖滑杆即固定（D-056）"
+                }
+                onChange={onEffortTier}
               />
             </fieldset>
           ) : null}

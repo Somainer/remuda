@@ -787,12 +787,23 @@ export function SessionList({
                         // effective level too, with `?` until it is observed.
                         const effective = hubStore.effortEffectiveOf(instance.id);
                         const effectiveName = effective?.name ?? "?";
-                        const mismatch =
-                          effective &&
-                          (effort.ultracode === true
-                            ? !(effective.name === "xhigh" && effective.ultracode === true)
-                            : effort.name !== effective.name);
+                        // D-056: level and switch are compared separately.
+                        const levelMismatch = Boolean(effective && effort.name !== effective.name);
+                        const flagMismatch =
+                          instance.kind === "claude"
+                          && Boolean(effective && (effort.ultracode === true) !== (effective.ultracode === true))
+                          // Only a positively observed flag participates.
+                          && effective?.ultracode !== null && effective?.ultracode !== undefined;
+                        const mismatch = levelMismatch || flagMismatch;
                         const ember = isEmberEffort(instance.kind, effort.index, effort.ultracode);
+                        const titleParts: string[] = [];
+                        if (effective) {
+                          titleParts.push(
+                            `请求 ${effort.name}${effort.ultracode ? " · ultracode" : ""} · 实际 ${effective.name}${effective.ultracode ? " · ultracode" : ""}（${effective.source}）`,
+                          );
+                        } else {
+                          titleParts.push("实际档位尚未从会话回读");
+                        }
                         return (
                           <>
                             <span className={css.sep}>·</span>
@@ -801,14 +812,22 @@ export function SessionList({
                               data-testid="session-effort"
                               data-ember={ember ? "1" : "0"}
                               data-effort-effective={effective ? effective.name : "unknown"}
-                              data-effort-mismatch={mismatch ? "1" : "0"}
-                              title={
+                              data-ultracode-effective={
                                 effective
-                                  ? `请求 ${effort.ultracode ? "ultracode" : effort.name} · 实际 ${effective.name}（${effective.source}）`
-                                  : "实际档位尚未从会话回读"
+                                  ? effective.ultracode === true
+                                    ? "on"
+                                    : effective.ultracode === false
+                                      ? "off"
+                                      : "unknown"
+                                  : "unknown"
                               }
+                              data-effort-mismatch={mismatch ? "1" : "0"}
+                              title={titleParts[0]}
                             >
                               {effectiveName}
+                              {effort.ultracode && effective?.ultracode !== false
+                                ? " · ultracode"
+                                : ""}
                             </span>
                           </>
                         );

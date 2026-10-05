@@ -1,21 +1,26 @@
 /**
- * §9.1 effort-sync-2 store behavior:
- * - a terminal-side `/effort` (effort observation, no pending push-down) moves
- *   the slider to the observed stop WITHOUT posting instance.configure (no
- *   ping-pong);
- * - a read-back that settles OUR pending push-down clears pending but leaves
- *   the slider where the user put it;
- * - a rejected push-down (effort-degraded lifecycle) clears pending and
- *   reverts the slider to the last observed level.
+ * §9.1 effort store behavior:
+ * - a terminal-side /effort (effort observation, no pending configure) moves
+ *   the slider to the observed stop WITHOUT posting a configure;
+ * - our pending push-down clears pending on a newer effective projection;
+ * - queued lifecycle shows the queued entry;
+ * - a rejected push-down reverts the slider and exposes its refusal (D-056);
+ * - §9.1 read-back provenance, per axis (D-056 level + ultracode flag);
+ * - c-perffu/c-effortui: per-request threshold so a replaced request's stale
+ *   projection cannot clear the newer request.
  */
 import { afterEach, expect, it, vi } from "vitest";
-import type { Instance } from "../types/instance";
 import type { Observation } from "../types/observation";
+import type { Instance } from "../types/instance";
 import { api } from "./api";
 import { mockDb } from "./mock";
 import { hubStore } from "./store";
+import { effortAt } from "../features/session/effort";
 
-type History = Awaited<ReturnType<typeof api.eventsRead>>;
+afterEach(() => {
+  hubStore.logout();
+  vi.restoreAllMocks();
+});
 
 function subscription(instance: Instance) {
   return {
@@ -23,8 +28,9 @@ function subscription(instance: Instance) {
     journalId: instance.journalId,
     durableSeq: "1",
     windowFromSeq: "1",
+    windowAfterSeq: "",
     reachedAfterSeq: true,
-        getReadyState: () => 1,
+    getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_effort_store",
@@ -34,8 +40,9 @@ function subscription(instance: Instance) {
       commands: [],
       pendingInteractions: [],
       nodes: [],
-      history: { earliestRetainedSeq: "1", complete: true },
+      history: { complete: true, earliestRetainedSeq: "1" },
     },
+    history: [],
   };
 }
 
@@ -44,6 +51,7 @@ async function startFollowing(
   activity: Instance["activity"] = { state: "known", value: "idle" },
 ) {
   const original = mockDb.instances[0];
+  // Isolate: every test flips its own instance id and journal.
   const instance: Instance = {
     ...original,
     id: `ins_effort_store_${idSuffix}`,
@@ -52,6 +60,7 @@ async function startFollowing(
     effortName: null,
     effortIndex: null,
     effortUltracode: null,
+    effortEffective: null,
     activity,
   };
   vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
@@ -60,297 +69,307 @@ async function startFollowing(
     durableSeq: "1",
     windowFromSeq: "1",
     reachedAfterSeq: true,
-        getReadyState: () => 1,
-  } as unknown as History);
-  let deliver!: Parameters<typeof api.eventsSubscribe>[2];
+  } as never);
+  let deliver!: (observation: Observation) => void;
   vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_j, _a, onBatch) => {
-    deliver = onBatch;
-    return subscription(instance);
-  });
-  await hubStore.follow(instance.id);
-  return {
-    instance,
-    receive: (observation: Observation) =>
-      deliver({
+    deliver = (observation: Observation) =>
+      onBatch({
         subscriptionId: `sub_${instance.id}`,
         journalId: instance.journalId,
         fromSeq: observation.seq,
         toSeq: observation.seq,
         durableSeq: observation.seq,
         events: [observation],
-      }),
+      });
+    return subscription(instance);
+  });
+  await hubStore.follow(instance.id);
+  // The follow snapshot is at seq 1; live events start at 2. Assign every
+  // delivered event a contiguous envelope seq regardless of the content seq
+  // the test baked into its payload timestamps. The payload keeps its own
+  // observedAt (what the effort reducer compares); the envelope gets a
+  // matching monotonic timestamp so the journal never sees a gap.
+  let delivered = 1;
+  const tsFor = (n: number) => `2026-10-06T00:0${n}:00.000Z`;
+  const ctx = {
+    instance,
+    receive: (observation: Observation) => {
+      delivered += 1;
+      deliver({ ...observation, seq: String(delivered), observedAt: tsFor(delivered) });
+    },
   };
+  return ctx;
 }
 
-function effortEvent(seq: number, name: string, ultracode: boolean | null, source: string): Observation {
+function effortEvent(seq: number, name: string, ultracode: boolean | null, source: string, observedAt?: string): Observation {
   return {
-    eventId: `evt_eff_${seq}_${name}`,
+    eventId: `evt_eff_${seq}_${name}_${ultracode}`,
     instanceId: "x",
     journalId: "x",
     seq: String(seq),
+    observedAt: `2026-09-16T00:0${seq}:00.000Z`,
     kind: "effort",
-    observedAt: `2026-09-16T00:0${seq}:00Z`,
     source: { channel: "transcript" },
     payload: {
-      effective: { name, ultracode, source, observedAt: `2026-09-16T00:0${seq}:00Z` },
-      raw: name,
+      kind: "effort",
+      payload: {
+        effective: {
+          name,
+          ultracode,
+          source,
+          observedAt: observedAt ?? `2026-09-16T00:0${seq}:00.000Z`,
+        },
+        raw: name,
+      },
     },
   } as unknown as Observation;
 }
 
-function configureLifecycle(seq: number, status: string, instanceId: string): Observation {
+function configureLifecycle(seq: number, status: string, instanceId = "x"): Observation {
   return {
-    eventId: `evt_cfg_${seq}`,
+    eventId: `evt_cfg_${seq}_${status}`,
     instanceId,
     journalId: "x",
     seq: String(seq),
+    observedAt: `2026-09-16T00:1${seq}:00.000Z`,
     kind: "lifecycle",
-    observedAt: `2026-09-16T00:1${seq}:00Z`,
     source: { channel: "runtime" },
     payload: {
       type: "native",
       nativeName: "instance.configure",
-      nativeId: { state: "not-applicable" },
       status: { state: "known", value: status },
-      relatedIds: {},
     },
   } as unknown as Observation;
 }
 
-afterEach(() => {
-  hubStore.logout();
-  vi.restoreAllMocks();
-});
-
-it("a terminal-side switch moves the slider without posting configure (no ping-pong)", async () => {
+it("a terminal-side level switch moves the slider without configure", async () => {
   const ctx = await startFollowing("terminal");
   const configure = vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
 
-  // First observed level (e.g. baseline assistant record).
-  ctx.receive(effortEvent(2, "high", null, "launch"));
-  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("high");
-  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("high");
-
-  // Human types /effort xhigh in the terminal.
-  ctx.receive(effortEvent(3, "xhigh", false, "slash"));
+  ctx.receive(effortEvent(2, "xhigh", false, "slash"));
   const selected = hubStore.effortOf(ctx.instance.id, "claude");
   expect(selected.name).toBe("xhigh");
-  expect(selected.ultracode).toBeFalsy();
-  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.source).toBe("slash");
-  // The store moved the slider purely from the observation — no configure.
   expect(configure).not.toHaveBeenCalled();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("xhigh");
 });
 
-it("an ultracode read-back from the terminal parks the slider on the ultracode stop", async () => {
+it("a terminal-side ultracode switch parks the slider on xhigh with the flag", async () => {
   const ctx = await startFollowing("ultra");
   ctx.receive(effortEvent(2, "xhigh", true, "slash"));
   const selected = hubStore.effortOf(ctx.instance.id, "claude");
-  expect(selected.name).toBe("xhigh");
-  expect(selected.ultracode).toBe(true);
-  expect(selected.index).toBe(3);
-  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("xhigh");
+  expect(selected).toMatchObject({ name: "xhigh", index: 3, ultracode: true });
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.ultracode).toBe(true);
 });
 
-it("our pending push-down clears when the effective read-back lands", async () => {
+it("our pending level push-down clears when the read-back lands", async () => {
   const ctx = await startFollowing("pending");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // User moves the slider to xhigh.
-  await hubStore.setEffort(ctx.instance.id, {
-    index: 3,
-    name: "xhigh",
-    kind: "claude",
-    ultracode: false,
-  });
-  expect(hubStore.effortPendingOf(ctx.instance.id)?.word).toBe("xhigh");
+
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, false));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("xhigh");
   ctx.receive(effortEvent(2, "xhigh", false, "remuda"));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
-  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("xhigh");
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("xhigh");
 });
 
-it("a queued lifecycle shows the pending entry; a degraded one reverts the slider", async () => {
-  const ctx = await startFollowing("revert");
-  const configure = vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
-
-  // Baseline high.
-  ctx.receive(effortEvent(2, "high", null, "launch"));
-  // While working, the user picks max; the driver journals queued.
-  await hubStore.setEffort(ctx.instance.id, {
-    index: 4,
-    name: "max",
-    kind: "claude",
-    ultracode: false,
-  });
-  ctx.receive(configureLifecycle(3, "effort-queued:max", ctx.instance.id));
-  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
-
-  // Claude refuses (Esc on the dialog): the chip reverts to high and the
-  // pending entry clears with a toast.
-  ctx.receive(configureLifecycle(4, "effort-degraded:max:dialog-kept", ctx.instance.id));
-  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
-  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("high");
-  expect(toast).toHaveBeenCalled();
-  // configure was called once (the user click); the revert did not call it.
-  expect(configure).toHaveBeenCalledTimes(1);
-});
-
-it("a poll-projected read-back settles a pending push-down without a live event (c-effortflake)", async () => {
-  // The live follow frame was gapped/coalesced under load, but the driver
-  // still projected the read-back onto the durable Hub record before acking.
-  // The configure-ack refresh folds that projection and must settle pending;
-  // otherwise the chip stays on 切换中 forever even though the Hub knows the
-  // new level.
-  const ctx = await startFollowing("poll-settle");
+it("a level+flag push-down settles each axis independently", async () => {
+  const ctx = await startFollowing("axes");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, true));
+  const pending0 = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending0).toMatchObject({ name: "xhigh", ultracode: true });
+  expect(pending0?.levelSettled).toBe(false);
+  expect(pending0?.flagSettled).toBe(false);
+
+  // First the level arrives with NO switch evidence: level settles, the
+  // switch indicator must stay pending (never silently cleared).
+  ctx.receive(effortEvent(2, "xhigh", null, "remuda"));
+  const pending1 = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending1?.levelSettled).toBe(true);
+  expect(pending1?.flagSettled).toBe(false);
+  expect(pending1?.ultracode).toBe(true);
+
+  // Then the attachment reports the flag on.
+  ctx.receive(effortEvent(3, "xhigh", true, "remuda"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("a level clamp settles the level axis while the unobserved switch stays pending", async () => {
+  const ctx = await startFollowing("clamp-flag");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, true)); // max,on
+  ctx.receive(effortEvent(2, "high", null, "remuda")); // clamped level, no flag evidence
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  // The level outcome is delivered (slider stays on max → mismatch); the flag
+  // has NO positive evidence yet, so its indicator must remain pending.
+  expect(pending?.levelSettled).toBe(true);
+  expect(pending?.flagSettled).toBe(false);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+
+  // When the process positively reports the flag refused off, that is the
+  // delivered refusal for the level mismatch and clears the indicator.
+  ctx.receive(effortEvent(3, "high", false, "remuda"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("while queued the entry shows queued until a strictly newer read-back", async () => {
+  const ctx = await startFollowing("queued", { state: "known", value: "working" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  // A pre-existing projection at a DIFFERENT level stamps the threshold and
+  // leaves the level axis unproven.
+  ctx.receive(effortEvent(1, "high", false, "slash", "2026-09-16T00:05:00.000Z"));
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
+  const lifecycle = configureLifecycle(3, "effort-queued:max");
+  ctx.receive(lifecycle);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+  // An older-than-threshold read-back must not settle a queued request.
+  ctx.receive(effortEvent(2, "max", false, "remuda", "2026-09-16T00:02:00.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+  ctx.receive(effortEvent(6, "max", false, "remuda", "2026-09-16T00:06:00.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("a stale queued lifecycle for a replaced request is dropped (A→B race)", async () => {
+  const ctx = await startFollowing("ab-queued", { state: "known", value: "idle" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 2, false)); // A: high
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false)); // B: max
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(false);
+  // A late queued lifecycle for A names a different axis — it must not
+  // overwrite B's pending indicator nor flip it to queued.
+  ctx.receive(configureLifecycle(4, "effort-queued:high"));
+  const after = hubStore.effortPendingOf(ctx.instance.id);
+  expect(after?.name).toBe("max");
+  expect(after?.queued).toBe(false);
+});
+
+it("a rejected switch reverts and records the model-scoped refusal", async () => {
+  const ctx = await startFollowing("revert");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const toast = vi.spyOn(hubStore, "toast");
+  ctx.instance.effortEffective = { name: "high", ultracode: false, source: "slash", observedAt: "2026-09-16T00:00:00.000Z" };
+
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, true));
+  ctx.receive(configureLifecycle(4, "effort-degraded:ultracode:ultracode-unavailable-for-model"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({ name: "high", ultracode: false });
+  const refusal = hubStore.effortRefusalOf(ctx.instance.id);
+  expect(refusal?.reason).toBe("ultracode-unavailable-for-model");
+  expect(refusal?.scope).toBe("model");
+  expect(toast).toHaveBeenCalled();
+});
+
+it("a workflows-disabled refusal is process-scoped and clears on a positive on read", async () => {
+  const ctx = await startFollowing("wfrefuse");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, true));
+  ctx.receive(configureLifecycle(4, "effort-degraded:ultracode:ultracode-workflows-disabled"));
+  expect(hubStore.effortRefusalOf(ctx.instance.id)?.scope).toBe("process");
+
+  // A later successful read-back clears it.
+  ctx.receive(effortEvent(5, "xhigh", true, "remuda"));
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
+});
+
+it("the model-scoped refusal expires when the model changes", async () => {
+  const ctx = await startFollowing("model-expiry");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // The refused model is the current (optimistic) one via a public model set.
+  await hubStore.setModel(ctx.instance.id, "claude-sonnet-4-6");
+  ctx.instance.effortEffective = { name: "high", ultracode: false, source: "slash", observedAt: "2026-09-16T00:00:00.000Z" };
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, true));
+  ctx.receive(configureLifecycle(4, "effort-degraded:ultracode:ultracode-unavailable-for-model"));
+  const refusal = hubStore.effortRefusalOf(ctx.instance.id);
+  expect(refusal?.reason).toBeTruthy();
+  expect(refusal?.modelId).toBe("claude-sonnet-4-6");
+  // A /model accept moves the current model: the bound refusal is lifted.
+  await hubStore.setModel(ctx.instance.id, "claude-opus-5");
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
+});
+
+it("a poll projection settles the push-down without a live event", async () => {
+  const ctx = await startFollowing("poll-settle");
   const projected: Instance = {
     ...ctx.instance,
-    effortEffective: {
-      name: "max",
-      ultracode: false,
-      source: "remuda",
-      observedAt: "2026-09-21T00:00:01.000Z",
-    },
+    effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: "2026-09-21T00:00:01.000Z" },
   };
   vi.spyOn(api, "instanceList").mockResolvedValue({ items: [projected] } as never);
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
 
-  await hubStore.setEffort(ctx.instance.id, {
-    index: 4,
-    name: "max",
-    kind: "claude",
-    ultracode: false,
-  });
-
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
 });
 
-it("a queued push-down survives a poll returning the unchanged level, then settles on the newer one", async () => {
-  const working = { state: "known", value: "working" } as const;
-  const ctx = await startFollowing("poll-queued", working);
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-  // Baseline read-back the session already had before the push-down.
-  ctx.receive(effortEvent(2, "xhigh", false, "remuda"));
-  const baselineAt = "2026-09-16T00:02:00Z";
-
-  const list = vi.spyOn(api, "instanceList");
-  list.mockResolvedValue({
-    items: [
-      {
-        ...ctx.instance,
-        activity: working,
-        effortEffective: { name: "xhigh", ultracode: false, source: "remuda", observedAt: baselineAt },
-      },
-    ],
-  } as never);
-
-  await hubStore.setEffort(ctx.instance.id, {
-    index: 4,
-    name: "max",
-    kind: "claude",
-    ultracode: false,
-  });
-  // The configure-ack poll still shows the OLD level (the turn has not ended):
-  // the queued push-down must remain, not be cleared by an equal observedAt.
-  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
-
-  // The turn ends and the new level projects; a later poll settles it.
-  list.mockResolvedValue({
-    items: [
-      {
-        ...ctx.instance,
-        effortEffective: { name: "xhigh", ultracode: false, source: "remuda", observedAt: "2026-09-16T00:03:00Z" },
-      },
-    ],
-  } as never);
-  await hubStore.refresh();
-  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
-});
-
-it("a poll-settled clamp still leaves the slider on the requested stop when its live frame lands (c-effortflake)", async () => {
-  // The live frame for our max push-down is lost; the configure-ack poll
-  // settles pending from the durable record — which shows the NATIVE CLAMP
-  // (effective xhigh). When that same edge later arrives on the live socket
-  // it must still read as OUR push-down: the slider stays on max so the
-  // 请求 max → 实际 xhigh mismatch survives, instead of folding the slider to
-  // the observed (terminal-switch) level.
+it("the level mismatch still leaves the slider on the requested max (clamp)", async () => {
   const ctx = await startFollowing("poll-clamp");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const clamped: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "xhigh", ultracode: null, source: "remuda", observedAt: "2026-09-21T00:00:05.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [clamped] } as never);
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-  const clampedAt = "2026-09-21T00:00:05.000Z";
-  vi.spyOn(api, "instanceList").mockResolvedValue({
-    items: [
-      {
-        ...ctx.instance,
-        effortEffective: { name: "xhigh", ultracode: null, source: "remuda", observedAt: clampedAt },
-      },
-    ],
-  } as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
 
-  await hubStore.setEffort(ctx.instance.id, {
-    index: 4,
-    name: "max",
-    kind: "claude",
-    ultracode: false,
-  });
-  // The poll settled pending; effective is the clamped level but the slider
-  // the user moved is still on max.
-  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
-  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("xhigh");
-  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
-
-  // The same clamped edge arrives on the live socket (gapped frame caught up).
-  ctx.receive({
-    ...effortEvent(2, "xhigh", null, "remuda"),
-    observedAt: clampedAt,
-    payload: {
-      effective: { name: "xhigh", ultracode: null, source: "remuda", observedAt: clampedAt },
-      raw: "xhigh",
-    },
-  } as unknown as Observation);
-  // Still our push-down: the slider is NOT folded to the clamped level.
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });
 
-it("an older poll projection cannot overwrite a newer live effective or move the slider", async () => {
-  // Monotonic guard: a stale/slower durable record (e.g. a poll answering out
-  // of order after the live socket already advanced) must never roll the
-  // effective level back, and the projection path never writes the slider.
+it("an older poll projection cannot overwrite the newer effective", async () => {
   const ctx = await startFollowing("monotonic");
-  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-
-  // A terminal-side switch arrives live: effective max, slider folds to max.
-  const newerAt = "2026-09-21T01:00:09.000Z";
-  ctx.receive({
-    ...effortEvent(2, "max", false, "slash"),
-    observedAt: newerAt,
-    payload: {
-      effective: { name: "max", ultracode: false, source: "slash", observedAt: newerAt },
-      raw: "max",
-    },
-  } as unknown as Observation);
-  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
-  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
-
-  // A poll then returns a durable projection carrying an OLDER effective level.
+  const newerAt = "2026-09-21T00:00:09.000Z";
+  ctx.receive(effortEvent(2, "max", false, "slash", newerAt));
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
       {
         ...ctx.instance,
-        effortEffective: {
-          name: "xhigh",
-          ultracode: null,
-          source: "remuda",
-          observedAt: "2026-09-21T01:00:01.000Z",
-        },
+        effortEffective: { name: "xhigh", ultracode: null, source: "remuda", observedAt: "2026-09-21T00:00:01.000Z" },
       },
     ],
   } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
   await hubStore.refresh();
-
-  // Neither the effective value nor the slider may regress to the older level.
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
-  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
-  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+});
+
+it("c-effortui: a poll between request A and request B cannot clear B's pending", async () => {
+  // The replaced-request provenance bug: setEffort stamps each request with
+  // the freshest effective observedAt. Request A settles at t002; request B
+  // is made right after, and a poll that returns A's read-back (t002) must
+  // not settle B — only a strictly newer projection may.
+  const ctx = await startFollowing("ab-threshold");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  // Request A (high) settles via its own live edge.
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 2, false));
+  ctx.receive(effortEvent(2, "high", false, "remuda", "2026-09-16T00:02:00.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe("2026-09-16T00:02:00.000Z");
+
+  // A poll now returns A's read-back (same timestamp) while request B is in
+  // flight. B's threshold is t002; an equal-or-older projection proves nothing.
+  const stale: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "high", ultracode: false, source: "remuda", observedAt: "2026-09-16T00:02:00.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [stale] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false)); // B: max
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
+
+  // B's own newer read-back settles it.
+  const settled: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: "2026-09-16T00:03:00.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [settled] } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
 });

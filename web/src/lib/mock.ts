@@ -1143,7 +1143,7 @@ const MOCK_CONFIGURE_KEY = "remuda.mock.configure";
 type MockConfigurePatch = {
   permission?: string;
   model?: string;
-  effort?: { name: string; index: number };
+  effort?: { name: string; index: number; ultracode?: boolean };
 };
 
 function readConfigurePatches(): Record<string, MockConfigurePatch> {
@@ -1171,6 +1171,7 @@ function applyConfigurePatches() {
     if (patch.effort) {
       inst.effortName = patch.effort.name;
       inst.effortIndex = patch.effort.index;
+      inst.effortUltracode = patch.effort.ultracode === true;
     }
   }
 }
@@ -1178,7 +1179,7 @@ function applyConfigurePatches() {
 export function mockConfigure(
   instanceId: Id,
   permission: string,
-  extras?: { model?: string; effort?: { name: string; index: number } },
+  extras?: { model?: string; effort?: { name: string; index: number; ultracode?: boolean } },
 ): CommandResult {
   const inst = instances.find((i) => i.id === instanceId);
   if (!inst) throw new Error("INSTANCE_NOT_FOUND");
@@ -1187,12 +1188,13 @@ export function mockConfigure(
   if (extras?.effort) {
     inst.effortName = extras.effort.name;
     inst.effortIndex = extras.effort.index;
+    inst.effortUltracode = extras.effort.ultracode === true;
   }
   writeConfigurePatch(instanceId, {
     permission,
     model: extras?.model ?? inst.model ?? undefined,
     effort: extras?.effort ?? (inst.effortName != null && inst.effortIndex != null
-      ? { name: inst.effortName, index: inst.effortIndex }
+      ? { name: inst.effortName, index: inst.effortIndex, ultracode: inst.effortUltracode === true }
       : undefined),
   });
   const commandId = id("cmd_");

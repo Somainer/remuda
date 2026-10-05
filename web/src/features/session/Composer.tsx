@@ -34,13 +34,16 @@ import {
   harnessMeta,
   isEmberEffort,
   mapEffort,
+  type ClaudeVersionGate,
   type EffortKind,
   type EffortSelection,
 } from "./effort";
 import { composerState, steerHeldControl, type Phase } from "../composer/state";
 import {
   effectiveLabel,
-  effortMismatch,
+  effectiveUltraWord,
+  effortFlagMismatch,
+  effortLevelMismatch,
   isEffortUnknown,
   type EffortEffectiveView,
 } from "./effortEffective";
@@ -107,8 +110,12 @@ export function Composer({
   modelCatalog,
   effort,
   onEffort,
+  onUltracode,
   effortEffective,
   effortPending,
+  ultraGate,
+  ultraBlocked,
+  effortDefaultIndex,
   onModel,
   contextLabel,
   usageRollup,
@@ -172,10 +179,24 @@ export function Composer({
   modelCatalog?: ModelCatalogView | null;
   effort?: EffortSelection;
   onEffort?: (next: EffortSelection) => void;
+  /** D-056 orthogonal switch flip (parent applies the coupled xhigh linkage). */
+  onUltracode?: (on: boolean) => void;
   /** §9.1 transcript-read-back level; null/undefined = unobserved (`?`). */
   effortEffective?: EffortEffectiveView | null;
-  /** §9.1 a push-down in flight (chip shows 切换中 / 排队中 until read-back). */
-  effortPending?: { word: string; queued: boolean } | null;
+  /** A push-down in flight (chip shows 切换中 / 排队中 until BOTH axes settle). */
+  effortPending?: {
+    name: string;
+    ultracode: boolean;
+    queued: boolean;
+    levelSettled?: boolean;
+    flagSettled?: boolean;
+  } | null;
+  /** Claude Code version classification for the switch (coupled/legacy gate). */
+  ultraGate?: ClaudeVersionGate;
+  /** Journal-projected refusal that disables the switch (model/workflows). */
+  ultraBlocked?: { reason: string; model?: string | null } | null;
+  /** Per-model default tier marker index; null = no marker, undefined = table. */
+  effortDefaultIndex?: number | null;
   onModel?: (model: string) => void;
   contextLabel?: string | null;
   /** context-usage-1: Hub-computed per-session token/context rollup; the chip
@@ -834,30 +855,64 @@ export function Composer({
   };
 
   const harnessChip = harnessMeta(harness);
-  // The chip names the current stop ("ultracode" at the top stop); the form's
-  // data-attr carries the wire name so an ultracode selection round-trips.
-  const effortChipLabel = effortStopName(harness, currentEffort.name, ultraOn);
+  // D-056: the chip names the LEVEL plus the orthogonal ultracode marker
+  // ("high · ultracode"). The collapsed width collapses the suffix to an
+  // ember dot (see mobileTriggerNode).
+  const effortChipLabel = effortStopName(harness, currentEffort.name);
   const effortWire = effortWireName(currentEffort);
   // §9.1: the chip text is the EFFECTIVE level read back from the transcript,
   // not the requested selection. `?` until the first read-back of a fresh
-  // session; a requested/effective divergence renders explicitly, it is never
-  // hidden. While a push-down is in flight the chip shows the requested word
-  // with a 切换中 / 排队中 tag instead of going ambiguous.
+  // session; a requested/effective divergence renders explicitly, per axis.
+  // While a push-down is in flight the chip shows the requested words with a
+  // 切换中 / 排队中 tag instead of going ambiguous.
   const effectiveUnknown = isEffortUnknown(effortEffective);
-  const pendingLabel = effortPending?.word ?? null;
-  const effectiveWord = pendingLabel ?? effectiveLabel(effortEffective);
-  const mismatch = caps.effort && !pendingLabel
-    ? effortMismatch(effortWire, ultraOn, effortEffective)
+  const pending = effortPending ?? null;
+  const pendingLevel = pending && !pending.levelSettled ? pending.name : null;
+  const pendingFlag =
+    pending && !pending.flagSettled ? (pending.ultracode ? "ultracode" : null) : null;
+  const effectiveLevelWord = pendingLevel ?? effectiveLabel(effortEffective);
+  const effectiveFlagWord = (() => {
+    if (pendingFlag) return pendingFlag;
+    if (!effortEffective) return null;
+    const word = effectiveUltraWord(effortEffective);
+    return word === "on" ? "ultracode" : word === "off" ? null : "ultracode?";
+  })();
+  const levelMismatch = caps.effort && !pendingLevel
+    ? effortLevelMismatch(effortWire, effortEffective)
     : null;
-  const effortChipTitle = pendingLabel
-    ? effortPending?.queued
-      ? `排队中：${pendingLabel} 将在本回合结束后生效`
-      : `切换中：${pendingLabel}`
+  const flagMismatch = caps.effort && !pendingFlag && harness === "claude"
+    ? effortFlagMismatch(ultraOn, effortEffective)
+    : null;
+  const mismatchLines: string[] = [];
+  if (levelMismatch) {
+    mismatchLines.push(`请求 ${levelMismatch.requested} → 实际 ${levelMismatch.effective}`);
+  }
+  if (flagMismatch) {
+    mismatchLines.push(
+      flagMismatch.requested === "on"
+        ? flagMismatch.observed === "off"
+          ? "请求 ultracode 开 → 实际关"
+          : "请求 ultracode 开 → 实际 ?"
+        : "请求 ultracode 关 → 实际开",
+    );
+  }
+  const pendingTitle = pending
+    ? pending.queued
+      ? `排队中：${pending.name}${pending.ultracode ? " · ultracode" : ""} 将在本回合结束后生效`
+      : `切换中：${pending.name}${pending.ultracode ? " · ultracode" : ""}`
+    : "";
+  const effortChipTitle = pending
+    ? pendingTitle
     : effectiveUnknown
       ? "实际档位：等待会话回读（？）"
-      : mismatch
-        ? `请求 ${mismatch.requested} → 实际 ${mismatch.effective}`
-        : `实际档位 ${effectiveWord}（来源 ${effortEffective?.source ?? "unknown"}）`;
+      : mismatchLines.length
+        ? mismatchLines.join("\n")
+        : [
+            `实际档位 ${effectiveLevelWord}（来源 ${effortEffective?.source ?? "unknown"}）`,
+            harness === "claude" && effortEffective
+              ? `ultracode：${effectiveUltraWord(effortEffective)}`
+              : "",
+          ].filter(Boolean).join("\n");
   const primaryLabel = sending ? "发送中" : controls.primary.label;
   const primaryTestId =
     controls.primary.kind === "queue" ? "composer-queue" : "composer-send";
@@ -899,22 +954,34 @@ export function Composer({
     </span>
   ) : null;
 
+  // The same slider mounts in the desktop popover and the phone options
+  // Sheet; only the close/focus handling differs. The D-056 switch props are
+  // shared (version gate, journal refusal, per-model default marker).
+  const sliderProps = {
+    kind: harness,
+    model: caps.model ? model : undefined,
+    launchModel: caps.model ? launchModel : null,
+    models: caps.model ? models : undefined,
+    modelEffective: caps.model ? modelEffective : null,
+    modelPending: caps.model ? modelPending : null,
+    modelSelectionPath: caps.model ? modelSelectionPath : null,
+    modelCatalog: caps.model ? (modelCatalog ?? null) : null,
+    modelLockedReason,
+    index: currentEffort.index,
+    ultracode: ultraOn,
+    disabled: effortLocked,
+    onChange: (next: EffortSelection) => onEffort?.(next),
+    onUltracodeChange: harness === "claude" ? (on: boolean) => onUltracode?.(on) : undefined,
+    ultraGate,
+    ultraBlocked,
+    ultraEffective: effortEffective?.ultracode ?? null,
+    defaultIndex: effortDefaultIndex,
+    onModel: caps.model ? onModel : undefined,
+  };
+
   const effortSliderNode = caps.effort ? (
     <EffortSlider
-      kind={harness}
-      model={caps.model ? model : undefined}
-      launchModel={caps.model ? launchModel : null}
-      models={caps.model ? models : undefined}
-      modelEffective={caps.model ? modelEffective : null}
-      modelPending={caps.model ? modelPending : null}
-      modelSelectionPath={caps.model ? modelSelectionPath : null}
-      modelCatalog={caps.model ? (modelCatalog ?? null) : null}
-      modelLockedReason={modelLockedReason}
-      index={currentEffort.index}
-      ultracode={ultraOn}
-      disabled={effortLocked}
-      onChange={(next) => onEffort?.(next)}
-      onModel={caps.model ? onModel : undefined}
+      {...sliderProps}
       onClose={() => {
         setMenu(null);
         triggerRefs.effort.current?.focus();
@@ -922,25 +989,12 @@ export function Composer({
     />
   ) : null;
 
-  // The same slider inside the phone options Sheet closes the SHEET and
-  // returns focus to its collapsed trigger (Sheet focus trap also restores
-  // focus, but the slider's own Escape path names the trigger explicitly).
+  // The phone Sheet variant closes the SHEET and returns focus to its
+  // collapsed trigger (Sheet focus trap also restores focus, but the slider's
+  // own Escape path names the trigger explicitly).
   const sheetEffortSliderNode = caps.effort ? (
     <EffortSlider
-      kind={harness}
-      model={caps.model ? model : undefined}
-      launchModel={caps.model ? launchModel : null}
-      models={caps.model ? models : undefined}
-      modelEffective={caps.model ? modelEffective : null}
-      modelPending={caps.model ? modelPending : null}
-      modelSelectionPath={caps.model ? modelSelectionPath : null}
-      modelCatalog={caps.model ? (modelCatalog ?? null) : null}
-      modelLockedReason={modelLockedReason}
-      index={currentEffort.index}
-      ultracode={ultraOn}
-      disabled={effortLocked}
-      onChange={(next) => onEffort?.(next)}
-      onModel={caps.model ? onModel : undefined}
+      {...sliderProps}
       onClose={() => {
         setOptionsOpen(false);
         optionsTriggerRef.current?.focus();
@@ -1004,18 +1058,27 @@ export function Composer({
   const effortWordNode = (
     <>
       <span className={css.chipModel} data-testid="model-effort-chip-label">
-        {pendingLabel ?? (effectiveUnknown ? "?" : effectiveWord)}
+        {pendingLevel ?? (effectiveUnknown ? "?" : effectiveLevelWord)}
       </span>
-      {pendingLabel ? (
+      {effectiveFlagWord ? (
+        <span
+          className={effortEffective?.ultracode === true || pending?.ultracode ? css.chipUltra : css.chipUltraMuted}
+          data-testid="model-effort-ultracode"
+          data-effective={effortEffective?.ultracode === true ? "on" : effortEffective?.ultracode === false ? "off" : "unknown"}
+        >
+          · {effectiveFlagWord}
+        </span>
+      ) : null}
+      {pending ? (
         <span className={css.chipEffortPendingTag} data-testid="model-effort-pending">
-          {effortPending?.queued ? "排队中" : "切换中"}
+          {pending.queued ? "排队中" : "切换中"}
         </span>
       ) : null}
-      {mismatch ? (
-        <span className={css.chipEffortMismatch} data-testid="model-effort-mismatch">
-          请求 {mismatch.requested} → 实际 {mismatch.effective}
+      {mismatchLines.map((line, i) => (
+        <span className={css.chipEffortMismatch} data-testid="model-effort-mismatch" key={i}>
+          {line}
         </span>
-      ) : null}
+      ))}
     </>
   );
 
@@ -1098,29 +1161,37 @@ export function Composer({
   // take danger styling right here, collapsed — the bypass state must never
   // be visible only after opening the sheet.
   const triggerModeWord = caps.permission ? permTag ?? permLabel : null;
+  const pendingAny = Boolean(pending);
+  const mismatchAny = mismatchLines.length > 0;
+  const triggerAriaState = pendingAny
+    ? `pending ${pending?.name}${pending?.ultracode ? " ultracode" : ""}`
+    : effectiveUnknown
+      ? "unknown"
+      : `${effectiveLevelWord}${effortEffective?.ultracode ? " ultracode" : ""}`;
   const mobileTriggerNode = (
     <span className={opt.triggerGroup}>
       <button
         ref={optionsTriggerRef}
         type="button"
-        className={`${opt.trigger} ${permDanger ? opt.triggerDanger : ""} ${ember ? opt.triggerEmber : ""} ${pendingLabel ? css.chipEffortPending : ""}`}
+        className={`${opt.trigger} ${permDanger ? opt.triggerDanger : ""} ${ember ? opt.triggerEmber : ""} ${pendingAny ? css.chipEffortPending : ""}`}
         data-testid={caps.effort ? "model-effort-chip" : "composer-options-trigger"}
         data-options-trigger="1"
         data-ember={ember ? "1" : "0"}
         data-permission={caps.permission ? liveMode : undefined}
         data-permission-danger={caps.permission && permDanger ? "1" : "0"}
         data-effort-effective={
-          caps.effort ? (pendingLabel ? "pending" : effectiveUnknown ? "unknown" : effectiveWord) : undefined
+          caps.effort ? (pendingLevel ? "pending" : effectiveUnknown ? "unknown" : effectiveLevelWord) : undefined
         }
-        data-effort-pending={caps.effort && pendingLabel ? (effortPending?.queued ? "queued" : "switching") : "0"}
+        data-ultracode-effective={caps.effort && harness === "claude" ? (effortEffective?.ultracode ? "on" : effortEffective?.ultracode === false ? "off" : "unknown") : undefined}
+        data-effort-pending={caps.effort && pendingAny ? (pending?.queued ? "queued" : "switching") : "0"}
         data-effort-source={caps.effort ? effortEffective?.source ?? "unknown" : undefined}
-        data-effort-mismatch={caps.effort ? (mismatch ? "1" : "0") : undefined}
+        data-effort-mismatch={caps.effort ? (mismatchAny ? "1" : "0") : undefined}
         aria-haspopup="dialog"
         aria-expanded={optionsOpen}
         // D-042: the accessible name must carry the permission word (and a
         // explicit 危险 marker for yolo modes) as well as the effort tier,
         // since this one trigger replaces both desktop chips.
-        aria-label={`${triggerModeWord ? `${triggerModeWord}${permDanger ? "（危险）" : ""} · ` : ""}Select effort, ${effortChipLabel}; effective ${pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
+        aria-label={`${triggerModeWord ? `${triggerModeWord}${permDanger ? "（危险）" : ""} · ` : ""}Select effort, ${effortChipLabel}${ultraOn ? " · ultracode" : ""}; effective ${triggerAriaState}`}
         title={[permOption?.description, effortChipTitle].filter(Boolean).join("\n")}
         // The trigger stays clickable for an exited/observed-only session so
         // the sheet can still show the locked effort slider / launch-only
@@ -1413,16 +1484,17 @@ export function Composer({
               <button
                 ref={triggerRefs.effort}
                 type="button"
-                className={`${css.chip} ${ember ? css.ember : ""} ${pendingLabel ? css.chipEffortPending : ""}`}
+                className={`${css.chip} ${ember ? css.ember : ""} ${pendingAny ? css.chipEffortPending : ""}`}
                 data-testid="model-effort-chip"
                 data-ember={ember ? "1" : "0"}
-                data-effort-effective={pendingLabel ? "pending" : effectiveUnknown ? "unknown" : effectiveWord}
-                data-effort-pending={pendingLabel ? (effortPending?.queued ? "queued" : "switching") : "0"}
+                data-effort-effective={pendingLevel ? "pending" : effectiveUnknown ? "unknown" : effectiveLevelWord}
+                data-ultracode-effective={harness === "claude" ? (effortEffective?.ultracode ? "on" : effortEffective?.ultracode === false ? "off" : "unknown") : undefined}
+                data-effort-pending={pendingAny ? (pending?.queued ? "queued" : "switching") : "0"}
                 data-effort-source={effortEffective?.source ?? "unknown"}
-                data-effort-mismatch={mismatch ? "1" : "0"}
+                data-effort-mismatch={mismatchAny ? "1" : "0"}
                 aria-expanded={menu === "effort"}
                 aria-haspopup="dialog"
-                aria-label={`Select effort, ${effortChipLabel}; effective ${pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
+                aria-label={`Select effort, ${effortChipLabel}${ultraOn ? " · ultracode" : ""}; effective ${triggerAriaState}`}
                 title={effortChipTitle}
                 onClick={() => toggle("effort")}
               >

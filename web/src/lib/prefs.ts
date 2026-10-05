@@ -8,7 +8,10 @@ export type NewSessionPrefs = {
   driver: string;
   delegation: string;
   effortIndex: number;
+  /** Remembered tier; D-056 legacy word `ultracode` migrates to {xhigh,on}. */
   effortName: string;
+  /** D-056 orthogonal launch switch remembered with the tier. */
+  effortUltracode?: boolean;
   /** Extra CLI args from the last successful create, as typed. */
   launchArgs: string;
   recentHostIds: string[];
@@ -27,8 +30,11 @@ const empty: NewSessionPrefs = {
   // (D-035; docs/design/evidence/dispatch-driver-1.md).
   driver: "",
   delegation: "none",
+  // D-056: no remembered tier. A fresh draft is unpinned ("follow the model
+  // default"); the per-model marker comes from the Hub capability catalog.
   effortIndex: 2,
   effortName: "",
+  effortUltracode: false,
   launchArgs: "",
   recentHostIds: [],
   recentWorkspaceIds: [],
@@ -60,6 +66,7 @@ export function rememberNewSessionSuccess(
     | "delegation"
     | "effortIndex"
     | "effortName"
+    | "effortUltracode"
     | "launchArgs"
   >,
 ): void {

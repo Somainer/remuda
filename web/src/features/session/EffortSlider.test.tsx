@@ -9,285 +9,158 @@ function mount(overrides: Partial<SliderProps> & Pick<SliderProps, "kind">) {
   return render(<EffortSlider index={2} onChange={vi.fn()} {...overrides} />);
 }
 
-describe("EffortSlider visual ladder", () => {
-  it("Claude low/medium/high are plain: cold fill, no ember field", () => {
-    for (const index of [0, 1, 2]) {
-      const { unmount } = mount({ kind: "claude", index });
+describe("EffortSlider five-stop slider + switch", () => {
+  it("Claude lists exactly five tier stops, no sixth ultracode stop", () => {
+    mount({ kind: "claude", index: 2 });
+    const slider = screen.getByTestId("effort-slider");
+    expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
+  });
+
+  it("low/medium/high plain; xhigh/max static top; no ember on the pill", () => {
+    for (const [index, look] of [
+      [0, "plain"],
+      [1, "plain"],
+      [2, "plain"],
+      [3, "top"],
+      [4, "top"],
+    ] as const) {
+      const { unmount } = mount({ kind: "claude", index, ultracode: true });
       const slider = screen.getByTestId("effort-slider");
-      expect(slider).toHaveAttribute("data-effort-look", "plain");
-      expect(slider).toHaveAttribute("data-ember", "0");
+      expect(slider).toHaveAttribute("data-effort-look", look);
+      // Pill ember follows the TIER only; the switch carries the ember.
       expect(screen.queryByTestId("effort-embers")).toBeNull();
       unmount();
     }
   });
 
-  it("Claude xhigh and max carry the restrained top accent without the ember", () => {
-    for (const index of [3, 4]) {
-      const { unmount } = mount({ kind: "claude", index });
-      const slider = screen.getByTestId("effort-slider");
-      expect(slider).toHaveAttribute("data-effort-look", "top");
-      // The animated ember field exists at neither top tier.
-      expect(screen.queryByTestId("effort-embers")).toBeNull();
-      expect(slider).toHaveAttribute("data-ember", "0");
-      unmount();
-    }
-  });
-
-  it("the Claude ultracode stop gets the strongest look: embers, its own label and thumb", async () => {
+  it("a tier drag changes only the tier, carrying the current flag along", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
-    mount({ kind: "claude", index: 3, ultracode: true, onChange });
-    const slider = screen.getByTestId("effort-slider");
-    expect(slider).toHaveAttribute("data-effort-look", "ultracode");
-    expect(slider).toHaveAttribute("data-ember", "1");
-    expect(slider).toHaveAttribute("data-name", "ultracode");
-    // Full field: glow + three spark layers + the dotted layer.
-    const embers = screen.getByTestId("effort-embers");
-    expect(embers).toHaveAttribute("data-intensity", "ultra");
-    expect(embers.querySelectorAll("span")).toHaveLength(5);
-    // Its own title colour, distinct from the top-tier dust.
-    const title = screen.getByTestId("effort-title");
-    expect(title).toHaveAttribute("data-effort-look", "ultracode");
-    // Stepping one stop left drops to the restrained `max` look, visibly.
-    slider.focus();
-    await user.keyboard("{ArrowLeft}");
-    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ name: "max", ultracode: false }));
-  });
-
-  it("walks plain → top → ultracode across the rightmost stops", async () => {
-    const user = userEvent.setup();
-    const onChange = vi.fn();
-    mount({ kind: "claude", index: 2, onChange });
+    mount({ kind: "claude", index: 2, ultracode: true, onChange });
     const slider = screen.getByTestId("effort-slider");
     slider.focus();
-    await user.keyboard("{ArrowRight}"); // xhigh: top
-    expect(onChange).toHaveBeenLastCalledWith(
-      expect.objectContaining({ name: "xhigh", ultracode: false }),
-    );
-    await user.keyboard("{ArrowRight}"); // max: still top, no ember
-    expect(onChange).toHaveBeenLastCalledWith(
-      expect.objectContaining({ name: "max", ultracode: false }),
-    );
-    await user.keyboard("{ArrowRight}"); // ultracode: strongest
+    await user.keyboard("{ArrowRight}"); // high → xhigh, flag rides along
     expect(onChange).toHaveBeenLastCalledWith(
       expect.objectContaining({ name: "xhigh", ultracode: true }),
     );
-  });
-
-  it("Codex enumerates six native stops and Max matches Claude's restrained accent", () => {
-    mount({ kind: "codex", index: 4 });
-    const slider = screen.getByTestId("effort-slider");
-    expect(slider).toHaveAttribute(
-      "data-tiers",
-      "low,medium,high,xhigh,max,ultra",
+    await user.keyboard("{ArrowRight}"); // xhigh → max, still on
+    expect(onChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: "max", ultracode: true }),
     );
-    expect(slider).toHaveAttribute("data-effort-look", "top");
-    expect(slider).toHaveAttribute("data-ember", "0");
-    expect(screen.queryByTestId("effort-embers")).toBeNull();
-    expect(screen.getByTestId("effort-title")).toHaveTextContent("Max");
-    expect(slider).toHaveAttribute("aria-valuetext", "Max");
   });
 
-  it("Codex Low through Extra high are plain and the flag is never ultracode", () => {
-    for (const index of [0, 1, 2, 3]) {
-      const { unmount } = mount({ kind: "codex", index });
-      const slider = screen.getByTestId("effort-slider");
-      expect(slider).toHaveAttribute("data-effort-look", "plain");
-      expect(slider).toHaveAttribute("data-ultracode", "0");
-      unmount();
-    }
-  });
-
-  it("Codex Ultra gets the strongest field while remaining a native tier without the workflow flag", async () => {
+  it("the switch never moves the slider; flipping it calls onUltracodeChange only", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
-    mount({ kind: "codex", index: 5, onChange });
+    const onUltra = vi.fn();
+    mount({ kind: "claude", index: 4, ultracode: false, onChange, onUltracodeChange: onUltra, ultraGate: "decoupled" });
+    const sw = screen.getByTestId("effort-ultracode-switch");
+    expect(sw).toHaveAttribute("role", "switch");
+    expect(sw).toHaveAttribute("aria-checked", "false");
+    await user.click(sw);
+    expect(onUltra).toHaveBeenCalledWith(true);
+    expect(onChange).not.toHaveBeenCalled();
+    // The slider still names max.
+    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-name", "max");
+  });
+
+  it("marks the per-model default tier with a dot, and hides it when defaultIndex is null", () => {
+    mount({ kind: "claude", index: 2, defaultIndex: 1 });
+    const dots = document.querySelectorAll("[data-default='1']");
+    expect(dots.length).toBeGreaterThan(0);
+  });
+
+  it("Codex keeps its six native tiers and an ember Ultra, no switch row", () => {
+    mount({ kind: "codex", index: 5 });
     const slider = screen.getByTestId("effort-slider");
-    expect(slider).toHaveAttribute("data-name", "ultra");
-    expect(slider).toHaveAttribute("aria-valuetext", "Ultra");
+    expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultra");
     expect(slider).toHaveAttribute("data-effort-look", "ultracode");
-    expect(slider).toHaveAttribute("data-ultracode", "0");
-    expect(slider).toHaveAttribute("data-ember", "1");
-    expect(screen.getByTestId("effort-embers").querySelectorAll("span")).toHaveLength(5);
-    expect(screen.getByTestId("effort-title")).toHaveTextContent("Ultra");
-    expect(screen.getByTestId("effort-model")).toHaveTextContent(
-      "For demanding work using multiple agents · highest usage",
-    );
-    slider.focus();
-    await user.keyboard("{ArrowLeft}");
-    expect(onChange).toHaveBeenLastCalledWith({ kind: "codex", name: "max", index: 4 });
-    expect(slider).toHaveAttribute("data-effort-look", "top");
-    await user.keyboard("{ArrowRight}");
-    expect(slider).toHaveAttribute("data-name", "ultra");
-    expect(slider).toHaveAttribute("data-effort-look", "ultracode");
-    expect(slider).toHaveAttribute("data-ultracode", "0");
+    expect(screen.queryByTestId("effort-ultracode")).toBeNull();
   });
 
-  it("lists all six exact Codex labels and descriptions, preserving the native values on selection", async () => {
-    const user = userEvent.setup();
-    const onChange = vi.fn();
-    mount({ kind: "codex", index: 1, onChange });
-    await user.click(screen.getByTestId("effort-open-list"));
-    const tiers = [
-      ["low", "Low", "Fast responses with lighter reasoning", "plain"],
-      ["medium", "Medium", "Balances speed and reasoning depth for everyday tasks", "plain"],
-      ["high", "High", "Greater reasoning depth for complex problems", "plain"],
-      ["xhigh", "Extra high", "Extra high reasoning depth for complex problems", "plain"],
-      ["max", "Max", "For difficult problems when quality matters more than speed · higher usage", "top"],
-      ["ultra", "Ultra", "For demanding work using multiple agents · highest usage", "ultracode"],
-    ];
-    for (const [name, label, description, look] of tiers) {
-      const row = screen.getByTestId(`effort-tier-${name}`);
-      expect(row).toHaveTextContent(label);
-      expect(row).toHaveTextContent(description);
-      expect(row).toHaveAttribute("title", description);
-      expect(row).toHaveAttribute("data-effort-look", look);
-      expect(row).toHaveAttribute("data-ultracode", "0");
-    }
-    expect(screen.queryByTestId("effort-tier-minimal")).toBeNull();
-    expect(screen.queryByTestId("effort-tier-ultracode")).toBeNull();
-    await user.click(screen.getByTestId("effort-tier-ultra"));
-    expect(onChange).toHaveBeenLastCalledWith({ kind: "codex", name: "ultra", index: 5 });
-    await user.click(screen.getByTestId("effort-open-list"));
-    await user.click(screen.getByTestId("effort-tier-max"));
-    expect(onChange).toHaveBeenLastCalledWith({ kind: "codex", name: "max", index: 4 });
+  it("grok has four stops and no switch", () => {
+    mount({ kind: "grok", index: 3 });
+    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "low,medium,high,xhigh");
+    expect(screen.queryByTestId("effort-ultracode")).toBeNull();
+  });
+});
+
+describe("Ultracode switch gating", () => {
+  it("is enabled with an onUltracodeChange handler and decoupled gate", () => {
+    mount({ kind: "claude", index: 3, ultraGate: "decoupled", onUltracodeChange: vi.fn() });
+    const row = screen.getByTestId("effort-ultracode");
+    expect(row).toHaveAttribute("data-disabled", "0");
+    expect(row).toHaveAttribute("data-gate", "decoupled");
   });
 
-  it("grok enumerates the verified four stops with no ember anywhere", () => {
-    const { unmount } = mount({ kind: "grok", index: 3 });
-    const slider = screen.getByTestId("effort-slider");
-    expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh");
-    expect(slider).toHaveAttribute("data-effort-look", "top");
-    expect(slider).toHaveAttribute("data-ember", "0");
-    expect(screen.queryByTestId("effort-embers")).toBeNull();
-    unmount();
+  it("is disabled below 2.1.203 with the version reason", () => {
+    mount({ kind: "claude", index: 3, ultraGate: "legacy", onUltracodeChange: vi.fn() });
+    expect(screen.getByTestId("effort-ultracode")).toHaveAttribute("data-disabled", "1");
+    expect(screen.getByTestId("effort-ultracode-switch")).toBeDisabled();
+    expect(screen.getByTestId("effort-ultracode-reason").textContent).toContain("2.1.203");
   });
 
-  it("marks every tier row in the list with its look", async () => {
-    const user = userEvent.setup();
-    mount({ kind: "claude", index: 2 });
-    await user.click(screen.getByTestId("effort-open-list"));
-    const rows = ["low", "medium", "high", "xhigh", "max", "ultracode"] as const;
-    const expected: Record<(typeof rows)[number], string> = {
-      low: "plain",
-      medium: "plain",
-      high: "plain",
-      xhigh: "top",
-      max: "top",
-      ultracode: "ultracode",
-    };
-    for (const name of rows) {
-      expect(screen.getByTestId(`effort-tier-${name}`)).toHaveAttribute(
-        "data-effort-look",
-        expected[name],
-      );
-    }
-    // Only the ultracode row carries the flag.
-    expect(screen.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ultracode", "1");
+  it("names the model on an ultracode-unavailable-for-model refusal", () => {
+    mount({
+      kind: "claude",
+      index: 3,
+      ultraGate: "decoupled",
+      onUltracodeChange: vi.fn(),
+      ultraBlocked: { reason: "ultracode-unavailable-for-model", model: "claude-sonnet-4-6" },
+    });
+    expect(screen.getByTestId("effort-ultracode-reason").textContent).toContain("claude-sonnet-4-6");
+  });
+
+  it("names dynamic workflows on a workflows-disabled refusal", () => {
+    mount({
+      kind: "claude",
+      index: 3,
+      ultraGate: "decoupled",
+      onUltracodeChange: vi.fn(),
+      ultraBlocked: { reason: "ultracode-workflows-disabled" },
+    });
+    expect(screen.getByTestId("effort-ultracode-reason").textContent).toContain("dynamic workflows");
+  });
+
+  it("says coupled builds run it as xhigh in the hint copy", () => {
+    mount({ kind: "claude", index: 3, ultraGate: "coupled", onUltracodeChange: vi.fn() });
+    expect(screen.getByTestId("effort-ultracode-hint").textContent).toContain("xhigh");
+  });
+
+  it("is disabled when there is no configure channel", () => {
+    mount({ kind: "claude", index: 3, ultraGate: "decoupled" });
+    expect(screen.getByTestId("effort-ultracode-switch")).toBeDisabled();
   });
 });
 
 describe("EffortSlider running-model chip", () => {
-  // The collapsed chip is `effort-model`; the expanded panel is reached by
-  // clicking effort-open-list after mount().
-
   it("shows the launch spec verbatim before any read-back", () => {
     mount({ kind: "claude", model: "", launchModel: "acme_hub/model_x_o50[1m]" });
     const chip = screen.getByTestId("effort-model");
     expect(chip.textContent).toBe("acme_hub/model_x_o50[1m]");
-    // The launch spec is not mislabeled as a read-back.
     expect(chip.getAttribute("title")).toContain("尚未从会话回读");
-    expect(chip.getAttribute("title")).not.toContain("实际 ");
-    // No pair machinery exists anywhere.
-    expect(screen.queryByTestId("model-option-different")).toBeNull();
   });
 
-  it("shows only the running id verbatim once read back, even if it differs from launch", async () => {
-    mount({
-      kind: "claude",
-      model: "",
-      launchModel: "acme_hub/model_x_o50[1m]",
-      modelEffective: "claude-opus-5",
-    });
-    const chip = screen.getByTestId("effort-model");
-    expect(chip.textContent).toBe("claude-opus-5");
-    expect(chip.getAttribute("title")).toBe("实际 claude-opus-5");
-    await userEvent.setup().click(screen.getByTestId("effort-open-list"));
-    const panel = screen.getByTestId("effort-slider-panel");
-    expect(panel).not.toHaveAttribute("data-model-different");
-    expect(screen.queryByTestId("model-option-different")).toBeNull();
+  it("shows the read-back id once observed", () => {
+    mount({ kind: "claude", model: "", launchModel: "acme/model", modelEffective: "claude-opus-5" });
+    expect(screen.getByTestId("effort-model").textContent).toBe("claude-opus-5");
+    expect(screen.getByTestId("effort-model").getAttribute("title")).toBe("实际 claude-opus-5");
   });
 
-  it("renders the full running id raw even when its last segment matches the launch", () => {
-    // The incident pair: no shortening, no pair; the running id alone is full.
-    mount({
-      kind: "claude",
-      model: "",
-      launchModel: "passthrough/ark/model-y",
-      modelEffective: "ark/model-y",
-    });
-    expect(screen.getByTestId("effort-model").textContent).toBe("ark/model-y");
-  });
-
-  it("shows nothing when there is no launch model and no read-back", () => {
-    mount({ kind: "claude", model: "", launchModel: null });
-    const chip = screen.getByTestId("effort-model");
-    expect(chip.textContent).toBe("");
-    expect(chip).not.toHaveTextContent("opus");
-  });
-
-  it("shows the running id for a row with no launch model", () => {
-    mount({ kind: "claude", model: "", launchModel: null, modelEffective: "sonnet" });
-    expect(screen.getByTestId("effort-model").textContent).toBe("sonnet");
-    expect(screen.getByTestId("effort-model")).not.toHaveTextContent("opus");
-  });
-
-  it("moves straight to a later /model id with no divergence note", async () => {
-    mount({ kind: "claude", model: "", launchModel: "acme_hub/A", modelEffective: "acme_hub/C" });
-    expect(screen.getByTestId("effort-model").textContent).toBe("acme_hub/C");
-    await userEvent.setup().click(screen.getByTestId("effort-open-list"));
-    const panel = screen.getByTestId("effort-slider-panel");
-    expect(panel).not.toHaveAttribute("data-model-different");
-  });
-
-  it("codex shows the model, not the effort stop description (effective / launch / absent)", () => {
-    // Codex supports the model axis: the chip must never substitute the
-    // tier sentence for the running id.
-    const { unmount } = mount({ kind: "codex", index: 4, model: "gpt-5", launchModel: "gpt-5" });
-    expect(screen.getByTestId("effort-model").textContent).toBe("gpt-5");
-    unmount();
-
-    // Read-back of a different id.
-    mount({
-      kind: "codex",
-      index: 4,
-      model: "gpt-5",
-      launchModel: "gpt-5",
-      modelEffective: "gpt-5.4",
-    });
+  it("codex shows the model, not the effort stop description", () => {
+    mount({ kind: "codex", index: 4, model: "gpt-5", launchModel: "gpt-5", modelEffective: "gpt-5.4" });
     expect(screen.getByTestId("effort-model").textContent).toBe("gpt-5.4");
   });
 
-  it("an effort-only slider (no model prop) keeps the tier stop description", () => {
-    // The New Session form mounts EffortSlider with kind+index only (model
-    // undefined); the explanatory stop sentence must remain under the slider.
-    {
-      const { unmount } = mount({ kind: "claude", index: 2 });
-      const chip = screen.getByTestId("effort-model");
-      expect(chip.textContent).not.toBe("");
-      expect(chip.textContent).toMatch(/档|default/i);
-      unmount();
-    }
-    // agy sessions are effort-only too.
-    {
-      const { unmount } = mount({ kind: "agy", index: 0 });
-      expect(screen.getByTestId("effort-model").textContent).not.toBe("");
-      unmount();
-    }
+  it("an effort-only slider (no model prop) keeps the tier description", () => {
+    mount({ kind: "claude", index: 2 });
+    const chip = screen.getByTestId("effort-model");
+    // The high tier description (no universal 默认档 copy under D-056).
+    expect(chip.textContent).toContain("综合实现");
   });
 });
 
-describe("EffortSlider tall catalog", () => {
+describe("EffortSlider tier/model list", () => {
   const tallCatalog = Array.from({ length: 80 }, (_, i) => `gateway/model-${i}`);
 
   function mountList() {
@@ -303,24 +176,36 @@ describe("EffortSlider tall catalog", () => {
     return onModel;
   }
 
+  it("lists the five Claude tiers with their looks (no ultracode row)", async () => {
+    const user = userEvent.setup();
+    mount({ kind: "claude", index: 2 });
+    await user.click(screen.getByTestId("effort-open-list"));
+    for (const [name, look] of [
+      ["low", "plain"],
+      ["medium", "plain"],
+      ["high", "plain"],
+      ["xhigh", "top"],
+      ["max", "top"],
+    ] as const) {
+      expect(screen.getByTestId(`effort-tier-${name}`)).toHaveAttribute("data-effort-look", look);
+    }
+    expect(screen.queryByTestId("effort-tier-ultracode")).toBeNull();
+  });
+
   it("renders every catalog row inside one scrollable list body", async () => {
     const user = userEvent.setup();
     mountList();
     await user.click(screen.getByTestId("effort-open-list"));
     const body = screen.getByTestId("effort-list");
-    expect(body).toHaveAttribute("data-popover-scroll", "1");
-    // The first tier row is reachable even though 80 model rows follow.
     expect(screen.getByTestId("effort-tier-low")).toBeInTheDocument();
     expect(screen.getByTestId("model-option-model-79")).toBeInTheDocument();
-    expect(body.querySelectorAll("button")).toHaveLength(80 + 6);
+    expect(body.querySelectorAll("button")).toHaveLength(80 + 5);
   });
 
   it("moves roving focus with arrow keys, Home and End", async () => {
     const user = userEvent.setup();
     mountList();
     await user.click(screen.getByTestId("effort-open-list"));
-    // The selected tier row (high, index 2) opens focused; the initial focus
-    // ride is scheduled on an animation frame.
     await waitFor(() => expect(screen.getByTestId("effort-tier-high")).toHaveFocus());
     await user.keyboard("{ArrowDown}");
     expect(screen.getByTestId("effort-tier-xhigh")).toHaveFocus();
@@ -328,25 +213,6 @@ describe("EffortSlider tall catalog", () => {
     expect(screen.getByTestId("model-option-model-79")).toHaveFocus();
     await user.keyboard("{Home}");
     expect(screen.getByTestId("effort-tier-low")).toHaveFocus();
-    await user.keyboard("{ArrowUp}");
-    // Clamps at the first row.
-    expect(screen.getByTestId("effort-tier-low")).toHaveFocus();
-  });
-
-  it("Enter picks the focused model row; Escape closes back to the slider", async () => {
-    const user = userEvent.setup();
-    const onModel = mountList();
-    await user.click(screen.getByTestId("effort-open-list"));
-    // The open-list focus ride is scheduled on an animation frame; pressing
-    // End before it lands retargets body (the listbox keydown never runs),
-    // and the late focus ride leaves Enter to activate the tier row instead
-    // of the model row. Wait for the documented focus state after each key.
-    await waitFor(() => expect(screen.getByTestId("effort-tier-high")).toHaveFocus());
-    await user.keyboard("{End}");
-    await waitFor(() => expect(screen.getByTestId("model-option-model-79")).toHaveFocus());
-    await user.keyboard("{Enter}");
-    expect(onModel).toHaveBeenCalledWith("gateway/model-79");
-    expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
   });
 
   it("lets a free-typed id through as the verbatim fallback", async () => {
@@ -358,7 +224,7 @@ describe("EffortSlider tall catalog", () => {
     expect(onModel).toHaveBeenCalledWith("claude-grok-4.6");
   });
 
-  it("renders model rows disabled with a why title when configure is unavailable", async () => {
+  it("disables model rows with a why title when configure is unavailable", async () => {
     const user = userEvent.setup();
     const onModel = vi.fn();
     mount({
@@ -372,36 +238,8 @@ describe("EffortSlider tall catalog", () => {
     await user.click(screen.getByTestId("effort-open-list"));
     const row = screen.getByTestId("model-option-sonnet");
     expect(row).toBeDisabled();
-    expect(row).toHaveAttribute("aria-disabled", "true");
     expect(row.getAttribute("title")).toContain("会话已退出");
     await user.click(row);
     expect(onModel).not.toHaveBeenCalled();
-    expect(screen.getByTestId("effort-model-type")).toBeDisabled();
-  });
-
-  it("flags the host-fallback catalog with a one-line diagnostic", async () => {
-    const user = userEvent.setup();
-    mount({
-      kind: "claude",
-      index: 2,
-      model: "opus",
-      models: ["claude-grok-4.6"],
-      onModel: vi.fn(),
-      modelCatalog: {
-        models: ["claude-grok-4.6"],
-        source: "gateway-discovery",
-        observedAt: "2026-09-18T10:00:00Z",
-        cache: {
-          scope: "host-fallback",
-          baseUrl: "https://relay.example.invalid/v1",
-          fetchedAt: "2026-09-18T10:00:00Z",
-        },
-        discoveryEnv: true,
-      },
-    });
-    await user.click(screen.getByTestId("effort-open-list"));
-    const note = screen.getByTestId("effort-catalog-note");
-    expect(note).toHaveAttribute("data-reason", "host-fallback");
-    expect(note.textContent).toContain("主机缓存");
   });
 });

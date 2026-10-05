@@ -12,7 +12,7 @@ import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
 import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
-import { contextPercent } from "../features/session/effort";
+import { CLAUDE_XHIGH_INDEX, claudeDefaultTier, contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import { Transcript } from "../features/session/Transcript";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
@@ -109,6 +109,11 @@ export function SessionPage({
   useEffect(() => {
     if (instanceId && !isTtyLabFixtureId(instanceId)) void hubStore.follow(instanceId);
   }, [instanceId]);
+
+  // D-056 §6: per-model default + ultracode capability rows (best-effort).
+  useEffect(() => {
+    void hubStore.loadSupplyCatalog();
+  }, []);
 
   useEffect(() => {
     if (instanceId && (view === "tty" || view === "structured")) writeSessionView(instanceId, view);
@@ -846,6 +851,23 @@ export function SessionPage({
           effort={hubStore.effortOf(instance.id, instance.kind)}
           effortEffective={hubStore.effortEffectiveOf(instance.id)}
           effortPending={hubStore.effortPendingOf(instance.id)}
+          ultraGate={instance.kind === "claude" ? hubStore.effortVersionGate(instance.id) : undefined}
+          ultraBlocked={
+            instance.kind === "claude"
+              ? (() => {
+                  const refusal = hubStore.effortRefusalOf(instance.id);
+                  return refusal ? { reason: refusal.reason, model: refusal.modelId } : null;
+                })()
+              : null
+          }
+          effortDefaultIndex={
+            instance.kind === "claude"
+              ? (claudeDefaultTier(
+                  hubStore.modelEffectiveOf(instance.id)?.id ?? instance.model ?? null,
+                  hubStore.supplyCatalogRows(),
+                )?.index ?? null)
+              : undefined
+          }
           contextLabel={(() => {
             const pct = contextPercent(usage, instance.kind);
             return pct == null ? null : `${pct}%`;
@@ -860,7 +882,38 @@ export function SessionPage({
           }
           effortDisabled={status === "exited" || instance.ownership === "observed-only"}
           onEffort={(next) => {
+            // D-056 coupled-build linkage lives HERE (the slider never moves
+            // itself): on 2.1.203–2.1.283 sliding away from xhigh turns the
+            // switch off; on ≥2.1.284 the flag is orthogonal and rides along.
+            if (
+              next.kind === "claude"
+              && hubStore.effortVersionGate(instance.id) === "coupled"
+              && (hubStore.effortOf(instance.id).ultracode === true)
+              && next.index !== CLAUDE_XHIGH_INDEX
+            ) {
+              void hubStore.setEffort(instance.id, { ...next, ultracode: false });
+              return;
+            }
             void hubStore.setEffort(instance.id, next);
+          }}
+          onUltracode={(on) => {
+            // Coupled build: turning the switch on also moves the slider to
+            // xhigh and says so; turning off leaves the tier where it is.
+            if (
+              on
+              && instance.kind === "claude"
+              && hubStore.effortVersionGate(instance.id) === "coupled"
+            ) {
+              const current = hubStore.effortOf(instance.id, instance.kind);
+              void hubStore.setEffort(instance.id, {
+                ...current,
+                index: CLAUDE_XHIGH_INDEX,
+                name: "xhigh",
+                ultracode: true,
+              });
+              return;
+            }
+            void hubStore.setUltracode(instance.id, on);
           }}
           // The store owns the failure mouth: it reverts modelPending and
           // toasts the Hub/Node reason. Return the promise (never void it) so

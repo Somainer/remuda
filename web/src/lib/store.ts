@@ -35,14 +35,18 @@ import {
   DEFAULT_EFFORT_INDEX,
   effortAt,
   effortFromRecord,
+  claudeVersionGate,
   effortWireName,
   mapEffort,
+  type ClaudeVersionGate,
   type EffortKind,
   type EffortSelection,
+  type ModelEffortCatalogRow,
 } from "../features/session/effort";
 import {
   effectiveFromObservation,
   effectiveFromRecord,
+  effortFlagSettles,
   type EffortEffectiveView,
 } from "../features/session/effortEffective";
 import type { UsageRollup } from "../features/session/contextUsage";
@@ -101,21 +105,57 @@ import {
   type PairedDevice,
 } from "./session";
 
-/** A push-down in flight (chip shows 切换中 / 排队中 until it settles). */
+/**
+ * A push-down in flight (chip shows 切换中 / 排队中 until BOTH requested axes
+ * settle). D-056: the request is two axes — level `low…max` and the
+ * orthogonal ultracode flag — each confirmed by its own read-back.
+ */
 export type EffortPending = {
-  /** Wire word the user chose (`low…max | ultracode`). */
-  word: string;
+  /** Per-instance nonce identifying one switch; stale lifecycles are dropped. */
+  nonce: number;
+  /** Requested native level word. */
+  name: string;
+  /** Requested switch state. */
+  ultracode: boolean;
   /** True while the agent is working — it applies at the next idle. */
   queued: boolean;
   /** Wall-clock ms the pending state was entered (stale-state safety net). */
   at: number;
   /**
-   * §9.1 effective-level `observedAt` the push-down started from (null when
-   * nothing had been read back). A read-back newer than this settles the
-   * push-down; an equal/older projection leaves a queued push pending.
+   * Effective `observedAt` of the newest projection when THIS request was
+   * made/queued. A projection settles an axis only when strictly newer — an
+   * observation belonging to the replaced request (an A→B race) is kept for
+   * history but can neither settle B nor clear its indicator.
    */
-  baselineObservedAt: string | null;
+  thresholdObservedAt: string | null;
+  /** Level axis confirmed by a newer projection. */
+  levelSettled: boolean;
+  /** Switch axis confirmed by a newer projection. */
+  flagSettled: boolean;
 };
+
+/**
+ * A refusal that keeps the ultracode switch disabled, projected from an
+ * `effort-degraded` lifecycle. Model-scoped refusals clear on a model
+ * change; process-scoped ones last the process (D-056 owner rule: this is a
+ * configure OUTCOME, never a session end — retry is allowed, not blocked).
+ */
+export type UltraRefusal = {
+  reason: string;
+  scope: "model" | "process";
+  modelId: string | null;
+  at: string;
+};
+
+/** Parse of an effort lifecycle status word into its two axes. */
+type EffortLifecycleRequest = {
+  name?: string;
+  ultracode?: boolean;
+};
+
+/** Stable reason codes that keep the switch disabled (D-056 §5). */
+const ULTRA_MODEL_REASON = "ultracode-unavailable-for-model";
+const ULTRA_WORKFLOWS_REASON = "ultracode-workflows-disabled";
 
 /** Pending entries older than this without a verdict are dropped. */
 const EFFORT_PENDING_MAX_AGE_MS = 30 * 60_000;
@@ -224,6 +264,32 @@ function effortLifecycleStatus(status: unknown):
     };
   }
   return null;
+}
+
+/**
+ * Map a lifecycle word onto the two request axes. The driver (D-056) journals
+ * the level word (`max`), an ultracode word (`ultracode`,
+ * `ultracode:on` / `ultracode:off`), or a legacy coupled `xhigh+flag` form.
+ * Only axes the word actually names are returned, so a stale lifecycle for a
+ * replaced request can never match the new one.
+ */
+function effortLifecycleRequest(word: string): EffortLifecycleRequest {
+  const normalized = word.trim().toLowerCase();
+  if (normalized === "ultracode" || normalized === "ultracode:on" || normalized === "ultracode-on") {
+    return { ultracode: true };
+  }
+  if (normalized === "ultracode:off" || normalized === "ultracode-off") {
+    return { ultracode: false };
+  }
+  return { name: normalized };
+}
+
+/** Whether a parsed lifecycle word refers to the in-flight request. */
+function effortLifecycleMatches(pending: EffortPending, word: string): boolean {
+  const request = effortLifecycleRequest(word);
+  if (request.name !== undefined && request.name !== pending.name) return false;
+  if (request.ultracode !== undefined && request.ultracode !== pending.ultracode) return false;
+  return request.name !== undefined || request.ultracode !== undefined;
 }
 
 /**
@@ -338,6 +404,12 @@ export type HubState = {
   effort: Record<string, EffortSelection>;
   /** §9.1 transcript-read-back effective effort per instance; absent = `?`. */
   effortEffective: Record<string, EffortEffectiveView>;
+  /** D-056 §5 refusal that keeps the ultracode switch disabled. */
+  effortRefusal: Record<string, UltraRefusal>;
+  /** Per-instance nonces so a replaced request can't be settled by stale events. */
+  effortNonces: Record<string, number>;
+  /** GET /v1/supply/catalog rows (per-model default + ultracode capability). */
+  supplyCatalog: ModelEffortCatalogRow[] | null;
   /** context-usage-1 Hub-computed token/context rollup per instance.
    *  Hydrated separately from `instances` for the same reason effort is:
    *  mergeInstanceSnapshots keeps the local instance while its
@@ -388,6 +460,9 @@ const initial: HubState = {
   permissionMode: {},
   effort: {},
   effortEffective: {},
+  effortRefusal: {},
+  effortNonces: {},
+  supplyCatalog: null,
   usageRollup: {},
   effortPending: {},
   permissionEffective: {},
@@ -707,6 +782,44 @@ class HubStore {
   }
 
   /**
+   * Apply one newer effective projection to an in-flight request, settling the
+   * axes the projection actually confirms (D-056: level and flag are separate
+   * reads). Returns the updated pending entry, or null when BOTH axes have
+   * settled and the indicator must clear.
+   *
+   * - an axis is confirmed only by a projection STRICTLY newer than the
+   *   request threshold — an observation belonging to the replaced request
+   *   (request A after the user asked B) neither matches nor settles;
+   * - the level axis is confirmed by a `remuda` projection even on mismatch
+   *   (that is the native clamp: 请求 max → 实际 xhigh), or by name agreement;
+   * - the flag axis is confirmed only by its own positive value; an
+   *   unreported flag (null) leaves the indicator pending.
+   */
+  private settleEffortAxes(
+    instanceId: Id,
+    pending: EffortPending,
+    view: EffortEffectiveView,
+  ): EffortPending | null {
+    const newer = !pending.thresholdObservedAt || view.observedAt > pending.thresholdObservedAt;
+    let { levelSettled, flagSettled } = pending;
+    // A remuda-sourced projection, or one agreeing with the request, is the
+    // outcome of OUR push-down (keeps the slider put on clamp); a terminal
+    // `/effort` edge is folded as a switch instead.
+    const ours = view.source === "remuda" || view.name === pending.name;
+    if (newer && !levelSettled) {
+      if (view.source === "remuda" || view.name === pending.name) levelSettled = true;
+    }
+    if (newer && !flagSettled && effortFlagSettles(view.ultracode)) {
+      flagSettled = true;
+    }
+    if (ours && (levelSettled || flagSettled)) {
+      this.settledEffortPushdown.set(instanceId, view.observedAt);
+    }
+    if (levelSettled && flagSettled) return null;
+    return { ...pending, levelSettled, flagSettled };
+  }
+
+  /**
    * Fold Hub-record `effortEffective` into the live map, newest wins.
    *
    * Also settles a push-down whose verdict has projected onto the durable
@@ -715,15 +828,15 @@ class HubStore {
    * (the client goes `readonly-stale` under load) or a late page attach only
    * reaches us through this poll/refresh path — without settling here the chip
    * would stay on 切换中 forever even though the Hub record already carries
-   * the new level. Only a projection strictly newer than the level the
-   * push-down started from settles, so a queued (working) switch is not
-   * cleared by a poll returning the unchanged baseline.
+   * the new level. Each axis needs a projection strictly newer than the
+   * request threshold, so a queued (working) switch and a replaced request's
+   * stale projection are never cleared by the wrong read-back.
    */
   private hydrateEffortEffective(instances: Instance[]) {
     const next = { ...this.state.effortEffective };
     const pendingNext = { ...this.state.effortPending };
     let effectiveUpdated = false;
-    let pendingSettled = false;
+    let pendingChanged = false;
     for (const instance of instances) {
       const view = effectiveFromRecord(instance.effortEffective);
       if (!view) continue;
@@ -732,24 +845,31 @@ class HubStore {
         next[instance.id] = view;
         effectiveUpdated = true;
         const pending = this.state.effortPending[instance.id];
-        if (
-          pending
-          && (!pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt)
-        ) {
-          delete pendingNext[instance.id];
-          pendingSettled = true;
-          // Remember the read-back that settled it so the same edge arriving
-          // later on the live socket is not mistaken for a terminal switch.
-          this.settledEffortPushdown.set(instance.id, view.observedAt);
+        if (pending) {
+          const updated = this.settleEffortAxes(instance.id, pending, view);
+          if (updated) pendingNext[instance.id] = updated;
+          else delete pendingNext[instance.id];
+          pendingChanged = true;
+        }
+        // A positive switch read-back clears the process-scoped refusal.
+        if (view.ultracode === true && this.state.effortRefusal[instance.id]) {
+          this.clearEffortRefusal(instance.id);
         }
       }
     }
-    if (effectiveUpdated || pendingSettled) {
+    if (effectiveUpdated || pendingChanged) {
       this.emit({
         ...(effectiveUpdated ? { effortEffective: next } : {}),
-        ...(pendingSettled ? { effortPending: pendingNext } : {}),
+        ...(pendingChanged ? { effortPending: pendingNext } : {}),
       });
     }
+  }
+
+  private clearEffortRefusal(instanceId: Id) {
+    if (!this.state.effortRefusal[instanceId]) return;
+    const refusal = { ...this.state.effortRefusal };
+    delete refusal[instanceId];
+    this.emit({ effortRefusal: refusal });
   }
 
   /** context-usage-1: fold Hub-computed usage rollups from polled instances
@@ -906,51 +1026,61 @@ class HubStore {
   }
 
   /** Apply one transcript-read-back effort observation to the live map.
-   *  Settles any pending push-down and, when the change came from the
-   *  terminal side, moves the slider to the observed stop (single source of
-   *  truth; never calls configure, so no push-down ping-pong). */
+   *  Settles the in-flight request per-axis and, when the change came from the
+   *  terminal side, moves the slider/switch to the observed axes (single
+   *  source of truth; never calls configure, so no push-down ping-pong). */
   private noteEffortObservation(instanceId: Id, observation: Observation): boolean {
     const parsed = effectiveFromObservation(observation);
     if (!parsed) return false;
+    const view = parsed.effective;
     const current = this.state.effortEffective[instanceId];
-    if (current && parsed.effective.observedAt < current.observedAt) return false;
+    if (current && view.observedAt < current.observedAt) return false;
     const patch: Partial<HubState> = {
       effortEffective: {
         ...this.state.effortEffective,
-        [instanceId]: parsed.effective,
+        [instanceId]: view,
       },
     };
+    // A positive switch read-back clears the process-scoped refusal and lets
+    // the model-scoped one clear too (the model clearly supports it now).
+    if (view.ultracode === true && this.state.effortRefusal[instanceId]) {
+      patch.effortRefusal = { ...this.state.effortRefusal };
+      delete patch.effortRefusal[instanceId];
+    }
     const pending = this.state.effortPending[instanceId];
     const hydratedAt = this.settledEffortPushdown.get(instanceId);
     // "Ours" = a live push-down still pending, OR one the durable projection
     // already settled whose live frame is only now arriving (same read-back,
     // observedAt no newer than the one the poll folded).
-    const ours = Boolean(pending) || (hydratedAt != null && parsed.effective.observedAt <= hydratedAt);
+    const ours = Boolean(pending) || (hydratedAt != null && view.observedAt <= hydratedAt);
     if (ours) {
-      // Our own push-down settled: leave the slider where the user put it (the
-      // mismatch line renders if the native side clamped it).
       if (pending) {
-        patch.effortPending = { ...this.state.effortPending };
-        delete patch.effortPending[instanceId];
+        const updated = this.settleEffortAxes(instanceId, pending, view);
+        if (updated) {
+          patch.effortPending = { ...this.state.effortPending, [instanceId]: updated };
+        } else {
+          patch.effortPending = { ...this.state.effortPending };
+          delete patch.effortPending[instanceId];
+        }
       }
       // Consume the marker once the matching (or an even newer) live edge for
       // our push-down arrives; a genuinely newer terminal switch (observedAt
       // past the marker) is handled in the else branch instead.
-      if (hydratedAt != null && parsed.effective.observedAt >= hydratedAt) {
+      if (hydratedAt != null && view.observedAt >= hydratedAt) {
         this.settledEffortPushdown.delete(instanceId);
       }
     } else {
-      // Terminal-side switch (or a level newer than any push-down we settled):
-      // the observed level is the truth — move the slider to it. This is local
-      // state only, so it cannot re-trigger a configure.
+      // Terminal-side switch (or an edge newer than any push-down we settled):
+      // the observed axes are the truth — move the slider and the switch. This
+      // is local state only, so it cannot re-trigger a configure.
       this.settledEffortPushdown.delete(instanceId);
       const instance = this.state.instances.find((row) => row.id === instanceId);
       const kind = (instance?.kind ?? "claude") as EffortKind;
       const selection = effortFromRecord(
         kind,
-        parsed.effective.name,
+        view.name,
         null,
-        parsed.effective.ultracode === true,
+        view.ultracode === true,
       );
       if (selection) {
         const stored = this.state.effort[instanceId];
@@ -982,52 +1112,95 @@ class HubStore {
           : undefined;
     const parsed = effortLifecycleStatus(value);
     if (!parsed) return;
-    const pending = { ...this.state.effortPending };
+    const current = this.state.effortPending[instanceId];
     if (parsed.kind === "queued") {
-      // Preserve the baseline the push-down started from so the queued entry
-      // is settled only by a strictly newer read-back, not a poll returning
-      // the unchanged level.
-      pending[instanceId] = {
-        word: parsed.word,
-        queued: true,
-        at: pending[instanceId]?.at ?? Date.now(),
-        baselineObservedAt: pending[instanceId]?.baselineObservedAt ?? null,
-      };
-      this.emit({ effortPending: pending });
+      if (!current) return;
+      // A queued lifecycle belongs to the REQUEST in flight only. A late
+      // `effort-queued` for request A after the user replaced it with B names
+      // different axes and is dropped — it must never overwrite B's pending
+      // indicator nor stamp B's threshold (c-effortui A→B race).
+      if (!effortLifecycleMatches(current, parsed.word)) return;
+      // Provenance: the threshold is stamped from THIS request's queued
+      // lifecycle; an earlier timestamp survives only for the same request
+      // (a duplicate queued edge), never across requests.
+      const fresh = this.state.effortEffective[instanceId]?.observedAt ?? current.thresholdObservedAt;
+      this.emit({
+        effortPending: {
+          ...this.state.effortPending,
+          [instanceId]: { ...current, queued: true, thresholdObservedAt: fresh },
+        },
+      });
       return;
     }
-    if (!pending[instanceId] && parsed.kind === "applied") return;
-    delete pending[instanceId];
+    if (parsed.kind === "applied") {
+      if (!current) return;
+      if (!effortLifecycleMatches(current, parsed.word)) return;
+      // The driver reported acceptance: the projected read-back is the source
+      // of truth, but clear the indicator now rather than leaving it on 切换中
+      // when the observation is delayed. The slider stays where requested.
+      const pendingNext = { ...this.state.effortPending };
+      delete pendingNext[instanceId];
+      this.settledEffortPushdown.delete(instanceId);
+      this.emit({ effortPending: pendingNext });
+      return;
+    }
+    // degraded
+    if (!current) return;
+    if (!effortLifecycleMatches(current, parsed.word)) return;
+    const pendingNext = { ...this.state.effortPending };
+    delete pendingNext[instanceId];
     // The push-down ended via a lifecycle, not a projected read-back: no settled
     // edge owes the later live frame the "our push-down" treatment.
     this.settledEffortPushdown.delete(instanceId);
-    if (parsed.kind === "degraded") {
-      // The native side refused: revert the slider to the last observed level
-      // (or drop the optimistic request so the record default returns).
-      const effective = this.state.effortEffective[instanceId];
-      const effort = { ...this.state.effort };
-      if (effective) {
-        const instance = this.state.instances.find((row) => row.id === instanceId);
-        const kind = (instance?.kind ?? "claude") as EffortKind;
-        const selection = effortFromRecord(
-          kind,
-          effective.name,
-          null,
-          effective.ultracode === true,
-        );
-        if (selection) effort[instanceId] = selection;
-      } else {
-        delete effort[instanceId];
-      }
-      const reason =
-        { "dialog-kept": "已取消切换", "invalid-argument": "档位无效", "no-readback-within-window": "未收到回读" }[
+    // The native side refused: revert the affected axes to the last observed
+    // state (or drop the optimistic request so the record default returns).
+    const effective = this.state.effortEffective[instanceId];
+    const effort = { ...this.state.effort };
+    if (effective) {
+      const instance = this.state.instances.find((row) => row.id === instanceId);
+      const kind = (instance?.kind ?? "claude") as EffortKind;
+      const selection = effortFromRecord(
+        kind,
+        effective.name,
+        null,
+        effective.ultracode === true,
+      );
+      if (selection) effort[instanceId] = selection;
+    } else {
+      delete effort[instanceId];
+    }
+    // D-056 stable reason codes. The two ultracode refusals also DISABLE the
+    // switch (model- or process-scoped); the others are plain rejections the
+    // user can immediately retry.
+    let toastReason: string = parsed.reason;
+    const refusalPatch: Partial<HubState> = {};
+    if (parsed.reason === ULTRA_MODEL_REASON || parsed.reason === ULTRA_WORKFLOWS_REASON) {
+      const scope = parsed.reason === ULTRA_MODEL_REASON ? "model" : "process";
+      const modelId =
+        scope === "model"
+          ? (this.state.modelEffective[instanceId]?.id ?? this.state.models[instanceId] ?? null)
+          : null;
+      refusalPatch.effortRefusal = {
+        ...this.state.effortRefusal,
+        [instanceId]: {
+          reason: parsed.reason,
+          scope,
+          modelId,
+          at: observation.observedAt ?? new Date().toISOString(),
+        },
+      };
+      toastReason =
+        scope === "model"
+          ? `模型 ${modelId ?? "当前模型"} 不支持 ultracode`
+          : "需要开启 dynamic workflows";
+    } else {
+      toastReason =
+        ({ "dialog-kept": "已取消切换", "invalid-argument": "档位无效", "no-readback-within-window": "未收到回读" } as Record<string, string>)[
           parsed.reason
         ] ?? parsed.reason;
-      this.toast(`effort 切换被拒绝：${reason}`);
-      this.emit({ effortPending: pending, effort });
-    } else {
-      this.emit({ effortPending: pending });
     }
+    this.toast(`effort 切换被拒绝：${toastReason}`);
+    this.emit({ effortPending: pendingNext, effort, ...refusalPatch });
   }
 
   toast(text: string) {
@@ -3289,10 +3462,17 @@ class HubStore {
     permissionMode: string,
     extras?: { model?: string; effort?: EffortSelection },
   ) {
-    // The wire stores an opaque {name,index}; ultracode rides the legacy
-    // "ultracode" name until x-p1-proto lands the {name,ultracode} shape.
+    // D-056 wire: `{name, ultracode, index}` — a native level word plus the
+    // orthogonal boolean; the web never sends the legacy "ultracode" name.
     const wireExtras = extras?.effort
-      ? { ...extras, effort: { name: effortWireName(extras.effort), index: extras.effort.index } }
+      ? {
+          ...extras,
+          effort: {
+            name: effortWireName(extras.effort),
+            ultracode: extras.effort.ultracode === true,
+            index: extras.effort.index,
+          },
+        }
       : extras;
     await api.instanceConfigure(instanceId, permissionMode, wireExtras);
     this.emit({
@@ -3315,24 +3495,30 @@ class HubStore {
   }
 
   async setEffort(instanceId: Id, effort: EffortSelection) {
-    const word = effortWireName(effort);
     const instance = this.state.instances.find((row) => row.id === instanceId);
     const busy =
       instance?.activity?.state === "known" ? instance.activity.value === "working" : false;
-    // Optimistic pending so the chip never shows the old level ambiguously:
-    // 切换中 on the idle fast path, 排队中 while the agent works. The driver's
-    // `effort-queued` lifecycle and the effective read-back settle it.
+    // New per-request provenance (c-effortui): every switch gets a fresh
+    // nonce and its OWN threshold stamped from the current projection. A
+    // replaced request's late events cannot settle this indicator.
+    const nonce = (this.state.effortNonces[instanceId] ?? 0) + 1;
+    const currentView = this.state.effortEffective[instanceId] ?? null;
+    const pending: EffortPending = {
+      nonce,
+      name: effort.name,
+      ultracode: effort.ultracode === true,
+      queued: busy,
+      at: Date.now(),
+      thresholdObservedAt: currentView?.observedAt ?? null,
+      // Axes that already agree with the projection need no further proof;
+      // an unobserved flag (null) is "not proven" only when switching it ON.
+      levelSettled: currentView?.name === effort.name,
+      flagSettled: effort.ultracode !== true && currentView?.ultracode !== true,
+    };
     this.settledEffortPushdown.delete(instanceId);
     this.emit({
-      effortPending: {
-        ...this.state.effortPending,
-        [instanceId]: {
-          word,
-          queued: busy,
-          at: Date.now(),
-          baselineObservedAt: this.state.effortEffective[instanceId]?.observedAt ?? null,
-        },
-      },
+      effortNonces: { ...this.state.effortNonces, [instanceId]: nonce },
+      effortPending: { ...this.state.effortPending, [instanceId]: pending },
     });
     try {
       await this.configure(instanceId, this.permissionModeOf(instanceId), { effort });
@@ -3347,6 +3533,58 @@ class HubStore {
       delete pending[instanceId];
       this.emit({ effortPending: pending });
       throw error;
+    }
+  }
+
+  /**
+   * Flip ONLY the ultracode switch axis, leaving the tier untouched (D-056
+   * decoupled ≥2.1.284). The caller applies the coupled-build linkage (on →
+   * xhigh) before calling, based on the session's version gate.
+   */
+  async setUltracode(instanceId: Id, ultracode: boolean) {
+    const current = this.effortOf(instanceId);
+    await this.setEffort(instanceId, { ...current, ultracode });
+  }
+
+  /** Claude Code version gate for a session, from its capability snapshot. */
+  effortVersionGate(instanceId: Id): ClaudeVersionGate {
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    return claudeVersionGate(instance?.capabilities?.binaryVersion);
+  }
+
+  /** Per-session switch refusal, applying the model-scoped expiry (D-056 §5). */
+  effortRefusalOf(instanceId: Id): UltraRefusal | null {
+    const refusal = this.state.effortRefusal[instanceId];
+    if (!refusal) return null;
+    if (refusal.scope === "model") {
+      // Bound to the model the driver named; a different current model
+      // re-enables the switch immediately.
+      const currentModel =
+        this.state.modelEffective[instanceId]?.id ?? this.state.models[instanceId] ?? null;
+      if (currentModel && refusal.modelId && currentModel !== refusal.modelId) {
+        return null;
+      }
+    }
+    return refusal;
+  }
+
+  /** Static capability rows (per-model default + ultracode), Hub or null. */
+  supplyCatalogRows(): ModelEffortCatalogRow[] | null {
+    return this.state.supplyCatalog;
+  }
+
+  /** Fetch GET /v1/supply/catalog once (best-effort; fallback rows live in the
+   *  effort module). */
+  async loadSupplyCatalog(): Promise<void> {
+    if (this.state.supplyCatalog) return;
+    try {
+      const body = await api.supplyCatalog();
+      const rows = Array.isArray(body?.models)
+        ? (body.models as ModelEffortCatalogRow[]).filter((row) => row && typeof row.id === "string")
+        : [];
+      if (rows.length) this.emit({ supplyCatalog: rows });
+    } catch {
+      // Operator/network unavailable: keep the built-in fallback table.
     }
   }
 

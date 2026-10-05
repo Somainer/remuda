@@ -1,39 +1,36 @@
 import type { UsagePayload } from "../../types/generated";
 import type { Kind } from "../../types/instance";
 
-/** Harness-native effort tables. Never a generic fast/standard/deep list. */
+/**
+ * D-056 (2026-10-05): Claude's effort is FIVE native slider stops
+ * (low · medium · high · xhigh · max) plus an ORTHOGONAL Ultracode switch.
+ * On Claude Code ≥ 2.1.284 the switch stays on at ANY level; on the coupled
+ * 2.1.203–2.1.283 builds turning it on moves the slider to xhigh and sliding
+ * away turns it off. The legacy word `ultracode` is accepted only as an
+ * INPUT alias (stored prefs/drafts/wire) and normalises to {xhigh, on}.
+ */
+
 export type EffortKind = Extract<Kind, "claude" | "codex" | "grok" | "agy" | "terminal" | "generic">;
 
+/**
+ * One native harness tier row.
+ */
 export type EffortTier = {
-  /** Native wire/config value; display labels must never replace it. */
   name: string;
   label?: string;
   description: string;
 };
 
-/**
- * One stop of the slider. Tiers map 1:1 onto a row of the harness table; the
- * Claude-only `ultracode` stop is a sixth stop PAST `max` that selects the
- * `xhigh` tier together with the ultracode workflow flag — the wire shape is
- * still {@link EffortSelection} `{name: "xhigh", ultracode: true}`.
- */
-export type EffortStop = {
-  name: string;
-  label?: string;
-  description: string;
-  /** Tier index addressed in {@link effortTable}; the ultracode stop parks on xhigh. */
+/** A slider stop is a native tier, 1:1 (the ultracode switch is separate). */
+export type EffortStop = EffortTier & {
   index: number;
-  ultracode: boolean;
-  /** Short tick label for the cramped composer popover; falls back to `name`. */
   short?: string;
 };
 
 /**
- * A chosen effort. `name`/`index` always address a row of the harness table.
- * `ultracode` is Claude-only and is NOT a tier: when it is on Claude forces
- * the `xhigh` tier plus workflow orchestration. In the UI it is the slider's
- * sixth (rightmost) stop rather than a separate switch; other harnesses leave
- * it `undefined`.
+ * A chosen effort. `ultracode` is the Claude-only orthogonal boolean and is
+ * session-only; it NEVER implies a tier on ≥2.1.284. For other harnesses the
+ * field is absent.
  */
 export type EffortSelection = {
   index: number;
@@ -49,20 +46,21 @@ export type EffortSelection = {
  * - `top` — a restrained static accent for Claude `xhigh`/`max`, Codex `max`,
  *   and Grok's native top tier. Same family as the Desktop's max look:
  *   warm label/tint, never the animated ember field.
- * - `ultracode` — the strongest visual treatment for the top multi-agent
- *   stop: Claude ultracode or Codex Ultra. This look is independent of the
- *   Claude-only workflow flag and adds no flag to Codex selections.
+ * - `ultracode` — the animated ember field. On Claude it follows the
+ *   ORTHOGONAL ultracode SWITCH (any level, D-056); on Codex it follows the
+ *   native Ultra tier.
  */
 export type EffortLook = "plain" | "top" | "ultracode";
 
 /**
  * The real Claude Code levels, in CLI order (`claude --effort`).
- * low · medium · high (default) · xhigh · max.
+ * low · medium · high · xhigh · max. No tier is labelled the universal
+ * default any more (D-056 §6: the default is per-model).
  */
 const CLAUDE: EffortTier[] = [
   { name: "low", description: "最省 · 最快" },
-  { name: "medium", description: "日常档" },
-  { name: "high", description: "默认档" },
+  { name: "medium", description: "均衡档" },
+  { name: "high", description: "综合实现 · 完整测试" },
   { name: "xhigh", description: "跨文件 · 长任务" },
   { name: "max", description: "最高档 · 慢且贵" },
 ];
@@ -93,7 +91,7 @@ const CODEX_DEFAULT_INDEX = 1;
  */
 const GROK: EffortTier[] = [
   { name: "low", description: "更快 · 更轻的思考" },
-  { name: "medium", description: "默认档" },
+  { name: "medium", description: "均衡档" },
   { name: "high", description: "重度思考" },
   { name: "xhigh", description: "延展推理 · 慢且贵" },
 ];
@@ -104,14 +102,22 @@ const AGY: EffortTier[] = [{ name: "default", description: "agy CLI 默认档" }
 
 const EMPTY: EffortTier[] = [];
 
-/** Settings / New Session default: claude `high` (index 2 of the five levels). */
+/**
+ * Legacy fallback when neither a per-model default nor any remembered
+ * preference exists: claude `high` (index 2). This is NOT a marked default in
+ * the UI — the marker comes from {@link claudeDefaultTier} (D-056 §6).
+ */
 export const DEFAULT_EFFORT_INDEX = 2;
+
+/** xhigh is the tier the coupled build forces while ultracode is on. */
+export const CLAUDE_XHIGH_INDEX = 3;
 
 /**
  * Legacy Claude tier names from before the real `--effort` levels, mapped by
- * NAME onto the new table. `ultracode` was once a tier; it is now the
- * rightmost slider stop over the `xhigh` tier plus the ultracode boolean.
- * Anything unrecognised lands on the default `high`.
+ * NAME onto the new table. `ultracode` was once a tier; it is now an INPUT
+ * alias for the `xhigh` tier plus the orthogonal ultracode boolean (legacy
+ * stored prefs/drafts load as {xhigh, on}, D-056). Anything unrecognised
+ * lands on the legacy fallback `high`.
  */
 const CLAUDE_LEGACY_NAMES: Record<string, { tier: string; ultracode?: boolean }> = {
   default: { tier: "low" },
@@ -121,8 +127,8 @@ const CLAUDE_LEGACY_NAMES: Record<string, { tier: string; ultracode?: boolean }>
 };
 
 /**
- * Codex's retired `minimal` stop migrates to Low; unknown names fall back to
- * Medium. Max and Ultra resolve directly as current native tiers.
+ * Codex's retired `minimal` stop migrates to Low. Max and Ultra resolve
+ * directly as current native tiers.
  */
 const CODEX_LEGACY_NAMES: Record<string, string> = {
   minimal: "low",
@@ -138,7 +144,7 @@ const GROK_LEGACY_NAMES: Record<string, string> = {
   max: "xhigh",
 };
 
-/** Real default-tier index per harness table. */
+/** Real default-tier index per harness table (legacy CLI fallback only). */
 const TABLE_DEFAULT: Partial<Record<string, number>> = {
   claude: DEFAULT_EFFORT_INDEX,
   codex: CODEX_DEFAULT_INDEX,
@@ -154,7 +160,7 @@ export function effortTable(kind: EffortKind | string): EffortTier[] {
   return EMPTY;
 }
 
-/** Index of the harness's real CLI default tier. */
+/** Index of the harness's real CLI default tier (legacy fallback). */
 export function effortDefaultIndex(kind: EffortKind | string): number {
   const table = effortTable(kind);
   if (table.length === 0) return 0;
@@ -162,68 +168,36 @@ export function effortDefaultIndex(kind: EffortKind | string): number {
 }
 
 /**
- * The slider stops for a harness. Claude gets a sixth stop past `max` —
- * ultracode — which selects `xhigh` plus the workflow flag. Every other
- * harness exposes its native tiers one-to-one.
+ * The slider stops for a harness: its native tiers 1:1. Claude gets FIVE
+ * stops — ultracode is the separate switch below the pill.
  */
 export function effortStops(kind: EffortKind | string): EffortStop[] {
   const table = effortTable(kind);
   // The ~280px composer popover cannot fit six full tick labels; New Session's
   // inline field is wider and renders the full names (see EffortSlider).
   const popoverShort: Record<string, string> = { medium: "med", minimal: "min" };
-  const stops: EffortStop[] = table.map((tier, index) => ({
+  return table.map((tier, index) => ({
     ...tier,
     index,
-    ultracode: false,
     short: kind === "codex" ? undefined : popoverShort[tier.name],
   }));
-  if (kind === "claude") stops.push({ ...CLAUDE_ULTRACODE_STOP_DEF });
-  return stops;
 }
 
-/** Claude forces this tier while ultracode is on. */
-export const CLAUDE_ULTRACODE_INDEX = 3;
-
-/** Position of the ultracode stop on the six-stop Claude slider (past `max`). */
-export const CLAUDE_ULTRACODE_STOP = 5;
-
-/**
- * The ultracode stop, in the Desktop's slot: the rightmost stop past `max`,
- * still the `xhigh` tier plus the workflow flag on the wire.
- */
-const CLAUDE_ULTRACODE_STOP_DEF: EffortStop = {
-  name: "ultracode",
-  description: "多代理工作流 · 锁 xhigh",
-  index: CLAUDE_ULTRACODE_INDEX,
-  ultracode: true,
-  short: "ultra",
-};
-
-/** Slider position (0..stops-1) of a Claude tier/flag pair. Ultracode is the last stop. */
-export function effortStopIndex(
-  kind: EffortKind | string,
-  index: number,
-  ultracode?: boolean,
-): number {
-  if (kind === "claude" && ultracode === true) return CLAUDE_ULTRACODE_STOP;
+/** Clamped tier index for a harness — the switch is a separate axis. */
+export function effortStopIndex(kind: EffortKind | string, index: number): number {
   const stops = effortStops(kind);
   return clampEffortIndex(index, Math.max(1, stops.length));
 }
 
-/** Build a selection from a slider position. The last Claude stop is xhigh + ultracode. */
+/** Build a selection from a slider position (tier only; the flag is separate). */
 export function effortAtStop(kind: EffortKind | string, stopIndex: number): EffortSelection {
   const stops = effortStops(kind);
   const stop = stops[clampEffortIndex(stopIndex, Math.max(1, stops.length))];
-  return effortAt(kind, stop?.index ?? 0, stop?.ultracode === true);
+  return effortAt(kind, stop?.index ?? 0, false);
 }
 
-/** The name the UI shows for the current stop: "ultracode" while the flag is on. */
-export function effortStopName(
-  kind: EffortKind | string,
-  name: string,
-  ultracode?: boolean,
-): string {
-  if (kind === "claude" && ultracode === true) return "ultracode";
+/** The tier display name (the switch's on/off is rendered by the switch). */
+export function effortStopName(kind: EffortKind | string, name: string): string {
   return effortTable(kind).find((tier) => tier.name === name)?.label ?? name;
 }
 
@@ -253,9 +227,8 @@ export function normalizeClaudeName(
 
 /**
  * Resolve a stored/legacy NAME on a non-Claude harness table to a current row.
- * Legacy words migrate (codex `minimal→low`; grok `quick/standard/max`); an
- * unrecognised word lands on that harness's real CLI default. Returns the
- * table index and tier name.
+ * Legacy words migrate (codex `minimal`; grok `quick/standard/max`); an
+ * unrecognised word lands on that harness's real CLI default.
  */
 export function normalizeHarnessName(
   kind: EffortKind | string,
@@ -300,7 +273,7 @@ export function nativeEffortWord(kind: EffortKind | string, name: string): strin
   return name;
 }
 
-/** 0..1 position of a snapped index on a discrete track. A single-tier table sits at the top end. */
+/** 0..1 position of a snapped index on a discrete track. */
 export function effortRatio(index: number, length: number): number {
   if (length <= 1) return length === 1 ? 1 : 0;
   return clampEffortIndex(index, length) / (length - 1);
@@ -335,7 +308,9 @@ export function keyboardEffortIndex(current: number, key: string, length: number
 
 /**
  * The reset/default stop for a harness: the CLI's own real default
- * (claude `high`, codex/grok `medium`), rather than a ratio-mapped position.
+ * (codex/grok `medium`), rather than a ratio-mapped position. For Claude the
+ * marked default is per-model ({@link claudeDefaultTier}); this remains the
+ * generic fallback.
  */
 export function defaultEffortIndex(kind: EffortKind | string): number {
   return effortDefaultIndex(kind);
@@ -349,20 +324,31 @@ export function mapEffortIndex(fromIndex: number, fromLen: number, toLen: number
   return Math.round(t * (toLen - 1));
 }
 
+/**
+ * Build a selection. D-056: on Claude the ultracode boolean is orthogonal and
+ * stays on at the requested tier (≥2.1.284 semantics); the COUPLED-build
+ * linkage lives in the UI layer ({@link coupledSelection}), not here.
+ */
 export function effortAt(
   kind: EffortKind | string,
   index: number,
   ultracode?: boolean,
 ): EffortSelection {
   const table = effortTable(kind);
-  let i = clampEffortIndex(index, table.length);
-  let ultra = kind === "claude" && ultracode === true;
-  // Ultracode forces xhigh; the tier index never lingers on a different stop.
-  if (ultra) i = clampEffortIndex(CLAUDE_ULTRACODE_INDEX, table.length);
+  const i = clampEffortIndex(index, table.length);
   const name = table[i]?.name ?? "default";
   const selection: EffortSelection = { index: i, name, kind: (kind as EffortKind) || "claude" };
-  if (kind === "claude") selection.ultracode = ultra;
+  if (kind === "claude") selection.ultracode = ultracode === true;
   return selection;
+}
+
+/**
+ * Apply the COUPLED-build (2.1.203–2.1.283) rule: ultracode on forces the
+ * slider to xhigh. Used by every surface that has a concrete version gate.
+ */
+export function coupledSelection(selection: EffortSelection): EffortSelection {
+  if (selection.kind !== "claude" || selection.ultracode !== true) return selection;
+  return { ...selection, index: CLAUDE_XHIGH_INDEX, name: effortTable("claude")[CLAUDE_XHIGH_INDEX].name };
 }
 
 /** Rebuild a selection from an instance record after reload, mapping legacy names. */
@@ -382,6 +368,9 @@ export function effortFromRecord(
         index: norm.index,
         name: norm.tier,
         kind: "claude",
+        // The legacy `ultracode` NAME implies the flag even when the record
+        // carried no explicit boolean; an explicit boolean still rides along
+        // independently (D-056: {max, on} stays max).
         ultracode: ultracode === true || norm.ultracode,
       };
     }
@@ -401,20 +390,19 @@ export function effortFromRecord(
 }
 
 export function mapEffort(current: EffortSelection, nextKind: EffortKind | string): EffortSelection {
-  // ultracode is Claude-only; leaving Claude drops it, and it never enters elsewhere.
-  if (nextKind === "claude" && current.kind === "claude" && current.ultracode) {
-    return effortAt("claude", CLAUDE_ULTRACODE_INDEX, true);
-  }
+  // ultracode is Claude-only; leaving Claude drops it. Re-entering Claude
+  // keeps the FLAG at the ratio-mapped tier (the flag is orthogonal, D-056),
+  // rather than forcing xhigh.
+  const keepFlag = nextKind === "claude" && current.kind === "claude" && current.ultracode === true;
   const from = effortTable(current.kind);
   const to = effortTable(nextKind);
   const index = mapEffortIndex(current.index, from.length, to.length);
-  return effortAt(nextKind, index);
+  return effortAt(nextKind, index, keepFlag);
 }
 
 /**
- * The visual look for a stop. Claude ultracode and Codex Ultra share the
- * strongest animated ember field. Codex Max matches Claude's static Max
- * accent; native Ultra never sets the Claude workflow flag.
+ * The visual look for a stop. Claude ember follows the orthogonal ultracode
+ * SWITCH (any tier); Codex ember follows the native Ultra tier.
  */
 export function effortLook(
   kind: EffortKind | string,
@@ -425,29 +413,26 @@ export function effortLook(
   const table = effortTable(kind);
   if (kind === "claude") {
     // xhigh and max share the restrained top-tier accent.
-    return index >= CLAUDE_ULTRACODE_INDEX ? "top" : "plain";
+    return index >= CLAUDE_XHIGH_INDEX ? "top" : "plain";
   }
   if (kind === "codex") {
     if (table[index]?.name === "ultra") return "ultracode";
     return table[index]?.name === "max" ? "top" : "plain";
   }
-  // Other harnesses: their single native top row gets the same static accent;
+  // Other harnesses: their single native top row gets the static accent;
   // a single-tier table (agy) stays plain.
   if (table.length > 1 && index === table.length - 1) return "top";
   return "plain";
 }
 
-/** The single top native table row (`max` for Claude, `ultra` for Codex). */
+/** The single top native table row (`max` for Claude, `ultra` for Codex);
+ *  a single-tier table (agy) has no ember row. */
 export function isEmberTier(kind: EffortKind | string, index: number): boolean {
   const table = effortTable(kind);
-  return table.length > 0 && index === table.length - 1;
+  return table.length > 1 && index === table.length - 1;
 }
 
-/**
- * The full animated ember plays on Claude ultracode and Codex Ultra. Kept
- * under this name for the existing chip/list call sites; Max has the static
- * `top` look.
- */
+/** The full animated ember plays on the Claude switch or on Codex Ultra. */
 export function isEmberEffort(
   kind: EffortKind | string,
   index: number,
@@ -459,19 +444,153 @@ export function isEmberEffort(
 export function isEmberName(kind: EffortKind | string, name: string): boolean {
   const stops = effortStops(kind);
   const stop = stops.find((s) => s.name === name);
-  return stop ? effortLook(kind, stop.index, stop.ultracode) === "ultracode" : false;
+  return stop ? effortLook(kind, stop.index, false) === "ultracode" : false;
 }
 
 /**
- * The tier name to put on the wire. The current Hub stores an opaque effort
- * name, so an ultracode selection round-trips as the legacy `"ultracode"`
- * string until x-p1-proto lands the `{name, ultracode}` shape; reads map it
- * back through {@link normalizeClaudeName}. Non-Claude names must be current
- * tier words — legacy words migrate before this point, never pass through.
+ * The tier name to put on the wire. D-056: the web always sends a native
+ * level word; ultracode rides as its own boolean (`{name, ultracode, index}`),
+ * never as the legacy `"ultracode"` name. Legacy names migrate via
+ * {@link effortFromRecord} before reaching this point.
  */
 export function effortWireName(selection: EffortSelection): string {
-  if (selection.kind === "claude" && selection.ultracode) return "ultracode";
   return nativeEffortWord(selection.kind, selection.name);
+}
+
+// ── D-056 Claude Code version gating ─────────────────────────────────────
+
+export type ClaudeVersionGate =
+  /** ≥ 2.1.284: five stops + orthogonal switch at any level. */
+  | "decoupled"
+  /** 2.1.203–2.1.283: switch on forces xhigh; single `/effort ultracode`. */
+  | "coupled"
+  /** < 2.1.203: no ultracode at all; the switch is disabled with the reason. */
+  | "legacy"
+  /** Version unknown/unread: treat as decoupled-capable but say nothing fixed. */
+  | "unknown";
+
+/** First build that offered `--effort ultracode`. */
+export const CLAUDE_ULTRACODE_MIN_VERSION = "2.1.203";
+/** First build with the orthogonal toggle (`/effort ultracode on|off`). */
+export const CLAUDE_DECOUPLED_MIN_VERSION = "2.1.284";
+
+/** Parse a `major.minor.patch` (extra suffix tolerated); null when unreadable. */
+export function parseClaudeVersion(version: string | null | undefined): [number, number, number] | null {
+  if (!version) return null;
+  const match = /(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function cmpVersion(a: [number, number, number], b: [number, number, number]): number {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+/** Classify a Claude Code binary version for the ultracode switch rules. */
+export function claudeVersionGate(version: string | null | undefined): ClaudeVersionGate {
+  const parsed = parseClaudeVersion(version);
+  if (!parsed) return "unknown";
+  if (cmpVersion(parsed, parseClaudeVersion(CLAUDE_DECOUPLED_MIN_VERSION)!) >= 0) return "decoupled";
+  if (cmpVersion(parsed, parseClaudeVersion(CLAUDE_ULTRACODE_MIN_VERSION)!) >= 0) return "coupled";
+  return "legacy";
+}
+
+// ── D-056 §6 per-model default effort ────────────────────────────────────
+
+/** One row of the Hub's GET /v1/supply/catalog, narrowed to what the slider
+ *  needs (the rest of the row is ignored). */
+export type ModelEffortCatalogRow = {
+  id: string;
+  aliases?: string[];
+  defaultEffort?: string | null;
+  ultracodeCapable?: boolean | null;
+};
+
+/**
+ * Built-in fallback for offline/mock sessions; mirrors the Hub catalog's
+ * Claude rows. Longest id/alias wins, a dated gateway id matches its family
+ * by the `family-` / `family` prefix (same rule as model_catalog::lookup).
+ */
+const CLAUDE_MODEL_FALLBACK: ModelEffortCatalogRow[] = [
+  { id: "claude-opus-5", aliases: ["opus"], defaultEffort: "medium", ultracodeCapable: true },
+  { id: "claude-sonnet-5", aliases: ["sonnet"], defaultEffort: "medium", ultracodeCapable: true },
+  { id: "claude-fable-5", aliases: ["fable"], defaultEffort: "high", ultracodeCapable: true },
+  { id: "claude-haiku-4-5", aliases: ["haiku"], defaultEffort: "high", ultracodeCapable: true },
+];
+
+function normalizeModelId(modelId: string): string {
+  let id = modelId.trim().toLowerCase();
+  if (id.endsWith("[1m]")) id = id.slice(0, -4);
+  // Strip a dated snapshot suffix (`-20251001`).
+  const bytes = id.split("");
+  if (
+    bytes.length > 9
+    && bytes[bytes.length - 9] === "-"
+    && bytes.slice(bytes.length - 8).every((c) => c >= "0" && c <= "9")
+  ) {
+    id = id.slice(0, -9);
+  }
+  return id;
+}
+
+/**
+ * Resolve one catalog row for a model id (exact id, alias, gateway
+ * `profile/family-…` spelling, or a dated snapshot), longest candidate wins.
+ * `rows` are the Hub catalog rows when reachable; the built-in fallback fills
+ * in for demo/offline mode.
+ */
+export function lookupModelEffortRow(
+  modelId: string | null | undefined,
+  rows?: ModelEffortCatalogRow[] | null,
+): ModelEffortCatalogRow | null {
+  if (!modelId) return null;
+  const candidates = new Set<string>();
+  for (const raw of [modelId, modelId.split("/").pop() ?? ""]) {
+    let id = normalizeModelId(raw);
+    if (id) candidates.add(id);
+    // A gateway profile id may itself carry a `/` after normalization.
+    const tail = id.split("/").pop();
+    if (tail && tail !== id) candidates.add(normalizeModelId(tail));
+  }
+  let best: { len: number; row: ModelEffortCatalogRow } | null = null;
+  for (const row of rows && rows.length ? rows : CLAUDE_MODEL_FALLBACK) {
+    for (const candidateName of [row.id, ...(row.aliases ?? [])]) {
+      const candidate = candidateName.toLowerCase();
+      for (const id of candidates) {
+        if ((id === candidate || id.startsWith(`${candidate}-`)) && (!best || candidate.length > best.len)) {
+          best = { len: candidate.length, row };
+        }
+      }
+    }
+  }
+  return best?.row ?? null;
+}
+
+/**
+ * The per-model DEFAULT Claude tier to mark on the slider, or null when the
+ * model is unknown (no marker; an unpinned draft says "follow the model
+ * default" without guessing the tier — D-056 §6).
+ */
+export function claudeDefaultTier(
+  modelId: string | null | undefined,
+  rows?: ModelEffortCatalogRow[] | null,
+): { name: string; index: number } | null {
+  const row = lookupModelEffortRow(modelId, rows);
+  const name = row?.defaultEffort;
+  if (!name) return null;
+  const index = CLAUDE.findIndex((tier) => tier.name === name);
+  return index >= 0 ? { name, index } : null;
+}
+
+/** Whether the static catalog says this model supports the ultracode toggle. */
+export function modelUltracodeCapable(
+  modelId: string | null | undefined,
+  rows?: ModelEffortCatalogRow[] | null,
+): boolean {
+  return lookupModelEffortRow(modelId, rows)?.ultracodeCapable !== false;
 }
 
 export function effortCaps(kind: EffortKind | string): {
@@ -519,12 +638,15 @@ export const DEFAULT_MODELS: Record<string, string[]> = {
 };
 
 export function modelsFor(kind: string, extra: string[] = []): string[] {
-  const base = DEFAULT_MODELS[kind] ?? ["passthrough/auto"];
   const out: string[] = [];
-  for (const name of [...extra, ...base]) {
+  for (const name of [...extra, ...baseModels(kind)]) {
     if (name && !out.includes(name)) out.push(name);
   }
   return out;
+}
+
+function baseModels(kind: string): string[] {
+  return DEFAULT_MODELS[kind] ?? ["passthrough/auto"];
 }
 
 const CONTEXT_WINDOWS: Record<string, number> = {
@@ -535,7 +657,7 @@ const CONTEXT_WINDOWS: Record<string, number> = {
 };
 
 function tokenCount(k: UsagePayload["inputTokens"]): number | null {
-  if (k.state !== "known") return null;
+  if (!k || k.state !== "known") return null;
   const n = Number(k.value);
   return Number.isFinite(n) ? n : null;
 }
@@ -554,4 +676,9 @@ export function contextPercent(payload: UsagePayload | undefined, kind: string =
 
 export const EFFORT_MENU_HEADER = "EFFORT · 本回合生效，发 Command 不只改本地";
 export const EFFORT_MENU_FOOTER = "切换只影响后续回合，不重写已发出的 prompt";
-export const ULTRACODE_HINT = "ultracode · 锁定 xhigh，启用多代理工作流编排";
+
+/** Switch row copy (D-056 ui-spec §2.2). */
+export const ULTRACODE_SWITCH_LABEL = "Ultracode";
+export const ULTRACODE_SWITCH_DESC = "每个任务编排 dynamic workflow · 仅本会话";
+export const ULTRACODE_SWITCH_SPACE = "Ultracode 开关在档位下方独立存在，不移动滑杆";
+export const ULTRACODE_COUPLED_DESC = "开启后以 xhigh 运行（Claude Code 2.1.203–2.1.283）";

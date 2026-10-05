@@ -321,6 +321,21 @@
   padding: 0 2px;
 }
 
+/* D-056: the orthogonal switch renders as an ember suffix on the level word;
+   an unobserved flag keeps the muted colour until the verdict lands. */
+.chipUltra {
+  color: var(--ember-ultra);
+  font-size: 11px;
+  white-space: nowrap;
+  padding: 0 2px;
+}
+.chipUltraMuted {
+  color: var(--mute);
+  font-size: 11px;
+  white-space: nowrap;
+  padding: 0 2px;
+}
+
 /* §9.1: a push-down in flight — the requested word with a pulsing tag so the
    chip never shows the old level ambiguously (切换中 idle, 排队中 working). */
 .chipEffortPending .chipModel {

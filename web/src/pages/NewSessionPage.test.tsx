@@ -106,7 +106,7 @@ it("does not invent a root for a host with no registered workspace", () => {
 const cliHost = {
   ...host,
   cli: [
-    { kind: "claude", version: "2.1.0", path: "/usr/bin/claude" },
+    { kind: "claude", version: "2.1.289", path: "/usr/bin/claude" },
     { kind: "codex", version: "0.9.0", path: "/usr/bin/codex" },
     { kind: "grok", version: "0.4.0", path: "/usr/bin/grok" },
   ],
@@ -164,25 +164,25 @@ function renderWithLaunchableMatrix() {
   renderAt(["/sessions/new"]);
 }
 
-it("mounts the inline slider (layout A, no card) with the six Claude stops", () => {
+it("mounts the inline slider (layout A, no card) with the five Claude stops and a switch", () => {
   renderWithCli();
   const slider = screen.getByTestId("new-session-effort-slider");
   expect(slider).toHaveAttribute("role", "slider");
-  expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultracode");
-  expect(slider).toHaveAttribute("aria-valuemax", "5");
-  // The device default is Claude `high`, the third of six stops.
+  expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
+  expect(slider).toHaveAttribute("aria-valuemax", "4");
+  // No remembered preference: the unpinned draft shows the fallback high.
   expect(slider).toHaveAttribute("data-name", "high");
   expect(slider).toHaveAttribute("data-index", "2");
   expect(screen.getByTestId("new-session-effort-knob")).toBeInTheDocument();
   expect(screen.getByTestId("new-session-effort-track")).toBeInTheDocument();
   // Layout A: the label row and tick labels are present, with no card frame.
   expect(screen.getByTestId("new-session-effort-slider-panel")).toHaveAttribute("data-variant", "inline");
-  // The helper stays user vocabulary; the InstanceSpec implementation name no
-  // longer appears anywhere on the New Session form.
-  expect(screen.getByTestId("new-session-effort-foot")).toHaveTextContent("会话开始后仍可在会话内调整");
-  expect(screen.getByTestId("new-session-effort")).toHaveTextContent("会话开始后仍可在会话内调整");
-  // The standalone ultracode chip is gone; ultracode is the last tick.
-  expect(screen.queryByTestId("new-session-effort-ultracode")).toBeNull();
+  // The unpinned helper names the follow-the-model-default state.
+  expect(screen.getByTestId("new-session-effort-foot")).toHaveTextContent("跟随模型默认");
+  expect(screen.getByTestId("new-session-effort")).toHaveTextContent("跟随模型默认");
+  // D-056: the orthogonal switch is a row under the pill, not a sixth tick.
+  expect(screen.getByTestId("new-session-effort-ultracode")).toBeInTheDocument();
+  expect(screen.queryByTestId("new-session-effort-tier-ultracode")).toBeNull();
 });
 
 it("re-snaps the slider onto the new harness table when the runtime changes", () => {
@@ -209,29 +209,29 @@ it("re-snaps the slider onto the new harness table when the runtime changes", ()
   expect(slider()).toHaveAttribute("data-ember", "0");
 });
 
-it("keeps the top tier on top across harnesses and drops the draft with it", () => {
+it("keeps the top tier on top across harnesses and drops the flag with it", () => {
   renderWithCli();
   const slider = () => screen.getByTestId("new-session-effort-slider");
   slider().focus();
   fireEvent.keyDown(slider(), { key: "End" });
-  // End lands on the sixth stop, ultracode (xhigh tier + workflow flag).
-  expect(slider()).toHaveAttribute("data-name", "ultracode");
-  expect(slider()).toHaveAttribute("data-index", "5");
-  expect(slider()).toHaveAttribute("data-ember", "1");
+  // End lands on the fifth native stop, max (the flag is the separate row).
+  expect(slider()).toHaveAttribute("data-name", "max");
+  expect(slider()).toHaveAttribute("data-index", "4");
+  expect(slider()).toHaveAttribute("data-effort-look", "top");
 
-  // The ultracode flag is Claude-only; leaving Claude drops it and maps the
-  // xhigh tier (3/4) by ratio onto grok `high` (2/3) — top accents map to the
-  // static accent, the ember never crosses harnesses.
+  // The top tier is Claude-only and drops with the harness; the max RATIO
+  // maps onto each table's own top row; ember never crosses harnesses.
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
-  expect(slider()).toHaveAttribute("data-name", "high");
-  expect(slider()).toHaveAttribute("data-index", "2");
-  expect(slider()).toHaveAttribute("data-effort-look", "plain");
-  expect(slider()).toHaveAttribute("data-ember", "0");
-
-  // ...and back, without the stale draft the unmounted card held.
-  fireEvent.click(screen.getByTestId("new-session-kind-codex"));
   expect(slider()).toHaveAttribute("data-name", "xhigh");
   expect(slider()).toHaveAttribute("data-index", "3");
+  expect(slider()).toHaveAttribute("data-effort-look", "top");
+  expect(slider()).toHaveAttribute("data-ember", "0");
+
+  // ...and to codex, the same ratio is its native Ultra — but no flag.
+  fireEvent.click(screen.getByTestId("new-session-kind-codex"));
+  expect(slider()).toHaveAttribute("data-name", "ultra");
+  expect(slider()).toHaveAttribute("data-index", "5");
+  expect(slider()).toHaveAttribute("data-ultracode", "0");
   fireEvent.keyDown(slider(), { key: "Home" });
   expect(slider()).toHaveAttribute("data-name", "low");
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
@@ -239,33 +239,30 @@ it("keeps the top tier on top across harnesses and drops the draft with it", () 
   expect(slider()).toHaveAttribute("data-ember", "0");
 });
 
-it("the ultracode stop is reached on the one slider and the create carries the ultracode wire name", async () => {
+it("the orthogonal switch turns ultracode on at any tier and the create carries name+flag", async () => {
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
   renderWithCli();
   const slider = () => screen.getByTestId("new-session-effort-slider");
-  // End walks all six stops to ultracode; the track stays an enabled slider.
-  slider().focus();
-  fireEvent.keyDown(slider(), { key: "End" });
-  expect(slider()).toHaveAttribute("data-name", "ultracode");
-  expect(slider()).toHaveAttribute("data-index", "5");
-  expect(slider()).toHaveAttribute("data-tier-index", "3");
-  expect(slider()).toHaveAttribute("data-ultracode", "1");
-  expect(slider()).toHaveAttribute("data-ember", "1");
-  expect(slider()).toHaveAttribute("aria-disabled", "false");
-  expect(screen.getByTestId("new-session-effort-title")).toHaveTextContent("ultracode");
-  // One step back returns to max on the same slider.
-  fireEvent.keyDown(slider(), { key: "ArrowLeft" });
-  expect(slider()).toHaveAttribute("data-name", "max");
-  expect(slider()).toHaveAttribute("data-index", "4");
-  fireEvent.keyDown(slider(), { key: "ArrowRight" });
-  expect(slider()).toHaveAttribute("data-name", "ultracode");
+  const sw = screen.getByTestId("new-session-effort-ultracode-switch");
+  // Initially off; the pill is on high and not ember.
+  expect(sw).toHaveAttribute("aria-checked", "false");
+  expect(slider()).toHaveAttribute("data-name", "high");
 
+  // Flip the switch on at high — the slider NEVER moves (decoupled mock CLI).
+  fireEvent.click(sw);
+  expect(sw).toHaveAttribute("aria-checked", "true");
+  expect(slider()).toHaveAttribute("data-name", "high");
+  expect(slider()).toHaveAttribute("data-ultracode", "1");
+  expect(screen.getByTestId("new-session-effort")).toHaveAttribute("data-pinned", "1");
+
+  // Create carries a native level plus the boolean, never the old alias.
   fireEvent.click(screen.getByTestId("new-session-start"));
   await waitFor(() =>
     expect(create).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "claude", effortIndex: 3, effortName: "ultracode" }),
+      expect.objectContaining({ kind: "claude", effortIndex: 2, effortName: "high", effortUltracode: true }),
     ),
   );
+  expect(create.mock.calls[0][0].effortName).not.toBe("ultracode");
 });
 
 it("writes the slider's tier into the instance it creates", async () => {

@@ -36,7 +36,7 @@ describe("Composer shortcuts", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("renders collapsed chips and lists the six Claude stops", async () => {
+  it("renders collapsed chips, five tier stops and the ultracode switch", async () => {
     const user = userEvent.setup();
     const onEffort = vi.fn();
     render(
@@ -60,28 +60,30 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("context-chip")).toHaveTextContent("74%");
     expect(screen.getByTestId("permission-chip")).toHaveTextContent(/询问/);
     await user.click(screen.getByTestId("model-effort-chip"));
-    // Row 1 lightning + tier + reset, row 2 model, then the pill with ticks.
-    // No standalone ultracode chip and no tier/model list until the chevron is tapped.
+    // The panel shows the pill, and the switch row sits below it.
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
     expect(screen.queryByTestId("effort-tier-low")).toBeNull();
     expect(screen.queryByTestId("model-option-opus")).toBeNull();
-    expect(screen.queryByTestId("effort-ultracode")).toBeNull();
     const slider = screen.getByTestId("effort-slider");
-    expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultracode");
-    expect(slider).toHaveAttribute("aria-valuemax", "5");
+    expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
+    expect(slider).toHaveAttribute("aria-valuemax", "4");
     expect(slider).toHaveAttribute("data-name", "high");
     expect(slider).toHaveAttribute("data-ultracode", "0");
     expect(slider).toHaveAttribute("aria-valuetext", "high");
     expect(screen.getByTestId("effort-title")).toHaveTextContent("high");
     expect(screen.getByTestId("effort-model")).toHaveTextContent("opus");
     expect(screen.getByTestId("effort-knob")).toBeInTheDocument();
+    // The orthogonal switch exists below the pill and starts off.
+    const sw = screen.getByTestId("effort-ultracode-switch");
+    expect(sw).toHaveAttribute("role", "switch");
+    expect(sw).toHaveAttribute("aria-checked", "false");
     slider.focus();
-    // End now lands on the sixth stop — ultracode = xhigh tier + workflow flag.
+    // End lands on the fifth native stop, max — the flag is a separate row.
     await user.keyboard("{End}");
-    expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "xhigh", kind: "claude", ultracode: true });
+    expect(onEffort).toHaveBeenCalledWith({ index: 4, name: "max", kind: "claude", ultracode: false });
   });
 
-  it("the tier name opens a list of stops and models, and picking one closes it", async () => {
+  it("the tier name opens a list of five stops and models, and picking one closes it", async () => {
     const user = userEvent.setup();
     const onEffort = vi.fn();
     const onModel = vi.fn();
@@ -101,11 +103,10 @@ describe("Composer shortcuts", () => {
     await user.click(screen.getByTestId("effort-open-list"));
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "list");
     expect(screen.queryByTestId("effort-slider")).toBeNull();
-    // The ladder in the list: max carries the restrained top accent, only
-    // ultracode plays the full ember look.
+    // Five tiers; max carries the restrained top accent; there is NO ultracode
+    // tier row (it is the switch on the slider view).
     expect(screen.getByTestId("effort-tier-max")).toHaveAttribute("data-effort-look", "top");
-    expect(screen.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-effort-look", "ultracode");
-    expect(screen.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ultracode", "1");
+    expect(screen.queryByTestId("effort-tier-ultracode")).toBeNull();
     expect(screen.getByTestId("effort-tier-high")).toHaveAttribute("data-selected", "1");
     expect(screen.getByTestId("effort-list")).toHaveTextContent("跨文件 · 长任务");
     await user.click(screen.getByTestId("model-option-sonnet"));
@@ -118,7 +119,7 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
   });
 
-  it("max carries the restrained top accent, not the ember (ultracode alone ember)", async () => {
+  it("max carries the restrained top accent, not the ember (the switch alone ember)", async () => {
     const user = userEvent.setup();
     render(
       <Composer
@@ -135,13 +136,14 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-effort-look", "top");
     expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-ember", "0");
     expect(screen.getByTestId("effort-title")).toHaveAttribute("data-effort-look", "top");
-    // The collapsed chip never animates on max.
+    // The collapsed chip never animates on a plain max.
     expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0");
   });
 
-  it("plain xhigh is not ember; the ultracode stop plays ember and names itself ultracode", async () => {
+  it("plain xhigh is not ember; flipping the switch plays ember at the tier and never moves the slider", async () => {
     const user = userEvent.setup();
     const onEffort = vi.fn();
+    const onUltracode = vi.fn();
     const { rerender } = render(
       <Composer
         instanceId="ins_ultra"
@@ -151,6 +153,8 @@ describe("Composer shortcuts", () => {
         model="opus"
         effort={effortAt("claude", 3)}
         onEffort={onEffort}
+        onUltracode={onUltracode}
+        ultraGate="decoupled"
       />,
     );
     await user.click(screen.getByTestId("model-effort-chip"));
@@ -160,12 +164,17 @@ describe("Composer shortcuts", () => {
     expect(slider).toHaveAttribute("data-ember", "0");
     expect(slider).toHaveAttribute("data-ultracode", "0");
 
-    // Walk xhigh → max → ultracode on the one slider (there is no separate chip).
+    // The arrow keys walk the five tiers only; they never toggle the switch.
     slider.focus();
     await user.keyboard("{ArrowRight}");
     expect(onEffort).toHaveBeenLastCalledWith({ index: 4, name: "max", kind: "claude", ultracode: false });
-    await user.keyboard("{ArrowRight}");
-    expect(onEffort).toHaveBeenLastCalledWith({ index: 3, name: "xhigh", kind: "claude", ultracode: true });
+    await user.keyboard("{End}");
+    expect(onEffort).toHaveBeenLastCalledWith({ index: 4, name: "max", kind: "claude", ultracode: false });
+
+    // The switch flips independently and keeps the slider on xhigh.
+    await user.click(screen.getByTestId("effort-ultracode-switch"));
+    expect(onUltracode).toHaveBeenCalledWith(true);
+    expect(onEffort).not.toHaveBeenCalledWith(expect.objectContaining({ ultracode: true }));
 
     rerender(
       <Composer
@@ -177,40 +186,26 @@ describe("Composer shortcuts", () => {
         effort={effortAt("claude", 3, true)}
         effortEffective={{ name: "xhigh", ultracode: true, source: "remuda", observedAt: "2026-09-14T00:00:00Z" }}
         onEffort={onEffort}
+        onUltracode={onUltracode}
+        ultraGate="decoupled"
       />,
     );
-    expect(slider).toHaveAttribute("data-name", "ultracode");
-    expect(slider).toHaveAttribute("data-index", "5");
-    expect(slider).toHaveAttribute("data-tier-index", "3");
+    // Slider stays on xhigh; ember follows the switch state.
+    expect(slider).toHaveAttribute("data-name", "xhigh");
+    expect(slider).toHaveAttribute("data-index", "3");
     expect(slider).toHaveAttribute("data-ultracode", "1");
-    expect(slider).toHaveAttribute("data-ember", "1");
-    // The stop is a normal slider stop: the track stays enabled...
-    expect(slider).toHaveAttribute("aria-disabled", "false");
-    // §9.1: the read-back is tier xhigh + the ultracode flag, and the chip
-    // names the stop the user actually chose — "ultracode" (effort-sync-2).
-    expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("ultracode");
-    expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-effective", "ultracode");
-    expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
-    // One arrow left from the ultracode stop returns to max — no locked track.
-    await user.keyboard("{ArrowLeft}");
-    expect(onEffort).toHaveBeenLastCalledWith({ index: 4, name: "max", kind: "claude", ultracode: false });
-    // A bare xhigh read-back without the flag is still the tier word.
-    rerender(
-      <Composer
-        instanceId="ins_ultra"
-        mobile={false}
-        onSend={vi.fn()}
-        kind="claude"
-        model="opus"
-        effort={effortAt("claude", 3, false)}
-        effortEffective={{ name: "xhigh", ultracode: false, source: "remuda", observedAt: "2026-09-14T00:00:01Z" }}
-        onEffort={onEffort}
-      />,
-    );
+    expect(screen.getByTestId("effort-ultracode-switch")).toHaveAttribute("aria-checked", "true");
+    // The chip reads the level plus the separate ultracode marker.
     expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("xhigh");
+    expect(screen.getByTestId("model-effort-ultracode")).toHaveTextContent(/ultracode/);
+    expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ultracode-effective", "on");
+    expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+    // Flipping the switch off leaves the tier on xhigh (orthogonal).
+    await user.click(screen.getByTestId("effort-ultracode-switch"));
+    expect(onUltracode).toHaveBeenLastCalledWith(false);
   });
 
-  it("snaps a pointer drag to the nearest of the six Claude stops", async () => {
+  it("snaps a pointer drag to the nearest of the five Claude stops", async () => {
     const user = userEvent.setup();
     const onEffort = vi.fn();
     render(
@@ -228,7 +223,7 @@ describe("Composer shortcuts", () => {
     const slider = screen.getByTestId("effort-slider");
     const track = screen.getByTestId("effort-track");
     // 400px pill; the knob centre travels between x=18 and x=382 (KNOB_INSET),
-    // now across six stops (5 intervals).
+    // across five stops (4 intervals).
     vi.spyOn(track, "getBoundingClientRect").mockReturnValue({
       x: 0,
       y: 0,
@@ -242,21 +237,15 @@ describe("Composer shortcuts", () => {
         return {};
       },
     });
-    // Four fifths across = the fifth stop, max (not yet ultracode).
-    fireEvent.pointerDown(slider, { clientX: 309, pointerId: 1, button: 0 });
-    fireEvent.pointerUp(slider, { clientX: 309, pointerId: 1, button: 0 });
+    // All the way right = the fifth stop, max (the flag is a separate row).
+    fireEvent.pointerDown(slider, { clientX: 396, pointerId: 2, button: 0 });
+    fireEvent.pointerUp(slider, { clientX: 396, pointerId: 2, button: 0 });
     expect(onEffort).toHaveBeenCalledWith({ index: 4, name: "max", kind: "claude", ultracode: false });
 
     onEffort.mockClear();
-    // The far-right stop is ultracode: xhigh tier plus the workflow flag.
-    fireEvent.pointerDown(slider, { clientX: 396, pointerId: 2, button: 0 });
-    fireEvent.pointerUp(slider, { clientX: 396, pointerId: 2, button: 0 });
-    expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "xhigh", kind: "claude", ultracode: true });
-
-    onEffort.mockClear();
-    // Three fifths lands on xhigh (stop 3), a plain tier.
-    fireEvent.pointerDown(slider, { clientX: 236, pointerId: 3, button: 0 });
-    fireEvent.pointerUp(slider, { clientX: 236, pointerId: 3, button: 0 });
+    // Three quarters lands on xhigh (stop 3), a plain tier.
+    fireEvent.pointerDown(slider, { clientX: 291, pointerId: 3, button: 0 });
+    fireEvent.pointerUp(slider, { clientX: 291, pointerId: 3, button: 0 });
     expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "xhigh", kind: "claude", ultracode: false });
   });
 

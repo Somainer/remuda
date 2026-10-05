@@ -898,3 +898,146 @@
 .effortDesc {
   composes: effortDesc from "./optionRows.module.css";
 }
+
+/* ── D-056 orthogonal Ultracode switch ──────────────────────────────────
+   Sits below the pill in both the desktop card and the phone sheet. The
+   ember follows the SWITCH state (any tier); the pill stays tier-only. */
+.ultraRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin: 10px 0 2px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-input) 80%, transparent);
+}
+.ultraRow[data-state="on"] {
+  border-color: color-mix(in srgb, var(--ember-ultra) 55%, var(--border));
+  background: color-mix(in srgb, var(--ember-ultra) 10%, var(--bg-input));
+}
+.ultraText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ultraLabel {
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-body);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.ultraLabelOn {
+  color: var(--ember-ultra);
+}
+.ultraMarker {
+  font-size: var(--text-faint);
+  color: var(--fg-faint);
+}
+.ultraMarker[data-effective="on"] {
+  color: var(--ember-ultra);
+}
+.ultraDesc {
+  font-size: var(--text-faint);
+  line-height: var(--lh-meta);
+  color: var(--fg-faint);
+}
+.ultraReason {
+  font-size: var(--text-faint);
+  color: var(--danger-fg, var(--fg-muted));
+}
+.ultraSwitch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-inset, var(--bg-input));
+  cursor: pointer;
+  padding: 0;
+  /* 44px hit area without growing the visual track. */
+  touch-action: manipulation;
+}
+.ultraSwitch::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--touch, 44px);
+  height: var(--touch, 44px);
+  transform: translate(-50%, -50%);
+}
+.ultraThumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--ember-knob-face);
+  border: 1px solid var(--ember-knob-edge);
+  transition: left 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+.ultraSwitchOn {
+  background: linear-gradient(120deg, color-mix(in srgb, var(--ember-ultra) 55%, #6b4413), var(--ember-ultra));
+  border-color: var(--ember-ring-ultra);
+}
+.ultraSwitchOn .ultraThumb {
+  left: 20px;
+  background: var(--ember-knob-ultra-bg);
+  box-shadow: 0 0 0 1px var(--ember-ring-ultra), 0 0 10px color-mix(in srgb, var(--ember-ultra) 70%, transparent);
+  animation: ultraSwitchBreath 2.4s ease-in-out infinite;
+}
+.ultraSwitch:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.ultraSwitch:disabled .ultraThumb {
+  animation: none;
+}
+.ultraSwitch:focus-visible {
+  outline: 2px solid var(--focus, #6ea8ff);
+  outline-offset: 2px;
+}
+@keyframes ultraSwitchBreath {
+  0%, 100% {
+    box-shadow: 0 0 0 1px var(--ember-ring-ultra), 0 0 6px color-mix(in srgb, var(--ember-ultra) 55%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 1px var(--ember-ring-ultra), 0 0 13px color-mix(in srgb, var(--ember-ultra) 85%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ultraSwitchOn .ultraThumb {
+    animation: none;
+  }
+  .ultraThumb {
+    transition: none;
+  }
+}
+@media (max-width: 767px) {
+  .ultraRow {
+    min-height: 44px;
+  }
+}
+
+/* Per-model default marker (D-056 §6): a small ring on the default dot/tick. */
+.effortDotDefault {
+  outline: 1px solid var(--fg-faint);
+  outline-offset: 1px;
+}
+.effortTickDefault {
+  position: absolute;
+  top: -7px;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: var(--fg-faint);
+}

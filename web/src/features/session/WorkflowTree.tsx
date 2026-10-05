@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { WorkflowMemberPayload, WorkflowPhasePayload, WorkflowRunPayload } from "../../types/generated";
 import { knowledgeValue } from "../../types/command";
@@ -28,21 +29,13 @@ export function WorkflowTree({
         <span className={css.stat}>只画身份与状态，log 进原始事件</span>
       </summary>
       <div className={css.wfMembers}>
-        {phases.map((phase) => {
-          const phaseMembers = members.filter((m) => m.phaseId === phase.phaseId);
-          return (
-            <details key={phase.phaseId} open data-testid="workflow-phase">
-              <summary className={css.wfPhase}>
-                <span>{knowledgeValue(phase.label) ?? phase.phaseId}</span>
-              </summary>
-              <ul className={css.wfMembers}>
-                {phaseMembers.map((m) => (
-                  <MemberRow key={m.memberId} member={m} />
-                ))}
-              </ul>
-            </details>
-          );
-        })}
+        {phases.map((phase) => (
+          <PhaseGroup
+            key={phase.phaseId}
+            phase={phase}
+            members={members.filter((m) => m.phaseId === phase.phaseId)}
+          />
+        ))}
         {unphasedMembers(phases, members).length ? (
           <ul className={css.wfMembers}>
             {unphasedMembers(phases, members).map((m) => (
@@ -51,6 +44,37 @@ export function WorkflowTree({
           </ul>
         ) : null}
       </div>
+    </details>
+  );
+}
+
+/**
+ * One collapsible phase. The disclosure state is owned here (rather than an
+ * always-`open` native details) so the chevron is bound to THIS phase's own
+ * open state (`details.wfPhaseDetails[open] > summary`), never to an open
+ * ancestor run <details>: a collapsed phase inside an open run must show ▸.
+ */
+function PhaseGroup({ phase, members }: { phase: WorkflowPhasePayload; members: WorkflowMemberPayload[] }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <details
+      className={css.wfPhaseDetails}
+      data-testid="workflow-phase"
+      open={open}
+      data-open={open ? "1" : "0"}
+    >
+      <summary
+        className={css.wfPhase}
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span>{knowledgeValue(phase.label) ?? phase.phaseId}</span>
+      </summary>
+      <ul className={css.wfMembers}>
+        {members.map((m) => (
+          <MemberRow key={m.memberId} member={m} />
+        ))}
+      </ul>
     </details>
   );
 }

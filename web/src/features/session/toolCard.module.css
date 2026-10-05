@@ -211,7 +211,11 @@
 }
 .wfPhase::-webkit-details-marker { display: none; }
 .wfPhase::before { content: "▸"; }
-details[open] .wfPhase::before { content: "▾"; }
+/* The chevron is bound to the phase's OWN <details> via a direct-child
+   selector. The previous `details[open] .wfPhase` matched any open ancestor
+   (the run <details open>), so a collapsed phase inside an open run kept the
+   down chevron. */
+details.wfPhaseDetails[open] > summary.wfPhase::before { content: "▾"; }
 
 .wfMembers {
   padding: var(--space-2) var(--space-3) 10px;

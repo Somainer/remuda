@@ -686,7 +686,7 @@ fn copy_dir_merge(root: &Path, src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Copy one symlink entry as an independent file, when and only when every hop
 /// of its target chain stays inside `root` and ends at a regular file.
 fn copy_linked_file(root: &Path, link: &Path, dest: &Path) -> std::io::Result<()> {
-    if lexically_exists(&dest)? {
+    if lexically_exists(dest)? {
         // Never overwrite a destination entry, including a destination link.
         return Ok(());
     }

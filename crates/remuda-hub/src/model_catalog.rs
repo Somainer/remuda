@@ -17,7 +17,7 @@ use remuda_protocol::ModelClass;
 
 /// Bumped whenever a row is added or changed so placement ledgers stay
 /// attributable to the catalog revision they were solved against.
-pub const CATALOG_REVISION: u32 = 2;
+pub const CATALOG_REVISION: u32 = 3;
 
 /// ISO date (YYYY-MM-DD) of the last catalog refresh.
 pub const CATALOG_UPDATED: &str = "2026-09-15";
@@ -68,6 +68,18 @@ pub struct CapabilityProfile {
     pub max_output_tokens: u64,
     /// Supported native effort tier names (aligns with the web effort tables).
     pub effort_levels: &'static [&'static str],
+    /// D-056 §6 per-model DEFAULT Claude effort tier (one of
+    /// [`effort_levels`](Self::effort_levels)). `None` means the catalog does
+    /// not know a default: the UI shows no default marker and the New Session
+    /// draft stays unpinned ("follow the model default") rather than guessing.
+    /// Always `None` for non-Claude rows (their CLI default lives in the
+    /// driver/web tier tables).
+    pub default_effort: Option<&'static str>,
+    /// D-056 §5: the model accepts the orthogonal ultracode session toggle
+    /// (Claude ≥2.1.284 semantics). `false` covers non-Claude rows and a
+    /// known-incapable model; a runtime refusal is still projected from the
+    /// session journal, not guessed from this static bit.
+    pub ultracode_capable: bool,
     /// Feature support.
     pub supports: ModelSupports,
     /// Task shapes this model is suited for (hints, never hard filters).
@@ -126,6 +138,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 1_000_000,
         max_output_tokens: 64_000,
         effort_levels: CLAUDE_LEVELS,
+        default_effort: Some("high"),
+        ultracode_capable: true,
         supports: CLAUDE_SUPPORTS,
         suited_for: &["design-heavy", "coordination", "review"],
         status: CapabilityStatus::Published,
@@ -138,6 +152,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 1_048_576,
         max_output_tokens: 64_000,
         effort_levels: CLAUDE_LEVELS,
+        default_effort: Some("medium"),
+        ultracode_capable: true,
         supports: CLAUDE_SUPPORTS,
         suited_for: &["design-heavy", "rebase", "review"],
         status: CapabilityStatus::Provisional,
@@ -150,6 +166,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 1_000_000,
         max_output_tokens: 64_000,
         effort_levels: CLAUDE_LEVELS,
+        default_effort: Some("medium"),
+        ultracode_capable: true,
         supports: CLAUDE_SUPPORTS,
         suited_for: &["implement", "test", "docs"],
         status: CapabilityStatus::Provisional,
@@ -162,6 +180,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 200_000,
         max_output_tokens: 8_192,
         effort_levels: CLAUDE_LEVELS,
+        default_effort: Some("high"),
+        ultracode_capable: true,
         supports: CLAUDE_SUPPORTS,
         suited_for: &["triage", "docs", "cheap"],
         status: CapabilityStatus::Published,
@@ -175,6 +195,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 400_000,
         max_output_tokens: 128_000,
         effort_levels: CODEX_LEVELS,
+        default_effort: None,
+        ultracode_capable: false,
         supports: ModelSupports {
             tool_choice_any: true,
             structured_output: true,
@@ -193,6 +215,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 400_000,
         max_output_tokens: 128_000,
         effort_levels: CODEX_LEVELS,
+        default_effort: None,
+        ultracode_capable: false,
         supports: ModelSupports {
             tool_choice_any: true,
             structured_output: true,
@@ -211,6 +235,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 400_000,
         max_output_tokens: 128_000,
         effort_levels: CODEX_LEVELS,
+        default_effort: None,
+        ultracode_capable: false,
         supports: ModelSupports {
             tool_choice_any: true,
             structured_output: true,
@@ -230,6 +256,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 256_000,
         max_output_tokens: 32_000,
         effort_levels: &["quick", "standard", "max"],
+        default_effort: None,
+        ultracode_capable: false,
         supports: ModelSupports {
             tool_choice_any: false,
             structured_output: true,
@@ -248,6 +276,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 256_000,
         max_output_tokens: 16_000,
         effort_levels: &["quick", "standard", "max"],
+        default_effort: None,
+        ultracode_capable: false,
         supports: ModelSupports {
             tool_choice_any: false,
             structured_output: true,
@@ -266,6 +296,8 @@ static CATALOG: &[CapabilityProfile] = &[
         context_window: 131_072,
         max_output_tokens: 8_192,
         effort_levels: &["quick", "standard", "max"],
+        default_effort: None,
+        ultracode_capable: false,
         supports: ModelSupports {
             tool_choice_any: false,
             structured_output: true,
@@ -336,6 +368,23 @@ pub fn class_of(model_id: &str, declared_role: Option<&str>) -> Option<ModelClas
         .or_else(|| declared_role.and_then(ModelClass::from_wire))
 }
 
+/// D-056 §6: the per-model default Claude effort tier the web marks on the
+/// slider and uses when a draft is unpinned. `None` = the catalog does not
+/// know this model (no marker; the draft stays on "follow the model
+/// default"). Non-Claude rows always return `None`.
+#[must_use]
+pub fn default_effort_of(model_id: &str) -> Option<&'static str> {
+    lookup(model_id).and_then(|row| row.default_effort)
+}
+
+/// D-056: whether the model accepts the orthogonal ultracode session toggle
+/// according to the static catalog. A `false` here is advisory — a runtime
+/// refusal still comes from the session journal.
+#[must_use]
+pub fn ultracode_capable(model_id: &str) -> bool {
+    lookup(model_id).is_some_and(|row| row.ultracode_capable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,7 +431,40 @@ mod tests {
         // Opus input price is carried from the (provisional) driver card.
         assert_eq!(opus.input_price_per_mtok(), Some(15.0));
         assert!(opus.price_is_provisional());
-        assert_eq!(CATALOG_REVISION, 2);
+        assert_eq!(CATALOG_REVISION, 3);
+    }
+
+    #[test]
+    fn d056_per_model_default_effort_and_ultracode_flags() {
+        // Measured 2.1.289 defaults: Opus 5.5 / Sonnet 5.5 = medium, the rest
+        // of the Claude family = high; only Claude rows carry the ultracode
+        // toggle, and every default is a real row of the table.
+        assert_eq!(default_effort_of("claude-opus-5"), Some("medium"));
+        assert_eq!(default_effort_of("opus"), Some("medium"));
+        assert_eq!(default_effort_of("claude-sonnet-5"), Some("medium"));
+        assert_eq!(default_effort_of("claude-fable-5"), Some("high"));
+        assert_eq!(default_effort_of("claude-haiku-4-5"), Some("high"));
+        // Non-Claude rows have no Claude default marker.
+        assert_eq!(default_effort_of("gpt-5"), None);
+        assert_eq!(default_effort_of("grok-4"), None);
+        // An unknown gateway model is unknown, not "high".
+        assert_eq!(default_effort_of("gw/some-claude-2099"), None);
+        for id in [
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ] {
+            let row = lookup(id).unwrap();
+            assert!(row.ultracode_capable, "{id}");
+            assert!(
+                row.effort_levels.contains(&row.default_effort.unwrap()),
+                "{id} default is a real tier"
+            );
+        }
+        assert!(!ultracode_capable("gpt-5"));
+        assert!(!ultracode_capable("grok-4"));
+        assert!(!ultracode_capable("gw/unknown"));
     }
 
     #[test]

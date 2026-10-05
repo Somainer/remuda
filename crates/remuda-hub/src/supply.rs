@@ -1422,6 +1422,10 @@ async fn catalog_http(
                 "contextWindow": row.context_window,
                 "maxOutputTokens": row.max_output_tokens,
                 "effortLevels": row.effort_levels,
+                // D-056 §6 per-model default + ultracode toggle capability;
+                // null/default when the catalog does not know the model.
+                "defaultEffort": row.default_effort,
+                "ultracodeCapable": row.ultracode_capable,
                 "supports": {
                     "toolChoiceAny": row.supports.tool_choice_any,
                     "structuredOutput": row.supports.structured_output,

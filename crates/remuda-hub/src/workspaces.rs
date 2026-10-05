@@ -200,13 +200,16 @@ async fn require_host(state: &AppState, id: &str) -> Result<(), HubError> {
     Ok(())
 }
 
-/// A session stops occupying its workspace only on process-end evidence:
-/// `exited` is set by the Node when the driver process actually ends
-/// (explicit close or native exit, failed or otherwise). A `failed` row is
-/// retriable in place and its process may still be alive, so it keeps
-/// blocking; every other lifecycle (including `closed`, which no Node emits)
-/// blocks too. Ended sessions keep their history rows but never block.
-const ACTIVE_WORKSPACE_SESSION_SQL: &str = "lifecycle <> 'exited'";
+/// A session stops occupying its workspace once its process has ended.
+/// Both terminal lifecycles end occupancy: `exited` (clean close or
+/// successful native exit) and `failed` (process ended with an error —
+/// non-zero exit, signal or EOF; D-057 OA6: failed is itself process-end
+/// evidence and never a turn-level error). Rows in every other lifecycle
+/// (including `closed`, which no current Node emits) keep blocking.
+/// Liveness for a legacy row written before c-cardsettle stays the Node's
+/// job: its own live-session count refuses unbind while the session's
+/// process is still running even if the Hub row says failed.
+const ACTIVE_WORKSPACE_SESSION_SQL: &str = "lifecycle NOT IN ('exited', 'failed')";
 
 /// Task states that no longer occupy the bound directory. A parked or
 /// deferred task still holds its lease, so it keeps blocking removal; an
@@ -628,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn only_process_end_exited_stops_blocking_failed_keeps_occupancy() {
+    fn both_terminal_lifecycles_exited_and_failed_stop_blocking() {
         let conn = seeded_conn();
         assert_eq!(
             count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
@@ -640,8 +643,7 @@ mod tests {
             count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
             (2, 0)
         );
-        // Only process-end evidence (`exited`) frees the directory; its
-        // history row is kept while the count drops.
+        // Clean process end frees the directory; its history row is kept.
         conn.execute(
             "UPDATE instances SET lifecycle = 'exited' WHERE workspace_id = 'wsp_x'",
             [],
@@ -651,21 +653,16 @@ mod tests {
             count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
             (0, 0)
         );
-        // `failed` is retriable in place and the process may still be alive:
-        // it keeps blocking. `closed` (defensive; never emitted by a Node) is
-        // not process-end evidence either and keeps blocking.
+        // A process that ended with an error is equally terminal (D-057 OA6):
+        // failed is process-end evidence, not a turn-level error.
         insert_instance(&conn, "wsp_x", "failed");
-        insert_instance(&conn, "wsp_x", "closed");
         assert_eq!(
             count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
-            (2, 0)
+            (0, 0)
         );
-        // The failed row stops blocking only once process-end lands.
-        conn.execute(
-            "UPDATE instances SET lifecycle = 'exited' WHERE workspace_id = 'wsp_x' AND lifecycle = 'failed'",
-            [],
-        )
-        .unwrap();
+        // `closed` (defensive; never emitted by a current Node) is not a
+        // terminal lifecycle and keeps blocking.
+        insert_instance(&conn, "wsp_x", "closed");
         assert_eq!(
             count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
             (1, 0)

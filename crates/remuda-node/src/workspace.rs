@@ -540,13 +540,19 @@ impl DevNode {
                     .list_instances()?
                     .items
                     .iter()
-                    // Only process-end evidence frees the directory: `exited`
-                    // is set when the driver process actually ends. A
-                    // `failed` session is retriable in place and its process
-                    // may still be alive, so it keeps blocking (owner rule).
+                    // Process-end evidence (`exited` = clean/close,
+                    // `failed` = ended with an error; D-057 OA6: failed is
+                    // terminal process state, not a turn-level error) frees
+                    // the directory. The Hub has the same ended definition.
+                    // A live process keeps blocking regardless of any stale
+                    // lifecycle recorded before the process actually ended.
                     .filter(|instance| {
                         instance.workspace_id == *workspace_id
-                            && instance.lifecycle != remuda_protocol::InstanceLifecycle::Exited
+                            && !matches!(
+                                instance.lifecycle,
+                                remuda_protocol::InstanceLifecycle::Exited
+                                    | remuda_protocol::InstanceLifecycle::Failed
+                            )
                     })
                     .count())
             })
@@ -1356,6 +1362,77 @@ mod tests {
                 .iter()
                 .all(|row| row.meta.id != workspace.meta.id)
         );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_native_process_dies_with_an_error_unblocks_removal() {
+        // Round 3 item 5: failed IS terminal (a non-zero native exit), so a
+        // real error exit — driven through the native-exit path, not an SQL
+        // update — ends occupancy just like a clean exit.
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(root.path().to_path_buf())
+            .with_workspace_roots(vec![root.path().to_path_buf()])
+            .with_workspace_registry(data.path().to_path_buf());
+        let node = crate::DevNode::new(&config).unwrap();
+        let workspace = node.workspaces().unwrap()[0].clone();
+
+        // A foreground command that exits non-zero: the process is genuinely
+        // gone, and the exit is terminal evidence (native-exit-code-1).
+        let request: crate::CreateInstanceRequest = serde_json::from_value(json!({
+            "workspaceId": workspace.meta.id,
+            "kind": "terminal",
+            "driver": "shell-pty",
+            "args": ["/bin/sh", "-c", "exit 1"],
+            "prompt": "",
+        }))
+        .unwrap();
+        let created = node.create_instance(request).await.unwrap();
+        let instance_id = created.instance.meta.id.clone();
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let instance = node
+                    .list_instances()
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .find(|instance| instance.meta.id == instance_id)
+                    .unwrap();
+                if matches!(
+                    instance.lifecycle,
+                    remuda_protocol::InstanceLifecycle::Exited
+                        | remuda_protocol::InstanceLifecycle::Failed
+                ) {
+                    break instance.lifecycle;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("native error exit detection");
+        assert!(
+            matches!(
+                settled,
+                remuda_protocol::InstanceLifecycle::Exited
+                    | remuda_protocol::InstanceLifecycle::Failed
+            ),
+            "non-zero native exit is terminal: {settled:?}"
+        );
+
+        // Removal prepares without a purge: the dead session does not count.
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-failed", "path": workspace.root_path, "phase": "prepare"}),
+        )
+        .unwrap();
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-failed", "path": workspace.root_path, "phase": "commit"}),
+        )
+        .unwrap();
         node.shutdown().await.unwrap();
     }
 

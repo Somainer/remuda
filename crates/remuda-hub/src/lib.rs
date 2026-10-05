@@ -590,6 +590,30 @@ impl RunningHub {
         Ok(())
     }
 
+    /// Test-only seam: mark one Hub-side instance row as having failed with
+    /// an error exit, so the occupancy guard's ended treatment of `failed`
+    /// (and the Node's independent liveness) can be exercised.
+    #[doc(hidden)]
+    pub async fn test_mark_instance_failed(&self, instance_id: &str) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let instance_id = instance_id.to_owned();
+        store
+            .run_named("test_mark_instance_failed", move |conn| {
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'failed', activity = 'idle', \
+                     last_error = 'test error exit', updated_at = ?1 WHERE id = ?2",
+                    ["2026-10-05T00:00:00Z", instance_id.as_str()],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
     /// Mint a single-use Node enroll token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/hosts/enroll-token`, used by

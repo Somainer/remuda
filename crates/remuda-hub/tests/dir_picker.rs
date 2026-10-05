@@ -433,3 +433,68 @@ async fn node_prepare_occupancy_refusal_surfaces_as_409_not_400() -> Result<()> 
     fixture.hub.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_failed_hub_row_does_not_override_a_live_node_session() -> Result<()> {
+    // Round 3 item 5: real liveness is the Node's job. A Hub row marked
+    // `failed` (a legacy row written before the process-end semantics, or a
+    // stale projection) must pass the Hub's own ended check, but a live
+    // session on the Node still makes the Node refuse the prepare — which
+    // surfaces as 409 with the visible reason.
+    let fixture = fixture().await?;
+    let _ = json_request(
+        fixture.hub.addr,
+        "GET",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        None,
+    )
+    .await?;
+    // Hub-side row: failed = ended for the occupancy query, so the DELETE
+    // proceeds past the Hub guard and reaches the Node.
+    let store = fixture.hub.store().expect("store open");
+    let instance = store
+        .insert_instance(
+            fixture.host.clone(),
+            Some(WORKSPACE.to_owned()),
+            "assistant".into(),
+            "claude-pty".into(),
+            Some("a legacy failed row whose process the Node still runs".into()),
+            json!({}),
+        )
+        .await?;
+    fixture
+        .hub
+        .test_mark_instance_failed(&instance.instance_id)
+        .await?;
+    fixture
+        .hub
+        .test_set_node_reply(
+            &fixture.host,
+            Some(json!({
+                "error": {
+                    "code": -32602,
+                    "message": format!(
+                        "workspace {ROOT} is still used by 1 live session(s); \
+                         end them before removing the directory (session history is kept)"
+                    )
+                }
+            })),
+        )
+        .await;
+    let (status, body) = json_request(
+        fixture.hub.addr,
+        "DELETE",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        Some(&json!({"path": ROOT}).to_string()),
+    )
+    .await?;
+    assert_eq!(
+        status, 409,
+        "live Node session must win over a failed-looking Hub row: {body}"
+    );
+    assert!(body.contains("1 live session(s)"), "{body}");
+    fixture.hub.shutdown().await;
+    Ok(())
+}

@@ -353,6 +353,9 @@ describe("EffortSlider tall catalog", () => {
     const user = userEvent.setup();
     const onModel = mountList();
     await user.click(screen.getByTestId("effort-open-list"));
+    // Let the animation-frame focus ride land first; otherwise it steals focus
+    // from the input mid-type and Enter never reaches it.
+    await waitFor(() => expect(screen.getByTestId("effort-tier-high")).toHaveFocus());
     const input = screen.getByTestId("effort-model-type");
     await user.type(input, "claude-grok-4.6{Enter}");
     expect(onModel).toHaveBeenCalledWith("claude-grok-4.6");

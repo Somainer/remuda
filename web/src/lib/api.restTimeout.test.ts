@@ -43,10 +43,13 @@ it("headers received but the success body stalls past the read deadline -> RestN
   await vi.advanceTimersByTimeAsync(1_000);
   expect(fetchMock).toHaveBeenCalledTimes(1);
 
+  // Attach the rejection handler BEFORE the deadline fires, otherwise the
+  // rejection lands while nobody listens and Vitest reports it as unhandled.
   // At the 10 s read deadline the internal timer aborts the body read.
+  const settled = expect(call).rejects.toThrow(/REST timeout reading body after 10000 ms/);
   await vi.advanceTimersByTimeAsync(10_000);
+  await settled;
   await expect(call).rejects.toBeInstanceOf(RestNetworkError);
-  await expect(call).rejects.toThrow(/REST timeout reading body after 10000 ms/);
 });
 
 it("headers received but the error body stalls past the deadline -> RestNetworkError, not HubHttpError", async () => {
@@ -55,7 +58,8 @@ it("headers received but the error body stalls past the deadline -> RestNetworkE
 
   const call = rest<unknown>("/v1/some-read");
   await vi.advanceTimersByTimeAsync(1_000);
+  const settled = expect(call).rejects.toThrow(/REST timeout reading error body after 10000 ms/);
   await vi.advanceTimersByTimeAsync(10_000);
+  await settled;
   await expect(call).rejects.toBeInstanceOf(RestNetworkError);
-  await expect(call).rejects.toThrow(/REST timeout reading error body after 10000 ms/);
 });

@@ -519,6 +519,10 @@ pub struct StagedResume {
 /// - `<session>/` — subagent transcripts and tool-result payloads;
 /// - `memory/` — the project memory Claude reloads on SessionStart.
 ///
+/// The copy is bounded (review item 7): at most 256 MiB of regular-file
+/// bytes, 10 000 files and 32 directory levels, transcript included.
+/// Exceeding any bound is a clear error before the transcript is published.
+///
 /// Existing destination files are kept ONLY with provenance (review item 4):
 /// an existing `<session>.jsonl` is preserved when a sibling staging marker
 /// proves this launch's predecessor staged it (source path plus size/sha256); a
@@ -536,6 +540,22 @@ pub fn stage_for_resume(
     target_home: &Path,
     target_cwd: &Path,
     session_id: &str,
+) -> std::io::Result<StagedResume> {
+    stage_for_resume_with_limits(
+        source_transcript,
+        target_home,
+        target_cwd,
+        session_id,
+        DEFAULT_STAGE_LIMITS,
+    )
+}
+
+fn stage_for_resume_with_limits(
+    source_transcript: &Path,
+    target_home: &Path,
+    target_cwd: &Path,
+    session_id: &str,
+    limits: StageLimits,
 ) -> std::io::Result<StagedResume> {
     let session_id = session_id.trim();
     if !is_safe_session_id(session_id) {
@@ -634,9 +654,17 @@ pub fn stage_for_resume(
             }
             // Proven: the child's own staged copy (possibly already appended
             // to by an earlier launch attempt). Merge any missing sidecars,
-            // never touch the transcript.
-            let sidecar_dirs =
-                copy_resume_sidecars(source_transcript, source_name, &dest_dir, session_id)?;
+            // never touch the transcript. The merge stays bounded even though
+            // the transcript itself is not recopied.
+            let mut budget = CopyBudget::default();
+            let sidecar_dirs = copy_resume_sidecars(
+                source_transcript,
+                source_name,
+                &dest_dir,
+                session_id,
+                &limits,
+                &mut budget,
+            )?;
             return Ok(StagedResume {
                 transcript: dest_transcript,
                 sidecar_dirs,
@@ -646,12 +674,22 @@ pub fn stage_for_resume(
         Err(err) => return Err(err),
     }
 
-    // Fresh staging. Sidecars merge first (idempotent: a crashed earlier
-    // attempt may have left parts), provenance is published next, and the
-    // transcript is published LAST through a same-directory temp file +
-    // rename — until that rename lands, the conversation is visibly absent and
+    // Fresh staging. The transcript counts against the budget first (review
+    // item 7). Sidecars merge next (idempotent: a crashed earlier attempt may
+    // have left parts), provenance is published after them, and the transcript
+    // is published LAST through a same-directory temp file + rename — until
+    // that rename lands, the conversation is visibly absent and
     // `claude --resume` fails its lookup rather than reading a partial copy.
-    let sidecar_dirs = copy_resume_sidecars(source_transcript, source_name, &dest_dir, session_id)?;
+    let mut budget = CopyBudget::default();
+    budget.charge(source_size, &limits)?;
+    let sidecar_dirs = copy_resume_sidecars(
+        source_transcript,
+        source_name,
+        &dest_dir,
+        session_id,
+        &limits,
+        &mut budget,
+    )?;
     write_staging_provenance(
         &marker_path,
         &StagingProvenance::new(source_transcript, source_size, &source_sha256),
@@ -788,6 +826,8 @@ fn copy_resume_sidecars(
     source_name: &std::ffi::OsStr,
     dest_dir: &Path,
     session_id: &str,
+    limits: &StageLimits,
+    budget: &mut CopyBudget,
 ) -> std::io::Result<Vec<PathBuf>> {
     let source_dir = source_transcript.parent().unwrap_or_else(|| Path::new("/"));
     let mut sidecar_dirs = Vec::new();
@@ -810,7 +850,7 @@ fn copy_resume_sidecars(
             Ok(metadata) if metadata.is_dir() => {
                 let dest_side = dest_dir.join(session_id);
                 ensure_within(dest_dir, &dest_side)?;
-                copy_dir_merge(source_dir, &source_side, &dest_side)?;
+                copy_dir_merge(source_dir, &source_side, &dest_side, 0, limits, budget)?;
                 sidecar_dirs.push(dest_side);
                 break;
             }
@@ -829,7 +869,7 @@ fn copy_resume_sidecars(
     {
         let dest_side = dest_dir.join("memory");
         ensure_within(dest_dir, &dest_side)?;
-        copy_dir_merge(source_dir, &memory_side, &dest_side)?;
+        copy_dir_merge(source_dir, &memory_side, &dest_side, 0, limits, budget)?;
         sidecar_dirs.push(dest_side);
     } else if let Ok(metadata) = std::fs::symlink_metadata(&memory_side)
         && metadata.file_type().is_symlink()
@@ -852,6 +892,66 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// cycle cannot hang the walk.
 const MAX_LINK_HOPS: usize = 32;
 
+/// Bounds on a resume staging copy (review item 7). A predecessor home is
+/// untrusted input: without caps, a huge transcript or an enormous sidecar
+/// tree could fill the child instance's disk or pin the staging worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StageLimits {
+    /// Total regular-file bytes staged (transcript included).
+    max_bytes: u64,
+    /// Total regular files staged (transcript included).
+    max_files: u64,
+    /// Directory depth below a sidecar root.
+    max_depth: u32,
+}
+
+/// 256 MiB / 10 000 files / 32 levels: well above a real conversation with
+/// subagent transcripts and project memory, bounded against abuse.
+const DEFAULT_STAGE_LIMITS: StageLimits = StageLimits {
+    max_bytes: 256 * 1024 * 1024,
+    max_files: 10_000,
+    max_depth: 32,
+};
+
+/// Running tally charged against [`StageLimits`].
+#[derive(Debug, Default)]
+struct CopyBudget {
+    files: u64,
+    bytes: u64,
+}
+
+impl CopyBudget {
+    fn charge(&mut self, size: u64, limits: &StageLimits) -> std::io::Result<()> {
+        let next_files = self
+            .files
+            .checked_add(1)
+            .ok_or_else(|| limit_exceeded("file count overflow while staging"))?;
+        let next_bytes = self
+            .bytes
+            .checked_add(size)
+            .ok_or_else(|| limit_exceeded("byte count overflow while staging"))?;
+        if next_files > limits.max_files {
+            return Err(limit_exceeded(format!(
+                "resume staging file count limit exceeded: more than {} files",
+                limits.max_files
+            )));
+        }
+        if next_bytes > limits.max_bytes {
+            return Err(limit_exceeded(format!(
+                "resume staging size limit exceeded: more than {} bytes",
+                limits.max_bytes
+            )));
+        }
+        self.files = next_files;
+        self.bytes = next_bytes;
+        Ok(())
+    }
+}
+
+fn limit_exceeded(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::other(message.into())
+}
+
 /// Recursively merge `src` into `dst`, never overwriting destination files.
 ///
 /// Symlinks are never recreated (c-resumehome, review item 2): a link recreated
@@ -861,7 +961,20 @@ const MAX_LINK_HOPS: usize = 32;
 /// — and its target is copied as an independent file only when the final
 /// target is a regular file. Escaping links, directory links, broken links and
 /// cycles are hard errors, never silently skipped.
-fn copy_dir_merge(root: &Path, src: &Path, dst: &Path) -> std::io::Result<()> {
+fn copy_dir_merge(
+    root: &Path,
+    src: &Path,
+    dst: &Path,
+    depth: u32,
+    limits: &StageLimits,
+    budget: &mut CopyBudget,
+) -> std::io::Result<()> {
+    if depth > limits.max_depth {
+        return Err(limit_exceeded(format!(
+            "resume staging depth limit exceeded: more than {} nested directories",
+            limits.max_depth
+        )));
+    }
     // Check before `create_dir_all`: on a broken directory symlink
     // `create_dir_all` follows the link and creates its external target.
     if is_symlink(dst)? {
@@ -879,10 +992,12 @@ fn copy_dir_merge(root: &Path, src: &Path, dst: &Path) -> std::io::Result<()> {
         // d_type of "file" can hide a link, and `is_dir`/`exists` follow links.
         let file_type = std::fs::symlink_metadata(&source)?.file_type();
         if file_type.is_symlink() {
-            copy_linked_file(root, &source, &dest)?;
+            copy_linked_file(root, &source, &dest, limits, budget)?;
         } else if file_type.is_dir() {
-            copy_dir_merge(root, &source, &dest)?;
+            copy_dir_merge(root, &source, &dest, depth + 1, limits, budget)?;
         } else if !lexically_exists(&dest)? {
+            let size = std::fs::symlink_metadata(&source)?.len();
+            budget.charge(size, limits)?;
             std::fs::copy(&source, &dest)?;
         }
     }
@@ -891,7 +1006,13 @@ fn copy_dir_merge(root: &Path, src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// Copy one symlink entry as an independent file, when and only when every hop
 /// of its target chain stays inside `root` and ends at a regular file.
-fn copy_linked_file(root: &Path, link: &Path, dest: &Path) -> std::io::Result<()> {
+fn copy_linked_file(
+    root: &Path,
+    link: &Path,
+    dest: &Path,
+    limits: &StageLimits,
+    budget: &mut CopyBudget,
+) -> std::io::Result<()> {
     if lexically_exists(dest)? {
         // Never overwrite a destination entry, including a destination link.
         return Ok(());
@@ -905,6 +1026,7 @@ fn copy_linked_file(root: &Path, link: &Path, dest: &Path) -> std::io::Result<()
             target.display()
         )));
     }
+    budget.charge(metadata.len(), limits)?;
     std::fs::copy(&target, dest)?;
     Ok(())
 }
@@ -1565,6 +1687,108 @@ mod tests {
                     .starts_with(".transcript-tmp-")),
             "temp staging files are never left behind"
         );
+    }
+
+    #[test]
+    fn resume_staging_enforces_the_size_file_and_depth_limits() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000f2";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "012345678\n");
+
+        // Bytes: the transcript alone exceeds the cap.
+        let tight_bytes = StageLimits {
+            max_bytes: 4,
+            max_files: 100,
+            max_depth: 32,
+        };
+        let error = stage_for_resume_with_limits(
+            &source,
+            &tmp.path().join("new-bytes"),
+            &cwd,
+            session,
+            tight_bytes,
+        )
+        .expect_err("an oversized transcript is refused before publishing");
+        assert!(
+            error.to_string().contains("size limit exceeded"),
+            "unexpected message: {error}"
+        );
+
+        // File count: transcript + two sidecar files, capped at two.
+        let project = source.parent().unwrap();
+        write_file(&project.join(session).join("a.jsonl"), "a\n");
+        write_file(&project.join("memory").join("M.md"), "m\n");
+        let tight_files = StageLimits {
+            max_bytes: 1 << 20,
+            max_files: 2,
+            max_depth: 32,
+        };
+        let error = stage_for_resume_with_limits(
+            &source,
+            &tmp.path().join("new-files"),
+            &cwd,
+            session,
+            tight_files,
+        )
+        .expect_err("too many files is refused");
+        assert!(
+            error.to_string().contains("file count limit exceeded"),
+            "unexpected message: {error}"
+        );
+
+        // Depth: a sidecar tree nested deeper than the cap.
+        let deep_home = tmp.path().join("old-deep");
+        let deep_source = transcript_layout(&deep_home, &cwd, session);
+        write_file(&deep_source, "x\n");
+        write_file(
+            &deep_home
+                .join("projects")
+                .join(encode_project_dir(&cwd))
+                .join(session)
+                .join("a/b/c/deep.jsonl"),
+            "deep\n",
+        );
+        let tight_depth = StageLimits {
+            max_bytes: 1 << 20,
+            max_files: 100,
+            max_depth: 1,
+        };
+        let error = stage_for_resume_with_limits(
+            &deep_source,
+            &tmp.path().join("new-depth"),
+            &cwd,
+            session,
+            tight_depth,
+        )
+        .expect_err("an overly deep sidecar tree is refused");
+        assert!(
+            error.to_string().contains("depth limit exceeded"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn resume_staging_within_default_limits_copies_everything() {
+        // Sanity: the production caps never bite a realistically sized resume
+        // (the main copy/chain tests also exercise the default path).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000f3";
+        let source = transcript_layout(&tmp.path().join("old"), &cwd, session);
+        write_file(&source, "real conversation\n");
+        let project = source.parent().unwrap();
+        write_file(&project.join(session).join("sub.jsonl"), "sub\n");
+        write_file(&project.join("memory/MEMORY.md"), "memory\n");
+
+        let staged =
+            stage_for_resume(&source, &tmp.path().join("new"), &cwd, session).expect("stage");
+        assert!(staged.transcript.is_file());
+        assert_eq!(staged.sidecar_dirs.len(), 2);
     }
 
     #[test]

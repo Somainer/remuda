@@ -618,6 +618,88 @@ async fn resume_into_a_home_holding_an_unmarked_same_session_file_is_rejected() 
     );
 }
 
+/// Review item 5: when the NEWEST predecessor's transcript is missing, resume
+/// is refused naming that instance — the resolver must not fall back to an
+/// older ancestor (whose transcript would silently drop the newest chapter's
+/// turns).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_refuses_when_the_newest_chapter_transcript_is_missing() {
+    let harness = ChainHarness::new();
+    let parent_home = harness.fresh_home();
+    let parent = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "first turn",
+            None,
+            &harness.binary,
+            &parent_home,
+        ))
+        .await
+        .expect("parent create");
+    wait_settled(&harness.node, &parent.command.command_id).await;
+    let parent_id = parent.instance.meta.id.clone();
+    let session = recorded_session(&harness.node, &parent_id).await;
+
+    let child1_home = harness.fresh_home();
+    let child1 = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "second turn",
+            Some((&parent_id, session.as_str())),
+            &harness.binary,
+            &child1_home,
+        ))
+        .await
+        .expect("gen1 resume accepted");
+    wait_settled(&harness.node, &child1.command.command_id).await;
+    let child1_id = child1.instance.meta.id.clone();
+    let child1_transcript = transcript_in(&child1_home, &harness.workspace, &session);
+    wait_contains(&child1_transcript, "second turn").await;
+
+    // The newest chapter's conversation disappears (retention / disk prune);
+    // the grandparent transcript still exists and must NOT be substituted.
+    std::fs::remove_file(&child1_transcript).expect("prune newest transcript");
+    let grandparent = transcript_in(&parent_home, &harness.workspace, &session);
+    assert!(
+        grandparent.is_file(),
+        "the older ancestor transcript still exists"
+    );
+
+    let child2_home = harness.fresh_home();
+    let instances_before = harness.node.list_instances().expect("list").items.len();
+    let error = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "third turn",
+            Some((&child1_id, session.as_str())),
+            &harness.binary,
+            &child2_home,
+        ))
+        .await
+        .expect_err("a missing newest transcript is refused, not substituted");
+    let message = error.to_string();
+    assert!(
+        message.contains("predecessor") && message.contains("not found"),
+        "clear refusal: {message}"
+    );
+    assert!(
+        message.contains(child1_id.as_id().as_str()),
+        "the message names the missing NEWEST predecessor: {message}"
+    );
+    assert!(
+        !message.contains(parent_id.as_id().as_str()),
+        "the refusal is about the newest chapter, not the grandparent: {message}"
+    );
+    assert_eq!(
+        harness.node.list_instances().expect("list").items.len(),
+        instances_before,
+        "a refused resume creates no instance row"
+    );
+}
+
 /// Review item 1: a `resumeSessionId` that is not one safe file-name component
 /// is refused before acceptance — it is interpolated into transcript paths in
 /// both the resolver and the staging factory.

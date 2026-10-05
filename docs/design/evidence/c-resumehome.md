@@ -111,13 +111,20 @@ Follow-up review on 2792100e (codex REJECT; grok timeout):
    targets are refused loudly, implicit operator homes are skipped (claude)
    or replaced with a private per-process temp home (harness). Guard tests
    verify all three behaviours; an mtime audit of `~/.claude` before/after
-   the full workspace run shows no fake-shaped writes.
+   the runs shows no fake-shaped writes attributable to them — the only
+   synthetic-id transcripts that appeared were concurrent workers on
+   pre-fix checkouts (vdb `TMPDIR` cwds, one under another worker's
+   scratch); the audited runs used `TMPDIR=/tmp` and an isolated
+   `shell_pty_fake_send` rerun produced no writes at all.
 
 Owner rule preserved: nothing changes when a session counts as ended — only
 process-end evidence is terminal.
 
 Tests: driver unit tests in `claude_transcript.rs` (28), node e2e in
-`resume_home.rs` (9), the existing `resume_home_pty.rs` chain, new
-`fake_home_guard.rs` (3), sandbox unit tests. `cargo fmt`,
+`resume_home.rs` (10 — the extra case rewinds the predecessor to its
+create-time `ins_…` placeholder recording and asserts the resume is accepted
+as inconclusive rather than refused; it fails with the old equality check and
+passes with the placeholder carve-out), the existing `resume_home_pty.rs`
+chain, new `fake_home_guard.rs` (3), sandbox unit tests. `cargo fmt`,
 `cargo clippy --workspace -D warnings`, four-crate suites and a full
 `nice cargo test --workspace` all green.

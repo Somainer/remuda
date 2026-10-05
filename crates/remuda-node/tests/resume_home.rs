@@ -863,3 +863,81 @@ async fn resume_session_id_must_match_the_predecessor_recorded_session() {
         "nothing is staged for a refused resume"
     );
 }
+
+/// Review item 1 follow-up: at create time an instance records its own
+/// `ins_…` id as the native session placeholder until the driver reports the
+/// real session. A resume that races that window must treat the placeholder as
+/// inconclusive (like an unknown recording), not refuse it as a mismatched
+/// predecessor session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_is_accepted_while_the_predecessor_still_records_the_ins_placeholder() {
+    use remuda_node::{LocalStore, MemoryStore, native_driver_registry};
+    use std::sync::Arc;
+
+    let root_dir = tempfile::tempdir().expect("tempdir");
+    let root = root_dir.path().to_path_buf();
+    let data = root.join("data");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let binary = install_fake_claude(&root);
+
+    let store: Arc<MemoryStore> = Arc::new(MemoryStore::new(256));
+    let native = NativeDriverConfig::new(data.clone()).with_claude_binary(binary.clone());
+    let registry = native_driver_registry(native).expect("native registry");
+    let node = DevNode::with_parts(
+        &serve_config(&workspace, &data, &binary).http,
+        store.clone(),
+        registry,
+    )
+    .expect("node");
+
+    let parent_home = root.join("homes/gen-0");
+    std::fs::create_dir_all(&parent_home).expect("home0");
+    let parent = node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "first turn",
+            None,
+            &binary,
+            &parent_home,
+        ))
+        .await
+        .expect("parent create");
+    wait_settled(&node, &parent.command.command_id).await;
+    let parent_id = parent.instance.meta.id.clone();
+    let session = recorded_session(&node, &parent_id).await;
+    let transcript = transcript_in(&parent_home, &workspace, &session);
+    assert!(transcript.is_file());
+
+    // Rewind the predecessor to its create-time recording: the native session
+    // is still the instance's own `ins_…` placeholder (driver evidence has not
+    // landed yet), while the transcript path is already recorded.
+    let placeholder = parent_id.as_id().to_string();
+    assert!(placeholder.starts_with("ins_"));
+    store
+        .set_native_session(
+            &parent_id,
+            &placeholder,
+            Some(transcript.to_str().unwrap()),
+            None,
+        )
+        .expect("rewind to the create-time placeholder recording");
+
+    let child_home = root.join("homes/gen-1");
+    std::fs::create_dir_all(&child_home).expect("home1");
+    let child = node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "second turn",
+            Some((&parent_id, session.as_str())),
+            &binary,
+            &child_home,
+        ))
+        .await
+        .expect("the ins_ placeholder is inconclusive, not a mismatched session");
+    wait_settled(&node, &child.command.command_id).await;
+    assert!(
+        transcript_in(&child_home, &workspace, &session).is_file(),
+        "the predecessor transcript was staged despite the placeholder recording"
+    );
+}

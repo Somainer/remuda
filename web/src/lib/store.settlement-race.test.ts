@@ -1,35 +1,40 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import type { Interaction } from "../types/interaction";
-import { mergeInteractionSnapshots } from "./store";
 
-/**
- * c-cardsettle r2 item 4: an older in-flight interaction poll resolving AFTER
- * the settlement refresh must not resurrect a settled card. The settlement pin
- * is installed against the seq captured at frame receipt (before the newer
- * refresh); mergeInteractionSnapshots must suppress the stale pending copy.
- */
+const INTERACTION = "int_settlement_race";
 
-function interaction(id: string, state: Interaction["state"]): Interaction {
+type Api = typeof import("./api").api;
+type Store = typeof import("./store").hubStore;
+
+/** Fresh store/api module pair per test — the store is a process singleton. */
+async function fresh(): Promise<{ api: Api; hubStore: Store }> {
+  vi.resetModules();
+  const [apiModule, storeModule] = await Promise.all([import("./api"), import("./store")]);
+  return { api: apiModule.api, hubStore: storeModule.hubStore };
+}
+
+function card(state: Interaction["state"]): Interaction {
+  const terminal =
+    state === "invalidated"
+      ? {
+          resolution: {
+            state: "known",
+            value: { reason: "generation-ended", eventIds: [] },
+          },
+        }
+      : {};
   return {
-    id: id as Interaction["id"],
-    revision: "1",
-    createdAt: "2026-10-01T00:00:00.000Z",
-    updatedAt: "2026-10-01T00:00:00.000Z",
-    instanceId: "ins_1" as Interaction["instanceId"],
+    id: INTERACTION,
+    interactionId: INTERACTION,
+    instanceId: "ins_settlement_race",
+    hostId: "hst_1",
     runId: null,
-    hostId: "hst_1" as Interaction["hostId"],
-    kind: "approval",
-    requestKey: {
-      native: { type: "none" },
-      processGeneration: "1",
-      runGeneration: null,
-      connectionEpoch: "epoch" as Interaction["requestKey"]["connectionEpoch"],
-    },
-    requestVersion: "1",
-    state,
     blocking: state === "pending",
     answerable: state === "pending",
     carrier: "harness-hook",
+    kind: "approval",
+    requestVersion: "1",
+    state,
     request: {
       kind: "approval",
       title: "Bash",
@@ -41,45 +46,116 @@ function interaction(id: string, state: Interaction["state"]): Interaction {
       inputDigest: "sha256:00",
     },
     deadline: { state: "not-applicable" },
-    deadlineSource: "none",
-    answer: { state: "not-applicable" },
     delivery: "not-sent",
-    resolution:
-      state === "invalidated"
-        ? { state: "known", value: { reason: "generation-ended", eventIds: [] } }
-        : { state: "not-applicable" },
-  } as Interaction;
+    answer: { state: "not-applicable" },
+    ...terminal,
+  } as unknown as Interaction;
 }
 
-describe("settlement pin vs an older in-flight poll", () => {
-  it("suppresses a stale pending copy from a poll older than the settlement pin", () => {
-    // reqSeq 1 (old poll) started first and is still in flight.
-    // reqSeq 2 is the settlement refresh; the frame pinned the id at seq 2.
-    const pin = new Map([["int_1" as never, { seq: 2, confirmedByNewer: false }]]) as never;
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
-    // The OLD poll resolves last, still carrying pending. Outstanding set is
-    // empty by then (the newer settlement refresh already finished). The
-    // locally known terminal (invalidated) projection survives — the card is
-    // dropped from the actionable queue, never flipped back to pending.
-    const merged = mergeInteractionSnapshots(
-      [interaction("int_1", "pending")],
-      [interaction("int_1", "invalidated")],
-      pin,
-      1,
-      new Set<number>(),
-    );
-    expect(merged.map((row) => row.state)).toEqual(["invalidated"]);
+/**
+ * c-cardsettle r3 item 3: drive the REAL store through its settlement
+ * subscription callback against deferred API responses.
+ *
+ *  - the bootstrap list seeds a pending card;
+ *  - an OLD refresh starts and stays in flight (its interaction.list is
+ *    held, and it still carries the stale pending row);
+ *  - the Hub settlement frame arrives: the store installs the terminal pin
+ *    against the current seq, flips the local row immediately, then runs a
+ *    trailing refresh;
+ *  - that NEWER refresh completes with the durable invalidated row;
+ *  - only THEN does the old held fetch resolve last, still pending.
+ *
+ * The store must stay invalidated (the pin suppresses the stale copy) and the
+ * pin must be released once the newer page confirms and the older request has
+ * drained. With settlement handling a no-op the stale pending row lands last
+ * and resurrects the card, so this fails without the fix.
+ */
+it("an older in-flight poll resolving after the settlement frame cannot resurrect the card", async () => {
+  const { api, hubStore } = await fresh();
+
+  // Capture the subscription callback the store installs at bootstrap.
+  let settlementCallback: ((interactionId: string) => void) | null = null;
+  vi.spyOn(api, "settlementSubscribe").mockImplementation((callback) => {
+    settlementCallback = callback;
+    return () => undefined;
   });
 
-  it("a newer poll reporting invalidated confirms the settlement", () => {
-    const pin = new Map([["int_1" as never, { seq: 2, confirmedByNewer: false }]]) as never;
-    const merged = mergeInteractionSnapshots(
-      [interaction("int_1", "invalidated")],
-      [interaction("int_1", "pending")],
-      pin,
-      3,
-      new Set<number>(),
-    );
-    expect(merged.map((row) => row.state)).toEqual(["invalidated"]);
+  vi.spyOn(api, "hello").mockResolvedValue({} as never);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null });
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null });
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+
+  // Response per interaction.list call:
+  //  1 = bootstrap seed (pending);
+  //  2 = the old poll, held open until released, resolving with stale pending;
+  //  3 = the settlement-driven newer refresh (durable invalidated);
+  //  later = terminal/empty.
+  let releaseOldPoll: () => void = () => undefined;
+  const oldPollGate = new Promise<void>((resolve) => {
+    releaseOldPoll = resolve;
   });
+  let listCalls = 0;
+  vi.spyOn(api, "interactionList").mockImplementation(async () => {
+    const n = ++listCalls;
+    if (n === 1) return [card("pending")];
+    if (n === 2) {
+      await oldPollGate;
+      return [card("pending")];
+    }
+    if (n === 3) return [card("invalidated")];
+    return [card("invalidated")];
+  });
+
+  await hubStore.bootstrap();
+  expect(settlementCallback, "bootstrap installed the settlement subscription").toBeTypeOf(
+    "function",
+  );
+  expect(
+    hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+  ).toBe("pending");
+
+  // The old poll starts before the settlement and stays in flight.
+  const oldRefresh = hubStore.refresh();
+  await vi.waitFor(() => expect(listCalls).toBeGreaterThanOrEqual(2));
+
+  // The Hub settlement frame arrives. The local row flips immediately.
+  settlementCallback!(INTERACTION);
+  expect(
+    hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+    "the frame flips the local row before its follow-up refresh resolves",
+  ).toBe("invalidated");
+
+  // The store's trailing refresh (300 ms) completes first with the durable
+  // invalidated row.
+  await vi.waitFor(() => expect(listCalls).toBeGreaterThanOrEqual(3));
+  await vi.waitFor(() =>
+    expect(
+      hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+    ).toBe("invalidated"),
+  );
+
+  // Then the OLD held poll resolves last, still carrying pending. It must not
+  // resurrect the card.
+  releaseOldPoll();
+  await oldRefresh;
+  expect(
+    hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+  ).toBe("invalidated");
+
+  // Pin release: the newer page (call 3) reported non-pending and the old
+  // request has now drained, so the pin is reaped instead of leaking.
+  const pins = (
+    hubStore as unknown as { settledInteractions: Map<string, unknown> }
+  ).settledInteractions;
+  await vi.waitFor(() => expect(pins.has(INTERACTION)).toBe(false));
+
+  hubStore.logout();
 });

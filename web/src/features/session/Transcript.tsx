@@ -420,17 +420,32 @@ function TranscriptInner({
       if (row) offset = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
     }
     pinRef.current = false;
+    // Arm the restore BEFORE the read. loadEarlier emits the merged events list
+    // synchronously (inside the awaited call) and the external-store commit
+    // flushes before this continuation resumes, so arming after the await missed
+    // the prepend commit itself; with the page body no longer re-rendering on an
+    // incidental 1 s/2 s tick, the anchor effects never re-ran and the anchor
+    // row stayed unmounted. Armed up front, the prepend commit runs the restore.
+    if (anchorId) {
+      restoringRef.current = true;
+      pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0 };
+      // Keep repinning as the prepended (unmeasured) rows settle; the
+      // one-shot restore effect alone stops before the average converges.
+      prependAnchorRef.current = { anchorId, offset, tries: 0 };
+    }
     setLoadingEarlier(true);
+    let floor: string | null = null;
     try {
-      await hubStore.loadEarlier(instanceId);
-      if (anchorId) {
-        restoringRef.current = true;
-        pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0 };
-        // Keep repinning as the prepended (unmeasured) rows settle; the
-        // one-shot restore effect alone stops before the average converges.
-        prependAnchorRef.current = { anchorId, offset, tries: 0 };
-      }
+      floor = await hubStore.loadEarlier(instanceId);
     } finally {
+      // Release the anchor when nothing was prepended (already at the floor, an
+      // empty/deduped page, or a divergence/stale read) so a later unrelated
+      // commit cannot restore to a stale position.
+      if (!floor) {
+        pendingScroll.current = null;
+        prependAnchorRef.current = null;
+        restoringRef.current = false;
+      }
       setLoadingEarlier(false);
     }
   }, [instanceId, loadingEarlier, canLoadEarlier, range.start]);

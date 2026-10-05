@@ -505,12 +505,16 @@ mediaType, name}`，`protocol.md` §5.2），字节在对象库、不在 journal
   - 余烬（`--ember-*`）只跟随两种状态，**不绑定滑杆上的某个位置**：Codex 的 `ultra` 档（整条 pill 换余烬）与 Claude 的 Ultracode 开关打开（任意档，余烬落在开关轨道与收起态触发器上；Claude 的 pill 只显档位外观，xhigh / max 用静态强调）。余烬的样子：`--ember-*` 余烬琥珀渐变，上面叠一层暖光 + 三层疏密不同的 ember 星点，各自以不同速度横向漂移（其中一层反向）并各自闪烁，钮或开关带一圈呼吸的琥珀光晕；收起态触发器同频率轻微发光。只用 transform / opacity，不触发布局；popover 关闭即卸载，`prefers-reduced-motion` 下全部停成静帧（essential 动效按 visual-system §7.4 标记）。
   - 吸附 harness 原生档（claude `low/medium/high/xhigh/max` 五档，没有 ultracode 档也没有 auto 档；codex `low/medium/high/xhigh/max/ultra`（显示 Low / Medium / High / Extra high / Max / Ultra；说明见 protocol.md effort 表）；grok `low/medium/high/xhigh`）。`role=slider`，`aria-valuetext` = 档名。←/→/Home/End、触摸拖动、44px 触控。
   - **Ultracode 开关（仅 Claude）**：pill 下方一行，左「Ultracode」+ 一行 muted 说明「每个任务编排 dynamic workflow · 仅本会话」，右 `role=switch`（`aria-checked`，Space 切换），44px 热区。非 Claude harness 不渲染。
-    - **不可用时禁用并写明原因**（禁用态仍可读，原因用 `--fg-muted` 字放在说明行）：Claude Code 版本低于 2.1.203；本会话已收到 `ultracode-workflows-disabled`（「需要开启 dynamic workflows」）或 `ultracode-unavailable-for-model`（「<模型> 不支持 ultracode」）。
-    - **耦合版本（Claude Code < 2.1.284）**：说明行改为「开启后以 xhigh 运行」；打开开关即把滑杆移到 xhigh，滑离 xhigh 即关开关，与 CLI 一致。版本读自实例的 `binaryVersion`，transcript 的 `version` 优先。
+    - **不可用时禁用并写明原因**（禁用态仍可读，原因用 `--fg-muted` 字放在说明行）。禁用只在原因成立的范围内有效：
+      - Claude Code 版本低于 2.1.203：整个会话禁用。
+      - `ultracode-unavailable-for-model`（「<模型> 不支持 ultracode」）：只对**拒绝它的那个模型**禁用。会话换了模型（`/model` accept 或回读到新模型）就重新启用，新模型可以再试；切回那个模型时恢复禁用。
+      - `ultracode-workflows-disabled`（「需要开启 dynamic workflows」）：对本进程禁用，resume 或重新 launch 后重新启用。
+    - **切换失败不结束会话**：被拒绝、degraded 或超时只显示在这次切换上（开关回到 effective 状态并给出原因），会话照常可用；除上面三种禁用外，用户可以直接再试一次（D-056 (4)）。
+    - **耦合版本（Claude Code 2.1.203–2.1.283；更低版本开关已禁用）**：说明行改为「开启后以 xhigh 运行」；打开开关即把滑杆移到 xhigh，driver 只发一条 `/effort ultracode`（本会话有效，不保存默认档）；滑离 xhigh 即关开关，与 CLI 一致。版本读自实例的 `binaryVersion`，transcript 的 `version` 优先。
   - **默认档不写死**：Claude 的默认档按模型（Opus 5.5 / Sonnet 5.5 = medium，Opus 4.7 = xhigh，其余 = high），任何文案都不得把某一档标成通用「默认」。未 pin 时触发器显示「跟随模型默认」，回读后显示解析出的档；没有记忆偏好的新会话即未 pin。
-  - 两条轴各自显示 effective：档位读不到显示 `?`，开关读不到显示 `?`；与请求不一致时逐轴提示「请求 max → 实际 high」「请求 ultracode → 实际关」（resume 后未重新生效就是后者）。
+  - 两条轴各自显示 effective：档位读不到显示 `?`，开关读不到显示 `?`；与请求不一致时逐轴提示「请求 max → 实际 high」「请求 ultracode → 实际关」（resume 后未重新生效就是后者；开关只认本进程的记录，resume 前重放出来的「Ultracode on」不算）。
   - `›` 展开的列表里才有档位说明和模型选择（`‹` 返回 pill）；pill 视图本身不列模型。
-  - 变更走 `instance.configure`（journal + persist），`effort` 发 `{name, ultracode, index}`（`index` 只是旧字段，Hub 读时忽略），不再用旧名 `ultracode` 上 wire。滑杆与开关在同一次确认里一起变时只发一次 configure，driver 端至多两条命令、档位在前（D-056 (3)）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
+  - 变更走 `instance.configure`（journal + persist），`effort` 发 `{name, ultracode, index}`（`index` 只是旧字段，Hub 读时忽略），不再用旧名 `ultracode` 上 wire。滑杆与开关在同一次确认里一起变时只发一次 configure，driver 端至多两条命令、档位在前；耦合版本打开 ultracode 永远只发一条 `/effort ultracode`（D-056 (3)）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
 - 本地草稿按 `instanceId` 存（herdrx `composerDrafts`）；未 accepted 的乐观气泡可撤回。
 
 **compact composer 边界（D-042，修订 §11.7 冲突「P0-3」；收起态单行 56px 不变）**

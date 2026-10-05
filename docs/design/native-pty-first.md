@@ -361,17 +361,18 @@ Claude 的默认档**按模型**定（官方 model-config；组织默认与 per-
     - 耦合版本：只有 `{xhigh, 开}` 能以 `--effort ultracode` 发出，其余组合以 `InvalidLaunchSpec` 拒绝并点名版本。
     - 版本取 pinned binary 的 `--version`。
     - `--resume` 不恢复 ultracode，resume launch 按同一规则再带一次。
-  - **会话内**：改档写 `/effort <level>\r`，开关写 `/effort ultracode on\r` 或 `/effort ultracode off\r`。一次 configure 至多两条，档位在前。耦合版本上开 = `/effort ultracode`，关 = `/effort <level>`。
+  - **会话内**：改档写 `/effort <level>\r`，开关写 `/effort ultracode on\r` 或 `/effort ultracode off\r`。一次 configure 至多两条，档位在前。耦合版本上开 = 单独一条 `/effort ultracode`（不论当前在哪一档都不先发 `/effort xhigh`，后者会保存默认档），关 = `/effort <level>`。
   - **确认框**：PTY 内驱动已实测（effort-sync-1…4）。2.1.289 上 `/effort` 不弹确认框；旧版本的确认框门控保留。
 - **绝不使用 `CLAUDE_CODE_EFFORT_LEVEL`**：它的优先级高于会话内 `/effort`，会把 PTY 的实时改档钉死；反向地，必须在 `child_env` 里**剥离宿主继承的该变量**，否则外部环境静默覆盖一切。
 - **不把 `settings.json` 的 `effortLevel` 当主通道**：其 enum 拒绝 `"max"`，也不收 `ultracode`；`maxEffortLevel` 会 clamp 一切。
 - **effective vs requested**：record 上拆成两个字段，`effortRequested` 与 `effortEffective{name, ultracode, source, observedAt} | null`，两条轴各自回读。
   - **档位**：从 transcript 每条 assistant 记录的 `effort` / `perTurnEffort` 回读。`auto` 回读为它解析出的档。
-  - **ultracode**：**从不**出现在 assistant 记录上，只从 `/effort` verdict 与 `ultra_effort_enter` / `ultra_effort_exit` 附件回读，footer 只作 Screen 层兜底。≥ 2.1.284 上开关在任意档锁存；新进程（含 resume）在证据出现之前为未知。
+  - **ultracode**：**从不**出现在 assistant 记录上，只从 `/effort` verdict 与 `ultra_effort_enter` / `ultra_effort_exit` 附件回读，footer 只作 Screen 层兜底。≥ 2.1.284 上开关在任意档锁存。只认本进程的记录：`--resume` 追加到同一个 transcript，上一个进程重放的「Ultracode on」verdict 不代表当前状态（effort-sync-4 (f) 中 resume 后实际为关，首个 prompt 带 `ultra_effort_exit`），回读游标从本进程 spawn 时的文件末尾开始；新进程（含 resume）在本进程第一条证据出现之前为未知。
   - **版本**：从记录的 `version` 回读。
   - **显示**：UI 一律显示 effective。回读不到时显示 `?` 并置灰，**绝不回落成请求值**。不一致时逐轴显示「请求 max → 实际 high」「请求 ultracode → 实际关」，这正是 clamp、org cap、模型不支持、resume 丢失开关的可见出口。
   - **拒绝**：映射为稳定 reason（`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`）。被 clamp 的 accept 报 clamp 之后的档。
   - **超时**：改档命令超时仍未回读到变化时，journal 记 `degraded`，不谎报 applied。
+  - **失败不结束会话**：拒绝、degraded、超时都只是这条 configure 的结局，实例 lifecycle 不变、进程不关，之后可以用新命令重试（D-056 (4)）。
 - 非 claude 三家继续返回诚实的 `CapabilityUnsupported`。
 
 ### 9.2 tui / 终端状态信号

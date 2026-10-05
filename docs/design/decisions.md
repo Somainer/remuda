@@ -34,7 +34,7 @@
 | D-052 | 2026-09-23 | **provenance-first UI 批次口径（ui-upgrade 批次，docs 先合）**：(a) 本批零新 wire/表/端点，出处读既有 envelope（`seq`/`source`/`completeness`）与既有 `Interaction`，迁移预算零；(b) 审批卡**不显** confidence/risk 分（`ApprovalRequest` 无 `risk`，`web/src/types/generated.ts:98-106`）且**不在 UI 断言会话边界**（`DecisionOption` 无 `destination`，`web/src/types/interaction.ts:4-8`；harness 的 permission suggestions 实测含 `session` 与 `localSettings` 两种 destination）——线框 `risk`/`Always in this cwd` 改为 preview 原文 + carrier + deadline + harness 原范围标签，副文案统一「按 harness 建议的范围持续允许」，引 §3.3；(c) completeness 三值不变、仅活过 `FoldedToolRow` 折叠（interaction 节点/ApprovalCard 需先做 store 连接键调研，批次计划 D11 默认本批不做）；(d) D-041「折叠在 family 判定之后」保留并被回归断言守住；(e) `/board` 路由与三列只读投影已上线，本批只在既有面上 graft、不新建页面/路由，已完成列不暴露 land；(f) ledger 浅色主题由 D-053（任务 15）正式化，D-052 不处理主题；(g) `/approvals` 与 `/m/inbox` 收敛为 InboxShell 单壳，桌面三档/手机两档各自保留；(h) 新增 `--warn`/`--info`/`--text-xl`/`--text-13` 四个 token（双主题各一值、文本对 `--ink-2` ≥ 4.5:1）；(i) stylelint 按文件白名单 opt-in，白名单是带摘除批次的台账，「辅助文本 vs 图形标注」分类口径进 ui-spec §3.4；(j) 参考清单定性「MIT 组件画廊，不声明任何 spacing/type/colour 规则」，证据只用 Remuda 自身 390/1440 渲染 | coordinator（ui-upgrade 计划任务 1 c-uispec2，docs-only） | [ui-spec.md §2.2/§2.5/§2.9/§3.3/§3.4/§4.7](./ui-spec.md)；[evidence/ui-upgrade-1.md](./evidence/ui-upgrade-1.md)；D-002/D-024/D-035/D-038/D-039/D-040/D-041/D-042/D-045/D-046/D-049/D-050 |
 | D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端跟随外观（2026-09-24 所有者改定，原恒深色口径废止）**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 z-index / elevation / 阴影 / disabled token」中的阴影部分（z-index/disabled 口径不变）；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围，并修订 D-024 addendum「侧栏强当前态」的品牌左条（改为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，关闭语义不变，详见 ui-spec §1.4）与「活动 tab」的品牌下划线（改为 2px `--fg-strong` 下划线 + `--bg-selected` 底 + 加粗，详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
 | D-055 | 2026-09-25 | **命令重放按操作分叉：`instance.send` 可重放，`instance.configure` 不可重放。** 同一 commandId 重放 `instance.send` 继续用于恢复丢失响应：返回存储原记录，对仍排队的行恰好转发一次（G1/G2 不变）。`instance.configure` 的 spec merge 只在首次 POST 发生且只发生一次，重放永不再次 merge：终态行（accepted/settled）原样返回存储记录（含首次 merge 失败时持久化的原始 500 与原始 body）；原始结果尚未持久化（转发仍在飞）时返回明确的 409「still in flight」并指引轮询 `GET …/commands/{commandId}`；离线排队（`forwarded=0`）的 configure 重放返回明确 409，要求客户端换用新 commandId 发新命令，绝不代为转发。理由：web 离线 outbox 只重放 send，configure 重放无法闭合「重复 merge / 首次 500 重放成 200 / 并发同 id 双 merge / 排队行重放被转发」四类边角。配套：`GET /v1/instances/{id}/commands/{commandId}` 在转发尝试进行中绑定到**本次尝试**发布的终态行（尝试尚未开始时如实返回 pending 的 `queued`/`forwarded=false`），永不先报 `forwarded=true` 再报回滚后的 `forwarded=false`。 | coordinator（c-configfix） | `protocol.md §2.5`；D-055 任务 B（send 重放） |
-| D-056 | 2026-10-05 | **Claude ultracode 是正交的会话开关（Claude ultracode is an orthogonal session toggle）：effort 档位与 ultracode 端到端是两条独立的轴，按 Claude Code 版本门控。** Claude Code 2.1.284 起 ultracode 不再强制 xhigh，在任意档都保持开启；2.1.203–2.1.283 是耦合基线（开 ultracode = xhigh，选任何档即关）。(1) wire `EffortSelection{name, ultracode}` 不变，但在 ≥2.1.284 上 `ultracode` 不再蕴含 xhigh；旧名 `ultracode` 只作输入别名，读入为 `{xhigh, true}`。(2) launch：≥2.1.284 发 `--effort <level>`，并把 `"ultracode": true` 写进**同一份** per-launch settings overlay（两个 `--settings` 不合并，后出现的整份胜出）；<2.1.284 只有 `{xhigh, true}` 可发 `--effort ultracode`，其余组合以 `InvalidLaunchSpec` 拒绝并点名版本；版本取 pinned binary 的 `--version`；`--resume` 不恢复 ultracode，resume launch 须再带一次。(3) 会话内：档位走 `/effort <level>`，保留确认框门控（2.1.289 上不弹框）；开关走 `/effort ultracode on\|off`，没有确认框；每次 configure 至多两条命令，档位在前；耦合版本上开 = `/effort ultracode`（仅 xhigh），关 = `/effort <level>`。(4) 回读：档位读 assistant `effort`/`perTurnEffort`；开关只读 verdict 与 `ultra_effort_enter`/`ultra_effort_exit` 附件，≥2.1.284 上在任意档锁存；版本读 transcript 的 `version`；拒绝映射为稳定 reason（`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`）；被 clamp 的 accept 报 clamp 后的档。(5) UI：Claude 五档滑杆 + 独立的 Ultracode 开关，芯片显示 `<level> · ultracode`；不可用时开关禁用并给出原因；耦合版本上开关注明以 xhigh 运行。(6) 默认档按模型（官方文档：Opus 5.5 / Sonnet 5.5 为 medium，Opus 4.7 为 xhigh，其余为 high），不得把任何一档标成通用默认。(7) `CLAUDE_CODE_EFFORT_LEVEL` 继续从子进程剥离。取代 D-028a 第 (5) 项中「ultracode ≡ xhigh + dynamic workflow」的口径。per-task / 供给层的 ultracode 请求是所有者的未决问题，本条不定。 | coordinator（c-effortadr，docs-only）；会话级开关为所有者现行口径 | [evidence/effort-sync-4.md](./evidence/effort-sync-4.md)（2.1.289 实测）；Claude Code 官方文档 model-config / cli-reference / settings-reference / workflows 与 2.1.284 changelog；effort-sync-2/3（耦合基线）；D-028、D-028a |
+| D-056 | 2026-10-05 | **Claude ultracode 是正交的会话开关（Claude ultracode is an orthogonal session toggle）：effort 档位与 ultracode 端到端是两条独立的轴，按 Claude Code 版本门控。** Claude Code 2.1.284 起 ultracode 不再强制 xhigh，在任意档都保持开启；2.1.203–2.1.283 是耦合基线（开 ultracode = xhigh，选任何档即关）。(1) wire `EffortSelection{name, ultracode}` 不变，但在 ≥2.1.284 上 `ultracode` 不再蕴含 xhigh；旧名 `ultracode` 只作输入别名，读入为 `{xhigh, true}`。(2) launch：≥2.1.284 发 `--effort <level>`，并把 `"ultracode": true` 写进**同一份** per-launch settings overlay（两个 `--settings` 不合并，后出现的整份胜出）；2.1.203–2.1.283 只有 `{xhigh, true}` 可发 `--effort ultracode`，其余组合以 `InvalidLaunchSpec` 拒绝并点名版本；低于 2.1.203 或版本读不出时，任何 `ultracode: true` 都拒绝；版本取 pinned binary 的 `--version`；`--resume` 不恢复 ultracode，resume launch 须再带一次。(3) 会话内：档位走 `/effort <level>`，保留确认框门控（2.1.289 上不弹框）；开关走 `/effort ultracode on\|off`，没有确认框；每次 configure 至多两条命令，档位在前；耦合版本上开 = 单独一条 `/effort ultracode`（仅 `{xhigh, true}`，不先发会保存默认档的 `/effort xhigh`），关 = `/effort <level>`。(4) 回读：档位读 assistant `effort`/`perTurnEffort`；开关只读 verdict 与 `ultra_effort_enter`/`ultra_effort_exit` 附件，且只认本进程产生的记录（resume 重放的旧 verdict 不算），≥2.1.284 上在任意档锁存；版本读 transcript 的 `version`；拒绝映射为稳定 reason（`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`）；被 clamp 的 accept 报 clamp 后的档；切换失败只是这次 configure 的结局，不结束会话，可以重试。(5) UI：Claude 五档滑杆 + 独立的 Ultracode 开关，芯片显示 `<level> · ultracode`；不可用时开关禁用并给出原因，模型拒绝只对那个模型禁用、换模型后重新启用；耦合版本上开关注明以 xhigh 运行。(6) 默认档按模型（官方文档：Opus 5.5 / Sonnet 5.5 为 medium，Opus 4.7 为 xhigh，其余为 high），不得把任何一档标成通用默认。(7) `CLAUDE_CODE_EFFORT_LEVEL` 继续从子进程剥离。取代 D-028a 第 (5) 项中「ultracode ≡ xhigh + dynamic workflow」的口径。per-task / 供给层的 ultracode 请求是所有者的未决问题，本条不定。 | coordinator（c-effortadr，docs-only）；会话级开关为所有者现行口径 | [evidence/effort-sync-4.md](./evidence/effort-sync-4.md)（2.1.289 实测）；Claude Code 官方文档 model-config / cli-reference / settings-reference / workflows 与 2.1.284 changelog；effort-sync-2/3（耦合基线）；D-028、D-028a |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -1295,7 +1295,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 | Claude Code 版本 | ultracode 语义 | launch | 会话内开 | 会话内关 |
 |---|---|---|---|---|
 | < 2.1.203 | 不存在 | 任何 `ultracode: true` 都拒绝 | 拒绝 | — |
-| 2.1.203–2.1.283（耦合） | 开 = xhigh + workflow；选任何档即关 | 只有 `{xhigh, true}` 发 `--effort ultracode`；其余 `ultracode: true` 组合拒绝 | `/effort ultracode`（仅当目标档是 xhigh） | `/effort <level>` |
+| 2.1.203–2.1.283（耦合） | 开 = xhigh + workflow；选任何档即关 | 只有 `{xhigh, true}` 发 `--effort ultracode`；其余 `ultracode: true` 组合拒绝 | 单条 `/effort ultracode`（仅当目标是 `{xhigh, true}`，不先发 `/effort xhigh`） | `/effort <level>` |
 | ≥ 2.1.284（解耦） | 任意档上的会话开关，改档不动它 | `--effort <level>`，加同一份 overlay 里的 `"ultracode": true` | `/effort ultracode on` | `/effort ultracode off` |
 
 1. **Wire 形状不变，语义按版本。**
@@ -1312,16 +1312,16 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
      - overlay 是 launch 作用域的物化文件，不写操作员自己的 settings，所以 ultracode 仍然只在本会话有效。
    - **2.1.203–2.1.283**：只有 `{xhigh, true}` 可以落地，发 `--effort ultracode`。`ultracode: true` 搭配其它档时以 `InvalidLaunchSpec` 拒绝，消息点名版本，例如「claude 2.1.277 的 ultracode 只能以 xhigh 运行」。
    - **<2.1.203**：任何 `ultracode: true` 都拒绝。版本读不出时，`ultracode: true` 也一律拒绝（失败关闭，不猜版本）。`ultracode: false` 的请求不受版本门影响。
-   - **resume 要重新声明。** `--resume` 不恢复 ultracode（f2），resume launch 按同一张版本门再带一次：≥2.1.284 写 overlay 键，耦合版本发 `--effort ultracode`（仅 xhigh）。`--resume` 加 overlay 键能否恢复 ultracode 还没有实测；实测之前由回读判定，没见到 `ultra_effort_enter` 或 verdict，开关的 effective 就不报「开」。
+   - **resume 要重新声明。** `--resume` 不恢复 ultracode（f2），resume launch 按同一张版本门再带一次：≥2.1.284 写 overlay 键，耦合版本发 `--effort ultracode`（仅 xhigh）。`--resume` 加 overlay 键能否恢复 ultracode 还没有实测；实测之前由回读判定：本进程没有产生 `ultra_effort_enter` 或「Ultracode on」verdict，开关的 effective 就不报「开」（上一个进程重放的旧 verdict 不算，见第 4 条）。
    - 所有拒绝都发生在 create 被持久接受**之前**，不会静默降级成「不开 ultracode」（与 D-035 的拒绝形状相同）。
 3. **会话内切换。**
    - **档位**：`/effort <level>`。保留既有的确认框门控，即目标词门控与救援 Enter（`perform_switch`，`crates/remuda-driver/src/effort.rs:521`）。2.1.289 上没有确认框，所以切换必须在无框时也能结算。
    - **开关**：`/effort ultracode on` 或 `/effort ultracode off`。不弹框，不走确认框门控。
    - **每次 configure 至多两条命令，档位在前。**
      - 只变一条轴，就只发一条命令。
-     - 两条轴都变时，先发 `/effort <level>` 并等它的 verdict，再发开关命令。开关的 verdict 自带「Effort stays <level>」，可以顺带确认最终档位。
+     - 两条轴都变时（仅 ≥2.1.284），先发 `/effort <level>` 并等它的 verdict，再发开关命令。开关的 verdict 自带「Effort stays <level>」，可以顺带确认最终档位。
    - **耦合版本。**
-     - 开 = `/effort ultracode`，只在目标档是 xhigh 时允许。
+     - 开 = **单独一条** `/effort ultracode`，只在目标是 `{xhigh, true}` 时允许。不论当前在哪一档，都不先发 `/effort xhigh`：耦合版本上 `/effort xhigh` 的 verdict 是 `Set effort level to xhigh (saved as your default for new sessions): …`，而 `/effort ultracode` 本身就是只在本会话有效的 xhigh + ultracode：`Set effort level to ultracode (this session only): xhigh + dynamic workflow orchestration`（两条都见 [effort-sync-2](./evidence/effort-sync-2.md)，2.1.272）。打开 ultracode 绝不顺带保存新的默认档。
      - 关 = `/effort <目标档>`。耦合版本上，任何一档的 accept 都会关掉 ultracode，xhigh 也一样。
      - 请求 `{非 xhigh 的档, true}` 时不打字，以 `effort-unsupported-in-session` 拒绝并点名版本。
    - **会话内用哪个版本**：以 transcript 最新记录的 `version` 为准，因为会话里跑的可能是手敲启动的 claude（D-025）。没有记录时用 pinned 版本；两者都没有时，只执行档位变化，开关变化以 `effort-unsupported-in-session` 拒绝。
@@ -1331,7 +1331,11 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
      - `/effort` verdict：`Ultracode on (this session only)…`；`Ultracode off. Effort stays <level>.`；滑杆 verdict 末尾的 ` · Ultracode off`；`/effort status` 末尾有没有 ` · Ultracode on`。
      - `ultra_effort_enter` / `ultra_effort_exit` 附件。`reminderType: "sparse"` 的 enter 只是重复提醒，不代表状态变化。
 
-     footer 上的 `· ultracode` 只作 Screen 层兜底（completeness 为 `screen-derived`）。≥2.1.284 上，开关在任意档都锁存，档位的 verdict 不改它；耦合版本上，档位 accept 会把它清掉（既有行为）。新进程（launch 或 resume）在出现证据之前，开关状态为未知。
+     footer 上的 `· ultracode` 只作 Screen 层兜底（completeness 为 `screen-derived`）。≥2.1.284 上，开关在任意档都锁存，档位的 verdict 不改它；耦合版本上，档位 accept 会把它清掉（既有行为）。
+   - **只认本进程的记录。** `--resume` 会把新进程的记录追加到同一个 transcript 文件，文件里和屏幕上都还留着上一个进程的历史，其中可能就有「Ultracode on (this session only)」。这些重放的旧 verdict 不代表当前状态：effort-sync-4 (f) 中 resume 后的进程实际以 ultracode **关**启动，并在首个 prompt 上发出 `ultra_effort_exit`。因此：
+     - 回读游标从本进程 spawn 时 transcript 的末尾开始，spawn 之前已在文件里的记录只进历史、不参与 effective；开关状态从本进程的第一条附件或 verdict 起算。
+     - 屏幕兜底同理：只认当前 footer，不认 scrollback 里重放的旧 verdict 行。
+     - 新进程（launch 或 resume）在本进程出现第一条证据之前，开关状态为未知。
    - **版本**：从 transcript 记录的 `version` 字段读，每条 assistant 记录都带。
    - **拒绝**映射为带稳定 reason 的 rejection，journal 状态沿用 `effort-degraded:<word>:<reason>`：
 
@@ -1342,14 +1346,19 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
      | `env-override` | verdict 表明档位被 `CLAUDE_CODE_EFFORT_LEVEL` 钉住。Remuda 会剥离这个变量，所以它只会出现在手敲启动、并继承了该变量的会话里。2.1.289 上没有录到原文，匹配前须先实测 |
      | `dialog-kept` | 旧版本的确认框被 Esc 关掉 |
      | `invalid-argument` | `Invalid argument: <x>. Valid options are: …` |
+   - **失败只是这次 configure 的结局，不结束会话**（所有者规则：「failed 不是进程退出；failed 之后可以重试」）。`/effort` 或 ultracode 切换被拒绝、degraded 或超时，都只落在这条 configure 命令和它所在的 turn 上：实例的 lifecycle 不变，不标 `failed` / `exited`，不关进程，不影响排队中的 prompt。之后可以重试，重试是一条新的 configure 命令（新 commandId；configure 不可重放，D-055）。launch 时的版本门拒绝发生在 create 被接受之前，不属于这一条。
    - **被 clamp 的 accept**：verdict 形如 `Effort '<x>' exceeds the cap for <model> …; set to '<y>' instead …`。按 applied 结算，effective 报 clamp 之后的 `<y>`，请求仍记 `<x>`，UI 显示「请求 x → 实际 y」。
    - **`auto`**：它不是 wire 值，Remuda 不发 `/effort auto`；会话里出现 auto 时，回读报它解析出的档。
    - **`/model` 的 verdict**：``with `<level>` effort`` 后缀可有可无，解析不得依赖它。
 5. **UI。**
    - Claude 滑杆只有 `low…max` 五档，没有 ultracode 档，也没有 auto 档。滑杆旁边是一个独立的 **Ultracode** 开关（`role=switch`）。
    - 收起态芯片与 compact 触发器在档名后加 ` · ultracode`，例如 `high · ultracode`、`manual · high · ultracode`；开关关着时只显示档名。两条轴各自显示 effective、各自显示「请求 → 实际」，读不到时显示 `?`。
-   - ultracode 不可用时，开关禁用并显示原因：版本低于 2.1.203；本会话已经收到 `ultracode-workflows-disabled` 或 `ultracode-unavailable-for-model`。非 Claude harness 不渲染这个开关。
-   - 耦合版本上，开关注明「以 xhigh 运行（Claude Code < 2.1.284）」：打开开关即把滑杆移到 xhigh，滑离 xhigh 即关掉开关，与 CLI 的行为一致。
+   - ultracode 不可用时，开关禁用并显示原因，禁用只在原因成立的范围内有效：
+     - 版本低于 2.1.203：整个会话禁用。
+     - `ultracode-unavailable-for-model`：只对**拒绝它的那个模型**禁用。会话换了模型（`/model` accept 或回读到新模型）就重新启用，新模型可以再试；切回那个模型时恢复禁用。
+     - `ultracode-workflows-disabled`：对本进程禁用；新进程（resume 或重新 launch）重新启用。
+     - 非 Claude harness 不渲染这个开关。
+   - 耦合版本上，开关注明「以 xhigh 运行（Claude Code 2.1.203–2.1.283）」：打开开关即把滑杆移到 xhigh，driver 只发一条 `/effort ultracode`（见第 3 条，不保存默认档）；滑离 xhigh 即关掉开关，与 CLI 的行为一致。
    - 余烬（`--ember-*`）只跟随两种状态：Claude 的 ultracode **开关**（任意档）和 Codex 的 `ultra` 档，不再绑定滑杆上的某个位置。Claude 的滑杆只显示档位外观，xhigh / max 用静态强调。
    - Codex、grok、agy 的滑杆不变。
 6. **默认档按模型。**

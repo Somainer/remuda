@@ -453,14 +453,14 @@ function TranscriptInner({
       prependAnchorRef.current = { anchorId, offset, tries: 0, armedIndex };
     }
     setLoadingEarlier(true);
-    let floor: string | null = null;
+    let result: { prepended: boolean; end: boolean } | null = null;
     try {
-      floor = await hubStore.loadEarlier(instanceId);
+      result = await hubStore.loadEarlier(instanceId);
     } finally {
       // Release the anchor when nothing was prepended (already at the floor, an
       // empty/deduped page, or a divergence/stale read) so a later unrelated
       // commit cannot restore to a stale position.
-      if (!floor) {
+      if (!result || result.end || !result.prepended) {
         pendingScroll.current = null;
         prependAnchorRef.current = null;
         restoringRef.current = false;

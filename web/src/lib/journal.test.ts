@@ -363,14 +363,15 @@ describe("JournalClient", () => {
       onPrepend: (events) => prepended.push(events.map((e) => Number(e.seq))),
     });
     // Late attach: the snapshot is a partial tail window.
+    client.noteHistory(Array.from({ length: 2_000 }, (_, i) => obs(3001 + i)));
     client.applySnapshot({
       ...snapshot(5_000),
       history: { earliestRetainedSeq: "3001", complete: false },
     });
     expect(client.retainedFloorSeq).toBe("3001");
 
-    const floor = await client.loadEarlier();
-    expect(floor).toBe("1001");
+    const result = await client.loadEarlier();
+    expect(result).toEqual({ prepended: true, end: false, floor: "1001" });
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ afterSeq: "0", beforeSeq: "3000" });
     expect(prepended).toHaveLength(1);
@@ -378,7 +379,7 @@ describe("JournalClient", () => {
     expect(prepended[0]?.at(-1)).toBe(3000);
 
     // A later partial snapshot with a higher floor must not move the loaded
-    // floor back up.
+    // floor back up (it only re-anchors the descending cursor).
     client.applySnapshot({
       ...snapshot(5_000),
       history: { earliestRetainedSeq: "3001", complete: false },
@@ -386,39 +387,76 @@ describe("JournalClient", () => {
     expect(client.retainedFloorSeq).toBe("1001");
   });
 
-  it("loadEarlier retires without a prepend when the page adds no new rows", async () => {
-    const range = (from: number, to: number) =>
-      Array.from({ length: to - from + 1 }, (_, i) => obs(from + i));
-    const reads = vi
-      .fn<JournalRead>()
-      // First page: the bounded window 1001..3000 below the partial floor.
-      .mockResolvedValueOnce(
-        page(range(1001, 3000), { durableSeq: "5000", windowFromSeq: "1001", reachedAfterSeq: false }),
-      )
-      // Second page re-serves rows the client already holds (server floor
-      // bookkeeping drifted above the rows it actually returns).
-      .mockResolvedValueOnce(
-        page(range(2997, 3000), { durableSeq: "5000", windowFromSeq: "2997", reachedAfterSeq: false }),
-      );
+  it("duplicate pages after a reconnect re-anchor keep descending to held history", async () => {
+    // Real bounded Hub: newest `window` rows of (afterSeq, beforeSeq]. Every
+    // response is one such window, so a duplicate page (rows already held) is
+    // only possible when a snapshot re-anchored the paging cursor ABOVE them.
+    const { read, calls } = windowedRead(10_000, 2_000);
     const prepended: number[][] = [];
-    const client = new JournalClient("obj_journal" as Id, reads, {
+    const client = new JournalClient("obj_journal" as Id, read, {
       onPrepend: (events) => prepended.push(events.map((e) => Number(e.seq))),
     });
+    // Late attach to a bounded tail window 3001..5000: the seed READ delivers
+    // the rows (noteHistory), the snapshot carries the window floor.
+    client.noteHistory(Array.from({ length: 2_000 }, (_, i) => obs(3001 + i)));
     client.applySnapshot({
       ...snapshot(5_000),
       history: { earliestRetainedSeq: "3001", complete: false },
     });
+    // Live frames extend the applied cursor to 8000 while connected.
+    const live = Array.from({ length: 3_000 }, (_, i) => obs(5001 + i));
+    client.applyBatch({
+      subscriptionId: "sub",
+      journalId: "obj_journal" as Id,
+      fromSeq: "5001",
+      toSeq: "8000",
+      events: live,
+      durableSeq: "8000",
+    });
 
-    await expect(client.loadEarlier()).resolves.toBe("1001");
-    expect(prepended).toHaveLength(1);
+    // Reconnect delivers a bounded resync snapshot whose window floor (8001)
+    // is ABOVE manually-loadable history the client has not paged yet.
+    client.applySnapshot({
+      ...snapshot(10_000),
+      history: { earliestRetainedSeq: "8001", complete: false },
+    });
+    expect(client.retainedFloorSeq).toBe("3001");
 
-    // Non-empty but fully deduped: no second onPrepend, floor retired.
-    await expect(client.loadEarlier()).resolves.toBeNull();
+    // Click 1 pages below the snapshot window: 6001..8000, every row already
+    // held. No prepend, NOT the end, the retained floor/button stay, and the
+    // cursor descended.
+    await expect(client.loadEarlier()).resolves.toEqual({
+      prepended: false,
+      end: false,
+      floor: "3001",
+    });
+    expect(prepended).toHaveLength(0);
+    expect(calls.at(-1)?.beforeSeq).toBe("8000");
+
+    // Click 2 walks down through another fully-held window.
+    await expect(client.loadEarlier()).resolves.toMatchObject({ prepended: false, end: false });
+    expect(calls.at(-1)?.beforeSeq).toBe("6000");
+
+    // Click 3 crosses into unseen rows: 2001..3000 arrive (3001..4000 were
+    // already held); the retained floor moves, the end is not reached.
+    const r3 = await client.loadEarlier();
+    expect(calls.at(-1)?.beforeSeq).toBe("4000");
+    expect(r3).toMatchObject({ prepended: true, end: false });
     expect(prepended).toHaveLength(1);
+    expect(prepended[0]?.[0]).toBe(2001);
+    expect(prepended[0]?.at(-1)).toBe(3000);
+    expect(client.retainedFloorSeq).toBe("2001");
+
+    // Click 4 reaches the authoritative end at seq 1.
+    const r4 = await client.loadEarlier();
+    expect(r4).toMatchObject({ prepended: true, end: true });
+    expect(prepended[1]?.[0]).toBe(1);
+    expect(prepended[1]?.at(-1)).toBe(2000);
     expect(client.retainedFloorSeq).toBe("1");
-    // Retired floor short-circuits: no third read is attempted.
-    await expect(client.loadEarlier()).resolves.toBeNull();
-    expect(reads).toHaveBeenCalledTimes(2);
+
+    // The end short-circuits further reads.
+    expect((await client.loadEarlier()).end).toBe(true);
+    expect(calls).toHaveLength(4);
   });
 });
 

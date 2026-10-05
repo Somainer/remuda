@@ -271,6 +271,14 @@ test("a redeployed shell renders on reload with no 404 and no HTML for the modul
   }
 });
 
+// Retained alongside pwa-realbuild.hub.spec.ts (c-perffu r9): the real-build
+// spec proves the WORKER's build-derived manifest precaches every real lazy
+// chunk and an in-SPA offline router nav serves it. THIS synthetic case still
+// proves one thing the real one does not — a COLD offline DOCUMENT navigation
+// (page.goto to an unvisited deep URL while setOffline): the SW's navigate
+// handler must fall back to the cached index.html and then boot the module
+// graph with no network at all. The real-build spec navigates client-side
+// (the document is already loaded), so it never exercises that fallback.
 test("an offline first visit to a never-visited route loads the precached chunk", async ({ page, context }) => {
   test.setTimeout(120_000);
   const dir = await mkdtemp(path.join(target, "pwa-shell-"));

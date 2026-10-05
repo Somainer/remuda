@@ -519,8 +519,13 @@ pub struct StagedResume {
 /// - `<session>/` — subagent transcripts and tool-result payloads;
 /// - `memory/` — the project memory Claude reloads on SessionStart.
 ///
-/// Existing destination files are kept: a retried build must never clobber a
-/// transcript the resumed instance has already appended to.
+/// Existing destination files are kept ONLY with provenance (review item 4):
+/// an existing `<session>.jsonl` is preserved when a sibling staging marker
+/// proves this launch's predecessor staged it (source path plus size/sha256); a
+/// file without that proof is a foreign conversation and aborts staging with a
+/// clear conflict. The transcript is published through a same-directory temp
+/// file plus rename, so a crashed copy is never seen as a complete
+/// conversation; sidecars merge first and never overwrite.
 ///
 /// The destination file is always named `<session_id>.jsonl` — the exact name
 /// `claude --resume <session_id>` looks for — even when the recorded source
@@ -578,7 +583,8 @@ pub fn stage_for_resume(
     }
 
     // Inherited-home resume (or a replayed build): the conversation already
-    // lives where the new process will look. Nothing to stage.
+    // lives where the new process will look. Nothing to stage, and no
+    // provenance marker is required — it is not a Remuda-made copy.
     if same_path(&dest_transcript, source_transcript) {
         return Ok(StagedResume {
             transcript: dest_transcript,
@@ -586,18 +592,210 @@ pub fn stage_for_resume(
         });
     }
 
-    if !dest_transcript.exists() {
-        std::fs::copy(source_transcript, &dest_transcript)?;
+    let (source_size, source_sha256) = sha256_file(source_transcript)?;
+    let marker_path = provenance_marker_path(&dest_dir, session_id);
+
+    // Classify any existing destination transcript without following it.
+    match std::fs::symlink_metadata(&dest_transcript) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(invalid_input(format!(
+                "resume destination {} is a symlink, not a real file",
+                dest_transcript.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(invalid_input(format!(
+                "resume destination {} is not a regular file",
+                dest_transcript.display()
+            )));
+        }
+        Ok(_) => {
+            // Review item 4: keep an existing destination ONLY when provenance
+            // proves this launch staged it from exactly this predecessor.
+            // Anything else (a stale same-session file, a foreign home that
+            // already held this id) is a conflict, never a silent overwrite.
+            let Some(provenance) = read_staging_provenance(&marker_path)? else {
+                return Err(invalid_input(format!(
+                    "resume destination {} already exists without Remuda staging provenance for \
+                     predecessor {}; refusing to overwrite a conversation this launch did not \
+                     stage (resume in a fresh native home or remove the stale file)",
+                    dest_transcript.display(),
+                    source_transcript.display()
+                )));
+            };
+            if !provenance.covers(source_transcript, source_size, &source_sha256) {
+                return Err(invalid_input(format!(
+                    "resume destination {} exists but its staging provenance does not match \
+                     predecessor {} (size {source_size}, sha256 {source_sha256}); refusing to \
+                     overwrite",
+                    dest_transcript.display(),
+                    source_transcript.display()
+                )));
+            }
+            // Proven: the child's own staged copy (possibly already appended
+            // to by an earlier launch attempt). Merge any missing sidecars,
+            // never touch the transcript.
+            let sidecar_dirs =
+                copy_resume_sidecars(source_transcript, source_name, &dest_dir, session_id)?;
+            return Ok(StagedResume {
+                transcript: dest_transcript,
+                sidecar_dirs,
+            });
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
     }
 
-    // Sidecars are siblings of the transcript in the source project dir;
-    // `memory/` is project-global. The per-session directory is keyed by the
-    // native session id: a promoted/renamed transcript can carry a different
-    // file name while its `<S>/` sidecar dir keeps the native id (review item
-    // 3), so `<dir>/<S>/` is looked up FIRST and the file stem is only a
-    // fallback for older promoted layouts.
+    // Fresh staging. Sidecars merge first (idempotent: a crashed earlier
+    // attempt may have left parts), provenance is published next, and the
+    // transcript is published LAST through a same-directory temp file +
+    // rename — until that rename lands, the conversation is visibly absent and
+    // `claude --resume` fails its lookup rather than reading a partial copy.
+    let sidecar_dirs = copy_resume_sidecars(source_transcript, source_name, &dest_dir, session_id)?;
+    write_staging_provenance(
+        &marker_path,
+        &StagingProvenance::new(source_transcript, source_size, &source_sha256),
+    )?;
+    publish_transcript_atomic(source_transcript, &dest_transcript, session_id)?;
+
+    Ok(StagedResume {
+        transcript: dest_transcript,
+        sidecar_dirs,
+    })
+}
+
+/// Directory (inside the destination project slug) holding per-session
+/// provenance markers. Dot-prefixed so Claude's transcript globs never read
+/// it; the fake and the real CLI only open `<session>.jsonl`.
+const STAGING_MARKER_DIR: &str = ".remuda-staging";
+
+/// Provenance recorded next to a staged transcript (review item 4).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StagingProvenance {
+    /// Marker format version.
+    version: u32,
+    /// Absolute path of the predecessor transcript this copy came from.
+    source: String,
+    /// Source size in bytes at staging time.
+    source_size: u64,
+    /// Lower-hex SHA-256 of the source at staging time.
+    source_sha256: String,
+}
+
+impl StagingProvenance {
+    fn new(source: &Path, source_size: u64, source_sha256: &str) -> Self {
+        Self {
+            version: 1,
+            source: source.to_string_lossy().into_owned(),
+            source_size,
+            source_sha256: source_sha256.to_owned(),
+        }
+    }
+
+    /// Whether this marker proves the destination was staged from `source`
+    /// with exactly the predecessor content currently on disk.
+    fn covers(&self, source: &Path, source_size: u64, source_sha256: &str) -> bool {
+        self.version == 1
+            && self.source == source.to_string_lossy()
+            && self.source_size == source_size
+            && self.source_sha256 == source_sha256
+    }
+}
+
+fn provenance_marker_path(dest_dir: &Path, session_id: &str) -> PathBuf {
+    dest_dir
+        .join(STAGING_MARKER_DIR)
+        .join(format!("{session_id}.json"))
+}
+
+/// Read and validate a provenance marker; `None` means absent (a corrupt or
+/// older-format marker is treated as absent — fail closed on the existing
+/// destination).
+fn read_staging_provenance(path: &Path) -> std::io::Result<Option<StagingProvenance>> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => Ok(serde_json::from_str::<StagingProvenance>(&body)
+            .ok()
+            .filter(|marker| marker.version == 1)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Write the marker via a same-directory temp file + rename, so a crash can
+/// leave either the old marker or the new one, never a torn write.
+fn write_staging_provenance(path: &Path, provenance: &StagingProvenance) -> std::io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        invalid_input(format!(
+            "provenance path has no directory: {}",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(dir)?;
+    if is_symlink(dir)? {
+        return Err(invalid_input(format!(
+            "provenance directory {} is a symlink",
+            dir.display()
+        )));
+    }
+    let tmp = dir.join(format!(".marker-tmp-{}", uuid::Uuid::new_v4()));
+    let body = serde_json::to_vec_pretty(provenance).map_err(std::io::Error::other)?;
+    let outcome = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    outcome
+}
+
+/// Copy `source` to `dest` via a same-directory temp file plus atomic rename.
+fn publish_transcript_atomic(source: &Path, dest: &Path, session_id: &str) -> std::io::Result<()> {
+    let dir = dest.parent().ok_or_else(|| {
+        invalid_input(format!(
+            "transcript destination has no directory: {}",
+            dest.display()
+        ))
+    })?;
+    let tmp = dir.join(format!(
+        ".transcript-tmp-{session_id}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let outcome = (|| {
+        std::fs::copy(source, &tmp)?;
+        // Flush the staged bytes before the rename makes them visible.
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+            let _ = file.sync_all();
+        }
+        std::fs::rename(&tmp, dest)
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    outcome
+}
+
+/// SHA-256 (lower hex) and byte size of a regular file read in bounded chunks.
+fn sha256_file(path: &Path) -> std::io::Result<(u64, String)> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let size = std::io::copy(&mut file, &mut hasher)?;
+    Ok((size, format!("{:x}", hasher.finalize())))
+}
+
+/// Copy the per-session sidecar dir (`<dir>/<S>/` first, file stem fallback)
+/// and the project-global `memory/` next to the staged transcript.
+fn copy_resume_sidecars(
+    source_transcript: &Path,
+    source_name: &std::ffi::OsStr,
+    dest_dir: &Path,
+    session_id: &str,
+) -> std::io::Result<Vec<PathBuf>> {
     let source_dir = source_transcript.parent().unwrap_or_else(|| Path::new("/"));
     let mut sidecar_dirs = Vec::new();
+    // The per-session directory is keyed by the native session id: a
+    // promoted/renamed transcript can carry a different file name while its
+    // `<S>/` sidecar dir keeps the native id (review item 3), so `<dir>/<S>/`
+    // is looked up FIRST and the file stem is only a fallback for older
+    // promoted layouts.
     let mut per_session_sources: Vec<std::ffi::OsString> = vec![session_id.into()];
     if let Some(stem) = Path::new(source_name)
         .file_stem()
@@ -611,7 +809,7 @@ pub fn stage_for_resume(
         match std::fs::symlink_metadata(&source_side) {
             Ok(metadata) if metadata.is_dir() => {
                 let dest_side = dest_dir.join(session_id);
-                ensure_within(&dest_dir, &dest_side)?;
+                ensure_within(dest_dir, &dest_side)?;
                 copy_dir_merge(source_dir, &source_side, &dest_side)?;
                 sidecar_dirs.push(dest_side);
                 break;
@@ -630,7 +828,7 @@ pub fn stage_for_resume(
         && metadata.is_dir()
     {
         let dest_side = dest_dir.join("memory");
-        ensure_within(&dest_dir, &dest_side)?;
+        ensure_within(dest_dir, &dest_side)?;
         copy_dir_merge(source_dir, &memory_side, &dest_side)?;
         sidecar_dirs.push(dest_side);
     } else if let Ok(metadata) = std::fs::symlink_metadata(&memory_side)
@@ -641,11 +839,7 @@ pub fn stage_for_resume(
             memory_side.display()
         )));
     }
-
-    Ok(StagedResume {
-        transcript: dest_transcript,
-        sidecar_dirs,
-    })
+    Ok(sidecar_dirs)
 }
 
 /// Path equality after canonicalization, falling back to lexical equality.
@@ -1303,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_staging_keeps_an_existing_destination_transcript() {
+    fn resume_staging_refuses_an_unprovenanced_existing_destination() {
         let tmp = tempfile::tempdir().expect("tmp");
         let old_home = tmp.path().join("old");
         let new_home = tmp.path().join("new");
@@ -1313,13 +1507,95 @@ mod tests {
         let source = transcript_layout(&old_home, &cwd, session);
         let dest = transcript_layout(&new_home, &cwd, session);
         write_file(&source, "source\n");
-        write_file(&dest, "destination already has turns\n");
+        // A stale same-session file with NO Remuda provenance marker.
+        write_file(&dest, "stale conversation from another launch\n");
 
-        stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
+        let error = stage_for_resume(&source, &new_home, &cwd, session)
+            .expect_err("an unprovenanced destination is a conflict, not a silent keep");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("staging provenance"),
+            "the conflict names the missing provenance: {error}"
+        );
         assert_eq!(
             std::fs::read_to_string(&dest).unwrap(),
-            "destination already has turns\n",
+            "stale conversation from another launch\n",
+            "the foreign file is never overwritten"
+        );
+    }
+
+    #[test]
+    fn resume_staging_keeps_a_provenanced_destination_and_its_appended_turns() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000f0";
+        let source = transcript_layout(&old_home, &cwd, session);
+        let dest = transcript_layout(&new_home, &cwd, session);
+        write_file(&source, "source\n");
+
+        // First staging publishes the transcript plus provenance marker.
+        let first = stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
+        assert!(
+            provenance_marker_path(dest.parent().unwrap(), session).is_file(),
+            "a provenance marker is published"
+        );
+        // The resumed instance appended its own turn to its staged copy.
+        write_file(&dest, "source\nchild turn\n");
+
+        // A retried build keeps the child's copy exactly.
+        let again = stage_for_resume(&source, &new_home, &cwd, session).expect("retry stage");
+        assert_eq!(again.transcript, first.transcript);
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "source\nchild turn\n",
             "a retried build must not clobber the child's own transcript"
+        );
+        assert!(
+            dest.parent()
+                .unwrap()
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".transcript-tmp-")),
+            "temp staging files are never left behind"
+        );
+    }
+
+    #[test]
+    fn resume_staging_conflicts_when_provenance_names_a_different_predecessor() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000f1";
+        let source = transcript_layout(&old_home, &cwd, session);
+        let dest = transcript_layout(&new_home, &cwd, session);
+        write_file(&source, "v2 source\n");
+
+        // A previous staging of a DIFFERENT predecessor byte-content.
+        let other_home = tmp.path().join("other");
+        let other = transcript_layout(&other_home, &cwd, session);
+        write_file(&other, "v1 source\n");
+        stage_for_resume(&other, &new_home, &cwd, session).expect("stage v1");
+
+        let error = stage_for_resume(&source, &new_home, &cwd, session)
+            .expect_err("provenance for a different predecessor is a conflict");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("provenance does not match"),
+            "unexpected message: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "v1 source\n",
+            "the conflict leaves the previously staged conversation in place"
         );
     }
 

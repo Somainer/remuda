@@ -548,6 +548,76 @@ async fn resume_uses_the_recorded_transcript_path_even_outside_the_native_home()
     );
 }
 
+/// Review item 4: a destination transcript that already exists but carries no
+/// Remuda staging provenance is a conflict at the staging boundary — a stale
+/// same-session file must never silently replace (or be replaced by) the
+/// predecessor's conversation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_into_a_home_holding_an_unmarked_same_session_file_is_rejected() {
+    let harness = ChainHarness::new();
+    let parent_home = harness.fresh_home();
+    let parent = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "first turn",
+            None,
+            &harness.binary,
+            &parent_home,
+        ))
+        .await
+        .expect("parent create");
+    wait_settled(&harness.node, &parent.command.command_id).await;
+    let parent_id = parent.instance.meta.id.clone();
+    let session = recorded_session(&harness.node, &parent_id).await;
+
+    // Pre-populate the child home as if a foreign launch once held this id.
+    let child_home = harness.fresh_home();
+    let stale = transcript_in(&child_home, &harness.workspace, &session);
+    std::fs::create_dir_all(stale.parent().unwrap()).expect("mkdir");
+    std::fs::write(&stale, b"a conversation this launch never staged\n").expect("stale file");
+
+    let child = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "second turn",
+            Some((&parent_id, session.as_str())),
+            &harness.binary,
+            &child_home,
+        ))
+        .await
+        .expect("the create is accepted; staging happens at build time");
+    let child_id = child.instance.meta.id.clone();
+
+    // Staging fails inside the build, which fails the materialization and
+    // records the reason on the instance (the command is marked unknown).
+    let failure = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let instance = harness.node.get_instance(&child_id).expect("instance");
+            if let Some(last_error) = &instance.last_error
+                && last_error.contains("staging provenance")
+            {
+                return last_error.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "build failure with the provenance conflict was not recorded: {:?}",
+            harness.node.get_instance(&child_id).map(|i| i.last_error)
+        )
+    });
+    assert!(failure.contains("staging provenance"), "{failure}");
+    assert_eq!(
+        std::fs::read_to_string(&stale).unwrap(),
+        "a conversation this launch never staged\n",
+        "the unmarked destination is never overwritten"
+    );
+}
+
 /// Review item 1: a `resumeSessionId` that is not one safe file-name component
 /// is refused before acceptance — it is interpolated into transcript paths in
 /// both the resolver and the staging factory.

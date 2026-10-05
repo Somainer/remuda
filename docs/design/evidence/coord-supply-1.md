@@ -39,7 +39,7 @@ Design: `docs/design/coordinator-hierarchy.md` §4.2–§4.6, §5.6, §8.1 row 3
    `placement_ledger` row stores the whole decision (`chosen`, `ranked`,
    `reasons[]`, `rejected[]`) for the audit trail and the future bot card.
 6. **Fallback chain** — per-model ordered `fallback` declared on the catalog
-   (es1 → seed in the 09-14 shape); it is selection order, not an automatic
+   (model_x → seed in the 09-14 shape); it is selection order, not an automatic
    retry: switching models is a new §4.6 solve (clean slate / switch-model).
 7. **Cooldown with backoff** — unit is `(supplyId, windowId)`; known
    `resetsAt` parks exactly to it; otherwise 60s → 2m → 5m → 15m capped
@@ -92,9 +92,9 @@ A user can declare only "workhorse X, scarce Y":
 
 ```json
 { "models": [
-  { "id": "gw/seed[1m]", "workhorse": true },
-  { "id": "gw/es1[1m]",  "family": "es1", "priority": 20,
-    "concurrencyMax": 4, "fallback": ["gw/seed[1m]"] }
+  { "id": "gw/model-y[1m]", "workhorse": true },
+  { "id": "gw/model_x[1m]",  "family": "model_x", "priority": 20,
+    "concurrencyMax": 4, "fallback": ["gw/model-y[1m]"] }
 ] }
 ```
 
@@ -102,18 +102,18 @@ Everything else defaults: absent windows make a profile `unknown` state
 (used only when explicitly prioritised/pinned or all windowed supply is
 exhausted); a secret-less `kind:"native"` profile needs no auth token.
 
-## 09-14 es1 incident replay
+## 09-14 model_x incident replay
 
 `crates/remuda-hub/tests/supply.rs::family_window_admits_sibling_account_window_parks_all`
 and the CLI golden
 `crates/remuda/tests/profile_cli.rs::profile_declare_event_and_probe_dry_run_against_hub`
 replay the incident shape with synthetic fixtures (no real models):
 
-1. `gw/es1[1m]` (family `es1`, priority 20, fallback `gw/seed[1m]`) 429s.
-2. A family window `appliesTo:["es1"]` parks with cooldown; account state is
+1. `gw/model_x[1m]` (family `model_x`, priority 20, fallback `gw/model-y[1m]`) 429s.
+2. A family window `appliesTo:["model_x"]` parks with cooldown; account state is
    `degraded`, not `cooling` — ordinary usage is not false-rejected.
-3. Re-solving admits the `seed` sibling (priority 18) and rejects es1 with a
-   `family es1 window 'model' cooling until …` reason.
+3. Re-solving admits the `seed` sibling (priority 18) and rejects model_x with a
+   `family model_x window 'model' cooling until …` reason.
 4. A subsequent account-level `weekly` window (`appliesTo:["*"]`, 100%)
    parks **all** models and produces a deferred decision with
    `deferredUntil` = the reset.

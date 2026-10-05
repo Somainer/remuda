@@ -44,12 +44,12 @@ vi.mock("../../lib/store", () => ({
     hostName: (id: string) => hostNames[id] ?? id,
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
     effortEffectiveOf: () => null,
-    modelOf: () => "model_hub/es1_orange_o50[1m]",
+    modelOf: () => "acme_hub/model_x_o50[1m]",
     // Running model for the chip: a read-back effective id wins; otherwise an
     // explicit fixture entry (pin or null); otherwise the fixture launch pin.
     runningModelOf: (id: string) =>
       modelEffective[id]?.id ??
-      (id in runningModel ? runningModel[id] : "model_hub/es1_orange_o50[1m]"),
+      (id in runningModel ? runningModel[id] : "acme_hub/model_x_o50[1m]"),
     modelEffectiveOf: (id: string) => modelEffective[id] ?? null,
     modelCatalogOf: () => null,
     refreshScreens: vi.fn(),
@@ -99,7 +99,7 @@ function session(id: string, patch: Partial<Instance> = {}): Instance {
 }
 
 /** The Space the list is pinned to in most of these cases. */
-const spaceA = { id: "space-a", name: "sfe-root", hostId: "host-a", workspaceId: "wsp-a" };
+const spaceA = { id: "space-a", name: "demo-root", hostId: "host-a", workspaceId: "wsp-a" };
 
 function renderList(search = "", options: { instances?: Instance[]; space?: typeof spaceA } = {}) {
   return render(
@@ -107,7 +107,7 @@ function renderList(search = "", options: { instances?: Instance[]; space?: type
       <SessionList
         variant="full"
         instances={options.instances ?? hub.instances}
-        title="sfe-root"
+        title="demo-root"
         space={"space" in options ? options.space : spaceA}
       />
     </MemoryRouter>,
@@ -117,7 +117,7 @@ function renderList(search = "", options: { instances?: Instance[]; space?: type
 beforeEach(() => {
   mobileViewport = false;
   hub.hosts = [host("host-a", "alpha"), host("host-b", "beta")];
-  hub.workspaces = [workspace("wsp-a", "host-a", "sfe-root", "/home/dev/sfe-root")];
+  hub.workspaces = [workspace("wsp-a", "host-a", "demo-root", "/home/dev/demo-root")];
   hub.instances = [session("ins_a"), session("ins_b", { activity: known("waiting-interaction") })];
   hub.interactions = [];
   hub.screens = {};
@@ -268,7 +268,7 @@ describe("SessionList scope and conditions", () => {
 });
 
 /** Space id the real buildSpaces() derives for the fixture host/workspace. */
-const derivedSpace = { id: '["host-a","wsp-a"]', name: "sfe-root", hostId: "host-a", workspaceId: "wsp-a" };
+const derivedSpace = { id: '["host-a","wsp-a"]', name: "demo-root", hostId: "host-a", workspaceId: "wsp-a" };
 
 describe("SessionList model label", () => {
   afterEach(() => {
@@ -279,7 +279,7 @@ describe("SessionList model label", () => {
   it("shows the durable launch spec verbatim before any read-back", () => {
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
-    expect(label.textContent).toBe("model_hub/es1_orange_o50[1m]");
+    expect(label.textContent).toBe("acme_hub/model_x_o50[1m]");
     expect(label).toHaveAttribute("data-model-effective", "unknown");
     // The launch spec is not mislabeled as observed.
     expect(label.getAttribute("title")).toContain("尚未从会话回读");
@@ -288,7 +288,7 @@ describe("SessionList model label", () => {
   it("shows the running id verbatim once read back, equal or not to the launch", () => {
     for (const id of ["ins_a", "ins_b"]) {
       modelEffective[id] = {
-        id: "model_hub/es1_orange_o48[1m]",
+        id: "acme_hub/model_x_o48[1m]",
         source: "launch",
         observedAt: "2026-09-18T00:00:00Z",
       };
@@ -297,25 +297,25 @@ describe("SessionList model label", () => {
     const label = screen.getAllByTestId("session-model")[0];
     // Only the running id — even when the launch pin differed, the chip
     // never reconstructs a requested-vs-running pair.
-    expect(label.textContent).toBe("model_hub/es1_orange_o48[1m]");
+    expect(label.textContent).toBe("acme_hub/model_x_o48[1m]");
     expect(label).not.toHaveTextContent("⇐");
-    expect(label).toHaveAttribute("data-model-effective", "model_hub/es1_orange_o48[1m]");
+    expect(label).toHaveAttribute("data-model-effective", "acme_hub/model_x_o48[1m]");
   });
 
   it("renders the running id raw even when its last segment matches the launch", () => {
     // The incident pair: shortening ids would collapse them to
-    // "seed-evolving"; the chip shows the full running string verbatim.
+    // "model-y"; the chip shows the full running string verbatim.
     for (const id of ["ins_a", "ins_b"]) {
-      runningModel[id] = "passthrough/ark/seed-evolving";
+      runningModel[id] = "passthrough/ark/model-y";
       modelEffective[id] = {
-        id: "ark/seed-evolving",
+        id: "ark/model-y",
         source: "launch",
         observedAt: "2026-09-23T00:00:00Z",
       };
     }
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
-    expect(label.textContent).toBe("ark/seed-evolving");
+    expect(label.textContent).toBe("ark/model-y");
     expect(label).not.toHaveTextContent("⇐");
   });
 
@@ -348,7 +348,7 @@ describe("SessionList model label", () => {
 function renderKeyList() {
   return render(
     <MemoryRouter initialEntries={["/sessions"]}>
-      <SessionList variant="full" instances={hub.instances} title="sfe-root" space={derivedSpace} />
+      <SessionList variant="full" instances={hub.instances} title="demo-root" space={derivedSpace} />
     </MemoryRouter>,
   );
 }
@@ -417,7 +417,7 @@ describe("SessionList rows: next step, wire disclosure and overflow sheet", () =
     const summaryTip = wireToggle.getAttribute("title") ?? "";
     expect(summaryTip).toContain("ready");
     expect(summaryTip).toContain("connected");
-    expect(summaryTip).toContain("alpha/sfe-root");
+    expect(summaryTip).toContain("alpha/demo-root");
     // Relative timestamp (mock timestamps are "now"-ish, so formatListTime
     // yields either "刚刚" or a clock string).
     expect(summaryTip).toMatch(/刚刚|^\d{1,2}:\d{2}$/m);

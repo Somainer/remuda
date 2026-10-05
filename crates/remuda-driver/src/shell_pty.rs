@@ -3604,7 +3604,7 @@ mod tests {
                     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
                 },
                 "model": "shared-gateway-model",
-                "modelSettings": [{"name": "model_hub/es1_orange_o48"}],
+                "modelSettings": [{"name": "acme_hub/model_x_o48"}],
                 "statusLine": {"type": "command", "command": "echo ready"},
                 "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "user-session-start"}]}]},
                 "theme": "dark"
@@ -3708,10 +3708,7 @@ mod tests {
             assert_eq!(merged["env"]["ANTHROPIC_MODEL"], "local-gateway-model");
             assert_eq!(merged["env"]["EXTRA"], "kept");
             assert_eq!(merged["model"], "local-gateway-model");
-            assert_eq!(
-                merged["modelSettings"][0]["name"],
-                "model_hub/es1_orange_o48"
-            );
+            assert_eq!(merged["modelSettings"][0]["name"], "acme_hub/model_x_o48");
             assert_eq!(merged["statusLine"]["command"], "echo ready");
             assert_eq!(merged["theme"], "dark");
             assert_eq!(merged["verbose"], true);
@@ -3786,7 +3783,7 @@ mod tests {
         std::fs::write(
             user_home.join("settings.json"),
             serde_json::json!({
-                "model": "ark/seed-evolving[1m]",
+                "model": "ark/model-y[1m]",
                 "theme": "dark",
                 "permissions": {"allow": ["Read"], "deny": ["Read(./.env)"]},
                 "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "user-session-start"}]}]},
@@ -3794,7 +3791,7 @@ mod tests {
                 "env": {
                     "ANTHROPIC_BASE_URL": "https://host-native.example/api",
                     "ANTHROPIC_AUTH_TOKEN": "host-token-placeholder",
-                    "ANTHROPIC_MODEL": "ark/seed-evolving[1m]",
+                    "ANTHROPIC_MODEL": "ark/model-y[1m]",
                     "ANTHROPIC_DEFAULT_OPUS_MODEL": "ark/host-opus",
                     "ANTHROPIC_DEFAULT_SONNET_MODEL": "ark/host-sonnet",
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "ark/host-haiku",
@@ -3811,7 +3808,7 @@ mod tests {
         std::fs::write(
             &provider_overlay,
             serde_json::json!({
-                "model": "passthrough/ark/seed-evolving",
+                "model": "passthrough/ark/model-y",
                 "env": {
                     "ANTHROPIC_BASE_URL": "https://gateway.example/v1",
                     "ANTHROPIC_AUTH_TOKEN": "hub-token-placeholder",
@@ -3837,7 +3834,7 @@ mod tests {
                     base_url: "https://gateway.example/v1".into(),
                     delegation: Delegation::Gateway,
                     secret_ref: None,
-                    models: vec!["passthrough/ark/seed-evolving".into()],
+                    models: vec!["passthrough/ark/model-y".into()],
                     health: crate::profile::ProviderHealth::Healthy,
                 }),
                 launch_dir: instance.join("launch"),
@@ -3888,11 +3885,11 @@ mod tests {
             merged["env"]["ANTHROPIC_AUTH_TOKEN"],
             "hub-token-placeholder"
         );
-        assert_eq!(merged["model"], "passthrough/ark/seed-evolving");
+        assert_eq!(merged["model"], "passthrough/ark/model-y");
         // No host endpoint or model variable survives anywhere.
         let rendered = merged.to_string();
         assert!(!rendered.contains("host-native.example"), "{rendered}");
-        assert!(!rendered.contains("ark/seed-evolving[1m]"), "{rendered}");
+        assert!(!rendered.contains("ark/model-y[1m]"), "{rendered}");
         assert!(!rendered.contains("ark/host-"), "{rendered}");
         for name in [
             "ANTHROPIC_MODEL",
@@ -3934,7 +3931,7 @@ mod tests {
         );
         assert_eq!(native.related_ids["delegation"], "gateway");
         assert_eq!(
-            native.related_ids["effectiveModel"], "passthrough/ark/seed-evolving",
+            native.related_ids["effectiveModel"], "passthrough/ark/model-y",
             "the line must name the model that actually answers"
         );
         assert_eq!(

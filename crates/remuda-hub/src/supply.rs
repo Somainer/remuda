@@ -2,7 +2,7 @@
 //! coordinator design §4.4–§4.6.
 //!
 //! Policy shape: **admission control is heavy, failover is light** (§4.4).
-//! Everything below is pure given a clock instant, so the 09-14 es1 replay
+//! Everything below is pure given a clock instant, so the 09-14 model_x replay
 //! can pin time deterministically. Rules encoded here:
 //!
 //! * capability filter (class ≥ `minClass`, context window, effort level),
@@ -368,7 +368,7 @@ pub struct ChosenSupply {
 /// A hard pin matched no eligible candidate. Admission **refuses**: a pin is
 /// a hard constraint (coordinator-hierarchy.md §4.3), never a preference the
 /// ranker may silently substitute. The 2026-09-17 incident dispatched on
-/// `ark/seed-evolving[1m]` — an id no profile listed — and the ranker launched
+/// `ark/model-y[1m]` — an id no profile listed — and the ranker launched
 /// the list head instead of failing.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -846,7 +846,7 @@ fn rank_cmp(a: &Evaluated, b: &Evaluated, input: &SolveInput<'_>) -> std::cmp::O
 // ── hard-pin refusal (§4.3) ────────────────────────────────────────────────
 
 /// Split a lowered model id into comparison tokens, e.g.
-/// `passthrough/ark/seed-evolving[1m]` → `{passthrough, ark, seed, evolving, 1m}`.
+/// `passthrough/ark/model-y[1m]` → `{passthrough, ark, model, y, 1m}`.
 /// Caller passes an already-lowercased id (see [`suggestion_score`]).
 fn pin_tokens(lowered: &str) -> HashSet<&str> {
     lowered
@@ -855,8 +855,8 @@ fn pin_tokens(lowered: &str) -> HashSet<&str> {
         .collect()
 }
 
-/// Drop bracket/colon qualifiers from a path segment so `seed-evolving[1m]`
-/// and `seed-evolving` compare as the same model tail.
+/// Drop bracket/colon qualifiers from a path segment so `model-y[1m]`
+/// and `model-y` compare as the same model tail.
 fn loose_tail(segment: &str) -> &str {
     segment.split(['[', ':']).next().unwrap_or(segment)
 }
@@ -865,7 +865,7 @@ fn loose_tail(segment: &str) -> &str {
 /// means no shared structure (the id is not offered as a suggestion).
 ///
 /// Signals, strongest first: exact id; listed id ending in the pin
-/// (`ark/seed-evolving` → `passthrough/ark/seed-evolving`); shared `/`
+/// (`ark/model-y` → `passthrough/ark/model-y`); shared `/`
 /// segments from the tail; qualifier-insensitive equal tail; shared
 /// family/name tokens; small Levenshtein term only to break near-ties.
 fn suggestion_score(wanted: &str, listed: &str) -> i64 {
@@ -1761,9 +1761,9 @@ mod tests {
     #[test]
     fn family_429_parks_family_but_siblings_stay_open_then_backoff_ladder() {
         let mut windows = Vec::new();
-        apply_family_rate_hit(&mut windows, "es1", NOW);
+        apply_family_rate_hit(&mut windows, "model_x", NOW);
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].applies_to, vec!["es1".to_string()]);
+        assert_eq!(windows[0].applies_to, vec!["model_x".to_string()]);
         assert_eq!(windows[0].cooldown_until, Some(NOW + 60));
         assert!(windows[0].is_cooling_at(NOW + 30));
         // A sibling family is not governed by the window.
@@ -1773,7 +1773,7 @@ mod tests {
             let t = NOW + at;
             let state = refresh_state(&mut windows, None, t);
             assert_eq!(state, SupplyState::Available, "cooldown expired at {at}");
-            apply_family_rate_hit(&mut windows, "es1", t);
+            apply_family_rate_hit(&mut windows, "model_x", t);
             assert_eq!(
                 windows[0].cooldown_until,
                 Some(t + wait),
@@ -1787,7 +1787,7 @@ mod tests {
         let observed = ObservedRateLimits {
             windows: vec![RateLimitWindow {
                 id: "primary".into(),
-                applies_to: vec!["es1".into()],
+                applies_to: vec!["model_x".into()],
                 limit: None,
                 window_duration_mins: Some(300),
                 used_percent: Some(100.0),
@@ -1800,7 +1800,7 @@ mod tests {
         };
         let mut windows = vec![RateLimitWindow::declared(
             "primary",
-            vec!["es1".into()],
+            vec!["model_x".into()],
             Some(300),
         )];
         apply_structured_windows(&mut windows, &observed, NOW);
@@ -1829,7 +1829,7 @@ mod tests {
         let mut windows = Vec::new();
         apply_structured_windows(&mut windows, &observed, NOW);
         assert_eq!(refresh_state(&mut windows, None, NOW), SupplyState::Cooling);
-        assert!(windows[0].applies_to_family("es1"));
+        assert!(windows[0].applies_to_family("model_x"));
         assert!(windows[0].applies_to_family("seed"));
     }
 
@@ -1953,7 +1953,7 @@ mod tests {
             "pvp_gw",
             "opaque-gateway",
             remuda_protocol::SupplyProfile::default(),
-            vec![model("gw/anything[1m]", "es1", "workhorse", 0)],
+            vec![model("gw/anything[1m]", "model_x", "workhorse", 0)],
         );
         let hosts = [host("hst_a", 8, 0)];
         // On its own: unknown pool is admitted (everything else exhausted).
@@ -2015,29 +2015,37 @@ mod tests {
     }
 
     #[test]
-    fn es1_incident_shape_family_cool_sibling_wins() {
-        // §4.6 replay core: es1 family is 429ing; seed sibling on the SAME
-        // account has been fine all along and sits in es1's fallback chain.
-        let mut es1_model = model("gw/es1[1m]", "es1", "workhorse", 20);
-        es1_model.fallback = vec!["gw/seed[1m]".into()];
+    fn model_x_incident_shape_family_cool_sibling_wins() {
+        // §4.6 replay core: model_x family is 429ing; seed sibling on the SAME
+        // account has been fine all along and sits in model_x's fallback chain.
+        let mut model_x_model = model("gw/model_x[1m]", "model_x", "workhorse", 20);
+        model_x_model.fallback = vec!["gw/model-y[1m]".into()];
         let mut supply = remuda_protocol::SupplyProfile {
             priority: 20,
             ..Default::default()
         };
-        apply_family_rate_hit(&mut supply.windows, "es1", NOW);
+        apply_family_rate_hit(&mut supply.windows, "model_x", NOW);
         let profiles = vec![profile_with(
             "pvp_relay",
             "relay",
             supply,
-            vec![es1_model, model("gw/seed[1m]", "seed", "workhorse", 18)],
+            vec![
+                model_x_model,
+                model("gw/model-y[1m]", "seed", "workhorse", 18),
+            ],
         )];
         let hosts = [host("hst_a", 8, 0)];
         let decision = solve(input(&profiles, &hosts, &task(None), &InFlight::default()));
         let chosen = decision.chosen.as_ref().unwrap();
-        assert_eq!(chosen.model_id, "gw/seed[1m]");
+        assert_eq!(chosen.model_id, "gw/model-y[1m]");
         assert_eq!(chosen.family, "seed");
-        assert!(decision.rejected.iter().any(|r| r.model_id == "gw/es1[1m]"
-            && r.reasons.iter().any(|reason| reason.contains("cooling"))));
+        assert!(
+            decision
+                .rejected
+                .iter()
+                .any(|r| r.model_id == "gw/model_x[1m]"
+                    && r.reasons.iter().any(|reason| reason.contains("cooling")))
+        );
     }
 
     #[test]
@@ -2072,7 +2080,8 @@ mod tests {
             vec!["*".to_string()],
             Some(300),
         )];
-        let signal = observe_textual_event(&mut windows, "es1", Some(529), "529 overloaded", NOW);
+        let signal =
+            observe_textual_event(&mut windows, "model_x", Some(529), "529 overloaded", NOW);
         assert_eq!(signal, Some(RateSignal::FleetOverloaded));
         assert_eq!(
             refresh_state(&mut windows, None, NOW),
@@ -2125,8 +2134,8 @@ mod tests {
             "passthrough",
             remuda_protocol::SupplyProfile::default(),
             vec![
-                model("passthrough/ark/seed-evolving", "ark", "workhorse", 20),
-                model("passthrough/ark/seed-legacy", "ark", "workhorse", 10),
+                model("passthrough/ark/model-y", "ark", "workhorse", 20),
+                model("passthrough/ark/model-legacy", "ark", "workhorse", 10),
                 model("gw/totally-unrelated[1m]", "other", "workhorse", 5),
             ],
         )];
@@ -2136,7 +2145,7 @@ mod tests {
         let decision = solve(input(
             &profiles,
             &hosts,
-            &model_pin("ark/seed-evolving[1m]"),
+            &model_pin("ark/model-y[1m]"),
             &InFlight::default(),
         ));
         let refusal = decision.pin_refusal.as_ref().expect("hard refusal");
@@ -2145,11 +2154,11 @@ mod tests {
             !decision.deferred,
             "a refusal is not a retry-later deferral"
         );
-        assert_eq!(refusal.suggestions[0], "passthrough/ark/seed-evolving");
+        assert_eq!(refusal.suggestions[0], "passthrough/ark/model-y");
         assert!(
             refusal
                 .suggestions
-                .contains(&"passthrough/ark/seed-legacy".to_string()),
+                .contains(&"passthrough/ark/model-legacy".to_string()),
             "{refusal:?}"
         );
         // The merely `1m`-tag-sharing unrelated id ranks below same-family ids.
@@ -2167,18 +2176,18 @@ mod tests {
             refusal
                 .reasons
                 .iter()
-                .any(|r| r.contains("did you mean \"passthrough/ark/seed-evolving\""))
+                .any(|r| r.contains("did you mean \"passthrough/ark/model-y\""))
         );
 
         // Exact suffix shape (no [1m] tag) is the strongest possible hint.
         let decision = solve(input(
             &profiles,
             &hosts,
-            &model_pin("ark/seed-evolving"),
+            &model_pin("ark/model-y"),
             &InFlight::default(),
         ));
         let refusal = decision.pin_refusal.as_ref().unwrap();
-        assert_eq!(refusal.suggestions[0], "passthrough/ark/seed-evolving");
+        assert_eq!(refusal.suggestions[0], "passthrough/ark/model-y");
     }
 
     #[test]
@@ -2196,7 +2205,7 @@ mod tests {
         let decision = solve(input(
             &profiles,
             &hosts,
-            &model_pin("ark/seed-evolving[1m]"),
+            &model_pin("ark/model-y[1m]"),
             &InFlight::default(),
         ));
         let refusal = decision.pin_refusal.as_ref().unwrap();
@@ -2242,7 +2251,7 @@ mod tests {
             "passthrough",
             remuda_protocol::SupplyProfile::default(),
             vec![
-                model("passthrough/ark/seed-evolving", "ark", "workhorse", 5),
+                model("passthrough/ark/model-y", "ark", "workhorse", 5),
                 model("claude-fable-5.1", "fable", "frontier", 99),
             ],
         )];
@@ -2250,12 +2259,12 @@ mod tests {
         let decision = solve(input(
             &profiles,
             &hosts,
-            &model_pin("passthrough/ark/seed-evolving"),
+            &model_pin("passthrough/ark/model-y"),
             &InFlight::default(),
         ));
         assert!(decision.pin_refusal.is_none());
         let chosen = decision.chosen.expect("the pin is listed, it wins");
-        assert_eq!(chosen.model_id, "passthrough/ark/seed-evolving");
+        assert_eq!(chosen.model_id, "passthrough/ark/model-y");
         assert_eq!(chosen.profile_id, "pvp_passthrough");
         // The higher-priority fable row must NOT replace the pin.
         assert_eq!(decision.ranked.len(), 1);

@@ -40,10 +40,10 @@ const REPORT_MODEL_ENV: &str = "FAKE_HARNESS_REPORT_MODEL";
 /// A synthetic pin in the shape a gateway catalog really lists: namespaced, with
 /// a `[1m]` context-window variant. The suffix is load-bearing — it selects a
 /// different model — so it is asserted byte-identical throughout.
-const PIN: &str = "model_hub/es1_orange_o50[1m]";
+const PIN: &str = "acme_hub/model_x_o50[1m]";
 /// A different id standing in for the launching host's own default, to prove the
 /// pin is what reached the process rather than whatever the host preferred.
-const HOST_DEFAULT: &str = "model_hub/es1_orange_o48[1m]";
+const HOST_DEFAULT: &str = "acme_hub/model_x_o48[1m]";
 
 #[test]
 fn a_pinned_model_reaches_the_process_on_a_native_shell_pty_launch() {

@@ -123,7 +123,7 @@ function departedOf(items: Interaction[]): ApprovalRow[] {
       hosts: [host],
       answering: {},
       deviceId: "dev_1",
-      workspaceLabel: () => "sfe-root",
+      workspaceLabel: () => "demo-root",
     },
     { kind: "all", hostId: "", workspaceId: "", focus: null },
   ).departed;
@@ -137,7 +137,7 @@ describe("DepartedList keyed list across a poll", () => {
   it("does not re-render unchanged departed rows when one new interaction arrives", async () => {
     const counts = new Map<string, number>();
     const onRowRender = (id: string) => counts.set(id, (counts.get(id) ?? 0) + 1);
-    const workspaceLabel = () => "sfe-root";
+    const workspaceLabel = () => "demo-root";
 
     // Initial commit: two departed rows.
     const first = departedOf([expired, superseded]);

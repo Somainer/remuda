@@ -2755,8 +2755,8 @@ mod tests {
         const HOST_ORIGIN: &str = "https://host-gateway.example/v1";
         const RELAY_BEARER: &str = "fake-relay-0002";
         const LISTENER_URL: &str = "http://127.0.0.1:41317/v1";
-        const PIN: &str = "model_hub/es1_orange_o50[1m]";
-        const HOST_MODEL: &str = "model_hub/host_default";
+        const PIN: &str = "acme_hub/model_x_o50[1m]";
+        const HOST_MODEL: &str = "acme_hub/host_default";
 
         let dir = tempfile::tempdir().expect("tempdir");
         let host = HostId::new();
@@ -3019,13 +3019,13 @@ mod tests {
             "kind": "claude",
             "driver": "shell-pty",
             "hostId": host,
-            "model": "passthrough/ark/seed-evolving",
+            "model": "passthrough/ark/model-y",
             "delegation": "gateway",
             "providerProfileId": "pvp_example",
             "providerOverlay": {
                 "kind": "gateway",
                 "baseUrl": "https://gateway.example/v1",
-                "model": "passthrough/ark/seed-evolving",
+                "model": "passthrough/ark/model-y",
                 "scope": format!("host:{}", host.as_id().as_str())
             },
             "providerAuthToken": "fake-hub-provider-token"
@@ -3037,7 +3037,7 @@ mod tests {
             base_url: String::new(),
             delegation: Delegation::Gateway,
             secret_ref: None,
-            models: vec!["passthrough/ark/seed-evolving".into()],
+            models: vec!["passthrough/ark/model-y".into()],
             health: ProviderHealth::Healthy,
         };
         let launch_dir = dir.path().join("launch");
@@ -3058,7 +3058,7 @@ mod tests {
             settings["env"]["ANTHROPIC_BASE_URL"], "https://gateway.example/v1",
             "the Hub's endpoint is what the session must talk to"
         );
-        assert_eq!(settings["model"], "passthrough/ark/seed-evolving");
+        assert_eq!(settings["model"], "passthrough/ark/model-y");
         // The host's own gateway must be nowhere in the materialised document.
         let rendered = settings.to_string();
         assert!(

@@ -355,7 +355,7 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
     // it must render verbatim on the channel surface even though no Project
     // with that id is in the Hub directory (the reference is never blanked).
     await page.goto("/bots/feishu");
-    await expect(page.getByTestId("bot-defaults")).toContainText("sfe-root");
+    await expect(page.getByTestId("bot-defaults")).toContainText("demo-root");
   });
 
   for (const width of [390, 1440]) {

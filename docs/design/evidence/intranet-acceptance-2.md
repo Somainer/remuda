@@ -33,7 +33,7 @@ The daemon retained the real repository, shown as `~/<repo>`, as its sole
 workspace root. That selection was configured during the preceding stopgap; the
 throwaway root was already deselected. This run verified the configuration and
 restarted the local daemon. No Node code or binary was changed during this
-milestone. No Caddy change, Hub upgrade, SG/bolt Node rollout, or tunnel was used.
+milestone. No Caddy change, Hub upgrade, SG/devbox Node rollout, or tunnel was used.
 
 ## Restart and workspace checks
 

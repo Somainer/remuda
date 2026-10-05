@@ -200,7 +200,7 @@ describe("resolveGatewayModel", () => {
  */
 describe("catalog grouping and filtering", () => {
   const catalog = normalizeModels([
-    { id: "passthrough/ark/seed-evolving", surfaces: ["openai"] },
+    { id: "passthrough/ark/model-y", surfaces: ["openai"] },
     { id: "passthrough/auto", label: "Auto", surfaces: ["openai"] },
     { id: "cursor/gpt-5", surfaces: ["openai"] },
     { id: "gemini-2.5-pro", surfaces: ["openai"] },
@@ -210,7 +210,7 @@ describe("catalog grouping and filtering", () => {
   ]);
 
   it("buckets an id by everything up to the first slash or dash", () => {
-    expect(modelGroupKey("passthrough/ark/seed-evolving")).toBe("passthrough/");
+    expect(modelGroupKey("passthrough/ark/model-y")).toBe("passthrough/");
     expect(modelGroupKey("cursor/gpt-5")).toBe("cursor/");
     expect(modelGroupKey("gemini-2.5-pro")).toBe("gemini-");
     expect(modelGroupKey("claude-opus-5")).toBe("claude-");
@@ -228,7 +228,7 @@ describe("catalog grouping and filtering", () => {
       "solo",
     ]);
     expect(groups[0].models.map((m) => m.id)).toEqual([
-      "passthrough/ark/seed-evolving",
+      "passthrough/ark/model-y",
       "passthrough/auto",
     ]);
     expect(groups.flatMap((g) => g.models)).toHaveLength(catalog.length);
@@ -241,8 +241,8 @@ describe("catalog grouping and filtering", () => {
     ]);
     // Matches the human label too, not just the wire id.
     expect(filterModels(catalog, "opus 5").map((m) => m.id)).toEqual(["claude-opus-5"]);
-    expect(filterModels(catalog, "SEED").map((m) => m.id)).toEqual([
-      "passthrough/ark/seed-evolving",
+    expect(filterModels(catalog, "MODEL-Y").map((m) => m.id)).toEqual([
+      "passthrough/ark/model-y",
     ]);
     expect(filterModels(catalog, "  ")).toHaveLength(catalog.length);
     expect(filterModels(catalog, "nothing-matches")).toHaveLength(0);
@@ -348,9 +348,9 @@ describe("nextDefaultModel", () => {
 
 describe("splitModelId", () => {
   it("keeps the tail, where ids in one family actually differ", () => {
-    const [head, tail] = splitModelId("passthrough/ark/seed-evolving-250918");
-    expect(head + tail).toBe("passthrough/ark/seed-evolving-250918");
-    expect(tail).toBe("ing-250918");
+    const [head, tail] = splitModelId("passthrough/ark/model-y-250918");
+    expect(head + tail).toBe("passthrough/ark/model-y-250918");
+    expect(tail).toBe("l-y-250918");
   });
 
   it("leaves a short id whole rather than splitting it for no gain", () => {

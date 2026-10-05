@@ -1478,7 +1478,7 @@ fn normalize_explicit_pin(pin: Option<&str>) -> Option<String> {
 /// session answer on something else. This gate reads back what actually
 /// answered using the alias-aware comparison in
 /// [`remuda_protocol::compare_model_pin`] so a correct gateway launch
-/// (`model_hub/es1_orange_o50[1m]` answered by `claude-opus-5`) is not flagged.
+/// (`acme_hub/model_x_o50[1m]` answered by `claude-opus-5`) is not flagged.
 ///
 /// It is deliberately event-driven and fail-open: it judges only the
 /// **launch-attributed** read-back, once. If no genuine read-back ever arrives
@@ -4217,7 +4217,7 @@ mod tests {
     mod model_pin_gate {
         use super::*;
 
-        const PIN: &str = "model_hub/es1_orange_o50[1m]";
+        const PIN: &str = "acme_hub/model_x_o50[1m]";
 
         /// The driver's synthetic launch snapshot: `source = Launch`, and crucially
         /// NO `raw` spelling, because the process has not spoken yet.
@@ -4289,13 +4289,13 @@ mod tests {
             assert_eq!(gate.observe(&launch_snapshot(PIN, None)), None);
             assert!(!gate.settled);
             let divergence = gate
-                .observe(&launch_readback("model_hub/es1_orange_o48[1m]"))
+                .observe(&launch_readback("acme_hub/model_x_o48[1m]"))
                 .expect("a namespaced substitution is a reported divergence");
             assert_eq!(divergence.pin, PIN);
-            assert_eq!(divergence.observed, "model_hub/es1_orange_o48[1m]");
+            assert_eq!(divergence.observed, "acme_hub/model_x_o48[1m]");
             // One launch, one verdict: a later edge reports nothing more.
             assert_eq!(
-                gate.observe(&launch_readback("model_hub/es1_orange_o48[1m]")),
+                gate.observe(&launch_readback("acme_hub/model_x_o48[1m]")),
                 None
             );
         }
@@ -4327,7 +4327,7 @@ mod tests {
         fn the_synthetic_snapshot_is_never_judged() {
             let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
             assert_eq!(
-                gate.observe(&launch_snapshot("model_hub/es1_orange_o48[1m]", None)),
+                gate.observe(&launch_snapshot("acme_hub/model_x_o48[1m]", None)),
                 None,
                 "even a snapshot that names a different id is only a prediction"
             );
@@ -4342,14 +4342,14 @@ mod tests {
             assert_eq!(gate.observe(&launch_readback(PIN)), None);
             assert_eq!(
                 gate.observe(&later_edge(
-                    "model_hub/es1_orange_o48[1m]",
+                    "acme_hub/model_x_o48[1m]",
                     remuda_protocol::EffortSource::Slash
                 )),
                 None
             );
             assert_eq!(
                 gate.observe(&later_edge(
-                    "ark/seed-evolving",
+                    "ark/model-y",
                     remuda_protocol::EffortSource::Remuda
                 )),
                 None
@@ -4364,7 +4364,7 @@ mod tests {
             assert_eq!(gate.observe(&launch_snapshot(PIN, None)), None);
             assert_eq!(
                 gate.observe(&later_edge(
-                    "model_hub/es1_orange_o48[1m]",
+                    "acme_hub/model_x_o48[1m]",
                     remuda_protocol::EffortSource::Unknown
                 )),
                 None
@@ -4377,7 +4377,7 @@ mod tests {
         fn no_pin_never_reports() {
             let mut gate = ModelPinGate::new(None);
             assert_eq!(
-                gate.observe(&launch_readback("model_hub/es1_orange_o48[1m]")),
+                gate.observe(&launch_readback("acme_hub/model_x_o48[1m]")),
                 None
             );
         }
@@ -4392,8 +4392,8 @@ mod tests {
             assert_eq!(normalize_explicit_pin(Some("   ")), None);
             assert_eq!(normalize_explicit_pin(Some("")), None);
             assert_eq!(
-                normalize_explicit_pin(Some("  model_hub/x[1m] ")),
-                Some("model_hub/x[1m]".to_owned())
+                normalize_explicit_pin(Some("  acme_hub/x[1m] ")),
+                Some("acme_hub/x[1m]".to_owned())
             );
             assert_eq!(pin_from_recipe(&None), None);
         }
@@ -4402,13 +4402,13 @@ mod tests {
         #[test]
         fn a_catalog_makes_an_unnamespaced_substitution_decidable() {
             let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
-            let catalog = vec!["es1_orange_o48".to_owned(), "es1_orange_o50".to_owned()];
+            let catalog = vec!["model_x_o48".to_owned(), "model_x_o50".to_owned()];
             gate.observe(&launch_snapshot(PIN, Some(catalog)));
             let divergence = gate
-                .observe(&launch_readback("es1_orange_o48"))
+                .observe(&launch_readback("model_x_o48"))
                 .expect("a catalog-listed substitution is decidable");
             assert_eq!(divergence.pin, PIN);
-            assert_eq!(divergence.observed, "es1_orange_o48");
+            assert_eq!(divergence.observed, "model_x_o48");
         }
 
         /// Non-model observations never decide anything.

@@ -393,6 +393,22 @@ async fn owner_resume_of_a_live_chapter_fences_it_and_copies_the_delegation() ->
     let (x, x_token) = ctx.seat(&mut node, None).await?;
     ctx.report_session(&node, &x, false).await?;
     let mcp = ctx.mcp_token(&x).await?;
+    // The transcript-observed effective permission mode the seat actually ran
+    // under (r2-7): the successor must inherit it too, not just the requested
+    // word.
+    let effective = json!({
+        "mode": "acceptEdits", "source": "slash",
+        "observedAt": "2026-10-05T12:00:00.000Z"
+    });
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE instances
+             SET spec_json = json_set(spec_json, '$.permissionEffective', json(?1))
+             WHERE id = ?2",
+            rusqlite::params![effective.to_string(), x],
+        )?;
+    }
 
     let response: Value = ctx
         .resume(&x, &ctx.human)
@@ -418,6 +434,18 @@ async fn owner_resume_of_a_live_chapter_fences_it_and_copies_the_delegation() ->
     assert_eq!(resume_params["spec"]["driver"], json!("claude-sdk"));
     assert_eq!(resume_params["spec"]["resumeSessionId"], json!(SESSION));
     assert_eq!(resume_params["spec"]["resumedFrom"], json!(x));
+    // r2-7: the seated permission posture — requested and effective —
+    // travels to the successor.
+    assert_eq!(
+        resume_params["spec"]["permissionMode"],
+        json!("manual"),
+        "successor spec: {}",
+        resume_params["spec"]
+    );
+    assert_eq!(
+        resume_params["spec"]["permissionEffective"], effective,
+        "successor must inherit the observed effective permission mode"
+    );
 
     // Successor projection: next generation, continuation edge, copied
     // delegation and restart policy.

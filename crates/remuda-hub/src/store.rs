@@ -1253,7 +1253,7 @@ pub(crate) fn run_continuation_hook(point: &str, lineage_id: &str) {
 /// The fence-and-continue transaction behind [`Store::continuation_resume`].
 fn continuation_resume_tx(
     conn: &mut Connection,
-    request: ContinuationResumeRequest,
+    mut request: ContinuationResumeRequest,
 ) -> Result<ContinuationResumeResult, StoreError> {
     let tx = conn.transaction()?;
     let addressed = load_instance(&tx, &request.addressed_instance_id)?
@@ -1306,6 +1306,33 @@ fn continuation_resume_tx(
     tx.execute("DELETE FROM devices WHERE instance_id = ?1", [&current_id])?;
     let current = load_instance(&tx, &current_id)?
         .ok_or_else(|| StoreError::Id("current chapter missing".into()))?;
+    // ma-lineage round 2: the seated permission mode is part of how the
+    // successor runs. The HTTP layer builds the successor spec from
+    // `spec_for_resume`, which does not carry the raw create spec, so carry
+    // both the requested `permissionMode` and the transcript-observed
+    // `permissionEffective` over here, filling only what the prepared spec
+    // lacks. A fresh-launch recovery (origin spec) already carries the
+    // requested mode, so its value wins.
+    let predecessor_spec: Value = tx
+        .query_row(
+            "SELECT spec_json FROM instances WHERE id = ?1",
+            params![current_id],
+            |row| {
+                let raw: String = row.get(0)?;
+                Ok(serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})))
+            },
+        )
+        .map_err(StoreError::from)?;
+    if let Some(spec) = request.spec.as_object_mut() {
+        for key in ["permissionMode", "permissionEffective"] {
+            let missing = spec.get(key).is_none_or(Value::is_null);
+            if missing
+                && let Some(value) = predecessor_spec.get(key).filter(|value| !value.is_null())
+            {
+                spec.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
     let host =
         load_host(&tx, &request.host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
     let connectivity = if host.online {

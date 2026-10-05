@@ -1679,6 +1679,39 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
     expect(geo.scrollTopNow()).toBeGreaterThanOrEqual(before + 39);
   });
 
+  it("cancels the held restore when the reader scrolls before the page lands (item 3)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeometry(40);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    const initial: Observation[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      initial.push(msg(1001 + i, i % 2 === 0 ? "user" : "assistant", "ins3", `m${1001 + i}`));
+    }
+    const older: Observation[] = [];
+    for (let i = 0; i < 20; i += 1) older.push(msg(901 + i, i % 2 === 0 ? "user" : "assistant", "ins3", `o${901 + i}`));
+    const g = gate<ReturnType<typeof pageOf>>();
+    makeClient(reg, "ins3", initial, vi.fn<JournalRead>().mockImplementation(() => g.promise), "1001", "1020");
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    renderDriver(reg, "/s/ins3");
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+    // The reader navigates manually while the older window is still in flight.
+    geo.scrollTo(300);
+    await act(async () => {
+      g.resolve(pageOf(older));
+      await Promise.resolve();
+    });
+    await act(async () => {});
+    // The prepend must not yank the scroller back to the click-time row.
+    expect(geo.scrollTopNow()).toBe(300);
+  });
+
   it("a late resolve from session A cannot clear session B's armed restore (item 4)", async () => {
     const user = userEvent.setup();
     const geo = installGeometry(40);

@@ -1105,6 +1105,22 @@ function TranscriptInner({
           setScrollTop(el.scrollTop);
           scrollTopRef.current = el.scrollTop;
           pinRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+          // A reader who navigates manually WHILE an older page is in flight
+          // owns the position: cancel that click's held anchors so the prepend
+          // cannot restore them back to the click-time row. Programmatic
+          // scrollTop writes from the anchor effects are synchronous and never
+          // interleave with an unfinished fetch (the request is marked done in
+          // the click's finally), so a cancel here is always a real gesture.
+          const req = loadReqRef.current;
+          if (req && !req.done && !req.cancelled) {
+            req.cancelled = true;
+            const pending = pendingScroll.current;
+            if (pending?.kind === "restore" && pending.reqId === req.reqId) {
+              pendingScroll.current = null;
+              restoringRef.current = false;
+            }
+            if (prependAnchorRef.current?.reqId === req.reqId) prependAnchorRef.current = null;
+          }
           sampleReadingAnchor();
           persistSoon();
         }}

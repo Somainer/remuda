@@ -168,13 +168,30 @@ async fn delegated_visible_items(
         if item.get("kind").and_then(Value::as_str) == Some(APPROVAL_KIND) {
             continue;
         }
-        // D-051 (6d): a plan review is the target instance's OWN plan. The
-        // self edge in `owns()` must not admit it to the child — only a
-        // direct parent or a human reviews a plan.
-        if item.get("kind").and_then(Value::as_str) == Some(PLAN_REVIEW_KIND)
-            && target == caller_instance
-        {
-            continue;
+        // D-051 (6d): a plan review is the target instance's OWN plan. No
+        // chapter of the plan's lineage may review it — a successor chapter is
+        // the same agent and must not approve the plan a predecessor chapter
+        // entered ExitPlanMode with — only a chapter OUTSIDE the lineage (the
+        // direct parent, via `owns()`'s parent edge) or a human reviews a plan.
+        // Comparing instance ids here let the successor self-approve its
+        // predecessor's plan (ma-lineage round 2).
+        if item.get("kind").and_then(Value::as_str) == Some(PLAN_REVIEW_KIND) {
+            let same_lineage = state
+                .store
+                .lineage_id_for_instance(caller_instance.to_string())
+                .await
+                .map_err(crate::http::map_store)?
+                .zip(
+                    state
+                        .store
+                        .lineage_id_for_instance(target.to_string())
+                        .await
+                        .map_err(crate::http::map_store)?,
+                )
+                .is_some_and(|(caller_lineage, target_lineage)| caller_lineage == target_lineage);
+            if same_lineage {
+                continue;
+            }
         }
         if !resolved.contains_key(target) {
             resolved.insert(target.to_string(), RouteTarget::load(state, target).await?);
@@ -226,13 +243,25 @@ async fn authorize_agent_answer(
     if row.kind == APPROVAL_KIND {
         return Err(HubError::Forbidden);
     }
-    // D-051 (6d): no self-answer for plan reviews. The child instance can
-    // approve its own ordinary interactions via the self edge, but it cannot
-    // be the reviewer of its own plan; only a direct parent or a human.
+    // D-051 (6d): no chapter of the plan's own lineage can answer a plan
+    // review. The successor chapter is the same agent as the predecessor that
+    // produced the plan, so the old instance-id self comparison admitted it;
+    // only a chapter outside the lineage (the direct parent) or a human may
+    // be the reviewer.
     if row.kind == PLAN_REVIEW_KIND
-        && device.instance_id.as_deref() == Some(row.instance_id.as_str())
+        && let Some(caller_instance) = device.instance_id.as_deref()
     {
-        return Err(HubError::Forbidden);
+        let caller_lineage = state
+            .store
+            .lineage_id_for_instance(caller_instance.to_string())
+            .await?;
+        let target_lineage = state
+            .store
+            .lineage_id_for_instance(row.instance_id.clone())
+            .await?;
+        if caller_lineage.is_some() && caller_lineage == target_lineage {
+            return Err(HubError::Forbidden);
+        }
     }
     // The handler re-checks the same one-hop edge the middleware relies on:
     // self, or target's `parent_instance_id == caller`

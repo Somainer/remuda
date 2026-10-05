@@ -1053,6 +1053,136 @@ async fn delegated_question_created_under_a_predecessor_reaches_the_successor() 
     Ok(())
 }
 
+/// D-051 (6d) across chapters: a plan review is the lineage's OWN plan, so no
+/// chapter of that lineage can review it — including the successor chapter,
+/// which the old instance-id self comparison let through. The direct parent
+/// (outside the lineage) and the human still review it.
+#[tokio::test]
+async fn a_successor_chapter_cannot_review_its_predecessors_plan() -> Result<()> {
+    let _flag = d051_on().await;
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, x_token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // A plan review owned by the seat X (predecessor chapter), pending before
+    // the continuation.
+    let plan_id = remuda_protocol::InteractionId::new()
+        .as_id()
+        .as_str()
+        .to_string();
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "INSERT INTO interactions
+                (id, instance_id, host_id, kind, state, blocking, payload_json,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'plan-review', 'pending', 1, '{}', ?4, ?4)",
+            rusqlite::params![plan_id, x, ctx.host, "2026-10-05T00:00:00.000Z"],
+        )?;
+    }
+
+    // The predecessor chapter cannot review its own plan (same lineage, same
+    // rule) — checked BEFORE the continuation, while its credential is live.
+    // The edge is lineage membership, not instance identity.
+    let predecessor_self = ctx
+        .http
+        .post(format!("{}/v1/interactions/{plan_id}/answer", ctx.base()))
+        .bearer_auth(&x_token)
+        .json(&json!({ "answer": {
+            "kind": "plan-review", "optionId": "approve",
+            "planRevision": "1",
+            "planDigest": format!("sha256:{}", "a".repeat(64)),
+            "feedback": null
+        } }))
+        .send()
+        .await?;
+    assert_eq!(predecessor_self.status(), 403);
+
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let (_close, _) = node.next_frame().await?;
+    let (_method, resume_params) = node.next_frame().await?;
+    let y_token = resume_params["agentCredential"]["token"]
+        .as_str()
+        .context("successor token")?
+        .to_owned();
+    let y = response["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The successor chapter does not see the plan in its routed list...
+    let list: Value = ctx
+        .http
+        .get(format!("{}/v1/interactions", ctx.base()))
+        .bearer_auth(&y_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let ids: Vec<String> = list["items"]
+        .as_array()
+        .context("items")?
+        .iter()
+        .filter_map(|item| item["interactionId"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !ids.contains(&plan_id),
+        "a successor chapter must not receive its predecessor lineage's own plan"
+    );
+
+    // ...and answering it directly is forbidden (unknown-id-shaped 403, not
+    // 404: the interaction exists, the lineage may just not review it).
+    let answer = ctx
+        .http
+        .post(format!("{}/v1/interactions/{plan_id}/answer", ctx.base()))
+        .bearer_auth(&y_token)
+        .json(&json!({ "answer": {
+            "kind": "plan-review", "optionId": "approve",
+            "planRevision": "1",
+            "planDigest": format!("sha256:{}", "a".repeat(64)),
+            "feedback": null
+        } }))
+        .send()
+        .await?;
+    assert_eq!(answer.status(), 403);
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    let state: String = db.query_row(
+        "SELECT state FROM interactions WHERE id = ?1",
+        rusqlite::params![plan_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(state, "pending", "the rejected answer must not commit");
+
+    // The predecessor chapter itself could not self-review either (same
+    // lineage, same rule) — the edge is membership, not instance identity.
+    // (After fencing its launch credential is revoked, which is 401; the
+    // rule itself is asserted above before the continuation.)
+
+    // The human still reviews the plan (not an Agent lineage member).
+    let human_answer = ctx
+        .http
+        .post(format!("{}/v1/interactions/{plan_id}/answer", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({ "answer": {
+            "kind": "plan-review", "optionId": "approve",
+            "planRevision": "1",
+            "planDigest": format!("sha256:{}", "a".repeat(64)),
+            "feedback": null
+        } }))
+        .send()
+        .await?;
+    assert_eq!(human_answer.status(), 200, "{}", human_answer.text().await?);
+    let _ = y;
+    Ok(())
+}
+
 // --- 6. Fan-out across chapters and equal depth --------------------------
 
 /// Drain forwarded frames until `instanceId == id` and the method matches.

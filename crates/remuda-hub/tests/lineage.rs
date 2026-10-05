@@ -847,6 +847,77 @@ async fn owner_resume_of_an_ended_chapter_works_and_offline_refuses_without_writ
     Ok(())
 }
 
+// --- 10. Offline running lineage is host-offline, not starting ------------
+
+#[tokio::test]
+async fn an_offline_running_lineage_reports_host_offline_and_a_live_one_running() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    let state_of = async {
+        let lineage: Value = ctx
+            .http
+            .get(format!("{}/v1/lineages/{x}", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::Ok(lineage["state"].as_str().unwrap().to_owned())
+    };
+
+    // Host link live + chapter running -> running.
+    assert_eq!(state_of.await?, "running");
+
+    // Drop the Node: the host loses its link while the chapter is still
+    // running. The lineage must NOT read `starting` — the process may be
+    // alive (D-019); it is a running chapter on an offline host.
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
+    let state_of = async {
+        let lineage: Value = ctx
+            .http
+            .get(format!("{}/v1/lineages/{x}", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::Ok(lineage["state"].as_str().unwrap().to_owned())
+    };
+    assert_eq!(state_of.await?, "host-offline");
+
+    // Process-end evidence on top of the lost link falls back to starting:
+    // there is no running chapter anymore and the supervisor has not acted.
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE instances SET lifecycle = 'exited', activity = 'idle'
+             WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+    }
+    let state_of = async {
+        let lineage: Value = ctx
+            .http
+            .get(format!("{}/v1/lineages/{x}", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::Ok(lineage["state"].as_str().unwrap().to_owned())
+    };
+    assert_eq!(state_of.await?, "starting");
+    Ok(())
+}
+
 // --- 9. Live chapter without a session is refused, not relaunched blank ---
 
 #[tokio::test]

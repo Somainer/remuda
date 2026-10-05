@@ -2189,10 +2189,15 @@ pub async fn get_lineage(
     if lineage.paused_by.is_some() {
         lineage_state = "paused".into();
     } else if let Some(current) = &current {
-        let live = matches!(current.lifecycle.as_str(), "ready" | "running")
-            && state.nodes.kind_of(&current.host_id).await.is_some();
-        lineage_state = if live {
+        let host_live = state.nodes.kind_of(&current.host_id).await.is_some();
+        let chapter_running = matches!(current.lifecycle.as_str(), "ready" | "running");
+        lineage_state = if chapter_running && host_live {
             "running".into()
+        } else if chapter_running {
+            // D-057 §5 derived state: the chapter was running but its host
+            // link is gone. It is not `starting` — the process may be alive
+            // (D-019); report it truthfully as running with an offline host.
+            "host-offline".into()
         } else {
             "starting".into()
         };

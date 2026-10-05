@@ -1803,11 +1803,12 @@
             ]
           },
           "state": {
-            "description": "starting, running, or paused; host-offline is derived from the current chapter's host link.",
+            "description": "starting, running, paused, or host-offline (a running current chapter whose host has no live link; derived, not starting).",
             "enum": [
               "starting",
               "running",
-              "paused"
+              "paused",
+              "host-offline"
             ],
             "type": "string"
           }

@@ -849,6 +849,85 @@ async fn owner_resume_of_an_ended_chapter_works_and_offline_refuses_without_writ
 
 // --- 3. Concurrent resumes: one successor (generation CAS) ---------------
 
+/// A resume addressed to an already-fenced chapter returns its existing
+/// successor idempotently (r2-8): it must not fence the live chapter or mint
+/// another generation.
+#[tokio::test]
+async fn a_resume_addressed_to_a_fenced_chapter_returns_its_successor() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // First continuation: X (gen 1) -> Y (gen 2).
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(first["replayed"], json!(false));
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (_close, _) = node.next_frame().await?;
+    let (_method, _) = node.next_frame().await?;
+    ctx.report_session(&node, &y, false).await?;
+
+    // Second resume, still addressed to the now-fenced X.
+    let second: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        second["replayed"],
+        json!(true),
+        "a fenced chapter resumes as an idempotent replay of its successor"
+    );
+    assert_eq!(
+        second["instance"]["instanceId"],
+        json!(y),
+        "the existing successor is returned, not a new chapter"
+    );
+
+    // No third chapter, no extra fencing: generation stays 2 and no frame
+    // targets Y (the live chapter is never closed by the stale address).
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(lineage["generation"], json!(2));
+    assert_eq!(lineage["chapters"].as_array().unwrap().len(), 2);
+    let stale = tokio::time::timeout(Duration::from_millis(200), node.next_frame()).await;
+    assert!(
+        stale.is_err(),
+        "a replay addressed to a fenced chapter forwards nothing"
+    );
+
+    // Resuming the CURRENT chapter still works and advances to generation 3.
+    let third: Value = ctx
+        .resume(&y, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(third["replayed"], json!(false));
+    assert_ne!(third["instance"]["instanceId"], json!(y));
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    assert_eq!(
+        params["instanceId"],
+        json!(y),
+        "only the live chapter is fenced"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
     // The Hub has one FIFO SQLite writer thread: two resume jobs queue in

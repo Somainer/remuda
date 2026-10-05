@@ -1263,6 +1263,20 @@ fn continuation_resume_tx(
     let lineage_id = lineage.lineage_id.clone();
     let current_id = lineage.current_instance_id.clone();
     run_continuation_hook("cas", &lineage_id);
+    // ma-lineage round 2: the owner may address an OLDER, already-fenced
+    // chapter. Such a resume is the same continuation its successor already
+    // represents — return that successor idempotently instead of fencing the
+    // live chapter and minting another one. Only the lineage's CURRENT chapter
+    // starts another continuation. Placed after the CAS rendezvous hook (which
+    // serializes concurrent resumes) but before any write: a racing loser that
+    // observed the old generation rolls back here and returns the winner.
+    if addressed.instance_id != current_id {
+        let current = load_instance(&tx, &current_id)?
+            .ok_or_else(|| StoreError::Id("current chapter missing".into()))?;
+        return Ok(ContinuationResumeResult::Superseded {
+            current: Box::new(current),
+        });
+    }
     let successor_id = new_id("ins").map_err(|e| StoreError::Id(e.to_string()))?;
     let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
     let command_id = new_id("cmd").map_err(|e| StoreError::Id(e.to_string()))?;
@@ -1285,8 +1299,12 @@ fn continuation_resume_tx(
         ],
     )?;
     if cas == 0 {
-        // The generation CAS lost; roll the (empty) transaction back and
-        // present the winner's current chapter as an idempotent replay.
+        // The generation CAS lost: the lineage already advanced — possibly
+        // because the addressed chapter was already fenced and the live
+        // chapter moved on. Roll the (empty) transaction back and present the
+        // winner's current chapter as an idempotent replay. A resume addressed
+        // to the fenced chapter must therefore converge on the existing
+        // successor instead of fencing the live one (ma-lineage round 2).
         drop(tx);
         let lineage = load_lineage(conn, &lineage_id)?
             .ok_or_else(|| StoreError::Id("lineage vanished after lost CAS".into()))?;
@@ -1296,7 +1314,10 @@ fn continuation_resume_tx(
             current: Box::new(current),
         });
     }
-    // 1. Fence the predecessor chapter.
+    // 1. Fence the CURRENT chapter — which is what the generation CAS just
+    // advanced from. The owner may have addressed an older fenced chapter;
+    // `current_id` is the lineage's current chapter regardless, so the live
+    // successor is what gets fenced and never a chapter fenced already.
     tx.execute(
         "UPDATE instances SET fenced_at = ?1, updated_at = ?2 WHERE id = ?3",
         params![now, now, current_id],

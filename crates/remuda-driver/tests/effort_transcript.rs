@@ -716,6 +716,88 @@ fn stdout_record_version(stdout: &str, n: u64, version: &str) -> String {
 }
 
 #[tokio::test]
+async fn resumed_history_ultracode_on_starts_off_and_only_the_new_verdict_settles() {
+    // D-056 (4): resume a session whose history says "Ultracode on". The
+    // replayed records set no state; the current state starts off; and a fresh
+    // switch armed during the replay is settled ONLY by its own post-launch
+    // verdict — never by a same-words verdict from history.
+    use std::time::Duration;
+    let bridge = std::sync::Arc::new(remuda_driver::test_support::Bridge::new());
+    let mut mapper = remuda_driver::test_support::resume_mapper(
+        remuda_driver::test_support::mapper_with_bridge(
+            bridge.clone(),
+            "effort-session",
+            "2.1.289",
+        ),
+    );
+
+    // Prior session: assistant high, `/effort ultracode`, its on verdict, and
+    // the next assistant record still at high with the flag latched.
+    let history = [
+        assistant(Some("high"), 1),
+        slash("ultracode", 2),
+        stdout_record_version(
+            "Ultracode on (this session only): dynamic workflows on every task. Effort stays high.",
+            3,
+            "2.1.289",
+        ),
+        assistant(Some("high"), 4),
+    ];
+    let mut edges = Vec::new();
+    for line in &history {
+        edges.extend(effort_edges(&mapper.map_line(line).expect("map")));
+    }
+    assert!(
+        edges.is_empty(),
+        "replayed history emitted effort edges: {edges:?}"
+    );
+
+    // Arm the NEW switch before the process boundary. A replayed high slash
+    // and its verdict arrive while still in history — they must not claim it.
+    let generation = bridge.arm_word("high");
+    mapper.map_line(&slash("high", 5)).expect("replayed slash");
+    mapper
+        .map_line(&stdout_record_version(
+            "Set effort level to high (saved as your default for new sessions): Comprehensive \
+             implementation with extensive testing and documentation",
+            6,
+            "2.1.289",
+        ))
+        .expect("replayed verdict");
+    assert!(
+        bridge.has_pending(),
+        "a replayed verdict must not settle the fresh switch"
+    );
+    assert!(
+        bridge
+            .wait(generation, Duration::from_millis(100))
+            .await
+            .is_none(),
+        "history produced no readback for the fresh generation"
+    );
+
+    // First post-launch record flips the gate; the fresh switch's OWN slash
+    // and verdict then settle it.
+    remuda_driver::test_support::mark_current_process(&mut mapper);
+    mapper.map_line(&slash("high", 7)).expect("fresh slash");
+    mapper
+        .map_line(&stdout_record_version(
+            "Set effort level to high (saved as your default for new sessions): Comprehensive \
+             implementation with extensive testing and documentation",
+            8,
+            "2.1.289",
+        ))
+        .expect("fresh verdict");
+    match bridge.wait(generation, Duration::from_secs(1)).await {
+        Some(remuda_driver::effort::Readback::Applied(observed)) => {
+            assert_eq!(observed.name, remuda_protocol::EffortName::High);
+        }
+        other => panic!("the fresh switch was not settled by its own verdict: {other:?}"),
+    }
+    assert!(!bridge.has_pending());
+}
+
+#[tokio::test]
 async fn real_21289_workflows_disabled_refuses_immediately_with_the_reason() {
     let body = fixture_21289("effort-launch-d-21289.jsonl");
     let (got, _) = armed_readbacks(&body, "2.1.289").await;

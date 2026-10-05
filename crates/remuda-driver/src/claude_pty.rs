@@ -285,6 +285,10 @@ impl ClaudePtyDriver {
             reject_bot_bypass(&spec)?;
         }
         let session_id = session.session_id().to_string();
+        // D-056 (4): a resume launch appends to an existing transcript; the
+        // pump tails from its launch-time end. Captured before `session` moves
+        // into the materialize request.
+        let resumed = matches!(session, SessionAction::Resume { .. });
         let request = MaterializeRequest {
             spec: &spec,
             profile: &self.options.profile,
@@ -584,6 +588,7 @@ impl ClaudePtyDriver {
             Some(Arc::clone(&permission_bridge)),
             launch_permission,
             self.options.media_stager.clone(),
+            resumed,
         );
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
             client: client.clone(),
@@ -1360,6 +1365,7 @@ fn spawn_transcript_pump(
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
+    resume: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
@@ -1434,7 +1440,22 @@ fn spawn_transcript_pump(
                         mapper =
                             mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
                     }
-                    hydrator = Some((crate::claude_transcript::TranscriptTail::new(path), mapper));
+                    // D-056 (4): a resume launch appends to an existing
+                    // transcript. Tail from its launch-time end AND keep the
+                    // effort tracker in history mode until the first appended
+                    // record, so even a record that beats the offset snapshot
+                    // can neither set state nor settle a fresh switch.
+                    if resume {
+                        mapper = mapper.following_history();
+                    }
+                    hydrator = if resume {
+                        Some((
+                            crate::claude_transcript::TranscriptTail::new_at_end(path),
+                            mapper,
+                        ))
+                    } else {
+                        Some((crate::claude_transcript::TranscriptTail::new(path), mapper))
+                    };
                 }
             }
             if let Some(hydrated) = hydrator.take() {
@@ -1451,6 +1472,12 @@ fn spawn_transcript_pump(
                     ) {
                         let (mut tail, mut mapper) = hydrated;
                         let lines = tail.poll().unwrap_or_default();
+                        // D-056 (4): the first appended lines are the first
+                        // current-process records; flip the tracker before any
+                        // of them maps. Idempotent on later polls.
+                        if !lines.is_empty() && !mapper.is_current_process() {
+                            mapper.mark_current_process();
+                        }
                         // Flush the buffered assistant run at the end of the
                         // batch: the mapper holds a run open until superseded,
                         // so the final message of a finished turn would

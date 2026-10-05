@@ -790,6 +790,10 @@ pub(super) fn spawn(
     model: Option<ModelSync>,
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
+    // D-056 (4): a `--resume` launch appends to an existing transcript, so the
+    // hydrator tails from the end; pre-launch history never replays into the
+    // current process's effort state.
+    resume: bool,
     // The exact executable this launch exec'd, when Remuda launched one
     // (c-wfdrill2 B). `None` for a login shell.
     alias: Option<LaunchAlias>,
@@ -1293,6 +1297,7 @@ pub(super) fn spawn(
                         model.as_ref(),
                         permission_bridge.as_ref(),
                         launch_permission,
+                        resume,
                     )
                     .await;
                 }
@@ -1495,6 +1500,7 @@ async fn maintain_binding(
     model: Option<&ModelSync>,
     permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
+    resume: bool,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -1618,6 +1624,7 @@ async fn maintain_binding(
             model,
             permission_bridge,
             launch_permission,
+            resume,
         );
     }
     if let Some(active) = hydrator.as_mut() {
@@ -1801,7 +1808,8 @@ struct Hydrator {
 }
 
 impl Hydrator {
-    /// Start replay at byte 0 of the bound transcript.
+    /// Start replay at byte 0 of the bound transcript, or at its current end
+    /// for a `--resume` launch (D-056 (4): only this process's records count).
     fn open(
         ctx: &PromoteCtx,
         binding: &TranscriptBinding,
@@ -1810,6 +1818,7 @@ impl Hydrator {
         model: Option<&ModelSync>,
         permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
         launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
+        resume: bool,
     ) -> Option<Self> {
         tracing::info!(
             instance_id = %ctx.instance_id.as_id(),
@@ -1845,9 +1854,16 @@ impl Hydrator {
         if let Some(bridge) = permission_bridge {
             mapper = mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
         }
+        if resume {
+            mapper = mapper.following_history();
+        }
         Some(Self {
             mapper,
-            tail: binding.tail(),
+            tail: if resume {
+                binding.tail_from_end()
+            } else {
+                binding.tail()
+            },
             pending,
         })
     }
@@ -1883,6 +1899,11 @@ async fn pump(
         }
     }
     let lines = hydrator.tail.poll().map_err(|_| ())?;
+    // D-056 (4): on a resume tail, the first appended lines are the first
+    // current-process records; flip the tracker before any of them maps.
+    if !lines.is_empty() && !hydrator.mapper.is_current_process() {
+        hydrator.mapper.mark_current_process();
+    }
     // The mapper buffers an assistant run until something supersedes it, so
     // the last message of a batch would otherwise sit unseen until the next
     // record arrives — which, at the end of a turn, may be minutes away.

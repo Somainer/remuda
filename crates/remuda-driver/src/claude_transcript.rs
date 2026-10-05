@@ -110,6 +110,13 @@ impl TranscriptBinding {
     pub fn tail(&self) -> TranscriptTail {
         TranscriptTail::new(self.path.clone())
     }
+
+    /// An incremental reader over the bound file starting at its current end —
+    /// for a `--resume` launch, whose file is all pre-launch history (D-056 (4)).
+    #[must_use]
+    pub fn tail_from_end(&self) -> TranscriptTail {
+        TranscriptTail::new_at_end(self.path.clone())
+    }
 }
 
 /// `~/.claude/sessions/<pid>.json` as Claude writes it at process startup.
@@ -507,6 +514,27 @@ impl TranscriptTail {
         }
     }
 
+    /// Start at the current end of `path`, following only appends.
+    ///
+    /// D-056 (4): a `--resume` launch reuses the previous session's transcript,
+    /// whose bytes are all pre-launch history — replaying them would let old
+    /// verdicts set the current effort state and could even settle a fresh
+    /// switch whose command words match a replayed slash record. Tail from the
+    /// end so the first line read is the first record THIS process appends.
+    /// A file that is missing or unstatable is treated as empty: the resumed
+    /// process creates/appends it and the first poll binds at 0.
+    #[must_use]
+    pub fn new_at_end(path: PathBuf) -> Self {
+        let offset = std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Self {
+            path,
+            offset,
+            partial: String::new(),
+        }
+    }
+
     /// File being followed.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -776,5 +804,27 @@ mod tests {
         assert_eq!(tail.poll().expect("poll").len(), 2);
         write(&path, "{\"c\":3}\n");
         assert_eq!(tail.poll().expect("poll"), vec!["{\"c\":3}"]);
+    }
+
+    #[test]
+    fn a_resume_tail_reads_only_appended_history_not_the_prior_session() {
+        // D-056 (4): the tail snapshot is the transcript length as it was when
+        // this process launched; every byte already on disk is pre-launch
+        // history and must never be replayed into current-process state.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("t.jsonl");
+        write(&path, "{\"old\":1}\n{\"old\":2}\n");
+        let mut tail = TranscriptTail::new_at_end(path.clone());
+        assert_eq!(tail.poll().expect("poll"), Vec::<String>::new());
+        // Only bytes appended AFTER the snapshot come back.
+        write(&path, "{\"new\":3}\n");
+        assert_eq!(tail.poll().expect("poll"), vec!["{\"new\":3}"]);
+        assert_eq!(tail.poll().expect("poll"), Vec::<String>::new());
+
+        // A missing file snapshots at 0 and follows once it appears.
+        let absent = tmp.path().join("never.jsonl");
+        let mut waiting = TranscriptTail::new_at_end(absent.clone());
+        write(&absent, "{\"first\":1}\n");
+        assert_eq!(waiting.poll().expect("poll"), vec!["{\"first\":1}"]);
     }
 }

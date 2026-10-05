@@ -1312,6 +1312,15 @@ impl ShellPtyDriver {
                     socket: session.socket_path.clone(),
                 })
             });
+            // D-056 (4): a resumed agent appends to an existing transcript;
+            // the hydrator must tail it from the end, not replay its history.
+            let resumed = matches!(
+                self.options.target,
+                Target::Agent {
+                    resume: Some(_),
+                    ..
+                }
+            );
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
                 hook_ctx.clone(),
@@ -1335,6 +1344,7 @@ impl ShellPtyDriver {
                 }),
                 Some(Arc::clone(&permission_bridge)),
                 launch_permission,
+                resumed,
                 // c-wfdrill2 B: the pinned path this launch exec'd, so
                 // detection does not depend on the executable's basename
                 // being one the agent table has heard of. Only for an agent

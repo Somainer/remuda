@@ -2656,6 +2656,30 @@ impl TranscriptMapper {
         self
     }
 
+    /// D-056 (4): engage pre-launch history mode for a mapper following a
+    /// `--resume` transcript whose tail started at end-of-file. State-mutating
+    /// records mapped before [`Self::mark_current_process`] change nothing and
+    /// cannot settle a switch. The caller marks at the first record appended
+    /// after launch.
+    #[must_use]
+    pub(crate) fn following_history(mut self) -> Self {
+        self.effort.begin_history();
+        self
+    }
+
+    /// Flip the effort tracker into current-process mode (idempotent). Called
+    /// by the resume pump immediately before mapping the first records appended
+    /// after launch.
+    pub(crate) fn mark_current_process(&mut self) {
+        self.effort.mark_current_process();
+    }
+
+    /// Whether the effort tracker is accepting current-process records (D-056
+    /// (4)). A resume mapper starts false until its first appended batch.
+    pub(crate) fn is_current_process(&self) -> bool {
+        self.effort.is_current_process()
+    }
+
     /// Attach the §9.1 model bridge so this mapper drives `/model` read-back
     /// and emits `model` observations. `launch` is the `--model` selection the
     /// process started with; `catalog` is the driver-resolved list the picker
@@ -2826,7 +2850,9 @@ impl TranscriptMapper {
             self.mapper.session_id = session.to_owned();
         }
         // D-056: every transcript record names its Claude Code version; the
-        // effort gate (coupled vs decoupled ultracode) follows it.
+        // effort gate (coupled vs decoupled ultracode) follows it. Version
+        // notes are not gated: a resumed mapper replays into the tracker only
+        // to learn the semantics before the first current-process record.
         if let Some(version) = value.get("version").and_then(Value::as_str) {
             self.effort.note_version(version);
         }
@@ -2870,6 +2896,11 @@ impl TranscriptMapper {
     /// bridge. Returns effort edge observations when the verdict changes the
     /// effective level or flag.
     fn note_effort_user(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        // D-056 (4): a resumed session replaying pre-launch records must not
+        // arm or settle a current switch from a same-words slash/verdict pair.
+        if !self.effort.is_current_process() {
+            return Ok(Vec::new());
+        }
         let Some(message) = value.get("message") else {
             return Ok(Vec::new());
         };

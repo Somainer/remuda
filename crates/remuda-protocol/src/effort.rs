@@ -469,6 +469,13 @@ pub struct EffortTracker {
     /// A Remuda level switch awaiting its read-back at this level. Flag
     /// toggles on decoupled builds do not arm this: the level stays put.
     awaiting: Option<EffortName>,
+    /// D-056 (4): only records produced by the CURRENT process may settle
+    /// state. While a live mapper replays a resumed session's pre-launch
+    /// history this is `false` and every state-mutating input is ignored; the
+    /// first record the current process produces flips it on forever. The
+    /// journal file tailer replays history on purpose and never engages this
+    /// gate, so the default is `true`.
+    current_process: bool,
 }
 
 impl Default for EffortTracker {
@@ -480,6 +487,7 @@ impl Default for EffortTracker {
             ultracode_pending: false,
             flag: None,
             awaiting: None,
+            current_process: true,
         }
     }
 }
@@ -505,6 +513,15 @@ impl EffortTracker {
     #[must_use]
     pub fn semantics(&self) -> EffortSemantics {
         self.semantics
+    }
+
+    /// Whether records fed now are produced by the current process. While this
+    /// is false a live mapper must not arm or settle a switch bridge from a
+    /// replayed slash record or verdict, even one whose words match a switch
+    /// that was armed concurrently.
+    #[must_use]
+    pub fn is_current_process(&self) -> bool {
+        self.current_process
     }
 
     /// The last settled effective state, if any. Lets a mapper resolve its
@@ -533,12 +550,36 @@ impl EffortTracker {
         }
     }
 
+    /// Put the tracker in pre-launch history mode (live mapper only). Until
+    /// [`Self::mark_current_process`] is called, every state-mutating record
+    /// (assistant levels, verdicts, attachments, slash arms) is ignored: a
+    /// resumed session's replayed verdicts must neither set the effective
+    /// state nor settle a fresh switch (D-056 (4)). The version gate is
+    /// deliberately not affected — the mapper needs the semantics before the
+    /// first current-process record.
+    pub fn begin_history(&mut self) {
+        self.current_process = false;
+    }
+
+    /// Mark every record fed from now on as produced by the CURRENT process.
+    /// The live mapper calls this at the top of each mapped record; it flips
+    /// permanently on the first one, so a resumed tail starting at end-of-file
+    /// flips on the first post-launch record, and a fresh tail flips on its
+    /// SessionStart record.
+    pub fn mark_current_process(&mut self) {
+        self.current_process = true;
+    }
+
     /// Record a `/effort …` slash record. `args` is the raw (trimmed,
     /// lowercased) command-args body, possibly empty for the bare slider;
     /// `from_remuda` says whether Remuda typed the bytes (otherwise the human
     /// gets the credit). Returns false for arguments that are not a switch
     /// (`auto`, `status`, `current`, invalid words).
     pub fn note_slash(&mut self, args: &str, from_remuda: bool) -> bool {
+        // A replayed slash from before this process launched arms nothing.
+        if !self.current_process {
+            return false;
+        }
         match classify_effort_slash(args, self.semantics) {
             EffortSlash::Level(name) => {
                 self.ultracode_pending = false;
@@ -599,6 +640,10 @@ impl EffortTracker {
         stdout: &str,
         from_remuda: bool,
     ) -> Option<(ObservedEffort, EffortSource)> {
+        // A replayed verdict from before this process launched settles nothing.
+        if !self.current_process {
+            return None;
+        }
         match parse_effort_stdout(stdout, self.semantics) {
             EffortStdout::Accepted(observed) => self.apply_accept(observed, from_remuda),
             EffortStdout::Status(observed) => self.note_status(observed),
@@ -671,6 +716,9 @@ impl EffortTracker {
         &mut self,
         parsed: ObservedEffort,
     ) -> Option<(ObservedEffort, EffortSource)> {
+        if !self.current_process {
+            return None;
+        }
         if let Some(flag) = parsed.ultracode {
             self.flag = Some(flag);
         }
@@ -693,6 +741,9 @@ impl EffortTracker {
         &mut self,
         enters: bool,
     ) -> Option<(ObservedEffort, EffortSource)> {
+        if !self.current_process {
+            return None;
+        }
         if self.flag == Some(enters) {
             return None;
         }
@@ -732,6 +783,11 @@ impl EffortTracker {
         effort: Option<&str>,
         per_turn: Option<&str>,
     ) -> Option<(ObservedEffort, EffortSource)> {
+        // An assistant record from before this process launched establishes
+        // neither the level nor the flag.
+        if !self.current_process {
+            return None;
+        }
         let raw = effort
             .filter(|value| !value.is_empty())
             .or_else(|| per_turn.filter(|value| !value.is_empty()))?;
@@ -753,6 +809,9 @@ impl EffortTracker {
         name: EffortName,
         source: EffortSource,
     ) -> Option<(ObservedEffort, EffortSource)> {
+        if !self.current_process {
+            return None;
+        }
         let ultracode = self.assistant_flag(name);
         let observed = ObservedEffort { name, ultracode };
         let edge = self.last != Some(observed);
@@ -842,6 +901,50 @@ mod tests {
         assert_eq!(parse_effort_version("2"), None);
         assert_eq!(parse_effort_version(""), None);
         assert_eq!(parse_effort_version("fixture"), None);
+    }
+
+    #[test]
+    fn resumed_history_sets_no_state_and_cannot_settle_a_fresh_switch() {
+        // D-056 (4): a resume launch replays the prior session's records. Its
+        // ultracode-on verdict must leave the current state off/unset, and its
+        // slash must not arm an await; only the new process's own verdict
+        // settles a fresh switch.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        tracker.begin_history();
+        assert!(!tracker.is_current_process());
+
+        // The history says "Ultracode on" at high …
+        assert!(!tracker.note_slash("ultracode", true));
+        assert!(tracker
+            .note_stdout(
+                "Ultracode on (this session only): dynamic workflows on every task. Effort stays \
+                 high.",
+                true,
+            )
+            .is_none());
+        // … and the next assistant record says high — still nothing.
+        assert!(tracker.observe(Some("high"), None).is_none());
+        assert!(tracker.note_ultra_attachment(true).is_none());
+        // The state starts with no level and a positively unknown flag.
+        assert_eq!(tracker.last_observed(), None);
+
+        // First post-launch record flips the gate permanently.
+        tracker.mark_current_process();
+        assert!(tracker.is_current_process());
+        tracker.mark_current_process();
+        assert!(tracker.is_current_process());
+
+        // A fresh `/effort high` arms only now, and its own verdict settles it.
+        assert!(tracker.note_slash("high", true));
+        let edge = tracker
+            .note_stdout(
+                "Set effort level to high (saved as your default for new sessions): Comprehensive \
+                 implementation with extensive testing and documentation",
+                true,
+            )
+            .expect("the fresh switch's own verdict is an edge");
+        assert_eq!(edge.0.name, EffortName::High);
     }
 
     #[test]

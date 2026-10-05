@@ -34,6 +34,7 @@
 | D-052 | 2026-09-23 | **provenance-first UI 批次口径（ui-upgrade 批次，docs 先合）**：(a) 本批零新 wire/表/端点，出处读既有 envelope（`seq`/`source`/`completeness`）与既有 `Interaction`，迁移预算零；(b) 审批卡**不显** confidence/risk 分（`ApprovalRequest` 无 `risk`，`web/src/types/generated.ts:98-106`）且**不在 UI 断言会话边界**（`DecisionOption` 无 `destination`，`web/src/types/interaction.ts:4-8`；harness 的 permission suggestions 实测含 `session` 与 `localSettings` 两种 destination）——线框 `risk`/`Always in this cwd` 改为 preview 原文 + carrier + deadline + harness 原范围标签，副文案统一「按 harness 建议的范围持续允许」，引 §3.3；(c) completeness 三值不变、仅活过 `FoldedToolRow` 折叠（interaction 节点/ApprovalCard 需先做 store 连接键调研，批次计划 D11 默认本批不做）；(d) D-041「折叠在 family 判定之后」保留并被回归断言守住；(e) `/board` 路由与三列只读投影已上线，本批只在既有面上 graft、不新建页面/路由，已完成列不暴露 land；(f) ledger 浅色主题由 D-053（任务 15）正式化，D-052 不处理主题；(g) `/approvals` 与 `/m/inbox` 收敛为 InboxShell 单壳，桌面三档/手机两档各自保留；(h) 新增 `--warn`/`--info`/`--text-xl`/`--text-13` 四个 token（双主题各一值、文本对 `--ink-2` ≥ 4.5:1）；(i) stylelint 按文件白名单 opt-in，白名单是带摘除批次的台账，「辅助文本 vs 图形标注」分类口径进 ui-spec §3.4；(j) 参考清单定性「MIT 组件画廊，不声明任何 spacing/type/colour 规则」，证据只用 Remuda 自身 390/1440 渲染 | coordinator（ui-upgrade 计划任务 1 c-uispec2，docs-only） | [ui-spec.md §2.2/§2.5/§2.9/§3.3/§3.4/§4.7](./ui-spec.md)；[evidence/ui-upgrade-1.md](./evidence/ui-upgrade-1.md)；D-002/D-024/D-035/D-038/D-039/D-040/D-041/D-042/D-045/D-046/D-049/D-050 |
 | D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端跟随外观（2026-09-24 所有者改定，原恒深色口径废止）**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 z-index / elevation / 阴影 / disabled token」中的阴影部分（z-index/disabled 口径不变）；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围，并修订 D-024 addendum「侧栏强当前态」的品牌左条（改为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，关闭语义不变，详见 ui-spec §1.4）与「活动 tab」的品牌下划线（改为 2px `--fg-strong` 下划线 + `--bg-selected` 底 + 加粗，详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
 | D-055 | 2026-09-25 | **命令重放按操作分叉：`instance.send` 可重放，`instance.configure` 不可重放。** 同一 commandId 重放 `instance.send` 继续用于恢复丢失响应：返回存储原记录，对仍排队的行恰好转发一次（G1/G2 不变）。`instance.configure` 的 spec merge 只在首次 POST 发生且只发生一次，重放永不再次 merge：终态行（accepted/settled）原样返回存储记录（含首次 merge 失败时持久化的原始 500 与原始 body）；原始结果尚未持久化（转发仍在飞）时返回明确的 409「still in flight」并指引轮询 `GET …/commands/{commandId}`；离线排队（`forwarded=0`）的 configure 重放返回明确 409，要求客户端换用新 commandId 发新命令，绝不代为转发。理由：web 离线 outbox 只重放 send，configure 重放无法闭合「重复 merge / 首次 500 重放成 200 / 并发同 id 双 merge / 排队行重放被转发」四类边角。配套：`GET /v1/instances/{id}/commands/{commandId}` 在转发尝试进行中绑定到**本次尝试**发布的终态行（尝试尚未开始时如实返回 pending 的 `queued`/`forwarded=false`），永不先报 `forwarded=true` 再报回滚后的 `forwarded=false`。 | coordinator（c-configfix） | `protocol.md §2.5`；D-055 任务 B（send 重放） |
+| D-056 | 2026-10-05 | **Claude ultracode 是正交的会话开关（Claude ultracode is an orthogonal session toggle）：effort 档位与 ultracode 端到端是两条独立的轴，按 Claude Code 版本门控。** Claude Code 2.1.284 起 ultracode 不再强制 xhigh，在任意档都保持开启；2.1.203–2.1.283 是耦合基线（开 ultracode = xhigh，选任何档即关）。(1) wire `EffortSelection{name, ultracode}` 不变，但在 ≥2.1.284 上 `ultracode` 不再蕴含 xhigh；旧名 `ultracode` 只作输入别名，读入为 `{xhigh, true}`。(2) launch：≥2.1.284 发 `--effort <level>`，并把 `"ultracode": true` 写进**同一份** per-launch settings overlay（两个 `--settings` 不合并，后出现的整份胜出）；2.1.203–2.1.283 只有 `{xhigh, true}` 可发 `--effort ultracode`，其余组合以 `InvalidLaunchSpec` 拒绝并点名版本；低于 2.1.203 或版本读不出时，任何 `ultracode: true` 都拒绝；版本取 pinned binary 的 `--version`；`--resume` 不恢复 ultracode，resume launch 须再带一次。(3) 会话内：档位走 `/effort <level>`，保留确认框门控（2.1.289 上不弹框）；开关走 `/effort ultracode on\|off`，没有确认框；每次 configure 至多两条命令，档位在前；耦合版本上开 = 单独一条 `/effort ultracode`（仅 `{xhigh, true}`，不先发会保存默认档的 `/effort xhigh`），关 = `/effort <level>`。(4) 回读：档位读 assistant `effort`/`perTurnEffort`；开关只读 verdict 与 `ultra_effort_enter`/`ultra_effort_exit` 附件，且只认本进程产生的记录（resume 重放的旧 verdict 不算），≥2.1.284 上在任意档锁存；版本读 transcript 的 `version`；拒绝映射为稳定 reason（`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`）；被 clamp 的 accept 报 clamp 后的档；切换失败只是这次 configure 的结局，不结束会话，可以重试。(5) UI：Claude 五档滑杆 + 独立的 Ultracode 开关，芯片显示 `<level> · ultracode`；不可用时开关禁用并给出原因，模型拒绝只对那个模型禁用、换模型后重新启用；耦合版本上开关注明以 xhigh 运行。(6) 默认档按模型（官方文档：Opus 5.5 / Sonnet 5.5 为 medium，Opus 4.7 为 xhigh，其余为 high），不得把任何一档标成通用默认。(7) `CLAUDE_CODE_EFFORT_LEVEL` 继续从子进程剥离。取代 D-028a 第 (5) 项中「ultracode ≡ xhigh + dynamic workflow」的口径。per-task / 供给层的 ultracode 请求是所有者的未决问题，本条不定。 | coordinator（c-effortadr，docs-only）；会话级开关为所有者现行口径 | [evidence/effort-sync-4.md](./evidence/effort-sync-4.md)（2.1.289 实测）；Claude Code 官方文档 model-config / cli-reference / settings-reference / workflows 与 2.1.284 changelog；effort-sync-2/3（耦合基线）；D-028、D-028a |
 | D-057 | 2026-10-05 | **main agent = an ordinary claude-sdk instance holding address-owner on the always-on intranet Hub**; lineage continuation (restart only on Node-attested process loss or start failure, any close pauses, Resume only from paused); fence transaction F is the Hub admission boundary, Nodes apply fences eventually and every pre-fence operation gets a truthful outcome; direct RPCs share one initiator-aware boundary; push suppressed only for interactions routed to an effectively running Agent parent, lifted when it stops running; no special permission design (D3). **Owner amendments OA1–OA6 (same day)**: an Agent-created child may turn its harness's permission control off only if its Agent creator runs with it off, and an omitted mode inherits the creator's (the one change to the Agent-origin permission rules, Hub and Node together); the seat's mode and grants are creation-time configuration with no stated default; D-051(b) amended so questions and plan reviews reach the Agent parent even under bypass, approvals stay human-only; failed is not the process exiting (only process-end evidence is terminal, turn-level failures are retryable in place, C1 restarts only on process loss or start failure) | owner + coordinator | [main-agent.md](./main-agent.md) |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
@@ -73,7 +74,7 @@ docs/                      # design/ research/
 | D-027a | 2026-09-13 | **§8.1 阻塞项已验证：Node 持有可用的 Hub HTTP base URL + token，因此 MVP 走 HTTP 回拉主路径，不启用 channel 2 `ObjectChunk` 兜底。** `WssConfig.url`/`token` 在生产 Node、daemon 与 `remuda dev` 三条路径上都齐备（`cmd/node.rs:188`、`cmd/node/daemon.rs:117`、`cmd/dev.rs:165`），且 Hub 已经用**同一个** host token 认证 WS 握手（`ws.rs:161` `presented_token` → `store.rs:616` `authenticate_host`），所以只需补 Hub 侧一个复用同一查询的 HTTP `require_host` 提取器 + Node 侧一个 `reqwest` 客户端，不新增凭据种类或信任边界。代价：Node 需要对 Hub 出站 **HTTPS** 而不只是 WSS——D-020 的部署形态本就要求如此，故非新增网络要求；若将来出现只开 WSS 的部署，回退仍是 v2 的 channel 2，Node 侧 materialize 接口不变、只换字节来源。 | x-clip（开工前第一件事验证） | [clipboard-images.md §8.1](./clipboard-images.md) 源码复核表 |
 | D-027b | 2026-09-15 | **附件从「仅图片」泛化为「任意文件」（owner：现在上传附件竟然只支持图片吗，应该各种文件都支持）。** 三段架构（浏览器→Hub 暂存→Node 回拉→driver 投递）与「字节只走 HTTP、命令帧只带 metadata」不变，放宽的是类型与名称：**(1) Hub**——`POST /v1/objects` 接受任意 MIME；PNG/JPEG/GIF/WebP 仍走 magic-byte 嗅探且声明类型必须一致，其余文件只校验声明类型 essence（合法 token、≤255 字节，参数丢弃），**声明 `image/*` 却嗅不出图片魔数的一律降级为 `application/octet-stream`**，杜绝把 HTML/SVG 当图片渲染；新增 `?name=` 原始文件名，服务端净化（无 `/`、`\`、控制字符，trim 首尾空白与点，≤255 字节，净化后为空则回退派生名）；单文件默认上限 5 MiB → **25 MiB**（配置键 `attachmentMaxBytes` / `REMUDA_ATTACHMENT_MAX_BYTES`，body 层 slack 同步放大），单条消息 4 → **8** 个，单 instance 暂存 64 → 256 MiB；`GET` 对图片 inline、非图片固定 `Content-Disposition: attachment`（净化文件名）+ `nosniff`；`objects` 表加 `original_name`、`kind('image'|'file')` 两列（ensure_column 迁移，老行默认 image）；send manifest 回写 Hub 自己的 `kind/mediaType/name/size/digest`，`AttachmentRef` 增 `kind`（缺省 image，老帧兼容）与 `digest`。**(2) Node**——落盘名从派生 `<obj_id>.<ext>` 改为净化后的原始文件名（Hub 净化 + Node 再净化，纵深防御），重名加 `-<n>` 数字后缀（同批次与已存在文件都避让）；回拉后校验 sha256，上限 25 MiB / 8 个，文件 0600、目录 0700、永不执行；journal user-message 记录 image/file + resource blocks，**绝对落盘路径作为 journal metadata**（PTY 队列在落盘完成后的 Replace 修订里补 blocks）。**(3) driver 投递**——图片保持原生路径（claude-print base64，>3.5 MiB 退化路径）；非图片**永不内联**，在用户文本**之前**逐文件展开一行 `[File #n] <name> (<mime>, <human size>) saved at <absolute path>`（`remuda-driver/src/attachment.rs` 共享 `file_mention_lines()`），claude/codex 用各自 Read/文件工具打开；grok 的「不支持读图」journal 徽标只对图片触发，普通文件路径不触发；shell-pty 追加 shell-quoted 路径。**(4) Web**——picker 改 `accept="*/*"`、拖拽与粘贴接受任意文件；chip 图片显缩略图、文件显类型图标+人名+可读大小；`[File #n]` 与 `[Image #n]` 共用 imageAnchors 同一编号空间（chip 位置），插入/删除/重编号/未引用标记完全复用；已发送消息里文件是指向 Hub 对象的下载 chip，图片仍是缩略图；结构化 transcript 把 harness 回显的 `[File #n] … saved at …` 行折叠成可展开行。证据 `evidence/attachments-4.md`（REMUDA_EVIDENCE=1）。 | 用户（owner nit）/ r-files | [clipboard-images.md §5.3.1](./clipboard-images.md)；[evidence/attachments-4.md](./evidence/attachments-4.md) |
 | D-028 | 2026-09-14 | **原生 PTY 优先（native PTY first）：统一「在终端里启动 agent」与「直接开 Session」两条路径。** **决策**：Remuda 自持的 native PTY（`portable-pty` master + `vt100` 模拟器 + 字节 ring）成为所有 harness 的默认 carrier，herdr 降为可选 feature（`REMUDA_PTY_CARRIER`），`claude-print` 按条件退役（见下）。统一原则：**一个 agent session 就是一个 terminal session，里面跑着 agent 命令，没有第二条路径**——New Session 等价于「在该终端里预填 launch command 并回车」，D-025 promotion 是唯一的检测/水合路径，`mode` 只记录出身（建议改名 `launchedBy`）而不表示能力等级。配套机制：per-session launch shim（`<data_dir>/instances/<id>/launch/bin/` 下透明 `exec` 包装置于 PATH 最前，让**用户手敲**的 `claude` 也命中 overlay）、per-instance hook unix socket（0600，取代 200 ms 轮询 JSON 文件，使 `PermissionRequest` 能阻塞等裁决）、信号分层 `Hook > File(tail) > OSC > Screen`（每条 Observation 带 `SourceChannel`）、capabilities 由 `DriverKind` 改为按**本 session 实际拿到的信号层级**运行时上报。**理由**：(a) herdr 拥有的是整个 agent 抽象（`agent.start`/`agent.prompt`/`agent.wait`/`AgentStatus`/`pane.agent_status_changed`），状态语义不可解释且无法细分「等审批」与「等输入」；(b) `shell-pty` 已用 `portable-pty` 独立实现了 raw PTY、mouse 透传、scrollback、`tcgetpgrp` 前台识别、D-025 promote 与 transcript 水合，两条路线在仓库里并存维护双份；(c) herdr 的 `rendered-ansi` 是视口 blit，帧内没有换行，xterm 永远没有行被逐出——**这是「agent pty 滚不动」的根因**，换真字节即解；(d) 用户在自己终端里敲的 `claude`，herdr 看不见也无法接管，统一原则在 herdr 下不可能成立；(e) herdr 的「trained classifier」实为可提取的 TOML 规则表（regions/priority/combinators），移植成本从「重训模型」降为「搬表 + 写引擎」。**影响**：**直接反转 D-010**（「PTY 载体 = herdr，不自建 PTY」）；D-016 线协议不变，仅升级服务端 snapshot 生成方式并新增 `altScreen` 上报；D-022 不变量（写前置 `attempted`、不重放回车、单次自动 trust）全保留，hook 回执成为队列的上位输入；D-025 升格为唯一入口；D-026 语义不变且 `ResumeMode{structured,terminal}` 可删；D-027 附件投递改走 MCP 工具，首次让 codex/grok 真拿到图片字节；D-013 的 `remuda-codex-wire` / `remuda-acp-wire` 保留为 codex 类型化审批旁路。**唯一没有廉价替代的 herdr 能力是跨 Node 重启存活**：本轮先接受丢失（Hub 既有 `node-epoch-changed` reconcile + UI 诚实说明 + D-026 Resume 兜底），`remuda-ptyd`（detached per-instance PTY holder + UDS + 重启认领）排 P8，**该项待用户拍板**；herdr 的删除以此为准，不以 `--bg` 为准。print 退役**按条件不按日程**：usage 三家覆盖 ≥1 周、MCP 附件三家验证、parity gate 连续 3 次全绿后逐 harness 翻默认（claude 最后），再降 `feature = "non-tty"` legacy，`pty.fork` 在无控制终端宿主实测可用前**不得删源码**。工期 P0–P7 约 25 人日，4 worker 并行约 12–14 个工作日。 | 用户 | [native-pty-first.md](./native-pty-first.md)（§5 生命周期、§6 steer/排队/打断、§7 实时流式、§8 重启存活、§9 effort/tui、§10 规则表、附录 A 覆盖矩阵） |
-| D-028a | 2026-09-14 | **D-028 增补 · 用户点名必须覆盖的五项**（本增补与 D-028 同时生效，任一项缺失即视为 D-028 未落地）：**(1) 无 herdr 的生命周期操作**——新建 Session（kind/driver 矩阵放开 `(claude\|codex\|grok\|agy, agent-pty)`，per-kind recipe 与 yolo argv 搬出 herdr driver，materializer/flags/hook overlay 必须对 native 路径生效）、发送消息（ready 阶梯 `hook 回执 > 模拟器模式+静默 > 字形`，`?2004` 观测到才用 bracketed paste，body 与 Enter 分两次写，**移动端 LocalInput 的一次性 `text+\r` 必须拆分**）、停止（**打断 turn 与停进程是两件事**：`instance.cancel` 发 per-harness 键而非 `\x03`；`instance.close` 对**进程组**走 SIGINT→SIGHUP→SIGKILL 阶梯，修掉 `try_lock` 拿不到锁就静默跳过 kill 的缺陷并复查进程树已消失）、删除（`DELETE /v1/instances/{id}`，`?force=1` 复用同一条停止阶梯，purge 实例目录但永不碰用户自己的 transcript）、退出检测（`child.wait()` + PTY EOF 双证据 → `exited`/`failed`；今天 EOF 只 `break`，崩掉的 agent 在 UI 上永远 ready）、resume（= 新 session 预填 `--resume`，session id 来自 `SessionStart` hook / `session_index.jsonl` / `active_sessions.json`）。**(2) steer / 排队 / 打断**——codex 已验证 Enter 立即发送、**Tab 排队**（0.154 起 `Ctrl+;` 已移除）、`Esc` 打断；claude 的「turn 中打字+Enter 到底是排队还是 steer」**未验证**，判据是 transcript 的 `queue-operation{enqueue}` 记录；grok/agy 全未验证。composer 呈现 发送/排队/打断 三态 + 队列 chip + `status: "interrupted"`；**未验证的能力一律 `unknown`，显示「尚未验证」，不得假装支持或假装不支持**。**(3) 实时流式**——claude 走 `MessageDisplay` hook 的行级 delta（`turn_id`/`message_id`/`index`/`final`/`delta`）为主、transcript block 为权威值，grok 走 `updates.jsonl` 的 ACP chunk，codex 只有 completed item（**如实标注无 delta**）；同时修复 `TranscriptMapper`：按 `(requestId, message.id)` 缓冲并按 `apiBlockIndex` 重组（一条记录只装一个 content block、同一 message.id 跨 2–7 条记录，这是 tool-call 串位的根因）、把不存在的 `parentToolUseId` 换成 `sourceToolUseID`/`sourceToolAssistantUUID`、保留 `queue-operation`/`permission-mode`/`toolUseResult`。**(4) 跨 Node 重启存活 = 未决**：in-process PTY 随 Node 进程死亡，本轮接受丢失（方案 A）并保留 herdr 为需要存活的宿主的可选 carrier，`remuda-ptyd`（方案 B）排 P8，**待用户拍板**。**(5) effort 与 tui overlay**——per-session settings overlay 钉死 `tui`（`fullscreen`/`default` **两个方向都显式写**）、`showStatusInTerminalTab`、`terminalProgressBarEnabled`（后两者关掉即丢失整层 OSC 信号）；effort 走 launch `--effort <v>` + 会话内 `/effort <level>`，**禁用 `CLAUDE_CODE_EFFORT_LEVEL` 并从子进程环境中剥离**（它压过会话内改档），UI 一律显示 **effective**（从 transcript 的 `effort`/`perTurnEffort` 回读），回读不到显示 `?` 而**绝不回落成请求值**；保留 `--setting-sources`（代价是会话内 `/tui` 被拒，而渲染器已在启动时决定），并从字节流探测 `ESC[?1049h` 判定实际全屏模式后经 `altScreen` 上报。 | 用户 | [native-pty-first.md](./native-pty-first.md) §5–§9；附录 A.2 逐项对账 **(6) Node 重启存活（用户 2026-09-14 拍板）**：本轮接受丢失（方案 A：Hub `node-epoch-changed` + Resume 兜底，herdr 保留为 optional carrier），`remuda-ptyd` 持有进程（方案 B）排到 P8 之后。 |
+| D-028a | 2026-09-14 | **D-028 增补 · 用户点名必须覆盖的五项**（本增补与 D-028 同时生效，任一项缺失即视为 D-028 未落地）：**(1) 无 herdr 的生命周期操作**——新建 Session（kind/driver 矩阵放开 `(claude\|codex\|grok\|agy, agent-pty)`，per-kind recipe 与 yolo argv 搬出 herdr driver，materializer/flags/hook overlay 必须对 native 路径生效）、发送消息（ready 阶梯 `hook 回执 > 模拟器模式+静默 > 字形`，`?2004` 观测到才用 bracketed paste，body 与 Enter 分两次写，**移动端 LocalInput 的一次性 `text+\r` 必须拆分**）、停止（**打断 turn 与停进程是两件事**：`instance.cancel` 发 per-harness 键而非 `\x03`；`instance.close` 对**进程组**走 SIGINT→SIGHUP→SIGKILL 阶梯，修掉 `try_lock` 拿不到锁就静默跳过 kill 的缺陷并复查进程树已消失）、删除（`DELETE /v1/instances/{id}`，`?force=1` 复用同一条停止阶梯，purge 实例目录但永不碰用户自己的 transcript）、退出检测（`child.wait()` + PTY EOF 双证据 → `exited`/`failed`；今天 EOF 只 `break`，崩掉的 agent 在 UI 上永远 ready）、resume（= 新 session 预填 `--resume`，session id 来自 `SessionStart` hook / `session_index.jsonl` / `active_sessions.json`）。**(2) steer / 排队 / 打断**——codex 已验证 Enter 立即发送、**Tab 排队**（0.154 起 `Ctrl+;` 已移除）、`Esc` 打断；claude 的「turn 中打字+Enter 到底是排队还是 steer」**未验证**，判据是 transcript 的 `queue-operation{enqueue}` 记录；grok/agy 全未验证。composer 呈现 发送/排队/打断 三态 + 队列 chip + `status: "interrupted"`；**未验证的能力一律 `unknown`，显示「尚未验证」，不得假装支持或假装不支持**。**(3) 实时流式**——claude 走 `MessageDisplay` hook 的行级 delta（`turn_id`/`message_id`/`index`/`final`/`delta`）为主、transcript block 为权威值，grok 走 `updates.jsonl` 的 ACP chunk，codex 只有 completed item（**如实标注无 delta**）；同时修复 `TranscriptMapper`：按 `(requestId, message.id)` 缓冲并按 `apiBlockIndex` 重组（一条记录只装一个 content block、同一 message.id 跨 2–7 条记录，这是 tool-call 串位的根因）、把不存在的 `parentToolUseId` 换成 `sourceToolUseID`/`sourceToolAssistantUUID`、保留 `queue-operation`/`permission-mode`/`toolUseResult`。**(4) 跨 Node 重启存活 = 未决**：in-process PTY 随 Node 进程死亡，本轮接受丢失（方案 A）并保留 herdr 为需要存活的宿主的可选 carrier，`remuda-ptyd`（方案 B）排 P8，**待用户拍板**。**(5) effort 与 tui overlay**——per-session settings overlay 钉死 `tui`（`fullscreen`/`default` **两个方向都显式写**）、`showStatusInTerminalTab`、`terminalProgressBarEnabled`（后两者关掉即丢失整层 OSC 信号）；effort 走 launch `--effort <v>` + 会话内 `/effort <level>`，**禁用 `CLAUDE_CODE_EFFORT_LEVEL` 并从子进程环境中剥离**（它压过会话内改档），UI 一律显示 **effective**（从 transcript 的 `effort`/`perTurnEffort` 回读），回读不到显示 `?` 而**绝不回落成请求值**；保留 `--setting-sources`（代价是会话内 `/tui` 被拒，而渲染器已在启动时决定），并从字节流探测 `ESC[?1049h` 判定实际全屏模式后经 `altScreen` 上报。*（2026-10-05 注：本项中 ultracode 的耦合口径由 D-056 取代——ultracode 是与档位正交、按 Claude Code 版本门控的会话开关；本项其余条文不变。）* | 用户 | [native-pty-first.md](./native-pty-first.md) §5–§9；附录 A.2 逐项对账 **(6) Node 重启存活（用户 2026-09-14 拍板）**：本轮接受丢失（方案 A：Hub `node-epoch-changed` + Resume 兜底，herdr 保留为 optional carrier），`remuda-ptyd` 持有进程（方案 B）排到 P8 之后。 |
 | D-029 | 2026-09-14 | **Claude 首次运行 onboarding 与 PTY pane 回收**：Node-scoped `CLAUDE_CONFIG_DIR` 首次使用是空目录，2.1.270 因此跑 first-run wizard（theme → security → terminal-setup）而不是挂出 prompt composer；Herdr 把这种 TUI 菜单报成 **idle + interactive_ready**，于是 D-022 队列看到「就绪」、SessionStart 永不触发、prompt 永远 `queued`——D-022 的 folder-trust 自动确认根本到不了。三层修复：**(1) 启动前 seed**：往 scoped `.claude.json` 写 `hasCompletedOnboarding`，并按**显式白名单**镜像宿主用户的 `lastOnboardingVersion` / `bypassPermissionsModeAccepted`（global config）与 `theme` / `skipDangerousModePermissionPrompt`（user settings）；`oauthAccount`/`userID`/`projects`/`.credentials.json` 一律不复制，scoped 目录里已有的键永远优先（pane 内改过的 theme 不被覆盖），文件 0600、目录 0700。继承用户默认 config 时跳过（那本就已 onboarded），`REMUDA_CLAUDE_SEED_ONBOARDING=0` 可关闭以复现 wizard。这与 Claude Code 自己 `plugin eval` 沙箱给一次性 config dir 的做法一致。**(2) 兜底识别屏幕**：claude-pty 认出 theme / security / terminal-setup / login / bypass 五种首屏，每种至少要两个独立标记（单句 stock phrase 可能出现在模型输出里），每个 carrier 每屏只自动答一次并记 `claude-onboarding` diagnostic。**terminal-setup 按 `escape` 而不是 `enter`**——enter 会改写操作者终端的键位与响铃配置，那不是 Remuda 该动的东西；login 与 bypass disclaimer 含真实决定，只上报、交人类。**(3) wizard 不算 idle**：`prompt_ready_for` 在识别到首屏时保持 blocked，prompt 不会被打进 theme picker；Claude 自己的 SessionStart 一到就解除该屏幕监视，之后的模型输出不会被误判成 wizard。另修 **stop 不回收 pane**：driver 只回收自己内存里的 Herdr 资源，而 durable `pty_resources` 行——rebuilt/adopted driver 或报错的 close 之后唯一的记录——此前只在 Node 启动与 shutdown 被读，**stop 时从不**，于是 12 次 stop 留下 12 个 idle pane。现在 stop 结算后按实例回收 durable ownership（逐个 carrier best-effort，关不掉的保留 ownership 交给下次 sweep 而不是遗忘），`PtyResource::close` 显式关 pane 并校验没有 owned pane 存活、`ctrl+c` 后有具名 2s grace，ownership 仍以唯一 creation label 匹配（server 重启后复用的 id 绝不误关）。 | 用户 | [claude-onboarding-1.md](./evidence/claude-onboarding-1.md)；D-022 |
 | D-030 | 2026-09-14 | **Passkey（WebAuthn）登录**：登录主路径改为 discoverable passkey + conditional mediation（autofill），访问码降为次级兜底；设置页可添加/重命名/删除 passkey。**决策要点**：(1) 第一次配对仍必须用访问码（D-018 不变），注册接口只接受已登录设备，不存在纯 passkey 自助开通；(2) passkey 登录成功发放与 `/v1/login` **完全相同**的设备 token / HttpOnly `remuda_device` cookie / DeviceSession，passkey 只是新的兑票方式而非新主体；(3) RP ID 与 expected origins 来自 Hub 配置（`--public-origin` / `REMUDA_PUBLIC_ORIGIN` + `allowed_origins`），未配置时仅对 `127.0.0.1`/`localhost` 回环来源按请求 Host 派生，**永不硬编码主机名**；凭据与来源绑定，内网 `https://remuda.<zone>` 与本地 demo 各自独立注册，UI 明确提示；(4) attestation `none`、UV required、resident key required、user.id 用按 RP ID 派生的固定 UUID v5；(5) 挑战进程内存放、120 s TTL、一次性取出、容量上限；新表 `passkeys`，credential id 全库唯一；签名计数器沿用 webauthn-rs 克隆检测；登录失败统一 401 防枚举；start/finish 全部并入既有认证 token-bucket 限流；`passkey.register/login/delete/rename` 进审计日志。实现直接依赖 `webauthn-rs-core = "=0.5.5"`（MPL-2.0）：其安全包装 crate 的 builder 因 `Url::domain()` 对 IP 字面量返回 `None` 无法构造回环 RP，且未导出 `new_unsafe_experts_only`，故在 core 上逐参数复刻包装 crate 的 passkey ceremony，origin allowlist 自行收敛。 | 用户 / x-passkey | [passkey-login.md](./passkey-login.md)；[evidence/passkey-1.md](./evidence/passkey-1.md) |
 | D-031 | 2026-09-14 | **关停，禁止使用隧道工具**。禁止安装、探测或使用隧道类工具，包括 cloudflared、ngrok、frp（frpc/frps）、bore、tailscale funnel，以及用于暴露服务的 `ssh -R` / `ssh -D` 等反向、转发或代理隧道；项目移除相关部署配置和探测。理由：内网风控将旧 `deploy/m1/preflight.sh:119` 的 cloudflared 探测标记为「建立隧道」，用户明确要求「不能使用内网穿透协议」并决定「关停，禁止使用隧道工具」。影响：公网部署待定，`deploy/intranet/` 的内网 Caddy 为唯一支持路径；本决策覆盖 D-006 与 D-020 的公网暴露安排，旧记录保留为历史。**Worker 规则：不得执行 deploy/ 下脚本或探测隧道工具。** | 用户 | 内网风控告警与用户原话；[deploy-runbook.md](./deploy-runbook.md)、[coordinator-guide.md](./coordinator-guide.md#worker-rules) |
@@ -1248,6 +1249,163 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 **不做什么**：不新增错误码或状态机取值（409 复用 `COMMAND_ID_CONFLICT`，消息区分在飞/排队）；不引入 configure 转发队列；不改 Node 侧 commandId+digest 去重；web 无代码改动（outbox 本来只重放 send）。
 
 **依据**：`crates/remuda-hub/src/http.rs`（`post_command`、`replay_existing_command`、`settled_command_row`、`get_instance_command`）；`crates/remuda-hub/src/store.rs`（`queue_command` 串行 writer、`reject_command`、`patch_instance_configure`）。
+
+## D-056
+
+**2026-10-05 · Claude ultracode 是正交的会话开关（Claude ultracode is an orthogonal session toggle）**
+
+| 日期 | 2026-10-05 |
+|---|---|
+| 状态 | adopted（规格层，docs-only；代码由后续 effort 任务跟进，本决策先合） |
+| 相关 | [evidence/effort-sync-4.md](./evidence/effort-sync-4.md)（2.1.289 实测）、[effort-sync-2](./evidence/effort-sync-2.md) / [effort-sync-3](./evidence/effort-sync-3.md)（2.1.272 / 2.1.273 耦合基线）、[native-pty-first.md §9.1](./native-pty-first.md) 与附录 A.2 第 5 行、[protocol.md §4.1 / §7.2](./protocol.md)、[ui-spec.md](./ui-spec.md) composer 的 Effort 条、[visual-system.md](./visual-system.md) `--ember-*`、D-028、D-028a、D-042 |
+
+**背景**：
+
+- **2.1.284 的变化。** 官方 changelog 在 2.1.284 下写道（原文，见 effort-sync-4 §2）：
+
+  > Changed Ultracode into its own toggle in `/effort` (Tab, or `/effort ultracode [on|off]`): it no longer forces xhigh effort and stays on at any effort level
+
+  官方 model-config 文档口径相同：
+  - ultracode 是 Claude Code 的一项设置，不是档位。开着时，Claude 在会话当前的任意档上为每个实质任务编排 dynamic workflow。
+  - 用 `/effort ultracode` 或 `ultracode` 设置键开关它，档位不变；选档也不动它。
+  - `--effort ultracode`（以及 Agent SDK 的 `effortLevel: "ultracode"`）仍然是「开 ultracode，并把档设为 xhigh」。
+  - workflows 关闭、或模型不支持 xhigh 时，ultracode 不可用。
+- **耦合基线（2.1.203–2.1.283）。** 按官方文档：
+  - `--effort ultracode` 从 2.1.203 起才被接受；更早的版本打印 `Unknown --effort value 'ultracode'`，并以默认档启动。
+  - 2.1.284 之前，开 ultracode 会把会话设为 xhigh，选任何其它档都会关掉它；档位上限低于 xhigh 时 ultracode 不可用。
+
+  effort-sync-2/3 的 2.1.272 / 2.1.273 录制是这一区间的基线：在缓存过的会话里改档，总会弹「Change effort level?」确认框。
+- **Remuda 现在按耦合模型实现。**
+  - D-028a 第 (5) 项指向的 native-pty-first §9.1 和 protocol §4.1 写的是「ultracode 等价 xhigh + dynamic workflow」，launch 只发一个 `--effort ultracode`（`crates/remuda-protocol/src/launch.rs:292`、`crates/remuda-driver/src/effort.rs:50`）。
+  - web 把 ultracode 当成滑杆的第六档，以旧名 `"ultracode"` 上 wire（`web/src/lib/store.ts:3292-3296`）。
+  - driver 在 ultracode 时只打一条 `/effort ultracode`（`crates/remuda-driver/src/effort.rs:229`）。
+  - 回读只在 xhigh 上保持开关（`crates/remuda-protocol/src/effort.rs:308-309`）。
+
+  到了 ≥2.1.284，这几处都会出错：`{max, 开}` 无法表达，`/effort ultracode` 不再改档，改档也不再关 ultracode。
+- **2.1.289 实测（effort-sync-4）。** 与研究阶段的推测冲突时，以这些实测为准：
+  - 两个 `--settings` 不合并，后出现的那份**整份**胜出（launch 用例 c1 / c2）。
+  - `--resume` 不恢复 ultracode，恢复后的首个 prompt 带 `ultra_effort_exit`（f1 / f2）。
+  - 26 条 `/effort` 命令都没有弹确认框。
+  - ultracode 从不出现在 assistant 记录上，只出现在 `/effort` verdict、`ultra_effort_enter` / `ultra_effort_exit` 附件和屏幕 footer 上。
+  - `auto` 回读为它解析出的档，只有 `/effort status` 显示 auto。
+  - 不支持的模型会拒绝：`Ultracode isn't available on <model>. Valid options are: …`。
+  - `/model` 的 verdict 不带 ``with `<level>` effort`` 后缀。
+
+**决策**：Claude 的 effort 档位与 ultracode 是两条独立的轴。wire、launch、会话内切换、回读、UI 全程分开处理，并按 Claude Code 版本门控。
+
+版本门（下面各条都引用这张表）：
+
+| Claude Code 版本 | ultracode 语义 | launch | 会话内开 | 会话内关 |
+|---|---|---|---|---|
+| < 2.1.203 | 不存在 | 任何 `ultracode: true` 都拒绝 | 拒绝 | — |
+| 2.1.203–2.1.283（耦合） | 开 = xhigh + workflow；选任何档即关 | 只有 `{xhigh, true}` 发 `--effort ultracode`；其余 `ultracode: true` 组合拒绝 | 单条 `/effort ultracode`（仅当目标是 `{xhigh, true}`，不先发 `/effort xhigh`） | `/effort <level>` |
+| ≥ 2.1.284（解耦） | 任意档上的会话开关，改档不动它 | `--effort <level>`，加同一份 overlay 里的 `"ultracode": true` | `/effort ultracode on` | `/effort ultracode off` |
+
+1. **Wire 形状不变，语义按版本。**
+   - `EffortSelection{name, ultracode}` 保留（`crates/remuda-protocol/src/launch.rs:168`）：`name` 是五档之一，`ultracode` 是独立的 boolean。
+   - 在 ≥2.1.284 上，`ultracode: true` **不再蕴含** xhigh，`{max, true}`、`{medium, true}` 都是合法请求。
+   - 旧名 `ultracode` 只作**输入**别名：读入时归一为 `{xhigh, true}`，永不写回（protocol §4.1）。
+   - `instance.configure` 的 `effort` 携带 `{name, ultracode, index}`，其中 `index` 是旧客户端字段，读时忽略。web 不再用旧名 `"ultracode"` 上 wire。
+   - `EffortEffective{name, ultracode?, source, observedAt}`（`launch.rs:347`）不变。
+   - 不新增 wire 字段：版本通过既有的 `CapabilitySnapshot.binaryVersion`（protocol §3.2）传递。
+2. **Launch。**
+   - 版本取 pinned binary 的 `--version`，即 materializer 已经记录的 `binaryVersion`（protocol §4.1）。
+   - **≥2.1.284**：发 `--effort <level>`。`ultracode: true` 时，把 `"ultracode": true` 写进本次 launch **已有**的那份 per-launch settings overlay，也就是放 hooks、`tui` 等键的同一个 JSON。
+     - 绝不为它另加第二个 `--settings`：两个 `--settings` 不合并，后出现的整份胜出，会静默丢掉 hooks 或 ultracode 之一（effort-sync-4 §4 (c)）。
+     - overlay 是 launch 作用域的物化文件，不写操作员自己的 settings，所以 ultracode 仍然只在本会话有效。
+   - **2.1.203–2.1.283**：只有 `{xhigh, true}` 可以落地，发 `--effort ultracode`。`ultracode: true` 搭配其它档时以 `InvalidLaunchSpec` 拒绝，消息点名版本，例如「claude 2.1.277 的 ultracode 只能以 xhigh 运行」。
+   - **<2.1.203**：任何 `ultracode: true` 都拒绝。版本读不出时，`ultracode: true` 也一律拒绝（失败关闭，不猜版本）。`ultracode: false` 的请求不受版本门影响。
+   - **resume 要重新声明。** `--resume` 不恢复 ultracode（f2），resume launch 按同一张版本门再带一次：≥2.1.284 写 overlay 键，耦合版本发 `--effort ultracode`（仅 xhigh）。`--resume` 加 overlay 键能否恢复 ultracode 还没有实测；实测之前由回读判定：本进程没有产生 `ultra_effort_enter` 或「Ultracode on」verdict，开关的 effective 就不报「开」（上一个进程重放的旧 verdict 不算，见第 4 条）。
+   - 所有拒绝都发生在 create 被持久接受**之前**，不会静默降级成「不开 ultracode」（与 D-035 的拒绝形状相同）。
+3. **会话内切换。**
+   - **档位**：`/effort <level>`。保留既有的确认框门控，即目标词门控与救援 Enter（`perform_switch`，`crates/remuda-driver/src/effort.rs:521`）。2.1.289 上没有确认框，所以切换必须在无框时也能结算。
+   - **开关**：`/effort ultracode on` 或 `/effort ultracode off`。不弹框，不走确认框门控。
+   - **每次 configure 至多两条命令，档位在前。**
+     - 只变一条轴，就只发一条命令。
+     - 两条轴都变时（仅 ≥2.1.284），先发 `/effort <level>` 并等它的 verdict，再发开关命令。开关的 verdict 自带「Effort stays <level>」，可以顺带确认最终档位。
+   - **耦合版本。**
+     - 开 = **单独一条** `/effort ultracode`，只在目标是 `{xhigh, true}` 时允许。不论当前在哪一档，都不先发 `/effort xhigh`：耦合版本上 `/effort xhigh` 的 verdict 是 `Set effort level to xhigh (saved as your default for new sessions): …`，而 `/effort ultracode` 本身就是只在本会话有效的 xhigh + ultracode：`Set effort level to ultracode (this session only): xhigh + dynamic workflow orchestration`（两条都见 [effort-sync-2](./evidence/effort-sync-2.md)，2.1.272）。打开 ultracode 绝不顺带保存新的默认档。
+     - 关 = `/effort <目标档>`。耦合版本上，任何一档的 accept 都会关掉 ultracode，xhigh 也一样。
+     - 请求 `{非 xhigh 的档, true}` 时不打字，以 `effort-unsupported-in-session` 拒绝并点名版本。
+   - **会话内用哪个版本**：以 transcript 最新记录的 `version` 为准，因为会话里跑的可能是手敲启动的 claude（D-025）。没有记录时用 pinned 版本；两者都没有时，只执行档位变化，开关变化以 `effort-unsupported-in-session` 拒绝。
+4. **回读。**
+   - **档位**：只从 assistant 记录的 `effort` / `perTurnEffort` 读；`perTurnEffort` 为 `null` 时用 `effort`。verdict 说的档与 assistant 记录不一致时，以 assistant 记录为 effective。实例：不支持 xhigh 的模型接受了 `/effort xhigh`，实际却以 high 运行（effort-sync-4 §4 (g)）。
+   - **开关**：只从两类证据读，**永远**不从 assistant 记录推断。
+     - `/effort` verdict：`Ultracode on (this session only)…`；`Ultracode off. Effort stays <level>.`；滑杆 verdict 末尾的 ` · Ultracode off`；`/effort status` 末尾有没有 ` · Ultracode on`。
+     - `ultra_effort_enter` / `ultra_effort_exit` 附件。`reminderType: "sparse"` 的 enter 只是重复提醒，不代表状态变化。
+
+     footer 上的 `· ultracode` 只作 Screen 层兜底（completeness 为 `screen-derived`）。≥2.1.284 上，开关在任意档都锁存，档位的 verdict 不改它；耦合版本上，档位 accept 会把它清掉（既有行为）。
+   - **只认本进程的记录。** `--resume` 会把新进程的记录追加到同一个 transcript 文件，文件里和屏幕上都还留着上一个进程的历史，其中可能就有「Ultracode on (this session only)」。这些重放的旧 verdict 不代表当前状态：effort-sync-4 (f) 中 resume 后的进程实际以 ultracode **关**启动，并在首个 prompt 上发出 `ultra_effort_exit`。因此：
+     - 回读游标从本进程 spawn 时 transcript 的末尾开始，spawn 之前已在文件里的记录只进历史、不参与 effective；开关状态从本进程的第一条附件或 verdict 起算。
+     - 屏幕兜底同理：只认当前 footer，不认 scrollback 里重放的旧 verdict 行。
+     - 新进程（launch 或 resume）在本进程出现第一条证据之前，开关状态为未知。
+   - **版本**：从 transcript 记录的 `version` 字段读，每条 assistant 记录都带。
+   - **拒绝**映射为带稳定 reason 的 rejection，journal 状态沿用 `effort-degraded:<word>:<reason>`：
+
+     | reason | 触发（verdict 原文前缀） |
+     |---|---|
+     | `ultracode-workflows-disabled` | `Ultracode needs dynamic workflows enabled (see /config).` |
+     | `ultracode-unavailable-for-model` | `Ultracode isn't available on <model>.` |
+     | `env-override` | verdict 表明档位被 `CLAUDE_CODE_EFFORT_LEVEL` 钉住。Remuda 会剥离这个变量，所以它只会出现在手敲启动、并继承了该变量的会话里。2.1.289 上没有录到原文，匹配前须先实测 |
+     | `dialog-kept` | 旧版本的确认框被 Esc 关掉 |
+     | `invalid-argument` | `Invalid argument: <x>. Valid options are: …` |
+   - **失败只是这次 configure 的结局，不结束会话**（所有者规则：「failed 不是进程退出；failed 之后可以重试」）。`/effort` 或 ultracode 切换被拒绝、degraded 或超时，都只落在这条 configure 命令和它所在的 turn 上：实例的 lifecycle 不变，不标 `failed` / `exited`，不关进程，不影响排队中的 prompt。之后可以重试，重试是一条新的 configure 命令（新 commandId；configure 不可重放，D-055）。launch 时的版本门拒绝发生在 create 被接受之前，不属于这一条。
+   - **被 clamp 的 accept**：verdict 形如 `Effort '<x>' exceeds the cap for <model> …; set to '<y>' instead …`。按 applied 结算，effective 报 clamp 之后的 `<y>`，请求仍记 `<x>`，UI 显示「请求 x → 实际 y」。
+   - **`auto`**：它不是 wire 值，Remuda 不发 `/effort auto`；会话里出现 auto 时，回读报它解析出的档。
+   - **`/model` 的 verdict**：``with `<level>` effort`` 后缀可有可无，解析不得依赖它。
+5. **UI。**
+   - Claude 滑杆只有 `low…max` 五档，没有 ultracode 档，也没有 auto 档。滑杆旁边是一个独立的 **Ultracode** 开关（`role=switch`）。
+   - 收起态芯片与 compact 触发器在档名后加 ` · ultracode`，例如 `high · ultracode`、`manual · high · ultracode`；开关关着时只显示档名。两条轴各自显示 effective、各自显示「请求 → 实际」，读不到时显示 `?`。
+   - ultracode 不可用时，开关禁用并显示原因，禁用只在原因成立的范围内有效：
+     - 版本低于 2.1.203：整个会话禁用。
+     - `ultracode-unavailable-for-model`：只对**拒绝它的那个模型**禁用。会话换了模型（`/model` accept 或回读到新模型）就重新启用，新模型可以再试；切回那个模型时恢复禁用。
+     - `ultracode-workflows-disabled`：对本进程禁用；新进程（resume 或重新 launch）重新启用。
+     - 非 Claude harness 不渲染这个开关。
+   - 耦合版本上，开关注明「以 xhigh 运行（Claude Code 2.1.203–2.1.283）」：打开开关即把滑杆移到 xhigh，driver 只发一条 `/effort ultracode`（见第 3 条，不保存默认档）；滑离 xhigh 即关掉开关，与 CLI 的行为一致。
+   - 余烬（`--ember-*`）只跟随两种状态：Claude 的 ultracode **开关**（任意档）和 Codex 的 `ultra` 档，不再绑定滑杆上的某个位置。Claude 的滑杆只显示档位外观，xhigh / max 用静态强调。
+   - Codex、grok、agy 的滑杆不变。
+6. **默认档按模型。**
+   - 官方文档：支持 effort 的模型默认 `high`；Opus 5.5 和 Sonnet 5.5 默认 `medium`；Opus 4.7 默认 `xhigh`。组织默认档和 per-model 保存的档都可以覆盖它。
+   - 任何 UI 文案、spec 表格、代码注释都不得把某一档标成 Claude 的通用默认。
+   - 未 pin（`effort` 缺省，不发 `--effort`）时显示「跟随模型默认」，回读后再显示解析出的档。没有记忆偏好的新草稿就是未 pin。
+7. **`CLAUDE_CODE_EFFORT_LEVEL` 继续从子进程环境剥离**（protocol §4.1、native-pty-first §9.1）。它压过 `--effort` 和 `/effort`，而且不接受 `ultracode`。不为 ultracode 新增任何环境变量通道。
+8. **取代与不变。**
+   - 本决策取代 D-028a 第 (5) 项（及其指向的 native-pty-first §9.1、protocol §4.1）中「ultracode ≡ xhigh + dynamic workflow」和「launch 只发一个 `--effort`」两处口径。
+   - 第 (5) 项的其余条文不变：tui 两个方向都显式写；`showStatusInTerminalTab`、`terminalProgressBarEnabled`；剥离 `CLAUDE_CODE_EFFORT_LEVEL`；UI 显示 effective，回读不到显示 `?` 而不回落成请求值；保留 `--setting-sources`；`altScreen`。
+   - prompt 里的 `ultracode` 关键词（单任务 workflow，按输入 origin 门控，protocol §6.2）与会话开关无关，不在本决策范围内。
+
+**不做什么**：
+
+- 不新增 wire 字段、档位或 `auto` 值，也不新增错误码：launch 拒绝复用 `INVALID_LAUNCH_SPEC`，会话内拒绝复用 `effort-degraded` / `effort-unsupported-in-session`。
+- 不把 ultracode 写进操作员的 settings 文件。不用 `effortLevel` 设置键当 launch 通道：它既不收 `max`，也不收 `ultracode`。
+- 不为 ultracode 加第二个 `--settings`。
+- 本次变更不改代码。
+
+**开放问题**：
+
+1. **（所有者）per-task / 供给层的 ultracode 请求。** 现行口径：ultracode 只是 UI 上**按会话**的开关。task、dispatch、supply 能否携带 ultracode 请求，由谁请求、是否受 origin 门控，都未决，本决策不定。
+2. （待实测）`--resume` 加 overlay 键 `"ultracode": true` 能否恢复 ultracode。
+3. （待实测）`env-override` 拒绝的 verdict 原文。
+4. （待实测）同时改模型和档位时，`/model` 的 verdict 是否带 effort 后缀。
+5. （待实测）耦合区间只录了 2.1.272 / 2.1.273 两个版本，其余版本按官方文档推定。
+
+**由谁**：coordinator（c-effortadr，docs-only）。会话级开关是所有者的现行口径；供给层请求留给所有者裁决。
+
+**依据**：
+
+- [evidence/effort-sync-4.md](./evidence/effort-sync-4.md) §2–§6。
+- Claude Code 官方文档：
+  - model-config：effort 档位、按模型的默认档、ultracode 及其版本历史；
+  - cli-reference：`--effort`（含 ultracode 别名）、`--settings`、`--resume`；
+  - settings-reference：`effortLevel`、`maxEffortLevel`、`modelSettings`、`ultracode`；
+  - workflows：ultracode 的语义与关闭 workflows；
+  - 2.1.284 changelog。
+- 代码锚点（2026-10-05 在 main `8a6c83a7` 上复核）：
+  - `crates/remuda-protocol/src/launch.rs:168,292,347`
+  - `crates/remuda-protocol/src/effort.rs:308-309`
+  - `crates/remuda-driver/src/effort.rs:50,229,521`
+  - `web/src/lib/store.ts:3292-3296`
+  - `web/src/features/session/effort.ts:419-438`
 
 ## D-057
 

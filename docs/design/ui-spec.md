@@ -494,29 +494,38 @@ mediaType, name}`，`protocol.md` §5.2），字节在对象库、不在 journal
 
 - 外壳：`--bg-input` 底，12px 圆角，1px `--border`，宽度与阅读列对齐（720px，停靠区内居中）；`:focus-within` 时边框变 `--focus` 并加 `0 0 0 1px var(--focus)`。
 - 文本框：无边框，16px/24px，`--fg-body`，placeholder「输入提示词…」。行数：桌面 1–10 行，手机 1–5 行，键盘态 1–3 行。自增高用 CSS grid 镜像（`::after{content: attr(data-value)}`）实现，不读 `scrollHeight`。
-- 桌面是两行：文本行 + 32px 工具行。控件 28px 高，12px `--fg-muted`，无边框；hover `--bg-hover`，打开时 `--bg-selected`。左：`attach-file` 与「粘贴附件」；中：`harness-chip`（静态文字）、`model-effort-chip`（显示「opus · high ▾」：切换中或排队中带 `--link`，与生效值不一致时带 `--attention-fg`，未知时显示「?」）、`context-chip`（圆环 + 「42%」）、`permission-chip`（danger 模式下仅 `--danger-fg` 字 + ⚠ 前缀，不加边框——带边框的 danger 触发器只属于 compact 单行的选项触发器，见下）；右：状态文字（`composer-queue-status`、`composer-interrupted-chip`、`composer-cap-note`）、忙碌时出现 `composer-steer` 和 `composer-interrupt`、发送按钮（32px 圆形，`--primary-fill` 底，里面是 ↑；`data-mode`、`data-holder` 不变）。composer 自身宽度 <600px 时先隐藏 harness 名，再把 context 收成只剩圆环。
+- 桌面是两行：文本行 + 32px 工具行。控件 28px 高，12px `--fg-muted`，无边框；hover `--bg-hover`，打开时 `--bg-selected`。左：`attach-file` 与「粘贴附件」；中：`harness-chip`（静态文字）、`model-effort-chip`（显示「opus · high ▾」，Claude ultracode 开时「opus · high · ultracode ▾」：切换中或排队中带 `--link`，与生效值不一致时带 `--attention-fg`，未知时显示「?」）、`context-chip`（圆环 + 「42%」）、`permission-chip`（danger 模式下仅 `--danger-fg` 字 + ⚠ 前缀，不加边框——带边框的 danger 触发器只属于 compact 单行的选项触发器，见下）；右：状态文字（`composer-queue-status`、`composer-interrupted-chip`、`composer-cap-note`）、忙碌时出现 `composer-steer` 和 `composer-interrupt`、发送按钮（32px 圆形，`--primary-fill` 底，里面是 ↑；`data-mode`、`data-holder` 不变）。composer 自身宽度 <600px 时先隐藏 harness 名，再把 context 收成只剩圆环。
 - 顶部区只在有内容时出现：最大高度 112px（键盘态 36px），自身可滚动。排队行（`composer-queued-row`、`composer-queued-chip`，28px，带「插队发送」和 ✕）、附件块（40px，`--bg-inset`；上传失败边框用 `--danger-border`）、代码引用芯片；手机额外显示「尚未验证」（`composer-cap-note`）——这是能力**未知/未验证**而不是需要人处理或失败，用 `--unknown-fg` 中性色 + 虚线标记，不用琥珀（D-053/§3.3：`unknown` 是诚实的欠缺）。
 - 桌面 ≥1024 时文本行下方显示说明（`composer-caption`），12px `--fg-faint`：「Enter 发送（工作中排队）· ⌘/Ctrl+Enter 插队 · Esc 打断 · 组字中 Enter 不发送」。
 - 发送语义：桌面 Enter 发送（IME composing / keyCode 229 / key=Process 时忽略，抄 herdrx `Composer.tsx` `composing()`），Shift+Enter 换行；⌘/Ctrl+Enter 插队；手机 Enter 换行、主发送是按钮。不要抢中文候选。
 - 权限芯片显示当前 `permissionMode`（dontAsk/acceptEdits/manual…），点开改本会话（发 Command，不是只改本地 chip）。
-- Effort：收起为 compact 触发器，只显示**档名**（`ultracode ▾`），宽度固定不顶布局。点开是一张 ~300px 的 card popover（手机改 sheet），钉在触发器上方：
+- Effort（Claude 的档位与 ultracode 是两条独立的轴，D-056，实测见 [effort-sync-4](./evidence/effort-sync-4.md)）：收起为 compact 触发器，只显示**档名**，ultracode 开着时加 ` · ultracode`（`high ▾`、`high · ultracode ▾`），宽度固定不顶布局。点开是一张 ~300px 的 card popover（手机改 sheet），钉在触发器上方：
   - 第 1 行 grid：左闪电图标 · 中间档位名（18px `--fg-strong`）+ `›`（点开档位/模型列表）· 右复位图标。第 2 行居中 muted 型号（13px）。
   - 下方一条 40px 高的圆角 pill：左侧已填部分是中性轨道色，右侧未填是中性 surface；每个档位一个小圆点 marker，两侧都看得见；钮是 36px 圆 + 柔和投影，拖动吸附到点上。
   - **填充必须压到钮下**：fill 宽 = 钮心 + 钮半径（`--knob * 2 + pos * (100% - --knob * 2)`），fill 右端正好落在钮右缘、圆头藏在钮底下，钮左侧和钮下不留暗轨；第一档 fill 正好一个钮宽，同样不留缝。
   - 手机上触控 ≥ 44px 只靠**热区**，不靠视觉尺寸：pill 仍是 40px，外面套 48px 热区；图标按钮保持可见字形，用 44×44 的 `::after` 扩大命中面。
-  - 最高档：整条 pill 换 `--ember-*` 余烬琥珀渐变，上面叠一层暖光 + 三层疏密不同的 ember 星点，各自以不同速度横向漂移（其中一层反向）并各自闪烁，钮带一圈呼吸的琥珀光晕；收起态触发器同频率轻微发光。只用 transform / opacity，不触发布局；popover 关闭即卸载，`prefers-reduced-motion` 下全部停成静帧（essential 动效按 visual-system §7.4 标记）。
-  - 吸附 harness 原生档（claude `low/medium/high/xhigh/max` 加 `ultracode` workflow stop，codex `low/medium/high/xhigh/max/ultra`（显示 Low / Medium / High / Extra high / Max / Ultra；说明见 protocol.md effort 表），grok `low/medium/high/xhigh`）。`role=slider`，`aria-valuetext` = 档名。←/→/Home/End、触摸拖动、44px 触控。
+  - 余烬（`--ember-*`）只跟随两种状态，**不绑定滑杆上的某个位置**：Codex 的 `ultra` 档（整条 pill 换余烬）与 Claude 的 Ultracode 开关打开（任意档，余烬落在开关轨道与收起态触发器上；Claude 的 pill 只显档位外观，xhigh / max 用静态强调）。余烬的样子：`--ember-*` 余烬琥珀渐变，上面叠一层暖光 + 三层疏密不同的 ember 星点，各自以不同速度横向漂移（其中一层反向）并各自闪烁，钮或开关带一圈呼吸的琥珀光晕；收起态触发器同频率轻微发光。只用 transform / opacity，不触发布局；popover 关闭即卸载，`prefers-reduced-motion` 下全部停成静帧（essential 动效按 visual-system §7.4 标记）。
+  - 吸附 harness 原生档（claude `low/medium/high/xhigh/max` 五档，没有 ultracode 档也没有 auto 档；codex `low/medium/high/xhigh/max/ultra`（显示 Low / Medium / High / Extra high / Max / Ultra；说明见 protocol.md effort 表）；grok `low/medium/high/xhigh`）。`role=slider`，`aria-valuetext` = 档名。←/→/Home/End、触摸拖动、44px 触控。
+  - **Ultracode 开关（仅 Claude）**：pill 下方一行，左「Ultracode」+ 一行 muted 说明「每个任务编排 dynamic workflow · 仅本会话」，右 `role=switch`（`aria-checked`，Space 切换），44px 热区。非 Claude harness 不渲染。
+    - **不可用时禁用并写明原因**（禁用态仍可读，原因用 `--fg-muted` 字放在说明行）。禁用只在原因成立的范围内有效：
+      - Claude Code 版本低于 2.1.203：整个会话禁用。
+      - `ultracode-unavailable-for-model`（「<模型> 不支持 ultracode」）：只对**拒绝它的那个模型**禁用。会话换了模型（`/model` accept 或回读到新模型）就重新启用，新模型可以再试；切回那个模型时恢复禁用。
+      - `ultracode-workflows-disabled`（「需要开启 dynamic workflows」）：对本进程禁用，resume 或重新 launch 后重新启用。
+    - **切换失败不结束会话**：被拒绝、degraded 或超时只显示在这次切换上（开关回到 effective 状态并给出原因），会话照常可用；除上面三种禁用外，用户可以直接再试一次（D-056 (4)）。
+    - **耦合版本（Claude Code 2.1.203–2.1.283；更低版本开关已禁用）**：说明行改为「开启后以 xhigh 运行」；打开开关即把滑杆移到 xhigh，driver 只发一条 `/effort ultracode`（本会话有效，不保存默认档）；滑离 xhigh 即关开关，与 CLI 一致。版本读自实例的 `binaryVersion`，transcript 的 `version` 优先。
+  - **默认档不写死**：Claude 的默认档按模型（Opus 5.5 / Sonnet 5.5 = medium，Opus 4.7 = xhigh，其余 = high），任何文案都不得把某一档标成通用「默认」。未 pin 时触发器显示「跟随模型默认」，回读后显示解析出的档；没有记忆偏好的新会话即未 pin。
+  - 两条轴各自显示 effective：档位读不到显示 `?`，开关读不到显示 `?`；与请求不一致时逐轴提示「请求 max → 实际 high」「请求 ultracode → 实际关」（resume 后未重新生效就是后者；开关只认本进程的记录，resume 前重放出来的「Ultracode on」不算）。
   - `›` 展开的列表里才有档位说明和模型选择（`‹` 返回 pill）；pill 视图本身不列模型。
-  - 变更走 `instance.configure`（journal + persist）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
+  - 变更走 `instance.configure`（journal + persist），`effort` 发 `{name, ultracode, index}`（`index` 只是旧字段，Hub 读时忽略），不再用旧名 `ultracode` 上 wire。滑杆与开关在同一次确认里一起变时只发一次 configure，driver 端至多两条命令、档位在前；耦合版本打开 ultracode 永远只发一条 `/effort ultracode`（D-056 (3)）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
 - 本地草稿按 `instanceId` 存（herdrx `composerDrafts`）；未 accepted 的乐观气泡可撤回。
 
 **compact composer 边界（D-042，修订 §11.7 冲突「P0-3」；收起态单行 56px 不变）**
 
 compact（§1.3 查询；56px 是 compact 布局行高，与指针无关）下 control bar 是单行 56px：`[选项触发器] [文本框 flex 1] [插队] [打断] [发送]`。
 
-- **选项触发器**（`composer-options-trigger` / `model-effort-chip`）：可见 32px，13px 字，最宽 132px，显示「manual · high ▾」；coarse 指针下命中区 44（fine 指针下不撑大）。`danger` 模式时 `--danger-fg` 字、⚠ 前缀、1px `--danger-border`。触发器**必须同时显示两样东西**：当前 `permissionMode` 的**词**（`manual` / `acceptEdits` / `dontAsk` / `bypassPermissions` 的 label 或 native 词）**和** effort 的**档名**（上一条「只显示档名」的要求不因收起而豁免），形如 `manual · high`。`permissions.ts` 标为 `danger` 的模式（绕过全部 / 不再询问 / 完全访问）必须在触发器上就用 danger 样式可见——**把 bypass 态藏进 sheet 是本条最响的禁止项**。
+- **选项触发器**（`composer-options-trigger` / `model-effort-chip`）：可见 32px，13px 字，最宽 132px，显示「manual · high ▾」；coarse 指针下命中区 44（fine 指针下不撑大）。`danger` 模式时 `--danger-fg` 字、⚠ 前缀、1px `--danger-border`。触发器**必须同时显示两样东西**：当前 `permissionMode` 的**词**（`manual` / `acceptEdits` / `dontAsk` / `bypassPermissions` 的 label 或 native 词）**和** effort 的**档名**（上一条「只显示档名」的要求不因收起而豁免），形如 `manual · high`。Claude ultracode 开时再加 ` · ultracode`（`manual · high · ultracode`）；132px 放不下时只把 ` · ultracode` 收成一枚余烬圆点（`aria-label` 仍含「ultracode」），`permissionMode` 的词与档名都不截（D-056 (5)）。`permissions.ts` 标为 `danger` 的模式（绕过全部 / 不再询问 / 完全访问）必须在触发器上就用 danger 样式可见——**把 bypass 态藏进 sheet 是本条最响的禁止项**。
 - **插队、打断**：只在忙碌时出现。都是 32px 的 `.iconBtn`，间距 12；coarse 指针下命中区 44（`::after`），fine 指针下保持 32；aria-label 分别为「插队发送」「打断」；testid 分别为 `composer-steer`、`composer-interrupt`。**发送**：可见 32px 的圆，coarse 指针下命中区 44。
-- **可以进 sheet**（D-042 允许）：附件、粘贴、harness 只读信息、context 用量、权限选择器本身、effort 滑杆。
+- **可以进 sheet**（D-042 允许）：附件、粘贴、harness 只读信息、context 用量、权限选择器本身、effort 滑杆与 Ultracode 开关。
 - **不得进 sheet**（留在 sheet 外，D-028a）：发送/排队/打断**三态**按钮、队列 chip、能力未验证时的「尚未验证」标注。三态是当回合的事实，`unknown` 是诚实的欠缺，两者都不是「选项」。
 - placeholder 分平台：手机「输入提示词…」（不写桌面快捷键——手机上 Enter 是换行、⌘ 不存在，写快捷键是误导）；桌面保留快捷键说明。
 - 确认类交互：插队与 Esc 打断**不再用 `window.confirm`**（Safari 上会盖住键盘，且样式不可控），改用 `Sheet`（桌面 `popover`，手机 `sheet`，焦点圈定、Esc = 取消、返回焦点到触发器）。确认后的命令语义与 `commandId` 路径**完全不变**。

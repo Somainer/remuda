@@ -411,15 +411,22 @@ function TranscriptInner({
   );
   const scrollerRef = useRef<HTMLDivElement>(null);
   /**
-   * Target of the most recent COMPONENT-INITIATED scrollTop write. The scroll
-   * handler compares the fired event against it: a scroll to the target is the
-   * echo of our own restore/pin/anchor math and must never cancel an in-flight
-   * load-earlier restore; any other scroll (wheel, touch, keyboard) is the
-   * reader. Consumed once by the matching event.
+   * Held across the scroll event fired by an ARMED load-earlier restore's own
+   * scrollTop write (the write + its event can land before the click's
+   * finally). A rAF scheduled with the write clears it once that event is
+   * delivered, so the echo never cancels the restore. Unarmed component
+   * scrolls (mount pin/follow, saved/search restores) do not set it and leave
+   * the scroll listener behaving exactly as before.
    */
-  const programmaticTopRef = useRef<number | null>(null);
+  const suppressScrollGestureRef = useRef(false);
   const programmaticScroll = useCallback((el: HTMLElement, top: number) => {
-    programmaticTopRef.current = top;
+    const armed = loadReqRef.current !== null && !loadReqRef.current.done;
+    if (armed) {
+      suppressScrollGestureRef.current = true;
+      requestAnimationFrame(() => {
+        suppressScrollGestureRef.current = false;
+      });
+    }
     el.scrollTop = top;
     scrollTopRef.current = top;
   }, []);
@@ -1202,10 +1209,9 @@ function TranscriptInner({
           // programmatic scrollTop writes land at the recorded target, so a
           // scroll matching it is the echo of our math, not a gesture, and must
           // not cancel the restore that just scrolled there.
-          const programmatic = programmaticTopRef.current;
-          const isOwnScroll = programmatic !== null && Math.abs(el.scrollTop - programmatic) <= 1;
-          programmaticTopRef.current = null;
-          if (!isOwnScroll) {
+          const programmatic = suppressScrollGestureRef.current;
+          suppressScrollGestureRef.current = false;
+          if (!programmatic) {
             const req = loadReqRef.current;
             if (req && !req.done && !req.cancelled) {
               req.cancelled = true;

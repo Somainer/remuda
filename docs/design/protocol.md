@@ -309,6 +309,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `commandId` | `Id` | 等于 EntityMeta.id；客户端重试必须保持相同 ID |
 | `actor` / `origin` | `ActorRef` / `ui\|bot\|mcp\|cli\|system` | 身份来自认证，不能信任请求自报 actor |
+| `initiator` | `{instanceId: Id, lineageId: Id, generation: U64}` \| 缺省 | 2026-10-05（D-057）：Agent 发起的变更由 Hub 依据已认证设备绑定的实例盖章，绝不取自请求体（请求体自带的 `initiator` 与 `actor` 一样被剥离）；Human 与 Bot 来源不带。认证设备 id 与之并列记录在 Hub 的命令行、gate job 与直连操作行上，只存于 Hub，不发往 Node |
 | `operation` | `instance.create\|instance.attach\|instance.resume\|instance.send\|instance.cancel\|instance.close\|instance.fork\|instance.configure\|interaction.respond\|tty.write\|workspace.register\|worktree.create\|worktree.remove` | 不认识的 operation 拒绝 |
 | `target` | `{hostId: Id, instanceId: Id\|null, runId: Id\|null}` | create 也预分配 instanceId |
 | `payloadRef` / `payloadDigest` | `Id` / `Digest` | 包含目标、generation、内容和配置引用的规范化摘要；secret 只哈希引用与版本，不哈希明文 |
@@ -334,7 +335,9 @@ stateDiagram-v2
 
 相同 `(principalId, commandId)`、相同 digest 返回原记录；不同 digest 返回 `COMMAND_ID_CONFLICT`。RPC id 只配对本次连接上的 response，不能替代 commandId。观察到最终原生结果而先前 ACK 丢失时，可以在一次持久事务中记录 accepted、settled 两个有序变更，不能声称收到从未收到的 ACK。
 
-> **2026-09-25 注（D-055）：重放按操作分叉——send 可重放，configure 不可重放。** 同 commandId 重放 `instance.send` 用于恢复丢失响应：返回存储的原始结局，仍排队的行恰好转发一次。`instance.configure` 的 spec merge 只在首次 POST 发生一次：重放命中终态行时原样返回存储记录（包括首次 merge 失败时持久化的原始 500/body，绝不把它重放成 200）；原始结局尚未持久化（转发在飞，`queued`+`forwarded=1`）时 Hub 返回 409 指明 “still in flight”，客户端应轮询 `GET /v1/instances/{id}/commands/{commandId}`；离线排队（`queued`+`forwarded=0`）的 configure 重放同样被 409 拒绝，客户端必须换用新 commandId 发新命令，重放不代为转发。并发同 id 首次 POST 在 Hub 串行 writer 上分出唯一创建行，merge 严格一次。GET 单行命令在转发尝试进行中返回该尝试的终态行（尝试未开始时如实返回 pending），任何读都不先报 `forwardIntent` 再报其回滚。
+> **2026-09-25 注（D-055）：重放按操作分叉——send 可重放，configure 不可重放。** 同 commandId 重放 `instance.send` 用于恢复丢失响应：返回存储的原始结局，仍排队的行恰好转发一次。`instance.configure` 的 spec merge 只在首次 POST 发生一次：重放命中终态行时原样返回存储记录（包括首次 merge 失败时持久化的原始 500/body，绝不把它重放成 200）；原始结局尚未持久化（转发在飞，`queued`+`forwarded=1`）时 Hub 返回 409 指明 “still in flight”，客户端应轮询 `GET /v1/instances/{id}/commands/{commandId}`；离线排队（`queued`+`forwarded=0`）的 configure 重放同样被 409 拒绝，客户端必须换用新 commandId 发新命令，重放不代为转发。并发同 id 首次 POST 在 Hub 串行 writer 上分出唯一创建行，merge 严格一次。GET 单行命令在转发尝试进行中返回该尝试的终态行（尝试未开始时如实返回 pending），任何读都不先报 `forwardIntent` 再报其回滚。（2026-10-05 补，D-057）commandId 身份（同一 id 必须对应同一载荷）、同 id 重放时转发仍排队的行、Node 按 commandId+digest 去重，这三点适用于除 `instance.configure` 以外的每一种操作，不只 `instance.send`；被隔离（fenced）发起者的行结算为 `rejected(fenced)`。
+
+> **2026-10-05 注（D-057）：发起者隔离（fencing）的两条边界与结果类别。** 续接血缘换代或暂停时，Hub 在单一 SQLite writer 中执行带 generation CAS 的隔离事务 F。**F 是 Hub 受理边界**：F 提交后，旧 generation 发起的变更在 writer 中受理时一律被拒（`queue_command`、`mark_forward_intent`、gate 入队与认领、直连操作受理），包括 F 之前已通过认证的请求。写出帧之前还有一道**发送闸**：内存 fence 表显示发起者已被隔离时不写出，并结算为 withheld；发送闸只缩小窗口，不构成任何保证。**Node 执行边界是最终一致的**：fence 在某台 Node 收到并持久化它（`lineage.fence`，§7.2）时才在该 Node 生效；此前，F 前已受理的操作仍可能在该 Node 上执行（断网 Node 的本地队列、fence 在途的窗口、F 前已通过发送闸的帧）。生效时 Node 取消尚未交付的旧 generation 操作、拒绝之后到达的操作，并在确认中报告结果。F 时尚未完成的每个旧 generation 操作都得到如实的结果类别：在 Hub 取消（cancelled at the Hub）、被发送闸拦下（withheld）、被 Node 取消（cancelled by the Node）、被 Node 拒绝（refused by the Node）、已执行（ran）；目标 host 确认之前记为未知（unknown）。机制、竞争与测试矩阵见 [main-agent.md §7](./main-agent.md#7-fencing)。
 
 派发顺序固定为：Hub durable inbox → Node durable command receipt → Node 写 `intent-durable` 并 fsync → 唯一 driver owner 发一次原生操作 → 记录 transport-written → 原生证据推进 accepted → 业务证据推进 settled。进程恰好在发出与落账之间崩溃时，intent 已存在即视为“可能发送”；恢复先查原生历史/请求状态，没有原生幂等保证则保持 unknown，**绝不因为找不到 ACK 而重发**。无法证明没执行时也不能标 rejected；超时查询返回 unknown 的现状。
 
@@ -346,23 +349,28 @@ Hub 从已认证设备记录的 `kind`（`human` / `bot` / `agent`）和绑定�
 
 Hub 在 create 与 command 的载荷外层覆盖 `origin: "human" | "bot" | "agent"`，同时覆盖输入来源。经 WSS / SSH stdio 解码后，Node 在 create 的 driver options、每次 `PromptInput` 和 Command 中保留来源，materializer 使用独立的 `LaunchOrigin::{Human,Bot,Agent}`。缺失或未知来源、未声明来源的 driver options 默认 Agent；`CommandOrigin::Mcp` / `System` 不能隐式转换为 Human。现有 Command 的 `origin` wire enum 不扩展：Human 对应 `ui`，Bot 对应 `bot`，Agent 对应 `mcp`，`actor.actorType` 同时区分三类。
 
+2026-10-05（D-057）：输入来源新增 `hub`，表示 Hub 生成的输入（第一阶段只有续接章节的重启通知）。它从不代表 Human 或 Agent 的权限。Node 把它与命令来源 `system` 双向映射：`parse_origin("hub")` 得 Hub，`command_origin(Hub)` 得 `System`，`input_origin(System)` 得 Hub（此前为 Agent），绝不映射为 Human 或 Agent。未升级的 Node 会按 fail-closed 把它存成 Agent，所以 Hub 只向在 hello 中声明 fence 能力的 Node 发送 `hub` 来源输入（§7.2）。
+
 每次 Hub 转发 create 时，为新实例签发仅绑定该实例的设备 token，经已认证 carrier 单独交给 Node。Node 把 `REMUDA_INSTANCE_ID`、`REMUDA_HOST_ID` 和该 `REMUDA_TOKEN` 注入实例子进程；WSS 使用其已配置的 Hub 地址作为 `REMUDA_HUB`，SSH stdio 部署须提供该地址。token 不进入持久化 command、HTTP create 返回体、request digest 或 launch recipe。实例内 CLI 不回退到 bootstrap 环境变量或仓库 token 文件。Human 可用 `POST /v1/instances/{id}/mcp-token` 为该实例配置外置 MCP，返回的仍是 Agent token。人类设备直接运行、没有实例绑定的 coordinator `claude -p --mcp-config …` 保持 Human。
 
 | 动作 | Agent 来源 | Human / Bot 来源 |
 | --- | --- | --- |
-| send / stop / rm 自己或直接创建的子实例 | 可执行；不扩展到兄弟、祖先或孙实例 | 可执行 |
+| send / stop / rm 自己血缘的章节，或该血缘任一章节创建的子实例（2026-10-05 起按血缘，D-057；此前为「自己或直接创建的子实例」） | 可执行；不扩展到兄弟、祖先或孙实例 | 可执行 |
 | 同 host create | 可执行，Hub 在 create 时持久记录 `parentInstanceId`；省略 MCP host 时使用 caller host | 按 placement 执行 |
 | 跨实例 send / stop / rm、跨 host create | 人类批准精确动作后执行一次 | 可执行 |
+| Agent dispatch（`POST /v1/workers/dispatch`，D-057） | 需要 `dispatch` grant 与 project scope；worker 权限档位按 [main-agent.md §4.2](./main-agent.md#42-the-changes-phase-1-needs-and-why)（子不超父）；跨 host dispatch 与 shell 驱动 carrier 需要一次性人审，并在分配名字、端口块与 worktree 之前按请求摘要判定。注意：Node 报告原生 `shell-pty` 可启动时，不指定 carrier 的 Claude dispatch 默认选 `shell-pty`，它属于 shell 驱动。免审的同 host 路径只有两条：显式 herdr carrier（Claude），或 codex/grok harness；且该 host 的记录已登记 herdr | 既有行为不变（Human 来源默认值逐字节不变） |
+| Agent 变更 worker（nudge、answer、switch-model、resume、replace、stop、retire、state、brief，D-057） | 要求该 worker 的实例在调用者血缘之下；读（list、get、observe）仍按 scope 放行。resume / replace 经 Hub 内部、按 dispatch grant + scope + 血缘归属授权的重生帮助函数，新实例的 parent 仍是创建它的章节；公开的 `POST /v1/instances/{id}/resume` 仍只限操作员 | 既有行为不变 |
+| Agent `worker answer` 的 keys（D-057） | 一次性人审，与 `tty.write` 相同 | 可执行 |
 | `remuda_instance_keys` / `tty.write` | 即使目标为自己或子实例也必须审批；新 `shell-pty`（含 `shell` / `terminal` alias）create 和 send 也经此门控；无原始 follow/tty 写通道 | 可执行 |
 | `remuda_fleet_send {all:true}` / `remuda_fleet_keys {all:true}` / `fleet send --all` / `fleet keys --all` | 明确拒绝，`confirm` 或审批都不能豁免 | 必须显式 `confirm:true` / `--confirm` |
-| filters 选择的 fleet send / keys | Hub 先检查整个目标集合；send 只含自己/直接子实例时可执行，跨实例或 keys 必须审批后才排队 | 可执行 |
+| filters 选择的 fleet send / keys | Hub 先检查整个目标集合；send 只含自己血缘的章节或其子实例时可执行（D-057 血缘规则），跨实例或 keys 必须审批后才排队 | 可执行 |
 | 本地 MCP merge / worktree create | 无实例范围的执行目标，拒绝；使用已有 workspace 创建子实例 | coordinator 可执行 |
 
 `POST /v1/fleet/broadcast` 与 MCP/CLI 共用全量发送约束；`all:true` 必须另带 `confirm:true`，Agent 不接受此豁免。
 
 MCP `call_tool` 在副作用前决定范围，并把需审批动作送到 Hub broker gate；Hub 重新依据认证与真实目标检查后才排队或转发。需要审批时 HTTP 返回 `409 HUMAN_APPROVAL_REQUIRED` 和 `interactionId`，MCP 将其作为明确的工具错误返回。票据显示在 `GET /v1/interactions`，只能由 Human 设备通过既有 `/v1/interactions/{id}/answer` 提交 `allow-once` / `deny` 及匹配的 `inputDigest`。随后用 MCP `approvalId`（HTTP `x-remuda-approval-id`）重试完全相同的动作。grant 绑定 caller device、caller instance/host、操作、目标 host/instance 和完整有效载荷；更改文本/目标、其他设备使用、重复消费、拒绝、过期均不能执行。复用 `InteractionBroker` 的 first-answer-wins，TTL 为 15 分钟；Hub 重启丢弃未消费 grant，必须重新申请审批。超时或 ACK 丢失不自动重放已批准的动作。
 
-Agent create 的 generic-pty 在 materialize 前把 bypass/dontAsk 降为 asking mode，因而得到非 yolo argv。preset bypass flags 仅在 `permissionMode=bypassPermissions` 且 Human/Bot 时合并；默认模式绝不追加。D-011 的 Bot materializer 拒绝 bypass/dontAsk 规则继续存在，因此此条件不授予 Bot 额外豁免。Agent 的结构化 Claude create 显式请求 bypass/dontAsk 会被拒绝，省略权限模式则采用 manual。
+Agent create 的 generic-pty 在 materialize 前把 bypass/dontAsk 降为 asking mode，因而得到非 yolo argv。preset bypass flags 仅在 `permissionMode=bypassPermissions` 且 Human/Bot 时合并；默认模式绝不追加。D-011 的 Bot materializer 拒绝 bypass/dontAsk 规则继续存在，因此此条件不授予 Bot 额外豁免。2026-10-05（D-057，子不超父）：Agent 创建的子实例，只有当它的 Agent 创建者自身运行在关闭 harness 控制的档位时，才可以使用关闭控制的档位（Claude `bypassPermissions`/`dontAsk`、Codex `never`、Grok `always-approve`、Agy `always-proceed`）；否则可以使用任何保留 harness 控制的档位。省略权限模式时，子实例继承创建者自己的档位，框架不另选档位。Hub 的 `restrict_permission` 与 Node 物化器（包括上文 generic-pty 的 Agent 降级与 preset bypass flags）一起改为这条规则，Node 依据 Hub 盖章的 `creatorPermissionMode`（§7.2）判定；Bot 来源不变。这是第一阶段唯一改动既有 Agent 来源权限规则的地方，取代此前「Agent 的结构化 Claude create 显式请求 bypass/dontAsk 会被拒绝，省略权限模式则采用 manual」的规则（实现随 `ma-admission` 落地）。
 
 此范围约束覆盖 Hub 与 MCP 控制面。Node stdio 的认证依赖其 SSH carrier，本地开发 Node HTTP 的 access code 仍是操作员凭据；同 UID 文件、原生 CLI 与 herdr 的进程隔离和凭据清理是独立边界（security-review-2 tasks 9/12/13），不能把 parent-child 范围检查描述为 OS sandbox。
 
@@ -1480,6 +1488,28 @@ Host、provider registry 和 Hub inbox 由 Hub 写；Workspace 与已接管的 I
 
 object 上传授权绑定 actor、host/workspace 和用途；uploadId 使用 obj_。暂存对象默认不可读/不可执行，过期后按配置 GC。超额返回 RESOURCE_LIMIT，offset/digest 冲突返回 OBJECT_REVISION_MISMATCH，未 commit 引用返回 OBJECT_NOT_FOUND。settings/answer 内容不以普通聊天附件权限暴露；object.commit 只证明字节已完整保存，不代表应用配置或提交 Interaction。
 
+**2026-10-05 补（D-057）：主 agent 第一阶段的加性 Hub↔Node 面。** 下表不属于上面 46 个目标方法（与 `MethodName` 一一对应的集合不变），而是与 [`hubnode.rs`](../../crates/remuda-protocol/src/hubnode.rs) 运维子集同一族的加性方法与字段，全部是 minor 加性变更；老 Node 由下面的能力门控挡住。机制见 [main-agent.md §7](./main-agent.md#7-fencing)。
+
+| 方法 / 字段 | 方向 | payload / result |
+| --- | --- | --- |
+| `lineage.fence` | Hub→Node | `{fenceId,lineageId,liveGeneration:U64}` → `{fenceId,closedInstanceIds:Id[],outcomes:[{opId,outcome:cancelled\|ran\|refused}]}`。Node 按 fenceId 幂等持久化；关闭该血缘 generation 低于 liveGeneration 的本地实例；取消这些旧发起者尚未交付的工作（含 PTY 提示队列）；此后在 `insert_command`、PTY 投递与下面直连方法的入口拒绝它们；daemon 重启后先应用已持久化的 fence，再恢复任何排队投递。结果里没有记录的操作即「未执行」 |
+| hello `capabilities.lineageFence` | Node→Hub | `true` 表示支持 `lineage.fence` 及本表其余字段；缺失即不支持。Hub 不向不支持的 Node 发送续接血缘发起的命令或直连操作（409，reason `node-lacks-fence`，§9），也不发送 `hub` 来源输入；发往它的其余流量不变 |
+| create / resume 的 `lineage` | Hub→Node | `instance.create` 与 `instance.resume` 的 params 增加 `lineage:{id:Id,generation:U64}`，让 Node 知道实例所属的血缘与代数 |
+| Agent 来源 create 的 `creatorPermissionMode` | Hub→Node | Hub 依据创建者章节上记录的生效档位盖章，绝不取自请求体；Node 物化器据此执行 §Origin 的「子不超父」 |
+| 转发命令的 `initiator` | Hub→Node | §2.5 的 `initiator`（不含设备 id）；Node 持久化到它的 Command 记录并写入 journal |
+| `initiator` 与 `opId` | Hub→Node | 加在 `interaction.answer`、`worker.provision`、`worker.remove`、`worktree.lease`、`worktree.return`、`gate.run` 的 params 上。`opId` 是 Hub 在任何外部效果之前已持久化的受理记录 id：`interaction.answer` 用该答案的 commandId，`gate.run` 用 gate job id，其余方法用 Hub 的直连操作行 id。Node 在分发入口（`dispatch_frame`）、任何副作用之前按已持久化的 fence 拒绝被隔离的发起者（reason `fenced`），并记录 opId、方法、发起者与结果，供 fence 确认报告 |
+| `gate.then` / `gate.land` / `gate.unpin` / `gate.cancel` | Hub→Node | 带 job id，是一个已开跑 job 的延续：Node 把它们作为 fence 之前已到达执行者的操作的后续步骤接纳，已开跑的 job（含 land 步骤）执行完毕 |
+
+示例（只为说明形状；本节新增的帧与字段一律放在 text 围栏里，不进 JSON 金样）：
+
+~~~text
+→ {"jsonrpc":"2.0","id":"h-17","method":"lineage.fence","params":{"fenceId":"…","lineageId":"ins_…","liveGeneration":"3"}}
+← {"jsonrpc":"2.0","id":"h-17","result":{"fenceId":"…","closedInstanceIds":["ins_…"],"outcomes":[{"opId":"cmd_…","outcome":"cancelled"},{"opId":"cmd_…","outcome":"ran"}]}}
+hello params: "capabilities": {"driverInventory": […], "lineageFence": true}
+instance.create params: "lineage": {"id": "ins_…", "generation": "3"}, "creatorPermissionMode": "acceptEdits"
+worker.provision params: "initiator": {"instanceId": "ins_…", "lineageId": "ins_…", "generation": "3"}, "opId": "…"
+~~~
+
 ### 7.3 Snapshot + seq follow 与重连补页
 
 订阅输入：`{journalId,afterSeq:U64|null,snapshot:"required"|"if-needed"|"none",projectionVersion:string,batchLimit:number}`。result：`{subscriptionId,journalId,floorSeq,durableSeq,snapshot:Snapshot|null,replayFromSeq,nextCursor,connectionId}`。`Snapshot` 包含 `{projectionVersion,projectionEpoch:Id,asOfSeq,instance,runs,commands,pendingInteractions,nodes,history:{earliestRetainedSeq,complete:boolean}}`；registry snapshot 使用其对应实体集合，不能给它虚构 Instance。
@@ -1943,6 +1973,12 @@ JSON-RPC response.error 使用 `{code:rpcCode,message,data:{code,retry,execution
 | `WAIT_TIMEOUT` | -32046 | read-only；超时本身不取消、不重试任务；run.wait 通常用 reason=timeout 正常返回 |
 
 普通 JSON-RPC parse/invalid request/method not found/invalid params/internal error 分别使用 -32700/-32600/-32601/-32602/-32603。内部错误只说明本次 RPC 失败，execution 必须如实填 possibly-dispatched 等，不能默认 not-dispatched。`retry` 描述的是下一步客户端动作，不是许可 native retry；same-command-query 表示先读取/重取同一命令结果。
+
+**2026-10-05 补（D-057）：拒绝原因 `fenced` 与 `node-lacks-fence`。** 两者都是既有错误形状上的稳定小写原因，不新增错误码，上表不变。
+- `fenced`：发起者的章节已被隔离、它的 generation 不是血缘的现行代、血缘已暂停，或认证设备行已被删除。Hub 在受理变更的 writer 作业里复核，拒绝时沿用既有 409 形状并带 `reason: "fenced"`，且不写入任何东西；被隔离发起者的 Hub 命令行结算为 `rejected(fenced)`。Node 在 `insert_command`、PTY 投递与直连方法分发入口拒绝被隔离的发起者时，沿用 §9.1 已有的 `OWNER_FENCED`（execution `not-dispatched`），Hub 把它结算为 reason `fenced`。
+- `node-lacks-fence`：目标 Node 未在 hello 中声明 `capabilities.lineageFence`，而命令或直连操作由续接血缘发起。Hub 沿用既有 409 形状并带 `reason: "node-lacks-fence"`，不写出帧。
+
+见 [main-agent.md §7.3 与 §7.6](./main-agent.md#73-commit-time-authority-check)。
 
 ### 9.2 Unknown 与 reconciliation 的实现要求
 

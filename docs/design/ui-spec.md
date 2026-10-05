@@ -246,6 +246,8 @@ Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mob
 
 compact（手机）不渲染这个页面：`<Navigate replace>` 到 `/m`（D-049），手机首页见 §4.7。
 
+**Main 置顶行（D-057，2026-10-05；机制见 [main-agent.md §9](./main-agent.md#9-chat-surface)）**：桌面会话列表顶部固定一行「Main」，解析为当前持有 `address-owner` 的那条血缘的现行章节；血缘暂停时解析为最近一条 address-owner 血缘的最新章节，并标注例如「已由你暂停 · T」。没有 address-owner 血缘时不渲染。点开进入该章节的 `/s/:instanceId`，一条会话跨章节显示（§2.2 的「Main 会话」）。行内容口径同下面的行规则（状态点 + 标题 + 一句下一步）。
+
 **行内容 = 状态点 + 标题 + 一句下一步（D-038，2026-09-19 增补）**
 
 上面线框里每行的第二句（「等你批准 Bash」「AskUserQuestion · 3 题」「Workflow wf_ab12 · phase compile」）是**派生出来的一句话**，不是 wire 字段的转写。据此把行内容钉死：
@@ -523,6 +525,16 @@ compact（§1.3 查询；56px 是 compact 布局行高，与指针无关）下 c
 **状态清单**
 
 `loading-snapshot` → `live` → `reconnecting` → `gap-backfill` → `readonly-stale`（`connectivity ≠ connected`）。`blocked`（`activity=waiting-interaction`）时 composer 换成 interaction 表面。`exited` 时 Composer 不挂载、挂 EndedBar（见上；若 `capabilities.resume`）显示续接，否则显示「开新会话继承 cwd」。`--bg` 空闲保持 `idle`，不要显示「已完成」。
+
+**Main 会话（D-057，2026-10-05；机制见 [main-agent.md §9](./main-agent.md#9-chat-surface)）**
+
+Main 的会话页仍是共享的 `/s/:instanceId`，不分叉；以下只对带 `lineageId` 的续接血缘出现。
+
+- **章节分隔**：一条会话跨章节按序渲染，章节之间是分隔条。分隔条显示原因、时间、前任被 superseded 的提问（链到 `/approvals`）与 fence 结果摘要：已取消、已执行、仍未知（点名 host）。较早章节默认折叠、按需加载；数据来自新读路由 `GET /v1/lineages/{id}`（章节、状态与 fence 记录）。仍未知的结果如实显示为未知，等 host 确认后再更新，不画成成功或取消。
+- **状态行**：章节号、lifecycle 与 activity、最近 24 h 的重启次数与原因、最近活动，以及血缘状态：「已由你暂停 · T」「重启上限」「host 离线，自 T 起」「正在重启」。
+- **控制**（只在 Human 设备上出现）：Stop 打断当前回合（既有 `instance.cancel`，不改血缘状态）；Pause 关闭当前章节，血缘进入暂停；Resume 做续接 resume，**只在血缘暂停时显示**。Agent 凭据看不到这些控制。
+- **Hub 来源输入**：重启通知（origin `hub`）原样渲染为独立的系统行，绝不渲染成所有者的气泡，也不渲染成 agent 的消息。
+- **被取代的章节**：发给已被取代章节的 held 所有者消息结算为 rejected，行上给出显式的「发给当前 Main」，它使用新的 commandId（D-055：绝不以新 id 自动重发）。`/approvals` 里 superseded 的项链接到当前章节。
 
 ### 2.3 会话页 · 终端视图 `/s/:instanceId/tty`
 
@@ -992,7 +1004,14 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 
 **权限申请位置（D-049）**：绝不在 App 启动时弹——用户还没有待办时消耗唯一一次授权机会没有意义。只允许两处由用户手势触发：(a) compact 收件箱 `/m/inbox` 顶部横幅（报告 §11.3 实测 Moshi 同位置），点「开启」才调 `Notification.requestPermission()` 与 `subscribePush()`（`push.ts:108-114`），横幅可关闭；(b) 设置 → 通知（既有，`SettingsPage.tsx:724` 的通知组）。横幅文案随能力变：未加主屏幕的 iOS 改为「先加到主屏幕」并复用 `needsHomeScreenForNotifications()`（`push.ts:19`），点「开启推送」静默无效的情况不允许发生。
 
-**PWA 关闭态**：SW 仍被系统唤醒并 `showNotification`（`sw.src.js:97`），点按走 `notificationclick` 聚焦既有窗口或 `openWindow`（`sw.src.js:106-120`），落点仍是 `data.url`（`/s/:id` 或 compact 下重定向到的 `/m/inbox?focus=`，§1.2）。已知边界保持不变：Hub 在有设备正 follow 该实例时抑制推送（`crates/remuda-hub/src/alerts.rs:159-160`）——「PWA 关着」正是推送真正生效的场景，这条抑制规则不改。
+**PWA 关闭态**：SW 仍被系统唤醒并 `showNotification`（`sw.src.js:97`），点按走 `notificationclick` 聚焦既有窗口或 `openWindow`（`sw.src.js:106-120`），落点仍是 `data.url`（`/s/:id` 或 compact 下重定向到的 `/m/inbox?focus=`，§1.2）。「PWA 关着」正是推送真正生效的场景。
+
+**抑制与新增推送（D-057，2026-10-05，取代原「Hub 在有设备正 follow 该实例时抑制推送，这条抑制规则不改」；机制见 [main-agent.md §8](./main-agent.md#8-push)）**：
+- **按设备静音**：follow 只静音正在 follow 且页面可见的那台设备，其余设备照常推送。PWA 用新增的加性 follow 可见性帧报告 document hidden / shown；从不发送该帧的客户端按可见处理，等于今天对这一台设备的行为。桌面标签页停在 Main 上不再静音手机。这是对所有会话的投递修正（今天 `crates/remuda-hub/src/alerts.rs` 只要有任一设备 follow 就静音全部设备）。
+- **转给 Agent 上级的交互**：一条关于实例 I 的告警只在三者同时成立时不推：I 有 Agent 上级血缘 P；该交互确实转给了 P（不是 approval，且 D-051 谓词对 P 的当前章节成立）；P 实际在运行（状态 running、当前章节未结束、章节所在 host 有活连接）。第一阶段其他种类的告警从不因此静音，approval 永远推送。
+- **重启窗口与补推**：P 不在「实际在运行」时（starting/正在重启、host 离线、暂停，或章节已结束而监督者尚未行动），它的子实例告警照常推送。P 从「实际在运行」变为否时，仍待回答的被静音交互各补推一次；触发点包括 F、监督者状态转移、host 断开、host 丢失判定与 Hub 启动对账。补推跨 Hub 重启仍会投递，推送 tag 用交互 id，所以重发会替换而不是叠加通知。P 恢复运行后，已补推的交互不再被静音。
+- **「Main 回复了」**：address-owner 当前章节的回合结束、且该回合收到过 Human 来源输入时，推送 “Main replied: <最终消息首行>”（截断），同样按设备静音；只由 Hub 或 Agent 输入触发的回合不推。
+- **C1 推送**：带 `restart` 的血缘不再推通用的 “Session exited”，改为 “Main restarted (cause)”“Main paused: restart cap”“Main closed itself”；所有者自己从 Human 设备暂停时不推。
 
 iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotifications()`）。设置页写明。HTTPS + `isSecureContext` 才能注册 SW。
 
@@ -1019,6 +1038,7 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 | `/m` 子树内容 | 说明 |
 |---|---|
 | `/m` 会话 home | 分组会话首页（项目 + git branch 组头、一句下一步、context 剩余环，行口径同 §2.1 / D-038）；D-050 起在项目/branch 分组上**叠加 task 分组层**（「需要你」首组、父子任务嵌套、`SE-nn` 派生 key、已归档折叠，§2.9） |
+| Main 置顶行（D-057，2026-10-05） | `/m` home 最上方固定一行「Main」，在所有分组之上；解析与标注口径同 §2.1 的 Main 置顶行，点开是共享的 `/s/:instanceId`（§2.2 的「Main 会话」），不进 `/m` |
 | 看板的 compact 形态 | 不复制桌面三列：单列滚动 + 待办/进行中/已完成/已归档分段过滤（`GET /v1/board` 同一投影，一次一段；D-050）；桌面 `/board` 在 compact 不重定向到一个新页面，分段过滤就是 `/m` 子树内的看板形态。**实现状态（D-052，批次计划 D8）**：`/m` home 的 task 分组层已上线（`HomeList.tsx` 的 `buildHomeTaskLayer`），但单列**分段过滤尚不存在**（`features/mobile/` 无「待办/进行中/已完成」分段）；compact 访问 `/board` 仍由既有重定向落 `/m`（`mobileRoute.ts`）。ui-upgrade 批次**不实现**分段过滤（目标形态以本行为准，实现排后续批次），不得在证据里声称它已由 /m home 承载 |
 | `/m/inbox` 收件箱 | 两档（待你处理 / 进行中·最近，无第三档），与桌面 `/approvals` 渲染同一 InboxShell、同一张 ApprovalCard 与同一 kind 分段（§2.5，D-052） |
 | Jump To sheet | 从 home 顶栏与终端键盘条打开的覆盖层，不独占路由；分组 + 时钟/列表，**不做第二套空间模型**（报告 §10-23 / §11.2） |

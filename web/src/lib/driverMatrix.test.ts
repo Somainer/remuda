@@ -108,4 +108,33 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
     expect(launchPreview({ kind: "agy" })).toContain("agy");
     expect(launchPreview({ kind: "terminal" })).toContain("$SHELL");
   });
+
+  it("previews the real D-056 ultracode argv for the Claude version", () => {
+    // ≥2.1.284 decoupled: --effort <level> plus the overlay's ultracode key,
+    // one overlay (never a second --settings that would drop the first).
+    const decoupled = launchPreview({
+      kind: "claude",
+      effortName: "max",
+      ultracode: true,
+      claudeVersion: "2.1.289",
+    });
+    expect(decoupled).toContain("--effort max");
+    expect(decoupled).toContain('{"ultracode": true}');
+    expect(decoupled).not.toContain("--effort ultracode");
+
+    // 2.1.203–2.1.283 coupled: the single spelling implies xhigh.
+    const coupled = launchPreview({
+      kind: "claude",
+      effortName: "xhigh",
+      ultracode: true,
+      claudeVersion: "2.1.277",
+    });
+    expect(coupled).toContain("--effort ultracode");
+    expect(coupled).not.toContain('{"ultracode": true}');
+
+    // Flag off is just the level, on any version.
+    expect(
+      launchPreview({ kind: "claude", effortName: "high", ultracode: false, claudeVersion: "2.1.289" }),
+    ).toBe(launchPreview({ kind: "claude", effortName: "high", claudeVersion: "2.1.289" }));
+  });
 });

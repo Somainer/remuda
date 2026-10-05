@@ -291,6 +291,23 @@ it("normalizes a remembered legacy tier name when the sheet opens", () => {
   expect(slider).toHaveAttribute("data-ultracode", "0");
 });
 
+it("loads a stored legacy 'ultracode' pref as xhigh + switch on (D-056)", () => {
+  localStorage.setItem(
+    "runtime.new-session",
+    JSON.stringify({ effortIndex: 5, effortName: "ultracode" }),
+  );
+  renderWithCli();
+  const slider = screen.getByTestId("new-session-effort-slider");
+  // The old sixth stop becomes the xhigh tier with the orthogonal flag on.
+  expect(slider).toHaveAttribute("data-name", "xhigh");
+  expect(slider).toHaveAttribute("data-index", "3");
+  expect(slider).toHaveAttribute("data-ultracode", "1");
+  expect(screen.getByTestId("new-session-effort-ultracode-switch")).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
+});
+
 it("writes the harness-native tier after a runtime switch", async () => {
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
   renderWithCli();

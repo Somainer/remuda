@@ -186,102 +186,97 @@ test.describe("composer control bar and effort", () => {
     }
   });
 
-  test("effort popover is a snapping six-stop slider and selecting a tier updates the request", async ({ page }) => {
+  test("effort popover is a snapping five-stop slider with an orthogonal ultracode switch", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
     await openEffort(page);
     const menu = page.getByTestId("effort-menu");
     await expect(menu).toBeVisible();
     const slider = page.getByTestId("effort-slider");
-    await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultracode");
-    await expect(slider).toHaveAttribute("aria-valuemax", "5");
+    await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
+    await expect(slider).toHaveAttribute("aria-valuemax", "4");
     await expect(slider).toHaveAttribute("data-name", /high/);
     await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
     await expect(page.getByTestId("effort-title")).toBeVisible();
     await expect(page.getByTestId("effort-model")).toBeVisible();
-    // Compact card: no tier list and no model list until the chevron is tapped.
+    // Compact card: no tier/model rows until the chevron is tapped.
     await expect(page.getByTestId("effort-tier-max")).toHaveCount(0);
     await expect(page.getByTestId("model-option-opus")).toHaveCount(0);
-    // There is no standalone ultracode chip anywhere in the card.
-    await expect(page.getByTestId("effort-ultracode")).toHaveCount(0);
-    // Six short tick labels under the six dots (the ~280px card can't fit full names).
+    // The orthogonal switch is a row BELOW the pill, never a sixth tick.
+    await expect(page.getByTestId("effort-ultracode")).toBeVisible();
+    await expect(slider).toHaveAttribute("data-tiers", /^(?!.*ultracode)/);
+    // Five short tick labels under five dots.
     const ticks = page.locator(
       "[data-testid='effort-slider-panel'] [class*='effortTickShort']",
     );
-    await expect(ticks).toHaveText(["low", "med", "high", "xhigh", "max", "ultra"]);
+    await expect(ticks).toHaveText(["low", "med", "high", "xhigh", "max"]);
     await assertPillGeometry(page);
     const card = await menu.boundingBox();
     expect(card).toBeTruthy();
     if (test.info().project.name === "chromium") {
-      // Desktop: compact ~300px anchored card.
       expect(card!.width).toBeLessThanOrEqual(301);
+      await shot(page, "composer-1-effort-menu.png");
     } else {
-      // D-042: in the phone options sheet the card is intentionally
-      // frameless and full-width (wider than the 300px desktop card).
       await expect(menu).toHaveAttribute("data-in-sheet", "1");
       expect(card!.width).toBeGreaterThan(301);
     }
     await assertFillReachesKnob(page);
-    if (test.info().project.name === "chromium") {
-      await shot(page, "composer-1-effort-menu.png");
-    }
-    // Dragging to the far-right stop selects ultracode (xhigh tier + flag).
+    // Dragging to the far-right stop selects MAX (a plain tier — no ember).
     await dragSlider(page, "end");
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1");
-    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
-    await assertRequestedEffortUnknown(page, "ultracode");
-    await expect(slider).toHaveAttribute("data-name", "ultracode");
-    await expect(slider).toHaveAttribute("data-index", "5");
-    await expect(slider).toHaveAttribute("data-tier-index", "3");
-    await expect(slider).toHaveAttribute("data-effort-look", "ultracode");
-    await expect(slider).toHaveAttribute("data-ember", "1");
-    // One stop left is max: restrained top accent, ember off.
-    await slider.focus();
-    await page.keyboard.press("ArrowLeft");
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
-    await assertRequestedEffortUnknown(page, "max");
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "0");
+    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0");
+    await expect(slider).toHaveAttribute("data-name", "max");
     await expect(slider).toHaveAttribute("data-index", "4");
     await expect(slider).toHaveAttribute("data-effort-look", "top");
     await expect(slider).toHaveAttribute("data-ember", "0");
+
+    // Flipping the switch turns ultracode on AT MAX without moving the slider.
+    await page.getByTestId("effort-ultracode-switch").click();
+    await expect(page.getByTestId("effort-ultracode-switch")).toHaveAttribute("aria-checked", "true");
+    await expect(slider).toHaveAttribute("data-name", "max");
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1");
+    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+    // Switching it off returns the ember to rest, slider still on max.
+    await page.getByTestId("effort-ultracode-switch").click();
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "0");
+    await expect(slider).toHaveAttribute("data-name", "max");
   });
 
-  test("the ultracode stop sits past max on the one slider, plays dense ember and reads ultracode", async ({ page }) => {
+  test("the five-stop slider is orthogonal to the ultracode switch", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
     await openEffort(page);
     const slider = page.getByTestId("effort-slider");
     await slider.focus();
-    // Walk the whole track: low → ultracode.
+    // Walk the whole tier track: low → max (five stops, no sixth).
     await page.keyboard.press("Home");
     for (const [index, name] of [
       ["1", "medium"],
       ["2", "high"],
       ["3", "xhigh"],
       ["4", "max"],
-      ["5", "ultracode"],
     ] as const) {
       await page.keyboard.press("ArrowRight");
       await expect(slider).toHaveAttribute("data-index", index);
       await expect(slider).toHaveAttribute("data-name", name);
     }
-    await expect(slider).toHaveAttribute("data-tier-index", "3");
-    await expect(slider).toHaveAttribute("data-ultracode", "1");
-    await expect(slider).toHaveAttribute("data-effort-look", "ultracode");
-    await expect(slider).toHaveAttribute("data-ember", "1");
-    await expect(slider).toHaveAttribute("aria-disabled", "false");
-    await expect(page.getByTestId("new-session-effort-embers")).toHaveCount(0);
-    await expect(page.getByTestId("effort-embers")).toBeVisible();
-    // The request and slider name the ultracode stop; native read-back stays unknown.
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1");
-    await assertRequestedEffortUnknown(page, "ultracode");
-    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
-    // Home leaves the stop entirely and lands back on low.
-    await page.keyboard.press("Home");
-    await expect(slider).toHaveAttribute("data-index", "0");
     await expect(slider).toHaveAttribute("data-ultracode", "0");
+    await expect(slider).toHaveAttribute("data-effort-look", "top");
+    // The ember field never appears on the pill; it belongs to the switch.
+    await expect(page.getByTestId("effort-embers")).toHaveCount(0);
+    // Switch on at the END of the track (max): the slider stays put.
+    await page.getByTestId("effort-ultracode-switch").click();
+    await expect(slider).toHaveAttribute("data-index", "4");
+    await expect(slider).toHaveAttribute("data-name", "max");
+    await expect(page.getByTestId("effort-ultracode-switch")).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+    // Home moves the tier to low while the flag stays on (orthogonal).
+    await slider.focus();
+    await page.keyboard.press("Home");
     await expect(slider).toHaveAttribute("data-name", "low");
+    await expect(page.getByTestId("effort-ultracode-switch")).toHaveAttribute("aria-checked", "true");
   });
 
   test("the tier name opens the tier and model list, then returns to the pill", async ({ page }) => {
@@ -292,15 +287,11 @@ test.describe("composer control bar and effort", () => {
     const panel = page.getByTestId("effort-slider-panel");
     await expect(panel).toHaveAttribute("data-view", "list");
     await expect(page.getByTestId("effort-slider")).toHaveCount(0);
-    // The three-level ladder in the list, too: max is the restrained top
-    // accent and only the ultracode row carries the strongest look.
+    // Five tiers in the list; max is the restrained top accent and there is
+    // no ultracode tier row (it is the switch on the pill view).
     await expect(page.getByTestId("effort-tier-max")).toHaveAttribute("data-effort-look", "top");
-    await expect(page.getByTestId("effort-tier-ultracode")).toHaveAttribute(
-      "data-effort-look",
-      "ultracode",
-    );
-    await expect(page.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ultracode", "1");
-    await expect(page.getByTestId("effort-list")).toContainText(/默认档|最省|日常|跨文件|最高档|工作流/);
+    await expect(page.getByTestId("effort-tier-ultracode")).toHaveCount(0);
+    await expect(page.getByTestId("effort-list")).toContainText(/最省|均衡|综合|跨文件|最高档/);
     await expect(page.getByTestId("effort-menu")).toContainText("切换只影响后续回合，不重写已发出的 prompt");
     await page.getByTestId("effort-list-back").click();
     await expect(panel).toHaveAttribute("data-view", "slider");
@@ -436,16 +427,16 @@ test.describe("composer control bar and effort", () => {
       const panel = await page.getByTestId("new-session-effort-slider-panel").boundingBox();
       expect(panel).toBeTruthy();
       expect(panel!.width).toBeLessThanOrEqual(width);
-      // Ultracode is the sixth slider tick, never a chip on the label row.
-      await expect(page.getByTestId("new-session-effort-ultracode")).toHaveCount(0);
-      // Six stops; full names on the wide sheet, shorts under the mobile breakpoint.
+      // The orthogonal ultracode switch is a row under the pill (not a tick).
+      await expect(page.getByTestId("new-session-effort-ultracode")).toBeVisible();
+      // Five tier stops; full names on the wide sheet, shorts on mobile.
       const tickKind = width === 390 ? "effortTickShort" : "effortTickFull";
       await expect(
         page.locator(`[data-testid='new-session-effort-slider-panel'] [class*='${tickKind}']`),
       ).toHaveText(
         width === 390
-          ? ["low", "med", "high", "xhigh", "max", "ultra"]
-          : ["low", "medium", "high", "xhigh", "max", "ultracode"],
+          ? ["low", "med", "high", "xhigh", "max"]
+          : ["low", "medium", "high", "xhigh", "max"],
       );
       if (test.info().project.name === "chromium") {
         await shot(page, `composer-1-new-session-${width}.png`);

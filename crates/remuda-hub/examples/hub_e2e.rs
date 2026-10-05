@@ -1909,6 +1909,13 @@ async fn fake_node(
                     if let Some(effort) = params.get("effort")
                         && let Some(requested) = effort.get("name").and_then(Value::as_str)
                     {
+                        // D-056: the wire is a native level word plus an
+                        // orthogonal ultracode boolean. Test-only sentinels
+                        // (the UI sends real words, never these):
+                        //   "__queued__:<word>"              → queued lifecycle
+                        //   "__degrade__:<word>:<reason>"    → degraded lifecycle
+                        //   "__ultra_refuse_model__"         → switch refused (model)
+                        //   "__ultra_refuse_workflows__"     → switch refused (workflows)
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
@@ -1917,44 +1924,59 @@ async fn fake_node(
                                 &format!("effort-queued:{word}"),
                             )
                             .await?;
-                        } else if let Some(word) = requested.strip_prefix("__degrade__:") {
+                        } else if let Some(rest) = requested.strip_prefix("__degrade__:") {
                             append_n = append_configure_status(
                                 &mut ws,
                                 &instance_id,
                                 append_n,
-                                &format!("effort-degraded:{word}:dialog-kept"),
+                                &format!("effort-degraded:{rest}"),
+                            )
+                            .await?;
+                        } else if requested == "__ultra_refuse_model__"
+                            || requested == "__ultra_refuse_workflows__"
+                        {
+                            let reason = if requested == "__ultra_refuse_model__" {
+                                "ultracode:ultracode-unavailable-for-model"
+                            } else {
+                                "ultracode:ultracode-workflows-disabled"
+                            };
+                            append_n = append_configure_status(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                &format!("effort-degraded:{reason}"),
                             )
                             .await?;
                         } else {
-                            // Keep the Claude mismatch fixture; Codex must echo
-                            // both max and ultra unchanged through the Hub.
-                            let clamped = requested == "max"
-                                && instance_kinds.get(&instance_id).map(String::as_str)
-                                    == Some("claude");
-                            let ultra = requested == "ultracode";
-                            // ultracode reads back as tier xhigh on Claude; a
-                            // clamped max reads back xhigh too.
-                            let tier = if clamped || ultra { "xhigh" } else { requested };
+                            let want_ultra =
+                                effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)
+                                    || requested == "ultracode";
+                            // D-056 normal behavior echoes the level unchanged.
+                            // "__clamp__" opts into the old model-cap clamp
+                            // fixture (reported tier xhigh); the legacy
+                            // "ultracode" name also parks on xhigh.
+                            let clamp_word = requested == "__clamp__" || requested == "ultracode";
+                            let tier = if clamp_word { "xhigh" } else { requested };
                             let observed_at = monotonic_effort_observed_at();
+                            // The flag is its OWN axis. On is positively
+                            // confirmed at the requested level; a plain level
+                            // request reports positive off; the opt-in clamp
+                            // leaves the flag unconfirmed (null).
+                            let flag: serde_json::Value = if want_ultra {
+                                serde_json::Value::Bool(true)
+                            } else if requested == "__clamp__" {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::Bool(false)
+                            };
                             let event = json!({
                                 "kind": "effort",
                                 "completeness": "structured",
                                 "payload": {
-                                    "requested": {"name": requested,
-                                        "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
+                                    "requested": {"name": requested, "ultracode": want_ultra},
                                     "effective": {
-                                        // Measured 2.1.272: ultracode carries the
-                                        // workflow flag; a plain level accept
-                                        // positively clears it; an unrelated clamp
-                                        // leaves the flag unknown.
                                         "name": tier,
-                                        "ultracode": if ultra {
-                                            serde_json::Value::Bool(true)
-                                        } else if clamped {
-                                            serde_json::Value::Null
-                                        } else {
-                                            serde_json::Value::Bool(false)
-                                        },
+                                        "ultracode": flag,
                                         "source": "remuda",
                                         "observedAt": observed_at
                                     },

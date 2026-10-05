@@ -127,6 +127,9 @@ export function agentPtyCapabilities(
   driverKind: DriverKind = "shell-pty",
 ): CapabilitySnapshot {
   const snapshot = ptyCapabilities(driverKind);
+  // D-056: live agent PTYs run the current decoupled build by default; a Node
+  // that reports its own snapshot (with the real binaryVersion) overrides this.
+  if (kind === "claude") snapshot.binaryVersion = "2.1.289";
   const row = AGENT_PTY_MATRIX[kind];
   if (!row) return snapshot;
   for (const name of ["steer", "queue", "interrupt"] as const) {

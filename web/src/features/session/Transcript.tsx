@@ -402,6 +402,19 @@ function TranscriptInner({
     [nodes, rowHeights],
   );
   const scrollerRef = useRef<HTMLDivElement>(null);
+  /**
+   * Target of the most recent COMPONENT-INITIATED scrollTop write. The scroll
+   * handler compares its fired event against it: a scroll to the target is the
+   * echo of our own restore/pin/anchor math and must never cancel an in-flight
+   * load-earlier restore; any other scroll (wheel, touch, keyboard) is the
+   * reader. Consumed once by the matching event.
+   */
+  const programmaticTopRef = useRef<number | null>(null);
+  const programmaticScroll = useCallback((el: HTMLElement, top: number) => {
+    programmaticTopRef.current = top;
+    el.scrollTop = top;
+    scrollTopRef.current = top;
+  }, []);
   // Latest scroll offset in a ref: passive-effect cleanup runs after refs are
   // detached on unmount, so the leave-session flush cannot read the DOM.
   const viewportRef = useRef(720);
@@ -619,10 +632,9 @@ function TranscriptInner({
     }
     const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) < 1) return;
-    el.scrollTop += delta;
-    scrollTopRef.current = el.scrollTop;
+    programmaticScroll(el, el.scrollTop + delta);
     held.top = el.scrollTop;
-  }, [sampleReadingAnchor]);
+  }, [sampleReadingAnchor, programmaticScroll]);
 
   // Stable per-row size reporter keyed by node id. The identity MUST stay
   // constant across parent re-renders (scroll fires setScrollTop on every
@@ -709,8 +721,7 @@ function TranscriptInner({
     }
     const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) > 1) {
-      el.scrollTop += delta;
-      scrollTopRef.current = el.scrollTop;
+      programmaticScroll(el, el.scrollTop + delta);
       held.tries = 0;
       return;
     }
@@ -739,8 +750,7 @@ function TranscriptInner({
       viewportRef.current = viewport;
       setViewport(viewport);
       if (wasPinned) {
-        el.scrollTop = el.scrollHeight;
-        scrollTopRef.current = el.scrollTop;
+        programmaticScroll(el, el.scrollHeight);
       }
     };
     measure();
@@ -767,9 +777,8 @@ function TranscriptInner({
     const base = offsets[index] ?? 0;
     const max = Math.max(0, total - el.clientHeight);
     const top = Math.min(max, Math.max(0, base + offset));
-    el.scrollTop = top;
-    scrollTopRef.current = top;
-  }, []);
+    programmaticScroll(el, top);
+  }, [programmaticScroll]);
 
   // Refine an estimated scroll (search hit, saved position) as the window
   // measures the rows around it. pendingScroll is declared with the other
@@ -824,8 +833,7 @@ function TranscriptInner({
           restoringRef.current = false;
           return;
         }
-        el.scrollTop += delta;
-        scrollTopRef.current = el.scrollTop;
+        programmaticScroll(el, el.scrollTop + delta);
       } else {
         // The anchor is not mounted yet: jump toward its estimated offset so
         // the window mounts it, then later passes correct against the real
@@ -836,8 +844,7 @@ function TranscriptInner({
         if (index >= 0) {
           const { offsets } = rowOffsets(nodes.length, sizes, estimate);
           const top = Math.round((offsets[index] ?? 0) + pending.offset);
-          el.scrollTop = top;
-          scrollTopRef.current = top;
+          programmaticScroll(el, top);
         }
       }
       pending.tries += 1;
@@ -866,9 +873,8 @@ function TranscriptInner({
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el || !pinRef.current) return;
-    el.scrollTop = el.scrollHeight;
-    scrollTopRef.current = el.scrollTop;
-  }, [nodes.length, sizes]);
+    programmaticScroll(el, el.scrollHeight);
+  }, [nodes.length, sizes, programmaticScroll]);
 
   const flushPosition = useCallback((top: number) => {
     if (!instanceId) return;
@@ -1172,12 +1178,16 @@ function TranscriptInner({
           pinRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
           // A reader who navigates manually WHILE an older page is in flight
           // owns the position: cancel that click's held anchors so the prepend
-          // cannot restore them back to the click-time row. Programmatic
-          // scrollTop writes from the anchor effects are synchronous and never
-          // interleave with an unfinished fetch (the request is marked done in
-          // the click's finally), so a cancel here is always a real gesture.
-          const req = loadReqRef.current;
-          if (req && !req.done && !req.cancelled) {
+          // cannot restore them back to the click-time row. The restore's OWN
+          // programmatic scrollTop writes land at the recorded target, so a
+          // scroll matching it is the echo of our math, not a gesture, and must
+          // not cancel the restore that just scrolled there.
+          const programmatic = programmaticTopRef.current;
+          const isOwnScroll = programmatic !== null && Math.abs(el.scrollTop - programmatic) <= 1;
+          programmaticTopRef.current = null;
+          if (!isOwnScroll) {
+            const req = loadReqRef.current;
+            if (req && !req.done && !req.cancelled) {
             req.cancelled = true;
             const pending = pendingScroll.current;
             if (pending?.kind === "restore" && pending.reqId === req.reqId) {
@@ -1185,6 +1195,7 @@ function TranscriptInner({
               restoringRef.current = false;
             }
             if (prependAnchorRef.current?.reqId === req.reqId) prependAnchorRef.current = null;
+            }
           }
           sampleReadingAnchor();
           persistSoon();
@@ -1251,7 +1262,7 @@ function TranscriptInner({
           onClick={() => {
             pinRef.current = true;
             const el = scrollerRef.current;
-            if (el) el.scrollTop = el.scrollHeight;
+            if (el) programmaticScroll(el, el.scrollHeight);
             const last = turnIds[turnIds.length - 1];
             if (last) setActiveTurn(last);
             persistSoon();

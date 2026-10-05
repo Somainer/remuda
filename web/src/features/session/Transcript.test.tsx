@@ -2099,6 +2099,78 @@ describe("load-earlier anchor lifecycle round 5", () => {
     return [...toolAt(106, "r5-tc-x", "insX"), ...toolAt(108, "r5-tc-y", "insX")];
   }
 
+  function gate<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  /** Geometry harness scoped to one Driver render (see round-4 block). */
+  it("a restore whose own scroll event lands mid-flight completes instead of cancelling (item 1)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeo(43, { echoOnWrite: true });
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    const g = gate<ReturnType<typeof pageOf>>();
+    const done = gate<void>();
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      // The client emits (and the restore writes + its scroll event fires)
+      // BEFORE the click's finally settles: hold the Transcript continuation
+      // on `done` so the echo truly lands while the request is in flight.
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      await done.promise;
+      return result;
+    });
+    // Older page: 31 standalone rows + two earlier tools renaming the fold.
+    const older: Observation[] = [];
+    let seq = 101;
+    for (let t = 0; t < 15; t += 1) {
+      older.push(m(seq, "user", "insX"));
+      older.push(m(seq + 1, "assistant", "insX"));
+      seq += 2;
+    }
+    older.push(m(seq, "user", "insX"));
+    older.push(...toolAt(seq + 1, "r5-tc-x", "insX"));
+    older.push(...toolAt(seq + 3, "r5-tc-y", "insX"));
+    makeClient(reg, "insX", foldSession(), () => g.promise, "201", "237");
+
+    render(
+      <MemoryRouter initialEntries={["/s/insX"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+
+    // The client emits: the restore jumps to the fold 31 rows deep and the
+    // browser echoes that programmatic scroll while the request is still in
+    // flight. The matching-target guard must not cancel the restore.
+    g.resolve(pageOf(older));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(geo.top()).toBe(31 * ROW);
+
+    // Mounted rows at the target window measure a very different real height
+    // (50px). An armed restore FREEZES the unmeasured-row estimate at 96, so
+    // the fold stays pinned at 2976; a wrongly self-cancelled restore clears
+    // restoringRef, the estimate converges, and the anchor drifts to 31*50.
+    for (let i = 0; i < 8; i += 1) geo.growRow(i, 50);
+    expect(geo.top()).toBe(31 * ROW);
+
+    // Now the finally settles; the button returns to idle.
+    await act(async () => {
+      done.resolve();
+      await Promise.resolve();
+    });
+    expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("retargets a renamed fold past newly inserted standalone rows to the content row (item 2)", async () => {
     const user = userEvent.setup();
     const geo = installGeo(43);

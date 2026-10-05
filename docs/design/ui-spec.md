@@ -246,6 +246,8 @@ Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mob
 
 compact（手机）不渲染这个页面：`<Navigate replace>` 到 `/m`（D-049），手机首页见 §4.7。
 
+**Main 置顶行（D-057，2026-10-05；机制见 [main-agent.md §9](./main-agent.md#9-chat-surface)）**：桌面会话列表顶部固定一行「Main」，解析为当前持有 `address-owner` 的那条血缘的现行章节；血缘暂停时解析为最近一条 address-owner 血缘的最新章节，并标注例如「已由你暂停 · T」。没有 address-owner 血缘时不渲染。点开进入该章节的 `/s/:instanceId`，一条会话跨章节显示（§2.2 的「Main 会话」）。行内容口径同下面的行规则（状态点 + 标题 + 一句下一步）。
+
 **行内容 = 状态点 + 标题 + 一句下一步（D-038，2026-09-19 增补）**
 
 上面线框里每行的第二句（「等你批准 Bash」「AskUserQuestion · 3 题」「Workflow wf_ab12 · phase compile」）是**派生出来的一句话**，不是 wire 字段的转写。据此把行内容钉死：
@@ -492,29 +494,38 @@ mediaType, name}`，`protocol.md` §5.2），字节在对象库、不在 journal
 
 - 外壳：`--bg-input` 底，12px 圆角，1px `--border`，宽度与阅读列对齐（720px，停靠区内居中）；`:focus-within` 时边框变 `--focus` 并加 `0 0 0 1px var(--focus)`。
 - 文本框：无边框，16px/24px，`--fg-body`，placeholder「输入提示词…」。行数：桌面 1–10 行，手机 1–5 行，键盘态 1–3 行。自增高用 CSS grid 镜像（`::after{content: attr(data-value)}`）实现，不读 `scrollHeight`。
-- 桌面是两行：文本行 + 32px 工具行。控件 28px 高，12px `--fg-muted`，无边框；hover `--bg-hover`，打开时 `--bg-selected`。左：`attach-file` 与「粘贴附件」；中：`harness-chip`（静态文字）、`model-effort-chip`（显示「opus · high ▾」：切换中或排队中带 `--link`，与生效值不一致时带 `--attention-fg`，未知时显示「?」）、`context-chip`（圆环 + 「42%」）、`permission-chip`（danger 模式下仅 `--danger-fg` 字 + ⚠ 前缀，不加边框——带边框的 danger 触发器只属于 compact 单行的选项触发器，见下）；右：状态文字（`composer-queue-status`、`composer-interrupted-chip`、`composer-cap-note`）、忙碌时出现 `composer-steer` 和 `composer-interrupt`、发送按钮（32px 圆形，`--primary-fill` 底，里面是 ↑；`data-mode`、`data-holder` 不变）。composer 自身宽度 <600px 时先隐藏 harness 名，再把 context 收成只剩圆环。
+- 桌面是两行：文本行 + 32px 工具行。控件 28px 高，12px `--fg-muted`，无边框；hover `--bg-hover`，打开时 `--bg-selected`。左：`attach-file` 与「粘贴附件」；中：`harness-chip`（静态文字）、`model-effort-chip`（显示「opus · high ▾」，Claude ultracode 开时「opus · high · ultracode ▾」：切换中或排队中带 `--link`，与生效值不一致时带 `--attention-fg`，未知时显示「?」）、`context-chip`（圆环 + 「42%」）、`permission-chip`（danger 模式下仅 `--danger-fg` 字 + ⚠ 前缀，不加边框——带边框的 danger 触发器只属于 compact 单行的选项触发器，见下）；右：状态文字（`composer-queue-status`、`composer-interrupted-chip`、`composer-cap-note`）、忙碌时出现 `composer-steer` 和 `composer-interrupt`、发送按钮（32px 圆形，`--primary-fill` 底，里面是 ↑；`data-mode`、`data-holder` 不变）。composer 自身宽度 <600px 时先隐藏 harness 名，再把 context 收成只剩圆环。
 - 顶部区只在有内容时出现：最大高度 112px（键盘态 36px），自身可滚动。排队行（`composer-queued-row`、`composer-queued-chip`，28px，带「插队发送」和 ✕）、附件块（40px，`--bg-inset`；上传失败边框用 `--danger-border`）、代码引用芯片；手机额外显示「尚未验证」（`composer-cap-note`）——这是能力**未知/未验证**而不是需要人处理或失败，用 `--unknown-fg` 中性色 + 虚线标记，不用琥珀（D-053/§3.3：`unknown` 是诚实的欠缺）。
 - 桌面 ≥1024 时文本行下方显示说明（`composer-caption`），12px `--fg-faint`：「Enter 发送（工作中排队）· ⌘/Ctrl+Enter 插队 · Esc 打断 · 组字中 Enter 不发送」。
 - 发送语义：桌面 Enter 发送（IME composing / keyCode 229 / key=Process 时忽略，抄 herdrx `Composer.tsx` `composing()`），Shift+Enter 换行；⌘/Ctrl+Enter 插队；手机 Enter 换行、主发送是按钮。不要抢中文候选。
 - 权限芯片显示当前 `permissionMode`（dontAsk/acceptEdits/manual…），点开改本会话（发 Command，不是只改本地 chip）。
-- Effort：收起为 compact 触发器，只显示**档名**（`ultracode ▾`），宽度固定不顶布局。点开是一张 ~300px 的 card popover（手机改 sheet），钉在触发器上方：
+- Effort（Claude 的档位与 ultracode 是两条独立的轴，D-056，实测见 [effort-sync-4](./evidence/effort-sync-4.md)）：收起为 compact 触发器，只显示**档名**，ultracode 开着时加 ` · ultracode`（`high ▾`、`high · ultracode ▾`），宽度固定不顶布局。点开是一张 ~300px 的 card popover（手机改 sheet），钉在触发器上方：
   - 第 1 行 grid：左闪电图标 · 中间档位名（18px `--fg-strong`）+ `›`（点开档位/模型列表）· 右复位图标。第 2 行居中 muted 型号（13px）。
   - 下方一条 40px 高的圆角 pill：左侧已填部分是中性轨道色，右侧未填是中性 surface；每个档位一个小圆点 marker，两侧都看得见；钮是 36px 圆 + 柔和投影，拖动吸附到点上。
   - **填充必须压到钮下**：fill 宽 = 钮心 + 钮半径（`--knob * 2 + pos * (100% - --knob * 2)`），fill 右端正好落在钮右缘、圆头藏在钮底下，钮左侧和钮下不留暗轨；第一档 fill 正好一个钮宽，同样不留缝。
   - 手机上触控 ≥ 44px 只靠**热区**，不靠视觉尺寸：pill 仍是 40px，外面套 48px 热区；图标按钮保持可见字形，用 44×44 的 `::after` 扩大命中面。
-  - 最高档：整条 pill 换 `--ember-*` 余烬琥珀渐变，上面叠一层暖光 + 三层疏密不同的 ember 星点，各自以不同速度横向漂移（其中一层反向）并各自闪烁，钮带一圈呼吸的琥珀光晕；收起态触发器同频率轻微发光。只用 transform / opacity，不触发布局；popover 关闭即卸载，`prefers-reduced-motion` 下全部停成静帧（essential 动效按 visual-system §7.4 标记）。
-  - 吸附 harness 原生档（claude `low/medium/high/xhigh/max` 加 `ultracode` workflow stop，codex `low/medium/high/xhigh/max/ultra`（显示 Low / Medium / High / Extra high / Max / Ultra；说明见 protocol.md effort 表），grok `low/medium/high/xhigh`）。`role=slider`，`aria-valuetext` = 档名。←/→/Home/End、触摸拖动、44px 触控。
+  - 余烬（`--ember-*`）只跟随两种状态，**不绑定滑杆上的某个位置**：Codex 的 `ultra` 档（整条 pill 换余烬）与 Claude 的 Ultracode 开关打开（任意档，余烬落在开关轨道与收起态触发器上；Claude 的 pill 只显档位外观，xhigh / max 用静态强调）。余烬的样子：`--ember-*` 余烬琥珀渐变，上面叠一层暖光 + 三层疏密不同的 ember 星点，各自以不同速度横向漂移（其中一层反向）并各自闪烁，钮或开关带一圈呼吸的琥珀光晕；收起态触发器同频率轻微发光。只用 transform / opacity，不触发布局；popover 关闭即卸载，`prefers-reduced-motion` 下全部停成静帧（essential 动效按 visual-system §7.4 标记）。
+  - 吸附 harness 原生档（claude `low/medium/high/xhigh/max` 五档，没有 ultracode 档也没有 auto 档；codex `low/medium/high/xhigh/max/ultra`（显示 Low / Medium / High / Extra high / Max / Ultra；说明见 protocol.md effort 表）；grok `low/medium/high/xhigh`）。`role=slider`，`aria-valuetext` = 档名。←/→/Home/End、触摸拖动、44px 触控。
+  - **Ultracode 开关（仅 Claude）**：pill 下方一行，左「Ultracode」+ 一行 muted 说明「每个任务编排 dynamic workflow · 仅本会话」，右 `role=switch`（`aria-checked`，Space 切换），44px 热区。非 Claude harness 不渲染。
+    - **不可用时禁用并写明原因**（禁用态仍可读，原因用 `--fg-muted` 字放在说明行）。禁用只在原因成立的范围内有效：
+      - Claude Code 版本低于 2.1.203：整个会话禁用。
+      - `ultracode-unavailable-for-model`（「<模型> 不支持 ultracode」）：只对**拒绝它的那个模型**禁用。会话换了模型（`/model` accept 或回读到新模型）就重新启用，新模型可以再试；切回那个模型时恢复禁用。
+      - `ultracode-workflows-disabled`（「需要开启 dynamic workflows」）：对本进程禁用，resume 或重新 launch 后重新启用。
+    - **切换失败不结束会话**：被拒绝、degraded 或超时只显示在这次切换上（开关回到 effective 状态并给出原因），会话照常可用；除上面三种禁用外，用户可以直接再试一次（D-056 (4)）。
+    - **耦合版本（Claude Code 2.1.203–2.1.283；更低版本开关已禁用）**：说明行改为「开启后以 xhigh 运行」；打开开关即把滑杆移到 xhigh，driver 只发一条 `/effort ultracode`（本会话有效，不保存默认档）；滑离 xhigh 即关开关，与 CLI 一致。版本读自实例的 `binaryVersion`，transcript 的 `version` 优先。
+  - **默认档不写死**：Claude 的默认档按模型（Opus 5.5 / Sonnet 5.5 = medium，Opus 4.7 = xhigh，其余 = high），任何文案都不得把某一档标成通用「默认」。未 pin 时触发器显示「跟随模型默认」，回读后显示解析出的档；没有记忆偏好的新会话即未 pin。
+  - 两条轴各自显示 effective：档位读不到显示 `?`，开关读不到显示 `?`；与请求不一致时逐轴提示「请求 max → 实际 high」「请求 ultracode → 实际关」（resume 后未重新生效就是后者；开关只认本进程的记录，resume 前重放出来的「Ultracode on」不算）。
   - `›` 展开的列表里才有档位说明和模型选择（`‹` 返回 pill）；pill 视图本身不列模型。
-  - 变更走 `instance.configure`（journal + persist）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
+  - 变更走 `instance.configure`（journal + persist），`effort` 发 `{name, ultracode, index}`（`index` 只是旧字段，Hub 读时忽略），不再用旧名 `ultracode` 上 wire。滑杆与开关在同一次确认里一起变时只发一次 configure，driver 端至多两条命令、档位在前；耦合版本打开 ultracode 永远只发一条 `/effort ultracode`（D-056 (3)）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
 - 本地草稿按 `instanceId` 存（herdrx `composerDrafts`）；未 accepted 的乐观气泡可撤回。
 
 **compact composer 边界（D-042，修订 §11.7 冲突「P0-3」；收起态单行 56px 不变）**
 
 compact（§1.3 查询；56px 是 compact 布局行高，与指针无关）下 control bar 是单行 56px：`[选项触发器] [文本框 flex 1] [插队] [打断] [发送]`。
 
-- **选项触发器**（`composer-options-trigger` / `model-effort-chip`）：可见 32px，13px 字，最宽 132px，显示「manual · high ▾」；coarse 指针下命中区 44（fine 指针下不撑大）。`danger` 模式时 `--danger-fg` 字、⚠ 前缀、1px `--danger-border`。触发器**必须同时显示两样东西**：当前 `permissionMode` 的**词**（`manual` / `acceptEdits` / `dontAsk` / `bypassPermissions` 的 label 或 native 词）**和** effort 的**档名**（上一条「只显示档名」的要求不因收起而豁免），形如 `manual · high`。`permissions.ts` 标为 `danger` 的模式（绕过全部 / 不再询问 / 完全访问）必须在触发器上就用 danger 样式可见——**把 bypass 态藏进 sheet 是本条最响的禁止项**。
+- **选项触发器**（`composer-options-trigger` / `model-effort-chip`）：可见 32px，13px 字，最宽 132px，显示「manual · high ▾」；coarse 指针下命中区 44（fine 指针下不撑大）。`danger` 模式时 `--danger-fg` 字、⚠ 前缀、1px `--danger-border`。触发器**必须同时显示两样东西**：当前 `permissionMode` 的**词**（`manual` / `acceptEdits` / `dontAsk` / `bypassPermissions` 的 label 或 native 词）**和** effort 的**档名**（上一条「只显示档名」的要求不因收起而豁免），形如 `manual · high`。Claude ultracode 开时再加 ` · ultracode`（`manual · high · ultracode`）；132px 放不下时只把 ` · ultracode` 收成一枚余烬圆点（`aria-label` 仍含「ultracode」），`permissionMode` 的词与档名都不截（D-056 (5)）。`permissions.ts` 标为 `danger` 的模式（绕过全部 / 不再询问 / 完全访问）必须在触发器上就用 danger 样式可见——**把 bypass 态藏进 sheet 是本条最响的禁止项**。
 - **插队、打断**：只在忙碌时出现。都是 32px 的 `.iconBtn`，间距 12；coarse 指针下命中区 44（`::after`），fine 指针下保持 32；aria-label 分别为「插队发送」「打断」；testid 分别为 `composer-steer`、`composer-interrupt`。**发送**：可见 32px 的圆，coarse 指针下命中区 44。
-- **可以进 sheet**（D-042 允许）：附件、粘贴、harness 只读信息、context 用量、权限选择器本身、effort 滑杆。
+- **可以进 sheet**（D-042 允许）：附件、粘贴、harness 只读信息、context 用量、权限选择器本身、effort 滑杆与 Ultracode 开关。
 - **不得进 sheet**（留在 sheet 外，D-028a）：发送/排队/打断**三态**按钮、队列 chip、能力未验证时的「尚未验证」标注。三态是当回合的事实，`unknown` 是诚实的欠缺，两者都不是「选项」。
 - placeholder 分平台：手机「输入提示词…」（不写桌面快捷键——手机上 Enter 是换行、⌘ 不存在，写快捷键是误导）；桌面保留快捷键说明。
 - 确认类交互：插队与 Esc 打断**不再用 `window.confirm`**（Safari 上会盖住键盘，且样式不可控），改用 `Sheet`（桌面 `popover`，手机 `sheet`，焦点圈定、Esc = 取消、返回焦点到触发器）。确认后的命令语义与 `commandId` 路径**完全不变**。
@@ -523,6 +534,16 @@ compact（§1.3 查询；56px 是 compact 布局行高，与指针无关）下 c
 **状态清单**
 
 `loading-snapshot` → `live` → `reconnecting` → `gap-backfill` → `readonly-stale`（`connectivity ≠ connected`）。`blocked`（`activity=waiting-interaction`）时 composer 换成 interaction 表面。`exited` 时 Composer 不挂载、挂 EndedBar（见上；若 `capabilities.resume`）显示续接，否则显示「开新会话继承 cwd」。`--bg` 空闲保持 `idle`，不要显示「已完成」。
+
+**Main 会话（D-057，2026-10-05；机制见 [main-agent.md §9](./main-agent.md#9-chat-surface)）**
+
+Main 的会话页仍是共享的 `/s/:instanceId`，不分叉；以下只对带 `lineageId` 的续接血缘出现。
+
+- **章节分隔**：一条会话跨章节按序渲染，章节之间是分隔条。分隔条显示原因、时间、前任被 superseded 的提问（链到 `/approvals`）与 fence 结果摘要：已取消、已执行、仍未知（点名 host）。较早章节默认折叠、按需加载；数据来自新读路由 `GET /v1/lineages/{id}`（章节、状态与 fence 记录）。仍未知的结果如实显示为未知，不画成成功、取消或「未执行」。host 确认之后它可能变成确定的结果，也可能仍是未知（Node 或进程崩溃后无法确定），这时一直显示未知。
+- **状态行**：章节号、lifecycle 与 activity、最近 24 h 的重启次数与原因、最近活动，以及血缘状态：「已由你暂停 · T」「重启上限」「host 离线，自 T 起」「正在重启」。
+- **控制**（只在 Human 设备上出现）：Stop 打断当前回合（既有 `instance.cancel`，不改血缘状态）；Pause 关闭当前章节，血缘进入暂停；Resume 做续接 resume，**只在血缘暂停时显示**。Agent 凭据看不到这些控制。
+- **Hub 来源输入**：重启通知（origin `hub`）原样渲染为独立的系统行，绝不渲染成所有者的气泡，也不渲染成 agent 的消息。
+- **被取代的章节**：发给已被取代章节的 held 所有者消息结算为 rejected，行上给出显式的「发给当前 Main」，它使用新的 commandId（D-055：绝不以新 id 自动重发）。`/approvals` 里 superseded 的项链接到当前章节。
 
 ### 2.3 会话页 · 终端视图 `/s/:instanceId/tty`
 
@@ -992,7 +1013,14 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 
 **权限申请位置（D-049）**：绝不在 App 启动时弹——用户还没有待办时消耗唯一一次授权机会没有意义。只允许两处由用户手势触发：(a) compact 收件箱 `/m/inbox` 顶部横幅（报告 §11.3 实测 Moshi 同位置），点「开启」才调 `Notification.requestPermission()` 与 `subscribePush()`（`push.ts:108-114`），横幅可关闭；(b) 设置 → 通知（既有，`SettingsPage.tsx:724` 的通知组）。横幅文案随能力变：未加主屏幕的 iOS 改为「先加到主屏幕」并复用 `needsHomeScreenForNotifications()`（`push.ts:19`），点「开启推送」静默无效的情况不允许发生。
 
-**PWA 关闭态**：SW 仍被系统唤醒并 `showNotification`（`sw.src.js:97`），点按走 `notificationclick` 聚焦既有窗口或 `openWindow`（`sw.src.js:106-120`），落点仍是 `data.url`（`/s/:id` 或 compact 下重定向到的 `/m/inbox?focus=`，§1.2）。已知边界保持不变：Hub 在有设备正 follow 该实例时抑制推送（`crates/remuda-hub/src/alerts.rs:159-160`）——「PWA 关着」正是推送真正生效的场景，这条抑制规则不改。
+**PWA 关闭态**：SW 仍被系统唤醒并 `showNotification`（`sw.src.js:97`），点按走 `notificationclick` 聚焦既有窗口或 `openWindow`（`sw.src.js:106-120`），落点仍是 `data.url`（`/s/:id` 或 compact 下重定向到的 `/m/inbox?focus=`，§1.2）。「PWA 关着」正是推送真正生效的场景。
+
+**抑制与新增推送（D-057，2026-10-05，取代原「Hub 在有设备正 follow 该实例时抑制推送，这条抑制规则不改」；机制见 [main-agent.md §8](./main-agent.md#8-push)）**：
+- **按设备静音**：follow 只静音正在 follow 且页面可见的那台设备，其余设备照常推送。PWA 用新增的加性 follow 可见性帧报告 document hidden / shown；从不发送该帧的客户端按可见处理，等于今天对这一台设备的行为。桌面标签页停在 Main 上不再静音手机。这是对所有会话的投递修正（今天 `crates/remuda-hub/src/alerts.rs` 只要有任一设备 follow 就静音全部设备）。
+- **转给 Agent 上级的交互**：一条关于实例 I 的告警只在三者同时成立时不推：I 有 Agent 上级血缘 P；该交互确实转给了 P（不是 approval，且 D-051 谓词对 P 的当前章节成立）；P 实际在运行（状态 running、当前章节未结束、章节所在 host 有活连接）。第一阶段其他种类的告警从不因此静音，approval 永远推送。
+- **重启窗口与补推**：P 不在「实际在运行」时（starting/正在重启、host 离线、暂停，或章节已结束而监督者尚未行动），它的子实例告警照常推送。P 从「实际在运行」变为否时，仍待回答的被静音交互各补推一次；触发点包括 F、监督者状态转移、host 断开、host 丢失判定与 Hub 启动对账。补推跨 Hub 重启仍会投递，推送 tag 用交互 id，所以重发会替换而不是叠加通知。P 恢复运行后，已补推的交互不再被静音。
+- **「Main 回复了」**：address-owner 当前章节的回合结束、且该回合收到过 Human 来源输入时，推送 “Main replied: <最终消息首行>”（截断），同样按设备静音；只由 Hub 或 Agent 输入触发的回合不推。
+- **C1 推送**：带 `restart` 的血缘不再推通用的 “Session exited”，改为 “Main restarted (cause)”“Main paused: restart cap”“Main closed itself”；所有者自己从 Human 设备暂停时不推。
 
 iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotifications()`）。设置页写明。HTTPS + `isSecureContext` 才能注册 SW。
 
@@ -1019,6 +1047,7 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 | `/m` 子树内容 | 说明 |
 |---|---|
 | `/m` 会话 home | 分组会话首页（项目 + git branch 组头、一句下一步、context 剩余环，行口径同 §2.1 / D-038）；D-050 起在项目/branch 分组上**叠加 task 分组层**（「需要你」首组、父子任务嵌套、`SE-nn` 派生 key、已归档折叠，§2.9） |
+| Main 置顶行（D-057，2026-10-05） | `/m` home 最上方固定一行「Main」，在所有分组之上；解析与标注口径同 §2.1 的 Main 置顶行，点开是共享的 `/s/:instanceId`（§2.2 的「Main 会话」），不进 `/m` |
 | 看板的 compact 形态 | 不复制桌面三列：单列滚动 + 待办/进行中/已完成/已归档分段过滤（`GET /v1/board` 同一投影，一次一段；D-050）；桌面 `/board` 在 compact 不重定向到一个新页面，分段过滤就是 `/m` 子树内的看板形态。**实现状态（D-052，批次计划 D8）**：`/m` home 的 task 分组层已上线（`HomeList.tsx` 的 `buildHomeTaskLayer`），但单列**分段过滤尚不存在**（`features/mobile/` 无「待办/进行中/已完成」分段）；compact 访问 `/board` 仍由既有重定向落 `/m`（`mobileRoute.ts`）。ui-upgrade 批次**不实现**分段过滤（目标形态以本行为准，实现排后续批次），不得在证据里声称它已由 /m home 承载 |
 | `/m/inbox` 收件箱 | 两档（待你处理 / 进行中·最近，无第三档），与桌面 `/approvals` 渲染同一 InboxShell、同一张 ApprovalCard 与同一 kind 分段（§2.5，D-052） |
 | Jump To sheet | 从 home 顶栏与终端键盘条打开的覆盖层，不独占路由；分组 + 时钟/列表，**不做第二套空间模型**（报告 §10-23 / §11.2） |

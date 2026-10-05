@@ -252,13 +252,18 @@ test("the header is a real progress bar with completed/total, not static dots", 
   await openWorkflowSession(page, "workflow card demo running");
   const card = page.getByTestId("workflow-card").first();
   await expect(card).toHaveAttribute("data-status", "running", { timeout: 20_000 });
-  // Running demo: totals 1 terminal of a fixed 4 — 1/4 agents beside the bar.
-  await expect(card.getByTestId("workflow-rail-count")).toContainText("1/4 agents");
+  // Running demo: totals 1 terminal of a fixed 4 — the known denominator is
+  // stable, but while the run is alive EVERY count is provisional, so it reads
+  // 1/4+ (a dynamic run between iterations can show N/N done yet keep going).
+  const liveCount = card.getByTestId("workflow-rail-count");
+  await expect(liveCount).toContainText("1/4+ agents");
+  await expect(liveCount).toHaveAttribute("data-provisional", "1");
 
   await page.getByTestId("composer-input").fill("workflow card demo done");
   await page.getByTestId("composer-send").click();
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
   await expect(card.getByTestId("workflow-rail-count")).toContainText("4/4 agents");
+  await expect(card.getByTestId("workflow-rail-count")).not.toHaveAttribute("data-provisional");
   // A clean run shows no failed marker.
   await expect(card.getByTestId("workflow-rail-failed")).toHaveCount(0);
 });

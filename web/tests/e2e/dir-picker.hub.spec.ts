@@ -27,6 +27,15 @@ test.skip(
 );
 
 const BROWSE_ROOT = "/tmp/remuda-dirpicker";
+
+/// The fake Node answers with canonical paths; on macOS /tmp is a symlink
+/// to /private/tmp, so compare against the canonical root the server sees.
+function canonicalRoot(): string {
+  // /private/tmp exists on macOS; elsewhere /tmp is real.
+  return process.platform === "darwin" && BROWSE_ROOT.startsWith("/tmp/")
+    ? `/private${BROWSE_ROOT}`
+    : BROWSE_ROOT;
+}
 const createdInstances: string[] = [];
 
 async function apiJson<T>(page: Page, method: string, path: string, body?: unknown): Promise<T> {
@@ -114,7 +123,7 @@ test.afterAll(async ({ browser }) => {
     }
     const host = await fakeHost(page).catch(() => null);
     if (host) {
-      for (const path of [`${BROWSE_ROOT}/alpha`, `${BROWSE_ROOT}/beta`]) {
+      for (const path of [`${canonicalRoot()}/alpha`, `${canonicalRoot()}/beta`]) {
         await page.request
           .fetch(`/v1/hosts/${host}/workspaces`, {
             method: "DELETE",
@@ -190,7 +199,7 @@ test("adds a directory by browsing the host filesystem", async ({ page }) => {
   await expect(browser).toBeHidden();
 
   const workspaces = await listWorkspaces(page, host);
-  const alpha = workspaces.find((row) => row.root === `${BROWSE_ROOT}/alpha`);
+  const alpha = workspaces.find((row) => row.root === `${canonicalRoot()}/alpha`);
   expect(alpha, JSON.stringify(workspaces)).toBeTruthy();
 
   // The new workspace is selected in the picker.
@@ -200,8 +209,8 @@ test("adds a directory by browsing the host filesystem", async ({ page }) => {
 test("removes a directory after confirmation and refuses it while a session is live", async ({ page }) => {
   const host = await fakeHost(page);
   let workspaces = await listWorkspaces(page, host);
-  if (!workspaces.some((row) => row.root === `${BROWSE_ROOT}/beta`)) {
-    workspaces = await registerByPath(page, host, `${BROWSE_ROOT}/beta`);
+  if (!workspaces.some((row) => row.root === `${canonicalRoot()}/beta`)) {
+    workspaces = await registerByPath(page, host, `${canonicalRoot()}/beta`);
   }
   const beta = workspaces.find((row) => row.root === `${BROWSE_ROOT}/beta`);
   expect(beta).toBeTruthy();

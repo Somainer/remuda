@@ -52,13 +52,12 @@ async fn list_dirs(
     if state.nodes.kind_of(&host_id).await.is_none() {
         return Err(HubError::HostOffline { host_id });
     }
+    // The path is forwarded verbatim: it is a filesystem-selected path, not
+    // typed input, so it must never be trimmed (a trailing space is a legal
+    // filename byte). An empty string means "default start"; any other value
+    // (including whitespace) goes to the Node, which rejects it.
     let mut params = json!({"showHidden": query.show_hidden});
-    if let Some(path) = query
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(path) = query.path.as_deref().filter(|value| !value.is_empty()) {
         params["path"] = json!(path);
     }
     let body = crate::http::call_node(&state, &host_id, "host.dirs.list", params).await?;

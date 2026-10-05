@@ -1787,3 +1787,310 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
     expect(Math.abs(geo.scrollTopNow() - 20 * ROW)).toBeLessThanOrEqual(4);
   });
 });
+
+describe("load-earlier anchor lifecycle round 5", () => {
+  const ROW = 96;
+  const VIEW = 720;
+
+  function source() {
+    return {
+      driverKind: "claude-print" as const,
+      driverVersion: "1",
+      adapterVersion: "1",
+      channel: "stdout" as const,
+      delivery: "replay" as const,
+      nativeSessionId: unknownKnowledge("none"),
+      nativeTurnId: unknownKnowledge("none"),
+      nativeAgentId: unknownKnowledge("none"),
+      nativeItemId: unknownKnowledge("none"),
+      nativeEventId: unknownKnowledge("none"),
+      nativeRequestId: { type: "none" as const },
+      sourceCursor: { type: "runtime" as const, ledgerRevision: "1" },
+    };
+  }
+
+  function m(seq: number, role: "user" | "assistant", instanceId: string): Observation {
+    return {
+      schemaVersion: 1,
+      eventId: `e_${seq}_${role}_${instanceId}` as Id,
+      journalId: `obj_${instanceId}` as Id,
+      instanceId: instanceId as Id,
+      runId: null,
+      hostId: "hst" as Id,
+      processGeneration: "1",
+      runGeneration: null,
+      seq: String(seq),
+      observedAt: "2026-09-12T00:00:00.000Z",
+      nativeAt: known("2026-09-12T00:00:00.000Z"),
+      source: source(),
+      kind: "message",
+      completeness: "structured",
+      rawRef: null,
+      evidenceEventIds: [],
+      payload: {
+        nodeId: `n_${seq}_${role}_${instanceId}` as Id,
+        messageId: `mm_${seq}_${role}_${instanceId}` as Id,
+        role,
+        phase: role === "user" ? "input" : "final",
+        revision: "1",
+        baseRevision: null,
+        operation: "open",
+        blocks: [{ type: "text", text: `${instanceId}-m${seq}` }],
+        targetBlock: null,
+        parentToolCallId: null,
+        nativeOrigin: known(role === "user" ? "ui" : "assistant"),
+        status: "complete",
+      },
+    } as Observation;
+  }
+
+  function pageOf(events: Observation[], reachedAfterSeq = false) {
+    return {
+      events,
+      durableSeq: events.at(-1)?.seq ?? "0",
+      windowFromSeq: events[0]?.seq ?? null,
+      reachedAfterSeq,
+    };
+  }
+
+  type Registry = {
+    events: Record<string, Observation[]>;
+    floors: Record<string, string>;
+    clients: Record<string, JournalClient>;
+    setEvents: Record<string, (events: Observation[]) => void>;
+    setFloor: Record<string, (floor: string) => void>;
+  };
+
+  function makeClient(
+    reg: Registry,
+    instanceId: string,
+    initial: Observation[],
+    read: JournalRead,
+    snapshotFloor: string,
+    asOf: string,
+  ): JournalClient {
+    const client = new JournalClient(`obj_${instanceId}` as Id, read, {
+      onPrepend: (rows) => {
+        const merged = (reg.events[instanceId] ?? []).concat(rows).sort((a, b) => Number(a.seq) - Number(b.seq));
+        reg.setEvents[instanceId]?.(merged);
+      },
+    });
+    client.noteHistory(initial);
+    client.applySnapshot({
+      projectionVersion: "v1",
+      projectionEpoch: "ep" as Id,
+      asOfSeq: asOf,
+      instance: {} as Snapshot["instance"],
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: snapshotFloor, complete: false },
+    });
+    reg.clients[instanceId] = client;
+    reg.events[instanceId] = initial;
+    reg.floors[instanceId] = snapshotFloor;
+    return client;
+  }
+
+  function Driver({ reg, compact = true }: { reg: Registry; compact?: boolean }) {
+    const { instanceId = "" } = useParams();
+    const [sessionId, setSessionId] = useState(instanceId);
+    const [events, setEvents] = useState<Observation[]>(reg.events[instanceId] ?? []);
+    const [floor, setFloor] = useState<string>(reg.floors[instanceId] ?? "1");
+    // Route param change WITHOUT a remount (Transcript itself stays mounted,
+    // exactly like SessionPage): swap the store-backed state in render.
+    if (sessionId !== instanceId) {
+      setSessionId(instanceId);
+      setEvents(reg.events[instanceId] ?? []);
+      setFloor(reg.floors[instanceId] ?? "1");
+    }
+    const activeRef = useRef(instanceId);
+    activeRef.current = instanceId;
+    reg.setEvents[instanceId] = (next) => {
+      if (activeRef.current !== instanceId) return;
+      reg.events[instanceId] = next;
+      setEvents(next);
+    };
+    reg.setFloor[instanceId] = (next) => {
+      if (activeRef.current !== instanceId) return;
+      reg.floors[instanceId] = next;
+      setFloor(next);
+    };
+    return <Transcript events={events} earlierFloor={floor} compact={compact} />;
+  }
+
+  function installGeo(totalCount: number, opts: { echoOnWrite?: boolean; onWrite?: (v: number) => void } = {}) {
+    const echoOnWrite = opts.echoOnWrite ?? false;
+    let dynamicTotal = totalCount;
+    const heights = new WeakMap<Element, number>();
+    const observerCbs = new Map<Element, () => void>();
+    const isScroller = (el: unknown) => el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    let top = 0;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? VIEW : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? dynamicTotal * ROW : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      const h = heights.get(el) ?? ROW;
+      if (el.dataset?.testid === "transcript-scroller") {
+        return { top: 0, left: 0, right: 500, bottom: VIEW, width: 500, height: VIEW, x: 0, y: 0, toJSON() {} } as DOMRect;
+      }
+      if (el.dataset?.anchor && el.parentElement) {
+        const list = el.parentElement;
+        const spacer = Array.from(list.children).find((c) => c.getAttribute("aria-hidden") === "true") as
+          | HTMLElement
+          | undefined;
+        const pad = Number.parseFloat(spacer?.style.height ?? "0") || 0;
+        let preceding = 0;
+        for (const sibling of Array.from(list.querySelectorAll("[data-anchor]"))) {
+          if (sibling === el) break;
+          preceding += heights.get(sibling) ?? ROW;
+        }
+        const rowTop = pad + preceding - top;
+        return { top: rowTop, left: 0, right: 500, bottom: rowTop + h, width: 500, height: h, x: 0, y: rowTop, toJSON() {} } as DOMRect;
+      }
+      return { top: 0, left: 0, right: 0, bottom: h, width: 0, height: h, x: 0, y: 0, toJSON() {} } as DOMRect;
+    });
+    class GeoRO {
+      private readonly cb: () => void;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe(el: Element) {
+        observerCbs.set(el, this.cb);
+      }
+      unobserve(el: Element) {
+        observerCbs.delete(el);
+      }
+      disconnect() {
+        observerCbs.clear();
+      }
+    }
+    vi.stubGlobal("ResizeObserver", GeoRO);
+    const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
+    const defineScroll = () => {
+      const el = scroller();
+      Object.defineProperty(el, "scrollTop", {
+        configurable: true,
+        get: () => top,
+        set: (v: number) => {
+          const changed = v !== top;
+          top = v;
+          opts.onWrite?.(v);
+          if (echoOnWrite && changed) fireEvent.scroll(el);
+        },
+      });
+    };
+    const scrollTo = (value: number) => {
+      top = value;
+      fireEvent.scroll(scroller());
+    };
+    const growRow = (ordinal: number, height: number) => {
+      const el = scroller().querySelectorAll<HTMLElement>("[data-anchor]")[ordinal];
+      if (!el) throw new Error(`mounted row ${ordinal} not found`);
+      heights.set(el, height);
+      observerCbs.get(el)?.();
+    };
+    const setTotal = (n: number) => {
+      dynamicTotal = n;
+    };
+    return { scroller: () => scroller(), defineScroll, scrollTo, growRow, top: () => top, setTotal };
+  }
+
+  /**
+   * Turn-start fixture: a fold of tc-a/tc-b/tc-c mid-turn, the assistant end,
+   * then 15 more message turns so the list is long enough to scroll inside.
+   */
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("a route switch mid-click clears the restore so estimate convergence resumes (item 4)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeo(60);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    // Session A: a click whose read never returns.
+    const aEvents: Observation[] = [];
+    for (let i = 0; i < 40; i += 1) aEvents.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insA"));
+    makeClient(
+      reg,
+      "insA",
+      aEvents,
+      () => new Promise(() => {}),
+      "1001",
+      "1040",
+    );
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+    // Session B: a 200-node follow-pinned window. Its first-paint head rows
+    // report 96px and the pinned tail rows are later measured at 50px; middle
+    // rows stay unmeasured and render at whatever the estimate converged to.
+    const bEvents: Observation[] = [];
+    for (let i = 0; i < 200; i += 1) bEvents.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insB"));
+    makeClient(reg, "insB", bEvents, vi.fn<JournalRead>().mockResolvedValue(pageOf([])), "1", "1200");
+
+    function GoB() {
+      const navigate = useNavigate();
+      return (
+        <button type="button" data-testid="go-b" onClick={() => navigate("/s/insB")}>
+          go
+        </button>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/s/insA"]}>
+        <Routes>
+          <Route
+            path="/s/:instanceId"
+            element={
+              <>
+                <Driver reg={reg} compact={false} />
+                <GoB />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+
+    // Switch routes while A's read is stuck: the epoch reset must clear A's
+    // restore (a leaked restoringRef freezes the row-height estimate).
+    await user.click(screen.getByTestId("go-b"));
+    await act(async () => {});
+    geo.setTotal(200);
+
+    // Measure the pinned tail rows at 50px: with the route reset the estimate
+    // converges; a leaked restoringRef from A keeps it frozen at 96px.
+    for (let pass = 0; pass < 4; pass += 1) {
+      const rows = geo.scroller().querySelectorAll<HTMLElement>("[data-anchor]");
+      await act(async () => {
+        rows.forEach((_i, idx) => {
+          if (idx >= rows.length - 16) geo.growRow(idx, 200);
+        });
+      });
+    }
+
+    // Jump to node 25: head rows hold 96px mount measurements, middle rows are
+    // unmeasured placeholders. Frozen estimate 96px -> 2400; a converged
+    // estimate (< 96px) lands noticeably higher.
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "insB-m1026");
+    await user.keyboard("[Enter]");
+    // Route reset restored estimate convergence: the 200px measurements move
+    // the jump well past the frozen-96 geometry (which lands near 4064).
+    expect(geo.top()).toBeGreaterThan(4500);
+  });
+
+});

@@ -230,6 +230,12 @@ function TranscriptInner({
   const restoredRef = useRef(false);
   // Follow state restores from the last visit; a brand-new session pins.
   const pinRef = useRef(saved ? saved.follow : true);
+  // True while a saved-position / load-earlier restore is in flight: freezes
+  // the unmeasured-row estimate so the rows above the anchor keep their saved
+  // contribution. Declared with the other per-instance refs so the
+  // route-switch reset below can clear it: a value left true after switching
+  // sessions stops the estimate converging for the next session.
+  const restoringRef = useRef(false);
   const scrollTopRef = useRef(0);
   const saveTimer = useRef<number | null>(null);
   const pendingScroll = useRef<
@@ -283,6 +289,7 @@ function TranscriptInner({
     pendingScroll.current = null;
     prependAnchorRef.current = null;
     loadReqRef.current = null;
+    restoringRef.current = false;
     steeringRef.current.clear();
     setLoadingEarlier(false);
     setRowHeights(new Map());
@@ -584,7 +591,6 @@ function TranscriptInner({
   // previous visit's average: the rows above the anchor were estimates at
   // save time too, so freezing reproduces their contribution exactly instead
   // of biasing the total toward the rows this window happened to mount.
-  const restoringRef = useRef(false);
   useLayoutEffect(() => {
     if (restoringRef.current) return;
     const measured = sizes.filter((h) => h > 0);

@@ -416,11 +416,35 @@ chunk。逐条复核：
 
 闸门错误不是"chunk 加载失败/错误面板"，而是重连后
 `hubJournalMessageCount(...).toBe(1)`（spec:365）30 s 超时收到 0：
-instance.send 的 command 行存在，fake Node 的用户消息 journal 帧没落进
-Hub 尾部窗口。fake Node（crates/remuda-hub/examples/hub_e2e.rs）对
-instance.send 先 `journal.append`（等 Hub 5 s ack）再回裸 `{ok:true}`，
-Hub 因此每次都打 `node did not durably accept ... result:{ok:true}`——
-这是该 fixture 的正常噪声；CPU/IO 饥饿时该帧/ack 时序丢帧。
+instance.send 的 command 行存在，但独立 API 在 Hub journal 尾部窗口里没
+读到那条用户消息（按 commandId 过滤）。这是**观测到的事实**，到此为止。
+
+fake Node（crates/remuda-hub/examples/hub_e2e.rs）这条 composer send 路径
+的**实际代码**（本任务不改它，由 coordinator 另派）：instance.send 的 HTTP
+处理（~1690）在回复前调用 `append_command_user`（~3558）→
+`append_user_message`（~3509）；后者发出 `journal.append` 后执行的是
+`let _ = tokio::time::timeout(Duration::from_secs(2), ws.next())`
+（~3553）——**最多等 2 s、随后把到达的那一帧整个丢弃**，既不校验也不匹
+配 ack id。**普通 instance.send 因此并不等 5 s ack**；带 5 s 超时、按
+`id` 精确匹配 ack 并把无关帧存入队列的辅助函数是 `wait_frame_ack`
+（~2500），它服务于另一些要求 durable 的 append 路径，composer send 不走
+它。先前"先 journal.append（等 Hub 5 s ack）"的说法不准确，已更正为
+2 s 丢弃窗口。
+
+append 之后 fake Node 对 send RPC 回的是裸 `{ok:true}`。Hub 侧
+（crates/remuda-hub/src/http.rs）转发命令走 `nodes.call(...)` 后用
+`node_accepted`（:3759）判定：裸 `{ok:true}` 既无
+`result.command.state` 的 accepted/settled、也无 `result.accepted===true`，
+判 false，于是落入通用 `Ok(Some(response))` 臂（:3553）打出
+`node did not durably accept command; will not resend ... result:{ok:true}`。
+即：**这条日志在 send 路径上确实每次都打**（先前文档对此的观察是对的），
+但它反映的是 fixture 回包形状不被识别为"已 durable 接收"，**不是** fake
+Node 在等一个 5 s journal ack。
+
+关于成因：**"CPU/IO 饥饿导致该帧/2 s ack 窗口丢帧"只是一个未证实的假
+设**——2 s 丢弃窗口与调度饥饿如何具体让该帧缺席 Hub 尾部，本轮没有直接
+证据（未抓到该帧的发送/落盘轨迹）。能证实的只有：该用例随机器负载窗口
+翻转，且下面的 main↔分支对照在同一噪声窗口同概率失败，与前端改动无关。
 
 关键事实：**闸门 hub 套件跑的是 Vite dev，不注册 service worker**
 （`startPWA` 仅 `import.meta.env.PROD` 注册），"只 precache shell、reload
@@ -436,8 +460,11 @@ hub_e2e 二进制，仅切换 Vite 服务的前端工作树）：
 | 分支，邻居高负载窗口 8 连 | 仅 1 次全过，失败全部只此用例 |
 | 分支，安静窗口（1m loadavg 4–5）5 次尝试 | 通过/失败/通过/通过/**通过**，末尾三连 |
 
-失败随机器窗口来去、两棵前端树同窗口同概率翻转 → 与 §5.4 同族的共享机
-饥饿 flake，不是 lazy chunk/precache/前端改动引入。
+观测层面（不依赖上面的帧丢失假设）：失败随机器窗口来去、两棵前端树同窗口
+同概率翻转 → 与 §5.4 同族的共享机饥饿 flake，不是 lazy chunk/precache/
+前端改动引入。丢帧机理留待 hub_e2e 路径被单独处理时验证。r9 闸门集复跑
+时该用例又一次在 :365（0 vs 1）抖动（同机其它 5 个 PWA 用例全过），安静
+窗口单跑通过，与上述一致。
 
 ### 7.2 uo10 xterm 主题（:314、:402）——断言在 PTY 回显哨兵，不在主题订阅
 
@@ -446,8 +473,18 @@ hub_e2e 二进制，仅切换 Vite 服务的前端工作树）：
 断言已先通过）。没有一处失败在 matchMedia/主题订阅/xterm option 断言
 上；lazy 化 TerminalView 未推迟 `useTerminalAppearance` 的订阅。
 
-对照：60 hog 下 4 个主题用例分支 4 passed；origin/main 全 spec 60 hog
-13 passed；分支全 spec 13 passed ×3（7.4 表）。同族 PTY 回显时序。
+对照（说清什么复现、什么没复现）：
+
+- **origin/main 全 spec + 60 CPU hog：13/13 passed。** main 上**没有**复现
+  这两处 uo10 失败，因此**不能**称闸门失败"在 origin/main 上相同复现"。
+- 分支在 60 hog 下定向只跑 4 个主题用例：4/4 passed；分支全 spec 13/13
+  ×3（见 7.4 表，较安静窗口）——受控复测同样**没有**复现。
+- 即：闸门那两次失败只在当次落地窗口出现，main 与分支受控跑均未再触发；
+  断言点是 PTY 回显哨兵（`includes(UO10_SENTINEL)`，在主题断言之外），不
+  在 matchMedia/主题订阅/xterm option 上，lazy 化 TerminalView 也未推迟
+  `useTerminalAppearance` 订阅。结论限定为：一次**未在 main 或受控复测中
+  重现**的 PTY 回显时序失败，无主题/懒加载回归证据；不把它等同于 main 上
+  的既有 flake。
 
 ### 7.3 font-swap（:382、:387）——确认既有，不在本任务修
 
@@ -471,7 +508,11 @@ sw.src.js/Transcript 本分支此前未触碰。按 owner 指示不修。
   skipWaiting，沿用"新版本"条流程）；真实 chunk 失败仍由 in-shell
   RouteErrorBoundary 兜住（r2-4 未动）。dev 中间件盖空清单。
 - 实测生产构建清单 96 项，全部存在于 dist：52 JS（14 路由 chunk +
-  闭包）、21 CSS、23 字体。
+  闭包，2,112,480 B）、21 CSS（356,367 B）、23 字体（21 woff2 + 2 woff，
+  312,064 B）。**96 项预缓存合计 2,780,911 B（≈2.65 MiB）**；另加 SHELL
+  的 index.html/manifest/favicon/两枚图标共 8,373 B（`/` 与 /index.html
+  同一文件），install `addAll` 去重后总计 2,789,284 B（≈2.66 MiB）。
+  （r9 实测 devbox：`vite build` 约 1.5 s、`pnpm build` 约 17 s。）
 
 测试：
 
@@ -492,3 +533,59 @@ sw.src.js/Transcript 本分支此前未触碰。按 owner 指示不修。
 | pwa-shell（新增离线首访 + 旧重部署） | 2 passed |
 | m-shell | 4 passed |
 | typecheck / lint / unit / pnpm build | 全通过 |
+
+## 8 复审 r9（c-perffu r9，2026-10-06）
+
+### 8.1 [medium] 真实生产构建的离线首访（保留在闸门集）
+
+r8 的离线首访用例喂的是手写 2-URL 清单 + toy `window.__loadRoute` 的
+合成 dist，即使真实 worker 清单有洞也会过。新增
+`web/tests/e2e/pwa-realbuild.hub.spec.ts`：
+
+1. beforeAll 用真实 `vite.config.ts` + serviceWorkerPlugin `vite build`
+   到临时 outDir（不动工作树 gitignored 的 dist/），并断言清单含
+   `/assets/Board-*.js`，否则直接 fail；
+2. 用同一 `serve` Hub 例子原样 serve 该 dist，走真实登录页 bootstrap
+   登录（不创建任何实例），打开 /sessions，等待真实 sw.js install 并
+   control 页面；
+3. 断言从未访问的 Board chunk 已在 Cache 但页面**未发起请求**；
+4. `setOffline(true)` 后点侧栏"任务看板"走应用**自己的路由**到 /board，
+   真实 Board 页（`[data-testid=board-page]`）离线渲染，且该 chunk 响应
+   `fromServiceWorker()===true`。afterAll 删临时目录，finally 停服。
+
+闸门/自跳过裁决：devbox 实测 `vite build` **1.4–1.5 s**、完整
+`pnpm build`（tsc -b + vite）**约 17 s**，远低于 ~90 s 阈值 →
+**保留在闸门集，不加 REMUDA_PWA_BUILD 自跳过**。证据运行（gate-e2e.lock
+内，TMPDIR 用短路径，bundled chromium，服务器在锁内）：
+`[pwa-realbuild] vite build finished in 1499 ms` → **1 passed (6.5 s)**。
+
+旧合成用例保留：它仍独占"冷离线**文档**导航（page.goto 深链 → SW
+navigate 回退到缓存 shell 后无网络启动模块图）"，真实用例是已加载文档
+上的客户端路由，不覆盖该回退（见该文件顶部注释）。
+
+### 8.2 [low] asChunk 对缺失键健壮
+
+`sw-build.ts` 的 `asChunk` 改为接受 `undefined` 并可选链：index.html 引用
+的 public 文件（/favicon.svg、/manifest.webmanifest、icons）或 imports
+边在插件顺序变化时可能不在 generateBundle 图里，旧代码会在 `.type` 上解
+引用 undefined，导致整个 generateBundle 抛错、sw.js 完全不发出。现在缺失
+键 = "非 chunk"，照常输出 worker。新增单测：index.html 引用 public 文件
+且 chunk imports 指向缺失键时不抛、仍从真实入口走到真实路由 chunk、非
+chunk/缺失键不入清单。sw-build.test.ts 38 passed。
+
+### 8.3 [doc] 更正 §7.1 fake Node 路径与 §7.2 uo10 表述
+
+- §7.1：普通 instance.send **不等 5 s ack**。实际路径
+  hub_e2e.rs ~1690 → append_command_user(~3558) → append_user_message
+  (~3509)，发出 journal.append 后是
+  `let _ = timeout(2s, ws.next())`（~3553）——最多等 2 s 并**丢弃**到达
+  帧、不校验 ack；5 s、按 id 匹配 ack 的 `wait_frame_ack`(~2500) 是另一
+  条 durable 路径。send 回裸 `{ok:true}` 不满足 Hub 的 `node_accepted`
+  判定（http.rs:3759），所以 :3553 通用臂**确实每次打**
+  `node did not durably accept ... result:{ok:true}`——先前观察到这条
+  日志没错，错的是"fake Node 在等 5 s journal ack"。观测失败（:365 收
+  0、command 行在、用户消息帧缺席尾部窗口）与"饥饿丢帧"的未证实假设已
+  分开陈述。本任务不改 hub_e2e.rs。
+- §7.2：uo10 在 origin/main 全 spec + 60 hog **13/13 passed**，分支定向
+  4/4、全 spec 13/13 ×3 受控复测也过 → 闸门那两次是**未在 main 或受控复
+  测重现**的 PTY 回显哨兵失败，不再称其"在 origin/main 上相同复现"。

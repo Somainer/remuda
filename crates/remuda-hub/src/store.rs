@@ -8359,6 +8359,86 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r2 item 6: replaying an `interaction.requested` (e.g. after
+    /// a lost ack) must not overwrite an already-invalidated/expired row's
+    /// payload or strip its generation-ended resolution, and never revives the
+    /// instance's blocked activity.
+    #[tokio::test]
+    async fn replayed_requested_keeps_a_terminal_rows_payload_and_state() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-replay").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+        let (_, _) = store
+            .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
+            .await
+            .expect("settle");
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+
+        // A lost-ack replay of the SAME interaction.requested event: append it
+        // again with the same explicit seq (an existing journal row replays
+        // instead of inserting).
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(2),
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": int_id,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "carrier": "harness-hook",
+                            "deadline": { "state": "unknown" },
+                            "resolution": { "state": "unknown" },
+                            "request": {"kind": "approval", "title": "Replay", "options": []}
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("replay");
+
+        // State, payload (resolution) and blocking all survive the replay.
+        let row = store
+            .get_interaction(int_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.state, "invalidated",
+            "a replay never revives a terminal row"
+        );
+        assert!(!row.blocking);
+        let reason = row
+            .payload
+            .pointer("/payload/interaction/resolution/value/reason")
+            .and_then(Value::as_str);
+        assert_eq!(
+            reason,
+            Some("generation-ended"),
+            "the settlement resolution survives the replay (desktop keeps 进程已结束 wording)"
+        );
+        // A terminal instance is not re-blocked.
+        let inst = store
+            .get_instance(instance.instance_id)
+            .await
+            .expect("get instance")
+            .expect("row");
+        assert_eq!(inst.lifecycle, "exited");
+        assert_ne!(inst.activity, "blocked");
+        store.close().await;
+    }
+
     /// c-cardsettle r2 item 3: authoritative terminal dedup ignores display
     /// retention — a durable invalidated row is reported terminal even when it
     /// is older than the 24 h inbox window, so a stale Node live copy of the
@@ -9453,20 +9533,46 @@ fn apply_interaction_event(
                     .and_then(Value::as_str)
             })
             .unwrap_or("permission");
+        // c-cardsettle r2 item 6: a replayed `interaction.requested` (e.g. a
+        // lost-ack replay) must not overwrite an already-terminal row. The old
+        // upsert rewrote payload_json unconditionally, stripping the
+        // generation-ended/invalidated resolution (and re-stamping a
+        // terminal card's activity), which made the desktop mislabel it as
+        // 已在其它设备处理. Keep the existing payload/state when the row is
+        // already invalidated or expired; only a pending (or non-terminal) row
+        // absorbs the replay.
         conn.execute(
             "INSERT INTO interactions
                 (id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?6)
              ON CONFLICT(id) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at,
+                payload_json = CASE
+                    WHEN interactions.state IN ('invalidated', 'expired')
+                        THEN interactions.payload_json
+                    ELSE excluded.payload_json
+                END,
+                updated_at = CASE
+                    WHEN interactions.state IN ('invalidated', 'expired')
+                        THEN interactions.updated_at
+                    ELSE excluded.updated_at
+                END,
                 state = CASE WHEN interactions.state = 'pending' THEN 'pending' ELSE interactions.state END",
             params![id, instance_id, host_id, ikind, event.to_string(), now],
         )?;
-        conn.execute(
-            "UPDATE instances SET activity = 'blocked', updated_at = ?1 WHERE id = ?2",
-            params![now, instance_id],
-        )?;
+        // A terminal interaction never puts the instance back to blocked.
+        let already_terminal: bool = conn
+            .query_row(
+                "SELECT state IN ('invalidated', 'expired') FROM interactions WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if !already_terminal {
+            conn.execute(
+                "UPDATE instances SET activity = 'blocked', updated_at = ?1 WHERE id = ?2",
+                params![now, instance_id],
+            )?;
+        }
     } else if kind == "interaction.answered"
         || kind == "interactionAnswered"
         || kind == "interaction.expired"
@@ -9789,7 +9895,14 @@ fn apply_instance_lifecycle(
         Some(next) if lifecycle_rank(next) >= lifecycle_rank(&current.lifecycle) => next,
         _ => current.lifecycle.as_str(),
     };
-    let activity = next_act.unwrap_or(current.activity.as_str());
+    // c-cardsettle r2 item 6: a terminal instance never has its activity
+    // revived to blocked by a late/replayed interaction.requested.
+    let is_terminal = matches!(lifecycle, "exited" | "failed" | "closed");
+    let activity = if is_terminal && next_act == Some("blocked") {
+        current.activity.as_str()
+    } else {
+        next_act.unwrap_or(current.activity.as_str())
+    };
     conn.execute(
         "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
         params![lifecycle, activity, now, instance_id],

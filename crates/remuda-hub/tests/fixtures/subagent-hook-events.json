@@ -1,0 +1,394 @@
+[
+ {
+  "schemaVersion": 1,
+  "eventId": "evt_01a10b71-d453-7774-a52b-b23a64a25a3c",
+  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
+  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
+  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
+  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "processGeneration": "1",
+  "runGeneration": "1",
+  "seq": "1981",
+  "observedAt": "2026-10-05T09:42:51.731Z",
+  "nativeAt": {
+   "state": "unknown",
+   "reason": "not-emitted",
+   "evidenceEventIds": []
+  },
+  "source": {
+   "driverKind": "shell-pty",
+   "driverVersion": "shell-pty",
+   "adapterVersion": "0.1.0",
+   "channel": "hook",
+   "delivery": "live",
+   "nativeSessionId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "nativeTurnId": {
+    "state": "not-applicable"
+   },
+   "nativeAgentId": {
+    "state": "not-applicable"
+   },
+   "nativeItemId": {
+    "state": "not-applicable"
+   },
+   "nativeEventId": {
+    "state": "not-applicable"
+   },
+   "nativeRequestId": {
+    "type": "none"
+   },
+   "sourceCursor": {
+    "type": "runtime",
+    "ledgerRevision": "1744"
+   }
+  },
+  "completeness": "structured",
+  "rawRef": null,
+  "evidenceEventIds": [],
+  "kind": "lifecycle",
+  "payload": {
+   "type": "native",
+   "topic": "turn",
+   "nativeName": "StopFailure",
+   "nativeId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "status": {
+    "state": "known",
+    "value": "idle"
+   },
+   "relatedIds": {
+    "agentId": "a77755a5a987d3e0c",
+    "agentType": "workflow-subagent",
+    "completeness": "structured",
+    "cwd": "<projects>/astergate",
+    "outcome": "failed",
+    "phase": "turn-ended",
+    "ppid": "49330",
+    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
+    "provision": "native",
+    "remudaActivity": "idle",
+    "since": "2026-10-05T09:42:51.730Z",
+    "tier": "hook",
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+   },
+   "dataRef": null,
+   "severity": "warning",
+   "affectsCompletion": false
+  }
+ },
+ {
+  "schemaVersion": 1,
+  "eventId": "evt_01a10b75-1eff-776a-83cb-f2e9007f4f61",
+  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
+  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
+  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
+  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "processGeneration": "1",
+  "runGeneration": "1",
+  "seq": "2246",
+  "observedAt": "2026-10-05T09:46:27.455Z",
+  "nativeAt": {
+   "state": "unknown",
+   "reason": "not-emitted",
+   "evidenceEventIds": []
+  },
+  "source": {
+   "driverKind": "shell-pty",
+   "driverVersion": "shell-pty",
+   "adapterVersion": "0.1.0",
+   "channel": "hook",
+   "delivery": "live",
+   "nativeSessionId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "nativeTurnId": {
+    "state": "not-applicable"
+   },
+   "nativeAgentId": {
+    "state": "not-applicable"
+   },
+   "nativeItemId": {
+    "state": "not-applicable"
+   },
+   "nativeEventId": {
+    "state": "not-applicable"
+   },
+   "nativeRequestId": {
+    "type": "none"
+   },
+   "sourceCursor": {
+    "type": "runtime",
+    "ledgerRevision": "1975"
+   }
+  },
+  "completeness": "structured",
+  "rawRef": null,
+  "evidenceEventIds": [],
+  "kind": "lifecycle",
+  "payload": {
+   "type": "native",
+   "topic": "diagnostic",
+   "nativeName": "SubagentStop",
+   "nativeId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "status": {
+    "state": "known",
+    "value": "observed"
+   },
+   "relatedIds": {
+    "agentId": "aac4b44de81e78e29",
+    "agentTranscriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b/subagents/workflows/wf_example000/agent-aac4b44de81e78e29.jsonl",
+    "agentType": "workflow-subagent",
+    "backgroundTaskId": "wag881flv",
+    "backgroundTaskName": "example-research-task",
+    "backgroundTaskStatus": "running",
+    "cwd": "<projects>/astergate",
+    "permissionMode": "bypassPermissions",
+    "ppid": "49330",
+    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+   },
+   "dataRef": null,
+   "severity": "info",
+   "affectsCompletion": false
+  }
+ },
+ {
+  "schemaVersion": 1,
+  "eventId": "evt_01a10b75-21b0-7230-bf00-a75d2351fcb7",
+  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
+  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
+  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
+  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "processGeneration": "1",
+  "runGeneration": "1",
+  "seq": "2252",
+  "observedAt": "2026-10-05T09:46:28.144Z",
+  "nativeAt": {
+   "state": "unknown",
+   "reason": "not-emitted",
+   "evidenceEventIds": []
+  },
+  "source": {
+   "driverKind": "shell-pty",
+   "driverVersion": "shell-pty",
+   "adapterVersion": "0.1.0",
+   "channel": "hook",
+   "delivery": "live",
+   "nativeSessionId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "nativeTurnId": {
+    "state": "not-applicable"
+   },
+   "nativeAgentId": {
+    "state": "not-applicable"
+   },
+   "nativeItemId": {
+    "state": "not-applicable"
+   },
+   "nativeEventId": {
+    "state": "not-applicable"
+   },
+   "nativeRequestId": {
+    "type": "none"
+   },
+   "sourceCursor": {
+    "type": "runtime",
+    "ledgerRevision": "1976"
+   }
+  },
+  "completeness": "structured",
+  "rawRef": null,
+  "evidenceEventIds": [],
+  "kind": "lifecycle",
+  "payload": {
+   "type": "native",
+   "topic": "diagnostic",
+   "nativeName": "SubagentStart",
+   "nativeId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "status": {
+    "state": "known",
+    "value": "observed"
+   },
+   "relatedIds": {
+    "agentId": "a6866168bc7ba361f",
+    "agentType": "workflow-subagent",
+    "cwd": "<projects>/astergate",
+    "ppid": "49330",
+    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+   },
+   "dataRef": null,
+   "severity": "info",
+   "affectsCompletion": false
+  }
+ },
+ {
+  "schemaVersion": 1,
+  "eventId": "evt_01a10b76-1596-729e-8355-e66111be0324",
+  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
+  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
+  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
+  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "processGeneration": "1",
+  "runGeneration": "1",
+  "seq": "2410",
+  "observedAt": "2026-10-05T09:47:30.582Z",
+  "nativeAt": {
+   "state": "unknown",
+   "reason": "not-emitted",
+   "evidenceEventIds": []
+  },
+  "source": {
+   "driverKind": "shell-pty",
+   "driverVersion": "shell-pty",
+   "adapterVersion": "0.1.0",
+   "channel": "hook",
+   "delivery": "live",
+   "nativeSessionId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "nativeTurnId": {
+    "state": "not-applicable"
+   },
+   "nativeAgentId": {
+    "state": "not-applicable"
+   },
+   "nativeItemId": {
+    "state": "not-applicable"
+   },
+   "nativeEventId": {
+    "state": "not-applicable"
+   },
+   "nativeRequestId": {
+    "type": "none"
+   },
+   "sourceCursor": {
+    "type": "runtime",
+    "ledgerRevision": "2113"
+   }
+  },
+  "completeness": "structured",
+  "rawRef": null,
+  "evidenceEventIds": [],
+  "kind": "lifecycle",
+  "payload": {
+   "type": "native",
+   "topic": "diagnostic",
+   "nativeName": "SubagentStop",
+   "nativeId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "status": {
+    "state": "known",
+    "value": "observed"
+   },
+   "relatedIds": {
+    "agentId": "a687eba352661cdda",
+    "agentTranscriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b/subagents/workflows/wf_example000/agent-a687eba352661cdda.jsonl",
+    "agentType": "workflow-subagent",
+    "backgroundTaskId": "wag881flv",
+    "backgroundTaskName": "example-research-task",
+    "backgroundTaskStatus": "running",
+    "cwd": "<projects>/astergate",
+    "permissionMode": "bypassPermissions",
+    "ppid": "49330",
+    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+   },
+   "dataRef": null,
+   "severity": "info",
+   "affectsCompletion": false
+  }
+ },
+ {
+  "schemaVersion": 1,
+  "eventId": "evt_01a10b76-175f-7065-af8f-31e80e55c685",
+  "journalId": "obj_01a10b65-afbb-72ba-a05e-720d5f91b464",
+  "instanceId": "ins_01a10b65-af47-7218-87d7-3629a56a614f",
+  "runId": "run_01a10b65-b024-7511-a25c-26b123f1871e",
+  "hostId": "hst_01a096a5-45ea-749a-9d87-51d012fc45d9",
+  "processGeneration": "1",
+  "runGeneration": "1",
+  "seq": "2411",
+  "observedAt": "2026-10-05T09:47:31.039Z",
+  "nativeAt": {
+   "state": "unknown",
+   "reason": "not-emitted",
+   "evidenceEventIds": []
+  },
+  "source": {
+   "driverKind": "shell-pty",
+   "driverVersion": "shell-pty",
+   "adapterVersion": "0.1.0",
+   "channel": "hook",
+   "delivery": "live",
+   "nativeSessionId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "nativeTurnId": {
+    "state": "not-applicable"
+   },
+   "nativeAgentId": {
+    "state": "not-applicable"
+   },
+   "nativeItemId": {
+    "state": "not-applicable"
+   },
+   "nativeEventId": {
+    "state": "not-applicable"
+   },
+   "nativeRequestId": {
+    "type": "none"
+   },
+   "sourceCursor": {
+    "type": "runtime",
+    "ledgerRevision": "2114"
+   }
+  },
+  "completeness": "structured",
+  "rawRef": null,
+  "evidenceEventIds": [],
+  "kind": "lifecycle",
+  "payload": {
+   "type": "native",
+   "topic": "diagnostic",
+   "nativeName": "SubagentStart",
+   "nativeId": {
+    "state": "known",
+    "value": "6a7eabee-41e7-4c46-9dc0-c18315fc546b"
+   },
+   "status": {
+    "state": "known",
+    "value": "observed"
+   },
+   "relatedIds": {
+    "agentId": "a6deb80621dd920ca",
+    "agentType": "workflow-subagent",
+    "cwd": "<projects>/astergate",
+    "ppid": "49330",
+    "promptId": "908c3edf-565b-44a7-86a6-cc314c1547c1",
+    "transcriptPath": "<data-dir>/dev-hub/node/instances/ins_01a10b65-af47-7218-87d7-3629a56a614f/native-home/projects/-Example-Project/6a7eabee-41e7-4c46-9dc0-c18315fc546b.jsonl"
+   },
+   "dataRef": null,
+   "severity": "info",
+   "affectsCompletion": false
+  }
+ }
+]

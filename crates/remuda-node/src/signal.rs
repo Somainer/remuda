@@ -119,6 +119,22 @@ pub fn file_activity(observation: &Observation) -> Option<remuda_protocol::Activ
     }
 }
 
+/// c-cardsettle r3 item 8: a hook/lifecycle observation attributed to a
+/// SUBAGENT (a relatedIds.agentId paired with an agentType, e.g.
+/// workflow-subagent) belongs to that subagent's scope — its start/stop/failure
+/// never moves the ROOT session's turn or activity. Only root observations
+/// (no agentId) drive the main composer.
+pub(crate) fn is_subagent_scoped(native: &NativeLifecycle) -> bool {
+    native
+        .related_ids
+        .get("agentId")
+        .is_some_and(|id| !id.is_empty())
+        && native
+            .related_ids
+            .get("agentType")
+            .is_some_and(|kind| !kind.is_empty())
+}
+
 /// The activity a hook observation proves, if it proves one.
 ///
 /// This is the §4.3 priority made real: without it the hook events are
@@ -134,10 +150,15 @@ pub fn file_activity(observation: &Observation) -> Option<remuda_protocol::Activ
 pub fn hook_activity(observation: &Observation) -> Option<remuda_protocol::Activity> {
     use remuda_protocol::Activity;
     let native = hook_lifecycle(observation)?;
+    // r3 item 8 clarification: a subagent's turn never moves the root turn.
+    if is_subagent_scoped(native) {
+        return None;
+    }
     match native.native_name.as_str() {
         "UserPromptSubmit" => Some(Activity::Working),
-        // A turn that ended badly still ended: the composer has to come back,
-        // or the user cannot type again after one failed turn.
+        // A ROOT turn that ended badly still ended: the composer has to come
+        // back, or the user cannot type again after one failed turn.
+        // (Subagent StopFailure is filtered above.)
         "Stop" | "StopFailure" => Some(Activity::Idle),
         // Only a real blocking request is a human turn. A `Notification` is an
         // idle-time advisory (the "waiting for your input" idle prompt fires

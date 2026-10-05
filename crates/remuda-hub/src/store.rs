@@ -5771,17 +5771,31 @@ fn apply_instance_projection(
             .get("severity")
             .and_then(Value::as_str)
             .unwrap_or("");
-        // c-cardsettle r2 item 1: only a REAL process end marks the instance
-        // failed/exited. A failed model/effort/permission switch on a still-
-        // running PTY session arrives as `instance.configure` (topic
-        // `configuration`, affectsCompletion=false, severity=error) — folding
-        // that into lifecycle=failed would wrongly invalidate the session's
-        // pending cards and a running hook would never get its allow. Real
-        // process deaths (pane exit, startup failure, shell-only drop) all
-        // carry topic `session` and affectsCompletion=true.
+        // c-cardsettle r2 item 1 / r3 addendum — owner rule: an instance is
+        // terminal ONLY from evidence the PROCESS ENDED (native exit / exit
+        // code, process/PTY gone, tty closed, launch that never started, Node
+        // reporting the instance gone). Every other failure is TURN-level and
+        // never folds the lifecycle: a failed live configure switch
+        // (topic=configuration), a hook StopFailure / turn-topic failure
+        // (stop button failed; outcome=failed ends the turn), API/hook/
+        // diagnostic errors, and any SUBAGENT-scoped observation
+        // (relatedIds.agentId + agentType — a workflow member's failure).
+        // Real deaths carry topic `session` (or a diagnostic emitted at a
+        // confirmed startup failure) + affectsCompletion=true.
         let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
         let affects_completion = payload.get("affectsCompletion").and_then(Value::as_bool);
-        let nonterminal_observation = topic == "configuration" || affects_completion == Some(false);
+        let subagent_scoped = native_payload_is_subagent(&payload);
+        // Non-terminal when the process survived (affectsCompletion=false),
+        // the event is a subagent's, or it is an informational topic
+        // (configure/hook/task/plan/diagnostic). topic=turn stays OUT of this
+        // list: a print driver's final result error arrives there with
+        // affectsCompletion=true and genuinely completes the process.
+        let nonterminal_observation = subagent_scoped
+            || affects_completion == Some(false)
+            || matches!(
+                topic,
+                "configuration" | "hook" | "task" | "plan" | "diagnostic"
+            );
         let failed = !nonterminal_observation
             && (severity == "error"
                 || native_name.contains("error")
@@ -8225,6 +8239,171 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r3 addendum (three-way split):
+    ///  (a) subagent / workflow-member / configure / diagnostic failures stay in
+    ///      their OWN scope — they do not touch the root turn/activity and
+    ///      never the lifecycle;
+    ///  (b) a ROOT-session failure (StopFailure with no agentId, or a root API
+    ///      error ending the root turn) ends the root TURN failed (status/idle,
+    ///      composer retryable) but the process stays alive — lifecycle not
+    ///      terminal;
+    ///  (c) only process-end evidence (native exit/exit code, process/PTY
+    ///      gone, launch never started, Node says gone) is lifecycle terminal.
+    #[test]
+    fn non_process_failure_signals_are_turn_level_not_terminal() {
+        // (label, payload json; derived lifecycle must not be failed)
+        let cases: Vec<(&str, Value)> = vec![
+            // Failed live configure switch (model/effort/permission).
+            (
+                "configure-error",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"configuration","nativeName":"instance.configure",
+                    "severity":"error","affectsCompletion":false,
+                    "status":{"state":"known","value":"model-control-unavailable:x"}}}),
+            ),
+            // The stop button failed on the MAIN session: turn ends failed,
+            // process alive.
+            (
+                "main-stop-failure",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"StopFailure",
+                    "severity":"warning","affectsCompletion":false,
+                    "status":{"state":"known","value":"idle"},
+                    "relatedIds":{"outcome":"failed","phase":"turn-ended"}}}),
+            ),
+            // The exact owner-reported bug: a workflow SUBAGENT's StopFailure
+            // (agentId + agentType) ends the subagent's turn, never the main
+            // instance.
+            (
+                "subagent-stop-failure",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"StopFailure",
+                    "severity":"warning","affectsCompletion":false,
+                    "status":{"state":"known","value":"idle"},
+                    "relatedIds":{
+                        "agentId":"a77755a5a987d3e0c","agentType":"workflow-subagent",
+                        "outcome":"failed","phase":"turn-ended"}}}),
+            ),
+            // severity=error API/hook diagnostic.
+            (
+                "error-diagnostic",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"diagnostic","nativeName":"api_error",
+                    "severity":"error","affectsCompletion":false,
+                    "status":{"state":"known","value":"rate limited"}}}),
+            ),
+            // hook-topic error.
+            (
+                "hook-error",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"hook","nativeName":"hook_failed",
+                    "severity":"error","affectsCompletion":false,
+                    "status":{"state":"known","value":"error"}}}),
+            ),
+            // Subagent lifecycle marker on session topic, severity error.
+            (
+                "subagent-session-error",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"session","nativeName":"error",
+                    "severity":"error","affectsCompletion":true,
+                    "status":{"state":"known","value":"error"},
+                    "relatedIds":{"agentId":"x","agentType":"workflow-subagent"}}}),
+            ),
+        ];
+        for (label, event) in cases {
+            let (lifecycle, _activity) = derive_instance_state(&event);
+            assert_ne!(
+                lifecycle,
+                Some("failed"),
+                "{label} is turn-level and must not mark the instance failed"
+            );
+            assert_ne!(
+                lifecycle,
+                Some("exited"),
+                "{label} must not mark the instance exited"
+            );
+        }
+
+        // The signals that DO end it via the DERIVED start-fail/entity rules.
+        // (severity=error native exits are additionally projected as failed by
+        // apply_instance_projection; native_terminal_projection_... covers that
+        // path with a real topic=session/affectsCompletion=true exit.)
+        let terminal_cases: Vec<(&str, Value)> = vec![
+            (
+                "native-driver-start-failed",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"session","nativeName":"x",
+                    "severity":"error","affectsCompletion":true,
+                    "reasonCode":"native-driver-start-failed",
+                    "status":{"state":"known","value":"error"}}}),
+            ),
+            // The print driver's FINAL result error: topic=turn but the result
+            // completed the one-shot process (affectsCompletion=true), so it is
+            // terminal (the watch-failed projection pinned by tests/watch).
+            (
+                "print-final-result-error",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"result",
+                    "affectsCompletion":true,
+                    "status":{"state":"known","value":"error"},
+                    "relatedIds":{"resultIndex":"1","numTurns":"1"}}}),
+            ),
+            (
+                "entity-failed",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"entity","entityType":"instance","state":"failed"}}),
+            ),
+        ];
+        for (label, event) in terminal_cases {
+            let (lifecycle, _) = derive_instance_state(&event);
+            assert!(
+                matches!(lifecycle, Some("failed") | Some("exited")),
+                "{label} is real process-end evidence and must be terminal, got {lifecycle:?}"
+            );
+        }
+    }
+
+    /// c-cardsettle r3 item 8: replay the scrubbed owner evidence (a workflow
+    /// subagent's failed stop plus SubagentStart/Stop markers) through the
+    /// durable Hub projection. The main instance stays running with its card
+    /// pending; nothing settles.
+    #[tokio::test]
+    async fn replayed_subagent_stopfailure_does_not_end_the_main_instance() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-subagent").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        let events: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/subagent-hook-events.json"))
+                .expect("fixture parses");
+        // Seed a ready lifecycle before the fixture (the fixture's seq 1981+
+        // events append after the test seed's seq 2).
+        let mut batch = Vec::new();
+        for event in events.iter() {
+            batch.push(event.clone());
+        }
+        store
+            .append_journal_batch(host.clone(), instance.instance_id.clone(), Some(2), batch)
+            .await
+            .expect("replay evidence");
+
+        let row = store
+            .get_instance(instance.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.lifecycle, "running",
+            "a subagent StopFailure never ends the main instance"
+        );
+        let (state, _) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "pending", "the main session's card stays pending");
+        store.close().await;
+    }
+
     /// c-cardsettle (native terminal projection): a NATIVE terminal event —
     /// a real process death (`topic=session`, nativeName "exit",
     /// affectsCompletion=true, severity "error") — writes lifecycle=failed
@@ -9664,6 +9843,27 @@ fn knowledge_value(value: Option<&Value>) -> Option<&str> {
         .or_else(|| value.get("value").and_then(Value::as_str))
 }
 
+/// c-cardsettle r3 item 8: a native lifecycle observation attributed to a
+/// SUBAGENT (a non-empty `relatedIds.agentId` paired with an `agentType`,
+/// e.g. workflow-subagent) belongs to that subagent's row, never the main
+/// instance. Main-session observations carry no agentId.
+fn native_payload_is_subagent(payload: &Value) -> bool {
+    let related = payload
+        .get("relatedIds")
+        .or_else(|| payload.get("related_ids"));
+    let Some(related) = related.and_then(Value::as_object) else {
+        return false;
+    };
+    related
+        .get("agentId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+        && related
+            .get("agentType")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| !kind.is_empty())
+}
+
 /// Terminal interaction states that no longer answer and leave the actionable
 /// queue.
 const TERMINAL_INSTANCE_LIFECYCLES: &[&str] = &["exited", "failed", "closed"];
@@ -9883,18 +10083,36 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         .or_else(|| knowledge_value(payload.pointer("/entity/activity")))
         .or_else(|| event.get("activity").and_then(Value::as_str));
 
-    // c-cardsettle r2 item 1: a failed live configure switch
-    // (`instance.configure`, topic `configuration` / affectsCompletion=false)
-    // is NOT a process death, even when its severity is error: it must never
-    // fold a still-running session to failed (which would settle its cards).
-    let configure_error = payload_type == "native"
-        && (payload.get("topic").and_then(Value::as_str) == Some("configuration")
-            || payload.get("affectsCompletion").and_then(Value::as_bool) == Some(false));
-    let start_failed = !configure_error
+    // c-cardsettle r3 addendum: a failure that is NOT evidence the process
+    // ended must never fold the lifecycle. Turn-level / configure / hook /
+    // diagnostic / subagent-scoped failures keep the session running; only a
+    // real start failure (reason native-driver-start-failed / start-fail
+    // name / entity failed) is terminal. The discriminator is
+    // `affectsCompletion`: false = the process survived (root turn failure /
+    // configure / subagent), true = this result completed the (one-shot)
+    // process, so a print driver's final `result` error at topic=turn IS
+    // terminal. Informational topics (diagnostic/hook/task/plan/configure) are
+    // never the lifecycle even with the flag set.
+    let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
+    let affects_completion = payload.get("affectsCompletion").and_then(Value::as_bool);
+    let process_alive = affects_completion == Some(false);
+    let informational_topic = payload_type == "native"
+        && matches!(
+            topic,
+            "hook" | "task" | "plan" | "configuration" | "diagnostic"
+        );
+    let subagent_scoped = payload_type == "native" && native_payload_is_subagent(payload);
+    // topic=turn is allowed to be terminal only with affectsCompletion=true
+    // (the print driver's final result); process_alive already covers the
+    // affectsCompletion=false turn (StopFailure/root API error).
+    let nonterminal_native_failure = subagent_scoped || process_alive || informational_topic;
+    let start_failed = !nonterminal_native_failure
         && (reason == "native-driver-start-failed"
             || native_name == "native-driver-start-failed"
             || native_name.contains("start-fail")
-            || status.is_some_and(|s| s == "failed" || s == "error")
+            || (!informational_topic
+                && !subagent_scoped
+                && status.is_some_and(|s| s == "failed" || s == "error"))
             || entity_state == Some("failed"));
     if start_failed && (kind == "lifecycle" || payload_type == "native" || payload_type == "entity")
     {
@@ -9915,13 +10133,9 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         || payload_type == "native"
         || payload.get("entityType").and_then(Value::as_str) == Some("instance");
     if herdr_idle_proof && let Some(status) = status {
-        // c-cardsettle r3 item 1: same configure exclusion here — a native
-        // status value of failed/error on a non-terminal configuration
-        // observation (affectsCompletion=false / topic=configuration) must not
-        // map the still-running PTY session to failed.
-        let nonterminal_native = payload_type == "native"
-            && (payload.get("topic").and_then(Value::as_str) == Some("configuration")
-                || payload.get("affectsCompletion").and_then(Value::as_bool) == Some(false));
+        // c-cardsettle r3 addendum: the same non-terminal set keeps a literal
+        // failed/error native status from mapping the running session to
+        // failed (stop-button failure, configure error, subagent event).
         match status {
             "starting" | "started" => {
                 lifecycle = Some(if status == "starting" {
@@ -9935,7 +10149,7 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
                 activity = normalize_activity(status);
             }
             "exited" => lifecycle = Some("exited"),
-            "failed" | "error" if !nonterminal_native => lifecycle = Some("failed"),
+            "failed" | "error" if !nonterminal_native_failure => lifecycle = Some("failed"),
             _ => {}
         }
     }

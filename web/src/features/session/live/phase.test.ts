@@ -214,3 +214,42 @@ describe("isActivePhase", () => {
     expect(isActivePhase("tool-started")).toBe(true);
   });
 });
+
+describe("subagent-scoped phases (c-cardsettle r3 item 8)", () => {
+  it("ignores a workflow subagent's turn-ended/failed, keeps the root turn live", () => {
+    // Main turn is working…
+    const working = turnLive(
+      1,
+      phase("thinking", T0),
+      T0,
+    );
+    // …then a SUBAGENT's StopFailure carries a turn-ended+failed tag.
+    const subagentFailed = turnLive(
+      2,
+      phase("turn-ended", T0, {
+        outcome: "failed",
+        agentId: "a77755a5a987d3e0c",
+        agentType: "workflow-subagent",
+      }),
+      "2026-10-05T00:00:05.000Z",
+    );
+    const got = livePhase([working, subagentFailed]);
+    expect(got?.phase, "a subagent turn-ended never settles the root strip").toBe(
+      "thinking",
+    );
+  });
+
+  it("still settles a ROOT turn-ended failed (no agentId)", () => {
+    const working = turnLive(1, phase("thinking", T0), T0);
+    const rootFailed = turnLive(
+      2,
+      phase("turn-ended", T0, { outcome: "failed" }),
+      "2026-10-05T00:00:05.000Z",
+      "hook",
+      "StopFailure",
+    );
+    const got = livePhase([working, rootFailed]);
+    expect(got?.phase).toBe("turn-ended");
+    expect(got?.outcome).toBe("failed");
+  });
+});

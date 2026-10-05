@@ -1717,7 +1717,9 @@ async fn pump_one_observation(
     prompts.correlate(&mut observation);
     // §5.5 before the generic failure fold: a clean exit carries
     // `Severity::Info` and would otherwise fall through both, leaving
-    // a finished instance reported as `ready`.
+    // a finished instance reported as `ready`. A subagent's lifecycle (the
+    // failed workflow member in the bug report) and any non-session/non-
+    // completion observation is never the main process exiting.
     if let Some(exit) = native_exit(&observation) {
         record_native_exit(store.as_ref(), instance_id, &exit);
     } else if let Some(reason) = native_failure_reason(&observation) {
@@ -2570,14 +2572,31 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
     let LifecyclePayload::Native(native) = payload.as_ref() else {
         return None;
     };
-    // c-cardsettle r3 item 1: a failed LIVE configure switch (model/effort/
-    // permission) is not a process death. The driver reports it on
-    // topic=configuration with affectsCompletion=false even at severity=error;
-    // folding that into record_task_exit would journal a FAILED entity and the
-    // Hub would invalidate a live session's pending approval while the PTY is
-    // still running. Real deaths carry topic=session + affectsCompletion=true
-    // (see failure_lifecycle in the driver).
-    if native.topic == remuda_protocol::LifecycleTopic::Configuration || !native.affects_completion
+    // c-cardsettle r3 item 1 + addendum (owner rule: "even failed must not be
+    // equated with the process exiting; after failed you can retry; only
+    // process exit / tty gone should go to resume"). An instance becomes
+    // terminal ONLY from evidence the PROCESS ENDED. The discriminator is the
+    // driver's `affectsCompletion`:
+    //  - affectsCompletion=false → the process is still alive: a failed live
+    //    configure switch (topic=configuration), a hook StopFailure / a root
+    //    turn failure the PTY survives (topic=turn), a subagent-scoped event
+    //    (relatedIds.agentId + agentType, e.g. workflow-subagent). All are
+    //    turn-level / own-scope and never end the main instance.
+    //  - affectsCompletion=true → this result IS the process completion. A
+    //    one-shot print driver's final `result` error (topic=turn) and a real
+    //    pane/process death (topic=session, name exit/error/gone) then
+    //    terminate. Informational topics (diagnostic/hook/task/plan/configure)
+    //    are never the process lifecycle even with the flag set.
+    if is_subagent_observation(native)
+        || !native.affects_completion
+        || matches!(
+            native.topic,
+            remuda_protocol::LifecycleTopic::Configuration
+                | remuda_protocol::LifecycleTopic::Diagnostic
+                | remuda_protocol::LifecycleTopic::Hook
+                | remuda_protocol::LifecycleTopic::Task
+                | remuda_protocol::LifecycleTopic::Plan
+        )
     {
         return None;
     }
@@ -2602,6 +2621,21 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
     }
 }
 
+/// c-cardsettle r3 item 8: a native lifecycle observation attributed to a
+/// SUBAGENT (a `relatedIds.agentId` paired with an `agentType`, or the
+/// workflow tailer's id field) is the subagent's row, never the main
+/// instance. Main-session observations carry no agentId.
+fn is_subagent_observation(native: &remuda_protocol::NativeLifecycle) -> bool {
+    native
+        .related_ids
+        .get("agentId")
+        .is_some_and(|id| !id.is_empty())
+        && native
+            .related_ids
+            .get("agentType")
+            .is_some_and(|kind| !kind.is_empty())
+}
+
 /// A PTY process that ended, as reported by the driver's exit waiter (§5.5).
 ///
 /// Separate from [`native_failure_reason`] because a *clean* exit is not a
@@ -2624,6 +2658,11 @@ fn native_exit(observation: &remuda_protocol::Observation) -> Option<NativeExit>
         return None;
     };
     if native.native_name != remuda_driver::shell_pty::NATIVE_EXIT {
+        return None;
+    }
+    // r3 item 8: a subagent's exit observation is the subagent's row, never
+    // the main process.
+    if is_subagent_observation(native) {
         return None;
     }
     let Knowledge::Known { value: state } = &native.status else {
@@ -3420,6 +3459,210 @@ mod tests {
         );
     }
 
+    /// c-cardsettle r3 addendum: a StopFailure on the MAIN session is a TURN
+    /// failure (topic=turn, affectsCompletion=false), never a process exit —
+    /// `record_task_exit` must not fire, so after a failed stop the composer is
+    /// usable again in the same live process.
+    #[test]
+    fn main_stop_failure_ends_only_the_turn_not_the_process() {
+        let obs = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "StopFailure",
+            "not-applicable",
+            &[("outcome", "failed"), ("phase", "turn-ended")],
+            remuda_protocol::Severity::Warning,
+            false,
+            "idle",
+        );
+        assert_eq!(
+            native_failure_reason(&obs),
+            None,
+            "a main StopFailure is turn-level, not a task exit"
+        );
+        assert!(native_exit(&obs).is_none());
+    }
+
+    /// c-cardsettle r3 item 8: any hook/turn/session observation carrying a
+    /// subagent agentId is the subagent's row — even a topic=session
+    /// severity=error "error" name must not fail the MAIN instance.
+    #[test]
+    fn subagent_observations_never_fail_the_main_instance() {
+        for (topic, name, severity, completion) in [
+            (
+                remuda_protocol::LifecycleTopic::Turn,
+                "StopFailure",
+                remuda_protocol::Severity::Warning,
+                false,
+            ),
+            (
+                remuda_protocol::LifecycleTopic::Diagnostic,
+                "SubagentStop",
+                remuda_protocol::Severity::Info,
+                false,
+            ),
+            // A subagent process genuinely dying is still the subagent's row.
+            (
+                remuda_protocol::LifecycleTopic::Session,
+                "error",
+                remuda_protocol::Severity::Error,
+                true,
+            ),
+        ] {
+            let obs = native_lifecycle_full(
+                topic,
+                name,
+                "not-applicable",
+                &[
+                    ("agentId", "a77755a5a987d3e0c"),
+                    ("agentType", "workflow-subagent"),
+                ],
+                severity,
+                completion,
+                "idle",
+            );
+            assert_eq!(
+                native_failure_reason(&obs),
+                None,
+                "subagent {name} must not fail the main instance"
+            );
+            assert!(
+                native_exit(&obs).is_none(),
+                "a subagent exit must not exit the main instance"
+            );
+        }
+    }
+
+    /// c-cardsettle r3 addendum — table-driven process-end vs turn-level.
+    #[test]
+    fn failure_signal_classification_table() {
+        use remuda_protocol::Severity;
+        // (label, topic, name, severity, affects_completion, related, is_terminal)
+        use remuda_protocol::LifecycleTopic;
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            LifecycleTopic,
+            &str,
+            Severity,
+            bool,
+            &[(&str, &str)],
+            bool,
+        )> = vec![
+            // Turn-level: configure / stop / hooks / diagnostics / subagents.
+            (
+                "configure",
+                LifecycleTopic::Configuration,
+                "instance.configure",
+                Severity::Error,
+                false,
+                &[],
+                false,
+            ),
+            (
+                "main-stop-failure",
+                LifecycleTopic::Turn,
+                "StopFailure",
+                Severity::Warning,
+                false,
+                &[("outcome", "failed")],
+                false,
+            ),
+            (
+                "main-stop",
+                LifecycleTopic::Turn,
+                "Stop",
+                Severity::Info,
+                false,
+                &[],
+                false,
+            ),
+            (
+                "hook-error",
+                LifecycleTopic::Hook,
+                "hook_failed",
+                Severity::Error,
+                false,
+                &[],
+                false,
+            ),
+            (
+                "diagnostic-error",
+                LifecycleTopic::Diagnostic,
+                "api_error",
+                Severity::Error,
+                false,
+                &[],
+                false,
+            ),
+            (
+                "subagent-stop-failure",
+                LifecycleTopic::Turn,
+                "StopFailure",
+                Severity::Warning,
+                false,
+                &[
+                    ("agentId", "a1"),
+                    ("agentType", "workflow-subagent"),
+                    ("outcome", "failed"),
+                ],
+                false,
+            ),
+            (
+                "subagent-exit",
+                LifecycleTopic::Session,
+                "error",
+                Severity::Error,
+                true,
+                &[("agentId", "a1"), ("agentType", "workflow-subagent")],
+                false,
+            ),
+            // Terminal: only real process ends of the MAIN session.
+            (
+                "pane-exit",
+                LifecycleTopic::Session,
+                "exit",
+                Severity::Error,
+                true,
+                &[("lastError", "pane exited")],
+                true,
+            ),
+            (
+                "startup-error",
+                LifecycleTopic::Session,
+                "error",
+                Severity::Error,
+                true,
+                &[("lastError", "agent process exited during startup")],
+                true,
+            ),
+            (
+                "gone",
+                LifecycleTopic::Session,
+                "agent_gone",
+                Severity::Error,
+                true,
+                &[],
+                true,
+            ),
+        ];
+        for (label, topic, name, severity, completion, related, terminal) in cases {
+            let obs = native_lifecycle_full(
+                topic,
+                name,
+                "not-applicable",
+                related,
+                severity,
+                completion,
+                "idle",
+            );
+            let is_failure = native_failure_reason(&obs).is_some();
+            assert_eq!(
+                is_failure, terminal,
+                "{label}: expected terminal={terminal}, got native_failure_reason={is_failure}"
+            );
+        }
+    }
+
     /// A live claude-print run emits several hook lifecycles after its session
     /// event, and `nativeId` there is the *hook* id. Recording one left
     /// nativeRef holding an id `claude --resume` rejects (D-026).
@@ -3559,6 +3802,109 @@ mod tests {
         })
         .await
         .expect("a genuine exit still fails the instance");
+
+        drop(tx);
+        pump.await.unwrap();
+    }
+
+    /// c-cardsettle r3 item 8 — the owner-reported sequence: a workflow
+    /// subagent's failed stop (StopFailure, agentId=workflow-subagent,
+    /// outcome=failed) followed by subagent start/stop markers keeps the MAIN
+    /// instance running and usable. The failed outcome belongs to the
+    /// subagent's turn only.
+    #[tokio::test]
+    async fn subagent_stopfailure_pump_keeps_the_main_instance_running() {
+        use remuda_protocol::DriverKind;
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudePty,
+        )
+        .unwrap();
+        let id = instance.meta.id.clone();
+        store.insert_instance(instance).unwrap();
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+        );
+
+        // The subagent's failed stop (the bug event)…
+        tx.send(native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "StopFailure",
+            "not-applicable",
+            &[
+                ("agentId", "a77755a5a987d3e0c"),
+                ("agentType", "workflow-subagent"),
+                ("outcome", "failed"),
+                ("phase", "turn-ended"),
+            ],
+            remuda_protocol::Severity::Warning,
+            false,
+            "idle",
+        ))
+        .await
+        .unwrap();
+        // …and subagent start/stop markers for other workflow members.
+        for (name, agent) in [
+            ("SubagentStop", "aac4b44de81e78e29"),
+            ("SubagentStart", "a6866168bc7ba361f"),
+        ] {
+            tx.send(native_lifecycle_full(
+                remuda_protocol::LifecycleTopic::Diagnostic,
+                name,
+                "not-applicable",
+                &[("agentId", agent), ("agentType", "workflow-subagent")],
+                remuda_protocol::Severity::Info,
+                false,
+                "idle",
+            ))
+            .await
+            .unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let row = store.get_instance(&id).unwrap();
+        assert!(
+            !matches!(
+                row.lifecycle,
+                InstanceLifecycle::Failed | InstanceLifecycle::Exited
+            ),
+            "a subagent failure never ends the main instance: {:?}",
+            row.lifecycle
+        );
+
+        // A subsequent MAIN-session StopFailure ends the TURN failed but still
+        // never the process.
+        tx.send(native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "StopFailure",
+            "not-applicable",
+            &[("outcome", "failed"), ("phase", "turn-ended")],
+            remuda_protocol::Severity::Warning,
+            false,
+            "idle",
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let row = store.get_instance(&id).unwrap();
+        assert!(
+            !matches!(
+                row.lifecycle,
+                InstanceLifecycle::Failed | InstanceLifecycle::Exited
+            ),
+            "a main StopFailure ends the TURN, not the process: {:?}",
+            row.lifecycle
+        );
 
         drop(tx);
         pump.await.unwrap();

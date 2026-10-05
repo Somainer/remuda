@@ -355,7 +355,11 @@ async function waitAnchorStable(
  * measurement correction tail has not run: the font released right after this
  * genuinely races the restore, instead of waiting until it has settled.
  */
-async function waitAnchorRendered(page: Page, anchor: number, { timeout = 15_000 }: {} = {}): Promise<number> {
+async function waitAnchorRendered(
+  page: Page,
+  anchor: number,
+  { timeout = 15_000 }: { timeout?: number } = {},
+): Promise<number> {
   const handle = await page.waitForFunction(
     ({ label }) => {
       const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']");
@@ -656,13 +660,15 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
   await expect(page.getByTestId("jump-latest")).not.toBeVisible();
   await firstGate.dispose();
 
-  // Leave and come back. The final visit gets its OWN fresh closed gate (the
-  // first document cached the woff2, so force revalidation): verify the font
-  // is genuinely unloaded AND the transcript is already pinned on fallback
-  // before release, then verify it stays pinned after the swap — again with
-  // no manual scroll to hide a failure.
-  await page.goto("/sessions");
-  await expect(page.getByTestId("session-list")).toBeVisible();
+  // Leave and come back. On this 390px viewport the router redirects
+  // /sessions to the mobile home /m (ViewportGate), so leave there. The
+  // final visit gets its OWN fresh closed gate (the first document cached the
+  // woff2, so force revalidation): verify the font is genuinely unloaded AND
+  // the transcript is already pinned on fallback before release, then verify
+  // it stays pinned after the swap — again with no manual scroll to hide a
+  // failure.
+  await page.goto("/m");
+  await expect(page.getByTestId("home-list")).toBeVisible();
   const finalGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
   await page.goto(`/s/${instanceId}`);
   await expect(page.getByTestId("transcript-row")).not.toHaveCount(0, { timeout: 15_000 });

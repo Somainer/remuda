@@ -25,7 +25,7 @@
 //!     to …` note on the next line;
 //!   * 2.1.221: `Set model to <bold>name</bold> and saved as your default …`.
 
-use crate::{EffortSource, EventId, Id, Timestamp};
+use crate::{EffortName, EffortSource, EventId, Id, Timestamp};
 
 /// Strip SGR escapes (`\x1b[…m`) only. The verdict carries bold/dim styling;
 /// other escape families never appear inside `<local-command-stdout>`.
@@ -78,8 +78,18 @@ pub struct ObservedModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelStdout {
     /// `Set model to <id>` — the switch is in effect now. Carries the resolved
-    /// id the TUI printed (an alias like `sonnet` resolves to a concrete id).
-    Accepted(ObservedModel),
+    /// id the TUI printed (an alias like `sonnet` resolves to a concrete id),
+    /// and the effort level an optional `` with `<level>` effort`` suffix
+    /// stated (D-056 §4: that suffix is an effort observation attributed like
+    /// the model switch; it was absent on 2.1.289, so `None` is the common
+    /// case).
+    Accepted {
+        /// Resolved model id.
+        model: ObservedModel,
+        /// Effort level the verdict's trailing ` with `<level>` effort` clause
+        /// stated, if any.
+        effort: Option<EffortName>,
+    },
     /// `Kept model as <id>` — the picker/dialog was dismissed.
     Kept,
     /// `Model '<id>' not found`.
@@ -107,12 +117,27 @@ fn resolved_id_after_prefix(rest: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_owned())
 }
 
+/// Extract the effort level from an optional `` with `<level>` effort``
+/// suffix (D-056 §4). The suffix was not reproduced on 2.1.289
+/// (effort-sync-4 §5 row 9), so a verdict without it yields `None`.
+fn effort_suffix(t: &str) -> Option<EffortName> {
+    let marker = " with `";
+    let start = t.find(marker)? + marker.len();
+    let end = start + t[start..].find('`')?;
+    let level = &t[start..end];
+    if !t[end + 1..].starts_with(" effort") {
+        return None;
+    }
+    crate::parse_plain_level(level)
+}
+
 /// Parse the verdict out of a `/model` `<local-command-stdout>` line.
 ///
 /// Measured strings:
 /// - `` Set model to `acme_hub/model_x_o48[1m]` and saved as your default
 ///   for new sessions `` (plus an optional dim second line about
 ///   `ANTHROPIC_MODEL` being set)
+/// - the same line optionally ending `` with `<level>` effort``
 /// - `Set model to \x1b[1mmodel-y\x1b[22m and saved as your default …`
 /// - `` Kept model as `acme_hub/model_x_o48[1m]` ``
 /// - `Model 'bogus-xyz-123' not found`
@@ -125,7 +150,11 @@ pub fn parse_model_stdout(text: &str) -> ModelStdout {
     if let Some(rest) = t.strip_prefix("Set model to")
         && let Some(id) = resolved_id_after_prefix(rest)
     {
-        return ModelStdout::Accepted(ObservedModel { id });
+        let effort = effort_suffix(t);
+        return ModelStdout::Accepted {
+            model: ObservedModel { id },
+            effort,
+        };
     }
     if t.starts_with("Kept model as") {
         return ModelStdout::Kept;
@@ -195,7 +224,9 @@ impl ModelTracker {
         from_remuda: bool,
     ) -> Option<(ObservedModel, EffortSource)> {
         match parse_model_stdout(stdout) {
-            ModelStdout::Accepted(observed) => {
+            ModelStdout::Accepted {
+                model: observed, ..
+            } => {
                 let mut source = if from_remuda {
                     EffortSource::Remuda
                 } else {
@@ -504,7 +535,10 @@ mod tests {
         match parse_model_stdout(
             "Set model to `acme_hub/model_x_o48[1m]` and saved as your default for new sessions",
         ) {
-            ModelStdout::Accepted(o) => assert_eq!(o.id, "acme_hub/model_x_o48[1m]"),
+            ModelStdout::Accepted { model, effort } => {
+                assert_eq!(model.id, "acme_hub/model_x_o48[1m]");
+                assert_eq!(effort, None);
+            }
             other => panic!("{other:?}"),
         }
         // The dim ANTHROPIC_MODEL hint rides the second line with more
@@ -512,14 +546,53 @@ mod tests {
         let with_hint = "Set model to `acme_hub/model_x_o50` and saved as your default for \
 new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`acme_hub/model_x_o48[1m]`\x1b[22m";
         match parse_model_stdout(with_hint) {
-            ModelStdout::Accepted(o) => assert_eq!(o.id, "acme_hub/model_x_o50"),
+            ModelStdout::Accepted { model, effort } => {
+                assert_eq!(model.id, "acme_hub/model_x_o50");
+                assert_eq!(effort, None);
+            }
             other => panic!("{other:?}"),
         }
         // 2.1.221 bold spelling.
         match parse_model_stdout(
             "Set model to \x1b[1mmodel-y\x1b[22m and saved as your default for new sessions",
         ) {
-            ModelStdout::Accepted(o) => assert_eq!(o.id, "model-y"),
+            ModelStdout::Accepted { model, effort } => {
+                assert_eq!(model.id, "model-y");
+                assert_eq!(effort, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_the_with_level_effort_suffix() {
+        // D-056 §4: a model verdict that also changes effort states the level
+        // in a trailing ` with `<level>` effort` clause. Not reproduced on
+        // 2.1.289 (effort-sync-4 §5 row 9) — parsing must not depend on it.
+        match parse_model_stdout(
+            "Set model to `Opus 5.5` and saved as your default for new sessions with `high` effort",
+        ) {
+            ModelStdout::Accepted { model, effort } => {
+                assert_eq!(model.id, "Opus 5.5");
+                assert_eq!(effort, Some(EffortName::High));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A trailing backticked clause that is not "… effort" stays None.
+        match parse_model_stdout(
+            "Set model to `Opus 5.5` and saved as your default for new sessions with `high` quality",
+        ) {
+            ModelStdout::Accepted { effort, .. } => assert_eq!(effort, None),
+            other => panic!("{other:?}"),
+        }
+        // An unknown level word in the suffix does not poison the accept.
+        match parse_model_stdout(
+            "Set model to `m` and saved as your default for new sessions with `bogus` effort",
+        ) {
+            ModelStdout::Accepted { model, effort } => {
+                assert_eq!(model.id, "m");
+                assert_eq!(effort, None);
+            }
             other => panic!("{other:?}"),
         }
     }

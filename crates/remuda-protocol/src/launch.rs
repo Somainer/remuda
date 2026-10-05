@@ -335,13 +335,15 @@ impl<'de> Deserialize<'de> for EffortSelection {
 }
 
 /// Effective effort, read back from a Claude assistant transcript record
-/// (`effort` / `perTurnEffort`); D-028 §9.1.
+/// (`effort` / `perTurnEffort`); D-028 §9.1 / D-056.
 ///
-/// This is the *observed* tier, never the requested one. Claude reports
-/// `ultracode` sessions as level `xhigh` and does not repeat the workflow flag
-/// on assistant records, so `ultracode` is `None` unless the observation path
-/// has positive evidence (e.g. an immediately preceding `/effort ultracode`
-/// switch the driver itself made).
+/// This is the *observed* tier, never the requested one. Claude never repeats
+/// the ultracode workflow flag on assistant records: it is read from the
+/// `/effort` verdicts and the `ultra_effort_enter` / `ultra_effort_exit`
+/// attachments instead. On coupled builds (2.1.203–2.1.283) the flag implies
+/// xhigh; on decoupled builds (≥ 2.1.284) it is an orthogonal toggle that
+/// latches at every level. `ultracode` is `None` until this process has
+/// positive evidence either way.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EffortEffective {

@@ -9,7 +9,15 @@
 //! with the onboarding flag, folder trust for its cwd and logging hooks, so a
 //! level "saved as your default" never touches the operator's own config and
 //! the transcript carries no personal skills or MCP listings. One claude runs
-//! at a time; every pid lands in `PROBE_DIR/pids.txt`.
+//! at a time, and the next case starts only after the previous claude and its
+//! process group are confirmed gone.
+//!
+//! Every process the probe starts directly is in the ledger
+//! `PROBE_DIR/pids.txt`: the probe itself, each claude session (at spawn and
+//! at confirmed termination), and every short helper (`claude --version`,
+//! `hostname`, `scutil`, the pre-kill `ps`/`lsof`), which all go through
+//! [`run_logged`]. Processes claude starts itself, such as its hook scripts,
+//! are not in the ledger.
 //!
 //! Output per session, under `PROBE_DIR/<case>/`: the raw transcript copy,
 //! the rendered vt100 screens and `actions.json` (per-step verdicts, dialog
@@ -22,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use remuda_screen::Emulator;
 use serde_json::{Value, json};
 
@@ -53,6 +61,8 @@ struct Case {
 
 struct Ctx {
     root: PathBuf,
+    /// `pids.txt`: every process this probe starts directly.
+    ledger: PathBuf,
     model: String,
     version: String,
     digits: String,
@@ -77,18 +87,21 @@ pub async fn run(scenario: &str) {
     );
     let model = std::env::var("REMUDA_PROBE_MODEL")
         .expect("REMUDA_PROBE_MODEL must name the model id to record with");
-    let version = cli_version();
-    let digits: String = version.chars().filter(char::is_ascii_digit).collect();
     let _ = std::fs::remove_dir_all(&given);
     std::fs::create_dir_all(given.join("out")).unwrap();
     let root = std::fs::canonicalize(&given).unwrap();
+    // The ledger exists before the first subprocess, the version query.
+    let ledger = root.join("pids.txt");
+    append_pid(&ledger, std::process::id(), "probe", "self");
+    let version = cli_version(&ledger);
+    let digits: String = version.chars().filter(char::is_ascii_digit).collect();
     let ctx = Ctx {
         root,
+        ledger,
         model,
         version,
         digits,
     };
-    append_pid(&ctx, std::process::id(), "probe", "self");
     println!("probe claude {} model {}", ctx.version, ctx.model);
 
     let cases = match scenario {
@@ -264,11 +277,8 @@ fn launch_cases(ctx: &Ctx) -> Vec<Case> {
     cases
 }
 
-fn cli_version() -> String {
-    let out = std::process::Command::new("claude")
-        .arg("--version")
-        .output()
-        .expect("claude --version");
+fn cli_version(ledger: &Path) -> String {
+    let out = run_logged(ledger, "claude", &["--version"]).expect("claude --version");
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .next()
@@ -276,13 +286,38 @@ fn cli_version() -> String {
         .to_owned()
 }
 
-fn append_pid(ctx: &Ctx, pid: u32, what: &str, label: &str) {
+fn append_pid(ledger: &Path, pid: u32, what: &str, label: &str) {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(ctx.root.join("pids.txt"))
+        .open(ledger)
         .unwrap();
     writeln!(file, "{pid} {what} {label}").unwrap();
+}
+
+/// The one way this probe runs a short helper: spawn, write its pid to the
+/// ledger, wait for it, then write its exit status. Its output is returned,
+/// never logged.
+fn run_logged(
+    ledger: &Path,
+    program: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    let label = std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    append_pid(ledger, pid, "helper", &label);
+    let out = child.wait_with_output()?;
+    append_pid(ledger, pid, "exited", &format!("{label} {}", out.status));
+    Ok(out)
 }
 
 fn quote(p: &Path) -> String {
@@ -584,43 +619,90 @@ impl Session {
         })
     }
 
-    async fn exit(mut self, ctx: &Ctx) -> Self {
+    /// End the session and return only once it is confirmed gone: `/exit`,
+    /// then, if claude still runs after 15 s, a logged kill followed by a
+    /// reap. claude leads its own process group (the PTY spawn runs
+    /// `setsid`), so the group must drain too, which means no hook it started
+    /// can still be writing. `Err` means termination could not be established
+    /// and the caller aborts the matrix.
+    async fn exit(mut self, ledger: &Path) -> Result<Self, String> {
         self.drain();
         self.write(b"/exit");
         sleep_ms(150).await;
         self.write(b"\r");
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut status = None;
-        while Instant::now() < deadline {
-            if let Ok(Some(s)) = self.child.try_wait() {
-                status = Some(s);
-                break;
+        let pid = self
+            .pid
+            .ok_or_else(|| format!("{}: claude pid unknown", self.label))?;
+        let mut status = self.wait_exit(Duration::from_secs(15)).await?;
+        if status.is_none() {
+            // Ours, by pid from our own spawn: show what it is before the kill.
+            describe_pid(ledger, pid);
+            // SIGHUP, then SIGKILL after a short grace; it does not reap.
+            match self.child.kill() {
+                Ok(()) => append_pid(ledger, pid, "kill-sent", &self.label),
+                Err(err) => {
+                    append_pid(ledger, pid, "kill-failed", &format!("{} {err}", self.label))
+                }
+            }
+            status = self.wait_exit(Duration::from_secs(10)).await?;
+        }
+        let Some(status) = status else {
+            append_pid(ledger, pid, "unconfirmed", &self.label);
+            return Err(format!(
+                "claude pid {pid} ({}) still running after the kill",
+                self.label
+            ));
+        };
+        append_pid(ledger, pid, "exited", &format!("{} {status:?}", self.label));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while group_alive(pid) {
+            if Instant::now() >= deadline {
+                append_pid(ledger, pid, "group-alive", &self.label);
+                return Err(format!(
+                    "process group {pid} ({}) still has members after claude exited",
+                    self.label
+                ));
             }
             sleep_ms(100).await;
         }
-        let pid = self.pid.unwrap_or(0);
-        if let Some(s) = status {
-            append_pid(ctx, pid, "exited", &format!("{} {s:?}", self.label));
-        } else {
-            // Ours, by pid from our own spawn: show what it is before the kill.
-            describe_pid(pid);
-            self.child.kill().ok();
-            append_pid(ctx, pid, "killed", &self.label);
+        append_pid(ledger, pid, "group-drained", &self.label);
+        Ok(self)
+    }
+
+    /// Poll (and so reap) the claude child for up to `within`.
+    async fn wait_exit(&mut self, within: Duration) -> Result<Option<ExitStatus>, String> {
+        let deadline = Instant::now() + within;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Ok(Some(status)),
+                Ok(None) if Instant::now() < deadline => sleep_ms(100).await,
+                Ok(None) => return Ok(None),
+                Err(err) => return Err(format!("{}: waiting for claude: {err}", self.label)),
+            }
         }
-        self
     }
 }
 
-fn describe_pid(pid: u32) {
+/// Whether any process is left in group `pgid`. Signal 0 delivers nothing;
+/// only `ESRCH` proves the group empty, so any other answer counts as alive.
+fn group_alive(pgid: u32) -> bool {
+    let pgid = nix::unistd::Pid::from_raw(i32::try_from(pgid).unwrap_or(i32::MAX));
+    !matches!(
+        nix::sys::signal::killpg(pgid, None),
+        Err(nix::errno::Errno::ESRCH)
+    )
+}
+
+fn describe_pid(ledger: &Path, pid: u32) {
+    let pid = pid.to_string();
     for (tool, args) in [
-        ("ps", vec!["-o", "pid=,command=", "-p"]),
-        ("lsof", vec!["-a", "-d", "cwd", "-Fn", "-p"]),
+        ("ps", ["-o", "pid=,command=", "-p", pid.as_str()].as_slice()),
+        (
+            "lsof",
+            ["-a", "-d", "cwd", "-Fn", "-p", pid.as_str()].as_slice(),
+        ),
     ] {
-        let out = std::process::Command::new(tool)
-            .args(args)
-            .arg(pid.to_string())
-            .output();
-        if let Ok(out) = out {
+        if let Ok(out) = run_logged(ledger, tool, args) {
             println!(
                 "before kill ({tool}): {}",
                 String::from_utf8_lossy(&out.stdout).trim()
@@ -691,7 +773,7 @@ async fn launch(ctx: &Ctx, case: &Case, dir: &Path) -> Session {
     let child = pair.slave.spawn_command(cmd).unwrap();
     drop(pair.slave);
     let pid = child.process_id();
-    append_pid(ctx, pid.unwrap_or(0), "claude", case.id);
+    append_pid(&ctx.ledger, pid.unwrap_or(0), "claude", case.id);
     println!(
         "[{}] spawned claude pid {pid:?} args {:?}",
         case.id, case.args
@@ -760,7 +842,11 @@ async fn run_case(ctx: &Ctx, case: &Case) -> String {
         };
         steps.push(step);
     }
-    let session = session.exit(ctx).await;
+    let session = session
+        .exit(&ctx.ledger)
+        .await
+        .unwrap_or_else(|err| panic!("aborting the matrix before the next case: {err}"));
+    // Only a confirmed termination gets here, so the transcript is final.
     let report = json!({
         "case": case.id,
         "cli_version": ctx.version,
@@ -1006,7 +1092,7 @@ impl Scrub {
                 forbidden.push(tmp);
             }
         }
-        for host in hostnames() {
+        for host in hostnames(&ctx.ledger) {
             pairs.push((host.clone(), "devbox".into()));
             forbidden.push(host);
         }
@@ -1136,21 +1222,15 @@ impl Scrub {
     }
 }
 
-fn hostnames() -> Vec<String> {
+fn hostnames(ledger: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    for args in [vec![], vec!["-s"]] {
-        if let Ok(o) = std::process::Command::new("hostname").args(&args).output() {
-            let host = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-            if host.len() >= 4 && !out.contains(&host) {
-                out.push(host);
-            }
-        }
-    }
-    for key in ["LocalHostName", "ComputerName"] {
-        if let Ok(o) = std::process::Command::new("scutil")
-            .args(["--get", key])
-            .output()
-        {
+    for (program, args) in [
+        ("hostname", [].as_slice()),
+        ("hostname", ["-s"].as_slice()),
+        ("scutil", ["--get", "LocalHostName"].as_slice()),
+        ("scutil", ["--get", "ComputerName"].as_slice()),
+    ] {
+        if let Ok(o) = run_logged(ledger, program, args) {
             let host = String::from_utf8_lossy(&o.stdout).trim().to_owned();
             if host.len() >= 4 && !out.contains(&host) {
                 out.push(host);

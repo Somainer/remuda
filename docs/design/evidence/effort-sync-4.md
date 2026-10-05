@@ -23,8 +23,23 @@ paraphrased.
 | latency | submit CR → the first 10 ms transcript poll that sees the `<local-command-stdout>` record |
 | fixtures | `crates/remuda-driver/tests/fixtures/effort-21289/` (transcripts + `.txt` screen logs), transcripts mirrored in `crates/remuda-journal/tests/fixtures/effort-21289/`; sequences and scrub in `SOURCES.md` |
 
-Every session ended with `/exit` and status 0; the probe's `pids.txt` lists
-each pid it started, and none needed a kill.
+**Process ledger (`PROBE_DIR/pids.txt`).**
+
+- **Recorded runs** (probe as of `43352377`/`650cbc61`): the ledger held the
+  probe's own pid and each claude session's pid, at spawn and with its exit
+  status. Every session ended through `/exit` with status 0, so the kill path
+  never ran.
+- **What that ledger missed:** the short helpers that probe started directly
+  and ran to completion: one `claude --version` per run, and four
+  `hostname` / `scutil` lookups per session while scrubbing.
+- **The probe now:** every process it starts directly goes into the ledger.
+  Helpers go through one spawn/log/wait function. Each claude session is
+  logged at spawn and again at confirmed termination: it must be reaped and
+  its process group drained before the transcript is copied. A forced
+  shutdown logs the kill result, and if termination cannot be confirmed the
+  matrix aborts. Processes claude starts itself, such as its hook scripts,
+  are not in the ledger.
+- The recordings were not redone for this change.
 
 ## 2. Version boundary
 

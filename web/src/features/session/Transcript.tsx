@@ -291,6 +291,16 @@ function TranscriptInner({
   // switch stops the estimate converging for the next session).
   const restoringRef = useRef(false);
   const scrollTopRef = useRef(0);
+  /**
+   * Echo record of a load-earlier restore's OWN scrollTop write. A scroll
+   * event is the write's echo only while this record is held AND its current
+   * scrollTop lands at (within rounding of) the recorded target. Every other
+   * event — a reader gesture, j/k navigation, a search hit, 跳到最新 — is an
+   * intentional jump that cancels the restore instead of being swallowed.
+   * The seq lets a later write's rAF invalidate only its own record.
+   */
+  const restoreEchoRef = useRef<{ top: number; seq: number } | null>(null);
+  const restoreEchoSeqRef = useRef(0);
   const saveTimer = useRef<number | null>(null);
   const pendingScroll = useRef<
     | { kind: "index"; index: number; offset: number; tries: number }
@@ -353,6 +363,8 @@ function TranscriptInner({
     prependAnchorRef.current = null;
     loadReqRef.current = null;
     restoringRef.current = false;
+    restoreEchoRef.current = null;
+    restoreEchoSeqRef.current = 0;
     steeringRef.current.clear();
     setLoadingEarlier(false);
     setRowHeights(new Map());
@@ -411,21 +423,25 @@ function TranscriptInner({
   );
   const scrollerRef = useRef<HTMLDivElement>(null);
   /**
-   * Held across the scroll event fired by an ARMED load-earlier restore's own
-   * scrollTop write (the write + its event can land before the click's
-   * finally). A rAF scheduled with the write clears it once that event is
-   * delivered, so the echo never cancels the restore. Unarmed component
-   * scrolls (mount pin/follow, saved/search restores) do not set it and leave
-   * the scroll listener behaving exactly as before.
+   * Write scrollTop programmatically. `fromRestore` marks a load-earlier /
+   * saved-position restore's OWN write: its dispatched scroll event is
+   * recorded (target + seq) so the listener recognizes the echo. Writes from
+   * every other caller (j/k, search, 跳到最新, pin/resize re-pins, growth
+   * anchoring) are intentional navigation: they invalidate any pending echo
+   * record so their event cancels an armed restore instead of protecting it.
+   * A rAF drops a record when the write was clamped to the same offset and
+   * the browser dispatched no event.
    */
-  const suppressScrollGestureRef = useRef(false);
-  const programmaticScroll = useCallback((el: HTMLElement, top: number) => {
-    const armed = loadReqRef.current !== null && !loadReqRef.current.done;
-    if (armed) {
-      suppressScrollGestureRef.current = true;
+  const programmaticScroll = useCallback((el: HTMLElement, top: number, fromRestore = false) => {
+    if (fromRestore) {
+      const seq = restoreEchoSeqRef.current + 1;
+      restoreEchoSeqRef.current = seq;
+      restoreEchoRef.current = { top, seq };
       requestAnimationFrame(() => {
-        suppressScrollGestureRef.current = false;
+        if (restoreEchoRef.current?.seq === seq) restoreEchoRef.current = null;
       });
+    } else {
+      restoreEchoRef.current = null;
     }
     el.scrollTop = top;
     scrollTopRef.current = top;
@@ -742,7 +758,7 @@ function TranscriptInner({
     }
     const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) > 1) {
-      programmaticScroll(el, el.scrollTop + delta);
+      programmaticScroll(el, el.scrollTop + delta, true);
       held.tries = 0;
       return;
     }
@@ -853,7 +869,7 @@ function TranscriptInner({
           restoringRef.current = false;
           return;
         }
-        programmaticScroll(el, el.scrollTop + delta);
+        programmaticScroll(el, el.scrollTop + delta, true);
       } else {
         // The anchor is not mounted yet: jump toward its estimated offset so
         // the window mounts it, then later passes correct against the real
@@ -864,7 +880,7 @@ function TranscriptInner({
         if (index >= 0) {
           const { offsets } = rowOffsets(nodes.length, sizes, estimate);
           const top = Math.round((offsets[index] ?? 0) + pending.offset);
-          programmaticScroll(el, top);
+          programmaticScroll(el, top, true);
         }
       }
       pending.tries += 1;
@@ -1206,12 +1222,15 @@ function TranscriptInner({
           // A reader who navigates manually WHILE an older page is in flight
           // owns the position: cancel that click's held anchors so the prepend
           // cannot restore them back to the click-time row. The restore's OWN
-          // programmatic scrollTop writes land at the recorded target, so a
-          // scroll matching it is the echo of our math, not a gesture, and must
-          // not cancel the restore that just scrolled there.
-          const programmatic = suppressScrollGestureRef.current;
-          suppressScrollGestureRef.current = false;
-          if (!programmatic) {
+          // programmatic scrollTop writes record their target, so only an
+          // event landing at that target is the echo of our math; an
+          // intentional programmatic navigation (j/k, a search hit, 跳到最新)
+          // invalidated the record before its event and cancels like a
+          // gesture, so it is never swallowed by the restore.
+          const echo = restoreEchoRef.current;
+          restoreEchoRef.current = null;
+          const ownEcho = echo !== null && Math.abs(el.scrollTop - echo.top) <= 2;
+          if (!ownEcho) {
             const req = loadReqRef.current;
             if (req && !req.done && !req.cancelled) {
               req.cancelled = true;

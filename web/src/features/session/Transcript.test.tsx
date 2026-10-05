@@ -2443,4 +2443,106 @@ describe("load-earlier anchor lifecycle round 5", () => {
     expect(reg.events.insR[0]?.seq).toBe("1001");
     expect(button()).not.toBeNull();
   });
+
+  // UO-6a round 6 item 2: while an older page is in flight, the restore must
+  // suppress only its OWN scroll echo. j/k navigation, search jumps and 跳到最新
+  // are intentional programmatic navigation: their events cancel the restore
+  // and the landing prepend must not restore the click-time row instead.
+  describe("round 6 item 2: in-flight programmatic navigation wins", () => {
+    type OlderPage = ReturnType<typeof pageOf>;
+
+    function setup(instanceId: string) {
+      const user = userEvent.setup();
+      const writes: number[] = [];
+      const geo = installGeo(50, {
+        echoOnWrite: true,
+        onWrite: (v) => {
+          writes.push(v);
+        },
+      });
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const tail: Observation[] = [];
+      for (let i = 0; i < 50; i += 1) tail.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", instanceId));
+      const older: Observation[] = [];
+      for (let seq = 901; seq <= 1000; seq += 1) {
+        older.push(m(seq, seq % 2 ? "user" : "assistant", instanceId));
+      }
+      const g = gate<OlderPage>();
+      makeClient(reg, instanceId, tail, () => g.promise, "1001", "1050");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (iid) => {
+        const result = await reg.clients[iid]!.loadEarlier();
+        reg.setFloor[iid]?.(reg.clients[iid]!.retainedFloorSeq);
+        return result;
+      });
+      render(
+        <MemoryRouter initialEntries={[`/s/${instanceId}`]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      geo.scrollTo(0);
+      return { user, geo, g, writes, older };
+    }
+
+    async function land(g: ReturnType<typeof setup>["g"], older: Observation[]) {
+      await act(async () => {
+        g.resolve(pageOf(older));
+        await Promise.resolve();
+      });
+      await act(async () => {});
+    }
+
+    // A leaked restore disables growth anchoring for the session (the hold
+    // bails while a prepend anchor is held). Cancelling must release it: after
+    // sitting at a genuine reading position, a row above the sampled anchor
+    // grows and the scroller compensates.
+    async function expectGrowthHolds(geo: ReturnType<typeof setup>["geo"]) {
+      geo.scrollTo(25 * ROW);
+      await act(async () => {});
+      const before = geo.top();
+      geo.growRow(4, ROW + 40);
+      expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+    }
+
+    it("j navigation during the fetch cancels the restore and stays on its turn", async () => {
+      const { user, geo, g, writes, older } = setup("insJ");
+      await user.click(screen.getByTestId("load-earlier"));
+      // First press selects turn 0 (already at top: no write/no event); the
+      // second jumps to turn 1 — its echo is an intentional navigation.
+      await user.keyboard("jj");
+      await land(g, older);
+      // The prepend would restore the click-time row to 100*ROW; the cancelled
+      // restore never writes it and the j target survives the prepend.
+      expect(writes).not.toContain(100 * ROW);
+      expect(geo.top()).toBe(ROW);
+      expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
+      await expectGrowthHolds(geo);
+    });
+
+    it("跳到最新 during the fetch cancels the restore and keeps the tail pinned", async () => {
+      const { user, geo, g, writes, older } = setup("insLatest");
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.click(screen.getByTestId("jump-latest"));
+      await land(g, older);
+      expect(writes).not.toContain(100 * ROW);
+      expect(geo.top()).toBe(50 * ROW);
+    });
+
+    it("a search jump during the fetch cancels the restore and stays on its hit", async () => {
+      const { user, geo, g, writes, older } = setup("insSearch");
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.click(screen.getByTestId("transcript-search-open"));
+      await user.type(screen.getByTestId("transcript-search-input"), "insSearch-m1035");
+      await user.keyboard("[Enter]");
+      await land(g, older);
+      // The prepend would restore the click-time row (100*ROW); the cancelled
+      // restore never writes it and the scroller stays at the search target.
+      expect(writes).not.toContain(100 * ROW);
+      expect(geo.top()).toBe(34 * ROW);
+      expect(geo.top()).not.toBe(100 * ROW);
+      await expectGrowthHolds(geo);
+    });
+  });
 });

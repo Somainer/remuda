@@ -95,6 +95,11 @@ pub const METHOD_HOST_FILES_READ: &str = "host.files.read";
 /// answer "unknown method", which the Hub surfaces as a clean 400 instead of
 /// hanging the route.
 pub const METHOD_HOST_FILES_SEARCH: &str = "host.files.search";
+/// Hub→Node: browse the host filesystem for a directory to register
+/// (c-dirpicker). Directories only, confined to the Node's configured
+/// `workspace_roots`, never following symlinks. Human-origin callers only;
+/// the Hub refuses Bot/Agent origins before proxying.
+pub const METHOD_HOST_DIRS_LIST: &str = "host.dirs.list";
 
 // ── api.* stream class (D-048, 2026-09-19) ─────────────────────────────────
 //
@@ -466,6 +471,59 @@ pub struct HostFilesSearchResult {
     pub files_scanned: u64,
     /// Total file bytes read in content mode.
     pub bytes_scanned: u64,
+}
+
+/// `host.dirs.list` params (c-dirpicker). The human-only directory browser.
+///
+/// Every path is an absolute Node path: the browser is not anchored to a
+/// registered workspace, but the Node confines it to the configured
+/// `workspace_roots` allowlist (the same policy registration validates
+/// against). Symlinks are never followed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDirsListParams {
+    /// Absolute directory to list. Absent names the Node default start
+    /// (the user's home when it lies inside an allowed root, else the first
+    /// allowed root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Include dot-directories; absent/`false` hides them.
+    #[serde(default)]
+    pub show_hidden: bool,
+}
+
+/// One subdirectory row in a [`HostDirsListResult`]. Symlinks are never
+/// listed (lstat classification), so a row is always a real directory the
+/// browser can descend into without escaping the allowlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDirEntry {
+    /// Bare directory name; never a path.
+    pub name: String,
+}
+
+/// `host.dirs.list` result: the canonical directory, navigation boundaries
+/// and its subdirectories (bounded).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDirsListResult {
+    /// Canonical absolute directory that was actually listed.
+    pub path: String,
+    /// Canonical parent when it still lies inside an allowed root; `None` at
+    /// the browse boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Canonical user home when it lies inside an allowed root, else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// Canonical configured allowlist roots (`workspace_roots`).
+    pub roots: Vec<String>,
+    /// Canonical already-registered workspace roots, for quick jumps.
+    pub workspaces: Vec<String>,
+    /// Subdirectories, sorted by name and capped at the Node bound.
+    pub dirs: Vec<HostDirEntry>,
+    /// True when entries were dropped at the result-size cap.
+    pub truncated: bool,
 }
 
 /// `node.auth` params (stdio first frame).

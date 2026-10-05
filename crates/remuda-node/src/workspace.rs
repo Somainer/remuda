@@ -91,6 +91,46 @@ impl WorkspaceRegistry {
         self.state.workspaces.clone()
     }
 
+    /// Canonical allowlist roots workspace registration (and the directory
+    /// browser, c-dirpicker) are confined to.
+    pub(crate) fn allowed_roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// Whether a prepare for this commandId was already persisted (an
+    /// idempotent Hub retry must not re-run admission checks).
+    pub(crate) fn has_prepared_command(&self, command_id: &str) -> bool {
+        self.state.commands.contains_key(command_id)
+    }
+
+    /// Resolve an unregister path (exact stored root, else a canonical alias
+    /// under the bounded probe) to its registered workspace id. Returns
+    /// `Ok(None)` when the path names no registered workspace.
+    pub(crate) fn workspace_id_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<WorkspaceId>, NodeError> {
+        let candidate = Path::new(path);
+        if let Some(workspace) = self
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| Path::new(&workspace.root_path) == candidate)
+        {
+            return Ok(Some(workspace.meta.id.clone()));
+        }
+        if !candidate.is_absolute() {
+            return Ok(None);
+        }
+        let canonical = canonical_directory(candidate)?;
+        Ok(self
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| Path::new(&workspace.root_path) == canonical)
+            .map(|workspace| workspace.meta.id.clone()))
+    }
+
     pub(crate) fn snapshot(&self) -> Value {
         json!({"workspaceRevision": self.state.revision, "workspaces": self.state.workspaces.iter().map(|workspace| {
             json!({"workspaceId": workspace.meta.id, "hostId": workspace.host_id, "root": workspace.root_path})
@@ -474,11 +514,65 @@ impl DevNode {
         if method == "workspace.list" {
             return self.workspace_snapshot();
         }
+        // c-dirpicker: an unregister prepare is refused while this Node still
+        // has a live session in the workspace. Ended sessions keep their
+        // history rows and never block removal; the Hub enforces the same
+        // rule for its task ledger before the command is ever queued.
+        if method == "workspace.unregister" {
+            self.guard_live_workspace_unregister(&params)?;
+        }
         self.inner
             .workspace_registry
             .write()
             .map_err(|_| NodeError::StorePoisoned)?
             .mutate(method, serde_json::from_value(params)?)
+    }
+
+    /// Refuse a fresh `workspace.unregister` prepare for a workspace with a
+    /// live session. Idempotent retries of an already-prepared command skip
+    /// the check: the Hub re-sends prepare verbatim after a transport loss.
+    fn guard_live_workspace_unregister(&self, params: &Value) -> Result<(), NodeError> {
+        let request: WorkspaceMutationParams = serde_json::from_value(params.clone())?;
+        if request.phase != WorkspaceMutationPhase::Prepare {
+            return Ok(());
+        }
+        let registry = self
+            .inner
+            .workspace_registry
+            .read()
+            .map_err(|_| NodeError::StorePoisoned)?;
+        if registry.has_prepared_command(&request.command_id) {
+            return Ok(());
+        }
+        // Resolve the path exactly the way the unregister prepare does: an
+        // exact stored canonical path wins, otherwise canonicalize the
+        // operator's alias (bounded probe). Without this, a `/a/../b`-shaped
+        // alias for a busy workspace would skip the guard and reach mutate.
+        let Some(workspace_id) = registry.workspace_id_for_path(&request.path)? else {
+            // An unknown/unresolvable path is the registry's prepare error.
+            return Ok(());
+        };
+        let live = self
+            .list_instances()?
+            .items
+            .iter()
+            .filter(|instance| {
+                instance.workspace_id == workspace_id
+                    && !matches!(
+                        instance.lifecycle,
+                        remuda_protocol::InstanceLifecycle::Exited
+                            | remuda_protocol::InstanceLifecycle::Failed
+                    )
+            })
+            .count();
+        if live > 0 {
+            return Err(NodeError::Conflict(format!(
+                "workspace {} is still used by {live} live session(s); \
+                 end them before removing the directory (session history is kept)",
+                request.path
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn resolve_workspace_cwd(
@@ -1199,6 +1293,78 @@ mod tests {
                 .to_string()
                 .contains("worktree directory")
         );
+    }
+
+    #[tokio::test]
+    async fn unregister_is_refused_while_a_live_session_uses_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let extra = root.path().join("extra");
+        fs::create_dir_all(extra.join("src")).unwrap();
+        let config = config(root.path(), data.path()).with_workspaces(vec![extra.clone()]);
+        let node = DevNode::new(&config).unwrap();
+        let workspace = node.workspaces().unwrap()[1].clone();
+
+        // A long-lived shell in the workspace blocks the unregister prepare.
+        let request: crate::CreateInstanceRequest = serde_json::from_value(json!({
+            "workspaceId": workspace.meta.id,
+            "kind": "terminal",
+            "driver": "shell-pty",
+            "args": ["sleep", "120"],
+            "prompt": "",
+        }))
+        .unwrap();
+        let created = node.create_instance(request).await.unwrap();
+        let instance_id = created.instance.meta.id.clone();
+        let error = node
+            .workspace_rpc(
+                "workspace.unregister",
+                json!({"commandId": "remove-busy", "path": workspace.root_path, "phase": "prepare"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 live session"), "{error}");
+
+        // A canonical alias for the same busy directory must not slip past
+        // the guard.
+        let aliased = format!("{}/./extra", root.path().canonicalize().unwrap().display());
+        let error = node
+            .workspace_rpc(
+                "workspace.unregister",
+                json!({"commandId": "remove-busy-alias", "path": aliased, "phase": "prepare"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 live session"), "{error}");
+
+        // Other workspaces are unaffected.
+        let first = node.workspaces().unwrap()[0].clone();
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-other", "path": first.root_path, "phase": "prepare"}),
+        )
+        .unwrap();
+
+        // Once the live session is purged (purge closes the driver first),
+        // the same command prepares and commits.
+        node.purge_instance(&instance_id).await.unwrap();
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-busy", "path": workspace.root_path, "phase": "prepare"}),
+        )
+        .unwrap();
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-busy", "path": workspace.root_path, "phase": "commit"}),
+        )
+        .unwrap();
+        assert!(
+            node.workspaces()
+                .unwrap()
+                .iter()
+                .all(|row| row.meta.id != workspace.meta.id)
+        );
+        node.shutdown().await.unwrap();
     }
 
     #[test]

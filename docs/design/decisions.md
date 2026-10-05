@@ -1403,3 +1403,41 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
   - `crates/remuda-driver/src/effort.rs:50,229,521`
   - `web/src/lib/store.ts:3292-3296`
   - `web/src/features/session/effort.ts:419-438`
+
+## D-057
+
+**2026-10-05 · 新建任务的目录浏览器与「移除目录」占用门（c-dirpicker：host.dirs.list + unregister guard）**
+
+| 日期 | 2026-10-05 |
+|---|---|
+| 状态 | adopted |
+| 相关 | [ui-spec.md](./ui-spec.md) §2 新建会话工作目录、[files-view-contract.md](./files-view-contract.md)（既有只读 host 文件通道）、D-023（workspace 注册协议）、[protocol.md §7.2](./protocol.md) |
+
+**背景**：
+
+- 新建任务（新建会话）页的「工作目录」此前只能从已注册目录里选，或在「+ 添加目录」里手敲一台主机上的绝对路径。路径记不住、敲错只会在提交后被 Node 以 `outside allowed workspace_roots` 拒绝；已注册目录也没有移除入口之外的保护——Hosts 页的「移除」直接解绑，即使该目录正有会话在跑。
+- 内网验收确认过「workspace lookup」的诉求：通过 Node 浏览主机文件系统找到目录并注册。既有 `host.files.*` 不能复用为浏览通道：它以**已注册 workspace 根**为锚（或 `/tmp/remuda-*` scratch），无法浏览尚未注册的目录；且它是文件+目录混列。
+
+**决策**：
+
+1. **新增 Node RPC `host.dirs.list`**（Hub→Node，JSON-RPC，走三条既有 carrier 的统一分发表）。入参 `{path?: 绝对路径, showHidden?: bool}`，出参 `{path, parent?, home?, roots[], workspaces[], dirs:[{name}], truncated}`。
+   - **只列目录**：`lstat` 判定，symlink 永不列出、永不跟随——一条指向 allowlist 外的链接不能成为导航目标；fifo/socket/device 同样不出现。
+   - **边界沿用注册策略**：可浏览范围就是 Node 配置的 `workspace_roots`（默认 `$HOME`），与 `workspace.register` 的 `validate` 同一张 allowlist；在 canonical 路径上做 containment，拒绝相对路径、拒绝非目录、拒绝越界。空入参的默认起点是「位于 allowlist 内的 `$HOME`」，否则第一个存在的 allowlist 根。
+   - **结果有界**：最多返回 4096 个目录、最多扫描 16384 个条目，超出置 `truncated:true`；不做深分页、不做递归。
+   - `roots`/`workspaces`/`home`/`parent` 让前端渲染面包屑、回到主目录、跳到已注册根和上一级，且边界（不能再往上）由 Node 给。
+2. **新增 Hub 端点 `GET /v1/hosts/{id}/dirs`**，代理到在线 Node 的 `host.dirs.list`。与 `host.files.*`（Human **或** Bot）不同，浏览器能枚举尚未注册的目录，因此**只允许 Human-origin 设备**：`require_operator` 之外再要求 `origin == Human`，Bot 与 Agent 一律 403；主机不存在 404、离线 409。路径主机永远是被寻址主机，不允许代理到别的主机。
+3. **前端**：「+ 添加目录」打开目录浏览器 Modal（面包屑 + 过滤框 + 「显示隐藏目录」开关 + 「使用此文件夹」），选定后走**既有**的 `workspace.register` 两阶段注册，不新增注册 wire；手敲绝对路径保留为「高级：手动输入路径」。遵循 [ui-spec.md](./ui-spec.md) / [visual-system.md](./visual-system.md) 的 Modal、role token 与移动端 viewport 约定。
+4. **移除目录（unregister）增加占用门**：
+   - Hub 在排队 `workspace.unregister` 命令**之前**统计该 `(hostId, workspaceId)` 的占用：Hub instances 表中 `lifecycle NOT IN ('exited','failed','closed')` 的会话，以及 tasks 表中非归档且 state 不属于 `done/failed`、`doc_json.workspaceBinding` 指向该目录的任务。任一非零即 **409**，理由（N live session(s) / N active task(s)）原样返回给前端，不产生命令行、不碰 Node 文件。
+   - Node 在 unregister **prepare** 上做同一道 live-session 门（权威数据在 Node 本机，离线积压命令重放时同样生效）；同一 commandId 的幂等 prepare 重放跳过检查。
+   - **只解绑、不删文件**；已结束会话的历史行保留且不再阻挡移除（Hub 行保留可查；Node 侧注册表仅移除成员身份）。前端移除前弹确认框，拒绝理由内联展示。
+
+**非目标**：
+
+- 不做文件浏览/下载（那是既有 `host.files.*` 的职责）；不做递归树、虚拟卷浏览、allowlist 之外的提权浏览。
+- 不改 `workspace.register` 的两阶段协议与 worktree 边界规则；浏览到的目录在「使用此文件夹」时仍要过注册的全部既有校验。
+- 不自动结束会话、不自动归档任务；占用由操作者先处理。
+
+**由谁**：c-dirpicker。Hub 端点、Node RPC、前端与文档在同一分支落地。
+
+**测试**：Node 单测（containment、symlink 不导航、隐藏目录开关、4096 上限、默认起点）；Hub 集成测试（Human 200、Bot/Agent 403、404/409、占用 409 不到达 Node、结束后两阶段解绑成功）；Hub SQL 单测（live/ended 会话与各种 task state/归档组合）；web 单测（浏览、过滤、手动输入、确认、拒绝理由）；HUB_E2E_DIR_PICKER=1 的 hub playwright（浏览器添加 + 占用拒绝/结束后移除，截图仅在 REMUDA_EVIDENCE 下）。

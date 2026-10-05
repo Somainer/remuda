@@ -183,6 +183,26 @@ async fn workspace_routes_require_settlement_persist_and_forbid_agents() -> Resu
         .send()
         .await?;
     assert_eq!(hostile_origin.status(), 403);
+    // c-dirpicker: while the session above is still live, an unregister is
+    // refused (409, reason names the live session) for any operator origin,
+    // and the refusal reaches the Node never.
+    let busy = client
+        .delete(&url)
+        .bearer_auth(&bot)
+        .json(&json!({"path":"/tmp/project"}))
+        .send()
+        .await?;
+    assert_eq!(busy.status(), 409);
+    assert!(busy.text().await?.contains("live session"));
+    // Ending the session (its history row stays) clears the Hub-side guard.
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .or_else(|| created["instance"]["id"].as_str())
+        .context("instance id")?;
+    db.execute(
+        "UPDATE instances SET lifecycle = 'exited', activity = 'idle' WHERE id = ?1",
+        [instance_id],
+    )?;
     let removed: Value = client
         .delete(&url)
         .bearer_auth(&bot)
@@ -193,6 +213,13 @@ async fn workspace_routes_require_settlement_persist_and_forbid_agents() -> Resu
         .json()
         .await?;
     assert_eq!(removed["workspaces"], json!([]));
+    // The ended session's history row is untouched by the unbind.
+    let kept_history: i64 = db.query_row(
+        "SELECT COUNT(*) FROM instances WHERE id = ?1",
+        [instance_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(kept_history, 1);
     let again: Value = client
         .post(&url)
         .bearer_auth(&human)

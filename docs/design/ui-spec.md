@@ -646,6 +646,13 @@ Bot / `claude-print` 实例没有终端 tab。Artifact 产物页走订阅登录�
 
 校验：主机 `connectivity`/offline 禁用开始；cwd 不在该主机 Workspace 表则先「登记项目」。开始后进 `/s/:id`，顶栏 `starting`，失败停留本页并显示错误。
 
+**目录浏览器（c-dirpicker，D-057）**：「+ 添加目录」打开目录浏览器 Modal，不再要求盲打绝对路径。
+
+- 数据来自该主机 Node 的 `host.dirs.list`（Human-only；只读、只列目录、不跟随 symlink、Node 以其 `workspace_roots` allowlist 为界，单页有条数上限，超限显示截断提示）。
+- Modal 自上而下：说明句（只解绑/只读语义）、快捷跳转（主目录 + 已注册根 chips）、面包屑（allowlist 根为首段，到达边界时「上一级」禁用）、当前目录过滤框（客户端即时过滤）与「显示隐藏目录」开关（默认关，重取该目录）、目录列表（点行进入子目录）、底部「高级：手动输入路径」（保留绝对路径直填，提交前仍校验必须以 `/` 开头）与「使用此文件夹：<当前绝对路径>」。
+- 「使用此文件夹」走既有 workspace 注册两阶段；成功后关闭 Modal 并在「已有目录」里选中新目录。注册失败（allowlist 外、不可访问等）理由内联留在 Modal 内，不关闭、不换路径。
+- 移除目录（`/hosts` 与主机详情的已注册目录列表）：先确认（说明只解绑不删文件、有占用会被拒绝、已结束会话保留历史）；Hub/Node 在仍有进行中会话或未归档未结束任务占用时返回拒绝，理由内联显示，行保留。
+
 高级（折叠）：`--settings` overlay、max budget。`CLAUDE_CONFIG_DIR` 与 `--bg --name` 不进 M0 表单。禁止同一 Instance 从 print 热切 `--bg`。
 
 ---
@@ -726,6 +733,8 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
   Workspace  最近 cwd …
   [新会话]
 ```
+
+已注册目录每行带「移除」：点击先弹确认（只解除 Remuda 与目录的绑定，不删除任何文件；仍有进行中会话或未结束任务时移除会被拒绝并显示理由，已结束会话保留历史——D-057）。拒绝后行保留、错误内联展示；主机离线时按钮禁用。
 
 **不要**复用 herdrx `transport: local|ssh|tailcat`，也**不要**用 herdr paneId 当 instanceId。无「打开 herdr 工作台」按钮。
 

@@ -163,6 +163,84 @@ async fn require_host(state: &AppState, id: &str) -> Result<(), HubError> {
     Ok(())
 }
 
+/// Lifecycles that still count as using a workspace (same set the seat
+/// uniqueness guard uses). Ended sessions (`exited`/`failed`/`closed`) keep
+/// their history rows but never block an unregister.
+const ACTIVE_WORKSPACE_SESSION_SQL: &str = "lifecycle NOT IN ('exited', 'failed', 'closed')";
+
+/// Task states that no longer occupy the bound directory. A parked or
+/// deferred task still holds its lease, so it keeps blocking removal; an
+/// archived task of any state is considered settled.
+const INACTIVE_TASK_STATES: &str = "('done', 'failed')";
+
+/// Count live sessions and active (non-archived) tasks bound to one host's
+/// workspace. c-dirpicker refuses an unregister while either count is non-zero.
+async fn workspace_users(
+    state: &AppState,
+    host_id: &str,
+    workspace_id: &str,
+) -> Result<(i64, i64), HubError> {
+    let host = host_id.to_owned();
+    let workspace = workspace_id.to_owned();
+    state
+        .store
+        .run_named("workspace_users", move |conn| {
+            count_workspace_users(conn, &host, &workspace)
+        })
+        .await
+        .map_err(HubError::from)
+}
+
+/// Plain SQL form of [`workspace_users`] (one writer transaction), also
+/// covered by the in-memory unit tests below.
+pub(crate) fn count_workspace_users(
+    conn: &Connection,
+    host_id: &str,
+    workspace_id: &str,
+) -> Result<(i64, i64), StoreError> {
+    let sessions: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM instances
+             WHERE host_id = ?1 AND workspace_id = ?2 AND {ACTIVE_WORKSPACE_SESSION_SQL}"
+        ),
+        params![host_id, workspace_id],
+        |row| row.get(0),
+    )?;
+    let tasks: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM tasks
+             WHERE archived_at IS NULL
+               AND state NOT IN {INACTIVE_TASK_STATES}
+               AND json_extract(doc_json, '$.workspaceBinding.hostId') = ?1
+               AND json_extract(doc_json, '$.workspaceBinding.workspaceId') = ?2"
+        ),
+        params![host_id, workspace_id],
+        |row| row.get(0),
+    )?;
+    Ok((sessions, tasks))
+}
+
+/// Map an absolute root path to the workspace id in the host's last observed
+/// snapshot, so the path-bodied DELETE route can run the usage guard.
+async fn workspace_id_for_path(
+    state: &AppState,
+    host_id: &str,
+    path: &str,
+) -> Result<Option<String>, HubError> {
+    let host = host_id.to_owned();
+    let path = path.to_owned();
+    let (_, workspaces) = state
+        .store
+        .run_named("workspace_id_for_path", move |conn| {
+            load_snapshot(conn, &host)
+        })
+        .await?;
+    Ok(workspaces
+        .iter()
+        .find(|workspace| workspace["root"].as_str() == Some(path.as_str()))
+        .and_then(|workspace| workspace["workspaceId"].as_str().map(str::to_owned)))
+}
+
 async fn mutate(
     state: &AppState,
     headers: &HeaderMap,
@@ -175,6 +253,29 @@ async fn mutate(
     require_host(state, &id).await?;
     if state.nodes.kind_of(&id).await.is_none() {
         return Err(HubError::HostOffline { host_id: id });
+    }
+    // c-dirpicker: never unbind a directory that a live session or an active
+    // task still uses. The check runs before a command is queued, so the
+    // refusal leaves neither a command row nor a prepared Node mutation.
+    if method == "workspace.unregister"
+        && let Some(workspace_id) = workspace_id_for_path(state, &id, body.path.trim()).await?
+    {
+        let (sessions, tasks) = workspace_users(state, &id, &workspace_id).await?;
+        if sessions > 0 || tasks > 0 {
+            let mut reasons = Vec::new();
+            if sessions > 0 {
+                reasons.push(format!("{sessions} live session(s)"));
+            }
+            if tasks > 0 {
+                reasons.push(format!("{tasks} active task(s)"));
+            }
+            return Err(HubError::Conflict(format!(
+                "directory {} is still used by {}; end or archive them before removing it \
+                 (ended sessions keep their history)",
+                body.path,
+                reasons.join(" and ")
+            )));
+        }
     }
     let mut payload = json!({"path": body.path});
     crate::agent_scope::stamp(&mut payload, &device);
@@ -380,5 +481,124 @@ pub fn load_snapshot(conn: &Connection, id: &str) -> Result<(i64, Vec<Value>), S
             ))
         }
         None => Ok((-1, Vec::new())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal tables carrying only the columns the usage guard reads.
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE instances (host_id TEXT, workspace_id TEXT, lifecycle TEXT);
+             CREATE TABLE tasks (state TEXT, archived_at TEXT, doc_json TEXT);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_instance(conn: &Connection, workspace: &str, lifecycle: &str) {
+        conn.execute(
+            "INSERT INTO instances (host_id, workspace_id, lifecycle) VALUES ('hst_a', ?1, ?2)",
+            params![workspace, lifecycle],
+        )
+        .unwrap();
+    }
+
+    fn insert_task(conn: &Connection, state: &str, archived: bool, host: &str, workspace: &str) {
+        let doc = json!({"workspaceBinding": {"hostId": host, "workspaceId": workspace}});
+        conn.execute(
+            "INSERT INTO tasks (state, archived_at, doc_json) VALUES (?1, ?2, ?3)",
+            params![
+                state,
+                if archived {
+                    Some("2026-10-05T00:00:00Z")
+                } else {
+                    None::<&str>
+                },
+                doc.to_string()
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn live_sessions_block_but_ended_sessions_keep_history_without_blocking() {
+        let conn = seeded_conn();
+        assert_eq!(
+            count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
+            (0, 0)
+        );
+        insert_instance(&conn, "wsp_x", "ready");
+        insert_instance(&conn, "wsp_x", "starting");
+        assert_eq!(
+            count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
+            (2, 0)
+        );
+        // Ended/failed sessions keep their rows (history) and stop blocking.
+        conn.execute(
+            "UPDATE instances SET lifecycle = 'exited' WHERE workspace_id = 'wsp_x'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
+            (0, 0)
+        );
+        insert_instance(&conn, "wsp_x", "failed");
+        insert_instance(&conn, "wsp_x", "closed");
+        assert_eq!(
+            count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
+            (0, 0)
+        );
+        // A live session on another workspace never counts.
+        insert_instance(&conn, "wsp_other", "ready");
+        assert_eq!(
+            count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            count_workspace_users(&conn, "hst_a", "wsp_other").unwrap(),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn active_tasks_block_but_done_failed_and_archived_tasks_do_not() {
+        let conn = seeded_conn();
+        for state in [
+            "pending", "placed", "running", "stalled", "parked", "deferred",
+        ] {
+            insert_task(&conn, state, false, "hst_a", "wsp_x");
+        }
+        assert_eq!(
+            count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
+            (0, 6)
+        );
+        // Settled states no longer occupy the directory.
+        conn.execute("UPDATE tasks SET state = 'done'", []).unwrap();
+        assert_eq!(
+            count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
+            (0, 0)
+        );
+        conn.execute("UPDATE tasks SET state = 'running'", [])
+            .unwrap();
+        // An archived task of any state is settled.
+        conn.execute("UPDATE tasks SET archived_at = '2026-10-05T00:00:00Z'", [])
+            .unwrap();
+        assert_eq!(
+            count_workspace_users(&conn, "hst_a", "wsp_x").unwrap(),
+            (0, 0)
+        );
+        // Bindings on other host/workspace pairs never match.
+        let fresh = seeded_conn();
+        insert_task(&fresh, "running", false, "hst_b", "wsp_x");
+        insert_task(&fresh, "running", false, "hst_a", "wsp_y");
+        assert_eq!(
+            count_workspace_users(&fresh, "hst_a", "wsp_x").unwrap(),
+            (0, 0)
+        );
     }
 }

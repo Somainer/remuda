@@ -795,7 +795,11 @@ async fn fake_node(
             "root": "/tmp/remuda-project-a"
         }));
     }
-    let workspaces = Value::Array(workspaces);
+    // c-dirpicker: the mutation RPCs update this vec and advance the revision
+    // in place. The hello takes the initial snapshot below.
+    let mut workspace_rows: Vec<Value> = workspaces;
+    let mut workspace_revision: u64 = 1;
+    let workspaces = Value::Array(workspace_rows.clone());
     // The enroll hello announces an empty inventory — this process holds no
     // sessions yet — and a later restart re-announces whatever is still live.
     // The Hub reads a missing key as "cannot enumerate" and an empty array as
@@ -826,6 +830,9 @@ async fn fake_node(
         .to_owned();
     let _ = ready.send(());
     seed_host_file_fixtures()?;
+    // The c-dirpicker browse tree; cheap to seed for every harness run while
+    // the RPC that exposes it stays gated on HUB_E2E_DIR_PICKER.
+    seed_dir_picker_fixtures()?;
     let mut append_n = 0u64;
     // Minimal PTY harness for the xterm e2e specs. A terminal session is
     // registered on create, tty.attach returns its stable per-instance stream
@@ -956,9 +963,99 @@ async fn fake_node(
                     send_rpc_ok(
                         &mut ws,
                         id,
-                        json!({"workspaceRevision": 1, "workspaces": workspaces}),
+                        workspace_snapshot(workspace_revision, &workspace_rows),
                     )
                     .await?;
+                }
+                // c-dirpicker: two-phase membership mutations behind the
+                // trigger; an untriggered harness answers "unknown method",
+                // exactly the shape an older Node gives the Hub.
+                "workspace.register" | "workspace.unregister" if dir_picker_enabled() => {
+                    let path = params.get("path").and_then(Value::as_str).unwrap_or("");
+                    let phase = params.get("phase").and_then(Value::as_str).unwrap_or("");
+                    let command_id = params.get("commandId").cloned().unwrap_or(Value::Null);
+                    let canonical = std::fs::canonicalize(path);
+                    let contained = canonical
+                        .as_ref()
+                        .ok()
+                        .filter(|path| {
+                            path.starts_with(
+                                std::fs::canonicalize(DIRPICKER_BROWSE_ROOT).unwrap_or_default(),
+                            )
+                        })
+                        .is_some();
+                    if !contained {
+                        send_rpc_error(
+                            &mut ws,
+                            id,
+                            &format!("workspace {path} is outside allowed workspace_roots"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let canonical = canonical?;
+                    if phase == "prepare" {
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({
+                                "workspaceRevision": workspace_revision,
+                                "workspaces": workspace_rows,
+                                "commandId": command_id,
+                                "phase": "prepared",
+                            }),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let root_display = canonical.display().to_string();
+                    let existing = workspace_rows
+                        .iter()
+                        .position(|row| row["root"].as_str() == Some(root_display.as_str()));
+                    let workspace_id;
+                    if method == "workspace.register" {
+                        if let Some(index) = existing {
+                            workspace_id = workspace_rows[index]["workspaceId"].clone();
+                        } else {
+                            let new_id = format!("wsp_dp_{}", uuid::Uuid::new_v4().simple());
+                            workspace_id = json!(new_id);
+                            workspace_rows.push(json!({
+                                "workspaceId": new_id,
+                                "hostId": host,
+                                "root": root_display,
+                            }));
+                            workspace_revision += 1;
+                        }
+                    } else {
+                        let Some(index) = existing else {
+                            send_rpc_error(
+                                &mut ws,
+                                id,
+                                &format!("workspace {path} is not registered"),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        workspace_id = workspace_rows[index]["workspaceId"].clone();
+                        workspace_rows.remove(index);
+                        workspace_revision += 1;
+                    }
+                    let mut snapshot = workspace_snapshot(workspace_revision, &workspace_rows);
+                    snapshot["workspaceId"] = workspace_id;
+                    snapshot["commandId"] = command_id;
+                    snapshot["phase"] = json!("settled");
+                    send_rpc_ok(&mut ws, id, snapshot).await?;
+                }
+                // c-dirpicker: real directories-only browse behind the trigger.
+                "host.dirs.list" if dir_picker_enabled() => {
+                    let registered_roots: Vec<String> = workspace_rows
+                        .iter()
+                        .map(|row| row["root"].as_str().unwrap_or("").to_owned())
+                        .collect();
+                    match dirs_list_answer(&params, &registered_roots) {
+                        Ok(result) => send_rpc_ok(&mut ws, id, result).await?,
+                        Err(error) => send_rpc_error(&mut ws, id, &error.to_string()).await?,
+                    }
                 }
                 // t-bind: in-memory worktree catalog/lease, gated on its own
                 // trigger so other specs see no worktree behaviour.
@@ -2937,6 +3034,109 @@ type NodeWs =
 
 fn task_bind_enabled() -> bool {
     std::env::var("HUB_E2E_TASK_BIND").as_deref() == Ok("1")
+}
+
+// ── c-dirpicker directory browser + workspace mutations (HUB_E2E_DIR_PICKER=1) ─
+//
+// The fake Node gains a real, bounded directories-only `host.dirs.list` rooted
+// at DIRPICKER_BROWSE_ROOT, plus the two-phase workspace.register/unregister
+// protocol (mutating the announced snapshot). Behind an explicit trigger so
+// every other spec keeps the unchanged hello and the "unknown method"
+// behaviour for the mutation RPCs.
+
+fn dir_picker_enabled() -> bool {
+    std::env::var("HUB_E2E_DIR_PICKER").as_deref() == Ok("1")
+}
+
+/// Browse allowlist root for the c-dirpicker spec.
+const DIRPICKER_BROWSE_ROOT: &str = "/tmp/remuda-dirpicker";
+
+fn seed_dir_picker_fixtures() -> Result<()> {
+    let root = std::path::Path::new(DIRPICKER_BROWSE_ROOT);
+    std::fs::create_dir_all(root.join("alpha/nested"))?;
+    std::fs::create_dir_all(root.join("beta/nested"))?;
+    std::fs::create_dir_all(root.join(".hidden"))?;
+    std::fs::write(root.join("note.txt"), b"files are not directories\n")?;
+    Ok(())
+}
+
+/// Build the workspace snapshot the Hub observes after each list/mutation.
+fn workspace_snapshot(revision: u64, rows: &[Value]) -> Value {
+    json!({"workspaceRevision": revision, "workspaces": rows})
+}
+
+/// Real directories-only answer for `host.dirs.list`, mirroring the Node
+/// bounds: containment under one allowlist root, no symlink following, hidden
+/// dot-directories off by default, and a hard result cap.
+fn dirs_list_answer(params: &Value, registered_roots: &[String]) -> Result<Value> {
+    let root = std::fs::canonicalize(DIRPICKER_BROWSE_ROOT)?;
+    let requested = params.get("path").and_then(Value::as_str).unwrap_or("");
+    let target = if requested.trim().is_empty() {
+        root.clone()
+    } else {
+        let path = std::path::Path::new(requested);
+        if !path.is_absolute() {
+            return Err(anyhow!("browsed path must be absolute"));
+        }
+        let canonical = std::fs::canonicalize(path)?;
+        if !canonical.starts_with(&root) {
+            return Err(anyhow!("path is outside the directories this Node allows"));
+        }
+        if !canonical.is_dir() {
+            return Err(anyhow!("{requested} is not a directory"));
+        }
+        canonical
+    };
+    let show_hidden = params
+        .get("showHidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut names: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    let mut truncated = false;
+    for entry in std::fs::read_dir(&target)? {
+        let Ok(entry) = entry else { continue };
+        scanned += 1;
+        if scanned > 16_384 {
+            truncated = true;
+            break;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    if names.len() > 4096 {
+        names.truncate(4096);
+        truncated = true;
+    }
+    let parent = if target == root {
+        None
+    } else {
+        target
+            .parent()
+            .filter(|parent| parent.starts_with(&root))
+            .map(|parent| json!(parent.display().to_string()))
+    };
+    Ok(json!({
+        "path": target.display().to_string(),
+        "parent": parent,
+        "home": root.display().to_string(),
+        "roots": [root.display().to_string()],
+        "workspaces": registered_roots,
+        "dirs": names.iter().map(|name| json!({"name": name})).collect::<Vec<_>>(),
+        "truncated": truncated,
+    }))
 }
 
 // ── c-perfaudit high-rate flood triggers (HUB_E2E_PERF=1 only) ────────────

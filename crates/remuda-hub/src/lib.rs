@@ -21,6 +21,7 @@ mod devices;
 mod error;
 mod fleet;
 mod gatequeue;
+mod host_dirs;
 mod host_files;
 mod hosts;
 mod http;
@@ -565,6 +566,30 @@ impl RunningHub {
         Ok(())
     }
 
+    /// Test-only seam: mark one Hub-side instance row as having exited, so a
+    /// guard that distinguishes live from ended sessions can be exercised
+    /// without driving a real close/journal sequence.
+    #[doc(hidden)]
+    pub async fn test_mark_instance_exited(&self, instance_id: &str) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let instance_id = instance_id.to_owned();
+        store
+            .run_named("test_mark_instance_exited", move |conn| {
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'exited', activity = 'idle', updated_at = ?1
+                     WHERE id = ?2",
+                    ["2026-10-05T00:00:00Z", instance_id.as_str()],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
     /// Mint a single-use Node enroll token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/hosts/enroll-token`, used by
@@ -829,6 +854,7 @@ pub fn router(state: AppState) -> Router {
         .merge(agent_scope::routes())
         .merge(objects::routes(state.config.attachment_max_bytes))
         .merge(host_files::routes(state.config.attachment_max_bytes))
+        .merge(host_dirs::routes())
         .merge(attachments::routes())
         .merge(workspaces::routes())
         .merge(workers::routes())

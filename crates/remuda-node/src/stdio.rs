@@ -504,6 +504,12 @@ async fn handle_stdio_frame(
             || crate::worker::is_worker_method(request.method.as_str())
             || crate::gate::is_gate_method(request.method.as_str())
             || crate::workspace_scm::is_scm_method(request.method.as_str())
+            // Read-only operator filesystem features: the workspace file
+            // view and the c-dirpicker directory browser. Without this row an
+            // ssh-stdio enrolled host answers both "stdio runtime does not
+            // handle …" even though the shared dispatch table implements them.
+            || crate::files::is_host_files_method(request.method.as_str())
+            || crate::dir_browser::is_host_dirs_method(request.method.as_str())
             // Drill-in read of one subagent's sidechain transcript. Without
             // this row the ssh-stdio carrier refuses it, and the web row can
             // only say 「启动中」 forever.

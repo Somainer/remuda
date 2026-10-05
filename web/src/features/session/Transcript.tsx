@@ -99,6 +99,57 @@ function useCompactLayout(): boolean {
   return compact;
 }
 
+/** Where a node id lives in a top-level list. */
+function findNodeIndex(nodes: readonly TranscriptNode[], id: string): number {
+  return nodes.findIndex((n) => n.id === id);
+}
+
+/** Ids a top-level node can be matched by after a prepend (fold + children). */
+function nodeContentIds(node: TranscriptNode): Set<string> {
+  const ids = new Set<string>([node.id]);
+  if (node.type === "compact") for (const child of node.children) ids.add(child.id);
+  return ids;
+}
+
+/**
+ * Resolve the armed anchor's row in the POST-prepend node list. The id usually
+ * survives; when an older tool page renames the armed compact fold, match by
+ * content (the renamed fold still contains the armed fold's original tools),
+ * then fall back to the slot before the first surviving follower. Never returns
+ * a raw pre-insert index (a prepend shifted every index after it).
+ */
+function resolvePrependedAnchor(
+  prevNodes: readonly TranscriptNode[],
+  nextNodes: readonly TranscriptNode[],
+  armedIndex: number,
+): { node: TranscriptNode; index: number } | null {
+  const armed = prevNodes[armedIndex];
+  if (!armed) {
+    const fallback = nextNodes[armedIndex];
+    return fallback ? { node: fallback, index: armedIndex } : null;
+  }
+  const exact = findNodeIndex(nextNodes, armed.id);
+  if (exact >= 0) return { node: nextNodes[exact]!, index: exact };
+  if (armed.type === "compact") {
+    const childIds = new Set(armed.children.map((child) => child.id));
+    const renamed = nextNodes.findIndex(
+      (n) => n.type === "compact" && n.children.some((child) => childIds.has(child.id)),
+    );
+    if (renamed >= 0) return { node: nextNodes[renamed]!, index: renamed };
+  }
+  for (let k = armedIndex + 1; k < prevNodes.length; k += 1) {
+    const followerIds = nodeContentIds(prevNodes[k]!);
+    const at = nextNodes.findIndex(
+      (n) => followerIds.has(n.id) || (n.type === "compact" && n.children.some((c) => followerIds.has(c.id))),
+    );
+    if (at > 0) return { node: nextNodes[at - 1]!, index: at - 1 };
+  }
+  const tail = nextNodes.length - (prevNodes.length - armedIndex);
+  const index = Math.max(0, Math.min(tail, nextNodes.length - 1));
+  const node = nextNodes[index];
+  return node ? { node, index } : null;
+}
+
 function locateNode(nodes: readonly TranscriptNode[], nodeId: string): NodeLocation | null {
   for (let i = 0; i < nodes.length; i += 1) {
     const node = nodes[i];
@@ -255,6 +306,8 @@ function TranscriptInner({
         awaitIndex?: number;
         /** Owning load-earlier request; cross-session late replies never clear it. */
         reqId?: number;
+        /** Pre-click top-level nodes, for content-based fold-rename retarget. */
+        prevNodes?: TranscriptNode[];
       }
     | null
   >(null);
@@ -266,6 +319,8 @@ function TranscriptInner({
     tries: number;
     armedIndex: number;
     reqId: number;
+    /** Top-level nodes at click time for content-based fold-rename retarget. */
+    prevNodes: TranscriptNode[];
   } | null>(null);
   /**
    * Identity of the in-flight load-earlier click. The Transcript stays mounted
@@ -486,12 +541,13 @@ function TranscriptInner({
     // incidental 1 s/2 s tick, the anchor effects never re-ran and the anchor
     // row stayed unmounted. Armed up front, the prepend commit runs the restore.
     const armedIndex = range.start;
+    const prevNodes = nodesRef.current.slice();
     if (anchorId) {
       restoringRef.current = true;
-      pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0, awaitIndex: armedIndex, reqId };
+      pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0, awaitIndex: armedIndex, reqId, prevNodes };
       // Keep repinning as the prepended (unmeasured) rows settle; the
       // one-shot restore effect alone stops before the average converges.
-      prependAnchorRef.current = { anchorId, offset, tries: 0, armedIndex, reqId };
+      prependAnchorRef.current = { anchorId, offset, tries: 0, armedIndex, reqId, prevNodes };
     }
     setLoadingEarlier(true);
     setLoadTick((n) => n + 1);
@@ -611,23 +667,22 @@ function TranscriptInner({
     const held = prependAnchorRef.current;
     const el = scrollerRef.current;
     if (!held || !el || !nodesRef.current.length) return;
-    // The armed anchor can VANISH: an older tool page renames the compact fold
-    // it became (`compact:<firstToolCallId>`). Retarget once to the row now
-    // occupying the armed slot; that row is the new anchor (the fold renamed in
-    // place), and an index advance alone also counts (plain prepend).
-    let anchorIndex = nodes.findIndex((n) => n.id === held.anchorId);
+    // The armed anchor can VANISH when an older tool page renames the compact
+    // fold it became. Resolve the post-prepend row by CONTENT against the
+    // pre-click list (fold child containment, then the follower slot): a raw
+    // pre-insert index points at a newly inserted row after the prepend.
+    const exactIndex = nodes.findIndex((n) => n.id === held.anchorId);
     let retargeted = false;
-    if (anchorIndex < 0) {
-      const replacement = nodes[held.armedIndex];
-      if (replacement) {
-        held.anchorId = replacement.id;
-        anchorIndex = held.armedIndex;
+    if (exactIndex < 0) {
+      const resolved = resolvePrependedAnchor(held.prevNodes, nodes, held.armedIndex);
+      if (resolved) {
+        held.anchorId = resolved.node.id;
         retargeted = true;
         const pending = pendingScroll.current;
-        if (pending?.kind === "restore" && pending.reqId === held.reqId) pending.anchorId = replacement.id;
+        if (pending?.kind === "restore" && pending.reqId === held.reqId) pending.anchorId = resolved.node.id;
       }
     }
-    const applied = retargeted || anchorIndex > held.armedIndex;
+    const applied = retargeted || exactIndex > held.armedIndex;
     if (!applied) {
       // Fetch still in flight: stay armed without burning the stable budget.
       // Once the owning request finished without a visible prepend (duplicate
@@ -725,18 +780,19 @@ function TranscriptInner({
     if (!el || !pending || !nodesRef.current.length) return;
     if (pending.kind === "restore") {
       if (pending.awaitIndex !== undefined) {
-        let armed = nodes.findIndex((n) => n.id === pending.anchorId);
-        // The armed anchor can vanish when an older tool page renames the
-        // compact fold it became: retarget to the row now at the armed slot.
+        const armed0 = nodes.findIndex((n) => n.id === pending.anchorId);
+        let armed = armed0;
         let retargeted = false;
-        if (armed < 0) {
-          const replacement = nodes[pending.awaitIndex];
-          if (replacement) {
-            pending.anchorId = replacement.id;
-            armed = pending.awaitIndex;
+        // The armed anchor can vanish when an older tool page renames the
+        // compact fold it became: resolve the post-prepend row by content.
+        if (armed0 < 0) {
+          const resolved = resolvePrependedAnchor(pending.prevNodes ?? [], nodes, pending.awaitIndex);
+          if (resolved) {
+            pending.anchorId = resolved.node.id;
+            armed = resolved.index;
             retargeted = true;
             const held = prependAnchorRef.current;
-            if (held && held.reqId === pending.reqId) held.anchorId = replacement.id;
+            if (held && held.reqId === pending.reqId) held.anchorId = resolved.node.id;
           }
         }
         // Nothing applied yet (no prepend, no rename). Stay armed while the

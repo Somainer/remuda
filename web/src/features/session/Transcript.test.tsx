@@ -2010,6 +2010,151 @@ describe("load-earlier anchor lifecycle round 5", () => {
     vi.unstubAllGlobals();
   });
 
+  function toolAt(seq: number, tcId: string, instanceId: string): Observation[] {
+    const s = source();
+    return [
+      {
+        schemaVersion: 1,
+        eventId: `e_${seq}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seq),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_call",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `nc_${tcId}` as Id,
+          revision: "1",
+          operation: "open",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          parentToolCallId: null,
+          toolName: known("Bash"),
+          displayTitle: known("Bash"),
+          category: "shell",
+          input: known({ command: tcId }),
+          inputTextDelta: null,
+          state: "running",
+          executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+        },
+      } as Observation,
+      {
+        schemaVersion: 1,
+        eventId: `e_${seq + 1}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seq + 1),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_result",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `nr_${tcId}` as Id,
+          revision: "1",
+          operation: "close",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          stage: "final",
+          outcome: "succeeded",
+          blocks: [{ type: "text", text: tcId }],
+          structuredResult: unknownKnowledge("text"),
+          exitCode: known(0),
+          changes: [],
+        },
+      } as Observation,
+    ];
+  }
+
+  function foldSession(): Observation[] {
+    const initial: Observation[] = [
+      ...toolAt(201, "r5-tc-a", "insX"),
+      ...toolAt(203, "r5-tc-b", "insX"),
+      ...toolAt(205, "r5-tc-c", "insX"),
+      m(207, "assistant", "insX"),
+    ];
+    for (let seq = 208, i = 0; i < 15; i += 1, seq += 2) {
+      initial.push(m(seq, "user", "insX"));
+      initial.push(m(seq + 1, "assistant", "insX"));
+    }
+    return initial;
+  }
+
+  /** Same-turn older tools that rename the fold to compact:r5-tc-x. */
+  function sameTurnOlderTools(): Observation[] {
+    return [...toolAt(106, "r5-tc-x", "insX"), ...toolAt(108, "r5-tc-y", "insX")];
+  }
+
+  it("retargets a renamed fold past newly inserted standalone rows to the content row (item 2)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeo(43);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    // Older page: a finished PREVIOUS turn (its lone tool stays standalone,
+    // only one routine tool so no fold), then this turn's user message and two
+    // earlier tools that rename the fold. The fold lands FOUR slots down.
+    const older: Observation[] = [
+      m(101, "user", "insX"),
+      ...toolAt(102, "r5-tc-solo", "insX"),
+      m(104, "assistant", "insX"),
+      m(105, "user", "insX"),
+      ...sameTurnOlderTools(),
+    ];
+    let resolve!: (v: ReturnType<typeof pageOf>) => void;
+    makeClient(
+      reg,
+      "insX",
+      foldSession(),
+      () =>
+        new Promise((r) => {
+          resolve = r;
+        }),
+      "201",
+      "237",
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/s/insX"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+    await act(async () => {
+      resolve(pageOf(older));
+      await Promise.resolve();
+    });
+
+    // The restored anchor is the RENAMED FOLD, not the standalone user row at
+    // the raw pre-insert index: the estimate jump is four rows deep.
+    expect(geo.top()).toBe(4 * ROW);
+    const fold = geo.scroller().querySelector("[data-anchor='compact:r5-tc-x']");
+    expect(fold).toBeTruthy();
+    expect(Math.round((fold as HTMLElement).getBoundingClientRect().top)).toBe(0);
+  });
+
   it("keeps restoring on the final history page until the anchor settles (item 3)", async () => {
     const user = userEvent.setup();
     const jumps: number[] = [];

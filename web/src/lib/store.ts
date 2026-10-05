@@ -1483,17 +1483,37 @@ class HubStore {
    * The machine's resume action. It certifies live ONLY when the follow socket
    * reopened AND the bounded journal catch-up succeeded — REST reachability
    * alone is not enough (a dead follow stream with working HTTP otherwise
-   * leaves the transcript frozen under a false live). Outbox delivery runs
-   * first (a POST proves the path) but its outcome never masks a socket
-   * failure: a "held" (host offline) row is a legitimate non-terminal result,
-   * while a follow/catch-up failure throws so the machine stays offline and
-   * retries.
+   * leaves the transcript frozen under a false live).
+   *
+   * Neither outbox delivery nor the post-delivery screen refresh gates the
+   * reopen: deliverOneRow's journal resync rides the fast journal chain the
+   * reopen joins, and the Node-bound /screen read rides a separate screen
+   * chain (it can stall for its whole REST timeout + NODE_BUSY backoff under
+   * load but must never hold the link). Awaiting the flush used to park the
+   * reopen behind that read: the queued row had committed and journaled while
+   * the link sat in recovering past its watchdog, so the journal banner never
+   * cleared (c-reconnfu gate flake). The machine also re-flushes on live.
    */
   private async resumeConnection() {
-    await this.flushAllOutbox();
+    // Kick outbox delivery CONCURRENTLY, never as a gate. The flush is more
+    // than POSTs: after the last row of an instance lands, deliverOneRow chains
+    // a journal resync plus a SCREEN read, and reopenFollow opens the socket on
+    // the journal chain. Screen reads are Node RPCs that can stall for their
+    // whole REST timeout (plus NODE_BUSY backoff) under gate load, so they ride
+    // a separate screen chain that waits BEHIND journal work but never blocks
+    // it; the flush itself is likewise never awaited here. Awaiting either used
+    // to park the reopen behind a parked /screen: the queued row had committed
+    // and journaled while the link sat in recovering past its watchdog, so the
+    // journal banner never cleared (c-reconnfu gate flake). Reopening first lets
+    // the subscribe snapshot certify the socket as soon as the Hub is
+    // reachable, and the machine re-flushes on the live transition regardless.
+    const flushed = this.flushAllOutbox();
+    void flushed.catch(() => undefined);
     if (this.connectionBoundTo) {
       // Throws on socket-open or catch-up failure → machine remains offline
-      // and retries; no toast-swallowing into false live.
+      // and retries; no toast-swallowing into false live. The journal chain
+      // never carries the Node-bound screen read, so this cannot stall behind
+      // a saturated Node.
       await this.reopenFollow(this.connectionBoundTo);
     }
     await Promise.all([this.refresh().catch(() => undefined), this.refreshHosts().catch(() => undefined)]);
@@ -1504,8 +1524,9 @@ class HubStore {
     const instance =
       this.state.instances.find((i) => i.id === instanceId) ?? (await api.instanceGet(instanceId));
     const client = this.journals.get(instance.journalId);
-    // Chain on any in-flight reconciliation so an older screen/resync job
-    // cannot land after this fresher one; errors propagate to the machine.
+    // Join the JOURNAL chain (never the Node-bound screen chain) so an older
+    // journal resync cannot land after this fresher one; errors propagate to
+    // the machine. A stalled /screen read cannot delay this reopen.
     await this.chainReconcile(instanceId, async () => {
       if (client) {
         await this.openFollowSocket(instance, client, client.appliedSeq);
@@ -1612,6 +1633,12 @@ class HubStore {
       // If that drained the instance, run the post-delivery resync/screen chain
       // exactly once.
       if (!box.pendingFor(instanceId).length) {
+        // Journal resync + bubble settlement are Hub-bound and link-relevant:
+        // run them on the journal chain the follow reopen joins. The SCREEN
+        // read is a Node RPC that can stall for its whole REST timeout under
+        // load — it rides the separate screen chain, so it can never hold the
+        // instance lock nor head-of-line the socket reopen (c-reconnfu gate
+        // flake: the banner stayed in recovering behind a parked /screen).
         await this.chainReconcile(instanceId, async () => {
           const client = this.journals.get(
             this.state.instances.find((i) => i.id === instanceId)?.journalId ?? "",
@@ -1623,12 +1650,12 @@ class HubStore {
           }
           const events = this.state.events[instanceId] ?? [];
           this.settleFromJournal(instanceId, events);
-          try {
-            await this.refreshScreen(instanceId);
-          } catch (err) {
-            if (!isScreenNodeBusy(err)) this.reconcileToast(err, "屏幕同步");
-          }
         });
+        void this
+          .chainScreenRead(instanceId, () => this.refreshScreen(instanceId))
+          .catch((err) => {
+            if (!isScreenNodeBusy(err)) this.reconcileToast(err, "屏幕同步");
+          });
       }
       return fresh.commandId;
     }
@@ -3318,8 +3345,22 @@ class HubStore {
    * resolves immediately, but the background work must be ordered so a screen
    * RPC never overtakes a journal resync that carries unseen screen history
    * (an older journal screen could otherwise overwrite a newer live buffer).
+   *
+   * This chain is JOURNAL-ONLY: it must never carry a Node-bound /screen read,
+   * because the follow reopen (resumeConnection) joins it and a read stalled on
+   * a saturated Node would park socket recovery (c-reconnfu). Screen reads use
+   * {@link screenChain}.
    */
   private reconcileChain = new Map<Id, Promise<unknown>>();
+  /**
+   * Per-instance serial chain for Node-bound /screen reads. A screen read
+   * waits behind any journal-chain work already queued for the instance (so it
+   * cannot overtake a fresher catch-up — the read's start-time basis still
+   * rejects any stale result), but journal/link work NEVER waits behind a
+   * screen read. Screen reads also serialise among themselves so the list-poll
+   * fan-out does not stack duplicates for one instance.
+   */
+  private screenChain = new Map<Id, Promise<unknown>>();
   /** Per-instance timer for retrying sends that failed transiently while live. */
   private outboxRetryTimer = new Map<Id, ReturnType<typeof setTimeout>>();
   private outboxRetryAttempt = new Map<Id, number>();
@@ -3442,18 +3483,44 @@ class HubStore {
     return next;
   }
 
+  /**
+   * Serialise a Node-bound /screen read: it runs after the previously queued
+   * screen read AND after any journal-chain reconciliation already queued at
+   * enqueue time (so a screen read never overtakes a fresher journal resync),
+   * but it never joins the journal chain itself — a stalled read must not block
+   * the follow reopen. Journal work queued AFTER the read starts is not waited
+   * for: the read's start-time basis in {@link readAndCommitScreen} rejects a
+   * result that a newer journal frame supersedes.
+   */
+  private chainScreenRead(instanceId: Id, job: () => Promise<unknown>): Promise<unknown> {
+    const journalGate = this.reconcileChain.get(instanceId) ?? Promise.resolve();
+    const prev = this.screenChain.get(instanceId) ?? Promise.resolve();
+    const gate = Promise.all([journalGate.catch(() => undefined), prev.catch(() => undefined)]).then(
+      () => undefined,
+    );
+    const next = gate.then(job);
+    this.screenChain.set(instanceId, next);
+    void next
+      .finally(() => {
+        if (this.screenChain.get(instanceId) === next) this.screenChain.delete(instanceId);
+      })
+      .catch(() => undefined);
+    return next;
+  }
+
   async refreshScreen(
     instanceId: Id,
     opts: { chained?: boolean } = {},
   ): Promise<void> {
     // The 2.5 s list-poll fan-out reads OUTSIDE any user flow: it must not
-    // overtake a journal catch-up/resync already queued on the per-instance
-    // chain, which can carry an unseen HIGHER-seq screen the RPC's start-time
-    // basis could not know about. Run the read behind the same ordered chain.
-    // Chain-internal callers (the post-delivery resync) pass no flag: nesting
-    // chainReconcile inside its own job would self-deadlock.
+    // overtake a journal catch-up/resync already queued for the instance, which
+    // can carry an unseen HIGHER-seq screen the RPC's start-time basis could
+    // not know about. Run it on the SCREEN chain: it waits behind queued
+    // journal work but a stalled Node read cannot block the journal/link chain.
+    // Chain-internal callers (the post-delivery resync) call readAndCommitScreen
+    // themselves: nesting a chain entry inside its own job would deadlock.
     if (opts.chained) {
-      await this.chainReconcile(instanceId, () => this.readAndCommitScreen(instanceId));
+      await this.chainScreenRead(instanceId, () => this.readAndCommitScreen(instanceId));
       return;
     }
     await this.readAndCommitScreen(instanceId);
@@ -3461,11 +3528,12 @@ class HubStore {
 
   private async readAndCommitScreen(instanceId: Id): Promise<void> {
     // Ordering vs catch-up: the list-poll path enters here ON the per-instance
-    // reconcile chain (refreshScreen({chained:true})), so a queued catch-up
-    // carrying an unseen higher-seq screen always applies first; the basis is
-    // captured at execution, once that job is done. The generation guard plus
-    // the basis (from committed screens, screen observations and known events)
-    // additionally covers a live frame arriving during the read itself.
+    // screen chain (refreshScreen({chained:true})), which gates on journal work
+    // queued first, so a queued catch-up carrying an unseen higher-seq screen
+    // always applies before this read starts; the basis is captured at
+    // execution. The generation guard plus the basis (from committed screens,
+    // screen observations and known events) additionally covers a live frame
+    // arriving during the read itself.
     // Generation guard: a newer read (or the periodic scheduler) superseding
     // this one makes its late resolution a no-op — including its error.
     const gen = (this.screenReadGen.get(instanceId) ?? 0) + 1;

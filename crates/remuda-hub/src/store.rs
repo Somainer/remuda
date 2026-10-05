@@ -5644,12 +5644,24 @@ fn apply_instance_projection(
             .get("severity")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let failed = severity == "error"
-            || native_name.contains("error")
-            || native_name == "exit"
-            || native_name.contains("gone")
-            || native_name.contains("agent_not_ready")
-            || native_name.contains("shell");
+        // c-cardsettle r2 item 1: only a REAL process end marks the instance
+        // failed/exited. A failed model/effort/permission switch on a still-
+        // running PTY session arrives as `instance.configure` (topic
+        // `configuration`, affectsCompletion=false, severity=error) — folding
+        // that into lifecycle=failed would wrongly invalidate the session's
+        // pending cards and a running hook would never get its allow. Real
+        // process deaths (pane exit, startup failure, shell-only drop) all
+        // carry topic `session` and affectsCompletion=true.
+        let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
+        let affects_completion = payload.get("affectsCompletion").and_then(Value::as_bool);
+        let nonterminal_observation = topic == "configuration" || affects_completion == Some(false);
+        let failed = !nonterminal_observation
+            && (severity == "error"
+                || native_name.contains("error")
+                || native_name == "exit"
+                || native_name.contains("gone")
+                || native_name.contains("agent_not_ready")
+                || native_name.contains("shell"));
         if failed {
             lifecycle = Some("failed");
             last_error = payload
@@ -7954,10 +7966,71 @@ mod tests {
         store.close().await;
     }
 
-    /// c-cardsettle (native terminal projection): a NATIVE terminal event
-    /// (nativeName "exit", severity "error") writes lifecycle=failed through
-    /// apply_instance_projection even though the derived lifecycle does not
-    /// name it; the pending card must settle on that effective transition.
+    /// c-cardsettle r2 item 1: a failed LIVE configure switch
+    /// (instance.configure / topic configuration / affectsCompletion=false,
+    /// severity=error) on a still-running PTY session must NOT end the session:
+    /// the instance stays running, its pending card stays pending, and no
+    /// settlement is returned.
+    #[tokio::test]
+    async fn live_configure_error_keeps_the_instance_running_and_the_card_pending() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-configure").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        for (outcome, detail) in [
+            ("model-control-unavailable", "model switch failed"),
+            ("effort-control-unavailable", "effort switch failed"),
+            ("permission-control-unavailable", "permission switch failed"),
+        ] {
+            let appended = store
+                .append_journal(
+                    host.clone(),
+                    instance.instance_id.clone(),
+                    None,
+                    json!({"kind":"lifecycle","payload":{
+                        "type":"native",
+                        "topic":"configuration",
+                        "nativeName":"instance.configure",
+                        "status":{"state":"known","value":format!("{outcome}:{detail}")},
+                        "severity":"error",
+                        "affectsCompletion":false,
+                        "relatedIds":{}
+                    }}),
+                )
+                .await
+                .expect("append configure error");
+            assert!(
+                appended.settlement.is_empty(),
+                "a configure error settles no cards ({outcome})"
+            );
+        }
+
+        let row = store
+            .get_instance(instance.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.lifecycle, "running",
+            "a configure error never folds a live session to failed"
+        );
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "pending", "the hook's pending card stays answerable");
+        assert!(
+            reason.is_none(),
+            "no generation-ended resolution is stamped"
+        );
+        store.close().await;
+    }
+
+    /// c-cardsettle (native terminal projection): a NATIVE terminal event —
+    /// a real process death (`topic=session`, nativeName "exit",
+    /// affectsCompletion=true, severity "error") — writes lifecycle=failed
+    /// through apply_instance_projection even though the derived lifecycle
+    /// does not name it; the pending card must settle on that transition.
     #[tokio::test]
     async fn native_terminal_projection_invalidates_pending_interactions() {
         let dir = tempfile::tempdir().expect("dir");
@@ -7973,7 +8046,9 @@ mod tests {
                 instance.instance_id.clone(),
                 None,
                 json!({"kind":"lifecycle","payload":{
-                    "type":"native","nativeName":"exit","severity":"error",
+                    "type":"native","topic":"session","nativeName":"exit",
+                    "severity":"error","affectsCompletion":true,
+                    "status":{"state":"known","value":"pane exited; agent process is gone"},
                     "relatedIds":{"lastError":"boom"}
                 }}),
             )
@@ -9410,11 +9485,19 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         .or_else(|| knowledge_value(payload.pointer("/entity/activity")))
         .or_else(|| event.get("activity").and_then(Value::as_str));
 
-    let start_failed = reason == "native-driver-start-failed"
-        || native_name == "native-driver-start-failed"
-        || native_name.contains("start-fail")
-        || status.is_some_and(|s| s == "failed" || s == "error")
-        || entity_state == Some("failed");
+    // c-cardsettle r2 item 1: a failed live configure switch
+    // (`instance.configure`, topic `configuration` / affectsCompletion=false)
+    // is NOT a process death, even when its severity is error: it must never
+    // fold a still-running session to failed (which would settle its cards).
+    let configure_error = payload_type == "native"
+        && (payload.get("topic").and_then(Value::as_str) == Some("configuration")
+            || payload.get("affectsCompletion").and_then(Value::as_bool) == Some(false));
+    let start_failed = !configure_error
+        && (reason == "native-driver-start-failed"
+            || native_name == "native-driver-start-failed"
+            || native_name.contains("start-fail")
+            || status.is_some_and(|s| s == "failed" || s == "error")
+            || entity_state == Some("failed"));
     if start_failed && (kind == "lifecycle" || payload_type == "native" || payload_type == "entity")
     {
         return (Some("failed"), None);

@@ -4149,6 +4149,54 @@ impl Store {
         .await
     }
 
+    /// c-cardsettle r2 item 3: of the given ids, return those whose DURABLE
+    /// Hub row is terminal, regardless of the 24 h inbox display retention.
+    /// Display retention decides whether a departed row is SHOWN; this decides
+    /// authoritative dedup, so a restarted Node's `interaction.list` can never
+    /// re-queue the same id as pending and put it back on the badge.
+    pub async fn terminal_interaction_ids(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        self.run_named("terminal_interaction_ids", move |conn| {
+            let placeholders = vec!["?"; ids.len()].join(",");
+            let sql = format!(
+                "SELECT id FROM interactions
+                 WHERE id IN ({placeholders})
+                   AND state IN ('expired', 'invalidated', 'answer-committed', 'resolved')"
+            );
+            let params: Vec<&dyn rusqlite::types::ToSql> = ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql)
+                .collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// Test-only seam: age one interaction's `updated_at` past the departed
+    /// retention (c-cardsettle r2 item 3).
+    pub async fn test_backdate_interaction(
+        &self,
+        interaction_id: String,
+        stamp: String,
+    ) -> Result<(), StoreError> {
+        self.run_named("test_backdate_interaction", move |conn| {
+            conn.execute(
+                "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
+                params![stamp, interaction_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// One interaction by id.
     pub async fn get_interaction(
         &self,
@@ -7462,6 +7510,32 @@ mod tests {
         (row.state, reason)
     }
 
+    /// Age an interaction row's updated_at so the 24 h departed retention can
+    /// be tested without sleeping.
+    async fn backdate_interaction(store: &Store, interaction_id: &str, hours: i64) {
+        let interaction_id = interaction_id.to_owned();
+        store
+            .run_named("backdate_interaction", move |conn| {
+                let then = time::OffsetDateTime::now_utc() - time::Duration::hours(hours);
+                let stamp = format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+                    then.year(),
+                    u8::from(then.month()),
+                    then.day(),
+                    then.hour(),
+                    then.minute(),
+                    then.second()
+                );
+                conn.execute(
+                    "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
+                    params![stamp, interaction_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("backdate interaction");
+    }
+
     /// D-047: the instance projection carries the *observed* route, so it must
     /// not be derived from the spec's *requested* route.
     ///
@@ -8282,6 +8356,47 @@ mod tests {
         assert_eq!(tombstone.interaction_id, int_id);
         assert_eq!(tombstone.instance_id, instance.instance_id);
         assert_eq!(tombstone.state, "invalidated");
+        store.close().await;
+    }
+
+    /// c-cardsettle r2 item 3: authoritative terminal dedup ignores display
+    /// retention — a durable invalidated row is reported terminal even when it
+    /// is older than the 24 h inbox window, so a stale Node live copy of the
+    /// same id can never re-queue.
+    #[tokio::test]
+    async fn terminal_interaction_ids_ignores_the_inbox_retention_cutoff() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-dedup").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+        let (_, _) = store
+            .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
+            .await
+            .expect("settle");
+        // Age the row well past the 24 h departed retention.
+        backdate_interaction(&store, &int_id, 48).await;
+
+        // It no longer feeds the inbox page…
+        let inbox = store
+            .list_inbox_interactions(None, None, None)
+            .await
+            .expect("inbox");
+        assert!(
+            !inbox.iter().any(|r| r.interaction_id == int_id),
+            "aged row hidden from display"
+        );
+        // …but authoritative dedup still knows it is terminal.
+        let terminal = store
+            .terminal_interaction_ids(vec![int_id.clone(), "int_does_not_exist".to_string()])
+            .await
+            .expect("terminal ids");
+        assert!(
+            terminal.contains(&int_id),
+            "terminal state wins regardless of age"
+        );
+        assert_eq!(terminal.len(), 1, "unknown ids are not reported terminal");
         store.close().await;
     }
 

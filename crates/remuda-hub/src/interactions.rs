@@ -406,18 +406,51 @@ pub async fn list_interactions(
             Ok(Some(frame)) => match rpc_result(frame) {
                 Ok(result) => {
                     if let Some(batch) = result.get("items").and_then(Value::as_array) {
-                        for item in batch {
-                            if query.kind.as_ref().is_none_or(|want| {
-                                item.get("kind").and_then(Value::as_str) == Some(want.as_str())
-                            }) {
-                                let id = item
-                                    .get("interactionId")
+                        // c-cardsettle r2 item 3: display retention (24 h) is
+                        // separate from authoritative dedup. A Node may still
+                        // list as pending an id the Hub settled; even when the
+                        // durable row is too old to be in the inbox page, the
+                        // Hub's terminal state wins and the live copy is
+                        // suppressed so it cannot return to the queue/badge.
+                        let candidate_ids: Vec<String> = batch
+                            .iter()
+                            .filter(|item| {
+                                query.kind.as_ref().is_none_or(|want| {
+                                    item.get("kind").and_then(Value::as_str) == Some(want.as_str())
+                                })
+                            })
+                            .filter_map(|item| {
+                                item.get("interactionId")
                                     .or_else(|| item.get("id"))
                                     .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                if id.is_empty() || seen.insert(id.to_string()) {
-                                    items.push(flatten_interaction(item.clone()));
-                                }
+                                    .map(str::to_string)
+                            })
+                            .filter(|id| !id.is_empty())
+                            .collect();
+                        let durable_terminal = state
+                            .store
+                            .terminal_interaction_ids(candidate_ids.clone())
+                            .await?;
+                        for item in batch {
+                            if !query.kind.as_ref().is_none_or(|want| {
+                                item.get("kind").and_then(Value::as_str) == Some(want.as_str())
+                            }) {
+                                continue;
+                            }
+                            let id = item
+                                .get("interactionId")
+                                .or_else(|| item.get("id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if durable_terminal.contains(id) {
+                                tracing::debug!(
+                                    interaction_id = %id,
+                                    "suppressing node live copy: durable Hub row is terminal"
+                                );
+                                continue;
+                            }
+                            if id.is_empty() || seen.insert(id.to_string()) {
+                                items.push(flatten_interaction(item.clone()));
                             }
                         }
                     }

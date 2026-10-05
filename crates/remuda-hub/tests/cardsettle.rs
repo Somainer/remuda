@@ -115,6 +115,8 @@ struct FakeNode {
     result_rx: Arc<tokio::sync::Mutex<UnboundedReceiver<Value>>>,
     /// Every inbound RPC METHOD observed, in arrival order.
     calls: Arc<Mutex<Vec<String>>>,
+    /// Live items the fake serves from `interaction.list`.
+    live_items: Arc<Mutex<Vec<Value>>>,
     /// Set if the socket dropped: a disconnect is a test failure.
     disconnected: Arc<AtomicBool>,
     _task: tokio::task::JoinHandle<()>,
@@ -131,9 +133,11 @@ impl FakeNode {
         let (result_tx, result_rx) = unbounded_channel::<Value>();
         let result_rx = Arc::new(tokio::sync::Mutex::new(result_rx));
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let live_items: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let disconnected = Arc::new(AtomicBool::new(false));
         let (mut sink, mut stream) = ws.split();
         let calls_task = calls.clone();
+        let live_items_task = live_items.clone();
         let disconnected_task = disconnected.clone();
         let disconnected_out = disconnected.clone();
         let task = tokio::spawn(async move {
@@ -170,11 +174,29 @@ impl FakeNode {
                                 "jsonrpc": "2.0", "id": id,
                                 "error": { "code": -32004, "message": "unknown instance" }
                             }),
-                            // The merge's live fan-out: an empty live page.
-                            "interaction.list" => json!({
-                                "jsonrpc": "2.0", "id": id,
-                                "result": { "items": [], "nextCursor": null }
-                            }),
+                            // The merge's live fan-out: serve the scripted live
+                            // items (filtered to the queried instance when one
+                            // is given).
+                            "interaction.list" => {
+                                let queried_instance =
+                                    frame.pointer("/params/instanceId").and_then(Value::as_str);
+                                let items: Vec<Value> = live_items_task
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .filter(|item| {
+                                        queried_instance.is_none_or(|id| {
+                                            item.get("instanceId").and_then(Value::as_str)
+                                                == Some(id)
+                                        })
+                                    })
+                                    .cloned()
+                                    .collect();
+                                json!({
+                                    "jsonrpc": "2.0", "id": id,
+                                    "result": { "items": items, "nextCursor": null }
+                                })
+                            }
                             // A violation: never accept an answer for a dead
                             // generation. Recorded as the method regardless;
                             // reply an error so the client can't misread it.
@@ -206,6 +228,7 @@ impl FakeNode {
             outbound_tx,
             result_rx,
             calls,
+            live_items,
             disconnected,
             _task: task,
         };
@@ -270,6 +293,11 @@ impl FakeNode {
 
     fn observed_methods(&self) -> HashSet<String> {
         self.calls.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Script the live `interaction.list` page the fake Node serves.
+    fn set_live_items(&self, items: Vec<Value>) {
+        *self.live_items.lock().unwrap() = items;
     }
 }
 
@@ -507,6 +535,83 @@ async fn late_answer_after_delete_with_rejected_purge_is_rejected_and_not_forwar
 
     tokio::time::sleep(NO_FORWARD_WINDOW).await;
     node.assert_no_answer_forwarded()?;
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// r2 item 3: an aged (outside the 24 h display retention) invalidated durable
+/// row must still suppress a restarted Node's `interaction.list` copy of the
+/// same id, which the stale process serves as pending. Display retention and
+/// authoritative dedup are separate.
+#[tokio::test]
+async fn aged_terminal_row_suppresses_the_nodes_pending_copy_from_the_merge() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+
+    let (instance_id, interaction_wire) =
+        seed_live_card(addr, &cookie, &node, &host_id, "cardsettle dedup").await?;
+
+    // End the generation on the Hub (node-lost stop) → durable invalidated.
+    let (status, _) = http(
+        addr,
+        "POST",
+        &format!("/v1/instances/{instance_id}/commands"),
+        &cookie,
+        Some(&json!({ "operation": "instance.close", "payload": {} }).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 200);
+    let mut state = String::new();
+    for _ in 0..40 {
+        state = poll_card_state(addr, &cookie, &instance_id).await?;
+        if state == "invalidated" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(state, "invalidated");
+
+    // Age the durable row past the 24 h departed retention.
+    if let Some(store) = hub.store() {
+        store
+            .test_backdate_interaction(
+                interaction_wire.clone(),
+                "1999-01-01T00:00:00.000Z".to_string(),
+            )
+            .await?;
+    }
+
+    // The restarted process wrongly still serves the same id as pending.
+    node.set_live_items(vec![json!({
+        "interactionId": interaction_wire,
+        "id": interaction_wire,
+        "instanceId": instance_id,
+        "hostId": host_id.as_id().as_str(),
+        "kind": "approval",
+        "state": "pending",
+        "blocking": true,
+        "answerable": true
+    })]);
+
+    // The merge must not bring the stale pending copy back.
+    let (status, body) = http(addr, "GET", "/v1/interactions", &cookie, None).await?;
+    assert_eq!(status, 200);
+    let page: Value = serde_json::from_str(&body)?;
+    let ids: Vec<&str> = page["items"]
+        .as_array()
+        .context("items array")?
+        .iter()
+        .filter_map(|item| item.get("interactionId").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !ids.contains(&interaction_wire.as_str()),
+        "the aged terminal row's stale Node copy must not re-queue: {body}"
+    );
 
     hub.shutdown().await;
     Ok(())

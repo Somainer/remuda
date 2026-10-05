@@ -608,13 +608,25 @@ pub fn stage_for_resume(
     }
     for (source_name, dest_name) in sidecars {
         let source_side = source_dir.join(&source_name);
-        if source_side.is_dir() {
-            let dest_side = dest_dir.join(&dest_name);
-            // Every staged path must stay inside the project dir (the dest
-            // names are validated tokens; this is the belt-and-braces check).
-            ensure_within(&dest_dir, &dest_side)?;
-            copy_dir_merge(&source_side, &dest_side)?;
-            sidecar_dirs.push(dest_side);
+        // `symlink_metadata`, not `is_dir`: a sidecar root that is itself a
+        // symlink to a directory must not be read through — that directory can
+        // live in the predecessor's home or anywhere else.
+        match std::fs::symlink_metadata(&source_side) {
+            Ok(metadata) if metadata.is_dir() => {
+                let dest_side = dest_dir.join(&dest_name);
+                // Every staged path must stay inside the project dir (the dest
+                // names are validated tokens; this is the belt-and-braces check).
+                ensure_within(&dest_dir, &dest_side)?;
+                copy_dir_merge(source_dir, &source_side, &dest_side)?;
+                sidecar_dirs.push(dest_side);
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_input(format!(
+                    "resume sidecar {} is a symlink, not a real directory",
+                    source_side.display()
+                )));
+            }
+            _ => {}
         }
     }
 
@@ -630,39 +642,121 @@ fn same_path(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
+/// Maximum symlink hops followed while resolving one staged link, so a link
+/// cycle cannot hang the walk.
+const MAX_LINK_HOPS: usize = 32;
+
 /// Recursively merge `src` into `dst`, never overwriting destination files.
-fn copy_dir_merge(src: &Path, dst: &Path) -> std::io::Result<()> {
+///
+/// Symlinks are never recreated (c-resumehome, review item 2): a link recreated
+/// in the child's home could point back at the predecessor's files or outside
+/// the managed home, and the resumed process would then write through it. A
+/// link is followed hop by hop — every hop containment-checked against `root`
+/// — and its target is copied as an independent file only when the final
+/// target is a regular file. Escaping links, directory links, broken links and
+/// cycles are hard errors, never silently skipped.
+fn copy_dir_merge(root: &Path, src: &Path, dst: &Path) -> std::io::Result<()> {
+    // Check before `create_dir_all`: on a broken directory symlink
+    // `create_dir_all` follows the link and creates its external target.
+    if is_symlink(dst)? {
+        return Err(invalid_input(format!(
+            "resume staging destination {} is a symlink, not a real directory",
+            dst.display()
+        )));
+    }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let source = entry.path();
         let dest = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_merge(&source, &dest)?;
-        } else if file_type.is_symlink() {
-            copy_symlink(&source, &dest);
-        } else if !dest.exists() {
+        // Classify with `symlink_metadata`: on some filesystems a read_dir
+        // d_type of "file" can hide a link, and `is_dir`/`exists` follow links.
+        let file_type = std::fs::symlink_metadata(&source)?.file_type();
+        if file_type.is_symlink() {
+            copy_linked_file(root, &source, &dest)?;
+        } else if file_type.is_dir() {
+            copy_dir_merge(root, &source, &dest)?;
+        } else if !lexically_exists(&dest)? {
             std::fs::copy(&source, &dest)?;
         }
     }
     Ok(())
 }
 
-/// Preserve a symlink as a link when the platform allows; fall back to a
-/// content copy (e.g. privileges that forbid creating links).
-fn copy_symlink(source: &Path, dest: &Path) {
-    #[cfg(unix)]
-    {
-        if let Ok(target) = std::fs::read_link(source)
-            && !dest.exists()
-            && std::os::unix::fs::symlink(target, dest).is_ok()
-        {
-            return;
-        }
+/// Copy one symlink entry as an independent file, when and only when every hop
+/// of its target chain stays inside `root` and ends at a regular file.
+fn copy_linked_file(root: &Path, link: &Path, dest: &Path) -> std::io::Result<()> {
+    if lexically_exists(&dest)? {
+        // Never overwrite a destination entry, including a destination link.
+        return Ok(());
     }
-    if !dest.exists() {
-        let _ = std::fs::copy(source, dest);
+    let target = resolve_link_within(root, link)?;
+    let metadata = std::fs::symlink_metadata(&target)?;
+    if !metadata.is_file() {
+        return Err(invalid_input(format!(
+            "symlink {} resolves to {} inside the staged project, which is not a regular file",
+            link.display(),
+            target.display()
+        )));
+    }
+    std::fs::copy(&target, dest)?;
+    Ok(())
+}
+
+/// Resolve `start` without trusting any single `canonicalize`, enforcing that
+/// every link in the chain stays lexically inside `root`.
+fn resolve_link_within(root: &Path, start: &Path) -> std::io::Result<PathBuf> {
+    let root = normalize_lexical(root);
+    let mut current = start.to_path_buf();
+    for _ in 0..=MAX_LINK_HOPS {
+        let normalized = normalize_lexical(&current);
+        if !normalized.is_absolute() || !normalized.starts_with(&root) {
+            return Err(invalid_input(format!(
+                "symlink {} escapes the staged project directory {} via {}",
+                start.display(),
+                root.display(),
+                current.display()
+            )));
+        }
+        let metadata = match std::fs::symlink_metadata(&normalized) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "symlink {} is broken (dangling target {})",
+                        start.display(),
+                        current.display()
+                    ),
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+        if !metadata.file_type().is_symlink() {
+            return Ok(normalized);
+        }
+        let target = std::fs::read_link(&normalized)?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            normalized
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .join(target)
+        };
+    }
+    Err(invalid_input(format!(
+        "symlink {} is a link cycle (more than {MAX_LINK_HOPS} hops)",
+        start.display()
+    )))
+}
+
+/// Whether a path exists, checked without following a terminal symlink.
+fn lexically_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
@@ -1302,6 +1396,150 @@ mod tests {
         assert!(bind_manual(&home, &cwd, "../escape").is_none());
         assert!(bind_by_session_id(&home, &cwd, "a/b").is_none());
         assert!(bind_manual(&home, &cwd, ".").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_staging_symlink_sidecars_are_copied_as_independent_files() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000ac";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+        let project = source.parent().unwrap();
+
+        // Internal relative link (subagents dir → memory file) and an internal
+        // link chain (chain → inner → real file). Both stay in the project.
+        let subagents = project.join(session).join("subagents");
+        std::fs::create_dir_all(&subagents).expect("mkdir");
+        write_file(&project.join("memory/MEMORY.md"), "project memory\n");
+        symlink("../../memory/MEMORY.md", subagents.join("memory-link.md")).expect("internal link");
+        write_file(&project.join(session).join("inner.jsonl"), "inner-target\n");
+        symlink("inner.jsonl", project.join(session).join("mid.jsonl")).expect("mid link");
+        symlink("mid.jsonl", project.join(session).join("chain.jsonl")).expect("chain link");
+
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
+
+        let copied = subagents.strip_prefix(project).unwrap().to_path_buf();
+        let dest_memory_link = staged
+            .transcript
+            .parent()
+            .unwrap()
+            .join(&copied)
+            .join("memory-link.md");
+        let metadata = std::fs::symlink_metadata(&dest_memory_link).expect("copied link entry");
+        assert!(
+            metadata.is_file(),
+            "the link becomes a regular file, not a link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest_memory_link).unwrap(),
+            "project memory\n",
+            "target content is copied as an independent file"
+        );
+        for name in ["chain.jsonl", "mid.jsonl"] {
+            let path = staged.transcript.parent().unwrap().join(session).join(name);
+            assert!(
+                std::fs::symlink_metadata(&path).unwrap().is_file(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(
+                staged
+                    .transcript
+                    .parent()
+                    .unwrap()
+                    .join(session)
+                    .join("chain.jsonl")
+            )
+            .unwrap(),
+            "inner-target\n",
+            "internal chains resolve to their final in-tree target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_staging_rejects_escaping_broken_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000ad";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+        let project = source.parent().unwrap();
+        let side = project.join(session);
+        std::fs::create_dir_all(&side).expect("mkdir");
+
+        // Outside the project tree: relative traversal and an absolute link.
+        let outside = tmp.path().join("outside.txt");
+        write_file(&outside, "outside\n");
+        symlink(&outside, side.join("escaping-abs")).expect("abs link");
+        symlink("../../../../outside.txt", side.join("escaping-rel")).expect("rel link");
+        // Multi-hop escape: the first hop looks internal (into the project
+        // root), the second leaves via an absolute target.
+        symlink("../../hop2", side.join("hop1")).expect("hop1");
+        symlink(&outside, project.join("hop2")).expect("hop2 leaves tree");
+        // Broken link.
+        symlink("does-not-exist", side.join("broken")).expect("broken link");
+        // Directory link, internal.
+        std::fs::create_dir_all(project.join("realdir")).expect("realdir");
+        symlink("realdir", side.join("dir-link")).expect("dir link");
+
+        let error = stage_for_resume(&source, &new_home, &cwd, session)
+            .expect_err("any unsafe sidecar link aborts staging with an error, never a skip");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+            ),
+            "escaping/dir links are InvalidInput; a dangling link is NotFound: {error}"
+        );
+        // The dangerous links are never reproduced in the child home.
+        for name in ["escaping-abs", "escaping-rel", "hop1", "broken", "dir-link"] {
+            assert!(
+                !new_home
+                    .join("projects")
+                    .join(encode_project_dir(&cwd))
+                    .join(session)
+                    .join(name)
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.file_type().is_symlink()),
+                "{name} must not exist as a symlink in the staged tree"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_staging_refuses_a_symlinked_sidecar_root() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000ae";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+        let project = source.parent().unwrap();
+        let elsewhere = tmp.path().join("elsewhere-memory");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        write_file(&elsewhere.join("SECRET.md"), "x\n");
+        symlink(&elsewhere, project.join("memory")).expect("symlinked memory root");
+
+        let error = stage_for_resume(&source, &new_home, &cwd, session)
+            .expect_err("a symlinked memory dir must not be read through");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("symlink"), "{error}");
     }
 
     #[test]

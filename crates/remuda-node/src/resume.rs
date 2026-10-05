@@ -108,16 +108,18 @@ pub(crate) fn resolve_resume_transcript(
     };
     // Review item 1: the id must be the *predecessor's* recorded native
     // session, not any conversation that happens to sit on this host. An
-    // unknown recording is inconclusive (structured drivers report late);
-    // a known-but-different id is a refusal.
-    if let Knowledge::Known { value } = &parent.native_ref.session_id
-        && value.trim() != session_id
-    {
-        return Err(crate::NodeError::InvalidRequest(format!(
-            "cannot resume session {session_id}: predecessor {} records native session {}",
-            parent_id.as_id(),
-            value.trim()
-        )));
+    // unknown recording is inconclusive (structured drivers report late), and
+    // so is the create-time `ins_…` placeholder that stands in until the
+    // driver reports its real id; a known-but-different native id is a refusal.
+    if let Knowledge::Known { value } = &parent.native_ref.session_id {
+        let recorded = value.trim();
+        let is_placeholder = recorded.is_empty() || recorded.starts_with("ins_");
+        if !is_placeholder && recorded != session_id {
+            return Err(crate::NodeError::InvalidRequest(format!(
+                "cannot resume session {session_id}: predecessor {} records native session {recorded}",
+                parent_id.as_id(),
+            )));
+        }
     }
     if let Knowledge::Known { value } = &parent.native_ref.transcript {
         let path = PathBuf::from(value.source_path.trim());

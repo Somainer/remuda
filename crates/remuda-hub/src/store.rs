@@ -5279,6 +5279,11 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         -- late answer must still get the state-derived rejection (invalidated
         -- -> 404, expired -> 410, answered/resolved -> 409) instead of a
         -- missing-row miss that fans interaction.answer out to every Node.
+        -- Retention: the LIFE of the database, same policy as
+        -- deleted_instances. Rows hold no payload (id/instance/host/state/
+        -- timestamps only, tens of bytes each), a stale link may answer at any
+        -- time, and pruning is exactly what would re-open the all-Node fan-out
+        -- hole; so there is deliberately no late-answer TTL prune.
         CREATE TABLE IF NOT EXISTS interaction_tombstones (
             id TEXT PRIMARY KEY,
             instance_id TEXT NOT NULL,

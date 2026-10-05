@@ -1,12 +1,14 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { act, createRef } from "react";
+import { act, createRef, useRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { buildLongObservations } from "../../fixtures/session/longEvents";
-import type { Observation } from "../../types/observation";
+import type { Observation, Snapshot } from "../../types/observation";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import type { LocalBubble } from "../../lib/store";
+import { hubStore } from "../../lib/store";
+import { JournalClient, type JournalRead } from "../../lib/journal";
 import { Transcript, type TranscriptHandle } from "./Transcript";
 
 // The commit probe is only mounted under ?profile=1; the flag is a getter so
@@ -1277,5 +1279,336 @@ describe("streaming row (D-053)", () => {
       .map((p) => (p.value as { nodeId: string }).nodeId);
     expect(new Set(rows).size).toBe(1);
     expect((screen.getByTestId("held-queue-steer") as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// load-earlier through the REAL JournalClient -> Transcript path (UO-6a r4).
+// A scripted bounded read drives a real JournalClient; its onPrepend feeds the
+// rendered Transcript exactly like hubStore.follow's listener, so anchor
+// completion, scroll cancellation and cross-session identity are exercised
+// end to end.
+// ---------------------------------------------------------------------------
+describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
+  const ROW = 96;
+  const VIEW = 720;
+
+  function source() {
+    return {
+      driverKind: "claude-print" as const,
+      driverVersion: "1",
+      adapterVersion: "1",
+      channel: "stdout" as const,
+      delivery: "replay" as const,
+      nativeSessionId: unknownKnowledge("none"),
+      nativeTurnId: unknownKnowledge("none"),
+      nativeAgentId: unknownKnowledge("none"),
+      nativeItemId: unknownKnowledge("none"),
+      nativeEventId: unknownKnowledge("none"),
+      nativeRequestId: { type: "none" as const },
+      sourceCursor: { type: "runtime" as const, ledgerRevision: "1" },
+    };
+  }
+
+  function msg(seq: number, role: "user" | "assistant", instanceId: string, text = `m${seq}`): Observation {
+    return {
+      schemaVersion: 1,
+      eventId: `evt_${seq}_${role}` as Id,
+      journalId: `obj_${instanceId}` as Id,
+      instanceId: instanceId as Id,
+      runId: null,
+      hostId: "hst" as Id,
+      processGeneration: "1",
+      runGeneration: null,
+      seq: String(seq),
+      observedAt: "2026-09-12T00:00:00.000Z",
+      nativeAt: known("2026-09-12T00:00:00.000Z"),
+      source: source(),
+      kind: "message",
+      completeness: "structured",
+      rawRef: null,
+      evidenceEventIds: [],
+      payload: {
+        nodeId: `n_${seq}_${role}` as Id,
+        messageId: `m_${seq}_${role}` as Id,
+        role,
+        phase: role === "user" ? "input" : "final",
+        revision: "1",
+        baseRevision: null,
+        operation: "open",
+        blocks: [{ type: "text", text }],
+        targetBlock: null,
+        parentToolCallId: null,
+        nativeOrigin: known(role === "user" ? "ui" : "assistant"),
+        status: "complete",
+      },
+    } as Observation;
+  }
+
+  function pageOf(events: Observation[], reachedAfterSeq = false) {
+    return {
+      events,
+      durableSeq: events.at(-1)?.seq ?? "0",
+      windowFromSeq: events[0]?.seq ?? null,
+      reachedAfterSeq,
+    };
+  }
+
+  type Registry = {
+    events: Record<string, Observation[]>;
+    floors: Record<string, string>;
+    clients: Record<string, JournalClient>;
+    setEvents: Record<string, (events: Observation[]) => void>;
+    setFloor: Record<string, (floor: string) => void>;
+  };
+
+  function makeClient(
+    reg: Registry,
+    instanceId: string,
+    initial: Observation[],
+    read: JournalRead,
+    snapshotFloor: string,
+    asOf: string,
+  ): JournalClient {
+    const client = new JournalClient(`obj_${instanceId}` as Id, read, {
+      onPrepend: (rows) => {
+        const merged = (reg.events[instanceId] ?? []).concat(rows).sort((a, b) => Number(a.seq) - Number(b.seq));
+        reg.setEvents[instanceId]?.(merged);
+      },
+    });
+    client.noteHistory(initial);
+    client.applySnapshot({
+      projectionVersion: "v1",
+      projectionEpoch: "ep" as Id,
+      asOfSeq: asOf,
+      instance: {} as Snapshot["instance"],
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: snapshotFloor, complete: false },
+    });
+    reg.clients[instanceId] = client;
+    reg.events[instanceId] = initial;
+    reg.floors[instanceId] = snapshotFloor;
+    return client;
+  }
+
+  function Driver({ reg }: { reg: Registry }) {
+    const { instanceId = "" } = useParams();
+    const [events, setEvents] = useState<Observation[]>(reg.events[instanceId] ?? []);
+    const [floor, setFloor] = useState<string>(reg.floors[instanceId] ?? "1");
+    const activeRef = useRef(instanceId);
+    activeRef.current = instanceId;
+    reg.setEvents[instanceId] = (next) => {
+      // A late prepend from another session's in-flight click must not paint
+      // over the route the reader switched to.
+      if (activeRef.current !== instanceId) return;
+      reg.events[instanceId] = next;
+      setEvents(next);
+    };
+    reg.setFloor[instanceId] = (next) => {
+      if (activeRef.current !== instanceId) return;
+      reg.floors[instanceId] = next;
+      setFloor(next);
+    };
+    return <Transcript events={events} earlierFloor={floor} compact />;
+  }
+
+  function GoTo({ to }: { to: string }) {
+    const navigate = useNavigate();
+    return (
+      <button type="button" data-testid={`go-${to}`} onClick={() => navigate(to)}>
+        go
+      </button>
+    );
+  }
+
+  function renderDriver(reg: Registry, path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route
+            path="/s/:instanceId"
+            element={
+              <>
+                <Driver reg={reg} />
+                <GoTo to="/s/insB" />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  /** Deterministic flat row geometry off the virtual window's pad spacer. */
+  function installGeometry(totalCount: number) {
+    const heights = new WeakMap<Element, number>();
+    const observerCbs = new Map<Element, () => void>();
+    const isScroller = (el: unknown) => el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    let top = 0;
+    // Full-list scroll height (the existing pin tests do the same): at the
+    // scroll event the DOM still shows the PREVIOUS virtual window, and
+    // deriving scrollHeight from it flips pinRef for any valid middle offset.
+    const listHeight = () => totalCount * ROW;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? VIEW : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? listHeight() : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      const h = heights.get(el) ?? ROW;
+      if (el.dataset?.testid === "transcript-scroller") {
+        return { top: 0, left: 0, right: 500, bottom: VIEW, width: 500, height: VIEW, x: 0, y: 0, toJSON() {} } as DOMRect;
+      }
+      if (el.dataset?.anchor && el.parentElement) {
+        const list = el.parentElement;
+        const spacer = Array.from(list.children).find((c) => c.getAttribute("aria-hidden") === "true") as
+          | HTMLElement
+          | undefined;
+        const pad = Number.parseFloat(spacer?.style.height ?? "0") || 0;
+        // Sum the MEASURED heights of every mounted sibling above this row: a
+        // grown row above contributes its extra height to every later rect.
+        let preceding = 0;
+        for (const sibling of Array.from(list.querySelectorAll("[data-anchor]"))) {
+          if (sibling === el) break;
+          preceding += heights.get(sibling) ?? ROW;
+        }
+        const rowTop = pad + preceding - top;
+        return { top: rowTop, left: 0, right: 500, bottom: rowTop + h, width: 500, height: h, x: 0, y: rowTop, toJSON() {} } as DOMRect;
+      }
+      return { top: 0, left: 0, right: 0, bottom: h, width: 0, height: h, x: 0, y: 0, toJSON() {} } as DOMRect;
+    });
+    class GeometryRO {
+      private readonly cb: () => void;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe(el: Element) {
+        observerCbs.set(el, this.cb);
+      }
+      unobserve(el: Element) {
+        observerCbs.delete(el);
+      }
+      disconnect() {
+        observerCbs.clear();
+      }
+    }
+    vi.stubGlobal("ResizeObserver", GeometryRO);
+
+    const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
+    const defineScroll = () => {
+      const el = scroller();
+      Object.defineProperty(el, "scrollTop", {
+        configurable: true,
+        get: () => top,
+        set: (v: number) => {
+          top = v;
+        },
+      });
+    };
+    const scrollTo = (value: number) => {
+      top = value;
+      fireEvent.scroll(scroller());
+    };
+    const growMountedRow = (ordinal: number, height: number) => {
+      const el = scroller().querySelectorAll<HTMLElement>("[data-anchor]")[ordinal];
+      if (!el) throw new Error(`mounted row ${ordinal} not found`);
+      heights.set(el, height);
+      observerCbs.get(el)?.();
+    };
+    const scrollTopNow = () => top;
+    return { scroller, defineScroll, scrollTo, growMountedRow, scrollTopNow };
+  }
+
+  function gate<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("a late resolve from session A cannot clear session B's armed restore (item 4)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeometry(40);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    const mkTurns = (instanceId: string) => {
+      const out: Observation[] = [];
+      for (let i = 0; i < 20; i += 1) {
+        out.push(msg(1001 + i, i % 2 === 0 ? "user" : "assistant", instanceId, `${instanceId}-${1001 + i}`));
+      }
+      return out;
+    };
+    // A reconnect re-anchor above held rows lets A's click resolve
+    // duplicate-only (rows all already held), which is the finalize path that
+    // used to clear whatever anchors were armed next.
+    const gateA = gate<ReturnType<typeof pageOf>>();
+    makeClient(
+      reg,
+      "insA",
+      mkTurns("insA"),
+      vi.fn<JournalRead>().mockImplementation(() => gateA.promise),
+      "1021",
+      "1040",
+    );
+    // Seed rows under the higher re-anchor floor.
+    reg.clients.insA.noteHistory(mkTurns("insA"));
+    const gateB = gate<ReturnType<typeof pageOf>>();
+    const olderB: Observation[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      olderB.push(msg(901 + i, i % 2 === 0 ? "user" : "assistant", "insB", `b-${901 + i}`));
+    }
+    makeClient(
+      reg,
+      "insB",
+      mkTurns("insB"),
+      vi.fn<JournalRead>().mockImplementation(() => gateB.promise),
+      "1001",
+      "1020",
+    );
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    renderDriver(reg, "/s/insA");
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+
+    // Route to B (same mounted Transcript) and arm B while A is still in flight.
+    await user.click(screen.getByTestId("go-/s/insB"));
+    geo.scrollTo(0);
+    const buttonB = screen.getByTestId("load-earlier");
+    await user.click(buttonB);
+    expect((buttonB as HTMLButtonElement).disabled).toBe(true);
+
+    // A resolves duplicate-only: 1001..1020 below the re-anchored floor 1021
+    // is every row A already holds.
+    await act(async () => {
+      gateA.resolve(pageOf(mkTurns("insA")));
+      await Promise.resolve();
+    });
+    // B's request is still the owner: loading state survives.
+    expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(true);
+
+    // B's real prepend lands and restores the click-time anchor (now 20 rows
+    // deeper) instead of having been cleared by A.
+    await act(async () => {
+      gateB.resolve(pageOf(olderB));
+      await Promise.resolve();
+    });
+    await act(async () => {});
+    expect(Math.abs(geo.scrollTopNow() - 20 * ROW)).toBeLessThanOrEqual(4);
   });
 });

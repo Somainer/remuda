@@ -102,6 +102,7 @@ function selectSession(state: HubState, instanceId: string) {
     instance,
     events: state.events[instanceId],
     journalStatus: state.journalStatus[instanceId],
+    earlierFloor: state.journalFloors[instanceId] ?? null,
     pending: state.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending"),
     bubbles: state.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled"),
     // c-steer: Remuda-held queue rows (Enter while busy / while a question is
@@ -754,6 +755,7 @@ function SessionPageBody({
             events={events}
             bubbles={bubbles}
             compact={hub.compact}
+            earlierFloor={hub.earlierFloor}
             journalStatus={journalStatus}
             steerHeld={steerHeldControl(instance.kind, composerPhase, instance.capabilities)}
             onSteerHeld={async (_iid, id) => {

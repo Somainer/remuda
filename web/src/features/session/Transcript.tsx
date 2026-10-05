@@ -151,6 +151,13 @@ export type TranscriptProps = {
    * and drives them through TranscriptHandle instead.
    */
   toolbar?: boolean;
+  /**
+   * Lowest LOADED journal seq as tracked by the store's descending pager. When
+   * provided it is the load-earlier authority (a reconnect snapshot can
+   * re-anchor the server window above rows this client already holds); absent
+   * (standalone unit mounts) the component derives a floor from its events.
+   */
+  earlierFloor?: string | null;
 };
 
 type InnerProps = TranscriptProps & {
@@ -181,6 +188,7 @@ function TranscriptInner({
   steerHeld,
   onSteerHeld,
   toolbar = true,
+  earlierFloor,
   handleRef,
 }: InnerProps) {
   // Per-instance reading position/follow persistence. The id comes from the
@@ -239,6 +247,8 @@ function TranscriptInner({
          * delta of 0. Absent on saved-position restores, which act at once.
          */
         awaitIndex?: number;
+        /** Owning load-earlier request; cross-session late replies never clear it. */
+        reqId?: number;
       }
     | null
   >(null);
@@ -249,7 +259,19 @@ function TranscriptInner({
     offset: number;
     tries: number;
     armedIndex: number;
+    reqId: number;
   } | null>(null);
+  /**
+   * Identity of the in-flight load-earlier click. The Transcript stays mounted
+   * across session routes, so a late `finally` from session A must not clear
+   * session B's armed restore or its loading state: every finalize path checks
+   * this object is still the current request FOR THE SAME instance.
+   */
+  const loadReqRef = useRef<{ reqId: number; instanceId: string; done: boolean; cancelled: boolean } | null>(null);
+  const loadReqSeqRef = useRef(0);
+  // Bumped on arm and on completion so the anchor effects run once more even
+  // when the click fetched nothing new (no nodes/sizes commit to rerun them).
+  const [loadTick, setLoadTick] = useState(0);
   // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
   // click on a held transcript row posts exactly once.
   const steeringRef = useRef<Set<string>>(new Set());
@@ -260,6 +282,7 @@ function TranscriptInner({
     scrollTopRef.current = 0;
     pendingScroll.current = null;
     prependAnchorRef.current = null;
+    loadReqRef.current = null;
     steeringRef.current.clear();
     setLoadingEarlier(false);
     setRowHeights(new Map());
@@ -424,7 +447,10 @@ function TranscriptInner({
     () => (events.length ? events.reduce((min, ev) => Math.min(min, Number(ev.seq)), Number(events[0].seq)) : 1),
     [events],
   );
-  const canLoadEarlier = nodes.length > 0 && loadedFloor > 1;
+  // The store floor survives reconnect snapshots that re-anchor the server
+  // window; the events-derived floor only backs standalone unit mounts.
+  const retainedFloor = earlierFloor === undefined ? loadedFloor : Math.max(1, Number(earlierFloor ?? 1));
+  const canLoadEarlier = nodes.length > 0 && retainedFloor > 1;
   const onLoadEarlier = useCallback(async () => {
     if (!instanceId || loadingEarlier || !canLoadEarlier) return;
     const el = scrollerRef.current;
@@ -438,6 +464,14 @@ function TranscriptInner({
       if (row) offset = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
     }
     pinRef.current = false;
+    // This click owns one request identity. Transcript stays mounted across
+    // routes, so the request carries its instance + a monotone id: session
+    // switches (epoch reset) and later clicks supersede it, and this click's
+    // late finally may only finalize its OWN anchors.
+    const reqId = loadReqSeqRef.current + 1;
+    loadReqSeqRef.current = reqId;
+    const req = { reqId, instanceId, done: false, cancelled: false };
+    loadReqRef.current = req;
     // Arm the restore BEFORE the read. loadEarlier emits the merged events list
     // synchronously (inside the awaited call) and the external-store commit
     // flushes before this continuation resumes, so arming after the await missed
@@ -447,25 +481,37 @@ function TranscriptInner({
     const armedIndex = range.start;
     if (anchorId) {
       restoringRef.current = true;
-      pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0, awaitIndex: armedIndex };
+      pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0, awaitIndex: armedIndex, reqId };
       // Keep repinning as the prepended (unmeasured) rows settle; the
       // one-shot restore effect alone stops before the average converges.
-      prependAnchorRef.current = { anchorId, offset, tries: 0, armedIndex };
+      prependAnchorRef.current = { anchorId, offset, tries: 0, armedIndex, reqId };
     }
     setLoadingEarlier(true);
+    setLoadTick((n) => n + 1);
     let result: { prepended: boolean; end: boolean } | null = null;
     try {
       result = await hubStore.loadEarlier(instanceId);
     } finally {
-      // Release the anchor when nothing was prepended (already at the floor, an
-      // empty/deduped page, or a divergence/stale read) so a later unrelated
-      // commit cannot restore to a stale position.
-      if (!result || result.end || !result.prepended) {
-        pendingScroll.current = null;
-        prependAnchorRef.current = null;
-        restoringRef.current = false;
+      req.done = true;
+      // Only the still-current request for THIS instance finalizes; after a
+      // route switch the epoch reset already cleared the refs and another
+      // session may own a newer request.
+      if (loadReqRef.current === req) {
+        setLoadingEarlier(false);
+        setLoadTick((n) => n + 1);
+        if (req.cancelled || !result || result.end || !result.prepended) {
+          // Nothing to anchor to (cancelled by a user scroll, a duplicate-only
+          // page, the retained end, or a failed read): retire what this click
+          // armed. A SUCCESSFUL prepend leaves the anchors to converge.
+          if (prependAnchorRef.current?.reqId === reqId) prependAnchorRef.current = null;
+          const pending = pendingScroll.current;
+          if (pending?.kind === "restore" && pending.reqId === reqId) {
+            pendingScroll.current = null;
+            restoringRef.current = false;
+          }
+          loadReqRef.current = null;
+        }
       }
-      setLoadingEarlier(false);
     }
   }, [instanceId, loadingEarlier, canLoadEarlier, range.start]);
 
@@ -556,9 +602,10 @@ function TranscriptInner({
     const held = prependAnchorRef.current;
     const el = scrollerRef.current;
     if (!held || !el || !nodesRef.current.length) return;
-    // Wait for the prepend itself: inert while the anchor still sits at its
-    // armed index (a live append or row-growth commit during the fetch must
-    // neither repin nor burn the stable-pass budget).
+    // The armed anchor can VANISH: an older tool page renames the compact fold
+    // it became (`compact:<firstToolCallId>`). Retarget once to the row now
+    // occupying the armed slot; that row is the new anchor (the fold renamed in
+    // place), and an index advance alone also counts (plain prepend).
     const anchorIndex = nodes.findIndex((n) => n.id === held.anchorId);
     if (anchorIndex < 0 || anchorIndex <= held.armedIndex) return;
     const rowEl = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.anchorId)}"]`);
@@ -577,8 +624,11 @@ function TranscriptInner({
     held.tries += 1;
     // Sizes/events arrive on separate commits; release after a few stable
     // passes with no correction needed.
-    if (held.tries >= 4) prependAnchorRef.current = null;
-  }, [sizes, nodes, estimate]);
+    if (held.tries >= 4) {
+      prependAnchorRef.current = null;
+      if (loadReqRef.current?.reqId === held.reqId) loadReqRef.current = null;
+    }
+  }, [sizes, nodes, estimate, loadTick]);
 
   useLayoutEffect(() => {
     const el = scrollerRef.current;
@@ -638,9 +688,6 @@ function TranscriptInner({
     if (pending.kind === "restore") {
       if (pending.awaitIndex !== undefined) {
         const armed = nodes.findIndex((n) => n.id === pending.anchorId);
-        // The older page has not landed yet (the read is in flight). Stay
-        // armed without scrolling or burning the retry budget on the
-        // pre-prepend commits a live append / row growth may cause meanwhile.
         if (armed < 0 || armed <= pending.awaitIndex) return;
       }
       // Estimate a starting position from the saved average, then correct
@@ -687,7 +734,7 @@ function TranscriptInner({
       return;
     }
     pending.tries += 1;
-  }, [sizes, nodes, estimate, applyOffset]);
+  }, [sizes, nodes, estimate, applyOffset, loadTick]);
 
   // A commit that moves rows above the anchor (padTop re-estimated, a row
   // inserted above) holds the reader the same way a measured growth does. A

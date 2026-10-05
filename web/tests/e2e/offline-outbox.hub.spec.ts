@@ -1,4 +1,7 @@
 import { expect, request as apiRequest, test, type APIRequestContext, type Browser, type Page } from "@playwright/test";
+import { rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { login } from "./hub-auth";
 
 /**
@@ -22,6 +25,24 @@ import { login } from "./hub-auth";
 test.describe.configure({ mode: "serial" });
 
 const created: string[] = [];
+
+/**
+ * Test-controlled journal release (c-reconnfu round 4 item 2): the fake
+ * node's `__gate_journal__` fixture accepts the POST immediately but withholds
+ * the mirrored journal observation until this gate file appears — replacing the
+ * autonomous 8 s sleep of `__hold_journal__` with a deterministic trigger
+ * the spec owns. File name is hub-port + commandId scoped so specs on
+ * parallel hubs never cross.
+ */
+const hubPort = (process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880").split(":")[1];
+const journalGates = new Set<string>();
+function journalGatePath(commandId: string): string {
+  return path.join(os.tmpdir(), `remuda-e2e-journal-release-${hubPort}-${commandId}`);
+}
+async function releaseJournal(commandId: string): Promise<void> {
+  journalGates.add(commandId);
+  await writeFile(journalGatePath(commandId), "release\n");
+}
 
 async function clearApprovals(page: Page, instanceId: string) {
   // The fake node raises a launch approval on create; answer it via the API so
@@ -246,6 +267,10 @@ async function deleteCreatedInstances(browser: Browser) {
 // run, and again in afterAll as a safety net when an afterEach could not run
 // its own cleanup (it only ever sees ids left behind).
 test.afterEach(async ({ browser }) => {
+  for (const commandId of journalGates) {
+    await rm(journalGatePath(commandId), { force: true });
+  }
+  journalGates.clear();
   await deleteCreatedInstances(browser);
 });
 
@@ -490,11 +515,12 @@ test("an online send labels the row 等待发送 then 已发送，等待确认/�
     return route.fulfill({ response: res });
   });
 
-  await sendMessage(page, "__hold_journal__:8000");
+  await sendMessage(page, "__gate_journal__");
   const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
   await expect(bubble).toBeVisible();
   const commandId = await bubble.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
+  await rm(journalGatePath(commandId!), { force: true });
 
   // Queued behind the lock, link live: 等待发送, never the offline wording.
   await expect(bubble).toContainText("等待发送");
@@ -507,11 +533,11 @@ test("an online send labels the row 等待发送 then 已发送，等待确认/�
   await expect(bubble).not.toContainText("已受理");
   await expect(bubble).not.toContainText("状态待确认");
 
-  // Release the POST. The fake node answers immediately but withholds the
-  // mirrored journal user observation for 8 s (__hold_journal__,
-  // hub_e2e.rs): once the browser has processed the accepted response the
-  // STILL-VISIBLE bubble must carry the distinct accepted/delivered label
-  // 已受理 — proving the answer landed, unlike inflight's
+  // Release the POST. The fake node accepts it immediately but withholds
+  // the mirrored journal user observation on the TEST-CONTROLLED gate
+  // (__gate_journal__, hub_e2e.rs): once the browser has processed the
+  // accepted response the STILL-VISIBLE bubble must carry the distinct
+  // accepted/delivered label 已受理 — unlike inflight's
   // 已发送，等待确认 — and exactly one Hub command row is committed.
   releasePost?.();
   await expect(bubble).toContainText("已受理", { timeout: 15_000 });
@@ -527,8 +553,15 @@ test("an online send labels the row 等待发送 then 已发送，等待确认/�
     )
     .toBe(1);
 
-  // The hold lapses: the journal user observation joins exactly once and the
+  // The journal is still gated by the test (no autonomous sleep to race):
+  // the observation has not joined and the chip stays on screen.
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 2_000 })
+    .toBe(0);
+
+  // Release the journal: the user observation joins exactly once and the
   // bubble is replaced by the authoritative transcript row.
+  await releaseJournal(commandId!);
   await expect
     .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
     .toBe(1);
@@ -540,15 +573,19 @@ test("a Hub-accepted send shows its delivered label on the still-visible bubble 
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   const api = await hubApi(page);
 
-  // The fake node answers the POST immediately but withholds its mirrored
-  // journal user observation (__hold_journal__:<ms>, hub_e2e.rs): the
-  // accepted/delivered phase must be assertable on the STILL-VISIBLE bubble
-  // before the authoritative transcript row replaces it.
-  await sendMessage(page, "__hold_journal__:8000");
+  // The fake node accepts the POST immediately but withholds its mirrored
+  // journal user observation until the TEST-CONTROLLED gate file appears
+  // (__gate_journal__, hub_e2e.rs — no autonomous sleep to race): the
+  // accepted/delivered phase is asserted on the STILL-VISIBLE bubble, then
+  // the spec releases the journal and asserts the replacement itself.
+  await sendMessage(page, "__gate_journal__");
   const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
   await expect(bubble).toBeVisible();
   const commandId = await bubble.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
+  // Defensive: no stale gate may release the hold before the label is
+  // asserted (commandId is a fresh uuidv7 per send; this is a safety net).
+  await rm(journalGatePath(commandId!), { force: true });
 
   // The POST landed with a CLEAR answer and the Hub committed the command
   // (the outbox row settles to "sent"), while the journal confirmation is
@@ -566,13 +603,18 @@ test("a Hub-accepted send shows its delivered label on the still-visible bubble 
       { timeout: 15_000 },
     )
     .toBe(1);
-  // The optimistic chip is still on screen: the journal confirmation is held
-  // back, so the authoritative (non-bubble) transcript row has not replaced
-  // it yet (assemble hides the chip the moment the journal node joins).
+  // The optimistic chip is still on screen: the journal confirmation is gated
+  // by this test, so the authoritative (non-bubble) transcript row cannot
+  // have replaced it yet (give the node a moment: it appends within 100 ms
+  // of the release file appearing, and no release has happened).
   await expect(bubble).toBeVisible();
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 2_000 })
+    .toBe(0);
 
-  // Hold released: the journal user observation joins exactly once and the
-  // bubble is replaced by the transcript row.
+  // Only NOW release the journal: the user observation joins exactly once
+  // and the bubble is replaced by the transcript row.
+  await releaseJournal(commandId!);
   await expect
     .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
     .toBe(1);

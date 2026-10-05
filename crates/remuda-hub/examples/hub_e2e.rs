@@ -1430,6 +1430,49 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
+                    // c-reconnfu round 4 item 2: `__gate_journal__` is the
+                    // test-controlled twin of `__hold_journal__:<ms>`. The POST is
+                    // answered with a durable acceptance IMMEDIATELY (so the chip
+                    // can be asserted at 已受理), then the mirrored journal user
+                    // observation is withheld until the SPEC creates a release file
+                    // (no autonomous sleep to race): std::env::temp_dir() /
+                    // remuda-e2e-journal-release-<hub port>-<commandId>. Only
+                    // after the gate appears do we append user + echo + idle,
+                    // which replaces the optimistic bubble with the journal row.
+                    if prompt == "__gate_journal__" {
+                        send_rpc_ok(&mut ws, id, json!({ "accepted": true })).await?;
+                        if let Some(cid) = command_id {
+                            let gate = std::env::temp_dir()
+                                .join(format!("remuda-e2e-journal-release-{}-{cid}", addr.port()));
+                            let step = Duration::from_millis(100);
+                            let max = Duration::from_secs(60);
+                            let mut waited = Duration::ZERO;
+                            while !gate.exists() && waited < max {
+                                tokio::time::sleep(step).await;
+                                waited += step;
+                            }
+                            let _ = std::fs::remove_file(&gate);
+                        }
+                        append_n = append_command_user(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            prompt,
+                            command_id,
+                        )
+                        .await?;
+                        append_n = append_journal(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "assistant",
+                            &format!("echo: {prompt}"),
+                        )
+                        .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                        continue;
+                    }
                     // c-reconnfu round 2 item 5 / round 3 item 5:
                     // `__hold_journal__:<ms>` answers the POST FIRST with a
                     // DURABLE acceptance (accepted:true — http.rs node_accepted

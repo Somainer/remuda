@@ -5,7 +5,7 @@ function row(page: import("@playwright/test").Page, text: string) {
 }
 
 // Scope note (see docs/design/evidence/ux2026-nextstep-1.md §3): these rows
-// live in worktree Spaces OTHER than the default sfe-root Space the bare
+// live in worktree Spaces OTHER than the default demo-root Space the bare
 // /sessions route pins to, so the default route renders none of them
 // (pre-existing fixed-scope behavior, failing identically on unmodified
 // main). The row shape is scope-independent; ?scope=all only restores the

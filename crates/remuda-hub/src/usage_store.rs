@@ -535,7 +535,7 @@ mod tests {
         let first = project_usage_event(
             &usage_record(1, 1000, Some("0.01")),
             Some("pvp_relay"),
-            Some("gw/es1[1m]"),
+            Some("gw/model_x[1m]"),
         )
         .unwrap();
         assert_eq!(first.total_tokens, Some(1000));
@@ -555,9 +555,9 @@ mod tests {
 
         // Unknown-cost events are not projected as cost rows...
         let third = usage_record(3, 10, None);
-        let third = project_usage_event(&third, Some("pvp_relay"), Some("gw/seed[1m]")).unwrap();
+        let third = project_usage_event(&third, Some("pvp_relay"), Some("gw/model-y[1m]")).unwrap();
         insert_usage_event(&conn, &third).unwrap();
-        let supply = aggregate_supply(&conn, "pvp_relay", "gw/seed[1m]").unwrap();
+        let supply = aggregate_supply(&conn, "pvp_relay", "gw/model-y[1m]").unwrap();
         assert_eq!(supply.events, 1);
         assert_eq!(supply.cost_usd, 0.0);
 
@@ -735,7 +735,7 @@ mod tests {
     fn context_window_resolution_order() {
         // Explicit [1m] tag wins over everything.
         assert_eq!(
-            context_window_tokens("claude", Some("gw/es1[1m]")),
+            context_window_tokens("claude", Some("gw/model_x[1m]")),
             Some(1_000_000)
         );
         // Static catalog row for a real model.

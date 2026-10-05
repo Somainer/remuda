@@ -63,7 +63,7 @@ Both `/models` and `/v1/models` returned HTTP 200 with these model IDs:
 ```text
 claude-fable-5.1
 claude-gpt-5.6-sol
-claude-gpt-6-astra
+claude-model-z
 claude-grok-4.6
 claude-opus-4-8
 claude-opus-5

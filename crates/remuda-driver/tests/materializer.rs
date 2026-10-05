@@ -1393,7 +1393,7 @@ mod shell_pty_agent {
     /// a different model while looking like a cosmetic cleanup.
     #[test]
     fn an_explicit_pin_reaches_every_claude_carrier_verbatim() {
-        const PIN: &str = "model_hub/es1_orange_o50[1m]";
+        const PIN: &str = "acme_hub/model_x_o50[1m]";
         let tmp = tempfile::tempdir().unwrap();
 
         for driver in [
@@ -1452,7 +1452,7 @@ mod shell_pty_agent {
                 );
             }
             assert!(
-                !recipe.argv.iter().any(|token| token.contains("es1_orange")),
+                !recipe.argv.iter().any(|token| token.contains("model_x")),
                 "{driver:?} invented a pin: {:?}",
                 recipe.argv
             );
@@ -1484,11 +1484,11 @@ mod shell_pty_agent {
         ] {
             let mut spec = agent_spec(AgentKind::Claude);
             spec.driver = driver;
-            spec.model_id = Some("model_hub/es1_orange_o50[1m]".into());
+            spec.model_id = Some("acme_hub/model_x_o50[1m]".into());
             let recipe = recipe(&spec, tmp.path(), LaunchOrigin::Human);
             assert_eq!(
                 recipe.provider.model_pin.as_deref(),
-                Some("model_hub/es1_orange_o50[1m]"),
+                Some("acme_hub/model_x_o50[1m]"),
                 "{driver:?} must carry the explicit pin"
             );
         }
@@ -1502,7 +1502,7 @@ mod shell_pty_agent {
         let tmp = tempfile::tempdir().unwrap();
         for kind in [AgentKind::Codex, AgentKind::Grok, AgentKind::Agy] {
             let mut spec = agent_spec(kind);
-            spec.model_id = Some("model_hub/es1_orange_o50[1m]".to_owned());
+            spec.model_id = Some("acme_hub/model_x_o50[1m]".to_owned());
             let recipe = recipe(&spec, tmp.path(), LaunchOrigin::Human);
             assert!(
                 !recipe.argv.iter().any(|token| token == "--model"),

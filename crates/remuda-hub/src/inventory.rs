@@ -256,7 +256,7 @@ mod tests {
     fn nested_hello_inventory_normalizes_cli_and_labels() {
         let params = json!({
             "hostId": "hst_x",
-            "label": "bolt-sg",
+            "label": "devbox-sg",
             "host": {
                 "hostname": "devbox-sg",
                 "labels": { "region": "sg", "gpu": "none" },
@@ -272,7 +272,7 @@ mod tests {
             }
         });
         let inv = from_node_params(&params);
-        assert_eq!(inv.display_label.as_deref(), Some("bolt-sg"));
+        assert_eq!(inv.display_label.as_deref(), Some("devbox-sg"));
         assert_eq!(inv.hostname.as_deref(), Some("devbox-sg"));
         assert_eq!(inv.max_instances, Some(8));
         let labels = inv.labels.unwrap();

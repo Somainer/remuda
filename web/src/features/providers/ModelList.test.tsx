@@ -8,7 +8,7 @@ import type { ProviderModel } from "./model";
 /** A catalog shaped like a real gateway's: several prefixes, mixed surfaces. */
 const catalog: ProviderModel[] = [
   { id: "passthrough/auto", enabled: true, label: "Auto", surfaces: ["openai"] },
-  { id: "passthrough/ark/seed-evolving", enabled: true, surfaces: ["openai"] },
+  { id: "passthrough/ark/model-y", enabled: true, surfaces: ["openai"] },
   { id: "cursor/gpt-5", enabled: false, surfaces: ["openai"] },
   { id: "claude-opus-5", enabled: true, label: "Opus 5", contextWindow: 1_048_576, tags: ["1m"], surfaces: ["openai", "anthropic"] },
   { id: "claude-haiku-4-5", enabled: true, surfaces: ["anthropic"] },
@@ -202,7 +202,7 @@ describe("ModelList bulk controls", () => {
     await user.click(screen.getByTestId("provider-models-none"));
     expect(enabledIds(state.models)).toEqual([
       "passthrough/auto",
-      "passthrough/ark/seed-evolving",
+      "passthrough/ark/model-y",
       "claude-opus-5",
       "claude-haiku-4-5",
     ]);
@@ -231,7 +231,7 @@ describe("ModelList bulk controls", () => {
     await user.click(screen.getByTestId("provider-models-undo-button"));
     expect(enabledIds(state.models)).toEqual([
       "passthrough/auto",
-      "passthrough/ark/seed-evolving",
+      "passthrough/ark/model-y",
       "claude-opus-5",
       "claude-haiku-4-5",
     ]);
@@ -292,7 +292,7 @@ describe("ModelList group controls", () => {
     const user = userEvent.setup();
     const state = renderStateful({ initial: catalog });
     await user.click(within(group("claude-")).getByTestId("provider-model-group-enabled"));
-    expect(enabledIds(state.models)).toEqual(["passthrough/auto", "passthrough/ark/seed-evolving"]);
+    expect(enabledIds(state.models)).toEqual(["passthrough/auto", "passthrough/ark/model-y"]);
     expect(screen.getByTestId("provider-models-undo")).toHaveTextContent("已停用 claude- 的 2 个模型");
 
     // Ticking a "none" group turns all of it on.
@@ -342,7 +342,7 @@ describe("ModelList group controls", () => {
     // A collapsed group hides its rows but still reports its count.
     expect(ids()).toEqual([
       "passthrough/auto",
-      "passthrough/ark/seed-evolving",
+      "passthrough/ark/model-y",
       "claude-opus-5",
       "claude-haiku-4-5",
     ]);

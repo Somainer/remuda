@@ -56,8 +56,8 @@ user settings.json
 | 顶层键 | 修复前 | 修复后 |
 |---|---|---|
 | `env`（10 个网关变量，含 `ANTHROPIC_AUTH_TOKEN`） | ❌ 丢失 | ✅ 透传，token=`[redacted]` |
-| `model` (`ark/seed-evolving[1m]`) | ❌ | ✅ |
-| `modelSettings` (`model_hub/es1_orange_o48` → effort xhigh) | ❌ | ✅ |
+| `model` (`ark/model-y[1m]`) | ❌ | ✅ |
+| `modelSettings` (`acme_hub/model_x_o48` → effort xhigh) | ❌ | ✅ |
 | `statusLine` | ❌ | ✅（用户脚本原样保留） |
 | `permissions.defaultMode` | ❌ | ✅ |
 | `effortLevel` / `theme` / `verbose` | ❌ | ✅ |
@@ -85,14 +85,14 @@ drwx------ launch/
 
 ```text
 Select model — Switch between Claude models.
-1. Default (recommended)     Use the default model (currently model_hub/es1_orange_o48[1m])
-2. model_hub/es1_orange_o48[1m]   Custom Opus model (1M context)
-3. model_hub/es1_orange_o48[1m]   Custom Sonnet model (1M context)
-4. model_hub/es1_orange_o48[1m]   Custom Haiku model (1M context)
-5. model_hub/es1_orange_o48[1m] ✔ Custom model
+1. Default (recommended)     Use the default model (currently acme_hub/model_x_o48[1m])
+2. acme_hub/model_x_o48[1m]   Custom Opus model (1M context)
+3. acme_hub/model_x_o48[1m]   Custom Sonnet model (1M context)
+4. acme_hub/model_x_o48[1m]   Custom Haiku model (1M context)
+5. acme_hub/model_x_o48[1m] ✔ Custom model
 ```
 
-顶部横幅同样显示 `model_hub/es1_orange_o48[1m] with xhigh effort`，与普通终端一致。
+顶部横幅同样显示 `acme_hub/model_x_o48[1m] with xhigh effort`，与普通终端一致。
 argv 里没有任何 token（credential 只在 0600 overlay 里）。
 
 ## 4 OSC 9;4 进度条打通
@@ -139,18 +139,18 @@ done 后 bar 消失（spec 断言 `data-tty-progress="hidden"` 且元素 count 0
   "env": {
     "ANTHROPIC_BASE_URL": "https://<gateway-host>",
     "ANTHROPIC_AUTH_TOKEN": "[redacted]",
-    "ANTHROPIC_MODEL": "model_hub/es1_orange_o48[1m]",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "model_hub/es1_orange_o48[1m]",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "model_hub/es1_orange_o48[1m]",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "model_hub/es1_orange_o48[1m]",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "model_hub/es1_orange_o48[1m]",
+    "ANTHROPIC_MODEL": "acme_hub/model_x_o48[1m]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "acme_hub/model_x_o48[1m]",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "acme_hub/model_x_o48[1m]",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "acme_hub/model_x_o48[1m]",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "acme_hub/model_x_o48[1m]",
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
     "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
   },
-  "model": "ark/seed-evolving[1m]",
+  "model": "ark/model-y[1m]",
   "modelSettings": {
-    "model_hub/es1_orange_o48": { "effortLevel": "xhigh" }
+    "acme_hub/model_x_o48": { "effortLevel": "xhigh" }
   },
   "statusLine": {
     "type": "command",

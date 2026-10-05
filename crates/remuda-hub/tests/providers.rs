@@ -840,7 +840,7 @@ struct PerHeaderUpstream {
 impl PerHeaderUpstream {
     async fn serve() -> Result<Self> {
         const OPENAI: &str = r#"{"object":"list","data":[
-            {"id":"passthrough/ark/seed-evolving"},
+            {"id":"passthrough/ark/model-y"},
             {"id":"cursor/gpt-5"},
             {"id":"claude-opus-5"}
         ]}"#;
@@ -920,7 +920,7 @@ async fn discover_unions_the_two_catalogs_a_gateway_serves_per_header() -> Resul
     assert_eq!(
         ids,
         vec![
-            "passthrough/ark/seed-evolving",
+            "passthrough/ark/model-y",
             "cursor/gpt-5",
             "claude-opus-5",
             "claude-haiku-4-5",

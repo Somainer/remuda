@@ -24,8 +24,8 @@ machine names — the remote is its registry label `devbox-sg`).
 | Project | `prj_01a0aa58-1ead-77c0-a11b-221d43efaecb` (`remuda`), homeHost = the Mac, `defaultBaseBranch: main`, `branchPattern: wt/{worker}/{topic}`, `permissionPosture: bypass`, `defaultEffort: high` |
 | Remote host | `hst_01a0a896-c963-74c2-bedd-14da447ff68c`, label `devbox-sg`, carrier **ssh-stdio**, `latencyClass: remote`, `maxInstances: 8`, portBlocks `57000-57999` / `58400-58999`, disk budget 200 GB |
 | Workspace | `wsp_01a0aa57-7bc7-76ef-83f6-d4b941c985d2`, role `build` |
-| Gate lane | `sg-lane1` on the same remote host (project `revision 7` after `remuda project set --gate`) |
-| Provider profile | `pvp_01a0adb4-1b89-7139-8331-ab2ca822c32a` — `"devbox-sg native"`, `kind: native`, `scope: host:hst_01a0a896…`, `defaultModel: ark/seed-evolving[1m]`, models = the host's own gateway ids (`ark/seed-evolving[1m]`, `model_hub/es1_orange_o50[1m]`) — **no stored secret** |
+| Gate lane | `lane1` on the same remote host (project `revision 7` after `remuda project set --gate`) |
+| Provider profile | `pvp_01a0adb4-1b89-7139-8331-ab2ca822c32a` — `"devbox-sg native"`, `kind: native`, `scope: host:hst_01a0a896…`, `defaultModel: ark/model-y[1m]`, models = the host's own gateway ids (`ark/model-y[1m]`, `acme_hub/model_x_o50[1m]`) — **no stored secret** |
 | Node binary | built from `main` `4ae9cda0` (`c-dispatchfix`), re-enrolled with a single-use Hub enroll token; the demo Hub on the same commit |
 | Worker | `wkr_01a0b025-d121-76a1-99cd-aaaf73542284` `readme2`, instance `ins_01a0b025-d01c-73da-bfb5-c30370bdc6ff` |
 | Gate job | `gjb_01a0b030-70a4-71aa-b324-88cab07cb2dc` |
@@ -33,7 +33,7 @@ machine names — the remote is its registry label `devbox-sg`).
 Each iteration of the day started with the same three operator steps (not part
 of the loop, and not scripted agent work): refresh the local demo to
 `origin/main`, rebuild the remote Node binary from the home clone, re-enrol
-`devbox-sg`, then `remuda project set --gate` for lane `sg-lane1`. The 23:55
+`devbox-sg`, then `remuda project set --gate` for lane `lane1`. The 23:55
 re-enrolment also had to kill one orphaned remote `remuda node --stdio` left
 over from an earlier bridge.
 
@@ -60,7 +60,7 @@ failed runs had left the branch behind (retire keeps branches, see §4 gap 3):
 
 ```text
 ### 2026-09-18 00:12:36 remuda dispatch readme-status --driver shell-pty \
-        --model ark/seed-evolving[1m] (native profile; demo+node on 4ae9cda0)
+        --model ark/model-y[1m] (native profile; demo+node on 4ae9cda0)
 Error: hub HTTP 400: {"error":"invalid request: worker branch
 wt/readme-status/b-readme-status-md-3 already exists; refusing to provision a
 second worktree","code":"BAD_REQUEST"}
@@ -75,9 +75,9 @@ inlined):
 
 ```text
 ### 2026-09-18 00:14:22 remuda dispatch readme2 --driver shell-pty \
-        --model ark/seed-evolving[1m] (native profile; demo+node on 4ae9cda0)
+        --model ark/model-y[1m] (native profile; demo+node on 4ae9cda0)
 {'id': 'wkr_01a0b025-d121-76a1-99cd-aaaf73542284', 'name': 'readme2',
- 'model': 'ark/seed-evolving[1m]',
+ 'model': 'ark/model-y[1m]',
  'providerProfileId': 'pvp_01a0adb4-1b89-7139-8331-ab2ca822c32a',
  'driver': 'shell-pty', 'branch': 'wt/readme2/b-readme-status-md',
  'portBlock': '57000-57009', 'state': {'state': 'working'}}
@@ -97,7 +97,7 @@ substitution happened.
 
 ```text
 ### 2026-09-18 00:15:41 instance ins_01a0b025-d01c-73da-bfb5-c30370bdc6ff after 75s
- driver shell-pty | model ark/seed-evolving[1m] | lifecycle running
+ driver shell-pty | model ark/model-y[1m] | lifecycle running
  | delegation none | nativeSessionId ins_01a0b025-d…
 screen tail: ──────────────────────────────────────────────────────────────
  Accessing workspace:
@@ -185,13 +185,13 @@ watch: every worker is done or retired
 Task time from answered dialog to DONE: ~7.5 min; `--follow` held the terminal
 for 6 min 26 s and returned rc=0 on its own.
 
-### 1.5 `remuda gate` on lane `sg-lane1`
+### 1.5 `remuda gate` on lane `lane1`
 
 DONE is a claim, not a gate (§7 I1). The verification ran on the lane host's
 own checkout, streamed step by step:
 
 ```text
-### 2026-09-18 00:25:59 remuda gate wt/readme2/b-readme-status-md --lane sg-lane1 --web auto
+### 2026-09-18 00:25:59 remuda gate wt/readme2/b-readme-status-md --lane lane1 --web auto
 repository:       ok (3 ms)
 preflight:        ok (7 ms)
 worktree:         ok (264 ms)
@@ -231,7 +231,7 @@ For contrast, the first branch ever verified through this lane earlier the same
 day took 44 min and failed:
 
 ```text
-### 2026-09-17 15:40:09 remuda gate wt/c-watchfailed/watch-report-failed-instances --web auto --lane sg-lane1
+### 2026-09-17 15:40:09 remuda gate wt/c-watchfailed/watch-report-failed-instances --web auto --lane lane1
 … secret-scan ok (11419 ms) … cargo-check ok (42672 ms) … cargo-clippy ok (43877 ms)
 cargo-test: failed (2355363 ms) [retried]
 gate failed or returned an incomplete step report
@@ -316,7 +316,7 @@ saying which the product now owns and which stay LLM judgement.*
 | M1 clause | Status in this cycle |
 |---|---|
 | Real task, not a fixture | **Yes.** A README Status refresh that landed on `origin/main` as `6f7d987a`; no synthetic repo, no fake harness, no stubbed gate. |
-| `remuda project` | **Yes.** `project set --gate` configured lane `sg-lane1`; the project row carries members/hosts/portBlocks/placement/posture (revision 7). |
+| `remuda project` | **Yes.** `project set --gate` configured lane `lane1`; the project row carries members/hosts/portBlocks/placement/posture (revision 7). |
 | `remuda brief` | **Yes.** Brief delivered as an objects-store `text/markdown` attachment; visible on the worker's screen as `…/attachments/b-readme-status-595.md`. |
 | `remuda dispatch` | **Yes**, to a remote **ssh-stdio** Node, `--driver shell-pty`, native provider profile, `delegation none`, no supply substitution (`warnings: []`). |
 | `remuda watch` | **Yes.** `--once` between every step, `--follow` to the DONE sha, self-exit rc=0. |

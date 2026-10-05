@@ -431,11 +431,11 @@ mod tests {
     #[test]
     fn window_scope_distinguishes_account_and_family() {
         let account = RateLimitWindow::declared("weekly", vec!["*".to_string()], Some(10080));
-        let family = RateLimitWindow::declared("model", vec!["es1".to_string()], Some(300));
+        let family = RateLimitWindow::declared("model", vec!["model_x".to_string()], Some(300));
         assert!(account.is_account_level());
         assert!(!family.is_account_level());
-        assert!(account.applies_to_family("es1"));
-        assert!(family.applies_to_family("es1"));
+        assert!(account.applies_to_family("model_x"));
+        assert!(family.applies_to_family("model_x"));
         assert!(!family.applies_to_family("seed"));
         let mut cooling = family.clone();
         cooling.cooldown_until = Some(100);

@@ -101,8 +101,8 @@ it("renders a recorded model_pin_mismatch in run details with both ids verbatim"
         dataRef: null,
         relatedIds: {
           reason: "model-mismatch",
-          requested: "passthrough/ark/seed-evolving",
-          observed: "ark/seed-evolving",
+          requested: "passthrough/ark/model-y",
+          observed: "ark/model-y",
         },
       },
     },
@@ -115,9 +115,9 @@ it("renders a recorded model_pin_mismatch in run details with both ids verbatim"
   });
   renderPage();
   const pin = screen.getByTestId("run-details-model-pin");
-  expect(pin).toHaveTextContent("请求模型 passthrough/ark/seed-evolving，实际运行 ark/seed-evolving");
-  expect(pin).toHaveAttribute("data-requested", "passthrough/ark/seed-evolving");
-  expect(pin).toHaveAttribute("data-observed", "ark/seed-evolving");
+  expect(pin).toHaveTextContent("请求模型 passthrough/ark/model-y，实际运行 ark/model-y");
+  expect(pin).toHaveAttribute("data-requested", "passthrough/ark/model-y");
+  expect(pin).toHaveAttribute("data-observed", "ark/model-y");
 });
 
 it("renders a projected model_pin_mismatch through the real API mapper even with an empty window", () => {
@@ -138,8 +138,8 @@ it("renders a projected model_pin_mismatch through the real API mapper even with
     durableSeq: "1",
     modelPinMismatches: [
       {
-        requested: "model_hub/es1_orange_o50[1m]",
-        observed: "model_hub/es1_orange_o48[1m]",
+        requested: "acme_hub/model_x_o50[1m]",
+        observed: "acme_hub/model_x_o48[1m]",
         observedAt: "2026-09-24T00:00:00.000Z",
       },
     ],
@@ -155,7 +155,7 @@ it("renders a projected model_pin_mismatch through the real API mapper even with
   const pins = screen.getAllByTestId("run-details-model-pin");
   expect(pins).toHaveLength(1);
   expect(pins[0]).toHaveTextContent(
-    "请求模型 model_hub/es1_orange_o50[1m]，实际运行 model_hub/es1_orange_o48[1m]",
+    "请求模型 acme_hub/model_x_o50[1m]，实际运行 acme_hub/model_x_o48[1m]",
   );
 });
 
@@ -175,8 +175,8 @@ it("deduplicates a projected diagnostic and the same launch event still in the w
     durableSeq: "2",
     modelPinMismatches: [
       {
-        requested: "passthrough/ark/seed-evolving",
-        observed: "ark/seed-evolving",
+        requested: "passthrough/ark/model-y",
+        observed: "ark/model-y",
         observedAt: "2026-09-24T00:00:00.000Z",
       },
     ],
@@ -201,8 +201,8 @@ it("deduplicates a projected diagnostic and the same launch event still in the w
         dataRef: null,
         relatedIds: {
           reason: "model-mismatch",
-          requested: "passthrough/ark/seed-evolving",
-          observed: "ark/seed-evolving",
+          requested: "passthrough/ark/model-y",
+          observed: "ark/model-y",
         },
       },
     },

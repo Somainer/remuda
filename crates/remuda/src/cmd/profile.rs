@@ -386,8 +386,8 @@ mod tests {
         assert_eq!(window["id"], "primary");
         assert_eq!(window["appliesTo"], json!(["*"]));
         assert_eq!(window["windowDurationMins"], 300);
-        let window = declared_window("model:es1,seed").unwrap();
-        assert_eq!(window["appliesTo"], json!(["es1", "seed"]));
+        let window = declared_window("model:model_x,seed").unwrap();
+        assert_eq!(window["appliesTo"], json!(["model_x", "seed"]));
         assert!(window.get("windowDurationMins").is_none());
         assert!(declared_window("nope").is_err());
     }

@@ -192,9 +192,9 @@ describe("EffortSlider running-model chip", () => {
   // clicking effort-open-list after mount().
 
   it("shows the launch spec verbatim before any read-back", () => {
-    mount({ kind: "claude", model: "", launchModel: "model_hub/es1_orange_o50[1m]" });
+    mount({ kind: "claude", model: "", launchModel: "acme_hub/model_x_o50[1m]" });
     const chip = screen.getByTestId("effort-model");
-    expect(chip.textContent).toBe("model_hub/es1_orange_o50[1m]");
+    expect(chip.textContent).toBe("acme_hub/model_x_o50[1m]");
     // The launch spec is not mislabeled as a read-back.
     expect(chip.getAttribute("title")).toContain("尚未从会话回读");
     expect(chip.getAttribute("title")).not.toContain("实际 ");
@@ -206,7 +206,7 @@ describe("EffortSlider running-model chip", () => {
     mount({
       kind: "claude",
       model: "",
-      launchModel: "model_hub/es1_orange_o50[1m]",
+      launchModel: "acme_hub/model_x_o50[1m]",
       modelEffective: "claude-opus-5",
     });
     const chip = screen.getByTestId("effort-model");
@@ -223,10 +223,10 @@ describe("EffortSlider running-model chip", () => {
     mount({
       kind: "claude",
       model: "",
-      launchModel: "passthrough/ark/seed-evolving",
-      modelEffective: "ark/seed-evolving",
+      launchModel: "passthrough/ark/model-y",
+      modelEffective: "ark/model-y",
     });
-    expect(screen.getByTestId("effort-model").textContent).toBe("ark/seed-evolving");
+    expect(screen.getByTestId("effort-model").textContent).toBe("ark/model-y");
   });
 
   it("shows nothing when there is no launch model and no read-back", () => {
@@ -243,8 +243,8 @@ describe("EffortSlider running-model chip", () => {
   });
 
   it("moves straight to a later /model id with no divergence note", async () => {
-    mount({ kind: "claude", model: "", launchModel: "model_hub/A", modelEffective: "model_hub/C" });
-    expect(screen.getByTestId("effort-model").textContent).toBe("model_hub/C");
+    mount({ kind: "claude", model: "", launchModel: "acme_hub/A", modelEffective: "acme_hub/C" });
+    expect(screen.getByTestId("effort-model").textContent).toBe("acme_hub/C");
     await userEvent.setup().click(screen.getByTestId("effort-open-list"));
     const panel = screen.getByTestId("effort-slider-panel");
     expect(panel).not.toHaveAttribute("data-model-different");

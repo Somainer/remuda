@@ -24,7 +24,7 @@ Owner amendments (2026-10-05, made after design v3). They override any text belo
   - The suggested restart cap is 3 per hour (§3.2, §6.1).
   - The laptop Node keeps its enrolled identity (§2).
   - Cross-host Agent dispatch keeps the D-017 one-shot approval in Phase 1 (§4.2).
-- **OA6 Failed is not the process exiting.** Only process-end evidence makes an instance terminal: an exit or exit code, the PTY or tty gone, a launch that never started, or the Node reporting the instance gone. Every other failure is retryable in place, is never a restart cause and sends no end push. Activity changes only on root-turn end evidence: a root-session turn failure (for example a main-session StopFailure without an `agentId`) ends the root turn with outcome `failed`, so activity goes idle and the owner can retry. Subagent, workflow, configure and diagnostic failures leave activity unchanged and are recorded in their own scope. C1 restarts only on process loss or start failure (§6.2, §6.3, §8.5).
+- **OA6 Failed is not the process exiting.** Only process-end evidence makes an instance terminal: an exit or exit code, the PTY or tty gone, a launch that never started, or the Node reporting the instance gone. Every other failure is retryable in place, is never a restart cause and sends no end push. Activity changes only on root-turn end evidence: a root-session turn failure ends the root turn with outcome `failed`, so activity goes idle and the owner can retry. A main-session StopFailure without an `agentId` counts as one only after protocol.md §5.6 settles it; until then the turn stays unknown, activity is unchanged and held prompts do not flush. Subagent, workflow, configure and diagnostic failures leave activity unchanged and are recorded in their own scope. C1 restarts only on process loss or start failure (§6.2, §6.3, §8.5).
 
 Owner principles applied throughout:
 - the harness supplies capabilities and the agent decides;
@@ -224,10 +224,11 @@ Derived state: `host-offline` means the current chapter's host has no live link.
 No other failure is an end. Each is retryable in place, is never a C1 restart cause, and sends no end push (§8.5). The rule holds for every instance; the `ma-sdk-state` task applies it to the claude-sdk projection (§15). C1 acts only on process-end evidence: it restarts on process loss or start failure (§6.3).
 
 What a non-terminal failure does to `activity` depends on its scope:
-- **Root-session turn failure.** The root turn itself ends in failure: for example a main-session StopFailure without an `agentId`, or the root turn's own result reporting an API error such as 429. It ends the root turn with outcome `failed`. Activity goes idle with a turn-error marker, never `lifecycle=failed`; the composer can retry, and held prompts may flush, as after any root-turn end.
+- **Root-session turn failure.** Settled evidence that the root turn itself ended in failure: the root turn's matching result reporting an API error such as 429 (protocol.md §5.7), or a main-session StopFailure without an `agentId` once protocol.md §5.6 has settled it from an exact native error under a version rule. It ends the root turn with outcome `failed`. Activity goes idle with a turn-error marker, never `lifecycle=failed`; the composer can retry, and held prompts may flush, as after any root-turn end.
+- **Unsettled root StopFailure.** A main-session StopFailure that §5.6 cannot settle (no versioned exact native error) is not a root-turn failure. The turn stays `unknown`, `activity` is unchanged, the composer is not offered as idle and held prompts do not flush. The StopFailure is recorded as a diagnostic until later evidence settles the turn.
 - **Scoped failures.** A subagent or workflow failure, a configure failure and a `severity=error` diagnostic do not change `activity`. Each is recorded in its own scope: the workflow member's state, the configure command's outcome, the diagnostic event. A background subagent can fail while the root agent keeps working, so a scoped failure never shows the turn as ended, never offers the composer as idle, and never flushes held prompts.
 
-Only root-turn end evidence sets `activity=idle`, by the scopes protocol.md already defines: `StopFailure` settles its turn only from an exact native error under a version rule and otherwise stays unknown (§5.6), a `SubagentStop` is not a root `Stop`, and a workflow member's end does not prove the root has no more work (§5.7, §5.8).
+Only settled root-turn end evidence sets `activity=idle`, by the scopes protocol.md already defines: `StopFailure` settles its turn only from an exact native error under a version rule and otherwise stays unknown (§5.6), a `SubagentStop` is not a root `Stop`, and a workflow member's end does not prove the root has no more work (§5.7, §5.8).
 
 ### 6.3 Cause table
 
@@ -244,7 +245,8 @@ Evidence is always Node-attested and about the lineage's current chapter at the 
 | A close admitted from a Human device (PWA Pause, CLI, fleet) | → paused{device} | F without successor at admission; the close is then forwarded |
 | A close by the chapter itself | → paused{self} | Same; C1 push |
 | A close by an Agent ancestor | → paused{ancestor} | Same; C1 push |
-| A root-session turn failure (§6.2): a main-session StopFailure without an `agentId`, or the root turn's result reporting an API error such as 429 | none | Not an exit and not a restart cause. The root turn ends with outcome `failed`: `activity=idle` plus a turn-error marker, never `lifecycle=failed`; retryable in place |
+| A settled root-session turn failure (§6.2): the root turn's result reporting an API error such as 429, or a main-session StopFailure without an `agentId` that protocol.md §5.6 has settled | none | Not an exit and not a restart cause. The root turn ends with outcome `failed`: `activity=idle` plus a turn-error marker, never `lifecycle=failed`; retryable in place |
+| A main-session StopFailure that §5.6 cannot settle (§6.2) | none | Not an exit and not a restart cause. The turn stays `unknown`; `activity` is unchanged and held prompts do not flush |
 | A scoped failure (§6.2): a subagent or workflow failure, a configure failure, a `severity=error` diagnostic | none | Not an exit and not a restart cause. `activity` is unchanged; the failure is recorded in its own scope (workflow member, configure outcome, diagnostic) |
 | Owner Resume (existing resume verb) on a paused lineage | paused → starting | F with successor; 409 while the chapter's host is offline |
 | Owner Resume on a lineage that is not paused | — | 409: pause it first |
@@ -667,7 +669,7 @@ New frames are documented in protocol.md inside `~~~text` fences, because a `jso
 - `owns()`, the D-051 edge and fan-out read the lineage.
 - claude-sdk resume stays claude-sdk.
 - Continuity rows are not settled `host-lost`.
-- Only process-end evidence makes an instance terminal; other failures stay live and are never a restart cause; only root-turn end evidence sets `activity=idle`, and scoped failures leave it unchanged (OA6).
+- Only process-end evidence makes an instance terminal; other failures stay live and are never a restart cause; only settled root-turn end evidence sets `activity=idle`, and scoped failures leave it unchanged (OA6).
 - Uniqueness ignores fenced chapters.
 - Resume works only on paused lineages, and `DELETE` of an unpaused current chapter returns 409.
 - `forward_if_online` withholds while fences are unacknowledged.
@@ -727,7 +729,7 @@ Every new route and CommandRecord field is reflected in `crates/remuda-hub/opena
   - 403 on mutating an owner-dispatched worker;
   - the keys approval;
   - Human-origin dispatch byte-identical to today.
-- **E8 Projection fixtures.** claude-sdk goes working → idle on root-turn end evidence. A root-session turn failure (a main-session StopFailure without an `agentId`, or an API error such as 429 on the root turn's result) ends the root turn with outcome `failed` and goes idle with a turn-error marker. A background subagent or workflow member fails while the root keeps working: activity stays `working`, the composer is not offered as idle, held prompts do not flush, and the failure appears on the workflow member. A configure failure and a `severity=error` diagnostic change only their own record. None of these triggers a restart or an end push, and the seat keeps its address-owner grant; only the process-end evidence of §6.2 ends it.
+- **E8 Projection fixtures.** claude-sdk goes working → idle on settled root-turn end evidence. A settled root-session turn failure (an API error such as 429 on the root turn's result, or a main-session StopFailure without an `agentId` that §5.6 settles from a versioned exact native error) ends the root turn with outcome `failed` and goes idle with a turn-error marker. A main-session StopFailure that §5.6 cannot settle leaves the turn `unknown`: activity is unchanged and held prompts do not flush. A background subagent or workflow member fails while the root keeps working: activity stays `working`, the composer is not offered as idle, held prompts do not flush, and the failure appears on the workflow member. A configure failure and a `severity=error` diagnostic change only their own record. None of these triggers a restart or an end push, and the seat keeps its address-owner grant; only the process-end evidence of §6.2 ends it.
 - **E9 Push audit** for the E2 run. Every push sent and every suppression is accounted for by §8. Nothing was suppressed that had not been routed to an effectively running chapter.
 
 ### 14.2 Phase 2: facts, not polling
@@ -791,7 +793,7 @@ Docs come first. Each task keeps the full gated suite (Rust, web, and hub e2e ag
 
 1. `ma-docs`: this document, the ADR, and the protocol, ui-spec, runbook, coordinator-hierarchy and CLI doc updates.
 2. `ma-ops-attach`: the owner or ops upgrade the intranet Hub, attach the Nodes, pair the phone and turn the D-051 switch on for the self-development project (no worker).
-3. `ma-sdk-state`: claude-sdk working, idle and turn-error projection; only process-end evidence is terminal, and only root-turn end evidence sets idle (OA6).
+3. `ma-sdk-state`: claude-sdk working, idle and turn-error projection; only process-end evidence is terminal, and only settled root-turn end evidence sets idle (OA6).
 4. `ma-lineage`: lineages; continuation resume (claude-sdk to claude-sdk) as one transaction; lineage-aware ownership and fan-out; `restart` stored.
 5. `ma-initiator`: initiator and device stamping, the commit-time authority check, and the Hub side of the direct-RPC boundary.
 6. `ma-fence`: F, the send gate, the Node fence at every executor entry, reconnect ordering, outcome resolution, close becomes pause, Resume only from paused.

@@ -17,6 +17,11 @@ const here = path.dirname(fileURLToPath(import.meta.url));
  * its sidechain transcript at /s/:instanceId/agents/:agentId.
  */
 
+// Every case drives the in-process fake Node's scripted scenario; against an
+// operator-provided hub (HUB_E2E_EXTERNAL=1) the prompt and the
+// e2e-fake-node host do not exist. Same idiom as hub-live/font-swap specs.
+test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
+
 const evidence = process.env.REMUDA_EVIDENCE === "1";
 const shotDir = evidence
   ? path.join(here, "../../../docs/design/evidence")

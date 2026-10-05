@@ -7,6 +7,11 @@ import { login } from "./hub-auth";
  * crates/remuda-hub/examples/hub_e2e.rs). No real models.
  */
 
+// Every case drives the in-process fake Node's synthetic scenarios; against an
+// operator-provided hub (HUB_E2E_EXTERNAL=1) the prompts and the
+// e2e-fake-node host do not exist. Same idiom as hub-live/font-swap specs.
+test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
+
 // Release every instance this spec creates. The hub suite is serial against one
 // fake Node capped at maxInstances 8; leaving a live row spends a slot for
 // every later spec (force is a u8 query param, not a boolean).

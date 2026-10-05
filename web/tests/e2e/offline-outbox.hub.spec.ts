@@ -270,6 +270,28 @@ async function sendMessage(page: Page, text: string) {
   else await send.click();
 }
 
+/**
+ * Read the instance.send commandId from the Hub command record
+ * (independent APIRequestContext), polling until it is committed. Use this
+ * for ungated sends whose optimistic bubble may already have been
+ * journal-replaced before an attribute read (c-reconnfu r6 item 2).
+ */
+async function pollForCommandId(
+  api: APIRequestContext,
+  instanceId: string,
+  timeoutMs = 15_000,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const id = (await hubCommands(api, instanceId)).find(
+      (c) => c.operation === "instance.send",
+    )?.id;
+    if (id) return id;
+    if (Date.now() >= deadline) throw new Error("no instance.send command recorded");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 const V1 = /\/v1\//;
 
 /**
@@ -762,17 +784,10 @@ test("a parked journal gate never blocks the node RPC loop and teardown ACKs a r
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   const apiB = await hubApi(page);
   await sendMessage(page, "unblocked normal B");
-  const commandB = await expect
-    .poll(
-      async () =>
-        (await hubCommands(apiB, instanceB)).find((c) => c.operation === "instance.send")?.id ??
-        null,
-      { timeout: 15_000 },
-    )
-    .then((id) => {
-      expect(id).toBeTruthy();
-      return id as string;
-    });
+  // B is ungated, so its optimistic bubble may already have been
+  // journal-replaced: read the commandId from the Hub command
+  // record (c-reconnfu r6 item 2), never the bubble attribute.
+  const commandB = await pollForCommandId(apiB, instanceB, 15_000);
   // B's node observation joins promptly (well inside one 60 s gate
   // timeout): the parked A did not block B's RPC + journal append.
   await expect

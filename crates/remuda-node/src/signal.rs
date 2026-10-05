@@ -20,7 +20,7 @@
 //!   fighting.
 
 use remuda_protocol::{
-    LifecyclePayload, NativeLifecycle, Observation, ObservationPayload, SourceChannel,
+    Knowledge, LifecyclePayload, NativeLifecycle, Observation, ObservationPayload, SourceChannel,
 };
 
 /// Environment flag gating the whole hook path. Off by default in P1.
@@ -144,6 +144,62 @@ pub fn hook_activity(observation: &Observation) -> Option<remuda_protocol::Activ
         // *after* the turn ended); folding it to `waiting` stranded the
         // composer, so it moves nothing.
         "PermissionRequest" | "Elicitation" => Some(Activity::WaitingInteraction),
+        _ => None,
+    }
+}
+
+/// The activity the print/sdk engine's own turn lifecycle proves (D-057 OA6,
+/// ma-sdk-state).
+///
+/// Unlike hooks, the structured stdio carriers (`claude-print`,
+/// `claude-sdk`) report their turns directly:
+///
+/// - `turn/turn_started` status `working` is emitted when the user frame is
+///   written to the native process, so activity flips to `working` even before
+///   the harness echoes anything;
+/// - `turn/result` status `turn_done` ends the root turn only when it is the
+///   process's terminal result (`affects_completion`, i.e. `result_index > 0`
+///   with nothing queued): a Workflow's intermediate result does not prove the
+///   root has no more work;
+/// - `turn/result` status `error` is still a *settled turn end*: a 429 frees
+///   the composer and never fails the instance. It applies whenever no further
+///   prompt is queued, matching the driver's own error-result shape
+///   (`map_result`).
+///
+/// Only the engine that emits these events qualifies, by driver kind; a
+/// hook- or screen-derived event can never masquerade as one here.
+#[must_use]
+pub fn engine_turn_activity(observation: &Observation) -> Option<remuda_protocol::Activity> {
+    use remuda_protocol::Activity;
+    if !matches!(
+        observation.source.driver_kind,
+        remuda_protocol::DriverKind::ClaudePrint | remuda_protocol::DriverKind::ClaudeSdk
+    ) {
+        return None;
+    }
+    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+        return None;
+    };
+    let LifecyclePayload::Native(native) = payload.as_ref() else {
+        return None;
+    };
+    if native.topic != remuda_protocol::LifecycleTopic::Turn {
+        return None;
+    }
+    let Knowledge::Known { value: status } = &native.status else {
+        return None;
+    };
+    let queued = native
+        .related_ids
+        .get("queuedTurnCount")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    match (native.native_name.as_str(), status.as_str()) {
+        ("turn_started", "working") => Some(Activity::Working),
+        ("result", "error") if queued == 0 => Some(Activity::Idle),
+        ("result", "turn_done") if native.affects_completion && queued == 0 => {
+            Some(Activity::Idle)
+        }
         _ => None,
     }
 }

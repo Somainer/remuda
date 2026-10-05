@@ -1793,12 +1793,18 @@ async fn pump_one_observation(
     // P6: File turn lifecycles fold only when no hook set activity and
     // only for a kind with a file-tail adapter (codex/grok); the
     // registry is the single lookup rather than another per-kind branch.
-    let activity = hook_activity.or_else(|| match store.get_instance(instance_id) {
-        Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
-            crate::signal::file_activity(&observation)
-        }
-        _ => None,
-    });
+    // D-057 OA6: the print/sdk engine's own turn/turn_started and
+    // settled turn/result come last — they are only ever emitted by those
+    // drivers, and a turn error idles exactly like a successful turn end,
+    // never failing the instance.
+    let activity = hook_activity
+        .or_else(|| match store.get_instance(instance_id) {
+            Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
+                crate::signal::file_activity(&observation)
+            }
+            _ => None,
+        })
+        .or_else(|| crate::signal::engine_turn_activity(&observation));
     if let Some(activity) = activity
         && let Err(error) = store.set_instance_state(
             instance_id,

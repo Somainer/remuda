@@ -649,10 +649,21 @@ impl Driver for ClaudePrintDriver {
         };
         match input {
             DriverInput::Prompt(prompt) => {
+                let client_message_id = prompt.native_client_message_id.clone();
                 live.process
                     .send_user(prompt_content(&prompt.blocks)?)
                     .await
                     .map_err(map_wire)?;
+                // D-057 OA6 (ma-sdk-state): the written user frame is the turn
+                // start. Emit it only after the native process accepted the
+                // frame, so activity can never flip to `working` for a prompt
+                // that never reached the child. The matching `result`
+                // (`map_result`) is the only settled root-turn end evidence.
+                let turn_started = {
+                    let mut mapper = self.inner.mapper.lock().await;
+                    mapper.turn_started(&client_message_id)?
+                };
+                emit_all(&self.inner, vec![turn_started]).await?;
                 Ok(DriverAck::transport_written())
             }
             DriverInput::Steer(_) => Err(DriverError::CapabilityUnknown("steer".into())),
@@ -1492,6 +1503,43 @@ fn task_notification_results(mapper: &mut Mapper, text: &str) -> DriverResult<Ve
     )?])
 }
 
+/// Max length of the turn-error text carried on a `turn/result` lifecycle
+/// (D-057 OA6). The Hub stores the same bound on `lastTurnError.text`.
+const TURN_ERROR_MAX_CHARS: usize = 200;
+
+/// Truncate to at most `max` characters, never splitting a UTF-8 boundary.
+fn truncate_char_boundary(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut end = text.len();
+    let mut taken = 0usize;
+    for (index, ch) in text.char_indices() {
+        if taken == max {
+            end = index;
+            break;
+        }
+        taken += 1;
+        end = index + ch.len_utf8();
+    }
+    text[..end].to_owned()
+}
+
+/// Human-readable text for an error `result` frame (an API error such as 429),
+/// or `None` when the frame carries nothing worth showing.
+fn turn_error_text(result: &ResultMessage) -> Option<String> {
+    if let Some(text) = result.result.as_ref().and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            return Some(text.trim().to_owned());
+        }
+    }
+    result
+        .subtype
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+}
+
 fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<Observation>> {
     let mut related = std::collections::BTreeMap::new();
     if let Some(index) = result.result_index {
@@ -1500,11 +1548,23 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
     if let Some(turns) = result.num_turns {
         related.insert("numTurns".into(), turns.to_string());
     }
-    let status = if result.is_error == Some(true) {
-        "error"
-    } else {
-        "turn_done"
-    };
+    // D-057 OA6: the Hub/Node fold needs the native queue depth to tell a
+    // settled root-turn end from a Workflow's intermediate `result`
+    // (`result_index` 0) or a turn with another prompt already queued.
+    if let Some(queued) = result.queued_turn_count {
+        related.insert("queuedTurnCount".into(), queued.to_string());
+    }
+    let is_turn_error = result.is_error == Some(true);
+    let status = if is_turn_error { "error" } else { "turn_done" };
+    // D-057 OA6: a turn-level error is retryable in place. Carry its text on
+    // the turn lifecycle (severity stays info) so the projection can show an
+    // additive turn-error marker without ever reading the turn failure as a
+    // process/start failure.
+    if is_turn_error
+        && let Some(text) = turn_error_text(result)
+    {
+        related.insert("lastError".into(), truncate_char_boundary(&text, TURN_ERROR_MAX_CHARS));
+    }
     // Workflow emits result_index 0 then 1; the first is not process completion
     // (stream-json §5: do not tear down on the first result).
     let affects_completion =
@@ -1809,6 +1869,30 @@ impl Mapper {
                     affects_completion,
                 },
             )))),
+        )
+    }
+
+    /// D-057 OA6 (ma-sdk-state): mark a new root turn started right after its
+    /// user frame was written to the native process. Topic/name pair with the
+    /// `turn/result` lifecycle from [`map_result`]; the Hub projects activity
+    /// `working` from this event and `idle` only from that settled result.
+    ///
+    /// The Remuda command id is owned by the Node and is not known here; the
+    /// native client message id (echoed by the harness on its `user` record) is
+    /// carried so a later fold can join the two.
+    fn turn_started(&mut self, client_message_id: &str) -> DriverResult<Observation> {
+        let mut related = std::collections::BTreeMap::new();
+        if !client_message_id.is_empty() {
+            related.insert("nativeClientMessageId".into(), client_message_id.into());
+        }
+        let session_id = self.session_id.clone();
+        self.lifecycle_related(
+            LifecycleTopic::Turn,
+            "turn_started",
+            Knowledge::Known { value: session_id },
+            "working",
+            related,
+            false,
         )
     }
 

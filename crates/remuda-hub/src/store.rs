@@ -655,6 +655,32 @@ pub struct InstanceRecord {
         rename = "usageRollup"
     )]
     pub usage_rollup: Option<crate::usage_store::InstanceUsageRollup>,
+    /// D-057 OA6 (ma-sdk-state): the most recent settled **root-turn** failure
+    /// (an API error such as 429 on the turn's `result`). Additive display
+    /// state only: a turn error never changes `lifecycle`, and the next turn
+    /// start clears it. Absent after a clean turn end and on rows constructed
+    /// outside [`load_instance`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "lastTurnError"
+    )]
+    pub last_turn_error: Option<TurnErrorMarker>,
+}
+
+/// Additive marker for a root turn that ended in failure while the process
+/// kept running (D-057 OA6).
+///
+/// This is deliberately not a lifecycle: the instance stays `running` and
+/// keeps every grant (e.g. `address-owner`); the composer shows the text and
+/// the owner can retry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnErrorMarker {
+    /// RFC3339 timestamp of the turn's `result` observation.
+    pub at: String,
+    /// Native error text, truncated to 200 characters.
+    pub text: String,
 }
 
 /// Delegation-tree state attached at instance create; design §2.5.
@@ -4928,7 +4954,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_error TEXT,
-            configure_seq INTEGER NOT NULL DEFAULT 0
+            configure_seq INTEGER NOT NULL DEFAULT 0,
+            turn_error_json TEXT
         );
         CREATE TABLE IF NOT EXISTS commands (
             id TEXT PRIMARY KEY,
@@ -5147,6 +5174,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "configure_seq",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // D-057 OA6 (ma-sdk-state): additive last root-turn-error marker, kept
+    // separate from `last_error` (which belongs to terminal/failed rows).
+    ensure_column(&conn, "instances", "turn_error_json", "TEXT")?;
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
     ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
@@ -8124,7 +8154,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
                 mode, promoted_at, launched_by,
-                role, scope_json, grants_json, task_id, api_route_json, configure_seq
+                role, scope_json, grants_json, task_id, api_route_json, configure_seq,
+                turn_error_json
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -8301,6 +8332,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 journal_id: row.get(9)?,
                 durable_seq: durable.to_string(),
                 configure_seq: row.get(23)?,
+                last_turn_error: row
+                    .get::<_, Option<String>>(24)?
+                    .filter(|raw| !raw.is_empty())
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
                 last_error: row.get(14)?,
@@ -8612,7 +8647,7 @@ fn normalize_lifecycle(state: &str) -> Option<&'static str> {
 
 fn normalize_activity(status: &str) -> Option<&'static str> {
     match status {
-        "idle" | "done" => Some("idle"),
+        "idle" | "done" | "turn_done" => Some("idle"),
         "working" => Some("working"),
         "blocked" | "waiting-interaction" => Some("blocked"),
         "draining" => Some("draining"),
@@ -8675,6 +8710,55 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
     let status = knowledge_value(payload.get("status"))
         .or_else(|| knowledge_value(payload.pointer("/entity/activity")))
         .or_else(|| event.get("activity").and_then(Value::as_str));
+
+    // D-057 OA6 (ma-sdk-state): the claude-print / claude-sdk engine's root
+    // turn evidence (topic `turn`). A turn is turn-level, never process-level:
+    //
+    // * `turn_started`/working (emitted when the user frame is written) sets
+    //   activity `working`;
+    // * a settled `result`/`turn_done` sets activity `idle`;
+    // * a settled `result`/`error` (an API error such as 429) also sets
+    //   activity `idle` and leaves lifecycle untouched, so the instance keeps
+    //   running with all its grants and can be retried in place. The additive
+    //   `lastTurnError` marker is applied in `apply_instance_lifecycle`.
+    //
+    // This arm must precede the start-failure fold below, whose generic
+    // `status == "error"` rule otherwise marks the instance `failed` and drops
+    // its seat while the process is still alive.
+    //
+    // "Settled" mirrors `map_result` in the driver: nothing further queued, and
+    // a successful result is the process's terminal result
+    // (`affectsCompletion`). A Workflow's intermediate result and a turn with
+    // another prompt already queued prove neither idle nor an end.
+    if payload_type == "native"
+        && payload.get("topic").and_then(Value::as_str) == Some("turn")
+    {
+        let queued = payload
+            .pointer("/relatedIds/queuedTurnCount")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let settled_end = queued == 0
+            && match (native_name, status) {
+                ("result", Some("error")) => true,
+                ("result", Some("turn_done")) => {
+                    payload.get("affectsCompletion").and_then(Value::as_bool)
+                        == Some(true)
+                }
+                _ => false,
+            };
+        if (native_name, status) == ("turn_started", Some("working")) {
+            return (Some("running"), Some("working"));
+        }
+        if settled_end {
+            return (None, Some("idle"));
+        }
+        // Any other turn/result shape (intermediate Workflow result, queued
+        // follow-up turn) changes neither lifecycle nor activity.
+        if native_name == "result" {
+            return (None, None);
+        }
+    }
 
     let start_failed = reason == "native-driver-start-failed"
         || native_name == "native-driver-start-failed"
@@ -8746,11 +8830,75 @@ fn apply_instance_lifecycle(
         _ => current.lifecycle.as_str(),
     };
     let activity = next_act.unwrap_or(current.activity.as_str());
+    // D-057 OA6: maintain the additive last-turn-error marker alongside the
+    // state change. `Some("")` clears it (next turn start), `Some(json)` sets
+    // it (a settled turn error), `None` leaves it untouched.
+    let turn_error = turn_error_projection(event, &now);
     conn.execute(
-        "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
-        params![lifecycle, activity, now, instance_id],
+        "UPDATE instances
+         SET lifecycle = ?1, activity = ?2, updated_at = ?3,
+             turn_error_json = COALESCE(?4, turn_error_json)
+         WHERE id = ?5",
+        params![lifecycle, activity, now, turn_error, instance_id],
     )?;
     Ok(())
+}
+
+/// Bound on [`TurnErrorMarker::text`]; mirrors the driver's clamp on the
+/// `lastError` related id, and is applied again here defensively.
+const TURN_ERROR_TEXT_MAX_CHARS: usize = 200;
+
+/// Build the `turn_error_json` write value for one journal event.
+///
+/// See [`derive_instance_state`] for the settled-end rule: a `turn/result`
+/// with status `error` and no queued follow-up turn sets the marker; a
+/// `turn/turn_started` clears it; every other event leaves the column alone
+/// (`None`, which the UPDATE coalesces away).
+fn turn_error_projection(event: &Value, now: &str) -> Option<String> {
+    let payload = event.get("payload").unwrap_or(event);
+    if payload.get("type").and_then(Value::as_str) != Some("native")
+        || payload.get("topic").and_then(Value::as_str) != Some("turn")
+    {
+        return None;
+    }
+    let name = payload.get("nativeName").and_then(Value::as_str).unwrap_or("");
+    let status = knowledge_value(payload.get("status"));
+    if name == "turn_started" && status == Some("working") {
+        return Some(String::new());
+    }
+    if name != "result" || status != Some("error") {
+        return None;
+    }
+    let queued = payload
+        .pointer("/relatedIds/queuedTurnCount")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    if queued != 0 {
+        return None;
+    }
+    let text = payload
+        .pointer("/relatedIds/lastError")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| {
+            if text.chars().count() <= TURN_ERROR_TEXT_MAX_CHARS {
+                text.to_owned()
+            } else {
+                text.chars().take(TURN_ERROR_TEXT_MAX_CHARS).collect()
+            }
+        })
+        .unwrap_or_else(|| "turn error".to_owned());
+    let at = event
+        .get("observedAt")
+        .and_then(Value::as_str)
+        .filter(|at| !at.is_empty())
+        .unwrap_or(now);
+    Some(
+        json!({ "at": at, "text": text })
+            .to_string(),
+    )
 }
 
 fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {

@@ -99,7 +99,7 @@ tokenGuard 断言两条：
 | `--diff-add-bg` / `-del-bg` / `-ctx-bg` | diff（必须配 +/- 字形） | `rgb(163 194 154/.14)`、`rgb(236 154 148/.14)`、`rgb(255 246 230/.03)` | `rgb(58 104 67/.10)`、`rgb(163 56 62/.09)`、`rgb(60 45 20/.03)` |
 | `--term-bg` / `--term-fg` | 终端，跟随外观（2026-09-24 改定） | `#1a1917` / `#e4dfd6` | `#faf9f6` / `#2b2a27` |
 | `--tok-*` | 代码语法色，两态分设 | UO-1 从 `components/codeBlock.module.css` 现有的两组 `[data-theme]` 值平移，并逐个校到 `--bg-inset` 上 ≥ 4.5:1 | 同左 |
-| `--ember-*` | effort 顶档余烬 | UO-1 从 `features/session/session.module.css` 现有 `.effortCard` / `.effortKnobUltra` 的 night/ledger 模式分支原值平移 | 同左 |
+| `--ember-*` | effort 余烬：Codex `ultra` 档与 Claude Ultracode 开关打开（任意档）；不绑定滑杆位置，Claude 已没有第六档（D-056） | UO-1 从 `features/session/session.module.css` 现有 `.effortCard` / `.effortKnobUltra` 的 night/ledger 模式分支原值平移 | 同左 |
 
 角色族一览（D-053 第 1 条）：
 

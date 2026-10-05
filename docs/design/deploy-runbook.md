@@ -200,3 +200,145 @@ secret envelope；数据库迁移失败时保持 Hub 停止。旧镜像必须兼
 bootstrap 轮转并首启成功，旧机配对码已失效，回滚方向只能是修新机，
 不能简单启旧机继续对外。
 
+## 升级到当前 main 并接入 Node（D1/D2，2026-10-05）
+
+**内网 Hub 升级（9dd7ec7 → 当前 main）与笔记本、devbox Node 接入 · 所有者/运维清单**
+
+适用：D1/D2（2026-10-05）。执行人：所有者或运维。worker 不执行本清单的任何一步，也不执行 `deploy/` 下的任何脚本。不使用任何隧道工具（D-031）。记录与证据只写占位名（`remuda.<zone>`、`<sg-host>`、`<devbox>`、`<laptop>`、`<DATA_DIR>`）；不写真实主机名、地址、用户名、家目录路径、token、访问码或配对码。
+
+### 0. 前提与边界
+- 起点是内网 Hub 自己的数据目录（D2）。笔记本 demo Hub 的数据不迁移、不合并，成为历史。这次不是换机，所以 hub-topology §7 的「首次启动前必须轮转 bootstrap」不适用；是否轮转见第 6 步。
+- 只升级 Hub 镜像。Caddy、DNS、证书、`deploy_default` 网络、网关站点一律不动，做法与上次升级到 9dd7ec7 相同。如果目标提交改动了 `deploy/intranet/`，先审阅 `git diff 9dd7ec7 <TARGET> -- deploy/intranet/`，只采纳审阅过的改动。凡涉及 Caddy 的改动，另走 deploy-runbook 的批准流程。
+- hub.lock 尚未实现，所以任何时刻同一个数据目录只允许一个 Hub 进程。服务运行期间，不要对同一数据目录再起第二个 Hub 进程，包括 `compose run`。
+- Node 升级或重启会结束该 Node 上正在运行的会话（`node-epoch-changed`）。只在 Node 空闲时操作。先升级 Hub，确认健康后再升级 Node。
+- 本清单要执行两次：
+  - 现在一次：升级到当前 main 并接入 Node；
+  - 第一阶段代码全部合入后再执行一次：升级到包含第一阶段的提交，然后入座 Main、取证、切换（见第 12 步）。
+
+### 1. 构建（在可信构建机上，用同一个提交）
+1. 固定目标提交 `<TARGET>`。确认 `git cat-file -t <TARGET>` 的结果是 commit，并且它在 `git ls-remote origin refs/heads/main` 所指提交的历史上。
+2. 在 `web/` 下执行 `pnpm install --frozen-lockfile && pnpm build`。然后执行 `REMUDA_GIT_SHA=<TARGET> cargo zigbuild --locked --release -p remuda --target x86_64-unknown-linux-musl`。Hub 与 devbox Node 用同一个 Linux musl 二进制；笔记本用同一提交的 macOS 原生构建。
+3. 用 `deploy/m1/Dockerfile` 打出 `remuda-hub:<TARGET 前 7 位>` 镜像归档。把 musl 二进制和镜像归档的 SHA-256、镜像 ID 写进私有记录；证据里只写哈希。
+4. 在本地对该二进制执行 `remuda version --json` 并核对：
+   - `git_sha` 等于 `<TARGET>`（即构建时经 `REMUDA_GIT_SHA` 注入的值）；
+   - `wire_major` 为 1；
+   - 记下 `version` 字段（包版本），第 5 步要和 `/healthz` 对比。
+
+   `schema_major` 写死为 0，只是 CLI 兼容标记，不是数据库迁移依据；它不能证明 schema 兼容。schema 兼容性只以第 4 步的 `hub --migrate` 演练结果为准。
+
+### 2. 只读预检（SG 主机 `<sg-host>`，服务照常运行）
+- `docker compose --env-file .env -p remuda-intranet -f compose.hub.yml config`（只读）。
+- `docker compose --env-file .env -p remuda-intranet -f compose.hub.yml exec remuda-hub /usr/local/bin/remuda version --json`：记录当前的 `git_sha`（预期为 9dd7ec7）和 `version`。
+- 从内网客户端、开启证书校验执行 `curl -fsS https://remuda.<zone>/healthz`，应返回 `{"ok":true,...}`；记录其中的 `version`。
+- 记录四项基线：Caddy 容器 ID、Caddy 启动时间、活动 Caddyfile 的 SHA-256、网关健康响应的 SHA-256。升级后逐项对比，必须不变。
+- 数据目录 `<DATA_DIR>`：属主为 `HUB_UID:HUB_GID`，模式 0700；可用空间不少于现有库体积的 3 倍（备份加演练副本）。
+- 出站探测（只读，不改配置）：
+  - Hub 所在主机可以访问 Web Push 服务（所有者已确认，D-057 OA4）；第 7 步的测试推送就是验证。
+  - devbox 与笔记本能否执行 `curl -fsS https://remuda.<zone>/healthz`？不能的话报告所有者，不要绕过。
+
+### 3. 备份（先停服务，再拷贝）
+1. 执行 `docker compose ... stop remuda-hub`（30 秒优雅期，writer 会做 WAL checkpoint），再用 `docker compose ... ps` 确认已退出。
+2. 使用审阅过的 `scripts/hub-backup.sh` 副本。它只做本地操作，需要用能读取数据目录的身份执行。
+   - 先 dry-run：`scripts/hub-backup.sh --data-dir <DATA_DIR> --output-dir <备份目录> --recipient <age 公钥>`。核对成员：`hub.sqlite`、`secrets/`、`bootstrap-token` 必须为 present；WAL/SHM、`vapid.json`、`push.sqlite*` 要么为 present，要么明确标为 absent。
+   - 再正式执行：`REMUDA_BACKUP_YES_I_KNOW=1 scripts/hub-backup.sh --data-dir <DATA_DIR> --output-dir <备份目录> --recipient <age 公钥> --execute`。
+   - 备份目录不得位于任何 `deploy/` 目录之下，也不得位于数据目录之内。
+3. 核对旁车 `.sha256` 文件。`.age` 与旁车各保存一份到带外位置；age 私钥不放在 SG 主机上。
+4. 保留旧镜像 `remuda-hub:9dd7ec7`，回滚时要用。
+
+### 4. schema 兼容性演练（唯一的 schema 证据，不碰活数据）
+1. 新建一个空目录（0700，属主为 HUB_UID），用 `age -d` 解密备份并解包进去，再按 manifest 逐个文件核对 SHA-256。
+2. 用新镜像只对副本做迁移，不联网：`docker run --rm --network none --user <HUB_UID>:<HUB_GID> -v <演练目录>:/data -e REMUDA_DATA_DIR=/data remuda-hub:<TARGET7> hub --migrate`。退出码必须为 0，日志里不能有迁移错误。
+3. 失败就停：不做第 5 步，保持旧 Hub 运行，把输出交给所有者。成功后，安全删除演练目录（里面有密钥）。
+
+### 5. 升级
+1. `docker load -i <镜像归档>`，核对镜像 ID 与第 1 步一致。
+2. 在私有 `.env` 中只改 `HUB_IMAGE=remuda-hub:<TARGET7>`，其他值不动；用 `docker compose ... config` 复核。
+3. 执行 `docker compose ... up -d remuda-hub`，等待健康检查变为 healthy（用 `docker compose ... ps` 查看），并确认日志里没有迁移错误。
+4. 验证：
+   - `docker compose ... exec remuda-hub /usr/local/bin/remuda version --json`：`git_sha` 等于 `<TARGET>`；
+   - `curl -fsS https://remuda.<zone>/healthz` 返回 200，且 `version` 等于上一条输出的 `version` 字段（包版本）。`/healthz` 不带提交号，提交号只看 `git_sha`；
+   - `/` 的响应体与该构建 `web/dist/index.html` 的 SHA-256 一致；
+   - Caddy 容器 ID、启动时间、Caddyfile 哈希、网关健康哈希与第 2 步的基线一致。
+5. 用已配对的笔记本浏览器登录 `https://remuda.<zone>/`，确认设备与历史都还在（数据延续自内网 Hub）。
+
+### 6. bootstrap 轮换（按需）
+- 什么时候需要：访问码曾出现在所有者私有文件之外（终端回滚、共享笔记、证据草稿等），或者回滚到了轮换之前的备份。D2 不是换机，所以不是必做项。
+- 怎么做：
+  1. `docker compose ... stop remuda-hub`；
+  2. `docker compose ... run --rm --no-deps remuda-hub hub rotate-bootstrap`。新访问码打印到 stdout，只写入私有的 0600 文件，不进 argv 历史、日志或证据；
+  3. `docker compose ... up -d remuda-hub`。
+- 已配对设备的 token 不受影响（D-018），只影响以后的新配对。
+
+### 7. 手机与推送
+1. 在笔记本浏览器的 Settings 里生成配对码；手机经**获准的内网路由**打开 `https://remuda.<zone>/login?pair`。iOS 需要先添加到主屏幕。
+2. 在 `/m/inbox` 的横幅或 Settings → 通知里开启推送。
+3. 推送测试：在 devbox Node 上开一个会提问的短会话。在第一阶段代码合入之前，只要有任一设备 follow 该会话，所有设备都会被静音，所以测试期间桌面端不要打开它。确认手机收到「Need your input」后，删除这个会话。
+4. 手机在办公网之外也有获准的路由到达内网 Hub（所有者已确认，D-057 OA4）。在办公网之外再做一次：打开 Hub，并收到一条测试推送。
+
+### 8. Node 接入
+
+**devbox（常驻；Main、worker、gate lanes、项目 home host 都在这里）**
+1. 以 devbox 运行用户的身份，把同一提交的 Linux 二进制放进该用户的私有 bin 目录，用 `remuda version --json` 核对 `git_sha`。
+2. 由已登录设备生成一次性 enroll token（在主机页操作，或调用已认证的 `POST /v1/hosts/enroll-token`）。
+3. 执行 `remuda --data-dir <稳定的私有目录，不在 /tmp> node install --systemd-user --hub 'https://remuda.<zone>' --enroll-token '<one-shot>'`，然后从 shell 历史里清除 token。数据目录要与任何既有 Node 或 demo 的数据目录分开（Herdr 会话名按数据目录派生，互不干扰）。
+4. 如果要在用户注销后继续运行，需要 systemd linger，由所有者或管理员按策略决定。
+5. 核对：
+   - `remuda --data-dir <目录> node status` 正常；
+   - Hub 主机页显示该主机 online，CLI 清单列出 claude、codex、herdr 及版本；
+   - **主机记录必须登记 herdr**：用 Human 设备读取 `GET /v1/hosts/<devbox-host-id>`（或打开主机详情），`herdr` 字段必须非空。只在 CLI 清单里出现 herdr 不够；
+   - 记录该 Node 是否报告原生 `shell-pty` 可启动（`capabilities.driverInventory`）；
+   - 在 Hub 上为它登记持久工作区（项目检出所在的家目录卷，不是 /tmp）。
+6. 说明：如果 Node 报告原生 shell-pty 可启动，不带 `--carrier` 的 Claude dispatch 会选 shell-pty。shell-pty 属于 shell 驱动，Agent 来源要做一次性人审（D-017）。免审的同 host 路径是显式 `--carrier herdr`，或 codex/grok worker（generic-pty，同样依赖 herdr）。**主机记录登记 herdr 之前，不要入座 Main。**
+7. 重启一次该用户服务，确认 Hub 上仍是同一个 host id，没有出现重复主机。
+8. 不要用 pkill/killall 按模式杀进程；不要动现有 demo 或脚本化 gate 的进程。
+
+**笔记本（普通 Node，会休眠；保留已接入的身份，D-057 OA5）**
+1. 沿用内网验收时安装的 Mac Node 数据目录与 host id，不重新 enroll：换成同一提交的 macOS 二进制，重启它的 launchd 用户代理，确认 Hub 主机页上 host id 不变。
+2. 只有当该数据目录已经不在、Hub 主机页也不再列出该主机时，才报告所有者并重新接入：`remuda --data-dir <稳定的私有目录> node install --launchd --hub 'https://remuda.<zone>' --enroll-token '<one-shot>'`。安装器拒绝覆盖属于其他数据目录的单元；需要时，先对旧数据目录执行 `node uninstall`（保留 journal 与身份）。
+3. 笔记本上的 demo Hub（本地 `remuda dev`）成为历史：确认上面没有所有者的会话后停掉它，不迁移它的数据。
+4. 合盖后，Hub 应显示该主机 offline；唤醒后自动恢复 online，host id 不变。
+
+### 9. 项目、lanes 与 provider（所有者在 Hub 上配置）
+- 在内网 Hub 上登记自开发项目（D2：不从 demo 迁移）。成员是 devbox 工作区（笔记本工作区可选），home host 是 devbox，gate lanes 在 devbox 上。需要时调整项目策略，例如 `coordinatorFanOut`（默认 8）。
+- provider 在各 Node 本地按主机配置。凭据不写进 Hub 的 `.env`，也不复制到别处；Hub 只保存 profile id。
+- 脚本化 landing gate 与 Hub 的 gate lanes 共用 devbox 的端口和 e2e 锁。在切换（D4）之前，两者不要同时运行。
+- 委托决策（D-051）对自开发项目开启（D-057 OA3）：在 Hub 进程环境里设置 `REMUDA_DELEGATED_DECISIONS_FORCE_ON=<project-id>`（项目登记后才有 id）。当前 `deploy/intranet/compose.hub.yml` 不透传这个变量，由所有者或运维以审阅过的方式加入 Hub 服务环境，用 `docker compose ... config` 复核后执行 `up -d remuda-hub`。这一步只改 Hub 环境，不涉及 Caddy；入座 Main 之前必须生效。
+
+### 10. 验收命令汇总
+- `docker compose --env-file .env -p remuda-intranet -f compose.hub.yml exec remuda-hub /usr/local/bin/remuda version --json`：`git_sha` 等于 `<TARGET>`。
+- `curl -fsS https://remuda.<zone>/healthz`（开启证书校验）：`ok` 为 true，`version` 等于上一条输出的 `version` 字段。
+- `/` 响应体哈希与构建产物一致。
+- Caddy 的四项基线与升级前一致。
+- schema：第 4 步的 `hub --migrate` 演练退出码为 0（不以 `schema_major` 为证据）。
+- 主机页：devbox 与笔记本都显示 online；断开再重连不会产生重复主机；笔记本的 host id 与升级前相同。
+- devbox：`remuda --data-dir <目录> node status` 正常；`GET /v1/hosts/<devbox-host-id>` 的 `herdr` 非空。
+- 手机：配对成功，并收到测试推送，其中一次在办公网之外。
+- D-051 开关：`docker compose ... config` 显示 Hub 环境含 `REMUDA_DELEGATED_DECISIONS_FORCE_ON=<project-id>`。
+- 第二次执行时（第一阶段代码合入后）额外确认：各 Node 的 hello 报告了 fence 能力（看主机详情或 Hub 日志），见 main-agent.md §7.6。
+
+### 11. 回滚
+- **新 Hub 起不来，或迁移失败**：
+  1. `docker compose ... stop remuda-hub`；
+  2. 保留失败的数据目录，供诊断；
+  3. 在一个**新的空目录**里，按第 4 步的方式恢复升级前的备份（迁移只前滚，旧二进制不保证能读迁移后的库）；
+  4. 在 `.env` 里改 `DATA_DIR=<新目录>`、`HUB_IMAGE=remuda-hub:9dd7ec7`；
+  5. `up -d`；
+  6. 按第 5.4 步核对，此时 `git_sha` 应为 9dd7ec7。
+- **Node**：Hub 确认健康之前，不升级 Node。如果 Node 已经升级而 Hub 又回滚了，把 Node 二进制也换回原版本，再重启它的服务。
+- **Caddy**：本流程不改 Caddy，无需回滚。如果基线对比发现 Caddy 变了，立即停止，按 deploy-runbook 的回滚流程处理（需所有者批准）。
+- **访问码**：回滚到轮换之前的备份后，旧访问码会重新有效，需要按第 6 步再轮换一次。
+- 回滚会丢失升级后新产生的数据（新会话、新配对）。回滚前先告知所有者。
+
+### 12. 第一阶段代码合入后：第二次执行、入座、取证与切换
+1. 按第 1–5 步把 Hub 升级到包含第一阶段的提交，再在空闲时依次升级 devbox 与笔记本 Node（第 8 步）。确认每个 Node 都报告了 fence 能力，确认 devbox 主机记录的 `herdr` 非空，并确认 D-051 开关已对自开发项目生效（第 9 步）。未升级的 Node 会把 Hub 生成的重启通知错记成 Agent 来源，所以全部 Node 升级完成之前不入座。
+2. 所有者用 Human 设备入座 Main（以下全部为占位）：
+   `remuda instance create --host <devbox-host-id> --workspace-id <workspace-id> --kind claude --driver claude-sdk --name main --title Main --grant address-owner [--grant <grant> …] --scope-project <project-id> --scope-host <devbox-host-id> --permission-mode <mode> --model <model> --restart process-loss:3 --prompt-file <启动说明>`
+
+   Main 由 `address-owner` 定义；其他 grants（包括 `land`）与权限档位和任何实例一样，是入座时选定的配置，本清单不作建议（D-057 OA2）。`process-loss:3` 是建议的重启上限，每小时 3 次（OA5）。
+3. 取证窗口内，人工 coordinator 与脚本化 gate 保持空闲。按 main-agent.md §14.1 的 E1–E9 取证，写入 `docs/design/evidence/main-agent-1.md`（脱敏）。E2 中的 worker 用 `--carrier herdr` 或 codex/grok。E3 要杀掉 Main 进程，由所有者或 coordinator 在 devbox 上执行，不由 worker 执行。
+4. 全部通过后，一次性切换（D4）：
+   - 人工 coordinator 停止派工、gate、land；
+   - 脚本化 gate、会话级 monitor 与 cron 退出循环路径；
+   - 所有者的 Human 设备仍可读、可回答。这是流程约定，Remuda 没有只读的 Human token。
+
+   任何一项不通过：从手机暂停 Main，恢复人工循环，把缺口记为任务。

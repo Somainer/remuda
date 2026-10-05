@@ -390,6 +390,83 @@ fn journal_complete(node: &DevNode, instance: &InstanceId) -> bool {
         .contains("\"text\":\"OK\"")
 }
 
+/// Accept the Node's WebSocket from `listener`, ignoring unrelated
+/// connections.
+///
+/// On a shared CI/devbox host a local service prober visits every freshly
+/// bound loopback listener once, a second or two after bind, with a plain
+/// `GET /` (`User-Agent: Go-http-client`) — no `Upgrade: websocket` header.
+/// The probe queues ahead of the Node's later reconnect, and handing it to
+/// `accept_async` panics with `MissingConnectionUpgradeHeader`. The real
+/// Node connection is simply the next accepted socket that completes a
+/// handshake, so drain strangers instead of trusting queue order.
+async fn accept_fake_hub_ws(
+    listener: &tokio::net::TcpListener,
+) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+    loop {
+        let (stream, peer) = listener.accept().await.unwrap();
+        // Bound the handshake: a stranger that connects but never sends must
+        // not sit ahead of the Node's real reconnect in the accept queue.
+        let handshake = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio_tungstenite::accept_async(stream).await
+        })
+        .await;
+        match handshake {
+            Ok(Ok(socket)) => return socket,
+            Ok(Err(error)) => {
+                eprintln!("fake Hub: skipping non-WebSocket connection from {peer}: {error}");
+            }
+            Err(_) => {
+                eprintln!("fake Hub: dropping silent connection from {peer}: handshake timed out");
+            }
+        }
+    }
+}
+
+/// The host service prober's plain `GET /` queued ahead of the Node must be
+/// drained, and the next socket — the real WebSocket upgrade — accepted.
+/// Before the accept loop this was the landing-gate
+/// `MissingConnectionUpgradeHeader` panic, reproduced here without depending
+/// on the shared host's prober being active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_hub_accept_drains_a_plain_http_probe_before_the_upgrade() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { accept_fake_hub_ws(&listener).await });
+
+    // Stranger first in the accept queue: the exact request the host-local
+    // Go service prober sends to every fresh loopback listener.
+    let mut probe = tokio::net::TcpStream::connect(address).await.unwrap();
+    probe
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1:1\r\nUser-Agent: Go-http-client/1.1\r\n\
+              Connection: close\r\nAccept-Encoding: gzip\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    // The Node's real reconnect is the next connection and must win.
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}/v1/node"))
+        .await
+        .unwrap();
+    client
+        .send(Message::Text("reconnect-hello".into()))
+        .await
+        .unwrap();
+
+    let mut accepted = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("accept loop must finish once the upgrade arrives")
+        .unwrap();
+    let frame = accepted.next().await.unwrap().unwrap();
+    assert_eq!(frame.to_text().unwrap(), "reconnect-hello");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn controller_takeover_fences_old_bridge_and_outbound_waits_until_detach() {
     let dir = tempfile::tempdir().unwrap();
@@ -470,8 +547,13 @@ async fn stalled_reply_pipe_does_not_block_replacement_controller() {
     node.shutdown().await.unwrap();
 }
 
+/// Inner body: run only via the outer harness below, which re-execs it with
+/// the developer's proxy environment cleared (`remove_var` is unsafe and the
+/// workspace forbids `unsafe`, so a child process is the only option — same
+/// pattern as `tty_fixture_survives_emulator_on_and_off` in local_api.rs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn outbound_reconnect_replays_offline_completion_without_a_new_command() {
+#[ignore = "re-exec'd with proxy env cleared by the outer _without_a_new_command test"]
+async fn outbound_reconnect_replays_offline_completion_inner() {
     use futures::{SinkExt, StreamExt};
     use remuda_node::{Backoff, WssConfig, WssLink};
     use tokio_tungstenite::tungstenite::Message;
@@ -479,6 +561,8 @@ async fn outbound_reconnect_replays_offline_completion_without_a_new_command() {
     let dir = tempfile::tempdir().unwrap();
     let (config, gate, release) = native_fixture(dir.path());
     let node = compose(&config).unwrap();
+    // A dedicated kernel-assigned ephemeral port per run; unrelated probers
+    // that find it are drained by `accept_fake_hub_ws`.
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -487,8 +571,7 @@ async fn outbound_reconnect_replays_offline_completion_without_a_new_command() {
     let (resume, resumed) = tokio::sync::oneshot::channel();
     let claude_config = dir.path().join("claude-config");
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut first = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut first = accept_fake_hub_ws(&listener).await;
         let hello: Value =
             serde_json::from_str(first.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(hello["params"]["daemon"], true);
@@ -518,8 +601,7 @@ async fn outbound_reconnect_replays_offline_completion_without_a_new_command() {
         drop(first);
         disconnected.send(()).unwrap();
         resumed.await.unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut second = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut second = accept_fake_hub_ws(&listener).await;
         let hello: Value =
             serde_json::from_str(second.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(hello["params"]["instances"].as_array().unwrap().len(), 1);
@@ -606,6 +688,46 @@ async fn outbound_reconnect_replays_offline_completion_without_a_new_command() {
     link.shutdown().await;
     drop(lease);
     node.shutdown().await.unwrap();
+}
+
+/// Run the reconnect body in a child whose proxy environment is clean.
+///
+/// The fake Hub is a raw loopback WebSocket; a shell `http_proxy`/`all_proxy`
+/// must never route the Node's Hub HTTP clients (built per hello) through a
+/// third process. The tungstenite dial ignores these variables, but clearing
+/// them keeps the whole fixture honest across shells and CI images.
+#[test]
+fn outbound_reconnect_replays_offline_completion_without_a_new_command() {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "outbound_reconnect_replays_offline_completion_inner",
+            "--ignored",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("NO_PROXY")
+        .output()
+        .expect("re-exec the reconnect fixture");
+    assert!(
+        output.status.success(),
+        "reconnect fixture failed in child\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 passed"),
+        "inner reconnect fixture did not run: {stdout}"
+    );
 }
 
 /// A long carrier method must not blind the daemon controller.

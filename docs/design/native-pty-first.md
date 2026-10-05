@@ -171,7 +171,7 @@ New Session = 在一个 Remuda 自持 PTY 里**预填 launch command 并回车**
 
 | kind | 基础 argv 与环境 | yolo argv（仅 Human/Bot 且显式 bypass） | overlay | session id 来源 |
 |---|---|---|---|---|
-| claude | `claude` + `--settings <overlay>` + `--effort <v>` | `--dangerously-skip-permissions` | settings overlay：hooks、`tui`、`showStatusInTerminalTab`、`terminalProgressBarEnabled` | `SessionStart` hook → `session-meta.json` |
+| claude | `claude` + `--settings <overlay>` + `--effort <v>` | `--dangerously-skip-permissions` | settings overlay：hooks、`tui`、`showStatusInTerminalTab`、`terminalProgressBarEnabled`，以及请求了 ultracode 时的 `ultracode`（≥ 2.1.284，§9.1 / D-056） | `SessionStart` hook → `session-meta.json` |
 | codex | `codex`，`CODEX_HOME` 指向影子目录 | `--dangerously-bypass-approvals-and-sandbox` | 影子 `config.toml`（`hooks = true`、`notify`）+ `hooks.json` | `SessionStart` hook；否则 `session_index.jsonl` 最新 `updated_at` |
 | grok | `grok`，`GROK_HOME` 指向影子目录 | `--always-approve` | 影子 `hooks/*.json`（须自辨 harness，见 §3.1） | `active_sessions.json` 按 PTY 子进程 pid 匹配 |
 | agy | `agy` | `--yolo` | `config/hooks.json`（namespace 键） | `PreInvocation.conversationId` |
@@ -340,17 +340,39 @@ resume = **新开一个 session，预填 `--resume <sid>`**——与 New Session
 | index | 名称 | 备注 |
 |---|---|---|
 | 0 | `low` | |
-| 1 | `medium` | |
-| 2 | `high` | **默认**（成本基准 1.0） |
-| 3 | `xhigh` | |
+| 1 | `medium` | Opus 5.5 / Sonnet 5.5 的模型默认 |
+| 2 | `high` | 成本基准 1.0；表外其余支持 effort 的模型默认 |
+| 3 | `xhigh` | Opus 4.7 的模型默认 |
 | 4 | `max` | 顶档 |
 
-`ultracode` **不是第 6 档**，是独立 boolean（等价 `xhigh` + dynamic workflow），session-only、永不持久化。
+Claude 的默认档**按模型**定（官方 model-config；组织默认与 per-model 保存档可覆盖），没有通用默认档。未 pin 时不发 `--effort`，由 harness 自己解析（D-056 (6)）。
 
-- **落地通道**：launch 时 argv 追加 `--effort <value>`（`--effort ultracode` 未文档化但已实测可用）；会话内改档写 `/effort <level>\r` 进 PTY（命令注册表已验证，PTY 实际驱动 **[U]**）。
+`ultracode` **不是第 6 档**，是与档位正交的会话开关：只在本会话有效、永不持久化，并按 Claude Code 版本门控（D-056，实测见 [effort-sync-4](./evidence/effort-sync-4.md)）：
+
+- ≥ 2.1.284：任意档都可以开，改档不影响它。
+- 2.1.203–2.1.283（耦合）：开 ultracode 即 xhigh，选任何档即关。
+- < 2.1.203：没有 ultracode。
+
+通道、环境与回读的规则如下：
+
+- **落地通道**：
+  - **launch**：argv 追加 `--effort <level>`。这是 cli-reference 文档化的 flag，`ultracode` 是它文档化的别名，含义是 xhigh 加开关打开。
+    - ≥ 2.1.284：ultracode 写成同一份 per-session settings overlay 里的 `"ultracode": true`。两个 `--settings` 不合并，后出现的整份胜出，所以绝不另加第二个。
+    - 耦合版本：只有 `{xhigh, 开}` 能以 `--effort ultracode` 发出，其余组合以 `InvalidLaunchSpec` 拒绝并点名版本。
+    - 版本取 pinned binary 的 `--version`。
+    - `--resume` 不恢复 ultracode，resume launch 按同一规则再带一次。
+  - **会话内**：改档写 `/effort <level>\r`，开关写 `/effort ultracode on\r` 或 `/effort ultracode off\r`。一次 configure 至多两条，档位在前。耦合版本上开 = 单独一条 `/effort ultracode`（不论当前在哪一档都不先发 `/effort xhigh`，后者会保存默认档），关 = `/effort <level>`。
+  - **确认框**：PTY 内驱动已实测（effort-sync-1…4）。2.1.289 上 `/effort` 不弹确认框；旧版本的确认框门控保留。
 - **绝不使用 `CLAUDE_CODE_EFFORT_LEVEL`**：它的优先级高于会话内 `/effort`，会把 PTY 的实时改档钉死；反向地，必须在 `child_env` 里**剥离宿主继承的该变量**，否则外部环境静默覆盖一切。
-- **不把 `settings.json` 的 `effortLevel` 当主通道**：其 enum 拒绝 `"max"`；`maxEffortLevel` 会 clamp 一切。
-- **effective vs requested**：record 上拆两个字段，`effortRequested` 与 `effortEffective{name, ultracode, source, observedAt} | null`。effective 从 transcript 每条 assistant 记录的 `effort` / `perTurnEffort` 回读。**UI 一律显示 effective**；回读不到时显示 `?` 并置灰，**绝不回落成请求值**；不一致时显示「请求 max → 实际 xhigh」，这正是 clamp / org cap / ultracode 降级的可见出口。改档命令超时未回读到变化 → journal 记 `degraded`，不谎报 applied。
+- **不把 `settings.json` 的 `effortLevel` 当主通道**：其 enum 拒绝 `"max"`，也不收 `ultracode`；`maxEffortLevel` 会 clamp 一切。
+- **effective vs requested**：record 上拆成两个字段，`effortRequested` 与 `effortEffective{name, ultracode, source, observedAt} | null`，两条轴各自回读。
+  - **档位**：从 transcript 每条 assistant 记录的 `effort` / `perTurnEffort` 回读。`auto` 回读为它解析出的档。
+  - **ultracode**：**从不**出现在 assistant 记录上，只从 `/effort` verdict 与 `ultra_effort_enter` / `ultra_effort_exit` 附件回读，footer 只作 Screen 层兜底。≥ 2.1.284 上开关在任意档锁存。只认本进程的记录：`--resume` 追加到同一个 transcript，上一个进程重放的「Ultracode on」verdict 不代表当前状态（effort-sync-4 (f) 中 resume 后实际为关，首个 prompt 带 `ultra_effort_exit`），回读游标从本进程 spawn 时的文件末尾开始；新进程（含 resume）在本进程第一条证据出现之前为未知。
+  - **版本**：从记录的 `version` 回读。
+  - **显示**：UI 一律显示 effective。回读不到时显示 `?` 并置灰，**绝不回落成请求值**。不一致时逐轴显示「请求 max → 实际 high」「请求 ultracode → 实际关」，这正是 clamp、org cap、模型不支持、resume 丢失开关的可见出口。
+  - **拒绝**：映射为稳定 reason（`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`）。被 clamp 的 accept 报 clamp 之后的档。
+  - **超时**：改档命令超时仍未回读到变化时，journal 记 `degraded`，不谎报 applied。
+  - **失败不结束会话**：拒绝、degraded、超时都只是这条 configure 的结局，实例 lifecycle 不变、进程不关，之后可以用新命令重试（D-056 (4)）。
 - 非 claude 三家继续返回诚实的 `CapabilityUnsupported`。
 
 ### 9.2 tui / 终端状态信号
@@ -548,7 +570,7 @@ reason = "…"                     # 必填，且不得为空白
 | 11 | **hook overlay 与「不碰用户配置」的边界** | 只 merge、只存活于 session、只写 per-session 影子目录，且可 `REMUDA_SHIM=off` 退出；需评审确认 |
 | 12 | **grok / agy 屏幕签名覆盖率目前为零**（现有检测只认 claude banner） | P7 规则表移植时补齐；证据夹具需指派产出人 |
 | 13 | **parity gate 长期不过**则 P7 的翻默认无限期推迟 | 这是**刻意设计**：print 退役由数据决定，不由日程决定 |
-| 14 | **`/effort` 在 PTY 内的实际驱动未实测**（**[U]**） | 回读不到即记 `degraded` + effective 置 unknown，绝不谎报 |
+| 14 | ~~**`/effort` 在 PTY 内的实际驱动未实测**~~ → **已实测**（effort-sync-1…4；2.1.289 不弹确认框、ultracode 解耦，见 [effort-sync-4](./evidence/effort-sync-4.md)） | 回读不到即记 `degraded` + effective 置 unknown，绝不谎报；ultracode 开关只认 verdict 与 `ultra_effort_*` 附件（D-056） |
 | 16 | **`launchedBy` 在 P2 后失真**（**[V]** [native-pty-2](./evidence/native-pty-2.md) §6）：Hub 从 `mode == "promoted"` 推断出身，而 §1.0 规则 2 让**两条路径都 promote**，于是 Remuda 启动的 agent 也被读成 `user`。仅为出身记录，不影响任何能力（规则 4） | Node 侧已显式存下正确值（它知道是谁启动的），Hub 改为**持久化并读取该列**而不是推断。`TODO(x-protocol)` 已留在 `crates/remuda-hub/src/store.rs`。这是 P2 的 parity 校验目前唯一验证不到的 entity 字段，故 §13 P2 的验收改以 journal 为准 |
 | 17 | **`instance.cancel` 的空闲判据仍是屏幕签名**（**[V]** 同上 §5）：`Esc` 打到**空闲** composer 上会退出 claude（实测落 `native-exit-code-1`），而 claude-queue-steer-1 的打断证据全部来自**运行中的 turn** | 现在 idle 时不发键、返回 `not-dispatched`；`unknown` 仍然发（漏打断比误退出轻）。真正要的是 harness 自己的 turn 结束证据（claude `Stop` / codex `TurnAborted` / grok `turn_ended`），随 P5 的 hook 路径补上 |
 | 15 | **grok 没有审批裁决通道**（**[V]**，新增）：`PermissionRequest` hook 名被静默忽略；`PreToolUse` 只有 `deny`/`ask`（**能拦不能替用户答**）；ACP `session/request_permission` 的原始 RPC **不落 `updates.jsonl`** → 无法从文件重建并回答原始请求 | 作答路径**只能是屏幕 + 按键**（tier D，D-022 全套不变量适用：写前置 `attempted`、`answerable &= !screen_truncated`、单次自动 trust）；capability 标注为**屏幕作答（emulated）**，**不得**冒充 hook 裁决。`events.jsonl` 的 `permission_requested` / `permission_resolved` 只能做**事后对账**（`wait_ms=0` 不代表没阻塞，`permissionMode: auto` 也不等于 `--always-approve`）。要拿到结构化作答，须另起一个真正的 ACP client（与 D-013 的 `remuda-acp-wire` 同族），排在 P6 之后单独评估 |
@@ -599,7 +621,7 @@ reason = "…"                     # 必填，且不得为空白
 | 2 | 无 herdr 后补齐：新建 / 停止 / 删除 Session、发送消息 | §5 全章（新建、发送、停止两义、删除、退出检测、resume） | P2 | 设计已定 |
 | 3 | 工作中 composer：steer / 排队 / 打断，逐 harness 键位，能力诚实 | §6（键位表 + native/emulated 映射 + composer 三态 + `unknown` 诚实上报） | P4 | **已实测三家**（claude / codex / grok，证据见 §6 末列）；agy 仍 **[U]** |
 | 4 | 结构化视图实时流式（文本/思考/工具增量） | §7（`MessageDisplay` 行级 + ACP chunk + mapper 重组修复） | P3 | 设计已定 |
-| 5 | effort：5 档 + ultracode；`--effort` + `/effort`；显示 effective vs requested | §9.1 | P2 | 部分 **[U]**（PTY 内 `/effort` 未实测） |
+| 5 | effort：Claude 五档 + 与档位正交、按版本门控的 ultracode 会话开关（D-056）；`--effort` + overlay `"ultracode"` + `/effort`；逐轴显示 effective vs requested | §9.1 | P2 | PTY 内 `/effort` 已实测（effort-sync-1…4；2.1.289 解耦见 [effort-sync-4](./evidence/effort-sync-4.md)）；按 D-056 解耦的实现待后续任务 |
 | 6 | 滚动 + 全屏 TUI：真字节修 scrollback；overlay 启动钉 `tui`、绑定后释放；保留正常 settings sources | §4.6 + §9.2 | P0 / P2 | 设计已定 |
 | 7 | 识别手敲启动的 agent（D-025 promotion），给同样的结构化视图 | §1.0 规则 2 + §4.2 launch shim + P1 验收 | P1 | 设计已定 |
 

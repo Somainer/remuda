@@ -112,6 +112,14 @@ owner 的评审意见：三层不能写死。对照先例（Erlang supervision t
 
 **对批次的影响**：批 1（co-project）实现 `scope`/`grants` 两列与预设，唯一性约束改为「每个 Hub 至多一个活跃的 `address-owner` 持有者」+「每个项目默认至多一个活跃 `dispatch` 持有者（策略可放宽）」；批 4 的 task ledger 带 `parentTaskId`；批 5 的 `dispatch` 动词在创建子节点时校验收窄与 DAG。§2.1–§2.4 中所有「T1/T2 不得…」的 403 规则一律读作「不在 scope/grants 内的动作」。
 
+> **2026-10-05 注（D-057，主 agent 第一阶段；机制以 [main-agent.md](./main-agent.md) 为准）**：
+> - **续接边不是委托边。** 同一 agent 的历次进程是一条血缘里的多个章节（`lineageId`、`generation`、`resumedFrom`、`chapterCause`）。新章节的 `parent` 等于前任的 parent，深度不随重启增长；worker 的 `parent` 保持为创建它的那个章节，审计始终显示谁创建了谁。`owns()`、D-051 一跳边、worker 归属与扇出计数都经同一个血缘帮助函数读取，所以后来的章节仍能管理前任创建的 worker，也不能靠重启突破扇出上限。
+> - **Agent 来源的 worker 路由放行。** `/v1/workers/*` 对 Agent 来源开放，仍要求 `dispatch` grant 与 project scope；变更动词还要求 worker 实例在调用者血缘之下（不能动所有者亲手派出的 worker），读按 scope 放行。
+> - **worker 重生帮助函数。** `worker resume` / `replace` 改走 Hub 内部、按 dispatch grant + scope + 血缘归属授权的帮助函数，不再走只限操作员的公开 resume 路由；它保留 carrier 与权限档位，新实例的 parent 仍是创建它的 coordinator 章节（`resumedFrom` 指向旧实例），重生的 worker 不会变成旧 worker 实例的子节点。
+> - **免审 carrier。** 同 host dispatch 显式 `--carrier herdr`（Claude），或 codex/grok harness（generic-pty），且该 host 记录已登记 herdr 时，不需要 D-017 一次性人审。不指定 carrier 的 Claude dispatch 在 Node 报告原生 `shell-pty` 可启动时选 `shell-pty`，它属于 shell 驱动，Agent 来源要一次性人审；跨 host dispatch 第一阶段同样保留一次性人审。
+> - **`restart` 属性。** `restart: {onProcessLoss, maxPerHour}` 只能由 Human 创建者设置（第一阶段），复制到每个章节。进程丢失或启动失败时，Hub 监督者续接一个新章节；达到上限或出现任何 close 时，血缘进入暂停，恢复只对已暂停的血缘有效。
+> - **子不超父。** Agent 创建的子节点只有在其 Agent 创建者自身关闭 harness 权限控制时，才可以关闭控制；省略档位时继承创建者的档位。这把「委托不扩大权限」落实到权限档位上，与上面的不变量 ①、⑥ 同向。
+
 ---
 
 ### 2.6 修订：Task / Project 台账向人向表面浮现（2026-09-20，D-050）

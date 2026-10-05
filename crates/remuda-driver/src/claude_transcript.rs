@@ -57,6 +57,97 @@ pub fn project_dir(claude_home: &Path, cwd: &Path) -> PathBuf {
         .join(encode_project_dir(&resolved))
 }
 
+/// Maximum native session id length accepted when an id is used as a file
+/// name component. UUIDs are 36 chars; this leaves headroom for another native
+/// shape without letting a token double as a path.
+const MAX_SESSION_ID_LEN: usize = 64;
+
+/// Validate the native Claude session id used by `--resume <id>` and by every
+/// file name the resume staging derives from it (c-resumehome, review item 1).
+///
+/// Real ids are UUIDs. The accepted class is deliberately a little wider — one
+/// non-empty path component of ASCII alphanumerics, `-` or `_`, at most
+/// [`MAX_SESSION_ID_LEN`] chars — so a future native id shape does not hard
+/// fail, while anything that could traverse (`/`, `\`, `..`), hide as a dot
+/// name, or smuggle a second component is rejected before acceptance.
+#[must_use]
+pub fn is_safe_session_id(session_id: &str) -> bool {
+    let id = session_id.trim();
+    !id.is_empty()
+        && id.len() <= MAX_SESSION_ID_LEN
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        && {
+            let mut components = Path::new(id).components();
+            matches!(
+                (components.next(), components.next()),
+                (Some(std::path::Component::Normal(_)), None)
+            )
+        }
+}
+
+/// Normalize a path lexically (`.` removed, `..` pops), never touching the
+/// filesystem, so symlinks cannot influence a containment verdict.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Verify `child` stays inside `base` using lexical components only — no
+/// `canonicalize`, so an untrusted symlink at either path is never followed
+/// (c-resumehome, review item 1). Both paths must be absolute; a verdict on
+/// relative paths would depend on the caller's cwd.
+fn ensure_within(base: &Path, child: &Path) -> std::io::Result<()> {
+    if !base.is_absolute() || !child.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "resume staging containment needs absolute paths (base {}, child {})",
+                base.display(),
+                child.display()
+            ),
+        ));
+    }
+    let base = normalize_lexical(base);
+    let child = normalize_lexical(child);
+    if child.starts_with(&base) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "resume staging path {} escapes its root {}",
+                child.display(),
+                base.display()
+            ),
+        ))
+    }
+}
+
+/// True when `path` itself is a symlink (its target is not followed).
+fn is_symlink(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// Construct an [`std::io::Error`] with kind [`std::io::ErrorKind::InvalidInput`].
+fn invalid_input(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
 /// How a promoted terminal came to be bound to a transcript.
 ///
 /// Reported to the UI so the header chip can state the channel honestly.
@@ -133,12 +224,15 @@ pub fn bind_by_session_id(
     cwd: &Path,
     session_id: &str,
 ) -> Option<TranscriptBinding> {
-    if session_id.trim().is_empty() {
+    let session_id = session_id.trim();
+    // The id becomes a file name: reject anything but one safe component
+    // instead of letting a traversal-shaped id escape the slug dir.
+    if !is_safe_session_id(session_id) {
         return None;
     }
-    let path = project_dir(claude_home, cwd).join(format!("{}.jsonl", session_id.trim()));
+    let path = project_dir(claude_home, cwd).join(format!("{session_id}.jsonl"));
     path.is_file().then(|| TranscriptBinding {
-        session_id: session_id.trim().to_owned(),
+        session_id: session_id.to_owned(),
         path,
         cwd: cwd.to_path_buf(),
         source: BindingSource::Argv,
@@ -163,10 +257,16 @@ pub fn bind_by_pid_file(
     let body =
         std::fs::read_to_string(claude_home.join("sessions").join(format!("{pid}.json"))).ok()?;
     let record: PidSession = serde_json::from_str(&body).ok()?;
-    if record.session_id.trim().is_empty() {
+    if !is_safe_session_id(&record.session_id) {
+        tracing::warn!(
+            pid,
+            session_id = %record.session_id,
+            "pid session id is not a single safe file-name component; refusing transcript"
+        );
         return None;
     }
-    let path = project_dir(claude_home, &record.cwd).join(format!("{}.jsonl", record.session_id));
+    let record_session = record.session_id.trim().to_owned();
+    let path = project_dir(claude_home, &record.cwd).join(format!("{record_session}.jsonl"));
     if !path.is_file() {
         return None;
     }
@@ -175,7 +275,7 @@ pub fn bind_by_pid_file(
     if !same_dir(&record.cwd, terminal_cwd) {
         tracing::warn!(
             pid,
-            session_id = %record.session_id,
+            session_id = %record_session,
             claimed = %record.cwd.display(),
             terminal = %terminal_cwd.display(),
             "pid session cwd does not match the promoted terminal; refusing transcript"
@@ -183,7 +283,7 @@ pub fn bind_by_pid_file(
         return None;
     }
     Some(TranscriptBinding {
-        session_id: record.session_id,
+        session_id: record_session,
         path,
         cwd: record.cwd,
         source: BindingSource::PidFile,
@@ -357,7 +457,7 @@ pub fn list_candidates(claude_home: &Path, cwd: &Path) -> Vec<TranscriptCandidat
 #[must_use]
 pub fn bind_manual(claude_home: &Path, cwd: &Path, session_id: &str) -> Option<TranscriptBinding> {
     let session_id = session_id.trim();
-    if session_id.is_empty() {
+    if !is_safe_session_id(session_id) {
         return None;
     }
     let path = project_dir(claude_home, cwd).join(format!("{session_id}.jsonl"));
@@ -432,7 +532,17 @@ pub fn stage_for_resume(
     target_cwd: &Path,
     session_id: &str,
 ) -> std::io::Result<StagedResume> {
-    let metadata = source_transcript.metadata().map_err(|err| {
+    let session_id = session_id.trim();
+    if !is_safe_session_id(session_id) {
+        return Err(invalid_input(format!(
+            "resume session id {session_id:?} is not a single safe file-name component \
+             (expected a UUID-style token)"
+        )));
+    }
+    // `symlink_metadata`, not `metadata`: a staged transcript must be a real
+    // regular file, never a link the resume could follow somewhere else. The
+    // original error kind is preserved (a missing file stays `NotFound`).
+    let metadata = source_transcript.symlink_metadata().map_err(|err| {
         std::io::Error::new(
             err.kind(),
             format!(
@@ -442,32 +552,30 @@ pub fn stage_for_resume(
         )
     })?;
     if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "resume transcript is not a regular file: {}",
-                source_transcript.display()
-            ),
-        ));
-    }
-    if session_id.trim().is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "resume session id is empty",
-        ));
+        return Err(invalid_input(format!(
+            "resume transcript is not a regular file: {}",
+            source_transcript.display()
+        )));
     }
     let source_name = source_transcript.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "resume transcript path has no file name: {}",
-                source_transcript.display()
-            ),
-        )
+        invalid_input(format!(
+            "resume transcript path has no file name: {}",
+            source_transcript.display()
+        ))
     })?;
     let dest_dir = project_dir(target_home, target_cwd);
+    // Lexical containment only: the managed home (and any partial retry state
+    // inside it) must not be able to redirect staging through a symlink.
+    ensure_within(target_home, &dest_dir)?;
+    let dest_transcript = dest_dir.join(format!("{session_id}.jsonl"));
+    ensure_within(&dest_dir, &dest_transcript)?;
     std::fs::create_dir_all(&dest_dir)?;
-    let dest_transcript = dest_dir.join(format!("{}.jsonl", session_id.trim()));
+    if is_symlink(&dest_dir)? {
+        return Err(invalid_input(format!(
+            "resume staging directory {} is a symlink, not a real directory",
+            dest_dir.display()
+        )));
+    }
 
     // Inherited-home resume (or a replayed build): the conversation already
     // lives where the new process will look. Nothing to stage.
@@ -496,12 +604,15 @@ pub fn stage_for_resume(
     let mut sidecars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
         vec![("memory".into(), "memory".into())];
     if let Some(stem) = session_stem {
-        sidecars.insert(0, (stem, session_id.trim().into()));
+        sidecars.insert(0, (stem, session_id.into()));
     }
     for (source_name, dest_name) in sidecars {
         let source_side = source_dir.join(&source_name);
         if source_side.is_dir() {
             let dest_side = dest_dir.join(&dest_name);
+            // Every staged path must stay inside the project dir (the dest
+            // names are validated tokens; this is the belt-and-braces check).
+            ensure_within(&dest_dir, &dest_side)?;
             copy_dir_merge(&source_side, &dest_side)?;
             sidecar_dirs.push(dest_side);
         }
@@ -1127,5 +1238,93 @@ mod tests {
             error.to_string().contains(&missing.display().to_string()),
             "the message names the path it looked for: {error}"
         );
+    }
+
+    #[test]
+    fn safe_session_id_accepts_uuid_shaped_tokens_and_rejects_traversal() {
+        assert!(is_safe_session_id("01993ab0-0000-7000-8000-0000000000aa"));
+        assert!(is_safe_session_id("  abc-123_DEF  "));
+        for dangerous in [
+            "",
+            "  ",
+            ".",
+            "..",
+            "../evil",
+            "foo/bar",
+            "foo/../../etc/passwd",
+            r"foo\bar",
+            "a/b",
+            "x.jsonl",
+            "with space",
+            &"x".repeat(65),
+        ] {
+            assert!(
+                !is_safe_session_id(dangerous),
+                "{dangerous:?} must not be a safe session id"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_staging_rejects_a_traversal_shaped_session_id() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000aa";
+        let source = transcript_layout(&home, &cwd, session);
+        write_file(&source, "{}\n");
+
+        for dangerous in ["../../../../tmp/evil", "..%2fevil", "a/b", "..", "x.txt"] {
+            let error = stage_for_resume(&source, &home, &cwd, dangerous)
+                .expect_err("traversal ids must be rejected before any path is built");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                error.to_string().contains("file-name component"),
+                "unexpected message: {error}"
+            );
+        }
+        // Nothing was created outside the source layout.
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            "{}\n",
+            "a rejected staging touches nothing"
+        );
+    }
+
+    #[test]
+    fn exact_session_binds_reject_traversal_tokens() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        assert!(bind_by_session_id(&home, &cwd, "../escape").is_none());
+        assert!(bind_manual(&home, &cwd, "../escape").is_none());
+        assert!(bind_by_session_id(&home, &cwd, "a/b").is_none());
+        assert!(bind_manual(&home, &cwd, ".").is_none());
+    }
+
+    #[test]
+    fn resume_staging_refuses_a_symlink_source_transcript() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let tmp = tempfile::tempdir().expect("tmp");
+            let old_home = tmp.path().join("old");
+            let new_home = tmp.path().join("new");
+            let cwd = tmp.path().join("ws");
+            std::fs::create_dir_all(&cwd).expect("cwd");
+            let session = "01993ab0-0000-7000-8000-0000000000ab";
+            let real = tmp.path().join("real-conversation.jsonl");
+            write_file(&real, "{}\n");
+            let link = transcript_layout(&old_home, &cwd, session);
+            std::fs::create_dir_all(link.parent().unwrap()).expect("mkdir");
+            symlink(&real, &link).expect("symlink");
+
+            let error = stage_for_resume(&link, &new_home, &cwd, session)
+                .expect_err("a symlinked transcript must not be staged verbatim");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("not a regular file"), "{error}");
+        }
     }
 }

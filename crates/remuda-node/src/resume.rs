@@ -76,8 +76,18 @@ pub(crate) fn resolve_resume_transcript(
     else {
         return Ok(ResumeTranscriptLookup::default());
     };
+    // Review item 1: validate BEFORE acceptance. The token is interpolated into
+    // file names on both sides of the staging boundary, so a traversal-shaped
+    // id is an invalid request, never a lookup.
+    if !remuda_driver::claude_transcript::is_safe_session_id(session_id) {
+        return Err(crate::NodeError::InvalidRequest(format!(
+            "cannot resume session {session_id:?}: not a valid Claude session id \
+             (expected a UUID-style single file-name component)"
+        )));
+    }
     let mut lookup = ResumeTranscriptLookup::default();
     let mut cursor = request.resumed_from.clone();
+    let mut immediate_predecessor = true;
     for _ in 0..MAX_RESUME_HOPS {
         let Some(parent_id) = cursor.take() else {
             break;
@@ -85,6 +95,21 @@ pub(crate) fn resolve_resume_transcript(
         let Ok(parent) = store.get_instance(&parent_id) else {
             break;
         };
+        // Review item 1: the id must be the *predecessor's* recorded native
+        // session, not any conversation that happens to sit on this host. An
+        // unknown recording is inconclusive (structured drivers report late);
+        // a known-but-different id is a refusal.
+        if immediate_predecessor
+            && let Knowledge::Known { value } = &parent.native_ref.session_id
+            && value.trim() != session_id
+        {
+            return Err(crate::NodeError::InvalidRequest(format!(
+                "cannot resume session {session_id}: predecessor {} records native session {}",
+                parent_id.as_id(),
+                value.trim()
+            )));
+        }
+        immediate_predecessor = false;
         if let Knowledge::Known { value } = &parent.native_ref.transcript {
             let path = PathBuf::from(value.source_path.trim());
             if path.is_file() {

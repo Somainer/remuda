@@ -528,3 +528,105 @@ async fn resume_uses_the_recorded_transcript_path_even_outside_the_native_home()
         "the external recorded transcript was staged into the child home"
     );
 }
+
+/// Review item 1: a `resumeSessionId` that is not one safe file-name component
+/// is refused before acceptance — it is interpolated into transcript paths in
+/// both the resolver and the staging factory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_with_a_traversal_session_id_is_refused_before_acceptance() {
+    let harness = ChainHarness::new();
+    let parent_home = harness.fresh_home();
+    let parent = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "first turn",
+            None,
+            &harness.binary,
+            &parent_home,
+        ))
+        .await
+        .expect("parent create");
+    wait_settled(&harness.node, &parent.command.command_id).await;
+    let parent_id = parent.instance.meta.id.clone();
+    let real_session = recorded_session(&harness.node, &parent_id).await;
+    let before = harness.node.list_instances().expect("list").items.len();
+
+    for evil in ["../../../../tmp/evil-session", "a/b", "..", "x.jsonl"] {
+        let child_home = harness.fresh_home();
+        let error = harness
+            .node
+            .create_instance(request(
+                DriverKind::ClaudePrint,
+                "continue",
+                Some((&parent_id, evil)),
+                &harness.binary,
+                &child_home,
+            ))
+            .await
+            .expect_err("a traversal-shaped resume id must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("not a valid Claude session id"),
+            "clear validation refusal for {evil:?}: {message}"
+        );
+    }
+    assert_eq!(
+        harness.node.list_instances().expect("list").items.len(),
+        before,
+        "refused ids create no instance rows; real predecessor session was {real_session}"
+    );
+}
+
+/// Review item 1: the requested resume session must be the predecessor's
+/// recorded native session. A different valid UUID names a different
+/// conversation and must not be resumed off this predecessor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_session_id_must_match_the_predecessor_recorded_session() {
+    let harness = ChainHarness::new();
+    let parent_home = harness.fresh_home();
+    let parent = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "first turn",
+            None,
+            &harness.binary,
+            &parent_home,
+        ))
+        .await
+        .expect("parent create");
+    wait_settled(&harness.node, &parent.command.command_id).await;
+    let parent_id = parent.instance.meta.id.clone();
+    let real_session = recorded_session(&harness.node, &parent_id).await;
+    let stranger = "01993ab0-0000-7000-8000-0000000000ff";
+    assert_ne!(stranger, real_session);
+
+    let child_home = harness.fresh_home();
+    let error = harness
+        .node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "continue",
+            Some((&parent_id, stranger)),
+            &harness.binary,
+            &child_home,
+        ))
+        .await
+        .expect_err("a foreign session id on this predecessor must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot resume session")
+            && message.contains(stranger)
+            && message.contains(&real_session),
+        "the refusal names both the requested and the recorded session: {message}"
+    );
+    assert!(
+        !child_home.exists()
+            || std::fs::read_dir(&child_home)
+                .expect("read home")
+                .next()
+                .is_none(),
+        "nothing is staged for a refused resume"
+    );
+}

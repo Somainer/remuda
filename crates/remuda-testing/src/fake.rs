@@ -376,6 +376,15 @@ impl Session {
 /// that asserted on it.
 fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>, FakeClaudeError> {
     if let Some(resume_id) = &flags.resume {
+        // The id is interpolated into a file name, exactly like the real CLI's
+        // lookup: reject a traversal-shaped token instead of escaping the
+        // config home.
+        if !remuda_driver::claude_transcript::is_safe_session_id(resume_id) {
+            return Err(FakeClaudeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --resume session id: {resume_id:?}"),
+            )));
+        }
         let Some(home) = config_home() else {
             return Err(FakeClaudeError::Io(io::Error::new(
                 io::ErrorKind::NotFound,

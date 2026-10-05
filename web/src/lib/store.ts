@@ -499,7 +499,8 @@ function mergeInstanceSnapshots(
  * Only a strictly newer response releases the pin (the caller marks it), and
  * the row is then dropped/confirmed normally.
  */
-function mergeInteractionSnapshots(
+/** c-cardsettle r2 item 4: exported for the settlement-race unit test. */
+export function mergeInteractionSnapshots(
   incoming: Interaction[],
   current: Interaction[],
   settled: ReadonlyMap<Id, { seq: number; confirmedByNewer: boolean }>,
@@ -1840,7 +1841,11 @@ class HubStore {
       // mounted inbox/badge drop the card immediately via one trailing-coalesced
       // interaction refresh; missed notices converge on the next 2 s poll.
       this.stopSettlementFollow?.();
-      this.stopSettlementFollow = api.settlementSubscribe(() => {
+      this.stopSettlementFollow = api.settlementSubscribe((interactionId) => {
+        // Install the terminal pin against the CURRENT list seq BEFORE
+        // refreshing, so an older in-flight poll resolving last cannot
+        // resurrect the settled card (r2 item 4).
+        this.pinHubSettlement(interactionId);
         if (this.settlementRefreshTimer) clearTimeout(this.settlementRefreshTimer);
         this.settlementRefreshTimer = setTimeout(() => {
           this.settlementRefreshTimer = null;
@@ -3533,6 +3538,36 @@ class HubStore {
           : row,
       ),
     });
+  }
+
+  /**
+   * c-cardsettle r2 item 4: pin a Hub settlement (instance ended → card
+   * invalidated) against the list seq captured at frame receipt, BEFORE the
+   * settlement refresh starts. An older in-flight interaction poll that
+   * resolves afterwards carries an older reqSeq and a stale pending copy; the
+   * pin makes mergeInteractionSnapshots suppress it and keeps the tombstone
+   * until a newer page confirms. The local row is flipped immediately so the
+   * card drops even before the refresh resolves.
+   */
+  private pinHubSettlement(interactionId: Id) {
+    this.settledInteractions.set(interactionId, {
+      seq: this.listReqSeq,
+      confirmedByNewer: false,
+    });
+    if (this.state.interactions.some((row) => row.id === interactionId)) {
+      this.emit({
+        interactions: this.state.interactions.map((row) =>
+          row.id === interactionId
+            ? {
+                ...row,
+                state: "invalidated" as const,
+                answerable: false,
+                blocking: false,
+              }
+            : row,
+        ),
+      });
+    }
   }
 
   titleOf(instanceId: Id) {

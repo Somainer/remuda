@@ -665,11 +665,11 @@ export type HubApi = {
   hostWorkspaceSubscribe(onSnapshot: (snapshot: WorkspaceSnapshot) => void, refresh: () => void): () => void;
   /**
    * Global Hub settlement notices (c-cardsettle): an instance ended and the
-   * Hub invalidated its pending card(s) in the same transaction. The callback
-   * fires once per notice; callers trailing-coalesce their own refresh.
-   * Returns a stop function.
+   * Hub invalidated its pending card(s) in the same transaction. Fires with
+   * the settled interaction id so the store can pin it before refreshing;
+   * callers trailing-coalesce their own refresh. Returns a stop function.
    */
-  settlementSubscribe(onSettlement: () => void): () => void;
+  settlementSubscribe(onSettlement: (interactionId: Id) => void): () => void;
   providerList(q?: { hostId?: string }): Promise<{ items: HubProviderRow[]; nextCursor?: string | null }>;
   providerGet(id: string): Promise<HubProviderRow>;
   providerCreate(body: ProviderCreate): Promise<HubProviderRow>;

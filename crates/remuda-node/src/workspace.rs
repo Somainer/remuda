@@ -18,6 +18,13 @@ struct RegistryState {
     revision: u64,
     workspaces: Vec<Workspace>,
     commands: BTreeMap<String, Mutation>,
+    /// Workspaces with a prepared-but-uncommitted unregister. New sessions
+    /// are refused here between prepare and commit, closing the
+    /// check-then-unbind race (c-dirpicker round 2 item 6). The flag is set
+    /// atomically with the occupancy check under the registry write lock and
+    /// disappears with the membership row at commit.
+    #[serde(default)]
+    unbinding: std::collections::HashSet<WorkspaceId>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -97,40 +104,6 @@ impl WorkspaceRegistry {
         &self.roots
     }
 
-    /// Whether a prepare for this commandId was already persisted (an
-    /// idempotent Hub retry must not re-run admission checks).
-    pub(crate) fn has_prepared_command(&self, command_id: &str) -> bool {
-        self.state.commands.contains_key(command_id)
-    }
-
-    /// Resolve an unregister path (exact stored root, else a canonical alias
-    /// under the bounded probe) to its registered workspace id. Returns
-    /// `Ok(None)` when the path names no registered workspace.
-    pub(crate) fn workspace_id_for_path(
-        &self,
-        path: &str,
-    ) -> Result<Option<WorkspaceId>, NodeError> {
-        let candidate = Path::new(path);
-        if let Some(workspace) = self
-            .state
-            .workspaces
-            .iter()
-            .find(|workspace| Path::new(&workspace.root_path) == candidate)
-        {
-            return Ok(Some(workspace.meta.id.clone()));
-        }
-        if !candidate.is_absolute() {
-            return Ok(None);
-        }
-        let canonical = canonical_directory(candidate)?;
-        Ok(self
-            .state
-            .workspaces
-            .iter()
-            .find(|workspace| Path::new(&workspace.root_path) == canonical)
-            .map(|workspace| workspace.meta.id.clone()))
-    }
-
     pub(crate) fn snapshot(&self) -> Value {
         json!({"workspaceRevision": self.state.revision, "workspaces": self.state.workspaces.iter().map(|workspace| {
             json!({"workspaceId": workspace.meta.id, "hostId": workspace.host_id, "root": workspace.root_path})
@@ -179,6 +152,12 @@ impl WorkspaceRegistry {
         if canonical != root {
             return Err(NodeError::InvalidRequest(format!(
                 "registered workspace {} changed its canonical location; unregister and register it again",
+                root.display()
+            )));
+        }
+        if self.state.unbinding.contains(&workspace.meta.id) {
+            return Err(NodeError::Conflict(format!(
+                "workspace {} is being unregistered; wait for it to settle before starting a session",
                 root.display()
             )));
         }
@@ -235,10 +214,15 @@ impl WorkspaceRegistry {
         result
     }
 
+    /// Apply one prepared/committed mutation. `live_sessions` reports the
+    /// current live-session count for a workspace and is invoked for a fresh
+    /// unregister prepare while the write lock is held, so the occupancy
+    /// check and the unbinding mark are one atomic step.
     fn mutate(
         &mut self,
         method: &str,
         params: WorkspaceMutationParams,
+        mut live_sessions: impl FnMut(&WorkspaceId) -> Result<usize, NodeError>,
     ) -> Result<Value, NodeError> {
         if params.command_id.trim().is_empty() || params.command_id.len() > 256 {
             return Err(NodeError::InvalidRequest(
@@ -298,6 +282,21 @@ impl WorkspaceRegistry {
                         .map(|workspace| workspace.meta.id.clone());
                     let was_registered = existing.is_some();
                     let workspace_id = existing.unwrap_or_default();
+                    if method == "workspace.unregister" {
+                        // Atomic with the write lock: a session entering in
+                        // another thread must take this same lock to resolve
+                        // its cwd, so it cannot slip in between the check and
+                        // the unbinding mark.
+                        let live = live_sessions(&workspace_id)?;
+                        if live > 0 {
+                            return Err(NodeError::Conflict(format!(
+                                "workspace {} is still used by {live} live session(s); \
+                                 end them before removing the directory (session history is kept)",
+                                params.path
+                            )));
+                        }
+                        next.unbinding.insert(workspace_id.clone());
+                    }
                     next.commands.insert(
                         params.command_id.clone(),
                         Mutation {
@@ -331,6 +330,9 @@ impl WorkspaceRegistry {
                             .find(|workspace| Path::new(&workspace.root_path) == canonical)
                         {
                             command.workspace_id = existing.meta.id.clone();
+                            // A committed (re)registration settles any pending
+                            // unbind mark against the surviving identity.
+                            next.unbinding.remove(&command.workspace_id);
                         } else {
                             // A prepared idempotent register must not resurrect a removed
                             // membership identity that an older unregister may still target.
@@ -359,6 +361,9 @@ impl WorkspaceRegistry {
                         if previous_len != next.workspaces.len() {
                             next.revision += 1;
                         }
+                        // The identity is gone with the membership; drop its
+                        // unbinding mark too.
+                        next.unbinding.remove(&command.workspace_id);
                     }
                     command.settled = true;
                     next.commands.insert(params.command_id.clone(), command);
@@ -514,65 +519,30 @@ impl DevNode {
         if method == "workspace.list" {
             return self.workspace_snapshot();
         }
-        // c-dirpicker: an unregister prepare is refused while this Node still
-        // has a live session in the workspace. Ended sessions keep their
-        // history rows and never block removal; the Hub enforces the same
-        // rule for its task ledger before the command is ever queued.
-        if method == "workspace.unregister" {
-            self.guard_live_workspace_unregister(&params)?;
-        }
+        // The unregister occupancy check runs inside the registry's mutate
+        // under its write lock (the callback below), so it and the unbinding
+        // mark that blocks new creates are one atomic step. The closure only
+        // takes a shared reborrow of self for the instance store, a different
+        // lock than the registry write guard being held.
         self.inner
             .workspace_registry
             .write()
             .map_err(|_| NodeError::StorePoisoned)?
-            .mutate(method, serde_json::from_value(params)?)
-    }
-
-    /// Refuse a fresh `workspace.unregister` prepare for a workspace with a
-    /// live session. Idempotent retries of an already-prepared command skip
-    /// the check: the Hub re-sends prepare verbatim after a transport loss.
-    fn guard_live_workspace_unregister(&self, params: &Value) -> Result<(), NodeError> {
-        let request: WorkspaceMutationParams = serde_json::from_value(params.clone())?;
-        if request.phase != WorkspaceMutationPhase::Prepare {
-            return Ok(());
-        }
-        let registry = self
-            .inner
-            .workspace_registry
-            .read()
-            .map_err(|_| NodeError::StorePoisoned)?;
-        if registry.has_prepared_command(&request.command_id) {
-            return Ok(());
-        }
-        // Resolve the path exactly the way the unregister prepare does: an
-        // exact stored canonical path wins, otherwise canonicalize the
-        // operator's alias (bounded probe). Without this, a `/a/../b`-shaped
-        // alias for a busy workspace would skip the guard and reach mutate.
-        let Some(workspace_id) = registry.workspace_id_for_path(&request.path)? else {
-            // An unknown/unresolvable path is the registry's prepare error.
-            return Ok(());
-        };
-        let live = self
-            .list_instances()?
-            .items
-            .iter()
-            .filter(|instance| {
-                // Only process-end evidence frees the directory: `exited` is
-                // set when the driver process actually ends. A `failed`
-                // session is retriable in place and its process may still be
-                // alive, so it keeps blocking (owner rule).
-                instance.workspace_id == workspace_id
-                    && instance.lifecycle != remuda_protocol::InstanceLifecycle::Exited
+            .mutate(method, serde_json::from_value(params)?, |workspace_id| {
+                Ok(self
+                    .list_instances()?
+                    .items
+                    .iter()
+                    // Only process-end evidence frees the directory: `exited`
+                    // is set when the driver process actually ends. A
+                    // `failed` session is retriable in place and its process
+                    // may still be alive, so it keeps blocking (owner rule).
+                    .filter(|instance| {
+                        instance.workspace_id == *workspace_id
+                            && instance.lifecycle != remuda_protocol::InstanceLifecycle::Exited
+                    })
+                    .count())
             })
-            .count();
-        if live > 0 {
-            return Err(NodeError::Conflict(format!(
-                "workspace {} is still used by {live} live session(s); \
-                 end them before removing the directory (session history is kept)",
-                request.path
-            )));
-        }
-        Ok(())
     }
 
     pub(crate) fn resolve_workspace_cwd(
@@ -697,6 +667,7 @@ mod tests {
                 path: path.display().to_string(),
                 phase,
             },
+            |_workspace_id| Ok(0),
         )
     }
 
@@ -1346,13 +1317,27 @@ mod tests {
         .unwrap();
 
         // Once the live session is purged (purge closes the driver first),
-        // the same command prepares and commits.
+        // the same command prepares.
         node.purge_instance(&instance_id).await.unwrap();
         node.workspace_rpc(
             "workspace.unregister",
             json!({"commandId": "remove-busy", "path": workspace.root_path, "phase": "prepare"}),
         )
         .unwrap();
+
+        // Between prepare and commit the directory is unbinding: a new
+        // session cannot enter in the check→unbind window.
+        let blocked: crate::CreateInstanceRequest = serde_json::from_value(json!({
+            "workspaceId": workspace.meta.id,
+            "kind": "terminal",
+            "driver": "shell-pty",
+            "args": ["sleep", "1"],
+            "prompt": "",
+        }))
+        .unwrap();
+        let error = node.create_instance(blocked).await.unwrap_err().to_string();
+        assert!(error.contains("being unregistered"), "{error}");
+
         node.workspace_rpc(
             "workspace.unregister",
             json!({"commandId": "remove-busy", "path": workspace.root_path, "phase": "commit"}),

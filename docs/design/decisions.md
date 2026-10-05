@@ -1606,7 +1606,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 3. **前端**：「+ 添加目录」打开目录浏览器 Modal（面包屑 + 过滤框 + 「显示隐藏目录」开关 + 「使用此文件夹」），选定后走**既有**的 `workspace.register` 两阶段注册，不新增注册 wire；手敲绝对路径保留为「高级：手动输入路径」。遵循 [ui-spec.md](./ui-spec.md) / [visual-system.md](./visual-system.md) 的 Modal、role token 与移动端 viewport 约定。
 4. **移除目录（unregister）增加占用门**：
    - Hub 在排队 `workspace.unregister` 命令**之前**统计该 `(hostId, workspaceId)` 的占用：Hub instances 表中 `lifecycle <> 'exited'` 的会话，以及 tasks 表中非归档且 state 不属于 `done/failed`、`doc_json.workspaceBinding` 指向该目录的任务。任一非零即 **409**，理由（N live session(s) / N active task(s)）原样返回给前端，不产生命令行、不碰 Node 文件。「结束」只认进程结束证据 `exited`：`failed` 可原地重试、进程可能仍存活，继续占用目录（与 D-057 OA6 同一口径）。
-   - Node 在 unregister **prepare** 上做同一道 live-session 门（权威数据在 Node 本机，离线积压命令重放时同样生效）；同一 commandId 的幂等 prepare 重放跳过检查。
+   - Node 在 unregister **prepare** 上做同一道 live-session 门（权威数据在 Node 本机，离线积压命令重放时同样生效）；检查与「解绑中」标记在注册表同一把写锁内原子完成，prepare→commit 之间该 workspace 拒绝新会话（`validate_existing`），杜绝检查通过后新会话进入再解绑的竞态；同一 commandId 的幂等 prepare 重放跳过检查。Hub 侧占用统计与两阶段命令也在按 `(host,workspace)` 的异步锁内串行。
    - **只解绑、不删文件**；已结束会话的历史行保留且不再阻挡移除（Hub 行保留可查；Node 侧注册表仅移除成员身份）。前端移除前弹确认框，拒绝理由内联展示。
 
 **非目标**：

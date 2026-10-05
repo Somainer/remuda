@@ -10,6 +10,26 @@ use axum::{Json, Router};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Per-`(host, workspace)` unbind lock. Held across the occupancy check and
+/// the whole prepare→settle unregister so two concurrent removals of one
+/// directory cannot both pass the check before either commits (round 2
+/// item 6). The Node additionally blocks new sessions on a prepared
+/// workspace, closing the check→unbind window end to end.
+fn unbind_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn unbind_lock(host_id: &str, workspace_id: &str) -> Arc<AsyncMutex<()>> {
+    let key = format!("{host_id}\u{1f}{workspace_id}");
+    let mut map = unbind_locks().lock().unwrap();
+    map.entry(key).or_default().clone()
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -294,12 +314,26 @@ async fn mutate(
         return Err(HubError::HostOffline { host_id: id });
     }
     // c-dirpicker: never unbind a directory that a live session or an active
-    // task still uses. The check runs before a command is queued, so the
-    // refusal leaves neither a command row nor a prepared Node mutation.
-    if method == "workspace.unregister"
-        && let Some(workspace_id) = workspace_id_for_path(state, &id, body.path.trim()).await?
-    {
-        let (sessions, tasks) = workspace_users(state, &id, &workspace_id).await?;
+    // task still uses. For a known workspace the occupancy check, command
+    // queue and prepare→settle run under one per-workspace lock, so a
+    // concurrent removal of the same directory cannot pass the check too;
+    // the Node's prepared-workspace create block closes the rest of the
+    // window. Unknown paths skip the lock and fall through to the Node's
+    // prepare rejection.
+    let unbind_key = if method == "workspace.unregister" {
+        workspace_id_for_path(state, &id, body.path.trim()).await?
+    } else {
+        None
+    };
+    let unbind_arc = unbind_key
+        .as_ref()
+        .map(|workspace_id| unbind_lock(&id, workspace_id));
+    let _unbind_guard = match &unbind_arc {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    if let Some(workspace_id) = &unbind_key {
+        let (sessions, tasks) = workspace_users(state, &id, workspace_id).await?;
         if sessions > 0 || tasks > 0 {
             let mut reasons = Vec::new();
             if sessions > 0 {

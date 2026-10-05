@@ -433,11 +433,16 @@ export function NewSessionPage() {
       if (draft.cwdMode === "existing" || draft.cwdMode === "worktree") setCwdMode(draft.cwdMode);
       if (draft.cwdPath !== undefined) setCwdPath(draft.cwdPath);
       if (draft.worktreeName !== undefined) setWorktreeName(draft.worktreeName);
-      // An effort-bearing draft is a pinned choice. Legacy drafts that stored
-      // the sixth stop (index 3 + flag) already load as {xhigh,on}; drafts
-      // without the flag stay on their tier (D-056 input migration).
+      // An effort-bearing draft is a pinned choice. D-056 input migration:
+      // a legacy draft parked on the old sixth stop (Claude index 5, flag
+      // unset) meant {xhigh,on}; clamp to the five-stop table and infer the
+      // flag. Drafts with an explicit flag keep it.
       if (draft.effortKind && draft.effortIndex !== undefined && KINDS.some((item) => item.id === draft.effortKind)) {
-        setEffort(effortAt(draft.effortKind as EffortKind, draft.effortIndex, draft.effortUltracode === true));
+        const k = draft.effortKind as EffortKind;
+        const legacySixth = k === "claude" && draft.effortIndex >= 5 && draft.effortUltracode === undefined;
+        const index = legacySixth ? CLAUDE_XHIGH_INDEX : draft.effortIndex;
+        const ultra = draft.effortUltracode === true || legacySixth;
+        setEffort(effortAt(k, index, ultra));
       } else {
         setEffort(null);
       }

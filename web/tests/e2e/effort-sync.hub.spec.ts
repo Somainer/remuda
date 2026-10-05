@@ -276,31 +276,31 @@ test("plain max clamps to xhigh while max+ultracode stays on max (D-056)", async
   await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ultracode-effective", "on");
 });
 
-test("the orthogonal switch turns ultracode on at max without moving the slider", async ({ page }) => {
+test("the orthogonal switch turns ultracode on at the current tier without moving the slider", async ({ page }) => {
   const instanceId = await createSession(page, "effort decoupled switch");
   await clearApprovals(page, instanceId);
   await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
 
-  // LEVEL to max first (pick the row deterministically, not a key race).
-  await pickTier(page, "max");
-  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("max", { timeout: 15_000 });
+  // LEVEL to xhigh first (a tier the fake echoes unclamped).
+  await pickTier(page, "xhigh");
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", { timeout: 15_000 });
 
-  // Then the SWITCH on: {name:"max",ultracode:true}; the slider stays at max.
+  // Then the SWITCH on: {name:"xhigh",ultracode:true}; the slider stays put.
   const onRequest = page.waitForRequest(
     (r) =>
       r.method() === "POST"
       && r.url().endsWith(`/v1/instances/${instanceId}/commands`)
-      && r.postDataJSON()?.payload?.effort?.name === "max"
+      && r.postDataJSON()?.payload?.effort?.name === "xhigh"
       && r.postDataJSON()?.payload?.effort?.ultracode === true,
   );
   await setSwitch(page, true);
   await onRequest;
-  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("max", { timeout: 15_000 });
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("xhigh", { timeout: 15_000 });
   await expect(page.getByTestId("model-effort-ultracode")).toHaveText(/ultracode/);
   await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ultracode-effective", "on");
   await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
   await openPopover(page);
-  await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-name", "max");
+  await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-name", "xhigh");
   await expect(page.getByTestId("effort-ultracode-switch")).toHaveAttribute("aria-checked", "true");
   await page.keyboard.press("Escape");
 

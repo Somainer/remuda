@@ -115,8 +115,8 @@ function nodeContentIds(node: TranscriptNode): Set<string> {
  * Resolve the armed anchor's row in the POST-prepend node list. The id usually
  * survives; when an older tool page renames the armed compact fold, match by
  * content (the renamed fold still contains the armed fold's original tools),
- * then fall back to the slot before the first surviving follower. Never returns
- * a raw pre-insert index (a prepend shifted every index after it).
+ * then fall back to the slot immediately before the first surviving node that
+ * used to follow it. Never returns a raw pre-insert index.
  */
 function resolvePrependedAnchor(
   prevNodes: readonly TranscriptNode[],
@@ -137,6 +137,8 @@ function resolvePrependedAnchor(
     );
     if (renamed >= 0) return { node: nextNodes[renamed]!, index: renamed };
   }
+  // Position fallback: the slot before the first still-present node that
+  // followed the anchor (its id or, if it joined a fold, its child content).
   for (let k = armedIndex + 1; k < prevNodes.length; k += 1) {
     const followerIds = nodeContentIds(prevNodes[k]!);
     const at = nextNodes.findIndex(
@@ -144,6 +146,7 @@ function resolvePrependedAnchor(
     );
     if (at > 0) return { node: nextNodes[at - 1]!, index: at - 1 };
   }
+  // The anchor was the last surviving row: keep the tail slot.
   const tail = nextNodes.length - (prevNodes.length - armedIndex);
   const index = Math.max(0, Math.min(tail, nextNodes.length - 1));
   const node = nextNodes[index];
@@ -283,9 +286,9 @@ function TranscriptInner({
   const pinRef = useRef(saved ? saved.follow : true);
   // True while a saved-position / load-earlier restore is in flight: freezes
   // the unmeasured-row estimate so the rows above the anchor keep their saved
-  // contribution. Declared with the other per-instance refs so the
-  // route-switch reset below can clear it: a value left true after switching
-  // sessions stops the estimate converging for the next session.
+  // contribution. Declared with the other per-instance refs so the route
+  // switch reset below can clear it (a frozen value left behind on a session
+  // switch stops the estimate converging for the next session).
   const restoringRef = useRef(false);
   const scrollTopRef = useRef(0);
   const saveTimer = useRef<number | null>(null);
@@ -319,7 +322,12 @@ function TranscriptInner({
     tries: number;
     armedIndex: number;
     reqId: number;
-    /** Top-level nodes at click time for content-based fold-rename retarget. */
+    /**
+     * Top-level nodes as they were at click time. The armed anchor can vanish
+     * (an older tool page renames its compact fold); the post-prepend list is
+     * resolved against THIS list by content, never against a raw pre-insert
+     * index.
+     */
     prevNodes: TranscriptNode[];
   } | null>(null);
   /**
@@ -404,7 +412,7 @@ function TranscriptInner({
   const scrollerRef = useRef<HTMLDivElement>(null);
   /**
    * Target of the most recent COMPONENT-INITIATED scrollTop write. The scroll
-   * handler compares its fired event against it: a scroll to the target is the
+   * handler compares the fired event against it: a scroll to the target is the
    * echo of our own restore/pin/anchor math and must never cancel an in-flight
    * load-earlier restore; any other scroll (wheel, touch, keyboard) is the
    * reader. Consumed once by the matching event.
@@ -554,6 +562,9 @@ function TranscriptInner({
     // incidental 1 s/2 s tick, the anchor effects never re-ran and the anchor
     // row stayed unmounted. Armed up front, the prepend commit runs the restore.
     const armedIndex = range.start;
+    // Snapshot the pre-click top-level list: a prepend can rename the armed
+    // compact fold, and the post-prepend anchor is resolved against this list
+    // by content rather than a raw index that shifted with the inserted rows.
     const prevNodes = nodesRef.current.slice();
     if (anchorId) {
       restoringRef.current = true;
@@ -576,12 +587,11 @@ function TranscriptInner({
         setLoadingEarlier(false);
         setLoadTick((n) => n + 1);
         if (req.cancelled || !result || !result.prepended) {
-          // Nothing to anchor to (cancelled by a user scroll, a failed read,
-          // or a duplicate-only/empty page). A page that PREPENDED keeps the
-          // anchors until the mounted anchor settles — INCLUDING the final
-          // history page (result.end): its rows still have to mount and
-          // measure before the held offset is correct; clearing here retired
-          // the restore before the virtual window ever reached the anchor.
+          // Cancelled by a user scroll, a failed read, or a duplicate-only /
+          // empty page (nothing to anchor). A page that PREPENDED keeps the
+          // anchors until the mounted anchor settles — including the final
+          // history page (result.end), whose rows still have to mount and
+          // measure before the held offset is correct.
           if (prependAnchorRef.current?.reqId === reqId) prependAnchorRef.current = null;
           const pending = pendingScroll.current;
           if (pending?.kind === "restore" && pending.reqId === reqId) {
@@ -679,10 +689,11 @@ function TranscriptInner({
     const held = prependAnchorRef.current;
     const el = scrollerRef.current;
     if (!held || !el || !nodesRef.current.length) return;
-    // The armed anchor can VANISH when an older tool page renames the compact
-    // fold it became. Resolve the post-prepend row by CONTENT against the
-    // pre-click list (fold child containment, then the follower slot): a raw
-    // pre-insert index points at a newly inserted row after the prepend.
+    // The armed anchor can VANISH: an older tool page renames the compact fold
+    // it became (`compact:<firstToolCallId>`). Resolve the post-prepend row by
+    // CONTENT against the pre-click node list (fold child containment, then
+    // the following sibling's slot) — a raw pre-insert index points at a newly
+    // inserted row after the prepend shifted indices.
     const exactIndex = nodes.findIndex((n) => n.id === held.anchorId);
     let retargeted = false;
     if (exactIndex < 0) {
@@ -694,6 +705,9 @@ function TranscriptInner({
         if (pending?.kind === "restore" && pending.reqId === held.reqId) pending.anchorId = resolved.node.id;
       }
     }
+    // Applied = a content-resolved fold rename, or the same id sitting beyond
+    // its armed slot (rows inserted before it). The same id still at the armed
+    // slot means the fetch has not prepended yet — stay inert.
     const applied = retargeted || exactIndex > held.armedIndex;
     if (!applied) {
       // Fetch still in flight: stay armed without burning the stable budget.
@@ -789,12 +803,11 @@ function TranscriptInner({
     if (!el || !pending || !nodesRef.current.length) return;
     if (pending.kind === "restore") {
       if (pending.awaitIndex !== undefined) {
-        const armed0 = nodes.findIndex((n) => n.id === pending.anchorId);
-        let armed = armed0;
-        let retargeted = false;
+        let armed = nodes.findIndex((n) => n.id === pending.anchorId);
         // The armed anchor can vanish when an older tool page renames the
         // compact fold it became: resolve the post-prepend row by content.
-        if (armed0 < 0) {
+        let retargeted = false;
+        if (armed < 0) {
           const resolved = resolvePrependedAnchor(pending.prevNodes ?? [], nodes, pending.awaitIndex);
           if (resolved) {
             pending.anchorId = resolved.node.id;
@@ -849,8 +862,15 @@ function TranscriptInner({
       }
       pending.tries += 1;
       if (pending.tries >= 24) {
+        // Give-up path: retire the whole load-earlier request, not just the
+        // pending restore, or the held repin anchor (whose row never mounted)
+        // and the request identity would leak for the session.
         pendingScroll.current = null;
         restoringRef.current = false;
+        if (pending.kind === "restore" && pending.reqId !== undefined) {
+          if (prependAnchorRef.current?.reqId === pending.reqId) prependAnchorRef.current = null;
+          if (loadReqRef.current?.reqId === pending.reqId) loadReqRef.current = null;
+        }
       }
       return;
     }
@@ -1188,13 +1208,13 @@ function TranscriptInner({
           if (!isOwnScroll) {
             const req = loadReqRef.current;
             if (req && !req.done && !req.cancelled) {
-            req.cancelled = true;
-            const pending = pendingScroll.current;
-            if (pending?.kind === "restore" && pending.reqId === req.reqId) {
-              pendingScroll.current = null;
-              restoringRef.current = false;
-            }
-            if (prependAnchorRef.current?.reqId === req.reqId) prependAnchorRef.current = null;
+              req.cancelled = true;
+              const pending = pendingScroll.current;
+              if (pending?.kind === "restore" && pending.reqId === req.reqId) {
+                pendingScroll.current = null;
+                restoringRef.current = false;
+              }
+              if (prependAnchorRef.current?.reqId === req.reqId) prependAnchorRef.current = null;
             }
           }
           sampleReadingAnchor();

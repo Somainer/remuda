@@ -1513,7 +1513,7 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
   }
 
   /** Deterministic flat row geometry off the virtual window's pad spacer. */
-  function installGeometry(totalCount: number) {
+  function installGeometry(totalCount: number, opts: { echoOnWrite?: boolean } = {}) {
     const heights = new WeakMap<Element, number>();
     const observerCbs = new Map<Element, () => void>();
     const isScroller = (el: unknown) => el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
@@ -1576,7 +1576,12 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
         configurable: true,
         get: () => top,
         set: (v: number) => {
+          const changed = v !== top;
           top = v;
+          // Simulate a browser delivering the programmatic scroll's own event
+          // while the fetch promise is still settling (real scroll events are
+          // queued, not microtask-ordered against the click's finally).
+          if (opts.echoOnWrite && changed) fireEvent.scroll(el);
         },
       });
     };
@@ -1788,6 +1793,10 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// UO-6a round 5: programmatic vs user scroll, post-prepend fold retarget,
+// final-page settle, route-change restore reset, reconnect duplicate paging.
+// ---------------------------------------------------------------------------
 describe("load-earlier anchor lifecycle round 5", () => {
   const ROW = 96;
   const VIEW = 720;
@@ -1842,6 +1851,76 @@ describe("load-earlier anchor lifecycle round 5", () => {
         status: "complete",
       },
     } as Observation;
+  }
+
+  function toolAt(seq: number, tcId: string, instanceId: string): Observation[] {
+    const s = source();
+    return [
+      {
+        schemaVersion: 1,
+        eventId: `e_${seq}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seq),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_call",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `nc_${tcId}` as Id,
+          revision: "1",
+          operation: "open",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          parentToolCallId: null,
+          toolName: known("Bash"),
+          displayTitle: known("Bash"),
+          category: "shell",
+          input: known({ command: tcId }),
+          inputTextDelta: null,
+          state: "running",
+          executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+        },
+      } as Observation,
+      {
+        schemaVersion: 1,
+        eventId: `e_${seq + 1}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seq + 1),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_result",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `nr_${tcId}` as Id,
+          revision: "1",
+          operation: "close",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          stage: "final",
+          outcome: "succeeded",
+          blocks: [{ type: "text", text: tcId }],
+          structuredResult: unknownKnowledge("text"),
+          exitCode: known(0),
+          changes: [],
+        },
+      } as Observation,
+    ];
   }
 
   function pageOf(events: Observation[], reachedAfterSeq = false) {
@@ -1920,6 +1999,15 @@ describe("load-earlier anchor lifecycle round 5", () => {
     return <Transcript events={events} earlierFloor={floor} compact={compact} />;
   }
 
+  function gate<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  /** Geometry harness scoped to one Driver render (see round-4 block). */
   function installGeo(totalCount: number, opts: { echoOnWrite?: boolean; onWrite?: (v: number) => void } = {}) {
     const echoOnWrite = opts.echoOnWrite ?? false;
     let dynamicTotal = totalCount;
@@ -2005,81 +2093,6 @@ describe("load-earlier anchor lifecycle round 5", () => {
    * Turn-start fixture: a fold of tc-a/tc-b/tc-c mid-turn, the assistant end,
    * then 15 more message turns so the list is long enough to scroll inside.
    */
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.unstubAllGlobals();
-  });
-
-  function toolAt(seq: number, tcId: string, instanceId: string): Observation[] {
-    const s = source();
-    return [
-      {
-        schemaVersion: 1,
-        eventId: `e_${seq}` as Id,
-        journalId: `obj_${instanceId}` as Id,
-        instanceId: instanceId as Id,
-        runId: null,
-        hostId: "hst" as Id,
-        processGeneration: "1",
-        runGeneration: null,
-        seq: String(seq),
-        observedAt: "2026-09-12T00:00:00.000Z",
-        nativeAt: known("2026-09-12T00:00:00.000Z"),
-        source: s,
-        kind: "tool_call",
-        completeness: "structured",
-        rawRef: null,
-        evidenceEventIds: [],
-        payload: {
-          nodeId: `nc_${tcId}` as Id,
-          revision: "1",
-          operation: "open",
-          baseRevision: null,
-          toolCallId: tcId as Id,
-          parentToolCallId: null,
-          toolName: known("Bash"),
-          displayTitle: known("Bash"),
-          category: "shell",
-          input: known({ command: tcId }),
-          inputTextDelta: null,
-          state: "running",
-          executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
-        },
-      } as Observation,
-      {
-        schemaVersion: 1,
-        eventId: `e_${seq + 1}` as Id,
-        journalId: `obj_${instanceId}` as Id,
-        instanceId: instanceId as Id,
-        runId: null,
-        hostId: "hst" as Id,
-        processGeneration: "1",
-        runGeneration: null,
-        seq: String(seq + 1),
-        observedAt: "2026-09-12T00:00:00.000Z",
-        nativeAt: known("2026-09-12T00:00:00.000Z"),
-        source: s,
-        kind: "tool_result",
-        completeness: "structured",
-        rawRef: null,
-        evidenceEventIds: [],
-        payload: {
-          nodeId: `nr_${tcId}` as Id,
-          revision: "1",
-          operation: "close",
-          baseRevision: null,
-          toolCallId: tcId as Id,
-          stage: "final",
-          outcome: "succeeded",
-          blocks: [{ type: "text", text: tcId }],
-          structuredResult: unknownKnowledge("text"),
-          exitCode: known(0),
-          changes: [],
-        },
-      } as Observation,
-    ];
-  }
-
   function foldSession(): Observation[] {
     const initial: Observation[] = [
       ...toolAt(201, "r5-tc-a", "insX"),
@@ -2099,15 +2112,11 @@ describe("load-earlier anchor lifecycle round 5", () => {
     return [...toolAt(106, "r5-tc-x", "insX"), ...toolAt(108, "r5-tc-y", "insX")];
   }
 
-  function gate<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
-    let resolve!: (value: T) => void;
-    const promise = new Promise<T>((r) => {
-      resolve = r;
-    });
-    return { promise, resolve };
-  }
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
 
-  /** Geometry harness scoped to one Driver render (see round-4 block). */
   it("a restore whose own scroll event lands mid-flight completes instead of cancelling (item 1)", async () => {
     const user = userEvent.setup();
     const geo = installGeo(43, { echoOnWrite: true });
@@ -2352,4 +2361,86 @@ describe("load-earlier anchor lifecycle round 5", () => {
     expect(geo.top()).toBeGreaterThan(4500);
   });
 
+  it("duplicate pages after a reconnect keep paging through until new rows prepend (item 5)", async () => {
+    const user = userEvent.setup();
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+
+    // Real bounded server: newest `window` rows of (afterSeq, beforeSeq].
+    const window = 500;
+    const read: JournalRead = vi.fn(async (args) => {
+      const total = 3000;
+      const after = Number(args.afterSeq ?? 0);
+      const before = args.beforeSeq === undefined ? total : Math.min(Number(args.beforeSeq), total);
+      const picked: number[] = [];
+      for (let seq = before; seq > after && picked.length < window; seq -= 1) picked.push(seq);
+      picked.reverse();
+      const events = picked.map((seq) => m(seq, seq % 2 ? "user" : "assistant", "insR"));
+      return pageOf(
+        events,
+        picked.length === 0 || picked[0] === after + 1,
+      );
+    });
+
+    // Seed tail 1501..2500 (500-row seed + 1000 live rows applied later).
+    const seed: Observation[] = [];
+    for (let seq = 1501; seq <= 2000; seq += 1) seed.push(m(seq, seq % 2 ? "user" : "assistant", "insR"));
+    const client = makeClient(reg, "insR", seed, read, "1501", "2000");
+    // Live frames extend the applied cursor to 2500; mirror them into the
+    // registry state the Transcript renders (the store does this onEvents).
+    const live = Array.from({ length: 500 }, (_, i) => m(2001 + i, (2001 + i) % 2 ? "user" : "assistant", "insR"));
+    client.applyBatch({
+      subscriptionId: "sub",
+      journalId: "obj_insR" as Id,
+      fromSeq: "2001",
+      toSeq: "2500",
+      events: live,
+      durableSeq: "2500",
+    });
+    reg.events.insR = seed.concat(live).sort((a, b) => Number(a.seq) - Number(b.seq));
+    // Reconnect re-anchors the window floor above the loaded range.
+    client.applySnapshot({
+      projectionVersion: "v1",
+      projectionEpoch: "ep2" as Id,
+      asOfSeq: "3000",
+      instance: {} as Snapshot["instance"],
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "2501", complete: false },
+    });
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/s/insR"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const button = () => screen.queryByTestId("load-earlier");
+    expect(button()).not.toBeNull();
+
+    // Click 1: 2001..2500 all already held — duplicate, no prepend, still open.
+    await user.click(button()!);
+    expect(reg.events.insR).toHaveLength(1000);
+    expect(button()).not.toBeNull();
+
+    // Click 2: 1501..2000 is the seed — also a duplicate, still open.
+    await user.click(button()!);
+    expect(reg.events.insR).toHaveLength(1000);
+    expect(button()).not.toBeNull();
+
+    // Click 3: 1001..1500 is unseen — rows prepend through to the Transcript.
+    await user.click(button()!);
+    await act(async () => {});
+    expect(reg.events.insR).toHaveLength(1500);
+    expect(reg.events.insR[0]?.seq).toBe("1001");
+    expect(button()).not.toBeNull();
+  });
 });

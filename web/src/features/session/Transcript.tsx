@@ -606,8 +606,37 @@ function TranscriptInner({
     // it became (`compact:<firstToolCallId>`). Retarget once to the row now
     // occupying the armed slot; that row is the new anchor (the fold renamed in
     // place), and an index advance alone also counts (plain prepend).
-    const anchorIndex = nodes.findIndex((n) => n.id === held.anchorId);
-    if (anchorIndex < 0 || anchorIndex <= held.armedIndex) return;
+    let anchorIndex = nodes.findIndex((n) => n.id === held.anchorId);
+    let retargeted = false;
+    if (anchorIndex < 0) {
+      const replacement = nodes[held.armedIndex];
+      if (replacement) {
+        held.anchorId = replacement.id;
+        anchorIndex = held.armedIndex;
+        retargeted = true;
+        const pending = pendingScroll.current;
+        if (pending?.kind === "restore" && pending.reqId === held.reqId) pending.anchorId = replacement.id;
+      }
+    }
+    const applied = retargeted || anchorIndex > held.armedIndex;
+    if (!applied) {
+      // Fetch still in flight: stay armed without burning the stable budget.
+      // Once the owning request finished without a visible prepend (duplicate
+      // page, a fold that swallowed the rows without renaming, or a retired
+      // floor), retire — otherwise the anchors stay set for the whole session,
+      // growth anchoring and estimate convergence stay disabled.
+      const req = loadReqRef.current;
+      if (req && req.reqId === held.reqId && req.done) {
+        prependAnchorRef.current = null;
+        const pending = pendingScroll.current;
+        if (pending?.kind === "restore" && pending.reqId === held.reqId) {
+          pendingScroll.current = null;
+          restoringRef.current = false;
+        }
+        loadReqRef.current = null;
+      }
+      return;
+    }
     const rowEl = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.anchorId)}"]`);
     if (!rowEl) {
       // Anchor not mounted yet (the pendingScroll restore runs after this
@@ -687,8 +716,34 @@ function TranscriptInner({
     if (!el || !pending || !nodesRef.current.length) return;
     if (pending.kind === "restore") {
       if (pending.awaitIndex !== undefined) {
-        const armed = nodes.findIndex((n) => n.id === pending.anchorId);
-        if (armed < 0 || armed <= pending.awaitIndex) return;
+        let armed = nodes.findIndex((n) => n.id === pending.anchorId);
+        // The armed anchor can vanish when an older tool page renames the
+        // compact fold it became: retarget to the row now at the armed slot.
+        let retargeted = false;
+        if (armed < 0) {
+          const replacement = nodes[pending.awaitIndex];
+          if (replacement) {
+            pending.anchorId = replacement.id;
+            armed = pending.awaitIndex;
+            retargeted = true;
+            const held = prependAnchorRef.current;
+            if (held && held.reqId === pending.reqId) held.anchorId = replacement.id;
+          }
+        }
+        // Nothing applied yet (no prepend, no rename). Stay armed while the
+        // fetch is in flight; once the owning request finished this way, retire
+        // instead of holding a restore that can never resolve.
+        if (!retargeted && armed < 0) {
+          const req = pending.reqId !== undefined ? loadReqRef.current : null;
+          if (req && req.reqId === pending.reqId && req.done) {
+            pendingScroll.current = null;
+            restoringRef.current = false;
+            if (prependAnchorRef.current?.reqId === pending.reqId) prependAnchorRef.current = null;
+            loadReqRef.current = null;
+          }
+          return;
+        }
+        if (!retargeted && armed <= pending.awaitIndex) return;
       }
       // Estimate a starting position from the saved average, then correct
       // against the anchor's real DOM position once the window mounts it.

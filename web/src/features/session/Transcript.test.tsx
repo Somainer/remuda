@@ -1293,6 +1293,76 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
   const ROW = 96;
   const VIEW = 720;
 
+  function toolPair(seqCall: number, tcId: string, instanceId: string): Observation[] {
+    const s = source();
+    return [
+      {
+        schemaVersion: 1,
+        eventId: `evt_${seqCall}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seqCall),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_call",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `n_${tcId}_c` as Id,
+          revision: "1",
+          operation: "open",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          parentToolCallId: null,
+          toolName: known("Bash"),
+          displayTitle: known("Bash"),
+          category: "shell",
+          input: known({ command: `cmd ${tcId}` }),
+          inputTextDelta: null,
+          state: "running",
+          executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+        },
+      } as Observation,
+      {
+        schemaVersion: 1,
+        eventId: `evt_${seqCall + 1}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seqCall + 1),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_result",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `n_${tcId}_r` as Id,
+          revision: "1",
+          operation: "close",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          stage: "final",
+          outcome: "succeeded",
+          blocks: [{ type: "text", text: `out ${tcId}` }],
+          structuredResult: unknownKnowledge("text"),
+          exitCode: known(0),
+          changes: [],
+        },
+      } as Observation,
+    ];
+  }
+
   function source() {
     return {
       driverKind: "claude-print" as const,
@@ -1535,6 +1605,78 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("retires a load-earlier anchor whose compact fold was renamed by the older page (item 1)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeometry(39);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    // Window starts mid-turn: three tools (one compact fold) then an assistant,
+    // followed by enough turns to scroll into later.
+    const initial: Observation[] = [
+      ...toolPair(201, "tc-a", "ins1"),
+      ...toolPair(203, "tc-b", "ins1"),
+      ...toolPair(205, "tc-c", "ins1"),
+      msg(207, "assistant", "ins1"),
+    ];
+    // Thirty more message nodes: a long list the reader can sit inside
+    // without being pinned to the tail (jsdom does not clamp scrollTop).
+    for (let seq = 208, i = 0; i < 15; i += 1, seq += 2) {
+      initial.push(msg(seq, "user", "ins1"));
+      initial.push(msg(seq + 1, "assistant", "ins1"));
+    }
+    // The older page continues the SAME tool run with earlier tool_call ids:
+    // the fold compact:tc-a is renamed to compact:tc-x (the armed id vanishes).
+    const olderPage = [
+      ...toolPair(101, "tc-x", "ins1"),
+      ...toolPair(103, "tc-y", "ins1"),
+    ];
+    makeClient(
+      reg,
+      "ins1",
+      initial,
+      vi.fn<JournalRead>().mockResolvedValue(pageOf(olderPage)),
+      "201",
+      "225",
+    );
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    renderDriver(reg, "/s/ins1");
+    geo.defineScroll();
+    const scroller = geo.scroller();
+    // Mount pins a follow session to the tail; scroll to the fold at the top.
+    geo.scrollTo(0);
+    expect(scroller.querySelector("[data-anchor='compact:tc-a']")).toBeTruthy();
+    await user.click(screen.getByTestId("load-earlier"));
+    await act(async () => {});
+    // The renamed fold sits where the armed fold was.
+    expect(scroller.querySelector("[data-anchor='compact:tc-x']")).toBeTruthy();
+
+    // Drive four stable passes (mount measure + three commits from rows below
+    // the anchor) so the held restore converges and releases.
+    await act(async () => {});
+    geo.growMountedRow(5, ROW + 1);
+    geo.growMountedRow(6, ROW + 2);
+    geo.growMountedRow(7, ROW + 3);
+    geo.growMountedRow(5, ROW);
+    geo.growMountedRow(6, ROW);
+    geo.growMountedRow(7, ROW);
+
+    // After release, ordinary growth anchoring works again: scroll into the
+    // list, sample a reading anchor, then grow a mounted row ABOVE it.
+    // Sit at a genuine reading position: 40+ nodes, viewport 720, not pinned.
+    geo.scrollTo(25 * ROW);
+    await act(async () => {});
+    const before = geo.scrollTopNow();
+    // Grow a mounted row ABOVE the sampled reading anchor. Once the prepend
+    // restore has RELEASED, holdReadingAnchor compensates (a leaked restore
+    // disables that hold for the whole session and leaves the growth ignored).
+    geo.growMountedRow(4, ROW + 40);
+    expect(geo.scrollTopNow()).toBeGreaterThanOrEqual(before + 39);
   });
 
   it("a late resolve from session A cannot clear session B's armed restore (item 4)", async () => {

@@ -1,4 +1,7 @@
 import { expect, request as apiRequest, test, type APIRequestContext, type Browser, type Page } from "@playwright/test";
+import { readdir, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { login } from "./hub-auth";
 
 /**
@@ -449,71 +452,107 @@ test("a committed POST whose browser response is lost retries with replayed:true
 });
 
 /**
- * c-hubfakeack: the fake Node must never swallow a Hub->Node RPC while waiting
- * for a journal.append ack. After appending a delivered command's user turn it
- * used to do `let _ = timeout(2s, ws.next())` and discard whatever frame
- * arrived. The Hub pipelines instance.send RPCs over the one Node link (many
- * in-flight slots), so when a burst of POSTs lands the later RPC frames are
- * already buffered by the time the first append waits for its ack: the discard
- * ate the SECOND send (never answered, never journaled). The fake now matches
- * its own j{seq} ack and queues every other frame for the dispatch loop, so a
- * whole burst is answered and journaled. This fails on origin/main, where the
- * burst journals one message short and one POST is never answered.
+ * c-hubfakeack round 2: DETERMINISTIC proof that a Hub->Node RPC buffered
+ * behind an outstanding journal.append ack is never swallowed.
+ *
+ * The first command (`__ackbarrier__:hold`) makes the fake Node park its
+ * append-ack wait until the NEXT instance.send RPC is actually on the socket;
+ * it records that intervening RPC in a marker file. The second command
+ * (`__ackbarrier__:next`) is that buffered RPC, drained from the pending queue
+ * after the hold completes. Both commands reply `accepted:true`, so the Hub
+ * marks them accepted from the RPC REPLY itself (state accepted / resolution
+ * clear) — independent of the journal, which a swallowed-but-appended RPC
+ * could otherwise reconcile on its own. The marker proves the queue-and-drain
+ * path really ran (not two independently-serialised sends).
+ *
+ * Fails on the pre-fix fake: it has no __ackbarrier__ arm (it replies the
+ * non-accepted `{ok:true}`, so the synchronous row is not accepted) and it
+ * never writes the barrier marker, and its 2 s `ws.next()` discard swallows
+ * the next send.
  */
-test("a pipelined burst of sends is all answered and journaled — no RPC swallowed behind an append ack", async ({
+test("an RPC buffered behind an append ack is queued, answered accepted and journaled (ack barrier)", async ({
   page,
 }) => {
-  const instanceId = await createSession(page, "ack-hole seed");
+  const instanceId = await createSession(page, "ack barrier seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   const api = await hubApi(page);
 
-  const BURST = 6;
-  // No client commandId: the Hub mints a canonical cmd_+UUIDv7 and forwards it
-  // to the Node. Fire the whole burst concurrently so the Hub pipelines every
-  // instance.send over the link (many in-flight slots) before the Node finishes
-  // appending the first turn — precisely the window in which the old fake
-  // discarded the next frame.
-  const settled = await Promise.all(
-    Array.from({ length: BURST }, (_, i) =>
-      api
-        .post(`/v1/instances/${instanceId}/commands`, {
-          data: {
-            operation: "instance.send",
-            payload: { prompt: `ack-hole message ${i}` },
-          },
-        })
-        .then(async (res) => {
-          const body = (await res.json().catch(() => ({}))) as {
-            command?: { commandId?: string };
+  // Marker files are scoped by the effective Hub port, like the other fakes.
+  const hubPort = new URL(page.url()).port;
+  const markerPrefix = `remuda-e2e-ackbarrier-${hubPort}-`;
+  const sweepMarkers = async () => {
+    const entries = await readdir(os.tmpdir()).catch(() => [] as string[]);
+    await Promise.all(
+      entries
+        .filter((e) => e.startsWith(markerPrefix))
+        .map((e) => rm(path.join(os.tmpdir(), e), { force: true }).catch(() => undefined)),
+    );
+  };
+  await sweepMarkers();
+
+  const post = (prompt: string) =>
+    api
+      .post(`/v1/instances/${instanceId}/commands`, {
+        data: { operation: "instance.send", payload: { prompt } },
+      })
+      .then(async (res) => {
+        const body = (await res.json().catch(() => ({}))) as {
+          command?: {
+            commandId?: string;
+            state?: string;
+            resolution?: string;
           };
-          return { status: res.status(), commandId: body.command?.commandId ?? null };
-        })
-        .catch((err: unknown) => ({ status: -1, commandId: null as string | null, error: String(err) })),
-    ),
-  );
+        };
+        return {
+          status: res.status(),
+          commandId: body.command?.commandId ?? null,
+          state: body.command?.state ?? null,
+          resolution: body.command?.resolution ?? null,
+        };
+      })
+      .catch((err: unknown) => ({ status: -1, commandId: null, state: null, resolution: null, error: String(err) }));
 
-  // Every POST was answered 200 — the Node replied to every forwarded RPC.
-  const failed = settled.filter((r) => r.status !== 200 || !r.commandId);
-  expect(
-    failed,
-    `unanswered/failed sends in burst: ${JSON.stringify(failed)}`,
-  ).toHaveLength(0);
-  const commandIds = settled.map((r) => r.commandId!);
-  expect(new Set(commandIds).size, "every send minted a distinct commandId").toBe(BURST);
+  // Fire both concurrently: the Hub pipelines the two instance.send frames, so
+  // the hold command's barrier observes the next send while its ack waits.
+  const [hold, next] = await Promise.all([
+    post("__ackbarrier__:hold"),
+    post("__ackbarrier__:next"),
+  ]);
 
-  // Authoritative proof: every command reaches the journal as exactly one user
-  // message. A swallowed RPC never runs its handler, so its user turn is absent
-  // on the buggy fake and this poll exhausts its timeout.
-  for (const commandId of commandIds) {
-    await expect
-      .poll(() => hubJournalMessageCount(api, instanceId, commandId), { timeout: 40_000 })
-      .toBe(1);
+  // The fake wrote a marker only after the NEXT instance.send was actually
+  // buffered behind the hold's outstanding ack. Content is the intervening RPC
+  // count (must be >= 1). This cannot pass on the old fake (no barrier arm).
+  let markerContent = "";
+  await expect
+    .poll(
+      async () => {
+        const entries = await readdir(os.tmpdir()).catch(() => [] as string[]);
+        const marker = entries.find((e) => e.startsWith(markerPrefix));
+        if (!marker) return "";
+        markerContent = await readFile(path.join(os.tmpdir(), marker), "utf8").catch(() => "");
+        return markerContent;
+      },
+      { timeout: 20_000 },
+    )
+    .not.toBe("");
+  expect(Number(markerContent), `intervening RPC count in ${markerContent}`).toBeGreaterThanOrEqual(1);
+
+  // The RPC REPLY (not later journal reconcile) cleared each row synchronously.
+  for (const r of [hold, next]) {
+    expect(r.status, `unexpected status ${JSON.stringify(r)}`).toBe(200);
+    expect(r.commandId, `missing commandId ${JSON.stringify(r)}`).toBeTruthy();
+    expect(r.state, `row not accepted from the RPC reply: ${JSON.stringify(r)}`).toBe("accepted");
+    expect(r.resolution).toBe("clear");
   }
 
-  // Exactly one command row per id — the swallowed RPC must not leave a missing
-  // ledger row (and the fix must not duplicate one).
+  // Exactly one journaled user message per id (the append ran exactly once).
+  await expect.poll(() => hubJournalMessageCount(api, instanceId, hold.commandId!), { timeout: 30_000 }).toBe(1);
+  await expect.poll(() => hubJournalMessageCount(api, instanceId, next.commandId!), { timeout: 30_000 }).toBe(1);
+
+  // One ledger row per id.
   const rows = await hubCommands(api, instanceId);
-  for (const commandId of commandIds) {
-    expect(rows.filter((c) => c.operation === "instance.send" && c.id === commandId)).toHaveLength(1);
+  for (const cid of [hold.commandId, next.commandId]) {
+    expect(rows.filter((c) => c.operation === "instance.send" && c.id === cid)).toHaveLength(1);
   }
+  await sweepMarkers();
 });

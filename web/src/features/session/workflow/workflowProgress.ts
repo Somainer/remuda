@@ -28,6 +28,12 @@ export type WfStatus = "running" | "completed" | "failed" | "killed" | "paused";
 /** Per-agent state. */
 export type WfState = "queued" | "running" | "done" | "failed" | "killed";
 
+/**
+ * Tooltip on a provisional running denominator (c-uifold): the total keeps
+ * growing as the run spawns agents into later phases, loops and fan-outs.
+ */
+export const PROVISIONAL_HINT = "运行中，可能还会启动更多 agent";
+
 /** A phase with more agents than this switches to column layout. */
 export const GRID_THRESHOLD = 8;
 /** A phase shows at most this many agent rows; the quiet tail folds. */
@@ -105,10 +111,17 @@ export interface WfPhaseView {
   tokens?: number;
   /** Summed tool calls across the phase's agents; undefined when none reported. */
   calls?: number;
-  /** Header count, e.g. `2/4` or `5/5 完成`. */
+  /** Header count, e.g. `2/4`, `2/4+` while spawning, or `5/5 完成`. */
   countText: string;
   /** Right-aligned meta, e.g. `1 运行中 · 3m 42s` / `全部排队中`. */
   metaText: string;
+  /**
+   * While the run is alive every phase count is provisional (the run can
+   * still spawn into the phase, even one that already reports completed):
+   * the count carries the provisional `+` and never says 完成. Final only
+   * once the run itself is terminal.
+   */
+  provisional: boolean;
   /** Expanded on first paint while the run is alive. */
   expandedByDefault: boolean;
 }
@@ -123,8 +136,27 @@ export interface WfCard {
   totals: WfTotals;
   /** Run launch instant (epoch ms); the per-agent queue-wait origin. */
   launchedAtMs?: number;
-  /** 0–100 fill for the dotted progress rail. */
+  /** 0–100 fill for the progress rail (terminal over the denominator). */
   railPct: number;
+  /** Done segment width, in rail percent. */
+  donePct: number;
+  /** Failed segment width, in rail percent; painted red over the fill. */
+  failedPct: number;
+  /** Killed segment width, in rail percent; painted muted over the fill. */
+  killedPct: number;
+  /**
+   * Member slots observed so far. While a dynamic run is alive this is the
+   * moving denominator (it grows as agents spawn); the card marks it as
+   * provisional. It is the final total once the run is terminal.
+   */
+  knownCount: number;
+  /**
+   * The run is still alive: the count shows `N/M+` and a dynamic run's bar
+   * may move backwards when the denominator grows (8/8 → 8/12). A run that
+   * reports totalKnown is provisional too — all CURRENT members may be done
+   * while the run keeps spawning. False for every terminal run.
+   */
+  provisional: boolean;
   /** 「当前 <phase>: <agent>」 while running. */
   live?: { phase: string; agent: string };
   /** Terminal one-line result. */
@@ -336,7 +368,13 @@ function sumMetric(agents: WfAgent[], pick: (a: WfAgent) => number | undefined):
   return total;
 }
 
-function projectPhase(id: string, title: string, agents: WfAgent[], nowMs?: number): WfPhaseView {
+function projectPhase(
+  id: string,
+  title: string,
+  agents: WfAgent[],
+  nowMs: number | undefined,
+  runLive: boolean,
+): WfPhaseView {
   const counts = countState(agents);
   const grid = agents.length > GRID_THRESHOLD;
   const { folded } = foldAgents(agents);
@@ -370,7 +408,18 @@ function projectPhase(id: string, title: string, agents: WfAgent[], nowMs?: numb
   }
 
   const fullyDone = total > 0 && counts.done === total;
-  const countText = fullyDone ? `${total}/${total} 完成` : `${terminal}/${total}`;
+  // While the RUN is alive every count is provisional, even for a phase whose
+  // own observation says completed: in a dynamic run a phase can show the
+  // final N/N between spawning iterations (or while members with a null
+  // phaseId all completed), and the run may still spawn into it or into the
+  // synthetic "unphased" bucket. The count is final only once the run is
+  // terminal — the phase's own state does not get a vote. A LIVE phase gets
+  // `+` even with zero members (0/0+): the run may still spawn into it.
+  const provisional = runLive;
+  const countText =
+    !runLive && fullyDone
+      ? `${total}/${total} 完成`
+      : `${terminal}/${total}${runLive ? "+" : ""}`;
 
   return {
     id,
@@ -386,6 +435,7 @@ function projectPhase(id: string, title: string, agents: WfAgent[], nowMs?: numb
     calls,
     countText,
     metaText,
+    provisional,
     expandedByDefault: counts.running > 0 || counts.failed > 0 || counts.killed > 0,
   };
 }
@@ -507,13 +557,31 @@ export function projectWorkflow({ run, phases, members, phaseOrder, nowMs }: Pro
     return fromPayload ?? fromOrder ?? `阶段 ${index + 1}`;
   };
 
-  const phaseViews = order.map((id, index) => projectPhase(id, titleOf(id, index), byPhase.get(id) ?? [], nowMs));
+  const runLive = status === "running" || status === "paused";
+  const phaseViews = order.map((id, index) =>
+    projectPhase(
+      id,
+      titleOf(id, index),
+      byPhase.get(id) ?? [],
+      nowMs,
+      runLive,
+    ),
+  );
 
   const allAgents: WfAgent[] = phaseViews.flatMap((p) => [...p.pinned, ...p.head, ...p.folded]);
   const totalsPayload = run.totals;
-  const totalKnown = totalsPayload?.totalKnown ?? true;
-  const agentsTotal =
-    num(u64(totalsPayload?.agentsTotal)) ?? allAgents.length;
+  const observedCount = allAgents.length;
+  const reportedCount = num(u64(totalsPayload?.agentsTotal));
+  // c-uifold: the moving denominator is the agents spawned so far — the
+  // workflow.member census, never below a count the run itself reports
+  // (script.calls.len() on fixed scripts). It grows as members appear.
+  const knownCount = Math.max(observedCount, reportedCount ?? observedCount);
+  // Without a totals block (older node) the census is complete only once the
+  // run is terminal; with one, trust the producer's totalKnown flag.
+  const totalKnown = totalsPayload
+    ? totalsPayload.totalKnown ?? true
+    : status !== "running" && status !== "paused";
+  const agentsTotal = knownCount;
   const totals: WfTotals = totalsPayload
     ? {
         totalKnown,
@@ -530,7 +598,23 @@ export function projectWorkflow({ run, phases, members, phaseOrder, nowMs }: Pro
     : totalsFrom(allAgents, 0, totalKnown, agentsTotal);
 
   const terminal = totals.done + totals.failed + totals.killed;
-  const railPct = totalKnown && agentsTotal > 0 ? Math.min(100, Math.round((terminal / agentsTotal) * 100)) : 0;
+  // Provisional while the run is alive (running or paused, which can resume):
+  // every count is interim, including a run that reports totalKnown with all
+  // current members done — a dynamic run can still spawn more agents. The
+  // fixed denominator stays stable (the rail keeps using agentsTotal), it is
+  // only marked provisional; finality comes once the run is terminal. A
+  // terminal/spawned fill may also move BACKWARDS when new agents spawn
+  // (8/8 → 8/12) while totalKnown is false — that is expected, not an error.
+  const provisional = runLive;
+  // While the total is unknown the rail is provisional: terminal over the
+  // slots observed so far, visibly marked as provisional by the card.
+  const denom = Math.max(1, totalKnown ? agentsTotal : knownCount);
+  const pct = (n: number) => Math.min(100, Math.round((n / denom) * 100));
+  const railReady = totalKnown ? agentsTotal > 0 : knownCount > 0;
+  const railPct = railReady ? pct(terminal) : 0;
+  const donePct = railReady ? pct(totals.done) : 0;
+  const failedPct = railReady ? pct(totals.failed) : 0;
+  const killedPct = railReady ? pct(totals.killed) : 0;
 
   // Live line: the most recent running agent (members arrive in event order, so
   // the last running one is current), else the last failed/killed.
@@ -552,6 +636,11 @@ export function projectWorkflow({ run, phases, members, phaseOrder, nowMs }: Pro
     totals,
     launchedAtMs: tsMs(run.launchedAt),
     railPct,
+    donePct,
+    failedPct,
+    killedPct,
+    knownCount,
+    provisional,
     live,
     summary: kv(run.live?.summary),
     note: run.note ?? undefined,
@@ -591,6 +680,11 @@ export function degradedCard(name: string, status: WfStatus, note: string, elaps
       elapsedMs,
     },
     railPct: 0,
+    donePct: 0,
+    failedPct: 0,
+    killedPct: 0,
+    knownCount: 0,
+    provisional: false,
     note,
   };
 }

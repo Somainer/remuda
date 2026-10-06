@@ -330,3 +330,86 @@ fn the_recorded_print_stream_still_assembles_on_sdk() {
         "sdk must report Partial on this fixture's deltas"
     );
 }
+
+/// Collect the native `turn/result` lifecycles emitted by replaying `source`.
+fn result_natives(
+    source: &str,
+    driver: DriverKind,
+) -> Vec<remuda_protocol::NativeLifecycle> {
+    let (_mapper, obs) = replay(source, driver);
+    obs.into_iter()
+        .filter_map(|o| match o.body {
+            ObservationPayload::Lifecycle(p) => match *p {
+                LifecyclePayload::Native(n) if n.native_name == "result" => Some(*n),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn settles_root_turn(n: &remuda_protocol::NativeLifecycle) -> bool {
+    n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true")
+}
+
+/// D-057 OA6 r2 item 1: the driver stamps `settledRootTurn` on the result that
+/// ends the ROOT turn, independent of `affectsCompletion` (the one-shot print
+/// heuristic). The single-turn `ok` session's FIRST result (index 0, queued
+/// omitted, affectsCompletion=false) settles the root turn — the live sdk case
+/// that previously stayed "working" forever.
+#[test]
+fn first_result_of_a_single_turn_session_settles_the_root() {
+    let ok = result_natives(
+        include_str!("../../remuda-testing/fixtures/scripts/ok.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(ok.len(), 1);
+    assert!(
+        settles_root_turn(&ok[0]),
+        "the first (only) result must carry settledRootTurn"
+    );
+    assert!(
+        !ok[0].affects_completion,
+        "index 0 still has the print heuristic false; settlement is separate"
+    );
+
+    // The shared print-carrier mapper makes the same decision.
+    let ok_print = result_natives(
+        include_str!("../../remuda-testing/fixtures/scripts/ok.jsonl"),
+        DriverKind::ClaudePrint,
+    );
+    assert!(settles_root_turn(&ok_print[0]));
+}
+
+/// In a multi-turn session each turn's result ends that turn (the next turn is
+/// already driven by its own turn_started), so both twoturn results settle —
+/// including index 0.
+#[test]
+fn every_result_of_a_multi_turn_session_settles_its_turn() {
+    let two = result_natives(
+        include_str!("../../remuda-testing/fixtures/scripts/twoturn.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(two.len(), 2);
+    assert!(settles_root_turn(&two[0]), "turn 1 settles");
+    assert!(settles_root_turn(&two[1]), "turn 2 settles");
+}
+
+/// A background Workflow emits an intermediate result (index 0) while the
+/// workflow is open — that one does NOT settle the root; the final result
+/// (index 1) does. This is the one shape `result_index` still gates.
+#[test]
+fn a_workflow_intermediate_result_does_not_settle_until_its_final() {
+    // Drive the workflow script (system/task_started local_workflow ->
+    // result 0 -> result 1) through the mapper.
+    let wf = result_natives(
+        include_str!("../../remuda-testing/fixtures/scripts/workflow.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(wf.len(), 2);
+    assert!(
+        !settles_root_turn(&wf[0]),
+        "the workflow's index-0 result is intermediate"
+    );
+    assert!(settles_root_turn(&wf[1]), "the workflow's final result settles");
+}

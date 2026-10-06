@@ -5517,19 +5517,26 @@ fn apply_instance_projection(
             .get("severity")
             .and_then(Value::as_str)
             .unwrap_or("");
-        // NOTE (ma-sdk-state): the print/sdk engine's turn lifecycle events
-        // (topic=turn: turn_started / result) are emitted at severity=info,
-        // so they never enter this process-failure fold. Turn activity and the
-        // lastTurnError marker are derived in `derive_instance_state` /
-        // `apply_instance_lifecycle`. The broader process-end classifier
-        // (turn/error-severity/session-exit split) lands with c-cardsettle;
-        // this branch intentionally does not duplicate it.
-        let failed = severity == "error"
-            || native_name.contains("error")
-            || native_name == "exit"
-            || native_name.contains("gone")
-            || native_name.contains("agent_not_ready")
-            || native_name.contains("shell");
+        // D-057 OA6 r2 item 4: this process-failure fold must ignore OWN-SCOPE
+        // and non-terminal evidence so a failed configure switch, a hook/task/
+        // plan/diagnostic error, or a subagent's event cannot fail the ROOT
+        // instance. Only a session-topic (or a topic-less legacy) observation
+        // qualifies. The full process-end classifier (explicit exit/start-fail
+        // names) lands with c-cardsettle; this is the minimal scope/topic guard
+        // consistent with it. Turn events are severity=info regardless.
+        let native_topic = payload.get("topic").and_then(Value::as_str);
+        let nonterminal_topic = matches!(
+            native_topic,
+            Some("turn" | "hook" | "task" | "plan" | "configuration" | "diagnostic")
+        );
+        let root_only = !nonterminal_topic && !native_event_is_subagent(&payload);
+        let failed = root_only
+            && (severity == "error"
+                || native_name.contains("error")
+                || native_name == "exit"
+                || native_name.contains("gone")
+                || native_name.contains("agent_not_ready")
+                || native_name.contains("shell"));
         if failed {
             lifecycle = Some("failed");
             last_error = payload
@@ -8729,52 +8736,64 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         .or_else(|| knowledge_value(payload.pointer("/entity/activity")))
         .or_else(|| event.get("activity").and_then(Value::as_str));
 
-    // D-057 OA6 (ma-sdk-state; same three-way rule as c-cardsettle r4): the
-    // claude-print / claude-sdk engine's root-turn evidence (topic `turn`) is
-    // ACTIVITY evidence only and never sets lifecycle — a turn is not process
-    // end. Terminal lifecycle comes solely from the separate topic=session
-    // process-exit/EOF event (or a start failure), projected below.
+    // D-057 OA6 (ma-sdk-state r2): the claude-print / claude-sdk engine's
+    // root-turn evidence (topic `turn`) is ACTIVITY evidence only and never
+    // sets lifecycle — a turn is not process end. Terminal lifecycle comes
+    // solely from the separate topic=session process-exit/EOF event (or a
+    // start failure), projected below.
     //
-    // * `turn_started`/working (emitted when the user frame is written) sets
-    //   activity `working` (lifecycle left as-is: the session lifecycle event
-    //   independently reaches `running`);
-    // * a settled `result`/`turn_done` sets activity `idle`;
-    // * a settled `result`/`error` (an API error such as 429) also sets
-    //   activity `idle` and leaves lifecycle untouched, so the instance keeps
-    //   running with all its grants and can be retried in place. The additive
-    //   `lastTurnError` marker is applied in `apply_instance_lifecycle`.
+    // * `turn_started`/working (emitted after the user frame is written) sets
+    //   activity `working`;
+    // * a SETTLED `result` sets activity `idle` whether it succeeded
+    //   (`turn_done`) or failed (`error`, an API error such as 429); the latter
+    //   also leaves the additive `lastTurnError` marker
+    //   (`apply_instance_lifecycle`), so the instance keeps running with all
+    //   its grants and retries in place.
     //
-    // "Settled" mirrors `map_result` in the driver: nothing further queued, and
-    // a successful result is the process's terminal result frame
-    // (`affectsCompletion`). Even that frame is NOT process-end here; a
-    // Workflow's intermediate result and a queued follow-up turn prove neither
-    // idle nor an end.
+    // "Settled" is the driver's explicit `relatedIds.settledRootTurn` flag —
+    // its own root-turn-completion decision, tracking open workflows and queued
+    // input. It is deliberately separate from `affectsCompletion` (the
+    // one-shot PRINT process heuristic, false on the first turn of the
+    // long-lived sdk child). A Workflow intermediate result and a queued
+    // follow-up turn carry no flag and change neither lifecycle nor activity.
     if payload_type == "native"
         && payload.get("topic").and_then(Value::as_str) == Some("turn")
         && !native_event_is_subagent(payload)
     {
-        let queued = payload
-            .pointer("/relatedIds/queuedTurnCount")
+        let settled_root_turn = payload
+            .pointer("/relatedIds/settledRootTurn")
             .and_then(Value::as_str)
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0);
-        let settled_end = queued == 0
-            && match (native_name, status) {
-                ("result", Some("error")) => true,
-                ("result", Some("turn_done")) => {
-                    payload.get("affectsCompletion").and_then(Value::as_bool) == Some(true)
-                }
-                _ => false,
-            };
+            == Some("true");
         if (native_name, status) == ("turn_started", Some("working")) {
             return (None, Some("working"));
         }
-        if settled_end {
-            return (None, Some("idle"));
+        if native_name == "result" && matches!(status, Some("error" | "turn_done")) {
+            if settled_root_turn {
+                return (None, Some("idle"));
+            }
+            // An intermediate result (open workflow, or a queued follow-up
+            // turn) changes neither lifecycle nor activity.
+            return (None, None);
         }
-        // Any other turn/result shape (intermediate Workflow result, queued
-        // follow-up turn) changes neither lifecycle nor activity.
-        if native_name == "result" {
+    }
+
+    // D-057 OA6 r2 item 4: scoped and non-terminal native evidence must make
+    // NO root change BEFORE the generic status handling below.
+    //  * a SUBAGENT observation (non-empty agentId), of any topic including a
+    //    turn/result/error, is that subagent's row — never the root's;
+    //  * the non-session informational topics never carry the root lifecycle.
+    // The root-turn arm above has already returned for recognized root turn
+    // events, so an unrecognized turn shape is intentionally left to the
+    // generic handling as before. The broader shared classifier lands with
+    // c-cardsettle; this is the minimal consistent guard.
+    if payload_type == "native" {
+        let topic = payload.get("topic").and_then(Value::as_str);
+        if native_event_is_subagent(payload)
+            || matches!(
+                topic,
+                Some("hook" | "task" | "plan" | "configuration" | "diagnostic")
+            )
+        {
             return (None, None);
         }
     }
@@ -8907,12 +8926,14 @@ fn turn_error_projection(event: &Value, now: &str) -> Option<String> {
     if name != "result" || status != Some("error") {
         return None;
     }
-    let queued = payload
-        .pointer("/relatedIds/queuedTurnCount")
+    // Set the marker only when the error SETTLES the root turn (the driver's
+    // explicit settledRootTurn decision). An intermediate workflow error or a
+    // queued follow-up turn's error keeps the turn open and sets no marker.
+    if payload
+        .pointer("/relatedIds/settledRootTurn")
         .and_then(Value::as_str)
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(0);
-    if queued != 0 {
+        != Some("true")
+    {
         return None;
     }
     let text = payload

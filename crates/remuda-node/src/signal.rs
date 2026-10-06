@@ -189,15 +189,16 @@ pub fn engine_turn_activity(observation: &Observation) -> Option<remuda_protocol
     let Knowledge::Known { value: status } = &native.status else {
         return None;
     };
-    let queued = native
-        .related_ids
-        .get("queuedTurnCount")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
+    // D-057 OA6 r2: settle on the driver's EXPLICIT root-turn decision
+    // (`relatedIds.settledRootTurn`), not `affects_completion` (the one-shot
+    // print process heuristic, false on the first turn of the long-lived sdk
+    // child). A result of either status idles only when it ends the root turn;
+    // an intermediate workflow result or a queued follow-up turn returns None.
+    let settled_root_turn = native.related_ids.get("settledRootTurn").map(String::as_str)
+        == Some("true");
     match (native.native_name.as_str(), status.as_str()) {
         ("turn_started", "working") => Some(Activity::Working),
-        ("result", "error") if queued == 0 => Some(Activity::Idle),
-        ("result", "turn_done") if native.affects_completion && queued == 0 => Some(Activity::Idle),
+        ("result", "error" | "turn_done") if settled_root_turn => Some(Activity::Idle),
         _ => None,
     }
 }
@@ -733,5 +734,82 @@ mod tests {
         // An unresumable session is recoverable; a session hydrated from
         // someone else's conversation is silently wrong.
         assert!(!binds_instance(4242, None));
+    }
+
+    /// Build an engine turn observation (`driver_kind` sdk/print) carrying the
+    /// given native name/status/related ids and completion flag.
+    fn engine_turn(
+        driver: DriverKind,
+        name: &str,
+        status: &str,
+        related: &[(&str, &str)],
+        affects_completion: bool,
+    ) -> Observation {
+        let mut obs = observation(SourceChannel::Stdout, name, Some("s"), related);
+        obs.source.driver_kind = driver;
+        if let ObservationPayload::Lifecycle(payload) = &mut obs.body {
+            if let LifecyclePayload::Native(native) = payload.as_mut() {
+                native.topic = LifecycleTopic::Turn;
+                native.status = Knowledge::Known {
+                    value: status.into(),
+                };
+                native.affects_completion = affects_completion;
+            }
+        }
+        obs
+    }
+
+    #[test]
+    fn the_first_sdk_turn_idles_on_settled_root_turn_despite_print_heuristic() {
+        // First turn: index 0 -> affects_completion=false, but the driver
+        // stamps settledRootTurn=true. The Node folds idle (r2 item 1).
+        let first = engine_turn(
+            DriverKind::ClaudeSdk,
+            "result",
+            "turn_done",
+            &[("settledRootTurn", "true")],
+            false,
+        );
+        assert_eq!(engine_turn_activity(&first), Some(remuda_protocol::Activity::Idle));
+
+        // Same for a first-turn error (retryable in place).
+        let first_err = engine_turn(
+            DriverKind::ClaudeSdk,
+            "result",
+            "error",
+            &[("settledRootTurn", "true"), ("lastError", "API 429")],
+            false,
+        );
+        assert_eq!(engine_turn_activity(&first_err), Some(remuda_protocol::Activity::Idle));
+    }
+
+    #[test]
+    fn turn_started_marks_working_and_unsettled_results_keep_it() {
+        let started = engine_turn(DriverKind::ClaudeSdk, "turn_started", "working", &[], false);
+        assert_eq!(engine_turn_activity(&started), Some(remuda_protocol::Activity::Working));
+
+        // An intermediate workflow result / queued turn carries no flag.
+        let intermediate = engine_turn(
+            DriverKind::ClaudeSdk,
+            "result",
+            "turn_done",
+            &[],
+            false,
+        );
+        assert_eq!(engine_turn_activity(&intermediate), None);
+        let intermediate_err =
+            engine_turn(DriverKind::ClaudeSdk, "result", "error", &[], false);
+        assert_eq!(engine_turn_activity(&intermediate_err), None);
+    }
+
+    #[test]
+    fn engine_turn_activity_is_scoped_to_the_structured_carriers() {
+        // A hook-channel event that looks like a turn result is ignored.
+        let mut via_hook = engine_turn(DriverKind::ClaudeSdk, "result", "turn_done", &[("settledRootTurn", "true")], false);
+        via_hook.source.channel = SourceChannel::Hook;
+        assert_eq!(engine_turn_activity(&via_hook), None);
+        // A non-engine driver kind is ignored.
+        let pty = engine_turn(DriverKind::ShellPty, "result", "turn_done", &[("settledRootTurn", "true")], false);
+        assert_eq!(engine_turn_activity(&pty), None);
     }
 }

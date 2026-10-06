@@ -165,6 +165,14 @@ struct Mapper {
     /// Stages image result bytes into the Hub object store (D-045 §6.2).
     /// `None` carriers degrade every image to an honest text block.
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
+    /// D-057 OA6 (ma-sdk-state r2): number of background Claude Workflows the
+    /// stream has opened (`system/task_started` with task_type=local_workflow)
+    /// whose terminal `result` has not yet been seen. While a workflow is open,
+    /// its first `result` (result_index 0) is an INTERMEDIATE result, not the
+    /// end of the root turn. This lets `map_result` decide root-turn settlement
+    /// independently of the one-shot `affects_completion` heuristic (which means
+    /// process completion for print and is wrong on the long-lived sdk child).
+    open_workflows: usize,
 }
 
 #[derive(Default)]
@@ -351,6 +359,7 @@ impl ClaudePrintDriver {
                     driver_kind: carrier,
                     channel: SourceChannel::Stdout,
                     media_stager,
+                    open_workflows: 0,
                 }),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
@@ -461,6 +470,7 @@ impl ClaudePrintDriver {
                 driver_kind: self.carrier,
                 channel: SourceChannel::Stdout,
                 media_stager: self.options.media_stager.clone(),
+                open_workflows: 0,
             };
         }
         *self.inner.policy.lock().await = policy;
@@ -1559,9 +1569,44 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
         );
     }
     // Workflow emits result_index 0 then 1; the first is not process completion
-    // (stream-json §5: do not tear down on the first result).
+    // (stream-json §5: do not tear down on the first result). This stays the
+    // one-shot PRINT process-completion heuristic; on the long-lived sdk child
+    // it does not mean "root turn complete" (result_index grows per turn).
     let affects_completion =
         result.result_index.unwrap_or(0) > 0 && result.queued_turn_count.unwrap_or(0) == 0;
+
+    // D-057 OA6 (ma-sdk-state r2): decide whether THIS result settles the ROOT
+    // turn, as a signal distinct from `affects_completion`. The root turn is
+    // settled when:
+    //  * no further prompt is queued (`queued_turn_count` 0/omitted), and
+    //  * this is not an open background workflow's intermediate result.
+    //
+    // A workflow emits result_index 0 (intermediate) then 1 (final). While a
+    // workflow is open, an index-0 result is the intermediate; a later result
+    // closes one open workflow. With no open workflow, a result settles the
+    // root turn regardless of index — including the FIRST turn of a long-lived
+    // sdk session (index 0/omitted), which the print heuristic misses.
+    let queued = result.queued_turn_count.unwrap_or(0);
+    let result_index = result.result_index.unwrap_or(0);
+    let settles_root_turn = if queued > 0 {
+        false
+    } else if mapper.open_workflows > 0 {
+        if result_index == 0 {
+            // Workflow still running behind its intermediate result.
+            false
+        } else {
+            // The workflow's final result ends the root turn; close one open
+            // workflow span (bounded so an unexpected extra result cannot
+            // underflow).
+            mapper.open_workflows = mapper.open_workflows.saturating_sub(1);
+            true
+        }
+    } else {
+        true
+    };
+    if settles_root_turn {
+        related.insert("settledRootTurn".into(), "true".into());
+    }
     let session_id = mapper.session_id.clone();
     let mut out = vec![mapper.lifecycle_related(
         LifecycleTopic::Turn,
@@ -1627,6 +1672,14 @@ fn usage_from_result(
 
 fn map_task_started(mapper: &mut Mapper, task: &TaskStarted) -> DriverResult<Vec<Observation>> {
     let task_id = task.task_id.clone().unwrap_or_default();
+    // D-057 OA6 (ma-sdk-state r2): a background workflow opens a span whose
+    // first `result` (result_index 0) is not the end of the root turn. Track it
+    // so `map_result` can tell a workflow intermediate from a normal first
+    // turn's result. local_agent/local_bash are subagent/shell tasks that do
+    // not own the root result sequence.
+    if task.task_type.as_deref() == Some("local_workflow") {
+        mapper.open_workflows = mapper.open_workflows.saturating_add(1);
+    }
     let workflow_id = mapper.ids.workflow(&task_id)?;
     let tool_call_id = match &task.tool_use_id {
         Some(id) => Some(mapper.ids.tool(id)?),
@@ -2603,6 +2656,7 @@ impl StdoutMapper {
                 driver_kind: driver,
                 channel: SourceChannel::Stdout,
                 media_stager: None,
+                open_workflows: 0,
             },
         }
     }
@@ -2686,6 +2740,7 @@ impl TranscriptMapper {
                 driver_kind: driver,
                 channel: SourceChannel::Transcript,
                 media_stager: None,
+                open_workflows: 0,
             },
             group: records::Group::default(),
             seen_prompts: std::collections::HashSet::new(),
@@ -3500,6 +3555,7 @@ pub mod review {
                     driver_kind: DriverKind::ClaudePrint,
                     channel: SourceChannel::Stdout,
                     media_stager: None,
+                    open_workflows: 0,
                 },
             }
         }
@@ -3530,6 +3586,7 @@ pub mod review {
             driver_kind: DriverKind::ClaudePrint,
             channel: SourceChannel::Stdout,
             media_stager: None,
+            open_workflows: 0,
         };
         map_outbound(&mut mapper, &frame)
     }

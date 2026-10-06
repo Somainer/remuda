@@ -119,6 +119,42 @@ for (const width of [390, 1440]) {
   });
 }
 
+// D-056 evidence renders: five-stop slider with the orthogonal Ultracode
+// switch at phone (390px, options sheet) and desktop (1440px, anchored
+// popover). Captured only with REMUDA_EVIDENCE=1; self-skips otherwise.
+// (The owner's WebKit-iPhone real-keyboard pass is separate; these are the
+// committed chromium renders of both surfaces.)
+for (const width of [390, 1440] as const) {
+  test.describe(`D-056 switch evidence ${width}px`, { tag: ["@evidence"] }, () => {
+    test.skip(process.env.REMUDA_EVIDENCE !== "1", "set REMUDA_EVIDENCE=1 for evidence renders");
+
+    test("five stops + ultracode switch render under the pill", async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      const instanceId = await createSession(page, `effort switch evidence ${width}`);
+      await clearApprovals(page, instanceId);
+      await page.getByTestId("model-effort-chip").click();
+      await expect(page.getByTestId("effort-slider")).toBeVisible();
+      await expect(page.getByTestId("effort-slider")).toHaveAttribute(
+        "data-tiers",
+        "low,medium,high,xhigh,max",
+      );
+      await expect(page.getByTestId("effort-ultracode-switch")).toBeVisible();
+      // At 390px the popover renders as the phone options sheet.
+      if (width === 390) {
+        await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute("data-in-sheet", "1");
+      }
+      await mkdir(evidenceDir, { recursive: true });
+      // Switch ON to capture the ember state on the switch row.
+      await page.getByTestId("effort-ultracode-switch").click();
+      await expect(page.getByTestId("effort-ultracode-switch")).toHaveAttribute("aria-checked", "true");
+      await page.screenshot({
+        path: path.join(evidenceDir, `effort-toggle-1-${width}.png`),
+        animations: "disabled",
+      });
+    });
+  });
+}
+
 // Clean up with `page.request`, which carries the login session cookie. The
 // standalone Playwright `request` fixture is unauthenticated: deleting with
 // it 401s (previously swallowed by .catch), leaving the fake node's 8

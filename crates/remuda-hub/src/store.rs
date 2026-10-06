@@ -8643,6 +8643,121 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r5 item 1 (the owner's bug): feed the REAL
+    /// WorkflowJournalTailer agent_failed output through the Hub — both the
+    /// synthesized `workflow.member` observation (kind=workflow.member,
+    /// payload.state=failed) and, defensively, the same fact carried as a
+    /// lifecycle ENTITY with entityType=workflow.member. Root lifecycle and
+    /// activity must not move, its approval must stay pending, and the
+    /// member-failed observations must be retained verbatim in the journal
+    /// (the member IS failed — that row is just not the root's row).
+    #[tokio::test]
+    async fn a_failed_workflow_member_never_ends_the_root() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-member-failed").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+        // Root is actively WORKING with a pending approval.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"agent_status",
+                    "status":{"state":"known","value":"working"}}}),
+            )
+            .await
+            .expect("seed working");
+        let before = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get before")
+            .expect("row");
+        assert_eq!(before.lifecycle, "running");
+        assert_eq!(before.activity, "working");
+
+        // 1) The REAL tailer output: kind=workflow.member, state failed.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "workflow.member",
+                    "payload": {
+                        "workflowId": "wf_owner",
+                        "memberId": "wf_owner:agent:agent0sub0agent000",
+                        "nativeAgentId": {"state":"known","value":"agent0sub0agent000"},
+                        "nativeKey": {"state":"unknown","reason":"not-emitted"},
+                        "attempt": {"state":"known","value":"1"},
+                        "label": {"state":"known","value":"researcher"},
+                        "state": "failed",
+                        "revision": "7",
+                    }
+                }),
+            )
+            .await
+            .expect("append real workflow.member failed");
+        // 2) The same fact as a lifecycle ENTITY (entityType
+        //    workflow.member): must be rejected as a root lifecycle source.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"entity","entityType":"workflow.member",
+                    "state":"failed","reasonCode":"member-stop-failed",
+                    "memberId":"wf_owner:agent:agent0sub0agent000"}}),
+            )
+            .await
+            .expect("append workflow.member entity failed");
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get after")
+            .expect("row");
+        assert_eq!(
+            row.lifecycle, "running",
+            "a failed WORKFLOW MEMBER never fails the root"
+        );
+        assert_eq!(
+            row.activity, "working",
+            "a failed WORKFLOW MEMBER never idles the root"
+        );
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(
+            state, "pending",
+            "the root's pending approval stays answerable"
+        );
+        assert!(reason.is_none(), "no generation-ended resolution is stamped");
+
+        // The member-failed evidence itself is retained in the journal.
+        let page = store
+            .read_journal(instance.instance_id.clone(), 0, None)
+            .await
+            .expect("read journal");
+        let member_failed = page.events.iter().any(|record| {
+            record.event.get("kind").and_then(Value::as_str) == Some("workflow.member")
+                && record.event.pointer("/payload/state").and_then(Value::as_str)
+                    == Some("failed")
+                && record
+                    .event
+                    .pointer("/payload/nativeAgentId/value")
+                    .and_then(Value::as_str)
+                    == Some("agent0sub0agent000")
+        });
+        assert!(
+            member_failed,
+            "the member IS failed: its workflow.member observation is retained verbatim"
+        );
+        store.close().await;
+    }
+
     /// c-cardsettle (native terminal projection): a NATIVE terminal event —
     /// a real process death (`topic=session`, nativeName "exit",
     /// affectsCompletion=true, severity "error") — writes lifecycle=failed

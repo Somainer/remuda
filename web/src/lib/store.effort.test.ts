@@ -299,6 +299,17 @@ it("a workflows-disabled refusal is process-scoped and clears on a positive on r
   expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
 });
 
+it("a degraded verdict clears a pending even when its word differs from the queued one", async () => {
+  const ctx = await startFollowing("queued-then-degrade", { state: "known", value: "working" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // Driver reports queued on xhigh...
+  ctx.receive(configureLifecycle(2, "effort-queued:xhigh"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+  // ...then rejects a different word (max). The terminal verdict clears it.
+  ctx.receive(configureLifecycle(3, "effort-degraded:max:dialog-kept"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
 it("an unsolicited ultracode refusal disables the switch with no client pending", async () => {
   const ctx = await startFollowing("unsolicited-refuse");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);

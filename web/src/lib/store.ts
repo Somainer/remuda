@@ -1173,10 +1173,12 @@ class HubStore {
     // exists (the configure can be posted outside the UI, and a refusal can
     // race the indicator). A LEVEL degradation must match the in-flight
     // request so a stale reject for a replaced request is ignored.
-    if (!isUltraRefusal) {
-      if (!current) return;
-      if (!effortLifecycleMatches(current, parsed.word)) return;
-    }
+    // A degraded verdict is TERMINAL for the indicator: clear any pending
+    // regardless of its named axes (the e2e driver queues one word and rejects
+    // another, and a replaced request's late reject must not leave the current
+    // indicator spinning — that freshness is owned by the queued/per-axis
+    // projection paths, not by a terminal lifecycle). An ultracode refusal
+    // also applies with no client pending at all (posted outside the UI).
     const pendingNext = { ...this.state.effortPending };
     delete pendingNext[instanceId];
     // The push-down ended via a lifecycle, not a projected read-back: no settled

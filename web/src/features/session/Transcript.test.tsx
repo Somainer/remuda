@@ -2603,6 +2603,121 @@ describe("load-earlier anchor lifecycle round 5", () => {
       expect(geo.top()).not.toBe(100 * ROW);
       await expectGrowthHolds(geo);
     });
+
+    // UO-6a round 7 item 1: cancellation must happen synchronously at the
+    // navigation entry, not only when an onScroll event happens to fire. The
+    // prepend here is shallow (5 rows) so the click-time anchor stays MOUNTED
+    // and a still-armed restore visibly repins it; event timing is controlled
+    // explicitly instead of flushed by land().
+    describe("round 7 item 1: navigation cancels without relying on a scroll event", () => {
+      type OlderPage = ReturnType<typeof pageOf>;
+      function shallowSetup(instanceId: string) {
+        const user = userEvent.setup();
+        const writes: number[] = [];
+        const geo = installGeo(20, { echoOnWrite: true, onWrite: (v) => writes.push(v) });
+        const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+        const tail: Observation[] = [];
+        for (let i = 0; i < 20; i += 1) tail.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", instanceId));
+        // Shallow prepend: the armed anchor lands only 5 rows deep, still
+        // inside the mounted viewport, so an armed restore repins it visibly.
+        const older: Observation[] = [];
+        for (let seq = 996; seq <= 1000; seq += 1) older.push(m(seq, seq % 2 ? "user" : "assistant", instanceId));
+        const g = gate<OlderPage>();
+        makeClient(reg, instanceId, tail, () => g.promise, "1001", "1020");
+        vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (iid) => {
+          const result = await reg.clients[iid]!.loadEarlier();
+          reg.setFloor[iid]?.(reg.clients[iid]!.retainedFloorSeq);
+          return result;
+        });
+        render(
+          <MemoryRouter initialEntries={[`/s/${instanceId}`]}>
+            <Routes>
+              <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+            </Routes>
+          </MemoryRouter>,
+        );
+        geo.defineScroll();
+        geo.scrollTo(0);
+        const resolvePage = async () => {
+          await act(async () => {
+            g.resolve(pageOf(older));
+            await Promise.resolve();
+          });
+          await act(async () => {});
+        };
+        return { user, geo, g, writes, older, resolvePage };
+      }
+
+      it("a single j at the top (no scroll event) is not repinned by the prepend", async () => {
+        const { user, geo, writes, resolvePage } = shallowSetup("insJZero");
+        await user.click(screen.getByTestId("load-earlier"));
+        // One j selects turn 0 already at the top: applyOffset writes an
+        // UNCHANGED clamped value, so the browser dispatches NO event.
+        await user.keyboard("j");
+        // The shallow page lands with no queued event in between.
+        await resolvePage();
+        // The armed anchor sits 5 rows deep and is mounted: an uncancelled
+        // restore repins it to 5*ROW; the cancelled restore leaves top at 0.
+        expect(writes).not.toContain(5 * ROW);
+        expect(geo.top()).toBe(0);
+      });
+
+      it("after jj (event delivered after the prepend) the estimate is not frozen", async () => {
+        // Deep window: the armed anchor lands 100 rows deep (off-screen), so a
+        // still-frozen restoringRef shows up only through the estimate an
+        // off-window search uses — exactly bug (b).
+        const { user, geo, g, writes, older } = setup("insJJEst");
+        await user.click(screen.getByTestId("load-earlier"));
+        // First j: unchanged write, no event. Second j: moves to turn 1, its
+        // event stays queued for the next frame.
+        await user.keyboard("jj");
+        // The 100-row page prepends BEFORE the queued event fires; without the
+        // synchronous cancel restoringRef would stay true forever.
+        await act(async () => {
+          g.resolve(pageOf(older));
+          await Promise.resolve();
+        });
+        await act(async () => {});
+        await geo.nextFrame();
+        await act(async () => {});
+        expect(writes).not.toContain(100 * ROW);
+        geo.setTotal(150);
+
+        // Measure the rows currently mounted near the top at 200px, with NO
+        // navigation or gesture in between (the growth hold is suppressed by
+        // the cancel). The estimate is global: frozen restoringRef keeps it
+        // at 96; released, it converges toward 200.
+        for (let pass = 0; pass < 4; pass += 1) {
+          const rows = geo.scroller().querySelectorAll<HTMLElement>("[data-anchor]");
+          await act(async () => {
+            rows.forEach((_row, idx) => {
+              if (idx < 16) geo.growRow(idx, 200);
+            });
+          });
+        }
+        // The first off-window navigation after the measurements: it must run
+        // with restoringRef already false (synchronous cancel), so the hit
+        // uses the converged estimate. Frozen at 96 the hit lands near 4064.
+        await user.click(screen.getByTestId("transcript-search-open"));
+        await user.type(screen.getByTestId("transcript-search-input"), "insJJEst-m1049");
+        await user.keyboard("[Enter]");
+        expect(geo.top()).toBeGreaterThan(4500);
+      });
+
+      it("a navigation whose event arrives after the prepend keeps its destination", async () => {
+        const { user, geo, writes, resolvePage } = shallowSetup("insLateEvent");
+        await user.click(screen.getByTestId("load-earlier"));
+        await user.keyboard("jj");
+        // Real response lands, THEN the deferred navigation scroll event.
+        await resolvePage();
+        await geo.nextFrame();
+        await act(async () => {});
+        // Without the synchronous cancel the coalesced post-prepend event
+        // matches the restore's new echo and the prepend repins to 5*ROW.
+        expect(writes).not.toContain(5 * ROW);
+        expect(geo.top()).toBe(ROW);
+      });
+    });
   });
 
   // UO-6a round 6 item 1: the held post-prepend repin must end even when

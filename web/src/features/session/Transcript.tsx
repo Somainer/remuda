@@ -317,6 +317,12 @@ function TranscriptInner({
    * stable-pass count cannot stay armed for the session.
    */
   const prependSettleTimerRef = useRef<number | null>(null);
+  /**
+   * Set when intentional navigation cancels an in-flight load-earlier, so the
+   * reading-anchor growth hold does not compensate for the cancelled
+   * prepend's inserted rows until the reader scrolls again.
+   */
+  const growthHoldSuppressedRef = useRef(false);
   const saveTimer = useRef<number | null>(null);
   const pendingScroll = useRef<
     | { kind: "index"; index: number; offset: number; tries: number }
@@ -386,6 +392,7 @@ function TranscriptInner({
     restoringRef.current = false;
     restoreEchoRef.current = null;
     restoreEchoSeqRef.current = 0;
+    growthHoldSuppressedRef.current = false;
     if (prependSettleTimerRef.current !== null) {
       window.clearTimeout(prependSettleTimerRef.current);
       prependSettleTimerRef.current = null;
@@ -448,13 +455,23 @@ function TranscriptInner({
   );
   const scrollerRef = useRef<HTMLDivElement>(null);
   /**
+   * Retire an armed/settling load-earlier restore synchronously, called from
+   * an INTENTIONAL navigation (j/k, a search hit, 跳到最新) BEFORE its own
+   * scrollTop is written: an unchanged/clamped write would dispatch no event
+   * and the old onScroll-only cancellation would never run, leaving the
+   * restore armed (repinning the click-time row) and the estimate frozen
+   * forever. The new navigation's own index pending is installed by the
+   * caller and is left intact; only that request's restore pending/anchor
+   * are retired. Returns true when a restore was cancelled.
+   */
+  const cancelLoadRestoreRef = useRef<() => void>(() => {});
+  /**
    * Write scrollTop programmatically. `fromRestore` marks a load-earlier /
    * saved-position restore's OWN write: its dispatched scroll event is
    * recorded (target + seq) so the listener recognizes the echo. Writes from
    * every other caller (j/k, search, 跳到最新, pin/resize re-pins, growth
-   * anchoring) are intentional navigation: they invalidate any pending echo
-   * record so their event cancels an armed restore instead of protecting it.
-   * A rAF drops a record when the write was clamped to the same offset and
+   * anchoring) are intentional navigation: they retire any armed restore
+   * synchronously and invalidate the echo record. A rAF drops a record when
    * the browser dispatched no event.
    */
   const programmaticScroll = useCallback((el: HTMLElement, top: number, fromRestore = false) => {
@@ -466,10 +483,11 @@ function TranscriptInner({
         if (restoreEchoRef.current?.seq === seq) restoreEchoRef.current = null;
       });
     } else {
+      cancelLoadRestoreRef.current();
       restoreEchoRef.current = null;
     }
     el.scrollTop = top;
-    scrollTopRef.current = top;
+    scrollTopRef.current = el.scrollTop;
   }, []);
   /**
    * Retire a held load-earlier anchor: clear its quiet timer, the pending
@@ -493,6 +511,38 @@ function TranscriptInner({
     const req = loadReqRef.current;
     if (req?.reqId === held.reqId && req.done) loadReqRef.current = null;
   }, []);
+  /**
+   * Synchronously retire the current load-earlier restore from an intentional
+   * navigation — independent of whether the upcoming write changes scrollTop
+   * (a single j at the top writes an unchanged value and dispatches no scroll
+   * event, so onScroll alone can never do this). Marks the in-flight request
+   * cancelled, releases the held anchor and the restore pending, and unfreezes
+   * the estimate. The request identity stays until the click's finally runs.
+   */
+  const cancelLoadRestore = useCallback(() => {
+    const req = loadReqRef.current;
+    if (!req || req.cancelled) return;
+    req.cancelled = true;
+    const held = prependAnchorRef.current;
+    if (held?.reqId === req.reqId) releasePrependAnchor(held);
+    // The caller (j/k, search, 跳到最新) has already replaced the pending with
+    // its OWN index navigation, so the restore pending may be gone — but the
+    // estimate freeze (restoringRef) belongs to THIS request and must end
+    // regardless of the current pending kind. Clear a surviving restore
+    // pending too.
+    const pending = pendingScroll.current;
+    if (pending?.kind === "restore" && pending.reqId === req.reqId) pendingScroll.current = null;
+    restoringRef.current = false;
+    // Drop the pre-navigation reading anchor: it was sampled above the row
+    // the incoming prepend will move, so without this the growth-anchor hold
+    // would compensate for that prepend and re-jump to the click-time row
+    // even after the reader intentionally navigated away.
+    readingAnchorRef.current = null;
+    growthHoldSuppressedRef.current = true;
+  }, [releasePrependAnchor]);
+  useEffect(() => {
+    cancelLoadRestoreRef.current = cancelLoadRestore;
+  }, [cancelLoadRestore]);
   /**
    * Arm (or re-arm) the quiet-window release: when measurement/size commits
    * stop for PREPEND_SETTLE_QUIET_MS the anchor is retired even though the
@@ -736,6 +786,10 @@ function TranscriptInner({
     const el = scrollerRef.current;
     const held = readingAnchorRef.current;
     if (!el || pinRef.current || pendingScroll.current || prependAnchorRef.current) return;
+    // An intentional navigation cancelled an in-flight load-earlier: the
+    // prepend still arriving must not be compensated for until the reader
+    // scrolls again (sample on that scroll, not from the prepend's reports).
+    if (growthHoldSuppressedRef.current) return;
     // No anchor, or one the window has since unmounted: take a new one from
     // the rows now in view. Growth that already landed is not undone.
     const row = held ? el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.id)}"]`) : null;
@@ -1340,6 +1394,9 @@ function TranscriptInner({
               // one is finalized by its click's finally.
               if (req.done && loadReqRef.current === req) loadReqRef.current = null;
             }
+            // Any non-echo scroll is the reader (or their navigation) owning
+            // the position again: resume normal growth anchoring.
+            growthHoldSuppressedRef.current = false;
           }
           sampleReadingAnchor();
           persistSoon();

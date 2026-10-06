@@ -454,7 +454,7 @@ describe("WorkflowTimelineCard", () => {
     expect(meter.getAttribute("aria-valuetext")).toBe("4 of 4 agents done");
   });
 
-  it("exposes a provisional progressbar with no final max while the run is alive", () => {
+  it("exposes a provisional progressbar with valuetext only (no now/min/max) while alive", () => {
     const agents8 = [
       ...["a", "b", "c"].map((id) => member({ memberId: id, state: "completed" as const })),
       member({ memberId: "d", state: "failed" as const }),
@@ -472,12 +472,37 @@ describe("WorkflowTimelineCard", () => {
       />,
     );
     const meter = screen.getByTestId("workflow-progress-meter");
-    // While provisional, do NOT claim a final max.
+    // A live run has no valid range at all: omit now/min/max so a count past
+    // any assumed default max (e.g. 101 completions) can't make an invalid
+    // range. Progress is conveyed solely by valuetext.
     expect(meter.getAttribute("aria-valuemax")).toBeNull();
-    expect(meter.getAttribute("aria-valuenow")).toBe("5"); // 4 done + 1 failed
+    expect(meter.getAttribute("aria-valuemin")).toBeNull();
+    expect(meter.getAttribute("aria-valuenow")).toBeNull();
     expect(meter.getAttribute("data-provisional")).toBe("1");
     expect(meter.getAttribute("aria-valuetext")).toBe(
       "5 of at least 8 agents done, still running; 1 failed",
     );
+    // The accessible-only node actually carries the hashed sr class.
+    expect(meter.className).toMatch(/_sr[_\s]/);
+  });
+
+  it("a live run with 101 completions exposes no invalid progressbar range", () => {
+    const agents101 = Array.from({ length: 101 }, (_, i) =>
+      member({ memberId: `m${i}`, state: i === 100 ? "running" : "completed" as const }),
+    );
+    renderCard(
+      <WorkflowTimelineCard
+        run={run({
+          state: "running",
+          totals: totalsBlock({ done: 100, running: 1, total: 101 }),
+        })}
+        phases={[phase()]}
+        members={agents101}
+      />,
+    );
+    const meter = screen.getByTestId("workflow-progress-meter");
+    expect(meter.getAttribute("aria-valuenow")).toBeNull();
+    expect(meter.getAttribute("aria-valuemax")).toBeNull();
+    expect(meter.getAttribute("aria-valuetext")).toContain("100 of at least 101");
   });
 });

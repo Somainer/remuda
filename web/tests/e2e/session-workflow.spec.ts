@@ -52,6 +52,39 @@ test.describe("workflow tree, task track, events drawer", () => {
     expect(await details.evaluate((el) => (el as HTMLDetailsElement).open)).toBe(true);
   });
 
+  test("native auto-expand (find-in-page) re-syncs React state so one click collapses", async ({ page }) => {
+    // Round 4: something OTHER than the summary click (browser find-in-page,
+    // form restore) can set details.open = true natively while React state
+    // stays collapsed. onToggle now follows the DOM state; after such an
+    // auto-expand, aria-expanded is true and a single summary click collapses.
+    await page.goto("/sessions");
+    await row(page, "看 TaskManager spill").click();
+    const details = page.getByTestId("workflow-phase").first();
+    const summary = details.locator("summary").first();
+    const body = details.locator("ul").first();
+
+    // Collapse via the controlled summary.
+    await summary.click();
+    await expect(summary).toHaveAttribute("aria-expanded", "false");
+    expect(await details.evaluate((el) => (el as HTMLDetailsElement).open)).toBe(false);
+
+    // Simulate find-in-page / an a11y action forcing the native disclosure
+    // open WITHOUT a summary click.
+    await details.evaluate((el) => {
+      (el as HTMLDetailsElement).open = true;
+      el.dispatchEvent(new Event("toggle"));
+    });
+    // React state follows the DOM: aria-expanded/body catch up.
+    await expect(summary).toHaveAttribute("aria-expanded", "true");
+    await expect(body).toBeVisible();
+
+    // One summary click collapses (it would have failed before onToggle).
+    await summary.click();
+    await expect(summary).toHaveAttribute("aria-expanded", "false");
+    expect(await details.evaluate((el) => (el as HTMLDetailsElement).open)).toBe(false);
+    await expect(body).toBeHidden();
+  });
+
   test("raw events drawer filters by kind", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "看 TaskManager spill").click();

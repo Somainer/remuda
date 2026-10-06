@@ -62,6 +62,13 @@ function PhaseGroup({ phase, members }: { phase: WorkflowPhasePayload; members: 
       data-testid="workflow-phase"
       open={open}
       data-open={open ? "1" : "0"}
+      // Re-sync when something OTHER than our summary click changes the native
+      // open state: browser find-in-page / form-restore / an accessibility
+      // action can expand a collapsed <details> natively. onToggle tracks the
+      // DOM state so React state and aria-expanded follow it; our summary
+      // handler still preventDefaults and drives the toggle for
+      // pointer/keyboard, so the two paths agree instead of fighting.
+      onToggle={(event) => setOpen(event.currentTarget.open)}
     >
       <summary
         className={css.wfPhase}

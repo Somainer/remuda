@@ -321,7 +321,7 @@ details.wfPhaseDetails[open] > summary.wfPhase::before { content: "▾"; }
 
 /* Accessible-only node (e.g. the workflow progress meter): removed from the
    visual flow but exposed to assistive tech. */
-.srOnly {
+.sr {
   position: absolute;
   width: 1px;
   height: 1px;

@@ -394,35 +394,43 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
                 format!("invalid --resume session id: {resume_id:?}"),
             )));
         }
-        let Some(home) = sandboxed_transcript_home()? else {
-            return Err(FakeClaudeError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("resume: no CLAUDE_CONFIG_DIR to look up session {resume_id}"),
-            )));
+        let home_fd = match crate::sandbox::claude_config_home_fd(
+            "CLAUDE_CONFIG_DIR",
+            "HOME",
+            ".claude",
+            ALLOW_HOME_WRITE_ENV,
+        )? {
+            Some(fd) => fd,
+            None => {
+                return Err(FakeClaudeError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("resume: no CLAUDE_CONFIG_DIR to look up session {resume_id}"),
+                )));
+            }
         };
         let slug =
             remuda_driver::claude_transcript::project_dir(std::path::Path::new("/"), &flags.cwd)
                 .file_name()
                 .map(std::ffi::OsString::from)
                 .unwrap_or_default();
+        let slug_bytes = std::os::unix::ffi::OsStrExt::as_bytes(slug.as_os_str()).to_vec();
         let file_name = format!("{resume_id}.jsonl");
-        return match crate::sandbox::open_existing_transcript_append(
-            &home,
-            &slug.to_string_lossy(),
-            &file_name,
-        ) {
+        return match home_fd
+            .subdir(b"projects")
+            .and_then(|projects| projects.subdir(&slug_bytes))
+            .and_then(|slug_fd| slug_fd.open_append_leaf(file_name.as_bytes()))
+        {
             Ok(file) => Ok(Some(file)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(error) if error.kind == remuda_fdsafe::FdErrorKind::Missing => {
                 Err(FakeClaudeError::Io(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "No conversation found with session ID: {resume_id} (looked in {}/projects/{})",
-                        home.display(),
+                        "No conversation found with session ID: {resume_id} (looked under projects/{})",
                         slug.to_string_lossy()
                     ),
                 )))
             }
-            Err(error) => Err(FakeClaudeError::Io(error)),
+            Err(error) => Err(FakeClaudeError::Io(error.into())),
         };
     }
     if let Some(dir) = std::env::var_os("FAKE_CLAUDE_TRANSCRIPT_DIR").filter(|v| !v.is_empty()) {
@@ -432,7 +440,7 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
         crate::sandbox::ensure_dir_in_temp(&dir, ALLOW_HOME_WRITE_ENV)?;
         // Same descriptor walk as the projects layout: no symlinked parent
         // can redirect the create.
-        let dir_fd = remuda_fdsafe::DirFd::open_or_create_abs(&crate::sandbox::normalize(&dir))
+        let dir_fd = remuda_fdsafe::DirFd::anchor_or_create(&crate::sandbox::normalize(&dir))
             .map_err(std::io::Error::from)?;
         let file_name = format!("{session_id}.jsonl");
         let name = file_name.as_bytes();
@@ -458,24 +466,28 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
     // find (or be proven not to find) the conversation. With no writable
     // per-test home the fake simply does not persist — it never falls back to
     // the operator's real ~/.claude.
-    match sandboxed_transcript_home()? {
-        Some(home) => {
-            let slug = remuda_driver::claude_transcript::project_dir(
-                std::path::Path::new("/"),
-                &flags.cwd,
-            )
-            .file_name()
-            .map(std::ffi::OsString::from)
-            .unwrap_or_default();
-            let file = crate::sandbox::append_project_transcript(
-                &home,
-                &slug.to_string_lossy(),
-                &format!("{session_id}.jsonl"),
-            )?;
-            Ok(Some(file))
-        }
-        None => Ok(None),
-    }
+    // No writable per-test home: do not persist, never touch the operator's
+    // real ~/.claude. (The harness engine mints a private home and passes it
+    // as HOME/CLAUDE_CONFIG_DIR; the standalone fake simply skips persistence.)
+    let Some(home_fd) = crate::sandbox::claude_config_home_fd(
+        "CLAUDE_CONFIG_DIR",
+        "HOME",
+        ".claude",
+        ALLOW_HOME_WRITE_ENV,
+    )?
+    else {
+        return Ok(None);
+    };
+    let slug = remuda_driver::claude_transcript::project_dir(std::path::Path::new("/"), &flags.cwd)
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
+    let file = crate::sandbox::append_project_transcript_fd(
+        &home_fd,
+        &slug.to_string_lossy(),
+        &format!("{session_id}.jsonl"),
+    )?;
+    Ok(Some(file))
 }
 
 /// Escape hatch for a deliberate manual run of the fake outside a test temp
@@ -494,11 +506,6 @@ const ALLOW_HOME_WRITE_ENV: &str = "FAKE_CLAUDE_ALLOW_HOME_WRITE";
 ///
 /// `FAKE_CLAUDE_ALLOW_HOME_WRITE=1` removes the restriction for a deliberate
 /// manual run.
-fn sandboxed_transcript_home() -> Result<Option<PathBuf>, FakeClaudeError> {
-    crate::sandbox::sandboxed_home("CLAUDE_CONFIG_DIR", "HOME", ".claude", ALLOW_HOME_WRITE_ENV)
-        .map_err(FakeClaudeError::from)
-}
-
 fn emit(value: &Value) -> Result<(), FakeClaudeError> {
     let mut out = io::stdout().lock();
     writeln!(out, "{}", serde_json::to_string(value)?)?;

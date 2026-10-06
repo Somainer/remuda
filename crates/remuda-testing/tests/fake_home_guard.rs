@@ -194,3 +194,79 @@ fn a_symlinked_projects_inside_the_home_is_refused_not_followed() {
         sink.display()
     );
 }
+
+/// Round 4 item 6: a REAL fake-process `--resume` whose target transcript is a
+/// FIFO must fail promptly (never block opening it), not hang the process.
+#[test]
+fn resume_of_a_fifo_transcript_fails_without_blocking() {
+    use nix::sys::stat::Mode;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    let root = TempHome::allocate("guard-fifo-resume").expect("allocated root");
+    let home = root.child("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let workspace = root.child("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let slug = remuda_driver::claude_transcript::encode_project_dir(&workspace);
+    let slug_dir = home.join(".claude/projects").join(slug);
+    std::fs::create_dir_all(&slug_dir).expect("slug dir");
+    let session = "01993ab0-0000-7000-8000-0000000000f0";
+    let fifo = slug_dir.join(format!("{session}.jsonl"));
+    nix::unistd::mkfifo(&fifo, Mode::from_bits_truncate(0o600)).expect("mkfifo");
+    // No writer is ever opened on the other end: a blocking open would hang
+    // forever; O_NONBLOCK plus fstatat pre-classification must refuse instead.
+
+    let mut opts = SpawnOptions::bundled(ScriptKind::Ok);
+    opts.session_id = session.to_owned();
+    opts.extra_args = vec!["--resume".to_owned(), session.to_owned()];
+    opts.cwd = Some(workspace.clone());
+    opts.extra_envs = vec![(
+        "CLAUDE_CONFIG_DIR".to_owned(),
+        home.join(".claude").to_string_lossy().into_owned(),
+    )];
+
+    let started = Instant::now();
+    let mut child = spawn_fake_claude(opts).expect("spawn fake-claude");
+    let init = child.recv_until(Duration::from_secs(3), |v| is_system_subtype(v, "init"));
+    assert!(
+        init.is_err(),
+        "the FIFO resume cannot produce an init frame"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the fake must not block opening the FIFO"
+    );
+    let status = child.wait().expect("wait");
+    assert!(
+        !status.success(),
+        "a FIFO transcript is a non-zero-exit refusal"
+    );
+    // The FIFO itself remains a FIFO (never opened/written).
+    let mode = std::fs::symlink_metadata(&fifo)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o170000,
+        0o010000,
+        "target is still a FIFO, not a file"
+    );
+}
+
+/// Round 4 item 8: allocation never returns the shared mount itself.
+#[test]
+fn allocation_never_marks_the_shared_tmp_mount() {
+    let allocated = remuda_testing::sandbox::TempHome::allocate("mount-check").expect("allocate");
+    assert_ne!(
+        allocated.path().canonicalize().unwrap(),
+        std::path::Path::new("/tmp").canonicalize().unwrap(),
+        "allocation never returns the shared mount itself"
+    );
+    let canonical = allocated.path().canonicalize().unwrap();
+    assert!(
+        canonical.starts_with("/tmp/") || canonical.starts_with("/private/tmp/"),
+        "allocation stays under a fixed temp mount: {}",
+        canonical.display()
+    );
+}

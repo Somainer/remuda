@@ -47,7 +47,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 /// What a directory entry is, classified without following links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +165,13 @@ impl FdError {
     pub fn is_symlink(&self) -> bool {
         self.kind == FdErrorKind::Symlink
     }
+
+    /// Whether the underlying OS error was "already exists" (used to retry a
+    /// randomized exclusive allocation).
+    #[must_use]
+    pub fn is_already_exists(&self) -> bool {
+        matches!(self.kind, FdErrorKind::Other(ref msg) if msg.contains("EEXIST"))
+    }
 }
 
 impl std::fmt::Display for FdError {
@@ -242,7 +249,8 @@ fn classify(stat: &FileStat) -> (LeafKind, u64) {
 }
 
 fn fstat_fd(fd: RawFd) -> Result<FileStat, FdError> {
-    nix::sys::stat::fstat(fd).map_err(|error| FdError::new("<fd>", FdErrorKind::Other(error.to_string())))
+    nix::sys::stat::fstat(fd)
+        .map_err(|error| FdError::new("<fd>", FdErrorKind::Other(error.to_string())))
 }
 
 #[allow(clippy::unnecessary_cast)]
@@ -301,9 +309,14 @@ impl DirFd {
         )
         .map_err(|error| match error {
             Errno::ELOOP => FdError::new(canonical.display().to_string(), FdErrorKind::Symlink),
-            Errno::ENOTDIR => FdError::new(canonical.display().to_string(), FdErrorKind::NotDirectory),
+            Errno::ENOTDIR => {
+                FdError::new(canonical.display().to_string(), FdErrorKind::NotDirectory)
+            }
             Errno::ENOENT => FdError::new(canonical.display().to_string(), FdErrorKind::Missing),
-            other => FdError::new(canonical.display().to_string(), FdErrorKind::Other(other.to_string())),
+            other => FdError::new(
+                canonical.display().to_string(),
+                FdErrorKind::Other(other.to_string()),
+            ),
         })?;
         Ok(Self {
             file: unsafe { own_fd(fd) },
@@ -318,7 +331,10 @@ impl DirFd {
     /// created through even when the anchor path did not previously exist.
     pub fn anchor_or_create(path: &Path) -> Result<Self, FdError> {
         if !path.is_absolute() {
-            return Err(FdError::new(path.display().to_string(), FdErrorKind::BadComponent));
+            return Err(FdError::new(
+                path.display().to_string(),
+                FdErrorKind::BadComponent,
+            ));
         }
         // Find the deepest existing ancestor.
         let mut existing = path.to_path_buf();
@@ -362,6 +378,23 @@ impl DirFd {
         Ok(stat.st_mode & nix::libc::S_IWOTH != 0)
     }
 
+    /// Create a fresh 0700 subdirectory with `mkdirat`; unlike
+    /// [`Self::ensure_subdir`], an existing name is an error (`EEXIST`), so a
+    /// randomized allocation cannot adopt or delete a directory it did not
+    /// create.
+    pub fn create_subdir_excl(&self, name: &[u8]) -> Result<Self, FdError> {
+        check_component(name)?;
+        match nix::sys::stat::mkdirat(Some(self.as_raw_fd()), name, DIR_MODE) {
+            // The caller (a randomized allocation) retries with another name.
+            Err(Errno::EEXIST) => Err(FdError::new(
+                String::from_utf8_lossy(name),
+                FdErrorKind::Other("EEXIST: name taken".into()),
+            )),
+            Err(error) => Err(FdError::io(name, error)),
+            Ok(()) => self.subdir(name),
+        }
+    }
+
     /// Owner uid of the opened directory (callers compare against `geteuid`).
     pub fn uid(&self) -> Result<u32, FdError> {
         let stat = fstat_fd(self.as_raw_fd())?;
@@ -402,7 +435,9 @@ impl DirFd {
                 Component::Normal(part) => {
                     current = current.subdir(part.as_bytes())?;
                 }
-                Component::CurDir | Component::ParentDir | Component::RootDir
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
                 | Component::Prefix(_) => {
                     return Err(FdError::new(
                         path.display().to_string(),
@@ -422,7 +457,9 @@ impl DirFd {
                 Component::Normal(part) => {
                     current = current.ensure_subdir(part.as_bytes())?;
                 }
-                Component::CurDir | Component::ParentDir | Component::RootDir
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
                 | Component::Prefix(_) => {
                     return Err(FdError::new(
                         path.display().to_string(),
@@ -692,14 +729,10 @@ fn errno_kind(error: std::io::Error) -> FdErrorKind {
 /// recorded length) so a file that grows after enumeration cannot push the
 /// total copy over the cap; the actual number of bytes copied is returned
 /// and must be what the caller charges.
-pub fn copy_capped<R: ?Sized, W: ?Sized>(
-    src: &mut R,
-    dst: &mut W,
-    cap: u64,
-) -> std::io::Result<u64>
+pub fn copy_capped<R, W>(src: &mut R, dst: &mut W, cap: u64) -> std::io::Result<u64>
 where
-    R: Read,
-    W: Write,
+    R: Read + ?Sized,
+    W: Write + ?Sized,
 {
     let mut buf = vec![0_u8; 64 * 1024];
     let mut total: u64 = 0;
@@ -800,9 +833,9 @@ mod tests {
         // anchor resolves it either way.
         let tmp = tempdir();
         let project = &tmp.join("real-dir");
-        std::fs::create_dir_all(&project).expect("mkdir");
+        std::fs::create_dir_all(project).expect("mkdir");
         use std::os::unix::fs::symlink;
-        symlink(&project, &tmp.join("linkdir")).expect("symlink dir");
+        symlink(project, tmp.join("linkdir")).expect("symlink dir");
         assert!(anchor(&tmp).subdir(b"linkdir").is_err());
         // A multi-component walk refuses parent/root components.
         assert!(matches!(
@@ -839,10 +872,17 @@ mod tests {
     fn open_append_leaf_never_blocks_on_a_fifo() {
         let tmp = tempdir();
         let root = anchor(&tmp);
-        nix::unistd::mkfifo(tmp.join("hose").as_os_str(), Mode::from_bits_truncate(0o600)).expect("mkfifo");
+        nix::unistd::mkfifo(
+            tmp.join("hose").as_os_str(),
+            Mode::from_bits_truncate(0o600),
+        )
+        .expect("mkfifo");
         let started = std::time::Instant::now();
         let result = root.open_append_leaf(b"hose");
-        assert!(started.elapsed() < std::time::Duration::from_secs(2), "append blocked");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "append blocked"
+        );
         assert!(result.is_err(), "fifo append refused");
     }
 
@@ -852,7 +892,7 @@ mod tests {
         use std::os::unix::net::UnixListener;
         let tmp = tempdir();
         let root = anchor(&tmp);
-        let _listener = UnixListener::bind(&tmp.join("sock")).expect("bind");
+        let _listener = UnixListener::bind(tmp.join("sock")).expect("bind");
         let entry = root.classify_leaf(b"sock").expect("stat").expect("entry");
         assert_eq!(entry.kind, LeafKind::Other);
         assert!(root.open_regular_leaf(b"sock").is_err());
@@ -905,20 +945,23 @@ mod tests {
         let root = anchor(&tmp);
         let temp = root.ensure_subdir(b"tmp-1").expect("temp");
         temp.create_leaf_excl(b"a").expect("a");
-        std::os::unix::fs::symlink("/etc/passwd", &tmp.join("tmp-1/link")).expect("link");
+        std::os::unix::fs::symlink("/etc/passwd", tmp.join("tmp-1/link")).expect("link");
         root.remove_private_tree(b"tmp-1").expect("rmtree");
         assert!(!&tmp.join("tmp-1").exists());
-        assert!(std::path::Path::new("/etc/passwd").exists(), "target untouched");
+        assert!(
+            std::path::Path::new("/etc/passwd").exists(),
+            "target untouched"
+        );
     }
 
     #[test]
     fn open_or_create_anchor_handles_missing_leaf_components() {
         let tmp = tempdir();
         let target = &tmp.join("a/b/c");
-        let dir = DirFd::anchor_or_create(&target).expect("anchor create");
+        let dir = DirFd::anchor_or_create(target).expect("anchor create");
         dir.create_leaf_excl(b"x").expect("leaf");
         assert!(target.join("x").is_file());
         // Re-open is idempotent.
-        DirFd::anchor_or_create(&target).expect("re-anchor");
+        DirFd::anchor_or_create(target).expect("re-anchor");
     }
 }

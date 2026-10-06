@@ -318,7 +318,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
     // manual run.
     crate::sandbox::ensure_home_allocated(&home, "FAKE_HARNESS_ALLOW_HOME_WRITE")
         .map_err(RunError::Io)?;
-    remuda_fdsafe::DirFd::open_or_create_abs(&home).map_err(std::io::Error::from)?;
+    remuda_fdsafe::DirFd::anchor_or_create(&home).map_err(std::io::Error::from)?;
     let session_id = opts
         .session_id
         .clone()
@@ -384,7 +384,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
                 )));
             };
             let parent_fd =
-                remuda_fdsafe::DirFd::open_or_create_abs(parent).map_err(std::io::Error::from)?;
+                remuda_fdsafe::DirFd::anchor_or_create(parent).map_err(std::io::Error::from)?;
             let file = match parent_fd.classify_leaf(name.as_encoded_bytes()) {
                 Ok(Some(entry)) if matches!(entry.kind, remuda_fdsafe::LeafKind::Regular) => {
                     parent_fd
@@ -612,6 +612,9 @@ fn config_trust_accepted(home: &Path, cwd: &Path) -> Option<bool> {
         .as_bool()
 }
 
+/// Escape hatch shared by every harness home/file write.
+const HARNESS_ALLOW_HOME_ENV: &str = "FAKE_HARNESS_ALLOW_HOME_WRITE";
+
 fn default_home(dialect: Dialect) -> Option<PathBuf> {
     let (env, fallback) = match dialect {
         Dialect::Claude => ("CLAUDE_CONFIG_DIR", ".claude"),
@@ -624,8 +627,8 @@ fn default_home(dialect: Dialect) -> Option<PathBuf> {
     // temp tree; with none, the engine mints a private per-process temp home.
     // `FAKE_HARNESS_ALLOW_HOME_WRITE=1` is the deliberate-manual-run escape
     // hatch.
-    const ALLOW_ENV: &str = "FAKE_HARNESS_ALLOW_HOME_WRITE";
-    match crate::sandbox::sandboxed_home(env, "HOME", fallback, ALLOW_ENV) {
+    const HARNESS_ALLOW_HOME_ENV: &str = "FAKE_HARNESS_ALLOW_HOME_WRITE";
+    match crate::sandbox::sandboxed_home(env, "HOME", fallback, HARNESS_ALLOW_HOME_ENV) {
         Ok(Some(home)) => Some(home),
         Ok(None) => Some(crate::sandbox::private_temp_home(match dialect {
             Dialect::Claude => "fake-harness-claude",
@@ -668,7 +671,7 @@ fn open_resume(
                     path.display()
                 )));
             }
-            let file = std::fs::OpenOptions::new().append(true).open(&path)?;
+            let file = crate::sandbox::open_append_file(&path, HARNESS_ALLOW_HOME_ENV)?;
             Ok((
                 ArtifactSet::from_existing(kind, file, None, meta, None)?,
                 ArtifactPaths {
@@ -684,7 +687,7 @@ fn open_resume(
                 .ok_or_else(|| {
                     RunError::Args(format!("resume: no codex rollout for {resume_id}"))
                 })?;
-            let file = std::fs::OpenOptions::new().append(true).open(&path)?;
+            let file = crate::sandbox::open_append_file(&path, HARNESS_ALLOW_HOME_ENV)?;
             Ok((
                 ArtifactSet::from_existing(kind, file, None, meta, None)?,
                 ArtifactPaths {
@@ -711,8 +714,11 @@ fn open_resume(
             Ok((
                 ArtifactSet::from_existing(
                     kind,
-                    std::fs::OpenOptions::new().append(true).open(&updates)?,
-                    Some(std::fs::OpenOptions::new().append(true).open(&events)?),
+                    crate::sandbox::open_append_file(&updates, HARNESS_ALLOW_HOME_ENV)?,
+                    Some(crate::sandbox::open_append_file(
+                        &events,
+                        HARNESS_ALLOW_HOME_ENV,
+                    )?),
                     meta,
                     Some(dir.clone()),
                 )?,
@@ -1455,7 +1461,11 @@ impl Engine {
                     json!({})
                 };
                 settings["tui"] = json!(tui);
-                std::fs::write(path, settings.to_string())?;
+                crate::sandbox::write_allowed_file(
+                    &path,
+                    settings.to_string().as_bytes(),
+                    HARNESS_ALLOW_HOME_ENV,
+                )?;
                 Ok(())
             })();
             match result {
@@ -2851,9 +2861,17 @@ impl Engine {
         if self.dialect == Dialect::Grok {
             // The registry entry is removed during shutdown, before the
             // process exits (evidence A2): discovery only, never liveness.
-            std::fs::write(self.home.join("active_sessions.json"), "[]\n")?;
+            crate::sandbox::write_allowed_file(
+                &self.home.join("active_sessions.json"),
+                b"[]\n",
+                HARNESS_ALLOW_HOME_ENV,
+            )?;
             if let Some(dir) = &self.paths.grok_dir {
-                std::fs::write(dir.join("usage.json"), "{}\n")?;
+                crate::sandbox::write_allowed_file(
+                    &dir.join("usage.json"),
+                    b"{}\n",
+                    HARNESS_ALLOW_HOME_ENV,
+                )?;
             }
         }
         self.event("exit", json!({}));

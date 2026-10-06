@@ -208,7 +208,10 @@ fn readable_regular_file(path: &Path) -> std::io::Result<bool> {
     let Some(name) = absolute.file_name() else {
         return Ok(false);
     };
-    let dir = match DirFd::open_existing_abs(parent) {
+    // Pin the parent as a trusted anchor (realpath resolved once; the fd walk
+    // stays symlink-free below it) rather than walking every system path from
+    // `/`, which breaks on macOS `/tmp → /private/tmp` mount symlinks.
+    let dir = match DirFd::anchor_existing(parent) {
         Ok(dir) => dir,
         Err(error) if error.kind == FdErrorKind::Missing => return Ok(false),
         Err(error) => return Err(error.into()),

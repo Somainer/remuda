@@ -448,7 +448,7 @@ pub fn cwd_matches(path: &Path, terminal_cwd: &Path) -> bool {
 //
 // Everything below reaches the filesystem through descriptor-relative walks
 // (remuda-fdsafe): see [`stage_for_resume`] for the safety contract.
-use remuda_fdsafe::{DirFd, FdErrorKind, LeafKind};
+use remuda_fdsafe::{DirFd, FdErrorKind, LeafKind, OpenedLeaf};
 use std::os::unix::ffi::OsStrExt;
 
 /// What [`stage_for_resume`] made visible inside the resume launch's home.
@@ -599,6 +599,40 @@ fn limit_exceeded(message: impl Into<String>) -> std::io::Error {
 const STAGING_MARKER_DIR: &str = ".remuda-staging";
 /// Prefix of the per-attempt private temp tree, also inside the slug dir.
 const STAGING_TMP_PREFIX: &str = ".stage-";
+/// Env seam for out-of-crate integration tests; in-crate unit tests use the
+/// `cfg(test)` thread-local instead (the workspace forbids `unsafe`, and
+/// `std::env::set_var` is unsafe on this edition).
+const PUBLISH_NO_MARKER_SEAM_ENV: &str = "REMUDA_RESUME_STAGE_SEAM_PUBLISH_NO_MARKER";
+/// Env seam for a crash after copy but before publish.
+const CRASH_AFTER_STAGE_SEAM_ENV: &str = "REMUDA_RESUME_STAGE_SEAM_AFTER_STAGE";
+
+#[cfg(not(test))]
+fn publish_no_marker_seam() -> bool {
+    std::env::var_os(PUBLISH_NO_MARKER_SEAM_ENV).is_some()
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLISH_NO_MARKER_SEAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CRASH_AFTER_STAGE_SEAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn publish_no_marker_seam() -> bool {
+    PUBLISH_NO_MARKER_SEAM.with(std::cell::Cell::get)
+        || std::env::var_os(PUBLISH_NO_MARKER_SEAM_ENV).is_some()
+}
+
+#[cfg(not(test))]
+fn crash_after_stage_seam() -> bool {
+    std::env::var_os(CRASH_AFTER_STAGE_SEAM_ENV).is_some()
+}
+
+#[cfg(test)]
+fn crash_after_stage_seam() -> bool {
+    CRASH_AFTER_STAGE_SEAM.with(std::cell::Cell::get)
+        || std::env::var_os(CRASH_AFTER_STAGE_SEAM_ENV).is_some()
+}
 
 /// Provenance recorded next to a staged transcript (review item 4). The sha is
 /// computed over the bytes actually streamed into the child home (round 3
@@ -686,7 +720,7 @@ fn stage_for_resume_with_limits(
                 source_abs.display()
             ))
         })?;
-    let src_dir_fd = DirFd::open_existing_abs(source_dir_path).map_err(|error| {
+    let src_dir_fd = DirFd::anchor_existing(source_dir_path).map_err(|error| {
         if error.kind == FdErrorKind::Missing {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -729,9 +763,10 @@ fn stage_for_resume_with_limits(
     let resolved_cwd =
         std::fs::canonicalize(target_cwd).unwrap_or_else(|_| target_cwd.to_path_buf());
     let slug = encode_project_dir(&resolved_cwd);
-    let dest_home_fd = DirFd::open_or_create_abs(&absolutize(target_home))?;
+    let dest_home_fd = DirFd::anchor_or_create(&absolutize(target_home))?;
     let projects_fd = dest_home_fd.ensure_subdir(b"projects")?;
     let dest_dir_fd = projects_fd.ensure_subdir(slug.as_bytes())?;
+    let dest_dir_identity = dest_dir_fd.dir_identity()?;
     let dest_dir = project_dir(target_home, &resolved_cwd);
     let transcript_name = format!("{session_id}.jsonl");
     let transcript_name_bytes = transcript_name.as_bytes().to_vec();
@@ -756,9 +791,13 @@ fn stage_for_resume_with_limits(
         }
         Some(_) => {
             let dest_leaf = dest_dir_fd.open_regular_leaf(&transcript_name_bytes)?;
-            if dest_leaf.identity()? == src_identity {
-                // Inherited home: the conversation already lives exactly where
-                // the new process looks. Nothing is staged, no marker needed.
+            if dest_leaf.identity()? == src_identity
+                && Some(dest_dir_identity) == src_dir_fd.dir_identity().ok()
+            {
+                // Same file in the SAME inherited project directory: the
+                // conversation already lives exactly where the new process
+                // looks. A cross-home hardlink (different directory fd) is
+                // NOT a no-op and falls through to be copied fresh.
                 return Ok(StagedResume {
                     transcript: dest_transcript,
                     sidecar_dirs: Vec::new(),
@@ -814,6 +853,7 @@ fn stage_for_resume_with_limits(
     let mut budget = CopyBudget::default();
     let mut skipped: Vec<String> = Vec::new();
     let outcome = build_verify_and_publish(
+        src_leaf,
         &src_dir_fd,
         &source_name,
         source_transcript,
@@ -848,6 +888,7 @@ fn stage_for_resume_with_limits(
 /// transcript, and the caller removes the temp tree.
 #[allow(clippy::too_many_arguments)]
 fn build_verify_and_publish(
+    transcript_leaf: OpenedLeaf,
     src_dir_fd: &DirFd,
     source_name: &std::ffi::OsStr,
     source_transcript: &Path,
@@ -867,22 +908,27 @@ fn build_verify_and_publish(
     let mut seeds: Vec<ManifestEntry> = Vec::new();
     let mut published_roots: Vec<PathBuf> = Vec::new();
 
-    // (1) Transcript. Count + bytes are charged BEFORE streaming; the stream
-    // independently refuses to cross the byte cap.
+    // (1) Transcript. Reserve the file count up front; bytes are charged on
+    // the real stream (round 4 item 10), capped at the remaining budget.
     budget.note_file(limits)?;
-    budget.charge_bytes(source_size, limits)?;
-    let transcript_src = src_dir_fd.open_regular_leaf(source_name.as_bytes())?;
+    // Round 4 item 4: stream the ORIGINAL opened fd; the name is never
+    // re-opened after validation.
+    let mut transcript_src = transcript_leaf;
+    let transcript_leaf_identity = transcript_src.identity()?;
     let mut transcript_tmp = temp_fd.create_leaf_excl(transcript_name.as_bytes())?;
-    let transcript_sha = stream_hashed(
-        &mut &transcript_src.file,
+    let remaining_bytes = limits.max_bytes.saturating_sub(budget.bytes);
+    let streamed = stream_hashed(
+        &mut &mut transcript_src.file,
         &mut transcript_tmp,
         source_size,
-        limits,
+        remaining_bytes,
     )?;
+    let transcript_sha = streamed.sha256;
+    budget.charge_bytes(streamed.bytes, limits)?;
     drop(transcript_tmp);
     seeds.push(ManifestEntry {
         rel: transcript_name.to_owned(),
-        size: source_size,
+        size: streamed.bytes,
         sha256: transcript_sha.clone(),
     });
 
@@ -928,15 +974,13 @@ fn build_verify_and_publish(
                     &mut files,
                 )?;
                 for (rel, size) in files {
-                    copy_sidecar_seed(
-                        &root_fd,
-                        &root_label,
-                        &rel,
-                        size,
-                        temp_fd,
+                    let mut account = StageAccount {
                         limits,
-                        &mut seeds,
-                    )?;
+                        budget,
+                        seeds: &mut seeds,
+                    };
+                    copy_sidecar_seed(&root_fd, &root_label, &rel, size, temp_fd, &mut account)?;
+                    // account holds &mut seeds; drop it before the next loop use.
                 }
                 if !is_memory {
                     session_root_taken = true;
@@ -963,27 +1007,64 @@ fn build_verify_and_publish(
         .write_all(&body)?;
     verify_temp_tree(temp_fd, &seeds)?;
 
+    // Test seam: crash after files are staged (and verified) in the private
+    // temp tree but before anything is published. The caller must remove the
+    // whole populated stage dir; a regression test asserts it is gone.
+    if crash_after_stage_seam() {
+        return Err(std::io::Error::other(
+            "injected staging failure after copy, before publish (test seam)",
+        ));
+    }
+
     // (4) A retained destination transcript now has to prove provenance
-    // against the source bytes we actually streamed.
+    // against the source bytes we actually streamed. Round 4 item 9: a
+    // transcript published in an earlier attempt whose marker never landed
+    // (a crash in the publish window) is RECOVERABLE — re-hash the bytes at
+    // the destination and accept them only if they are exactly the bytes the
+    // current source streamed.
     if retained {
-        let marker = read_staging_provenance(dest_dir_fd, transcript_name)?.ok_or_else(|| {
-            invalid_input(format!(
-                "resume destination {dest_transcript} already exists without Remuda staging \
-                     provenance for predecessor {source}; refusing to keep or overwrite a \
-                     conversation this launch did not stage (resume in a fresh native home or \
-                     remove the stale file)",
-                dest_transcript = dest_dir.join(transcript_name).display(),
-                source = source_transcript.display()
-            ))
-        })?;
-        if !marker.covers(source_transcript, source_size, &transcript_sha) {
-            return Err(invalid_input(format!(
-                "resume destination {} exists but its staging provenance does not match \
-                 predecessor {} (size {source_size}, sha256 {transcript_sha}); refusing to \
-                 overwrite",
-                dest_dir.join(transcript_name).display(),
-                source_transcript.display()
-            )));
+        // The marker binds the PUBLISHED transcript, whose size is the number
+        // of bytes actually streamed.
+        let published_size = seeds
+            .iter()
+            .find(|seed| seed.rel == transcript_name)
+            .map_or(source_size, |seed| seed.size);
+        match read_staging_provenance(dest_dir_fd, transcript_name)? {
+            // A marker that covers the predecessor we just streamed: keep it.
+            Some(marker) if marker.covers(source_transcript, published_size, &transcript_sha) => {}
+            // A marker that names different bytes/source is a definitive
+            // conflict; do NOT byte-recover over an existing marker.
+            Some(_) => {
+                return Err(invalid_input(format!(
+                    "resume destination {} exists but its staging provenance does not match \
+                     predecessor {} (size {published_size}, sha256 {transcript_sha}); refusing to \
+                     overwrite",
+                    dest_dir.join(transcript_name).display(),
+                    source_transcript.display()
+                )));
+            }
+            // No marker at all: an interrupted publish (crash between the
+            // transcript rename and the marker write). Recover ONLY when the
+            // bytes already at the destination are exactly the bytes the
+            // current source streamed; a fresh marker is written below.
+            None => {
+                let recovered = destination_bytes_match(
+                    dest_dir_fd,
+                    transcript_name,
+                    published_size,
+                    &transcript_sha,
+                )?;
+                if !recovered {
+                    return Err(invalid_input(format!(
+                        "resume destination {dest_transcript} already exists without Remuda staging \
+                         provenance for predecessor {source} (and its bytes do not match the staged \
+                         copy); refusing to keep or overwrite a conversation this launch did not \
+                         stage (resume in a fresh native home or remove the stale file)",
+                        dest_transcript = dest_dir.join(transcript_name).display(),
+                        source = source_transcript.display()
+                    )));
+                }
+            }
         }
     }
 
@@ -1003,8 +1084,20 @@ fn build_verify_and_publish(
         }
         publish_one_seed(temp_fd, dest_dir_fd, seed)?;
     }
-    if !retained {
-        // Re-check right before the rename: the destination must still be
+    // Publish the transcript. Two retained cases:
+    // - the destination is the SAME INODE as the open source but in a
+    //   DIFFERENT directory (a cross-home hardlink, round 4 item 2): replace it
+    //   with the fresh independent temp copy, breaking the link;
+    // - the destination is a different inode (an independent prior stage,
+    //   possibly carrying this child's appended turns): keep its bytes and drop
+    //   the temp copy, never overwriting the child's turns.
+    // The inherited-home no-op (same directory AND same inode) returned before
+    // this function.
+    let replace_retained = if retained {
+        let dest_leaf = dest_dir_fd.open_regular_leaf(transcript_name.as_bytes())?;
+        dest_leaf.identity()? == transcript_leaf_identity
+    } else {
+        // Re-check right before the rename: a fresh destination must still be
         // absent, otherwise fail closed instead of replacing it.
         if dest_dir_fd
             .classify_leaf(transcript_name.as_bytes())?
@@ -1016,25 +1109,66 @@ fn build_verify_and_publish(
                 dest_dir.join(transcript_name).display()
             )));
         }
+        true
+    };
+    if replace_retained {
         temp_fd.rename(
             transcript_name.as_bytes(),
             dest_dir_fd,
             transcript_name.as_bytes(),
         )?;
     } else {
-        // The retained transcript is never replaced; drop its temp copy.
+        // Keep the independent destination (its provenance was validated above
+        // and it may carry this child's appended turns); discard the temp copy.
         let _ = temp_fd.unlink_file(transcript_name.as_bytes());
+    }
+
+    // Test seam: simulate a crash AFTER the transcript (and sidecars) are
+    // published but BEFORE the provenance marker is written. The transcript is
+    // left stranded without a marker; a retry must detect and recover it via
+    // destination_bytes_match. Toggled by the cfg(test) thread-local (the
+    // workspace forbids the unsafe env::set_var); the env var is the seam for
+    // out-of-crate integration tests.
+    if publish_no_marker_seam() {
+        return Err(std::io::Error::other(
+            "injected staging failure between transcript publish and marker (test seam)",
+        ));
     }
 
     // (6) Provenance marker last (a reader sees the transcript before the
     // marker can validate it; the reverse order would validate nothing).
+    let published_size = seeds
+        .iter()
+        .find(|seed| seed.rel == transcript_name)
+        .map_or(source_size, |seed| seed.size);
     write_staging_provenance(
         dest_dir_fd,
         transcript_name,
-        &StagingProvenance::new(source_transcript, source_size, &transcript_sha),
+        &StagingProvenance::new(source_transcript, published_size, &transcript_sha),
     )?;
 
     Ok(published_roots)
+}
+
+/// Whether the existing destination transcript is byte-identical to the copy
+/// we just streamed from the source: same size and same sha256. Used to
+/// recover an interrupted publish (transcript renamed, marker never written).
+fn destination_bytes_match(
+    dest_dir_fd: &DirFd,
+    transcript_name: &str,
+    source_size: u64,
+    source_sha: &str,
+) -> std::io::Result<bool> {
+    let leaf = match dest_dir_fd.open_regular_leaf(transcript_name.as_bytes()) {
+        Ok(leaf) => leaf,
+        Err(error) if error.kind == FdErrorKind::Missing => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if leaf.len != source_size {
+        return Ok(false);
+    }
+    let sha = hash_reader(&mut &leaf.file)?;
+    Ok(sha == source_sha)
 }
 
 /// Recursively classify a source sidecar directory. Regular files are
@@ -1080,8 +1214,11 @@ fn enumerate_regular(
                 )?;
             }
             LeafKind::Regular => {
+                // Round 4 item 10: do NOT charge the enumerated size here —
+                // a file can grow between enumeration and the open. Only the
+                // file count is reserved now; bytes are charged on the real
+                // stream against the REMAINING aggregate budget.
                 budget.note_file(limits)?;
-                budget.charge_bytes(entry.len, limits)?;
                 files.push((rel, entry.len));
             }
             LeafKind::Symlink => skipped.push(format!("symlink:{root_label}/{rel}")),
@@ -1095,15 +1232,23 @@ fn enumerate_regular(
 /// symlink between enumeration and open is refused here), stream it into the
 /// temp tree under `<root_label>/<rel>`, and record its slug-relative manifest
 /// entry.
+/// Mutable per-attempt accounting shared by the transcript and every
+/// sidecar stream: the live aggregate budget and the manifest being built.
+struct StageAccount<'a> {
+    limits: &'a StageLimits,
+    budget: &'a mut CopyBudget,
+    seeds: &'a mut Vec<ManifestEntry>,
+}
+
 fn copy_sidecar_seed(
     root_fd: &DirFd,
     root_label: &str,
     rel: &str,
     expected_size: u64,
     temp_fd: &DirFd,
-    limits: &StageLimits,
-    seeds: &mut Vec<ManifestEntry>,
+    account: &mut StageAccount,
 ) -> std::io::Result<()> {
+    let seeds = &mut *account.seeds;
     let inside: Vec<&[u8]> = rel.split('/').map(str::as_bytes).collect();
     // Source: walk from the root fd along the root-relative chain.
     let mut source_chain: Vec<DirFd> = Vec::new();
@@ -1127,59 +1272,80 @@ fn copy_sidecar_seed(
     }
     let temp_parent = temp_chain.last().unwrap_or(temp_fd);
     let mut out = temp_parent.create_leaf_excl(inside.last().unwrap())?;
-    let sha = stream_hashed(&mut &leaf.file, &mut out, expected_size, limits)?;
+    // Stream at most the REMAINING aggregate byte budget (+1 byte is probed
+    // inside copy_capped to detect an over-cap stream); charge the actual
+    // byte count afterwards.
+    let remaining_bytes = account
+        .limits
+        .max_bytes
+        .saturating_sub(account.budget.bytes);
+    let streamed = stream_hashed(&mut &leaf.file, &mut out, expected_size, remaining_bytes)?;
+    account
+        .budget
+        .charge_bytes(streamed.bytes, account.limits)?;
     seeds.push(ManifestEntry {
         rel: format!("{root_label}/{rel}"),
-        size: expected_size,
-        sha256: sha,
+        size: streamed.bytes,
+        sha256: streamed.sha256,
     });
     Ok(())
 }
 
-/// Stream `src` to `dst`, SHA-256-ing every byte actually copied. The byte cap
-/// is enforced on the live byte count (independent of the pre-charged
-/// budget), and the stream must end at exactly the size the entry was
-/// classified with — a grown or swapped file is a hard error.
+/// Copy result: the number of bytes streamed and their sha256.
+struct Streamed {
+    bytes: u64,
+    sha256: String,
+}
+
+/// Stream `src` to `dst`, SHA-256-ing every byte actually copied.
+///
+/// `min_size` is the size the entry was classified with; the stream must read
+/// at least that many (a truncated file fails). `remaining_bytes` is the
+/// caller's remaining AGGREGATE budget; no more than that many bytes are
+/// copied, and a stream with one more byte fails. A file that grew after
+/// enumeration therefore fails the cap instead of pushing the copy over.
 fn stream_hashed<R, W>(
     src: &mut R,
     dst: &mut W,
-    expected_size: u64,
-    limits: &StageLimits,
-) -> std::io::Result<String>
+    min_size: u64,
+    remaining_bytes: u64,
+) -> std::io::Result<Streamed>
 where
     R: std::io::Read,
     W: std::io::Write,
 {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0_u8; 64 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        let read = src.read(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        let next = total
-            .checked_add(read as u64)
-            .ok_or_else(|| limit_exceeded("byte count overflow while staging"))?;
-        if next > limits.max_bytes {
-            return Err(limit_exceeded(format!(
-                "resume staging size limit exceeded: more than {} bytes",
-                limits.max_bytes
-            )));
-        }
-        hasher.update(&buf[..read]);
-        dst.write_all(&buf[..read])?;
-        total = next;
-    }
-    dst.flush()?;
-    if total != expected_size {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut hashing = HashedWriter {
+        out: dst,
+        hasher: &mut hasher,
+    };
+    let bytes = remuda_fdsafe::copy_capped(src, &mut hashing, remaining_bytes)?;
+    if bytes < min_size {
         return Err(std::io::Error::other(format!(
-            "resume staging source file changed size while copying: classified {expected_size}, \
-             read {total}"
+            "resume staging source file shrank while copying: classified {min_size}, read {bytes}"
         )));
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(Streamed {
+        bytes,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+/// A writer that tees each byte into a Sha256 hasher and onward to `out`.
+struct HashedWriter<'a, W: std::io::Write> {
+    out: &'a mut W,
+    hasher: &'a mut sha2::Sha256,
+}
+impl<W: std::io::Write> std::io::Write for HashedWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        sha2::Digest::update(&mut *self.hasher, buf);
+        self.out.write_all(buf)?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
 }
 
 /// Walk the temp tree and prove every manifest entry is present at exactly the
@@ -2712,7 +2878,7 @@ mod tests {
     #[test]
     fn round3_streaming_hashes_the_opened_fd_not_a_path_reread() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let root = remuda_fdsafe::DirFd::open_root(tmp.path()).expect("root");
+        let root = remuda_fdsafe::DirFd::anchor_existing(tmp.path()).expect("root");
         root.create_leaf_excl(b"t.jsonl")
             .expect("create")
             .write_all(b"original-bytes\n")
@@ -2727,11 +2893,11 @@ mod tests {
             .expect("swap path");
         let mut reader = leaf.file;
         let mut out = root.create_leaf_excl(b"copy").expect("copy");
-        let sha = stream_hashed(
+        let streamed = stream_hashed(
             &mut reader,
             &mut out,
             "original-bytes\n".len() as u64,
-            &DEFAULT_STAGE_LIMITS,
+            DEFAULT_STAGE_LIMITS.max_bytes,
         )
         .expect("stream from held fd");
         let mut got = Vec::new();
@@ -2747,9 +2913,10 @@ mod tests {
             format!("{:x}", Sha256::digest(b"original-bytes\n"))
         };
         assert_eq!(
-            sha, expected,
+            streamed.sha256, expected,
             "provenance hashes the streamed bytes, not the swapped path"
         );
+        assert_eq!(streamed.bytes, "original-bytes\n".len() as u64);
     }
 
     /// Item 4: a FIFO sidecar can never block staging or be copied: it is
@@ -2969,9 +3136,235 @@ mod tests {
         }
     }
 
+    /// Round 4 item 2: a HARDlink to the predecessor placed in a DIFFERENT
+    /// destination directory is not an inherited-home no-op — it is streamed
+    /// from the open source fd into a fresh O_EXCL file and lands as an
+    /// independent regular file (the source stays untouched).
+    #[cfg(unix)]
+    #[test]
+    fn round4_cross_home_hardlink_is_copied_not_treated_as_same_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b7";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "hardlink-content\n");
+
+        // First stage so the destination directory + marker exist, then replace
+        // the destination transcript with a hardlink into the predecessor file
+        // located in a DIFFERENT directory.
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
+        let dest = staged.transcript;
+        std::fs::remove_file(&dest).expect("remove staged transcript");
+        // Create the hardlink by the low-level linkat-less std path: std::fs::hard_link.
+        std::fs::hard_link(&source, &dest).expect("cross-dir hardlink");
+
+        // The hardlink now shares the source inode, but the destination and
+        // source project DIRECTORIES differ. A second stage must not no-op; it
+        // must replace the link with an independent copy.
+        let staged2 = stage_for_resume(&source, &new_home, &cwd, session).expect("second stage");
+        assert_eq!(
+            std::fs::read_to_string(&staged2.transcript).unwrap(),
+            "hardlink-content\n"
+        );
+        // Breaking the link: mutate the copy destination; the source inode must
+        // be independent (the staged file is no longer a hardlink).
+        let src_ino_before = inode_of(&source);
+        let dst_ino_after = inode_of(&staged2.transcript);
+        assert_ne!(
+            src_ino_before, dst_ino_after,
+            "a cross-directory hardlink must be replaced by an independent file, not no-op'd"
+        );
+    }
+
+    /// Same-file no-op still applies when the destination directory IS the
+    /// source project directory (the inherited-home case).
+    #[cfg(unix)]
+    #[test]
+    fn round4_same_directory_same_inode_is_still_a_noop() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b8";
+        let source = transcript_layout(&home, &cwd, session);
+        write_file(&source, "inherited\n");
+        let staged = stage_for_resume(&source, &home, &cwd, session).expect("inherited no-op");
+        assert_eq!(
+            std::fs::read_to_string(&staged.transcript).unwrap(),
+            "inherited\n"
+        );
+        // No marker is written for the no-op.
+        assert!(
+            !source.parent().unwrap().join(".remuda-staging").exists(),
+            "inherited-home no-op needs no staging marker"
+        );
+    }
+
+    /// Round 4 item 5: a unix socket sidecar is classified Other, skipped and
+    /// reported, and staging still succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn round4_socket_and_device_sidecars_are_skipped_and_reported() {
+        use std::os::unix::net::UnixListener;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b9";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+        let side = source.parent().unwrap().join(session);
+        std::fs::create_dir_all(&side).expect("side dir");
+        let _listener = UnixListener::bind(side.join("sock")).expect("bind socket");
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
+        assert!(staged.transcript.is_file());
+        assert!(
+            !staged
+                .transcript
+                .parent()
+                .unwrap()
+                .join(session)
+                .join("sock")
+                .exists(),
+            "socket sidecar is never copied"
+        );
+        assert!(
+            staged.skipped.iter().any(|entry| entry.contains("sock")),
+            "socket reported: {:?}",
+            staged.skipped
+        );
+    }
+
+    /// Round 4 item 9: a crash between publishing the transcript and writing
+    /// the marker leaves a stranded, byte-identical transcript; the retry
+    /// validates the bytes and recovers instead of refusing.
+    #[test]
+    fn round4_interrupted_publish_without_marker_is_recoverable() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000ba";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "recoverable-turn\n");
+        // First attempt injects the post-publish/pre-marker failure.
+        // First attempt injects the post-publish/pre-marker failure.
+        PUBLISH_NO_MARKER_SEAM.with(|seam| seam.set(true));
+        let first = stage_for_resume(&source, &new_home, &cwd, session);
+        PUBLISH_NO_MARKER_SEAM.with(|seam| seam.set(false));
+        assert!(first.is_err(), "seam forces a failure");
+        // The transcript landed, the marker did not.
+        let dest_project = new_home.join("projects").join(encode_project_dir(&cwd));
+        let dest = dest_project.join(format!("{session}.jsonl"));
+        assert!(dest.is_file(), "transcript published before the crash seam");
+        assert!(
+            !dest_project.join(".remuda-staging").exists(),
+            "marker not written at the seam"
+        );
+        // Retry recovers the identical transcript and writes the marker.
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("retry recovers");
+        assert_eq!(
+            std::fs::read_to_string(&staged.transcript).unwrap(),
+            "recoverable-turn\n"
+        );
+        assert!(
+            dest_project.join(".remuda-staging").exists(),
+            "marker written on recovery"
+        );
+    }
+
+    /// Round 4 item 10: a sidecar that grows after enumeration cannot push the
+    /// copy over the aggregate byte cap. The transcript fills most of a tiny
+    /// cap; an enumerated sidecar slightly over the remainder is refused
+    /// during the real stream.
+    #[test]
+    fn round4_a_sidecar_growing_past_remaining_budget_is_refused() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000bb";
+        let source = transcript_layout(&old_home, &cwd, session);
+        // 10-byte transcript.
+        write_file(&source, "0123456789");
+        // A 6-byte sidecar.
+        write_file(&source.parent().unwrap().join("memory/MEMORY.md"), "abcdef");
+        // Cap of 12 bytes: transcript (10) + sidecar (6) exceeds it, although
+        // EACH file is under the cap on its own.
+        let tight = StageLimits {
+            max_bytes: 12,
+            max_files: 10_000,
+            max_depth: 32,
+        };
+        let error = stage_for_resume_with_limits(&source, &new_home, &cwd, session, tight)
+            .expect_err("aggregate cap enforced on live stream");
+        assert!(
+            error.to_string().contains("size limit exceeded"),
+            "unexpected: {error}"
+        );
+    }
+
+    /// Round 4 item 11: an injected failure after files are staged (but before
+    /// publish) leaves NOTHING in the slug directory — the populated private
+    /// stage tree is removed by the caller.
+    #[test]
+    fn round4_failed_attempt_removes_its_populated_stage_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000bc";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "the transcript\n");
+        write_file(
+            &source.parent().unwrap().join("memory/MEMORY.md"),
+            "project memory\n",
+        );
+        CRASH_AFTER_STAGE_SEAM.with(|seam| seam.set(true));
+        let error = stage_for_resume(&source, &new_home, &cwd, session);
+        CRASH_AFTER_STAGE_SEAM.with(|seam| seam.set(false));
+        assert!(error.is_err(), "seam forces a failure");
+        let slug_dir = new_home.join("projects").join(encode_project_dir(&cwd));
+        let leftover: Vec<_> = std::fs::read_dir(&slug_dir)
+            .expect("slug dir exists")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(STAGING_TMP_PREFIX)
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "the populated private stage dir was removed after failure: {leftover:?}"
+        );
+        // Nothing was published either.
+        assert!(
+            !slug_dir.join(format!("{session}.jsonl")).exists(),
+            "no transcript published before the seam"
+        );
+        // A normal retry then succeeds.
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("retry succeeds");
+        assert!(staged.transcript.is_file());
+    }
+
+    #[cfg(unix)]
+    fn inode_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn resume_staging_refuses_a_symlink_source_transcript() {
-        #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
             let tmp = tempfile::tempdir().expect("tmp");

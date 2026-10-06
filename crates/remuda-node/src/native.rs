@@ -357,7 +357,7 @@ impl DriverFactory for NativeClaudeFactory {
                     "cannot resume session {session_id}: predecessor transcript was not located on this host"
                 )));
             };
-            remuda_driver::claude_transcript::stage_for_resume(
+            let staged = remuda_driver::claude_transcript::stage_for_resume(
                 source,
                 &native_home,
                 &launch.workspace_root,
@@ -366,6 +366,19 @@ impl DriverFactory for NativeClaudeFactory {
             .map_err(|error| {
                 DriverError::Failed(format!("cannot resume session {session_id}: {error}"))
             })?;
+            // Surface every skipped sidecar (a symlink/FIFO/socket/device the
+            // safe staging walk refused to copy) as a production launch
+            // diagnostic — staging still succeeds, but the omission must never
+            // be silent.
+            for entry in &staged.skipped {
+                tracing::warn!(
+                    instance_id = %launch.instance.meta.id.as_id(),
+                    %session_id,
+                    skipped_sidecar = %entry,
+                    "resume staging skipped a non-regular or symlinked sidecar; it was not copied \
+                     into the new native home"
+                );
+            }
         }
         let spec = instance_spec(&launch, &self.config, &profile)?;
         let binary = resolve_binary_source(

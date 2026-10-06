@@ -4181,18 +4181,34 @@ fn fake_hook_question(instance_id: &str, host_id: &str, interaction_id: &str) ->
 /// r-ux-comment: prompts mentioning code get an assistant reply containing a
 /// fenced ts block, so the browser spec can quote it with the 评论 action.
 fn code_comment_reply(prompt: &str) -> Option<String> {
-    // Font-swap fixture: a pre-wrap fenced block whose LONG lines cross a wrap
-    // boundary between the fallback monospace and IBM Plex Mono at both the
-    // desktop read measure and the 390px mobile pane, so a real font swap
-    // changes the block's (and thus the transcript row's) HEIGHT, not just
-    // glyph widths. Rendered with soft-wrap on (the spec sets
-    // runtime.code-wrap=1).
+    // Font-swap fixture: a COMPACT pre-wrap fenced block with a few lines
+    // tuned to the wrap boundary at each pane width. IBM Plex Mono is the
+    // wider face (~8.0px/char vs ~7.83 system monospace), so a line just
+    // under capacity on the fallback wraps to an extra line on Plex — always
+    // in the same direction. Three lines around the ~340px mobile capacity
+    // (~43-45 chars) move the block height at 390px; three around the ~700px
+    // desktop read measure (~87-90 chars) move it at 1440. The block stays
+    // short enough that the burst anchor below still parks near the top, but
+    // its real HEIGHT changes across faces (unlike a non-wrapping <pre>).
     if prompt.contains("font wrap probe") {
-        let long = "const fontSwapProbe = aaaa9bbb8cccc7dddd6eeee5ffff4gggg3hhhh2iiii1jjjj0kkkk9llll8mmmm7nnnn6oooo5pppp4qqqq3rrrr2ssss1tttt0uuuu9vvvv8wwww7xxxx6yyyy5zzzz4aaaa3bbbb2cccc1dddd0eeee9ffff8gggg7hhhh6iiii5jjjj4kkkk3llll2mmmm1nnnn0oooo9pppp8qqqq7rrrr6ssss5tttt4uuuu3vvvv2wwww1xxxx0;".repeat(4);
-        let mut body = String::from("here is a function that wraps across the fallback and final faces:\n\n```ts src/font_swap_probe.ts\n");
-        for i in 0..4 {
-            body.push_str(&format!("// wrap probe line {i}: {long}\n"));
-        }
+        // Lines tuned EXACTLY to the measured wrap boundary against the real
+        // <pre> content width (see the r3 wrap-count probes). The boundary is
+        // the TOTAL line length including the "// x " marker below: 41 chars
+        // at the 330px mobile content width (390 pane), 87 chars at the 692px
+        // desktop content width (1440). IBM Plex Mono is ~2.2% wider than the
+        // system fallback monospace, so a line of exactly boundary length fits
+        // the fallback on one line but wraps to two on Plex — always the same
+        // direction, never cancelling. One line per width: the swap changes
+        // the block/row HEIGHT by ~one line (~21px) at each viewport while
+        // the block stays compact enough for the saved-position restore.
+        let marker_line = |total: usize, tag: char| -> String {
+            let prefix_len = format!("// {tag} ").len();
+            let chars: String = std::iter::repeat('m').take(total.saturating_sub(prefix_len)).collect();
+            format!("// {tag} {chars}\n")
+        };
+        let mut body = String::from("here is a function whose comments wrap across faces:\n\n```ts src/font_swap_probe.ts\n");
+        body.push_str(&marker_line(41, 'm'));
+        body.push_str(&marker_line(87, 'd'));
         body.push_str("export function fontSwapProbe(): string {\n  return \"font metrics moved the wrap count\";\n}\n```\n\nask about any wrapped line.");
         return Some(body);
     }

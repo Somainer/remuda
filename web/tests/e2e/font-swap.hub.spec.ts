@@ -305,7 +305,8 @@ async function rowOffset(scroller: Locator, n: number): Promise<number | null> {
       re.test(candidate.textContent ?? ""),
     );
     if (!row) return null;
-    return row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+    const top = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+    return top >= 0 && top <= el.clientHeight ? top : null;
   }, n);
 }
 
@@ -334,7 +335,11 @@ async function waitAnchorStable(
             (candidate) => re.test(candidate.textContent ?? ""),
           );
           if (!row) return null;
-          return row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+          const top = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+          // Only an ON-SCREEN row counts: a mounted but below-the-fold row
+          // would otherwise report a "stable" offset the reader never sees.
+          if (top < 0 || top > el.clientHeight) return null;
+          return top;
         };
         const REQUIRED = 3;
         let last: number | null = offset();
@@ -430,7 +435,8 @@ async function waitRestoreActiveAndPainted(
         re.test(candidate.textContent ?? ""),
       );
       if (!row) return null;
-      return row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+      const top = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+      return top >= 0 && top <= el.clientHeight ? top : null;
     },
     { label: anchor },
     { polling: "raf", timeout },
@@ -539,9 +545,10 @@ async function afterSwap(page: Page, scroller: Locator): Promise<void> {
  * the block is not mounted in the current virtual window.
  */
 async function wrapBlockRowHeight(scroller: Locator): Promise<number | null> {
-  return scroller.evaluate((el) => {
-    const blocks = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']"));
-    const block = blocks.find((b) => b.textContent?.includes("wrap probe line 0"));
+  return scroller.evaluate(() => {
+    const block = Array.from(document.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
+      b.textContent?.includes("fontSwapProbe(): string"),
+    );
     if (!block) return null;
     const row = block.closest<HTMLElement>("[data-testid='transcript-row']");
     return (row ?? block).getBoundingClientRect().height;
@@ -581,6 +588,7 @@ async function savedPositionSurvivesSwap(
   await loaded(page, instanceId);
   await afterSwap(page, scroller);
 
+
   // Reach the code block (virtualised out while pinned to the bottom). A
   // short journal walks up as a reader would. In a long window a pixel walk
   // jumps over unmeasured rows (a Transcript virtualiser issue outside this
@@ -590,7 +598,7 @@ async function savedPositionSurvivesSwap(
   if (longBurst > 0) {
     await page.getByTestId("transcript-search-open").click();
     const search = page.getByTestId("transcript-search-input");
-    await search.fill("wrap probe line 0");
+    await search.fill("font metrics moved the wrap count");
     await search.press("Enter");
     await expect(page.getByTestId("transcript-search-count")).toHaveText(/^1\//);
     await page.getByTestId("transcript-search-close").click();
@@ -611,13 +619,15 @@ async function savedPositionSurvivesSwap(
       .toBe(true);
   }
 
-  // Park the code block's tail near the top of the viewport and anchor on
-  // the first burst row below it, then leave.
-  const anchor = await scroller.evaluate((el) => {
-    // The newest reply's fenced block (the last one rendered).
+  // Park so the wrap-probe block fills the UPPER viewport and the first
+  // burst row below it sits in the LOWER viewport: both the block (whose
+  // height the swap changes) and the anchor row must stay mounted together
+  // for the height-delta and drift assertions to be observable.
+  const PARK_BOTTOM = 140;
+  const anchor = await scroller.evaluate((el, parkBottom) => {
     const pre = Array.from(el.querySelectorAll("pre")).at(-1);
     if (!pre) throw new Error("code block not rendered");
-    el.scrollTop += pre.getBoundingClientRect().bottom - el.getBoundingClientRect().top - 200;
+    el.scrollTop += pre.getBoundingClientRect().bottom - el.getBoundingClientRect().top - parkBottom;
     el.dispatchEvent(new Event("scroll", { bubbles: true }));
     const below = pre.getBoundingClientRect().bottom - 1;
     const labels = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']"))
@@ -626,14 +636,15 @@ async function savedPositionSurvivesSwap(
       .filter((value): value is string => Boolean(value))
       .map(Number);
     return Math.min(...labels);
-  });
+  }, PARK_BOTTOM);
   expect(Number.isFinite(anchor), "a burst row renders below the code block").toBe(true);
   await page.waitForTimeout(400);
   const saved = await rowOffset(scroller, anchor);
   expect(saved).not.toBeNull();
-  // The anchor is on screen, so the restore is observable.
   expect(saved!).toBeGreaterThanOrEqual(0);
   expect(saved!).toBeLessThan(900);
+  // The block must be mounted right above the anchor (height-delta proof).
+  expect(await wrapBlockRowHeight(scroller), "wrap-probe block mounted next to the saved anchor").not.toBeNull();
 
   await page.goto("/sessions");
   await expect(page.getByTestId("session-list")).toBeVisible();
@@ -695,11 +706,11 @@ async function savedPositionSurvivesSwap(
       await fontGate.waitArrival();
       expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
       beforeSwap = await waitAnchorStable(page, scroller, anchor);
-      blockFallback = await waitWrapBlockMeasured(scroller, "late arm (fallback)");
+      blockFallback = await expect.poll(() => wrapBlockRowHeight(scroller), { timeout: 5_000 }).not.toBeNull() as unknown as number;
       fontGate.release();
       await afterSwap(page, scroller);
       settled = await waitAnchorStable(page, scroller, anchor);
-      blockSwapped = await waitWrapBlockMeasured(scroller, "late arm (swapped)");
+      blockSwapped = await expect.poll(() => wrapBlockRowHeight(scroller), { timeout: 5_000 }).not.toBeNull() as unknown as number;
     } finally {
       await fontGate.dispose();
     }
@@ -722,7 +733,7 @@ async function savedPositionSurvivesSwap(
       // pending (the hook defers finalization until the font is available).
       beforeSwap = await waitRestoreActiveAndPainted(page, scroller, anchor);
       expect(await monoLoaded(page), "rows must paint on the fallback face before the swap").toBe(false);
-      blockFallback = await waitWrapBlockMeasured(scroller, "mid arm (fallback)");
+      blockFallback = await expect.poll(() => wrapBlockRowHeight(scroller), { timeout: 5_000 }).not.toBeNull() as unknown as number;
       const advanceFallback = await monoAdvance(page);
       fontGate.release();
       await waitFontLoaded(page, scroller, "mid arm release");
@@ -739,7 +750,7 @@ async function savedPositionSurvivesSwap(
         () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))),
       );
       settled = await waitAnchorStable(page, scroller, anchor);
-      blockSwapped = await waitWrapBlockMeasured(scroller, "mid arm (swapped)");
+      blockSwapped = await expect.poll(() => wrapBlockRowHeight(scroller), { timeout: 5_000 }).not.toBeNull() as unknown as number;
       const advanceSwapped = await monoAdvance(page);
       expect(advanceSwapped, "the held font never swapped to the final face").not.toBe(advanceFallback);
     } finally {
@@ -857,7 +868,7 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
     // raw write, so pin state is legitimate.
     await scroller.evaluate((el) => {
       const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
-        b.textContent?.includes("wrap probe line 0"),
+        b.textContent?.includes("fontSwapProbe(): string"),
       );
       block?.scrollIntoView({ block: "center" });
     });
@@ -876,7 +887,7 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
     // Measure the swapped block (390px) and require a real height change.
     await scroller.evaluate((el) => {
       const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
-        b.textContent?.includes("wrap probe line 0"),
+        b.textContent?.includes("fontSwapProbe(): string"),
       );
       block?.scrollIntoView({ block: "center" });
     });

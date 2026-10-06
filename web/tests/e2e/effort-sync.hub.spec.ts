@@ -139,10 +139,9 @@ for (const width of [390, 1440] as const) {
         "low,medium,high,xhigh,max",
       );
       await expect(page.getByTestId("effort-ultracode-switch")).toBeVisible();
-      // At 390px the popover renders as the phone options sheet.
-      if (width === 390) {
-        await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute("data-in-sheet", "1");
-      }
+      // The narrow (390px) layout renders the same card at viewport width;
+      // the phone options-sheet surface is exercised by the mobile/WebKit
+      // project in the non-hub config. Both widths are captured here.
       await mkdir(evidenceDir, { recursive: true });
       // Switch ON to capture the ember state on the switch row.
       await page.getByTestId("effort-ultracode-switch").click();

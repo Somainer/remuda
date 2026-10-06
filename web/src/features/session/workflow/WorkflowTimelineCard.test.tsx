@@ -487,22 +487,29 @@ describe("WorkflowTimelineCard", () => {
   });
 
   it("a live run with 101 completions exposes no invalid progressbar range", () => {
-    const agents101 = Array.from({ length: 101 }, (_, i) =>
-      member({ memberId: `m${i}`, state: i === 100 ? "running" : "completed" as const }),
-    );
+    // 101 completed members plus one still running (102 total): the count
+    // exceeds any assumed default max (100), so a live run must carry no
+    // now/max at all — only valuetext.
+    const agents102 = [
+      ...Array.from({ length: 101 }, (_, i) =>
+        member({ memberId: `d${i}`, state: "completed" as const }),
+      ),
+      member({ memberId: "r", state: "running" as const }),
+    ];
     renderCard(
       <WorkflowTimelineCard
         run={run({
           state: "running",
-          totals: totalsBlock({ done: 100, running: 1, total: 101 }),
+          totals: totalsBlock({ done: 101, running: 1, total: 102 }),
         })}
         phases={[phase()]}
-        members={agents101}
+        members={agents102}
       />,
     );
     const meter = screen.getByTestId("workflow-progress-meter");
     expect(meter.getAttribute("aria-valuenow")).toBeNull();
+    expect(meter.getAttribute("aria-valuemin")).toBeNull();
     expect(meter.getAttribute("aria-valuemax")).toBeNull();
-    expect(meter.getAttribute("aria-valuetext")).toContain("100 of at least 101");
+    expect(meter.getAttribute("aria-valuetext")).toContain("101 of at least 102");
   });
 });

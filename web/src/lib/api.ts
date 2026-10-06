@@ -275,6 +275,17 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
       : ptyDriver
         ? ptyCapabilities(driver)
         : HUB_CAPABILITIES;
+  // D-056 round 2: never run the version gate on a fabricated version. The
+  // static matrix blanks binaryVersion; if the Hub/Node record carries a real
+  // per-instance capability snapshot (or the future transcript version),
+  // stamp that reported version onto the synthesized snapshot. An unknown
+  // version then disables ONLY the ultracode switch with a named reason.
+  const reportedVersion = (
+    rec as { capabilities?: { binaryVersion?: unknown } | null }
+  ).capabilities?.binaryVersion;
+  if (typeof reportedVersion === "string" && reportedVersion.trim()) {
+    capabilities.binaryVersion = reportedVersion.trim();
+  }
   const launchedBy =
     extra.launchedBy === "remuda" || extra.launchedBy === "user" ? extra.launchedBy : null;
   const signalTier =

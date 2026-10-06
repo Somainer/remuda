@@ -555,6 +555,34 @@ impl EffortTracker {
         self.last
     }
 
+    /// Mark effective effort read-back as unavailable for the rest of the
+    /// process (D-056 (4): a resume boundary that was verified became
+    /// unverifiable — a shrink/replacement/EOF, an exec that kept the shell
+    /// pid, or a backward clock step).
+    ///
+    /// Clears the projected effective level/flag so a previously published
+    /// `{high, ultracode on}` no longer masquerades as "effective" (the UI
+    /// falls back to `?`, per D-028a). It does NOT resolve any awaiting
+    /// switch: with read-back gone no switch may report Applied, so the
+    /// pending generation keeps waiting for its bounded timeout and degrades
+    /// rather than claiming success. Sticky for the run. Returns the cleared
+    /// observation (if there was a projected state) so the caller can publish
+    /// one explicit read-back-unavailable edge.
+    pub fn read_back_unavailable(&mut self) -> Option<ObservedEffort> {
+        if self.last.is_none() {
+            self.current_process = false;
+            return None;
+        }
+        let cleared = self.last.take();
+        // Drop any process-specific flag/awaiting latch: no later record is
+        // trusted to re-set them, and no pending switch resolves Applied.
+        self.flag = None;
+        self.awaiting = None;
+        self.ultracode_pending = false;
+        self.current_process = false;
+        cleared
+    }
+
     /// Learn the semantics from one transcript record's `version` field. A
     /// later record cannot move a known gate back to unknown: a pre-2.1.203
     /// version now parses to [`EffortSemantics::Unknown`], and adopting it

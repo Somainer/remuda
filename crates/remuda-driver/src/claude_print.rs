@@ -2674,6 +2674,66 @@ impl TranscriptMapper {
         }
     }
 
+    /// Drive the gate from a tail batch, returning an explicit
+    /// read-back-unavailable observation when a previously VERIFIED resume
+    /// becomes UNVERIFIABLE mid-run (item 5).
+    ///
+    /// `current` is this batch's provenance. When it flips to false the
+    /// tracker clears its projected effective state; if that clears a
+    /// previously published `{level, ultracode}`, the returned observation
+    /// carries that effective state cleared to `None` so the UI stops showing
+    /// a stale "effective" (it renders `?`) and no pending switch resolves
+    /// Applied. Callers emit the returned observation like any mapped edge.
+    pub(crate) fn apply_effort_provenance(
+        &mut self,
+        current: bool,
+    ) -> DriverResult<Vec<Observation>> {
+        if current {
+            self.set_effort_current_process(true);
+            return Ok(Vec::new());
+        }
+        self.set_effort_current_process(false);
+        let Some(cleared) = self.effort.read_back_unavailable() else {
+            return Ok(Vec::new());
+        };
+        let requested = self
+            .effort_bridge
+            .as_ref()
+            .and_then(|bridge| bridge.requested())
+            .map(|request| remuda_protocol::EffortSelection {
+                name: request.name,
+                ultracode: request.ultracode,
+            });
+        Ok(vec![Observation {
+            schema_version: SchemaVersion,
+            event_id: remuda_protocol::effort_record_event_id(
+                self.mapper.instance_id.as_id().as_str(),
+                "effort-readback-unavailable",
+                cleared.name,
+            ),
+            journal_id: self.mapper.journal_id.clone(),
+            instance_id: self.mapper.instance_id.clone(),
+            run_id: self.mapper.run_id.clone(),
+            observed_at: now()?,
+            native_at: Knowledge::Unknown,
+            source: ObservationSource {
+                driver_kind: self.mapper.driver,
+                channel: remuda_protocol::SourceChannel::Transcript,
+                delivery: SourceDelivery::Live,
+            },
+            body: ObservationPayload::Effort(Box::new(EffortPayload {
+                requested,
+                effective: EffortEffective {
+                    name: None,
+                    ultracode: None,
+                    source: cleared.source,
+                    observed_at: now()?,
+                },
+                raw: None,
+            })),
+        }])
+    }
+
     /// Whether the effort tracker is accepting current-process records (D-056
     /// (4)). False for a resume tail that has not reached (or has lost) its
     /// current-process boundary. Test-only: production pumps drive provenance

@@ -591,6 +591,9 @@ pub struct ResumeBoundary {
     pub identity: FileIdentity,
     /// First byte offset that may belong to the new process.
     pub start: u64,
+    /// Whether the boundary is proven (pre-exec snapshot / process-start scan)
+    /// versus a known-but-unproven resume anchored at current EOF.
+    pub verified: bool,
     /// Fingerprint of the file head at capture, to reject a same-path
     /// replacement that reused the inode and grew the file.
     head: Option<HeadFingerprint>,
@@ -609,6 +612,7 @@ impl ResumeBoundary {
         Some(Self {
             identity,
             start,
+            verified: true,
             head,
         })
     }
@@ -623,6 +627,28 @@ impl ResumeBoundary {
     #[must_use]
     pub fn for_resume(claude_home: &Path, cwd: &Path, session_id: &str) -> Option<Self> {
         Self::snapshot(&Self::session_path(claude_home, cwd, session_id))
+    }
+
+    /// Current-EOF snapshot for a resume whose boundary is known (it IS a
+    /// resume) but cannot be proven: `claude --resume` with no usable uuid, a
+    /// platform without process-start evidence (macOS), an unreadable
+    /// transcript at process start, or a `exec`-based resume that kept the
+    /// shell's pid/start time. The tail starts after every byte currently on
+    /// disk so history never replays, but the resume is reported
+    /// [`TailProvenance::Unverified`] for the whole epoch — the effort gate
+    /// never opens on time-based evidence alone. `None` when the file does not
+    /// exist yet (there is nothing to anchor to; the caller treats that as
+    /// unverifiable too).
+    #[must_use]
+    pub fn unverified_eof(path: &Path) -> Option<Self> {
+        let identity = FileIdentity::of(path)?;
+        let start = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        Some(Self {
+            identity,
+            start,
+            verified: false,
+            head: hash_head(path, start),
+        })
     }
 
     /// Boundary for a resume discovered only after its process started (a
@@ -643,9 +669,17 @@ impl ResumeBoundary {
         let mut start = 0usize;
         let mut cursor = 0usize;
         while cursor < bytes.len() {
-            let nl = bytes[cursor..].iter().position(|b| *b == b'\n')?;
-            let line_end = cursor + nl + 1;
-            let line = &bytes[cursor..cursor + nl];
+            // A partial trailing line (no newline yet) is exactly what a
+            // running process is currently writing: treat it as the boundary
+            // instead of failing the scan (which previously made the resume
+            // unprovable and tailed byte 0 as current).
+            let Some(nl_rel) = bytes[cursor..].iter().position(|b| *b == b'\n') else {
+                start = cursor;
+                break;
+            };
+            let nl = cursor + nl_rel;
+            let line_end = nl + 1;
+            let line = &bytes[cursor..nl];
             let at = serde_json::from_slice::<Value>(line)
                 .ok()
                 .and_then(|v| {
@@ -666,6 +700,7 @@ impl ResumeBoundary {
         Some(Self {
             identity,
             start: start as u64,
+            verified: true,
             head: Some(fingerprint_bytes(&bytes, total)),
         })
     }
@@ -708,6 +743,12 @@ struct ResumeState {
     identity: FileIdentity,
     /// Fingerprint of the file head at boundary capture.
     head: Option<HeadFingerprint>,
+    /// The resume boundary is proven (pre-exec snapshot or other verifiable
+    /// evidence). When false the resume is known but its boundary could not be
+    /// proven: the tail follows current EOF and reports every batch
+    /// [`TailProvenance::Unverified`] (conversation hydrates, effort gate
+    /// stays closed) until a discontinuity — never Current.
+    verified: bool,
     /// Set once the tracked file shrank, was replaced, or vanished.
     displaced: bool,
 }
@@ -743,10 +784,10 @@ impl TranscriptTail {
         }
     }
 
-    /// Follow a resumed transcript whose new-process records begin at
-    /// `boundary` (captured before spawn, or derived from process start).
+    /// Follow a resumed transcript; provenance comes from `boundary.verified`.
     #[must_use]
     pub fn resumed(path: PathBuf, boundary: ResumeBoundary) -> Self {
+        let verified = boundary.verified;
         Self {
             path,
             offset: boundary.start,
@@ -754,9 +795,16 @@ impl TranscriptTail {
             resume: Some(ResumeState {
                 identity: boundary.identity,
                 head: boundary.head,
+                verified,
                 displaced: false,
             }),
         }
+    }
+
+    /// Whether the resume boundary was proven (false for an unverified resume).
+    #[must_use]
+    pub fn verified(&self) -> bool {
+        self.resume.as_ref().is_none_or(|s| s.verified && !s.displaced)
     }
 
     /// File being followed.
@@ -782,27 +830,34 @@ impl TranscriptTail {
     pub fn poll(&mut self) -> std::io::Result<TailRead> {
         let mut file = match std::fs::File::open(&self.path) {
             Ok(file) => file,
-            Err(error) => {
-                // The bound file vanished mid-run: an unbridgeable
-                // discontinuity for a resume tail. Even if a later recreate
-                // happens to reuse the same inode number (tmpfs frees and
-                // hands it straight back), its bytes are not provenanced to
-                // this process — degrade now, keep the error visible.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A one-poll ENOENT (the bound file is being rotated/recreated)
+                // is NOT the end of the transcript for a resume tail: keep the
+                // hydrator alive at the stored anchor and return no lines. The
+                // resume is already unproven (or becomes unverified) so a
+                // restored file can never replay history as current.
                 if let Some(state) = self.resume.as_mut() {
                     state.displaced = true;
+                    return Ok(TailRead {
+                        lines: Vec::new(),
+                        provenance: TailProvenance::Unverified,
+                    });
                 }
                 return Err(error);
             }
+            Err(error) => return Err(error),
         };
         let metadata = file.metadata()?;
         let len = metadata.len();
 
         // A resume tail keeps the boundary honest.
         if let Some(state) = self.resume.as_mut() {
+            // An unverified resume (resume known, boundary never proven) reports
+            // every batch Unverified for the whole epoch, even with no shrink.
+            // A shrink/replacement/head-rewrite also invalidates a previously
+            // verified resume. Displacement is sticky but no longer tears down
+            // the hydrator.
             let identity = FileIdentity::from_metadata(&metadata);
-            // A same-path replacement can reuse the inode (tmpfs) AND grow the
-            // file, so identity/length alone miss it — the head fingerprint
-            // catches a rewrite of the transcript's first record.
             let head_intact = match state.head {
                 Some(probe) if !state.displaced => {
                     use std::io::{Read, Seek, SeekFrom};
@@ -814,12 +869,12 @@ impl TranscriptTail {
                 }
                 _ => true,
             };
-            if !state.displaced && (!head_intact || identity != state.identity || len < self.offset)
+            if !state.displaced
+                && (!state.verified || !head_intact || identity != state.identity || len < self.offset)
             {
-                // Rotated/recreated/truncated across the verified boundary.
-                // Anchor at the present EOF so the new (unverifiable) bytes are
-                // not replayed; only appends after this instant come back, and
-                // they stay Unverified for the rest of the run.
+                // Boundary lost. Re-anchor at the present EOF so a recreated
+                // file's bytes are not replayed; from here appends hydrate
+                // conversation only.
                 state.displaced = true;
                 self.offset = len;
                 self.partial.clear();
@@ -828,9 +883,9 @@ impl TranscriptTail {
                     provenance: TailProvenance::Unverified,
                 });
             }
-            if state.displaced {
-                // Following a displaced file for message hydration only: skip
-                // any gap/truncation and never report the lines as current.
+            // A displaced/unverified tail follows appends for message
+            // hydration only, skipping any gap/truncation, never as Current.
+            if state.displaced || !state.verified {
                 if len < self.offset {
                     self.offset = len;
                     self.partial.clear();
@@ -841,8 +896,8 @@ impl TranscriptTail {
                     provenance: TailProvenance::Unverified,
                 });
             }
-            // Trustworthy resume: the read cursor starts at the spawn/process
-            // boundary, so every byte beyond it is a current-process record.
+            // Verified resume on the same identity/head: bytes past the anchor
+            // are current-process records.
             let lines = Self::read_lines(&mut file, len, &mut self.offset, &mut self.partial)?;
             return Ok(TailRead {
                 lines,

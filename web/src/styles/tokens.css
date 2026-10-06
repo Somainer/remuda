@@ -291,6 +291,15 @@
   --dur-3: 240ms;
   --ease-out: cubic-bezier(0.2, 0, 0, 1);
   --ease-in: cubic-bezier(0.3, 0, 1, 1);
+
+  /*
+   * Stacking order. Popovers/menus/sheets must sit ABOVE the notification
+   * stack so a toast or standing error never covers or dismisses an open
+   * menu (c-composerpop item 8).
+   */
+  --z-notify-stack: 30;
+  --z-popover: 40;
+  --z-sheet: 60;
 }
 
 @media (max-width: 1199px) {

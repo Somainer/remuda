@@ -49,6 +49,7 @@ import { useCodeQuotes } from "./useCodeQuotes";
 import { ContextUsagePopover } from "./ContextUsagePopover";
 import { ComposerConfirmDialog, ComposerOptionsSheet } from "./ComposerOptions";
 import type { UsageRollup } from "./contextUsage";
+import { EMPTY_USAGE_ROLLUP, EMPTY_USAGE_NOTE } from "./contextUsage";
 import type { AttachmentRef, Attachment } from "../../lib/attachments";
 // UO-4: import the base popover styles before composer.module.css so its
 // .popover/.popoverCard rules precede composer/contextUsage overrides at the
@@ -58,6 +59,10 @@ import css from "./composer.module.css";
 import opt from "./composerOptions.module.css";
 
 type MenuId = "effort" | "permission" | "usage" | null;
+
+/** Delay before the usage hover card closes after the pointer leaves it / its
+ *  chip. Exported for fake-timer/clock tests (no wall-clock assertions). */
+export const HOVER_CLOSE_DELAY_MS = 140;
 
 /** A Sheet-based confirmation replacing a `window.confirm` (D-042). */
 type ConfirmRequest = {
@@ -456,13 +461,19 @@ export function Composer({
       ? Number(contextLabel.slice(0, -1))
       : null;
   const contextChipLabel = contextPct == null || !Number.isFinite(contextPct) ? "—" : `${contextPct}%`;
+  // RC3: the chip is never dead — with no rollup it opens a card explaining
+  // that the harness has not reported usage yet.
+  const hasRollup = Boolean(usageRollup);
+  const displayRollup: UsageRollup = usageRollup ?? EMPTY_USAGE_ROLLUP;
+  const usageEmptyNote = hasRollup ? null : EMPTY_USAGE_NOTE;
   const hoverCapable = () =>
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
     window.matchMedia("(hover: hover) and (pointer: fine)").matches;
   // The popover is not a DOM child of the chip, so the cursor crossing the
   // gap between them must not close the card: leave schedules a short close
-  // that entering the popover cancels.
+  // that entering the popover cancels. Exported so tests drive time in units
+  // of this delay rather than wall-clock ms.
   const cancelHoverClose = () => {
     if (hoverCloseTimer.current != null) {
       clearTimeout(hoverCloseTimer.current);
@@ -470,10 +481,16 @@ export function Composer({
     }
   };
   const scheduleHoverClose = () => {
-    cancelHoverClose();
-    if (!hoverCapable() || usagePinned.current) return;
-    hoverCloseTimer.current = setTimeout(() => setMenu(null), 140);
-  };
+  cancelHoverClose();
+  if (!hoverCapable() || usagePinned.current) return;
+  // RC2: the leave timer belongs to the USAGE card only. It must never close
+  // an effort/permission menu the pointer crosses into/over — only an open,
+  // unpinned usage card may be dismissed this way.
+  hoverCloseTimer.current = setTimeout(
+    () => setMenu((cur) => (cur === "usage" && !usagePinned.current ? null : cur)),
+    HOVER_CLOSE_DELAY_MS,
+  );
+};
   const dismissUsage = () => {
     usagePinned.current = false;
     cancelHoverClose();
@@ -829,6 +846,8 @@ export function Composer({
   }, [menu]);
 
   const toggle = (id: MenuId) => {
+    // A click-open must not be undone by an in-flight hover-leave timer.
+    cancelHoverClose();
     if (id !== "usage") usagePinned.current = false;
     setMenu((cur) => (cur === id ? null : id));
   };
@@ -1033,23 +1052,19 @@ export function Composer({
   );
   const contextChipNode = caps.context ? (
     <button
+      ref={triggerRefs.usage}
       type="button"
       className={`${css.chip} ${opt.sheetTouch}`}
       data-testid="context-chip"
-      data-has-popover={usageRollup ? "1" : "0"}
-      aria-haspopup={usageRollup ? "dialog" : undefined}
+      data-has-popover="1"
+      aria-haspopup="dialog"
       aria-expanded={menu === "usage"}
-      aria-label={
-        usageRollup
-          ? `上下文用量 ${contextChipLabel}，查看明细`
-          : `上下文用量 ${contextChipLabel}`
-      }
+      aria-label={`上下文用量 ${contextChipLabel}，查看明细`}
+      title={hasRollup ? undefined : EMPTY_USAGE_NOTE}
       onClick={() => {
-        if (usageRollup) {
-          usagePinned.current = true;
-          cancelHoverClose();
-          setMenu("usage");
-        }
+        usagePinned.current = true;
+        cancelHoverClose();
+        setMenu("usage");
       }}
     >
       {contextChipInner}
@@ -1062,30 +1077,27 @@ export function Composer({
       type="button"
       className={css.chip}
       data-testid="context-chip"
-      data-has-popover={usageRollup ? "1" : "0"}
-      aria-haspopup={usageRollup ? "dialog" : undefined}
+      data-has-popover="1"
+      aria-haspopup="dialog"
       aria-expanded={menu === "usage"}
-      aria-label={
-        usageRollup
-          ? `上下文用量 ${contextChipLabel}，查看明细`
-          : `上下文用量 ${contextChipLabel}`
-      }
+      aria-label={`上下文用量 ${contextChipLabel}，查看明细`}
+      title={hasRollup ? undefined : EMPTY_USAGE_NOTE}
       onClick={() => {
         // Idempotent, click-pinned open: mouseenter may already have opened
         // it on precise pointers, and touch fires no hover. Pinning means a
         // later pointer leave cannot dismiss the card; × / outside
-        // pointerdown / Escape unpin and close.
-        if (usageRollup) {
-          usagePinned.current = true;
-          cancelHoverClose();
-          setMenu("usage");
-        }
+        // pointerdown / Escape unpin and close. Opens even with no rollup
+        // (RC3 empty state).
+        usagePinned.current = true;
+        cancelHoverClose();
+        setMenu("usage");
       }}
       onMouseEnter={() => {
-        if (usageRollup && hoverCapable()) {
-          cancelHoverClose();
-          setMenu("usage");
-        }
+        if (!hoverCapable()) return;
+        // RC2: never steal an open effort/permission menu. Open the usage
+        // card only when nothing else is open (or it is already showing).
+        setMenu((cur) => (cur === null || cur === "usage" ? "usage" : cur));
+        cancelHoverClose();
       }}
       onMouseLeave={scheduleHoverClose}
     >
@@ -1459,9 +1471,9 @@ export function Composer({
           </>
         )}
       </div>
-      {menu === "usage" && usageRollup ? (
+      {menu === "usage" ? (
         <ContextUsagePopover
-          rollup={usageRollup}
+          rollup={displayRollup}
           mobile={mobile}
           onClose={dismissUsage}
           placement={usageAnchor.placement}
@@ -1469,6 +1481,7 @@ export function Composer({
           panelRef={menuRefs.usage}
           onMouseEnter={cancelHoverClose}
           onMouseLeave={scheduleHoverClose}
+          emptyNote={usageEmptyNote}
         />
       ) : null}
       {!mobile && menu === "effort" ? (
@@ -1495,7 +1508,17 @@ export function Composer({
       ) : null}
       <ComposerOptionsSheet
         open={mobile && optionsOpen}
-        onClose={() => setOptionsOpen(false)}
+        onClose={() => {
+          // RC4: a stacked usage sheet is the TOPMOST layer — the first
+          // Escape/scrim dismiss closes ONLY it; the second closes the
+          // options sheet. When usage is not stacked, close the sheet.
+          if (menu === "usage") {
+            dismissUsage();
+            return;
+          }
+          dismissUsage();
+          setOptionsOpen(false);
+        }}
         returnFocusRef={optionsTriggerRef}
         attach={
           <AttachButtons

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Composer } from "./Composer";
+import { Composer, HOVER_CLOSE_DELAY_MS } from "./Composer";
 import { effortAt } from "./effort";
 import { printCapabilities } from "../../lib/capabilities";
 import type { Capability, CapabilityProvision, CapabilitySnapshot } from "../../types/nativeRef";
@@ -506,14 +506,88 @@ describe("Composer context usage chip", () => {
     expect(screen.queryByTestId("context-usage-popover")).toBeNull();
   });
 
-  it("renders the dash when usage is unknown and offers no popover", async () => {
+  // RC2: the context chip's leave timer must never close an open
+  // effort/permission menu, and entering the context chip must not steal one.
+  function stubFinePointer() {
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({
+        matches: query.includes("hover: hover"),
+        media: query,
+        onchange: null,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+        dispatchEvent: () => false,
+      })),
+    );
+  }
+
+  it("a no-rollup context-chip leave does not close the effort menu (RC2)", async () => {
+    stubFinePointer();
+    const user = userEvent.setup();
+    render(<Composer instanceId="ins_rc2_e" mobile={false} onSend={vi.fn()} kind="claude" />);
+    await user.click(screen.getByTestId("model-effort-chip"));
+    expect(screen.getByTestId("effort-slider-panel")).toBeInTheDocument();
+    // Cross/leave the context chip and wait beyond HOVER_CLOSE_DELAY_MS: the
+    // scoped leave timer must not dismiss the effort menu.
+    fireEvent.mouseLeave(screen.getByTestId("context-chip"));
+    await new Promise((r) => setTimeout(r, HOVER_CLOSE_DELAY_MS + 60));
+    expect(screen.getByTestId("effort-slider-panel")).toBeInTheDocument();
+  });
+
+  it("a no-rollup context-chip leave does not close the permission menu (RC2)", async () => {
+    stubFinePointer();
+    const user = userEvent.setup();
+    render(
+      <Composer
+        instanceId="ins_rc2_p"
+        mobile={false}
+        onSend={vi.fn()}
+        onPermission={vi.fn()}
+        permissionMode="manual"
+      />,
+    );
+    await user.click(screen.getByTestId("permission-chip"));
+    expect(screen.getByTestId("permission-menu")).toBeInTheDocument();
+    fireEvent.mouseLeave(screen.getByTestId("context-chip"));
+    await new Promise((r) => setTimeout(r, HOVER_CLOSE_DELAY_MS + 60));
+    expect(screen.getByTestId("permission-menu")).toBeInTheDocument();
+  });
+
+  it("with a rollup, entering the context chip does not steal the effort menu (RC2)", () => {
+    stubFinePointer();
+    render(
+      <Composer
+        instanceId="ins_rc2_steal"
+        mobile={false}
+        onSend={vi.fn()}
+        usageRollup={rollup}
+        kind="claude"
+      />,
+    );
+    fireEvent.click(screen.getByTestId("model-effort-chip"));
+    expect(screen.getByTestId("effort-slider-panel")).toBeInTheDocument();
+    // Hover the context chip: it must not replace the effort menu.
+    fireEvent.mouseEnter(screen.getByTestId("context-chip"));
+    expect(screen.getByTestId("effort-slider-panel")).toBeInTheDocument();
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+  });
+
+  it("opens an empty-state card with a description when there is no rollup (RC3)", async () => {
     const user = userEvent.setup();
     render(<Composer instanceId="ins_none" mobile={false} onSend={vi.fn()} />);
     const chip = screen.getByTestId("context-chip");
     expect(chip).toHaveTextContent("—");
-    expect(chip).toHaveAttribute("data-has-popover", "0");
+    // The chip is never dead: it advertises and opens the card.
+    expect(chip).toHaveAttribute("data-has-popover", "1");
+    expect(chip.getAttribute("aria-label")).toContain("查看明细");
+    expect(chip).toHaveAttribute("aria-haspopup", "dialog");
     await user.click(chip);
-    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+    const card = await screen.findByTestId("context-usage-popover");
+    expect(card).toBeInTheDocument();
+    expect(screen.getByTestId("context-usage-empty-note").textContent).toContain("未上报 usage");
   });
 
   it("renders a sheet on touch widths", async () => {
@@ -526,6 +600,27 @@ describe("Composer context usage chip", () => {
     expect(screen.getByTestId("context-chip")).toBeInTheDocument();
     await user.click(screen.getByTestId("context-chip"));
     expect(screen.getByTestId("context-usage-popover")).toHaveAttribute("data-mobile", "1");
+  });
+
+  it("dismissing the options sheet also closes a stacked usage sheet (RC4)", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_sheet_usage" mobile onSend={vi.fn()} usageRollup={rollup} />,
+    );
+    // On mobile the collapsed effort chip opens the options sheet.
+    await user.click(screen.getByTestId("model-effort-chip"));
+    expect(screen.getByTestId("composer-options-sheet")).toBeVisible();
+    // Stack the usage sheet inside.
+    await user.click(within(screen.getByTestId("composer-options-sheet")).getByTestId("context-chip"));
+    expect(screen.getByTestId("context-usage-popover")).toHaveAttribute("data-mobile", "1");
+    // First Escape closes the TOPMOST layer (usage); the Sheet onClose now
+    // dismisses usage only when it is stacked.
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+    expect(screen.getByTestId("composer-options-sheet")).toBeVisible();
+    // Second Escape closes the options sheet.
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("composer-options-sheet")).toBeNull();
   });
 });
 

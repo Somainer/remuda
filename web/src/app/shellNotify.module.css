@@ -17,7 +17,7 @@
 .stack {
   position: fixed;
   /* Unchanged anchor: clear of the phone home bar where one shows. */
-  bottom: calc(var(--phone-nav-h) + var(--safe-bottom) + var(--space-3));
+  bottom: calc(var(--safe-bottom) + var(--space-3));
   left: 50%;
   transform: translateX(-50%);
   display: flex;
@@ -25,7 +25,11 @@
   gap: var(--space-2);
   align-items: center;
   width: min(92vw, 520px);
-  z-index: 30;
+  /* Below popovers/menus/sheets so notifications never cover an open menu. */
+  z-index: var(--z-notify-stack);
+  /* The stack container never swallows pointer events; only standing
+     (blocking) items are interactive. Transient toasts pass clicks through. */
+  pointer-events: none;
 }
 
 /* Transient confirmations, above the errors in the same stack. */
@@ -59,6 +63,8 @@
   flex-direction: column;
   gap: var(--space-2);
   width: 100%;
+  /* Standing errors are interactive; the rest of the stack passes through. */
+  pointer-events: auto;
 }
 
 .blockingItem {

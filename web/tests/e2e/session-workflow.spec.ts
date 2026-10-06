@@ -23,6 +23,35 @@ test.describe("workflow tree, task track, events drawer", () => {
     await expect(page.getByTestId("opaque-json")).toContainText("rate_limit_event");
   });
 
+  test("two phase-summary clicks keep the native details in sync with React state", async ({ page }) => {
+    // Round 3 codex: the native <summary> used to toggle details.open itself
+    // while React also flipped state, so the second click desynced the real
+    // details.open / body visibility / chevron / aria-expanded. React now
+    // preventDefaults and owns the disclosure; assert all four in a real
+    // browser after open → close → open.
+    await page.goto("/sessions");
+    await row(page, "看 TaskManager spill").click();
+    const details = page.getByTestId("workflow-phase").first();
+    const summary = details.locator("summary").first();
+    const body = details.locator("ul").first();
+
+    // Initially open (running run/phase).
+    await expect(summary).toHaveAttribute("aria-expanded", "true");
+    await expect(body).toBeVisible();
+
+    // Click 1: the native details.open, the body and aria-expanded all close.
+    await summary.click();
+    await expect(summary).toHaveAttribute("aria-expanded", "false");
+    await expect(body).toBeHidden();
+    expect(await details.evaluate((el) => (el as HTMLDetailsElement).open)).toBe(false);
+
+    // Click 2: they all reopen together (the previously-desynced click).
+    await summary.click();
+    await expect(summary).toHaveAttribute("aria-expanded", "true");
+    await expect(body).toBeVisible();
+    expect(await details.evaluate((el) => (el as HTMLDetailsElement).open)).toBe(true);
+  });
+
   test("raw events drawer filters by kind", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "看 TaskManager spill").click();

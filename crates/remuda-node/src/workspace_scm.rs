@@ -727,14 +727,54 @@ fn git_toplevel(root: &Path) -> Result<(), GitFailure> {
     // root. On hosts where an ancestor happens to be a repo (e.g. a `/tmp`
     // checkout), git would otherwise report that ancestor and let a non-git
     // directory masquerade as supported.
+    //
+    // Compare by filesystem IDENTITY, not by path string: `git rev-parse
+    // --show-toplevel` prints the symlink-resolved path, while the registered
+    // root may be reached through a symlinked prefix (macOS /var →
+    // /private/var, /tmp → /private/tmp; any Linux workspace under a symlink).
+    // Canonicalising both sides (falling back to (dev,ino) metadata) makes the
+    // comparison true for the same directory however it was addressed, while
+    // still rejecting an ancestor repo for a non-git subdirectory.
     let raw = run_git(root, &["rev-parse", "--show-toplevel"], 4096)?;
     let raw = classify(raw)?;
     let toplevel = String::from_utf8_lossy(&raw.stdout).trim().to_owned();
-    if Path::new(&toplevel) == root {
+    if paths_same_dir(Path::new(&toplevel), root) {
         Ok(())
     } else {
         Err(GitFailure::Unsupported("not-a-git-repository"))
     }
+}
+
+/// Whether two paths name the same directory, robust to symlinked prefixes.
+///
+/// Prefers `canonicalize` on both sides; if either path (or an ancestor
+/// needed to resolve it) does not exist, compares `(dev, ino)` metadata so a
+/// still-present path is matched against a reported toplevel. Returns false
+/// when neither comparison can establish equality (which preserves the
+/// ancestor-repo guard: a non-git subdir never compares equal to the repo
+/// root above it).
+fn paths_same_dir(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+        return ca == cb;
+    }
+    // Fallback: compare (dev, ino) metadata when canonicalization fails but
+    // both paths exist. Gated per platform (the accessor traits differ).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (a.metadata(), b.metadata()) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (a.metadata(), b.metadata()) {
+            return ma.volume_serial_number() == mb.volume_serial_number()
+                && ma.file_index() == mb.file_index();
+        }
+    }
+    false
 }
 
 fn git_head(root: &Path) -> Result<String, GitFailure> {
@@ -1085,6 +1125,67 @@ mod tests {
         assert_eq!(diffs["availability"], "unsupported");
         let content = file(&id, root.path(), &json!({"path": "x"})).unwrap();
         assert_eq!(content["availability"], "unsupported");
+    }
+
+    #[test]
+    fn repo_reached_through_a_symlinked_parent_is_still_supported() {
+        // Regression for the macOS /var → /private/var (and Linux /tmp →
+        // /private/tmp) case: `git rev-parse --show-toplevel` prints the
+        // symlink-RESOLVED path while the registered root is addressed via a
+        // symlinked prefix. Identity (not string equality) must accept it.
+        let base = tempfile::tempdir().unwrap();
+        let real_parent = base.path().join("real");
+        fs::create_dir_all(&real_parent).unwrap();
+        let link_parent = base.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real_parent, &link_parent).unwrap();
+
+        let real_root = real_parent.join("ws");
+        fs::create_dir_all(&real_root).unwrap();
+        fs::write(real_root.join("a.txt"), "a\n").unwrap();
+        run_init_git(&real_root);
+
+        // Address the SAME directory through the symlinked prefix.
+        let via_link = link_parent.join("ws");
+        let id = WorkspaceId::new();
+        let view = status(&id, &via_link);
+        assert_eq!(
+            view["availability"], "ok",
+            "repo under a symlinked prefix must be supported; reason: {}",
+            view["unsupportedReason"]
+        );
+        // Keep both trees alive for the process.
+        base.keep();
+    }
+
+    #[test]
+    fn non_git_subdir_of_a_repo_stays_unsupported_through_a_symlink() {
+        // The ancestor-repo guard must survive the identity comparison: a
+        // plain subdirectory of a repo (reached through a symlink too) is NOT
+        // itself a repository root.
+        let base = tempfile::tempdir().unwrap();
+        let real_parent = base.path().join("real");
+        fs::create_dir_all(&real_parent).unwrap();
+        let link_parent = base.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real_parent, &link_parent).unwrap();
+
+        let repo = real_parent.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_init_git(&repo);
+        let subdir = repo.join("not-a-repo");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let via_link = link_parent.join("repo").join("not-a-repo");
+        let id = WorkspaceId::new();
+        let view = status(&id, &via_link);
+        assert_eq!(view["availability"], "unsupported");
+        assert_eq!(view["unsupportedReason"], "not-a-git-repository");
+        base.keep();
     }
 
     #[test]

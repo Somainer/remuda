@@ -2768,40 +2768,39 @@ async fn wait_frame_ack(ws: &mut NodeWs, queue: &mut FrameQueue, want: &str) -> 
 ///
 /// If no further RPC arrives within the barrier window the Node is mis-wired
 /// or the Hub serialised — a loud error rather than a silent pass.
+/// A frame's Hub->Node request method, or None for a journal ack / other
+/// response (frames without a `method`).
+fn frame_rpc_method(frame: &str) -> Option<String> {
+    serde_json::from_str::<Value>(frame)
+        .ok()
+        .and_then(|v| v.get("method").and_then(Value::as_str).map(str::to_owned))
+}
+
 async fn ensure_intervening_rpc(
     ws: &mut NodeWs,
     queue: &mut FrameQueue,
     want: &str,
-    method_match: &str,
     marker: &std::path::Path,
 ) -> Result<()> {
-    // Count a matching RPC already queued (e.g. forwarded before the append);
-    // other RPCs (interaction.list polls, …) are still stashed but do not count.
-    let mut intervening = queue
-        .iter()
-        .filter(|f| {
-            serde_json::from_str::<Value>(f)
-                .map(|v| v.get("method").and_then(Value::as_str) == Some(method_match))
-                .unwrap_or(false)
-        })
-        .count() as u64;
+    // Any Hub->Node REQUEST already queued (a frame carrying a method; not a
+    // journal ack response) satisfies the barrier. A mounted session page's
+    // ~2 s interaction.list poll reliably produces one even when the Hub
+    // serialises a second instance.send behind the first turn's reply.
+    let mut first_method = queue.iter().find_map(|f| frame_rpc_method(f));
     let deadline = Instant::now() + ACK_BARRIER_TIMEOUT;
-    while intervening == 0 {
+    while first_method.is_none() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             anyhow::bail!(
-                "ack barrier: no {method_match} RPC arrived behind append ack {want} within {} ms",
+                "ack barrier: no Hub RPC arrived behind append ack {want} within {} ms",
                 ACK_BARRIER_TIMEOUT.as_millis()
             );
         }
         match tokio::time::timeout(remaining, ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
-                let value: Value = serde_json::from_str(&text)?;
-                if value.get("method").and_then(Value::as_str) == Some(method_match) {
-                    intervening += 1;
-                }
-                // Stash EVERYTHING (including an early ack and other RPCs) for
-                // wait_frame_ack / the dispatch loop.
+                first_method = frame_rpc_method(&text);
+                // Stash EVERYTHING (including an early ack and every RPC) for
+                // wait_frame_ack / the dispatch loop — never drop a frame.
                 if queue.len() >= PENDING_FRAME_QUEUE_CAP {
                     anyhow::bail!("pending frame queue overflow in ack barrier for {want}");
                 }
@@ -2810,17 +2809,23 @@ async fn ensure_intervening_rpc(
             Ok(_) => anyhow::bail!("hub connection closed during ack barrier for {want}"),
             Err(_) => {
                 anyhow::bail!(
-                    "ack barrier: no {method_match} RPC arrived behind append ack {want} within {} ms",
+                    "ack barrier: no Hub RPC arrived behind append ack {want} within {} ms",
                     ACK_BARRIER_TIMEOUT.as_millis()
                 )
             }
         }
     }
-    std::fs::write(marker, intervening.to_string())
+    let method = first_method.expect("a matching RPC was observed");
+    // Marker content: "<count> <firstMethod>" — request frames queued when the
+    // first one landed, plus its method for a strong, inspectable proof.
+    let queued_requests = queue
+        .iter()
+        .filter(|f| frame_rpc_method(f).is_some())
+        .count();
+    std::fs::write(marker, format!("{queued_requests} {method}"))
         .with_context(|| format!("write ack barrier marker {}", marker.display()))?;
     Ok(())
 }
-
 /// Journal the entity lifecycle a terminal-answered question settles with:
 /// state `resolved`, actor human with no device, answer carried verbatim.
 async fn append_terminal_resolution(
@@ -3925,7 +3930,7 @@ async fn append_command_user_barrier(
     let seq = send_user_message_frame(ws, instance_id, n, text, command_id, &node).await?;
     let want = format!("j{seq}");
     let marker = std::env::temp_dir().join(format!("remuda-e2e-ackbarrier-{port}-{seq}"));
-    ensure_intervening_rpc(ws, queue, &want, "instance.send", &marker).await?;
+    ensure_intervening_rpc(ws, queue, &want, &marker).await?;
     wait_frame_ack(ws, queue, &want).await?;
     Ok(seq)
 }

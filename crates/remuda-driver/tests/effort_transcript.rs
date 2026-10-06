@@ -778,7 +778,7 @@ async fn resumed_history_ultracode_on_starts_off_and_only_the_new_verdict_settle
 
     // First post-launch record flips the gate; the fresh switch's OWN slash
     // and verdict then settle it.
-    remuda_driver::test_support::mark_current_process(&mut mapper);
+    remuda_driver::test_support::mark_current_process(&mut mapper, true);
     mapper.map_line(&slash("high", 7)).expect("fresh slash");
     mapper
         .map_line(&stdout_record_version(

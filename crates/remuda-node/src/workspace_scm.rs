@@ -1156,8 +1156,9 @@ mod tests {
             "repo under a symlinked prefix must be supported; reason: {}",
             view["unsupportedReason"]
         );
-        // Keep both trees alive for the process.
-        base.keep();
+        // Keep both trees alive for the process (bind the kept PathBuf
+        // so the must_use return is consumed).
+        let _kept = base.keep();
     }
 
     #[test]
@@ -1185,7 +1186,7 @@ mod tests {
         let view = status(&id, &via_link);
         assert_eq!(view["availability"], "unsupported");
         assert_eq!(view["unsupportedReason"], "not-a-git-repository");
-        base.keep();
+        let _kept = base.keep();
     }
 
     #[test]

@@ -175,6 +175,19 @@ fn turn_done_count(obs: &[Observation]) -> usize {
         .count()
 }
 
+fn turn_started_count(obs: &[Observation]) -> usize {
+    obs.iter()
+        .filter(|o| lifecycle_named(o) == Some("turn_started"))
+        .count()
+}
+
+/// Index of the first observation matching `pred`.
+fn first_where(obs: &[Observation], pred: impl Fn(&Observation) -> bool) -> usize {
+    obs.iter()
+        .position(pred)
+        .unwrap_or_else(|| panic!("no match in {} observations", obs.len()))
+}
+
 /// Golden argv, read back from the child itself.
 ///
 /// The earlier version of this test asserted against `fake_claude_argv`, a
@@ -807,4 +820,72 @@ async fn relaunch_after_close_emits_one_exited_per_launch() {
              a reader from a prior launch leaked into this channel"
         );
     }
+}
+
+/// D-057 OA6 r2 item 2: every turn's `turn_started` is published before THAT
+/// turn's `result`. The send task (write + turn_started) and the reader task
+/// (map + result) serialize through the driver's turn-order lock; run both
+/// turns so the forced interleave (a result ready while a send emits) is
+/// exercised, and assert the causal ordering on the collected stream.
+#[tokio::test]
+async fn every_turn_started_precedes_its_own_result() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    driver.send(prompt("first")).await.expect("first send");
+    let first = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+    assert_eq!(turn_started_count(&first), 1);
+    let s1 = first_where(&first, |o| lifecycle_named(o) == Some("turn_started"));
+    let r1 = first_where(&first, |o| lifecycle_status(o) == Some("turn_done"));
+    assert!(
+        s1 < r1,
+        "turn 1 start must precede turn 1 result: {s1} >= {r1}"
+    );
+
+    driver.send(prompt("second")).await.expect("second send");
+    let second = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+    assert_eq!(turn_started_count(&second), 1);
+    let s2 = first_where(&second, |o| lifecycle_named(o) == Some("turn_started"));
+    let r2 = first_where(&second, |o| lifecycle_status(o) == Some("turn_done"));
+    assert!(
+        s2 < r2,
+        "turn 2 start must precede turn 2 result: {s2} >= {r2}"
+    );
+
+    driver.close().await.expect("close");
+}
+
+/// D-057 OA6 r2 item 3: `send` resolves only after the user line is WRITTEN,
+/// and propagates the write failure once the child's stdin is gone (closed
+/// pipe / broken pipe) instead of reporting `transport_written` for a prompt
+/// that never reached the process.
+#[tokio::test]
+async fn a_send_after_the_child_stdin_closed_is_an_error_not_written() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Drain the first turn so the child is up and reading.
+    driver.send(prompt("one")).await.expect("first send ok");
+    let _ = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+
+    // Close the child's stdin and reap the process; the writer channel then
+    // rejects the next write.
+    driver.close().await.expect("close");
+
+    let result = driver.send(prompt("after close")).await;
+    assert!(
+        result.is_err(),
+        "a prompt after stdin closed must propagate the write failure, got {result:?}"
+    );
 }

@@ -259,14 +259,65 @@ where
     Ok(())
 }
 
+/// Reply delivered after a stdin line has actually been written (or the write
+/// failed), so callers distinguish "queued in the driver's channel" from
+/// "accepted by the child's stdin" (D-057 ma-sdk-state r2 item 3).
+type WriteDone = tokio::sync::oneshot::Sender<Result<(), Error>>;
+
 enum WriterCmd {
+    /// A message on the fire-and-forget control/init path (no write ack).
     Message(Box<Inbound>),
+    /// A user turn whose caller awaits write completion.
+    UserWrite(Box<Inbound>, WriteDone),
     Close,
+}
+
+/// Write one queued command to the child's stdin.
+///
+/// A user write reports the write result back on its oneshot (write-completion
+/// ack); a broken/closed pipe propagates to the awaiting caller instead of
+/// being swallowed by the background task. Returns `false` when the writer loop
+/// must stop (a write failed), `true` to continue.
+async fn handle_writer_cmd<S>(stdin: &mut S, cmd: WriterCmd) -> bool
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    match cmd {
+        WriterCmd::Message(msg) => {
+            if let Err(error) = codec::write_line(stdin, msg.as_ref()).await {
+                warn!(%error, "claude stdin write failed");
+                return false;
+            }
+            true
+        }
+        WriterCmd::UserWrite(msg, ack) => match codec::write_line(stdin, msg.as_ref()).await {
+            Ok(()) => {
+                let _ = ack.send(Ok(()));
+                true
+            }
+            Err(error) => {
+                warn!(%error, "claude stdin user write failed");
+                let _ = ack.send(Err(error));
+                false
+            }
+        },
+        WriterCmd::Close => {
+            if let Err(error) = tokio::io::AsyncWriteExt::shutdown(stdin).await {
+                debug!(%error, "claude stdin shutdown");
+            }
+            // Signals the caller loop to return after shutdown.
+            false
+        }
+    }
 }
 
 /// Live Claude print process plus helpers that write stdin.
 pub struct ClaudeProcess {
     inbound: mpsc::Sender<Inbound>,
+    /// User-turn writes that resolve only once the line is on the child's
+    /// stdin (write-completion ack), separate from the fire-and-forget
+    /// control/init `inbound` channel.
+    user_writes: mpsc::Sender<WriterCmd>,
     writer: mpsc::Sender<WriterCmd>,
     child: Child,
     reader: JoinHandle<()>,
@@ -324,28 +375,43 @@ impl ClaudeProcess {
         let stderr = child.stderr.take().ok_or(Error::MissingPipe("stderr"))?;
 
         let (pub_in_tx, mut pub_in_rx) = mpsc::channel::<Inbound>(64);
-        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterCmd>(64);
+        // Control/init fire-and-forget channel.
+        let (writer_tx, writer_rx) = mpsc::channel::<WriterCmd>(64);
+        // User-turn channel with a write-completion ack (item 3).
+        let (user_tx, user_rx) = mpsc::channel::<WriterCmd>(64);
         let (raw_out_tx, mut raw_out_rx) = mpsc::channel::<Outbound>(256);
         let (pub_out_tx, pub_out_rx) = mpsc::channel::<Outbound>(256);
 
         let writer_task = {
             let mut stdin = stdin;
+            // Serialize every stdin write through one loop; user writes report
+            // success/failure back on their oneshot. FIFO per channel, and the
+            // two channels are selected in declaration order so an init message
+            // queued at spawn precedes a user write.
+            let mut writer_rx = writer_rx;
+            let mut user_rx = user_rx;
             tokio::spawn(async move {
-                while let Some(cmd) = writer_rx.recv().await {
-                    match cmd {
-                        WriterCmd::Message(msg) => {
-                            if let Err(error) = codec::write_line(&mut stdin, msg.as_ref()).await {
-                                warn!(%error, "claude stdin write failed");
-                                break;
+                loop {
+                    tokio::select! {
+                        // Biased is unnecessary: both arms run the same single
+                        // writer; ordering between independent control/user
+                        // lines is not meaningful beyond init-first.
+                        cmd = writer_rx.recv() => match cmd {
+                            Some(cmd) => {
+                                if !handle_writer_cmd(&mut stdin, cmd).await {
+                                    break;
+                                }
                             }
-                        }
-                        WriterCmd::Close => {
-                            if let Err(error) = tokio::io::AsyncWriteExt::shutdown(&mut stdin).await
-                            {
-                                debug!(%error, "claude stdin shutdown");
+                            None => break,
+                        },
+                        cmd = user_rx.recv() => match cmd {
+                            Some(cmd) => {
+                                if !handle_writer_cmd(&mut stdin, cmd).await {
+                                    break;
+                                }
                             }
-                            break;
-                        }
+                            None => break,
+                        },
                     }
                 }
             })
@@ -465,6 +531,7 @@ impl ClaudeProcess {
 
         let process = Self {
             inbound: pub_in_tx.clone(),
+            user_writes: user_tx,
             writer: writer_tx,
             child,
             reader,
@@ -476,7 +543,7 @@ impl ClaudeProcess {
         Ok((pub_in_tx, pub_out_rx, process))
     }
 
-    /// Channel used by [`Self::send_user`] / [`Self::respond_control`].
+    /// Channel used by control responses.
     pub fn inbound(&self) -> &mpsc::Sender<Inbound> {
         &self.inbound
     }
@@ -487,12 +554,22 @@ impl ClaudeProcess {
     }
 
     /// Send a user turn (`content` string or blocks).
+    ///
+    /// Resolves only once the NDJSON line has been written to the child's
+    /// stdin (write-completion ack), not merely queued in a driver channel —
+    /// so the caller can safely treat "written" as the turn start. A closed or
+    /// failed pipe propagates as [`Error::StdinClosed`].
     pub async fn send_user(&self, content: UserContent) -> Result<(), Error> {
-        let message = match content {
+        let message = Inbound::User(match content {
             UserContent::Text(text) => UserMessage::text(text),
             UserContent::Blocks(blocks) => UserMessage::blocks(blocks),
-        };
-        self.send(Inbound::User(message)).await
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.user_writes
+            .send(WriterCmd::UserWrite(Box::new(message), tx))
+            .await
+            .map_err(|_| Error::StdinClosed)?;
+        rx.await.map_err(|_| Error::StdinClosed)?
     }
 
     /// Answer a CLI control request with a success payload (permission camelCase).

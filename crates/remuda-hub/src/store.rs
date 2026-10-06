@@ -5821,13 +5821,15 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // event (a transition into exited/failed/closed), kept separate from the
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
     ensure_column(&conn, "instances", "ended_at", "TEXT")?;
-    // Rows written before the column existed already carry their end event;
-    // `updated_at` was then the end time. Stamp them once; new end events use
-    // the event's own timestamp and never refresh this column.
+    // Rows written before the column existed: a transition to exited/closed is
+    // itself process-end evidence, so backfill those once from updated_at. A
+    // `failed` row is NOT trusted — round 3 (OA6) failed can be a turn-level
+    // error the process survived, and without the original event there is no
+    // way to distinguish; leave its ended_at null rather than fabricate one.
     conn.execute(
         "UPDATE instances SET ended_at = updated_at
          WHERE ended_at IS NULL
-           AND lifecycle IN ('exited', 'failed', 'closed')",
+           AND lifecycle IN ('exited', 'closed')",
         [],
     )?;
     // Rows written before the column existed are each their own lineage.
@@ -6225,12 +6227,25 @@ fn apply_instance_projection(
             .get("severity")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let failed = severity == "error"
-            || native_name.contains("error")
-            || native_name == "exit"
-            || native_name.contains("gone")
-            || native_name.contains("agent_not_ready")
-            || native_name.contains("shell");
+        let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
+        // ma-lineage round 3 item 2 (OA6): a native event folds the lifecycle
+        // to `failed` ONLY from explicit process-end evidence, never from a
+        // turn/configure/hook/diagnostic error or a bare error severity the
+        // process survived. This is independent of the Node/c-cardsettle split
+        // so a turn error can never stamp the row (or ended_at) terminal.
+        let start_failure = is_start_failure_reason(
+            payload
+                .pointer("/relatedIds/reasonCode")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ) || native_name == "native-driver-start-failed"
+            || native_name.contains("start-fail");
+        let process_exit = matches!(
+            native_name.as_str(),
+            "exit" | "gone" | "agent_not_ready" | "shell"
+        ) || native_name.contains("exit")
+            || native_name.contains("gone");
+        let failed = topic == "session" && (start_failure || (severity == "error" && process_exit));
         if failed {
             lifecycle = Some("failed");
             last_error = payload
@@ -6252,16 +6267,9 @@ fn apply_instance_projection(
              WHERE id = ?5",
             params![seq, lifecycle, last_error, now, instance_id],
         )?;
-        // ma-lineage round 2: an immutable end timestamp at the real end
-        // event; never refreshed by a later journal row.
-        if matches!(lifecycle, "exited" | "failed" | "closed") {
-            let at = event
-                .get("observedAt")
-                .and_then(Value::as_str)
-                .filter(|at| !at.is_empty())
-                .unwrap_or(now);
-            stamp_ended_at(conn, instance_id, at)?;
-        }
+        // ma-lineage round 3 item 2: ended_at is stamped ONLY at explicit
+        // process-end evidence; a `ready`/`running` entity event clears it.
+        apply_ended_at_from_event(conn, instance_id, lifecycle, event, now)?;
         // D-027: a terminal instance can never consume a staged attachment
         // again, and the Node drops its own copy at the same point.
         if matches!(lifecycle, "exited" | "failed") {
@@ -9346,6 +9354,92 @@ fn knowledge_value(value: Option<&Value>) -> Option<&str> {
         .or_else(|| value.get("value").and_then(Value::as_str))
 }
 
+/// D-057 OA6 (ma-lineage round 3, items 2+3): the SINGLE predicate for
+/// "explicit process-end evidence". A chapter is over only when one of these
+/// is present on a journal event:
+///
+/// * an entity lifecycle `exited` or `closed` (a real process exit the Node
+///   observed);
+/// * an entity lifecycle `failed` whose reason is an attested launch failure
+///   (the launch never started — `native-driver-start-failed` / `start-fail`);
+/// * a `topic=session` native event naming a process exit (`exit`, `gone`,
+///   `agent_not_ready`, `shell`) or that the launch never started
+///   (`native-driver-start-failed` / `start-fail`).
+///
+/// Everything else is NOT process end: a TURN result error (`topic=turn`, even
+/// with `affectsCompletion=true`), a transient error-severity session event
+/// with no exit name, and configure/hook/task/plan/diagnostic failures. The
+/// process is still alive in all of those, so no `ended_at` is stamped and a
+/// sessionless resume is refused rather than recovered (item 3).
+pub(crate) fn event_is_explicit_process_end(event: &Value) -> bool {
+    let payload = event.get("payload").unwrap_or(event);
+    let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    if payload_type == "entity" {
+        return match payload.get("state").and_then(Value::as_str) {
+            Some("exited" | "closed") => true,
+            Some("failed") => {
+                let reason = payload
+                    .get("reasonCode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                is_start_failure_reason(reason)
+                    || payload
+                        .pointer("/entity/lastError")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("start"))
+            }
+            _ => false,
+        };
+    }
+    if payload_type != "native" || payload.get("topic").and_then(Value::as_str) != Some("session") {
+        return false;
+    }
+    let name = payload
+        .get("nativeName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let reason = payload
+        .pointer("/relatedIds/reasonCode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    is_start_failure_reason(reason)
+        || name == "native-driver-start-failed"
+        || name.contains("start-fail")
+        || name == "exit"
+        || name.contains("exit")
+        || name.contains("gone")
+        || name.contains("agent_not_ready")
+        || name.contains("shell")
+}
+
+/// Whether a reason string attests that the launch never started (process-end
+/// evidence even though no process ever ran).
+fn is_start_failure_reason(reason: &str) -> bool {
+    reason == "native-driver-start-failed" || reason.contains("start-fail")
+}
+
+/// Lifecycles that mean the process (or launch attempt) has ended.
+fn lifecycle_is_terminal(lifecycle: &str) -> bool {
+    matches!(lifecycle, "exited" | "failed" | "closed")
+}
+
+/// D-057 OA6 row-level predicate for the continuation resume gate (ma-lineage
+/// round 3 item 3): does this chapter's row carry evidence the process is gone
+/// (or never launched)?
+///
+/// * `exited` / `closed` — a real observed process end;
+/// * `failed` — an attested launch failure (the launch never started) or a
+///   process death; round 3 item 2 guarantees a row reaches `failed` only from
+///   such evidence, never a turn error.
+///
+/// Everything else (`requested`/`starting`/`ready`/`running`) is a LIVE
+/// chapter, which with no native session must be refused rather than quietly
+/// relaunched.
+pub(crate) fn instance_row_has_process_end_evidence(record: &InstanceRecord) -> bool {
+    lifecycle_is_terminal(record.lifecycle.as_str())
+}
+
 fn lifecycle_rank(state: &str) -> i32 {
     match state {
         "requested" => 0,
@@ -9435,11 +9529,25 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         .or_else(|| knowledge_value(payload.pointer("/entity/activity")))
         .or_else(|| event.get("activity").and_then(Value::as_str));
 
-    let start_failed = reason == "native-driver-start-failed"
-        || native_name == "native-driver-start-failed"
-        || native_name.contains("start-fail")
-        || status.is_some_and(|s| s == "failed" || s == "error")
-        || entity_state == Some("failed");
+    // ma-lineage round 3 item 2 (OA6): `failed` is set ONLY from explicit
+    // process-end / launch-failure evidence, never from a turn result error or
+    // a bare error severity the process survived. A native event qualifies on
+    // topic=session with an exit/gone name or a start-fail reason (same rule
+    // as apply_instance_projection); turn/hook/task/plan/configuration/
+    // diagnostic topics never fail the row.
+    let native_topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
+    let native_process_failure = payload_type == "native"
+        && native_topic == "session"
+        && (is_start_failure_reason(reason)
+            || native_name == "native-driver-start-failed"
+            || native_name.contains("start-fail")
+            || native_name == "exit"
+            || native_name.contains("exit")
+            || native_name.contains("gone")
+            || native_name.contains("agent_not_ready")
+            || native_name.contains("shell"));
+    let start_failed = (payload_type == "native" && native_process_failure)
+        || (payload_type == "entity" && entity_state == Some("failed"));
     if start_failed && (kind == "lifecycle" || payload_type == "native" || payload_type == "entity")
     {
         return (Some("failed"), None);
@@ -9472,7 +9580,14 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
                 activity = normalize_activity(status);
             }
             "exited" => lifecycle = Some("exited"),
-            "failed" | "error" => lifecycle = Some("failed"),
+            // ma-lineage round 3 item 2 (OA6): a literal failed/error native
+            // STATUS never maps to a failed lifecycle here. Genuine process /
+            // launch failures are caught earlier by `native_process_failure`
+            // (explicit exit/start-fail evidence), and an entity state=failed
+            // is normalized to failed above. A turn result error or a
+            // transient session error reaches this arm while the process is
+            // alive and must leave the row running.
+            "failed" | "error" => {}
             _ => {}
         }
     }
@@ -9509,24 +9624,58 @@ fn apply_instance_lifecycle(
         "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
         params![lifecycle, activity, now, instance_id],
     )?;
-    // ma-lineage round 2: the chapter's immutable end timestamp. A journal
-    // end event stamps it once; later events keep updating `updated_at` but
-    // never move this.
-    if matches!(lifecycle, "exited" | "failed" | "closed") {
-        let at = event
-            .get("observedAt")
-            .and_then(Value::as_str)
-            .filter(|at| !at.is_empty())
-            .unwrap_or(&now);
-        stamp_ended_at(conn, instance_id, at)?;
-    }
+    // ma-lineage round 3 item 2: ended_at is set only at explicit process-end
+    // evidence and CLEARED when a later entity event brings the chapter back
+    // to ready/running (so a live chapter can never keep a stale endedAt).
+    apply_ended_at_from_event(conn, instance_id, lifecycle, event, &now)?;
     Ok(())
 }
 
 /// Lifecycles that are a real end event (ma-lineage round 2).
 const ENDED_LIFECYCLES: &str = "'exited', 'failed', 'closed'";
 
-/// Stamp the immutable `ended_at` once, at the real end event.
+/// Stamp or clear the immutable `ended_at` from one journal event according to
+/// the OA6 process-end rule (ma-lineage round 3 items 2+3).
+///
+/// * a resulting `ready`/`running`/`starting` lifecycle CLEARS `ended_at`
+///   (a live chapter carries no end time, even after an earlier transient
+///   failure);
+/// * a terminal lifecycle is stamped ONLY when the event itself is
+///   [`event_is_explicit_process_end`] — a turn error that happens to derive
+///   `failed` never stamps it;
+/// * `COALESCE` keeps the first real end timestamp: a close ACK landing after
+///   the process-exit event must not rewrite it.
+///
+/// Direct scheduler writes that are process-end by construction (host loss,
+/// inventory loss, stale create, explicit settle, Node-rejected create) call
+/// [`stamp_ended_at`] directly.
+fn apply_ended_at_from_event(
+    conn: &Connection,
+    instance_id: &str,
+    resulting_lifecycle: &str,
+    event: &Value,
+    now: &str,
+) -> Result<(), StoreError> {
+    if matches!(resulting_lifecycle, "ready" | "running" | "starting") {
+        conn.execute(
+            "UPDATE instances SET ended_at = NULL WHERE id = ?1",
+            params![instance_id],
+        )?;
+        return Ok(());
+    }
+    if lifecycle_is_terminal(resulting_lifecycle) && event_is_explicit_process_end(event) {
+        let at = event
+            .get("observedAt")
+            .and_then(Value::as_str)
+            .filter(|at| !at.is_empty())
+            .unwrap_or(now);
+        stamp_ended_at(conn, instance_id, at)?;
+    }
+    Ok(())
+}
+
+/// Stamp the immutable `ended_at` once, for a write that is process-end
+/// evidence by construction (scheduler / settle / Node-rejected launch).
 ///
 /// `COALESCE` keeps the first end timestamp: a close ACK landing after the
 /// process-exit event (or any later journal row) must not rewrite it, and the

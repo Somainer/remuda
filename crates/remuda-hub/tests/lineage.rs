@@ -581,28 +581,36 @@ async fn owner_resume_of_a_live_chapter_fences_it_and_copies_the_delegation() ->
     Ok(())
 }
 
-/// D-057 OA6: a chapter marked `failed` by a retryable SDK turn error still
-/// has a live process. `failed` is turn-level, not process termination, so a
-/// continuation MUST close the predecessor — otherwise two live chapters
-/// coexist. Only process-end evidence (exited/closed) skips the close.
+/// D-057 OA6 (round 3): a chapter whose ROOT TURN failed stays RUNNING with a
+/// live process (a turn error is never process termination). A continuation
+/// MUST close that live predecessor — otherwise two live chapters coexist.
 #[tokio::test]
-async fn a_failed_but_alive_chapter_is_closed_when_the_lineage_continues() -> Result<()> {
+async fn a_live_chapter_after_a_failed_turn_is_closed_when_the_lineage_continues() -> Result<()> {
     let ctx = Ctx::boot().await?;
     let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
     let (x, _token) = ctx.seat(&mut node, None).await?;
-    // The chapter reports its native session and stays RUNNING; the Hub
-    // projection then records a turn-level failure (the ma-sdk-state
-    // projection keeps lifecycle running, but older rows may already carry
-    // `failed` — either way this row has no process-end evidence).
+    // The chapter reports its native session; a failed turn (429) leaves the
+    // row RUNNING — the process is still alive.
     ctx.report_session(&node, &x, false).await?;
-    {
-        let db = rusqlite::Connection::open(&ctx.db_path)?;
-        db.execute(
-            "UPDATE instances SET lifecycle = 'failed', last_error = 'api-error: 429'
-             WHERE id = ?1",
-            rusqlite::params![x],
-        )?;
-    }
+    node.appends.send((
+        x.clone(),
+        json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "native", "topic": "turn", "nativeName": "result",
+                "status": { "state": "known", "value": "error" },
+                "severity": "info", "affectsCompletion": true,
+                "relatedIds": { "queuedTurnCount": "0", "lastError": "api-error: 429" }
+            }
+        }),
+    ))?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let before = ctx.get_instance(&x, &ctx.human).await?;
+    assert_eq!(
+        before["lifecycle"],
+        json!("running"),
+        "a failed turn is not process end"
+    );
 
     let response: Value = ctx
         .resume(&x, &ctx.human)
@@ -975,6 +983,127 @@ async fn a_live_chapter_without_a_native_session_is_refused_and_an_ended_one_rel
 }
 
 // --- 3. Concurrent resumes: one successor (generation CAS) ---------------
+
+/// Fetch the `endedAt` of a lineage's first chapter.
+async fn first_chapter_ended_at(ctx: &Ctx, lineage_id: &str) -> Result<Option<Value>> {
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{lineage_id}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(lineage["chapters"][0]["endedAt"].as_str().map(Value::from))
+}
+
+/// r3 item 2: a failed SDK TURN does not end the chapter. `endedAt` stays null
+/// through the turn error and is stamped only by the later real exit.
+#[tokio::test]
+async fn a_failed_turn_sets_no_ended_at_until_the_real_process_exit() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // A settled turn error (the print/sdk mapper's `result` is_error frame):
+    // topic=turn, status error, queued 0. The chapter is still running.
+    node.appends.send((
+        x.clone(),
+        json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-06T01:00:00.000Z",
+            "payload": {
+                "type": "native", "topic": "turn", "nativeName": "result",
+                "status": { "state": "known", "value": "error" },
+                "severity": "info", "affectsCompletion": true,
+                "relatedIds": { "queuedTurnCount": "0", "lastError": "API Error: 429" }
+            }
+        }),
+    ))?;
+    let view = ctx
+        .wait_until(&x, |v| v["durableSeq"].as_str().is_some_and(|s| s != "0"))
+        .await?;
+    assert_ne!(
+        view["lifecycle"],
+        json!("failed"),
+        "a turn error never marks the lifecycle failed"
+    );
+    assert_eq!(
+        first_chapter_ended_at(&ctx, &x).await?,
+        None,
+        "a turn error stamps no endedAt"
+    );
+
+    // The real process exits later: only now is endedAt set.
+    node.appends.send((
+        x.clone(),
+        json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-06T02:00:00.000Z",
+            "payload": { "type": "entity", "state": "exited", "reasonCode": "native-exit" }
+        }),
+    ))?;
+    ctx.wait_until(&x, |v| v["lifecycle"] == json!("exited"))
+        .await?;
+    assert_eq!(
+        first_chapter_ended_at(&ctx, &x).await?,
+        Some(json!("2026-10-06T02:00:00.000Z")),
+        "endedAt comes from the real exit, not the turn error"
+    );
+    Ok(())
+}
+
+/// r3 item 2: an error-severity session event without exit evidence does not
+/// end a live chapter, and a later `ready` entity event leaves endedAt null.
+#[tokio::test]
+async fn an_error_severity_event_then_ready_leaves_ended_at_null() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    node.appends.send((
+        x.clone(),
+        json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-06T01:00:00.000Z",
+            "payload": {
+                "type": "native", "topic": "session", "nativeName": "transient_runtime_error",
+                "status": { "state": "known", "value": "working" },
+                "severity": "error", "affectsCompletion": false,
+                "relatedIds": {}
+            }
+        }),
+    ))?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let view = ctx.get_instance(&x, &ctx.human).await?;
+    assert_ne!(
+        view["lifecycle"],
+        json!("failed"),
+        "a transient error is not process end"
+    );
+    assert_eq!(first_chapter_ended_at(&ctx, &x).await?, None);
+
+    // A later ready entity event confirms the process is alive.
+    node.appends.send((
+        x.clone(),
+        json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-06T01:05:00.000Z",
+            "payload": { "type": "entity", "state": "ready", "reasonCode": "driver-started" }
+        }),
+    ))?;
+    ctx.wait_until(&x, |v| v["lifecycle"] == json!("running"))
+        .await?;
+    assert_eq!(
+        first_chapter_ended_at(&ctx, &x).await?,
+        None,
+        "ready on a live chapter leaves endedAt null"
+    );
+    Ok(())
+}
 
 /// A resume addressed to an already-fenced chapter returns its existing
 /// successor idempotently (r2-8): it must not fence the live chapter or mint

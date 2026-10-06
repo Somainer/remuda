@@ -856,8 +856,15 @@ mod tests {
         }
         let roots = roots_for(&root);
         let canonical_root = fs::canonicalize(root.path()).unwrap();
+        // Per-process fd directory: /proc/self/fd on Linux, /dev/fd on macOS
+        // (and other BSDs). Both expose per-fd symlinks resolving to the open
+        // target, which is what the leak assertion reads.
+        #[cfg(target_os = "linux")]
+        let fd_dir = "/proc/self/fd";
+        #[cfg(not(target_os = "linux"))]
+        let fd_dir = "/dev/fd";
         let fds_under_root = || -> usize {
-            fs::read_dir("/proc/self/fd")
+            fs::read_dir(fd_dir)
                 .unwrap()
                 .filter_map(Result::ok)
                 .filter_map(|entry| fs::read_link(entry.path()).ok())

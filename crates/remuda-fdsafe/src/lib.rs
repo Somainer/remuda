@@ -955,6 +955,23 @@ mod tests {
     }
 
     #[test]
+    fn create_subdir_excl_never_adopts_or_replaces_an_existing_name() {
+        let tmp = tempdir();
+        let root = anchor(&tmp);
+        root.ensure_subdir(b"planted").expect("real dir");
+        // Exclusive create on an existing name fails (EEXIST); it does not
+        // adopt, open, or delete it.
+        let error = root.create_subdir_excl(b"planted").expect_err("EEXIST");
+        assert!(error.is_already_exists());
+        // The existing directory and contents are untouched.
+        root.subdir(b"planted")
+            .expect("subdir")
+            .create_leaf_excl(b"keep")
+            .expect("leaf");
+        assert!(tmp.join("planted/keep").is_file());
+    }
+
+    #[test]
     fn open_or_create_anchor_handles_missing_leaf_components() {
         let tmp = tempdir();
         let target = &tmp.join("a/b/c");

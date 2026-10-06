@@ -128,7 +128,8 @@ pub enum FdErrorKind {
 }
 
 impl FdError {
-    fn new(at: impl Into<String>, kind: FdErrorKind) -> Self {
+    /// Construct a walk failure from its component and kind.
+    pub fn new(at: impl Into<String>, kind: FdErrorKind) -> Self {
         Self {
             at: at.into(),
             kind,
@@ -263,6 +264,26 @@ impl DirFd {
     pub fn open_root(path: &Path) -> Result<Self, FdError> {
         let fd = nix::fcntl::openat(Some(nix::libc::AT_FDCWD), path, DIR_FLAGS, Mode::empty())
             .map_err(|error| FdError::io_path(path, error))?;
+        Ok(Self {
+            file: unsafe { own_fd(fd) },
+        })
+    }
+
+    /// Whether this opened directory is world-writable (`S_IWOTH`), read from
+    /// the opened fd — no path re-stat.
+    pub fn is_world_writable(&self) -> Result<bool, FdError> {
+        let stat = nix::sys::stat::fstat(self.as_raw_fd())
+            .map_err(|error| FdError::new("<dir fd>", FdErrorKind::Other(error.to_string())))?;
+        Ok(stat.st_mode & nix::libc::S_IWOTH != 0)
+    }
+
+    /// Open this directory's own parent (`..`) with the same
+    /// `O_NOFOLLOW|O_DIRECTORY` flags. Used by callers that need to climb a
+    /// REAL directory tree (as opposed to a user-supplied multi-component
+    /// name, which [`Self::subdir`] deliberately rejects).
+    pub fn open_parent(&self) -> Result<Self, FdError> {
+        let fd = nix::fcntl::openat(Some(self.as_raw_fd()), "..", DIR_FLAGS, Mode::empty())
+            .map_err(|error| FdError::io(b"..", error))?;
         Ok(Self {
             file: unsafe { own_fd(fd) },
         })
@@ -429,6 +450,29 @@ impl DirFd {
         let fd = nix::fcntl::openat(Some(self.as_raw_fd()), name, CREATE_EXCL_FLAGS, FILE_MODE)
             .map_err(|error| FdError::io(name, error))?;
         Ok(unsafe { own_fd(fd) })
+    }
+
+    /// Open an existing regular leaf for appending
+    /// (`O_WRONLY|O_APPEND|O_NOFOLLOW`). Symlinks and non-regular entries are
+    /// refused; absence is [`FdErrorKind::Missing`].
+    pub fn open_append_leaf(&self, name: &[u8]) -> Result<File, FdError> {
+        check_component(name)?;
+        let flags = OFlag::O_WRONLY
+            .union(OFlag::O_APPEND)
+            .union(OFlag::O_NOFOLLOW)
+            .union(OFlag::O_CLOEXEC);
+        let fd = nix::fcntl::openat(Some(self.as_raw_fd()), name, flags, FILE_MODE)
+            .map_err(|error| FdError::io(name, error))?;
+        let file = unsafe { own_fd(fd) };
+        let stat =
+            nix::sys::stat::fstat(file.as_raw_fd()).map_err(|error| FdError::io(name, error))?;
+        if classify(&stat).0 != LeafKind::Regular {
+            return Err(FdError::new(
+                String::from_utf8_lossy(name).into_owned(),
+                FdErrorKind::Other("not a regular file".into()),
+            ));
+        }
+        Ok(file)
     }
 
     /// Rename one component relative to two pinned directory fds. The caller

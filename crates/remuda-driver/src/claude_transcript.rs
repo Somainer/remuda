@@ -92,6 +92,14 @@ fn invalid_input(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
 }
 
+/// Construct a security refusal (a symlink or other non-regular entry where
+/// the staging walk requires a real file/directory). Same kind the
+/// descriptor-relative walk itself returns, so callers cannot distinguish a
+/// walk-level refusal from an explicit one.
+fn symlink_refused(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, message.into())
+}
+
 /// How a promoted terminal came to be bound to a transcript.
 ///
 /// Reported to the UI so the header chip can state the channel honestly.
@@ -678,8 +686,33 @@ fn stage_for_resume_with_limits(
                 source_abs.display()
             ))
         })?;
-    let src_dir_fd = DirFd::open_existing_abs(source_dir_path)?;
-    let src_leaf = src_dir_fd.open_regular_leaf(source_name.as_bytes())?;
+    let src_dir_fd = DirFd::open_existing_abs(source_dir_path).map_err(|error| {
+        if error.kind == FdErrorKind::Missing {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "resume transcript not found at {}: the predecessor directory does not exist",
+                    source_abs.display()
+                ),
+            )
+        } else {
+            error.into()
+        }
+    })?;
+    let src_leaf = src_dir_fd.open_regular_leaf(source_name.as_bytes()).map_err(|error| {
+        if error.kind == FdErrorKind::Missing {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "resume transcript not found at {}: it is not a readable regular file in the \
+                     predecessor directory",
+                    source_abs.display()
+                ),
+            )
+        } else {
+            std::io::Error::from(error)
+        }
+    })?;
     let source_size = src_leaf.len;
     let src_identity = src_leaf.identity()?;
     // Round 3 item 7: refuse an oversized transcript before reading/hashing.
@@ -710,7 +743,7 @@ fn stage_for_resume_with_limits(
     let existing = dest_dir_fd.classify_leaf(&transcript_name_bytes)?;
     let retained = match existing {
         Some(entry) if entry.kind == LeafKind::Symlink => {
-            return Err(invalid_input(format!(
+            return Err(symlink_refused(format!(
                 "resume destination {} is a symlink, not a real file; refusing to stage through it",
                 dest_transcript.display()
             )));
@@ -741,6 +774,36 @@ fn stage_for_resume_with_limits(
     };
 
     // ---- Private temp tree for this attempt, inside the pinned slug dir.
+    // Round 3 item 5: first discard every temp tree a crashed/ENOSPC-killed
+    // earlier attempt left behind — none of their partial files may be charged,
+    // trusted, or published. They are private (dot-prefixed, EXCL-created by
+    // this code), so removal never touches an operator's directory.
+    for entry in dest_dir_fd.entries()? {
+        let name = String::from_utf8_lossy(&entry.name);
+        if name.starts_with(STAGING_TMP_PREFIX) {
+            match entry.kind {
+                LeafKind::Directory => dest_dir_fd.remove_private_tree(&entry.name)?,
+                // A link wearing our private prefix is an intrusion, not
+                // removable as a temp tree and never to be touched.
+                LeafKind::Symlink | LeafKind::Other => {
+                    return Err(invalid_input(format!(
+                        "resume staging refuses a non-directory entry wearing its private temp \
+                         prefix in {}: {name}",
+                        dest_dir.display()
+                    )));
+                }
+                LeafKind::Regular => {
+                    // A regular file with the temp prefix cannot be one of ours
+                    // (temp trees are directories); leave it alone and refuse.
+                    return Err(invalid_input(format!(
+                        "resume staging refuses a regular file wearing its private temp prefix \
+                         in {}: {name}",
+                        dest_dir.display()
+                    )));
+                }
+            }
+        }
+    }
     let tmp_name = format!(
         "{STAGING_TMP_PREFIX}{session_id}-{}",
         uuid::Uuid::new_v4().as_simple()
@@ -979,6 +1042,7 @@ fn build_verify_and_publish(
 /// THE ROOT (not including its label); directories are descended within the
 /// depth cap; symlinks and other non-regular entries are skipped and reported
 /// with the root label prefix — never opened, never followed.
+#[allow(clippy::too_many_arguments)]
 fn enumerate_regular(
     dir_fd: &DirFd,
     rel_inside: &str,
@@ -1048,7 +1112,7 @@ fn copy_sidecar_seed(
         source_chain.push(base.subdir(component)?);
     }
     let source_parent = source_chain.last().unwrap_or(root_fd);
-    let leaf = source_parent.open_regular_leaf(*inside.last().unwrap())?;
+    let leaf = source_parent.open_regular_leaf(inside.last().unwrap())?;
 
     // Destination in the temp tree mirrors the slug: root label first.
     let root_bytes = root_label.as_bytes();
@@ -1062,7 +1126,7 @@ fn copy_sidecar_seed(
         temp_chain.push(base.ensure_subdir(component)?);
     }
     let temp_parent = temp_chain.last().unwrap_or(temp_fd);
-    let mut out = temp_parent.create_leaf_excl(*inside.last().unwrap())?;
+    let mut out = temp_parent.create_leaf_excl(inside.last().unwrap())?;
     let sha = stream_hashed(&mut &leaf.file, &mut out, expected_size, limits)?;
     seeds.push(ManifestEntry {
         rel: format!("{root_label}/{rel}"),
@@ -1076,7 +1140,7 @@ fn copy_sidecar_seed(
 /// is enforced on the live byte count (independent of the pre-charged
 /// budget), and the stream must end at exactly the size the entry was
 /// classified with — a grown or swapped file is a hard error.
-fn stream_hashed<R: ?Sized, W: ?Sized>(
+fn stream_hashed<R, W>(
     src: &mut R,
     dst: &mut W,
     expected_size: u64,
@@ -1191,9 +1255,9 @@ fn verify_dir(
     Ok(())
 }
 
-fn hash_reader<R: ?Sized>(reader: &mut R) -> std::io::Result<String>
+fn hash_reader<R>(reader: &mut R) -> std::io::Result<String>
 where
-    R: std::io::Read,
+    R: std::io::Read + ?Sized,
 {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1806,6 +1870,26 @@ mod tests {
         std::fs::write(path, body).expect("write");
     }
 
+    /// Every regular file below `root` (symlinks deliberately not followed —
+    /// a staged tree must contain none).
+    fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                let entry = entry.expect("entry");
+                let ty = entry.file_type().expect("file type");
+                let path = entry.path();
+                if ty.is_dir() {
+                    stack.push(path);
+                } else if ty.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
     fn transcript_layout(home: &std::path::Path, cwd: &std::path::Path, session: &str) -> PathBuf {
         project_dir(home, cwd).join(format!("{session}.jsonl"))
     }
@@ -2284,7 +2368,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resume_staging_symlink_sidecars_are_copied_as_independent_files() {
+    fn resume_staging_skips_and_reports_every_sidecar_symlink_never_resolving_it() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().expect("tmp");
         let old_home = tmp.path().join("old");
@@ -2296,60 +2380,79 @@ mod tests {
         write_file(&source, "{}\n");
         let project = source.parent().unwrap();
 
-        // Internal relative link (subagents dir → memory file) and an internal
-        // link chain (chain → inner → real file). Both stay in the project.
+        // A real regular sidecar (must still be staged) beside three links.
         let subagents = project.join(session).join("subagents");
         std::fs::create_dir_all(&subagents).expect("mkdir");
+        write_file(&subagents.join("real-side.jsonl"), "{\"real\":true}\n");
         write_file(&project.join("memory/MEMORY.md"), "project memory\n");
+        // In-tree link that WOULD resolve to a regular file under round 2's
+        // hop-following rules.
         symlink("../../memory/MEMORY.md", subagents.join("memory-link.md")).expect("internal link");
+        // Multi-hop in-tree chain.
         write_file(&project.join(session).join("inner.jsonl"), "inner-target\n");
         symlink("inner.jsonl", project.join(session).join("mid.jsonl")).expect("mid link");
         symlink("mid.jsonl", project.join(session).join("chain.jsonl")).expect("chain link");
 
         let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
 
-        let copied = subagents.strip_prefix(project).unwrap().to_path_buf();
-        let dest_memory_link = staged
-            .transcript
-            .parent()
-            .unwrap()
-            .join(&copied)
-            .join("memory-link.md");
-        let metadata = std::fs::symlink_metadata(&dest_memory_link).expect("copied link entry");
+        // The regular sidecar is copied.
         assert!(
-            metadata.is_file(),
-            "the link becomes a regular file, not a link"
+            staged
+                .transcript
+                .parent()
+                .unwrap()
+                .join(session)
+                .join("subagents/real-side.jsonl")
+                .is_file()
         );
-        assert_eq!(
-            std::fs::read_to_string(&dest_memory_link).unwrap(),
-            "project memory\n",
-            "target content is copied as an independent file"
+        assert!(
+            staged
+                .transcript
+                .parent()
+                .unwrap()
+                .join("memory/MEMORY.md")
+                .is_file()
         );
-        for name in ["chain.jsonl", "mid.jsonl"] {
-            let path = staged.transcript.parent().unwrap().join(session).join(name);
+        // Every link is skipped — none is recreated, neither as a link nor as
+        // an independent regular file.
+        for rel in [
+            format!("{session}/subagents/memory-link.md"),
+            format!("{session}/mid.jsonl"),
+            format!("{session}/chain.jsonl"),
+        ] {
             assert!(
-                std::fs::symlink_metadata(&path).unwrap().is_file(),
-                "{name}"
+                !staged.transcript.parent().unwrap().join(&rel).exists(),
+                "{rel} must not be staged at all"
             );
         }
-        assert_eq!(
-            std::fs::read_to_string(
-                staged
-                    .transcript
-                    .parent()
-                    .unwrap()
-                    .join(session)
-                    .join("chain.jsonl")
-            )
-            .unwrap(),
-            "inner-target\n",
-            "internal chains resolve to their final in-tree target"
+        let reports = staged.skipped.join("|");
+        assert!(
+            reports.contains("symlink:"),
+            "links are reported: {reports}"
+        );
+        assert!(
+            reports.contains(&format!("{session}/subagents/memory-link.md")),
+            "{reports}"
+        );
+        assert!(
+            reports.contains(&format!("{session}/chain.jsonl")),
+            "{reports}"
+        );
+        // The in-tree target bytes must not leak in under a link's name.
+        assert!(
+            !staged
+                .transcript
+                .parent()
+                .unwrap()
+                .join(session)
+                .join("subagents/memory-link.md")
+                .is_file()
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn resume_staging_rejects_escaping_broken_and_directory_symlinks() {
+    fn resume_staging_skips_escaping_broken_and_directory_links_without_following_them() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().expect("tmp");
         let old_home = tmp.path().join("old");
@@ -2362,14 +2465,14 @@ mod tests {
         let project = source.parent().unwrap();
         let side = project.join(session);
         std::fs::create_dir_all(&side).expect("mkdir");
+        write_file(&side.join("real.jsonl"), "real sidecar\n");
 
         // Outside the project tree: relative traversal and an absolute link.
         let outside = tmp.path().join("outside.txt");
-        write_file(&outside, "outside\n");
+        write_file(&outside, "OUTSIDE-SECRET-BYTES\n");
         symlink(&outside, side.join("escaping-abs")).expect("abs link");
         symlink("../../../../outside.txt", side.join("escaping-rel")).expect("rel link");
-        // Multi-hop escape: the first hop looks internal (into the project
-        // root), the second leaves via an absolute target.
+        // Multi-hop escape: the first hop looks internal, the second leaves.
         symlink("../../hop2", side.join("hop1")).expect("hop1");
         symlink(&outside, project.join("hop2")).expect("hop2 leaves tree");
         // Broken link.
@@ -2378,33 +2481,52 @@ mod tests {
         std::fs::create_dir_all(project.join("realdir")).expect("realdir");
         symlink("realdir", side.join("dir-link")).expect("dir link");
 
-        let error = stage_for_resume(&source, &new_home, &cwd, session)
-            .expect_err("any unsafe sidecar link aborts staging with an error, never a skip");
+        // Round 3: non-regular leaves are skipped and reported, never opened;
+        // the transcript and regular sidecars still stage.
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
+        assert!(staged.transcript.is_file());
         assert!(
-            matches!(
-                error.kind(),
-                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
-            ),
-            "escaping/dir links are InvalidInput; a dangling link is NotFound: {error}"
+            staged
+                .transcript
+                .parent()
+                .unwrap()
+                .join(session)
+                .join("real.jsonl")
+                .is_file(),
+            "the legitimate regular sidecar is staged"
         );
-        // The dangerous links are never reproduced in the child home.
         for name in ["escaping-abs", "escaping-rel", "hop1", "broken", "dir-link"] {
             assert!(
-                !new_home
-                    .join("projects")
-                    .join(encode_project_dir(&cwd))
+                !staged
+                    .transcript
+                    .parent()
+                    .unwrap()
                     .join(session)
                     .join(name)
-                    .symlink_metadata()
-                    .is_ok_and(|meta| meta.file_type().is_symlink()),
-                "{name} must not exist as a symlink in the staged tree"
+                    .exists(),
+                "{name} must not exist in the staged tree"
             );
         }
+        // The outside content must not appear ANYWHERE in the staged tree.
+        for entry in walkdir(staged.transcript.parent().unwrap()) {
+            let body = std::fs::read(&entry).unwrap_or_default();
+            assert!(
+                !body.windows(21).any(|w| w == b"OUTSIDE-SECRET-BYTES"),
+                "outside bytes leaked into {}",
+                entry.display()
+            );
+        }
+        assert_eq!(
+            staged.skipped.len(),
+            5,
+            "all five links reported: {:?}",
+            staged.skipped
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn resume_staging_refuses_a_symlinked_sidecar_root() {
+    fn resume_staging_skips_a_symlinked_sidecar_root_and_never_reads_through_it() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().expect("tmp");
         let old_home = tmp.path().join("old");
@@ -2417,13 +2539,434 @@ mod tests {
         let project = source.parent().unwrap();
         let elsewhere = tmp.path().join("elsewhere-memory");
         std::fs::create_dir_all(&elsewhere).expect("mkdir");
-        write_file(&elsewhere.join("SECRET.md"), "x\n");
+        write_file(&elsewhere.join("SECRET.md"), "ELSEWHERE-MEMORY-SECRET\n");
         symlink(&elsewhere, project.join("memory")).expect("symlinked memory root");
 
-        let error = stage_for_resume(&source, &new_home, &cwd, session)
-            .expect_err("a symlinked memory dir must not be read through");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        // The root is a link: skipped and reported, but the transcript stages.
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
+        assert!(staged.transcript.is_file());
+        assert!(
+            !staged
+                .transcript
+                .parent()
+                .unwrap()
+                .join("memory/SECRET.md")
+                .exists(),
+            "a symlinked memory root is never read through"
+        );
+        assert!(
+            staged.skipped.iter().any(|entry| entry == "symlink:memory"),
+            "the root link is reported: {:?}",
+            staged.skipped
+        );
+    }
+
+    // ===================== c-resumehome round 3 regressions =====================
+
+    /// Item 2: the exact round-2 escape — `<session>/exfil -> ../bridge/passwd`
+    /// with `bridge -> /etc` — used to pass the lexical containment check
+    /// because a stat followed the intermediate component. The fd walk never
+    /// resolves any sidecar link: the exfil entry is skipped and reported, and
+    /// no byte from `/etc/passwd` lands in the staged tree.
+    #[cfg(unix)]
+    #[test]
+    fn round3_an_in_tree_hop_to_an_outside_target_is_skipped_and_never_read() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b3";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+        let project = source.parent().unwrap();
+        let side = project.join(session);
+        std::fs::create_dir_all(&side).expect("side dir");
+        symlink("/etc", project.join("bridge")).expect("bridge -> /etc");
+        symlink("../bridge/passwd", side.join("exfil")).expect("in-tree hop");
+
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("staging succeeds");
+        assert!(staged.transcript.is_file(), "the transcript still stages");
+        let exfil = staged
+            .transcript
+            .parent()
+            .unwrap()
+            .join(session)
+            .join("exfil");
+        assert!(!exfil.exists(), "the exfil link is never reproduced");
+        assert!(
+            staged.skipped.iter().any(|entry| entry.contains("exfil")),
+            "the hop is reported: {:?}",
+            staged.skipped
+        );
+        for entry in walkdir(staged.transcript.parent().unwrap()) {
+            let body = std::fs::read(&entry).unwrap_or_default();
+            assert!(
+                !body.windows(5).any(|w| w == b"root:"),
+                "/etc/passwd bytes leaked into {}",
+                entry.display()
+            );
+        }
+    }
+
+    /// Item 1: a symlink at ANY destination level is refused before a file is
+    /// created through it — the projects slug dir, a sidecar directory, and the
+    /// transcript leaf.
+    #[cfg(unix)]
+    #[test]
+    fn round3_destination_symlinks_at_every_level_are_refused() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b1";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+
+        // (a) `projects` in the new home is a symlink: never create_dir_all
+        // through it (the sibling dir must not receive the slug).
+        let new_a = tmp.path().join("new-a");
+        std::fs::create_dir_all(&new_a).expect("home");
+        let project_target = tmp.path().join("projects-elsewhere-a");
+        std::fs::create_dir_all(&project_target).expect("target dir");
+        symlink(&project_target, new_a.join("projects")).expect("projects link");
+        let error = stage_for_resume(&source, &new_a, &cwd, session).expect_err("projects link");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        assert!(
+            !project_target.join(encode_project_dir(&cwd)).exists(),
+            "the slug dir must not be created through the symlinked projects"
+        );
+
+        // (b) The destination transcript leaf is a symlink at the predecessor
+        // (would previously pass same_path-style acceptance).
+        let new_b = tmp.path().join("new-b");
+        let dest = transcript_layout(&new_b, &cwd, session);
+        std::fs::create_dir_all(dest.parent().unwrap()).expect("slug");
+        symlink(&source, &dest).expect("dest transcript link");
+        let error = stage_for_resume(&source, &new_b, &cwd, session)
+            .expect_err("a symlinked destination transcript is refused first");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
         assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    /// Item 1: an existing symlinked destination SIDECAR is never kept or
+    /// written through, even though a regular identical sidecar would be kept.
+    #[cfg(unix)]
+    #[test]
+    fn round3_an_existing_destination_sidecar_symlink_is_refused_not_kept() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b2";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+        write_file(
+            &source.parent().unwrap().join(session).join("side.jsonl"),
+            "real side\n",
+        );
+        // First, a clean stage so the home has a real slug dir + transcript.
+        stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
+        // Then swap in a symlink where the sidecar would land.
+        let dest_side = transcript_layout(&new_home, &cwd, session)
+            .parent()
+            .unwrap()
+            .join(session)
+            .join("side.jsonl");
+        std::fs::create_dir_all(dest_side.parent().unwrap()).expect("dest side dir");
+        // Attacker swaps the previously-copied sidecar for a symlink.
+        std::fs::remove_file(&dest_side).expect("remove the good sidecar");
+        let outside = tmp.path().join("outside-side.txt");
+        write_file(&outside, "side-target\n");
+        symlink(&outside, &dest_side).expect("dest sidecar link");
+        let error = stage_for_resume(&source, &new_home, &cwd, session)
+            .expect_err("a symlinked destination sidecar aborts staging");
+        assert!(
+            error.to_string().contains("symlink")
+                || error.kind() == std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&outside).unwrap().len(),
+            "side-target\n".len() as u64,
+            "the link target is never written through"
+        );
+    }
+
+    /// Item 3: provenance/streaming reads the OPENED fd. Replace the source
+    /// path with different bytes AFTER the fd is opened; the stream must still
+    /// see the original file, and its sha must match the original bytes — not a
+    /// re-read of the (now different) path.
+    #[test]
+    fn round3_streaming_hashes_the_opened_fd_not_a_path_reread() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = remuda_fdsafe::DirFd::open_root(tmp.path()).expect("root");
+        root.create_leaf_excl(b"t.jsonl")
+            .expect("create")
+            .write_all(b"original-bytes\n")
+            .expect("write original");
+        // Open the leaf, then swap the path away (rename a new file over it).
+        let leaf = root.open_regular_leaf(b"t.jsonl").expect("open leaf");
+        let mut temp_name = root.create_leaf_excl(b"replacement").expect("temp");
+        temp_name
+            .write_all(b"REPLACED-BYTES\n")
+            .expect("write replacement");
+        root.rename(b"replacement", &root, b"t.jsonl")
+            .expect("swap path");
+        let mut reader = leaf.file;
+        let mut out = root.create_leaf_excl(b"copy").expect("copy");
+        let sha = stream_hashed(
+            &mut reader,
+            &mut out,
+            "original-bytes\n".len() as u64,
+            &DEFAULT_STAGE_LIMITS,
+        )
+        .expect("stream from held fd");
+        let mut got = Vec::new();
+        use std::io::Read;
+        root.open_regular_leaf(b"copy")
+            .expect("reopen copy")
+            .file
+            .read_to_end(&mut got)
+            .expect("read copy");
+        assert_eq!(&got, b"original-bytes\n", "the held fd is the old inode");
+        let expected = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(b"original-bytes\n"))
+        };
+        assert_eq!(
+            sha, expected,
+            "provenance hashes the streamed bytes, not the swapped path"
+        );
+    }
+
+    /// Item 4: a FIFO sidecar can never block staging or be copied: it is
+    /// classified Other before any open, skipped, and reported.
+    #[cfg(unix)]
+    #[test]
+    fn round3_a_fifo_sidecar_is_skipped_without_blocking() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b4";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+        let side_dir = source.parent().unwrap().join(session);
+        std::fs::create_dir_all(&side_dir).expect("side dir");
+        nix::unistd::mkfifo(
+            &side_dir.join("hose"),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .expect("mkfifo");
+        write_file(&side_dir.join("real.jsonl"), "real\n");
+
+        let started = std::time::Instant::now();
+        let staged = stage_for_resume(&source, &new_home, &cwd, session)
+            .expect("fifo must not abort staging");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a FIFO never blocks"
+        );
+        assert!(staged.transcript.is_file());
+        assert!(
+            staged
+                .transcript
+                .parent()
+                .unwrap()
+                .join(session)
+                .join("real.jsonl")
+                .is_file()
+        );
+        assert!(
+            !staged
+                .transcript
+                .parent()
+                .unwrap()
+                .join(session)
+                .join("hose")
+                .exists(),
+            "the FIFO is not reproduced"
+        );
+        assert!(
+            staged.skipped.iter().any(|entry| entry.contains("hose")),
+            "the FIFO is reported: {:?}",
+            staged.skipped
+        );
+    }
+
+    /// Item 5: a stale partial sidecar sitting under its FINAL name (a crashed
+    /// copy from an older staging design) is a conflict — it is never silently
+    /// kept — while a leftover private temp tree is discarded.
+    #[test]
+    fn round3_partial_final_sidecar_conflicts_and_stale_temp_tree_is_discarded() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b5";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+        write_file(
+            &source.parent().unwrap().join(session).join("full.jsonl"),
+            "the complete sidecar contents\n",
+        );
+        // Stage once to establish the slug and transcript.
+        stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
+        let dest_project = transcript_layout(&new_home, &cwd, session)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        // (a) A crashed old-style copy left a truncated file under its name.
+        let final_side = dest_project.join(session).join("full.jsonl");
+        std::fs::remove_file(&final_side).expect("remove the good copy");
+        write_file(&final_side, "the comp");
+        let error = stage_for_resume(&source, &new_home, &cwd, session)
+            .expect_err("a partial same-name sidecar is a conflict, not a kept file");
+        assert!(
+            error
+                .to_string()
+                .contains("already exists with a different size"),
+            "{error}"
+        );
+        // (b) A leftover private temp tree from a killed attempt is discarded,
+        // and the retry then succeeds.
+        let stale = dest_project.join(".stage-crashed-attempt");
+        std::fs::create_dir_all(stale.join(session)).expect("stale temp tree");
+        write_file(&stale.join(session).join("partial.jsonl"), "x");
+        write_file(&final_side, "the complete sidecar contents\n");
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("retry succeeds");
+        assert!(staged.transcript.is_file());
+        assert!(
+            !dest_project
+                .iter()
+                .any(|name| name.to_string_lossy().starts_with(".stage-")),
+            "every private temp tree is gone after staging"
+        );
+    }
+
+    /// Item 6: a second attempt after a byte-limit or file-limit failure is not
+    /// given the leftovers' budget — the budget starts at zero each time and
+    /// the failed temp tree is gone. Then a retry within limits succeeds.
+    #[test]
+    fn round3_repeat_staging_after_a_limit_failure_charges_from_scratch() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b6";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "ten-bytes\n");
+        write_file(
+            &source.parent().unwrap().join(session).join("a.jsonl"),
+            "aaaaa\n",
+        );
+        write_file(
+            &source.parent().unwrap().join(session).join("b.jsonl"),
+            "bbbbb\n",
+        );
+
+        // Byte limit smaller than the 10-byte transcript fails before publish.
+        let tight_bytes = StageLimits {
+            max_bytes: 5,
+            max_files: 100,
+            max_depth: 32,
+        };
+        let error = stage_for_resume_with_limits(&source, &new_home, &cwd, session, tight_bytes)
+            .expect_err("byte cap");
+        assert!(error.to_string().contains("size limit exceeded"), "{error}");
+        let dest_project = transcript_layout(&new_home, &cwd, session)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(
+            !dest_project
+                .iter()
+                .any(|name| name.to_string_lossy().starts_with(".stage-")),
+            "the failed attempt's temp tree was discarded"
+        );
+        assert!(
+            !transcript_layout(&new_home, &cwd, session).is_file(),
+            "the transcript was never published"
+        );
+
+        // File cap: transcript + 2 sidecars = 3 files, cap 2 fails.
+        let tight_files = StageLimits {
+            max_bytes: 1 << 20,
+            max_files: 2,
+            max_depth: 32,
+        };
+        let error = stage_for_resume_with_limits(&source, &new_home, &cwd, session, tight_files)
+            .expect_err("file cap");
+        assert!(
+            error.to_string().contains("file count limit exceeded"),
+            "{error}"
+        );
+
+        // Retry within limits succeeds.
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("retry");
+        assert_eq!(
+            std::fs::read_to_string(&staged.transcript).unwrap(),
+            "ten-bytes\n"
+        );
+        assert!(
+            staged
+                .transcript
+                .parent()
+                .unwrap()
+                .join(session)
+                .join("a.jsonl")
+                .is_file()
+        );
+    }
+
+    /// Item 7: an oversized transcript is refused before its bytes are read —
+    /// and no private temp tree survives the refusal.
+    #[test]
+    fn round3_an_oversized_transcript_is_refused_before_streaming() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000b7";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, &"x".repeat(4096));
+        let tight = StageLimits {
+            max_bytes: 16,
+            max_files: 10,
+            max_depth: 32,
+        };
+        let error = stage_for_resume_with_limits(&source, &new_home, &cwd, session, tight)
+            .expect_err("oversized refused");
+        assert!(error.to_string().contains("size limit exceeded"), "{error}");
+        let dest_project = transcript_layout(&new_home, &cwd, session)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        if dest_project.exists() {
+            assert!(
+                !dest_project
+                    .iter()
+                    .any(|name| name.to_string_lossy().starts_with(".stage-")),
+                "no temp tree survives an oversized-transcript refusal"
+            );
+        }
     }
 
     #[test]
@@ -2445,8 +2988,12 @@ mod tests {
 
             let error = stage_for_resume(&link, &new_home, &cwd, session)
                 .expect_err("a symlinked transcript must not be staged verbatim");
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-            assert!(error.to_string().contains("not a regular file"), "{error}");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "an fd-walk symlink refusal surfaces as PermissionDenied: {error}"
+            );
+            assert!(error.to_string().contains("symlink"), "{error}");
         }
     }
 }

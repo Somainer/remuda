@@ -130,6 +130,11 @@ pub(crate) fn resolve_resume_transcript(
             // unreadable, refuse BEFORE any row is created — never silently fall
             // back to a stale same-session file in a managed home, which could
             // replay the wrong (older) conversation.
+            // Round 3 item 8: a non-empty recorded transcript is authoritative.
+            // If it is missing, not a regular file (a FIFO/symlink/…), or
+            // unreadable, refuse BEFORE any row is created — never silently fall
+            // back to a stale same-session file in a managed home, which could
+            // replay the wrong (older) conversation.
             return match readable_regular_file(&path) {
                 Ok(true) => {
                     lookup.path = Some(path);

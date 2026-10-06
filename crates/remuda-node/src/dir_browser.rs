@@ -66,7 +66,11 @@ pub(crate) struct AllowedRoot {
     pub(crate) identity: Option<RootIdentity>,
 }
 
-/// Pinned root identity for an [`AllowedRoot`].
+/// Pinned root identity for an [`AllowedRoot`]. Both fields are normalized
+/// to `u64` so comparison is portable across the unix targets this crate
+/// builds on: Linux `dev_t`/`ino_t` are 64-bit, but macOS `dev_t` is `i32`
+/// (its `ino_t` is `u64`), so a direct `st_dev == u64` fails to compile
+/// there.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RootIdentity {
@@ -82,9 +86,13 @@ impl AllowedRoot {
 
     #[cfg(unix)]
     pub(crate) fn new(path: PathBuf) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        // Cast through u64 (do not copy the raw fields): Darwin st_dev is i32.
+        // The cast is a no-op on Linux and allowed for portability.
+        #[allow(clippy::unnecessary_cast)]
         let identity = std::fs::metadata(&path).ok().map(|metadata| RootIdentity {
-            dev: std::os::unix::fs::MetadataExt::dev(&metadata),
-            ino: std::os::unix::fs::MetadataExt::ino(&metadata),
+            dev: MetadataExt::dev(&metadata) as u64,
+            ino: MetadataExt::ino(&metadata) as u64,
         });
         Self { path, identity }
     }
@@ -318,7 +326,12 @@ mod imp {
         }
         if let Some(identity) = &pin.identity {
             let stat = fstat(anchor.0).map_err(nix_err)?;
-            if stat.st_dev != identity.dev || stat.st_ino != identity.ino {
+            // Compare in u64: Darwin st_dev is i32 and would not typecheck
+            // against the pinned u64 identity without the cast (a no-op cast
+            // on Linux, hence the scoped allow).
+            #[allow(clippy::unnecessary_cast)]
+            let same = stat.st_dev as u64 == identity.dev && stat.st_ino as u64 == identity.ino;
+            if !same {
                 return Err(refused());
             }
         }
@@ -374,8 +387,15 @@ mod imp {
                 anchor = open_component(Some(anchor.0), &cstr)?;
             }
         }
-        let path = fd_canonical_path(anchor.0)?;
-        Ok(OpenedDir { fd: anchor, path })
+        // The target path is the normalized request path. The walk started at
+        // a canonical pinned root and opened every component O_NOFOLLOW, so
+        // this string is the fd's real canonical path — no fd→path syscall
+        // (which would need /proc on Linux or F_GETPATH on macOS) is required,
+        // keeping the crate free of unsafe fcntl.
+        Ok(OpenedDir {
+            fd: anchor,
+            path: normalized.display().to_string(),
+        })
     }
 
     fn default_start(
@@ -428,22 +448,6 @@ mod imp {
             return Ok(None);
         }
         Ok(Some(parent.display().to_string()))
-    }
-
-    /// Kernel-resolved path of an opened directory fd. Linux exposes
-    /// `/proc/self/fd/N`; macOS resolves `/dev/fd/N` (both are safe symlinks
-    /// provided by the kernel; the fd was already containment-verified, so
-    /// reading its link adds no TOCTOU).
-    fn fd_canonical_path(fd: RawFd) -> Result<String, NodeError> {
-        #[cfg(target_os = "linux")]
-        let link = format!("/proc/self/fd/{fd}");
-        #[cfg(target_os = "macos")]
-        let link = format!("/dev/fd/{fd}");
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let link = format!("/dev/fd/{fd}");
-        std::fs::read_link(&link)
-            .map(|path| path.display().to_string())
-            .map_err(|_| refused())
     }
 
     fn entry_is_dir(dir: RawFd, name: &std::ffi::CStr) -> bool {
@@ -837,8 +841,11 @@ mod tests {
         assert!(error.contains(DIR_NOT_ALLOWED), "{error}");
     }
 
-    #[cfg(unix)]
-    #[cfg(unix)]
+    // Linux-only: it enumerates /proc/self/fd symlinks to count fds opened
+    // under the test tree. Darwin's /dev/fd entries are character devices,
+    // not symlinks; the no-fd-opened classification itself is platform-neutral
+    // and is exercised on macOS by all the other dir_browser tests.
+    #[cfg(target_os = "linux")]
     #[test]
     fn enumeration_does_not_leak_file_descriptors_under_repeated_load() {
         use std::sync::Arc;
@@ -856,13 +863,9 @@ mod tests {
         }
         let roots = roots_for(&root);
         let canonical_root = fs::canonicalize(root.path()).unwrap();
-        // Per-process fd directory: /proc/self/fd on Linux, /dev/fd on macOS
-        // (and other BSDs). Both expose per-fd symlinks resolving to the open
-        // target, which is what the leak assertion reads.
-        #[cfg(target_os = "linux")]
+        // Linux exposes the open target of each descriptor as a
+        // /proc/self/fd/N symlink.
         let fd_dir = "/proc/self/fd";
-        #[cfg(not(target_os = "linux"))]
-        let fd_dir = "/dev/fd";
         let fds_under_root = || -> usize {
             fs::read_dir(fd_dir)
                 .unwrap()

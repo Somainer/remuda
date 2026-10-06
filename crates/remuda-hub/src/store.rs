@@ -8421,6 +8421,22 @@ mod tests {
                     "status":{"state":"known","value":"idle"},
                     "relatedIds":{"agentId":"agentwithouttype"}}}),
             ),
+            // r5 item 3: the exact owner replay row — shell-pty hook
+            // StopFailure for a subagent, remudaActivity=idle, agentId +
+            // agentType. The idle is the SUBAGENT's turn; the root must not
+            // idle (and of course must not end).
+            (
+                "subagent-stop-failure-remuda-activity-idle",
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"StopFailure",
+                    "severity":"warning","affectsCompletion":false,
+                    "status":{"state":"known","value":"idle"},
+                    "relatedIds":{
+                        "agentId":"agent0sub0agent000",
+                        "agentType":"workflow-subagent",
+                        "outcome":"failed","phase":"turn-ended",
+                        "remudaActivity":"idle"}}}),
+            ),
         ];
         // r4 item 1: for the full three-way split, assert lifecycle AND
         // activity. Own-scope (subagent/configure/diagnostic): BOTH untouched.

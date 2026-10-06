@@ -3958,6 +3958,136 @@ mod tests {
         pump.await.unwrap();
     }
 
+    /// c-cardsettle r5 item 3 — the owner replay driven through the REAL Node
+    /// pump: a shell-pty hook StopFailure for a workflow subagent (agentId +
+    /// agentType, outcome=failed, remudaActivity=idle, NO
+    /// agentTranscriptPath, StopFailure before SubagentStart) must (a) leave
+    /// the root instance exactly as it was — no failed/exited lifecycle and
+    /// no idle — while (b) journaling a workflow.member Failed for THAT
+    /// agent, resolved from agentId via its on-disk transcript.
+    #[tokio::test]
+    async fn owner_subagent_stopfailure_pump_keeps_root_and_fails_the_member() {
+        use remuda_protocol::{DriverKind, Knowledge, ObservationPayload, SourceChannel};
+
+        // On-disk session tree the tailer resolves runs from.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let enc = tmp.path().join("enc");
+        std::fs::create_dir_all(&enc).unwrap();
+        std::fs::write(enc.join("sid.jsonl"), "{}\n").unwrap();
+        let run_dir = enc.join("sid/subagents/workflows/wf_owner");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // The harness wrote the agent transcript at spawn; the hook names no
+        // path (owner order: StopFailure beats SubagentStart).
+        std::fs::write(run_dir.join("agent-agent0sub0agent000.jsonl"), "{}\n").unwrap();
+
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ShellPty,
+        )
+        .unwrap();
+        let id = instance.meta.id.clone();
+        store.insert_instance(instance).unwrap();
+        let instance = store.get_instance(&id).unwrap();
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+        );
+
+        // A shell-pty HOOK observation (the mapped shape the hook shim commits).
+        let hook = |topic: remuda_protocol::LifecycleTopic,
+                    name: &str,
+                    related: &[(&str, &str)],
+                    status: &str,
+                    severity: remuda_protocol::Severity| {
+            let mut observation =
+                native_lifecycle_full(topic, name, "not-applicable", related, severity, false, status);
+            observation.source.channel = SourceChannel::Hook;
+            observation.source.driver_kind = DriverKind::ShellPty;
+            observation
+        };
+
+        // SessionStart binds the session directory.
+        tx.send(hook(
+            remuda_protocol::LifecycleTopic::Session,
+            "SessionStart",
+            &[(
+                "transcriptPath",
+                enc.join("sid.jsonl").to_string_lossy().as_ref(),
+            )],
+            "observed",
+            remuda_protocol::Severity::Info,
+        ))
+        .await
+        .unwrap();
+        // The owner's first event: subagent StopFailure, remudaActivity=idle.
+        let before = store.get_instance(&id).unwrap();
+        let before_lifecycle = before.lifecycle.clone();
+        let before_activity = before.activity.clone();
+        tx.send(hook(
+            remuda_protocol::LifecycleTopic::Turn,
+            "StopFailure",
+            &[
+                ("agentId", "agent0sub0agent000"),
+                ("agentType", "workflow-subagent"),
+                ("outcome", "failed"),
+                ("phase", "turn-ended"),
+                ("remudaActivity", "idle"),
+            ],
+            "idle",
+            remuda_protocol::Severity::Warning,
+        ))
+        .await
+        .unwrap();
+
+        // Poll until the member-failed observation lands (or time out).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let page = store.read_events(&instance.journal_id, None, 256).unwrap();
+                let failed = page.events.iter().any(|event| {
+                    let remuda_protocol::JournalEvent::Instance(event) = event else {
+                        return false;
+                    };
+                    matches!(&event.body,
+                        ObservationPayload::WorkflowMember(member)
+                            if matches!(&member.native_agent_id,
+                                Knowledge::Known { value }
+                                    if value == "agent0sub0agent000")
+                                && member.state == remuda_protocol::WorkflowState::Failed)
+                });
+                if failed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the failed workflow member is journaled");
+
+        // The root turn is unchanged: lifecycle and activity equal what they
+        // were BEFORE the subagent StopFailure (no end, no idle).
+        let root = store.get_instance(&id).unwrap();
+        assert_eq!(
+            root.lifecycle, before_lifecycle,
+            "a subagent StopFailure never ends the root"
+        );
+        assert_eq!(
+            root.activity, before_activity,
+            "the subagent's remudaActivity=idle never moves the root activity"
+        );
+
+        drop(tx);
+        pump.await.unwrap();
+    }
+
     #[tokio::test]
     async fn legacy_claude_pty_session_start_keeps_screen_activity_enabled() {
         use remuda_protocol::{DriverKind, SourceChannel};

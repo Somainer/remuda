@@ -556,6 +556,50 @@ async function wrapBlockRowHeight(scroller: Locator): Promise<number | null> {
 }
 
 /**
+ * Park the wrap-probe block at a fixed viewport-top offset and read the
+ * geometry in ONE frame: the block's row height and the saved anchor's
+ * scroller-relative offset. The anchor is the first burst row directly
+ * below the block, so parking the block near the top keeps BOTH mounted
+ * (virtualisation-safe). Calling this identically before and after the swap
+ * makes the block-height delta and the anchor drift directly comparable
+ * without any estimate-restore differences between visits.
+ */
+async function parkBlockAndMeasure(
+  scroller: Locator,
+  anchor: number,
+  blockTopTarget: number,
+): Promise<{ blockHeight: number; anchorOffset: number }> {
+  await scroller.evaluate((blockTop) => {
+    const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']")!;
+    const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
+      b.textContent?.includes("fontSwapProbe(): string"),
+    );
+    if (block) {
+      const rect = block.getBoundingClientRect();
+      const elTop = el.getBoundingClientRect().top;
+      el.scrollTop += rect.top - elTop - blockTop;
+      el.dispatchEvent(new Event("scroll", { bubbles: true }));
+    }
+  }, blockTopTarget);
+  await new Promise((r) => setTimeout(r, 200));
+  return scroller.evaluate((el, label) => {
+    const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
+      b.textContent?.includes("fontSwapProbe(): string"),
+    );
+    const re = new RegExp(`journal_burst_* event ${label}\\b`);
+    const anchorRow = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']")).find((c) =>
+      re.test(c.textContent ?? ""),
+    );
+    if (!block || !anchorRow) throw new Error("block or anchor not mounted after park");
+    const blockRow = block.closest<HTMLElement>("[data-testid='transcript-row']");
+    return {
+      blockHeight: (blockRow ?? block).getBoundingClientRect().height,
+      anchorOffset: anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top,
+    };
+  }, anchor);
+}
+
+/**
  * Wait until the wrap-probe block is mounted and measure it; asserts soft
  * wrap is actually on (pre-wrap), otherwise the height probe cannot move.
  */
@@ -705,12 +749,16 @@ async function savedPositionSurvivesSwap(
       await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
       await fontGate.waitArrival();
       expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
-      beforeSwap = await waitAnchorStable(page, scroller, anchor);
-      blockFallback = await expect.poll(() => wrapBlockRowHeight(scroller), { timeout: 5_000 }).not.toBeNull() as unknown as number;
+      // Fallback geometry with block parked at a fixed top.
+      const fb = await parkBlockAndMeasure(scroller, anchor, 24);
+      beforeSwap = fb.anchorOffset;
+      blockFallback = fb.blockHeight;
       fontGate.release();
       await afterSwap(page, scroller);
-      settled = await waitAnchorStable(page, scroller, anchor);
-      blockSwapped = await expect.poll(() => wrapBlockRowHeight(scroller), { timeout: 5_000 }).not.toBeNull() as unknown as number;
+      // Re-park identically on the final face and read.
+      const sw = await parkBlockAndMeasure(scroller, anchor, 24);
+      settled = sw.anchorOffset;
+      blockSwapped = sw.blockHeight;
     } finally {
       await fontGate.dispose();
     }
@@ -729,12 +777,15 @@ async function savedPositionSurvivesSwap(
     try {
       await page.goto(`/s/${instanceId}?restoreProbe=1`);
       await fontGate.waitArrival();
-      // The saved anchor paints on the fallback face while the restore stays
-      // pending (the hook defers finalization until the font is available).
-      beforeSwap = await waitRestoreActiveAndPainted(page, scroller, anchor);
+      // The anchor paints on the fallback face while the restore is still
+      // armed (the ?restoreProbe hook keeps it pending until the font loads).
+      await waitRestoreActiveAndPainted(page, scroller, anchor);
       expect(await monoLoaded(page), "rows must paint on the fallback face before the swap").toBe(false);
-      blockFallback = await expect.poll(() => wrapBlockRowHeight(scroller), { timeout: 5_000 }).not.toBeNull() as unknown as number;
       const advanceFallback = await monoAdvance(page);
+      // Park the block at a fixed top on the fallback face and read geometry.
+      const fb = await parkBlockAndMeasure(scroller, anchor, 24);
+      beforeSwap = fb.anchorOffset;
+      blockFallback = fb.blockHeight;
       fontGate.release();
       await waitFontLoaded(page, scroller, "mid arm release");
       // The font became available at a turn the restore was still active.
@@ -744,13 +795,13 @@ async function savedPositionSurvivesSwap(
           message: "the held font did not become available while the restore was active",
         })
         .toBe("1");
-      // Let the virtualiser re-measure on the final face and the deferred
-      // restore run its correction; then take the settled position.
       await page.evaluate(
         () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))),
       );
-      settled = await waitAnchorStable(page, scroller, anchor);
-      blockSwapped = await expect.poll(() => wrapBlockRowHeight(scroller), { timeout: 5_000 }).not.toBeNull() as unknown as number;
+      // Re-park identically on the final face and read.
+      const sw = await parkBlockAndMeasure(scroller, anchor, 24);
+      settled = sw.anchorOffset;
+      blockSwapped = sw.blockHeight;
       const advanceSwapped = await monoAdvance(page);
       expect(advanceSwapped, "the held font never swapped to the final face").not.toBe(advanceFallback);
     } finally {

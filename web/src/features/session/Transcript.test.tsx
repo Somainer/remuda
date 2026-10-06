@@ -2034,7 +2034,10 @@ describe("load-earlier anchor lifecycle round 5", () => {
   }
 
   /** Geometry harness scoped to one Driver render (see round-4 block). */
-  function installGeo(totalCount: number, opts: { echoOnWrite?: boolean; onWrite?: (v: number) => void } = {}) {
+  function installGeo(
+    totalCount: number,
+    opts: { echoOnWrite?: boolean; onWrite?: (v: number) => void; clampHeight?: () => number } = {},
+  ) {
     const echoOnWrite = opts.echoOnWrite ?? false;
     let dynamicTotal = totalCount;
     const heights = new WeakMap<Element, number>();
@@ -2095,7 +2098,7 @@ describe("load-earlier anchor lifecycle round 5", () => {
     // no event when the value does not change, and a programmatic write's
     // scroll event is delivered next frame (coalesced).
     let queued = false;
-    const maxScroll = () => Math.max(0, dynamicTotal * ROW - VIEW);
+    const maxScroll = () => Math.max(0, (opts.clampHeight?.() ?? dynamicTotal * ROW) - VIEW);
     const dispatchScroll = () => {
       queued = false;
       fireEvent.scroll(scroller());
@@ -2716,6 +2719,54 @@ describe("load-earlier anchor lifecycle round 5", () => {
         // matches the restore's new echo and the prepend repins to 5*ROW.
         expect(writes).not.toContain(5 * ROW);
         expect(geo.top()).toBe(ROW);
+      });
+    });
+
+    // UO-6a round 7 item 2: the browser can CLAMP a saved-position restore
+    // write when the tail is short (requested offset beyond
+    // scrollHeight - clientHeight). The echo must record the kept value so
+    // the restore does not cancel its own clamped event and stop refining.
+    describe("round 7 item 2: a clamped restore echo does not self-cancel", () => {
+      it("keeps refining a saved-position restore after its write is clamped", async () => {
+        const writes: number[] = [];
+        const geo = installGeo(20, {
+          echoOnWrite: true,
+          onWrite: (v) => writes.push(v),
+        });
+        const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+        const events: Observation[] = [];
+        for (let i = 0; i < 20; i += 1) events.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insSavedClamp"));
+        // Saved position on a deep row (index 19): the estimated jump
+        // requests near 19*ROW, but the short 20-row tail clamps scrollTop
+        // to 20*ROW - VIEW (1200).
+        localStorage.setItem(
+          "runtime.reading.v1.insSavedClamp",
+          JSON.stringify({ anchorId: events[19]!.id, offset: 0, ratio: 1, avgRow: ROW, follow: false }),
+        );
+        vi.spyOn(hubStore, "loadEarlier").mockResolvedValue({ prepended: false, end: false, floor: "1" });
+        render(
+          <MemoryRouter initialEntries={["/s/insSavedClamp"]}>
+            <Routes>
+              <Route path="/s/:instanceId" element={<Driver reg={reg} compact={false} />} />
+            </Routes>
+          </MemoryRouter>,
+        );
+        geo.defineScroll();
+        // Initial restore commits; the write is clamped to the tail bottom.
+        await act(async () => {});
+        await geo.nextFrame();
+        const clampedTop = 20 * ROW - VIEW;
+        expect(writes).toContain(clampedTop);
+
+        // The restore survives the clamped echo and keeps refining as rows
+        // measure: after the echo lands the window shifts to show the anchor;
+        // growing a mounted row ABOVE it (ordinal 0) shifts the anchor down,
+        // so the still-active correction loop writes again. A self-cancelled
+        // restore goes permanently silent.
+        const before = writes.length;
+        geo.growRow(0, ROW + 44);
+        await act(async () => {});
+        expect(writes.length).toBeGreaterThan(before);
       });
     });
   });

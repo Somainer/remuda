@@ -478,15 +478,20 @@ function TranscriptInner({
     if (fromRestore) {
       const seq = restoreEchoSeqRef.current + 1;
       restoreEchoSeqRef.current = seq;
-      restoreEchoRef.current = { top, seq };
+      el.scrollTop = top;
+      // Record the value the BROWSER kept, read back AFTER the write, not the
+      // requested one: a short tail (earlierFloor > 1) can clamp the restore
+      // write, so a requested-target echo would mismatch the clamped event by
+      // more than the tolerance and make the restore cancel its own echo.
+      restoreEchoRef.current = { top: el.scrollTop, seq };
       requestAnimationFrame(() => {
         if (restoreEchoRef.current?.seq === seq) restoreEchoRef.current = null;
       });
     } else {
       cancelLoadRestoreRef.current();
       restoreEchoRef.current = null;
+      el.scrollTop = top;
     }
-    el.scrollTop = top;
     scrollTopRef.current = el.scrollTop;
   }, []);
   /**

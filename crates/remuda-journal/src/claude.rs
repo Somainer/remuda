@@ -606,6 +606,7 @@ fn effort_envelope(
                 ultracode: observed.ultracode,
                 source,
                 observed_at: timestamp_now()?,
+                readback_available: None,
             },
             raw: raw.map(str::to_owned),
         })),

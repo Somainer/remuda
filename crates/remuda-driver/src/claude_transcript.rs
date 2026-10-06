@@ -623,6 +623,18 @@ impl ResumeBoundary {
         project_dir(claude_home, cwd).join(format!("{session_id}.jsonl"))
     }
 
+    /// Build the resume mode for a deterministic `<id>.jsonl` resume: a proven
+    /// boundary when the transcript already exists, otherwise [`ResumeMode::Unverified`]
+    /// (the file the resumed process will create is not history to trust).
+    #[must_use]
+    pub fn mode_for(claude_home: &Path, cwd: &Path, session_id: &str) -> ResumeMode {
+        let path = Self::session_path(claude_home, cwd, session_id);
+        match Self::snapshot(&path) {
+            Some(boundary) => ResumeMode::Boundary(boundary),
+            None => ResumeMode::Unverified,
+        }
+    }
+
     /// Pre-spawn snapshot of the deterministic `<id>.jsonl` for a resume.
     #[must_use]
     pub fn for_resume(claude_home: &Path, cwd: &Path, session_id: &str) -> Option<Self> {
@@ -761,6 +773,57 @@ pub enum TailProvenance {
     /// Resume tail displaced by a shrink/replacement: provenance unknown, the
     /// gate must stay closed. Lines (if any) hydrate messages only.
     Unverified,
+}
+
+/// How a transcript pump should treat one launch/detection epoch.
+///
+/// The three D-056 (4) states: a fresh session (tail from byte 0, current); a
+/// verified resume (a proven [`ResumeBoundary`]); and an unverifiable resume
+/// (a known `--resume` whose boundary could not be proven — no uuid, no
+/// process-start evidence on macOS, an exec keeping the shell pid, a clock
+/// step, or a transcript missing at spawn). The unverifiable resume hydrates
+/// conversation from current EOF but NEVER opens the effort gate and never
+/// takes the fresh byte-0/current path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeMode {
+    /// A brand-new session: every record on the file is current.
+    Fresh,
+    /// A resume with a proven boundary (pre-exec snapshot / process-start
+    /// evidence trusted by the caller). `boundary.verified` is normally true;
+    /// a `false` boundary is treated like [`ResumeMode::Unverified`].
+    Boundary(ResumeBoundary),
+    /// A known resume whose boundary could not be proven (no uuid, macOS with
+    /// no start-time, an exec keeping the shell pid, a backward clock step, or
+    /// a transcript missing at spawn). The tail anchors at current EOF and
+    /// reports every batch unverified — conversation hydrates, the effort gate
+    /// never opens.
+    Unverified,
+}
+
+impl ResumeMode {
+    /// Whether this is any kind of resume (verified or not).
+    #[must_use]
+    pub fn is_resume(&self) -> bool {
+        !matches!(self, ResumeMode::Fresh)
+    }
+
+    /// Open the tail for a bound transcript `path`. For an [`ResumeMode::Unverified`]
+    /// resume, anchors at the file's CURRENT EOF unverified; if the file does
+    /// not exist yet returns `None` so the pump retries next tick (never a live
+    /// byte-0 tail).
+    #[must_use]
+    pub fn open_tail(&self, path: &Path) -> Option<TranscriptTail> {
+        match self {
+            ResumeMode::Fresh => Some(TranscriptTail::new(path.to_path_buf())),
+            ResumeMode::Boundary(boundary) if boundary.verified => {
+                Some(TranscriptTail::resumed(path.to_path_buf(), *boundary))
+            }
+            ResumeMode::Boundary(_) | ResumeMode::Unverified => {
+                let boundary = ResumeBoundary::unverified_eof(path)?;
+                Some(TranscriptTail::resumed(path.to_path_buf(), boundary))
+            }
+        }
+    }
 }
 
 /// One poll: the whole lines appended since the last call and their provenance.

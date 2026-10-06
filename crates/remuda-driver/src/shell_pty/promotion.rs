@@ -1499,20 +1499,21 @@ fn current_turn_interrupted(grid: &remuda_screen::ScreenGrid) -> Option<bool> {
 /// history). `None` for a non-resume process, or when start time/transcript
 /// cannot be established (the caller then tails live from byte 0 — there is
 /// nothing older than the live shell epoch to gate against there).
-fn shell_resume_boundary(ctx: &PromoteCtx, found: &Detected) -> Option<ResumeBoundary> {
-    if !found.resume {
-        return None;
+/// Epoch resume mode for an agent the terminal did NOT launch (a hand-typed
+/// `claude --resume` in a login shell).
+///
+/// r4 item 2: even with a uuid and a readable process start time this is
+/// [`ResumeMode::Unverified`], never time-verified — `exec claude --resume`
+/// keeps the shell's PID/start time and a backward clock step defeats
+/// timestamp reasoning. Only a Remuda-launched agent with a pre-exec EOF
+/// snapshot (the caller's `pre_resume_boundary`) is proven. A non-resume
+/// foreground agent is [`ResumeMode::Fresh`].
+fn shell_resume_mode(found: &Detected) -> ResumeMode {
+    if found.resume {
+        ResumeMode::Unverified
+    } else {
+        ResumeMode::Fresh
     }
-    let session_id = found.session_id.as_deref()?;
-    let started = crate::promote::process_started_at(found.pid)?;
-    let path = ResumeBoundary::session_path(&ctx.claude_home, &ctx.cwd, session_id);
-    let boundary = ResumeBoundary::at_process_start(&path, started)?;
-    tracing::info!(
-        pid = found.pid,
-        %session_id,
-        "hand-typed resume detected; bounding transcript at process start"
-    );
-    Some(boundary)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1851,11 +1852,11 @@ impl Hydrator {
     /// promotion epoch.
     ///
     /// `boundary` is the verified resume boundary for THIS epoch:
-    /// - `None` → a new (or non-resume) process: live tail from byte 0.
-    /// - `Some(boundary)` → a resume: tail from the pre-spawn EOF, or from the
-    ///   foreground process's start when it was only discovered later. Bytes
-    ///   before the boundary stay history and never reach the mapper, so the
-    ///   mapper starts in current-process mode.
+    /// - [`ResumeMode::Fresh`] → live tail from byte 0.
+    /// - [`ResumeMode::Boundary`] → a verified resume: tail from the pre-exec /
+    ///   process-start boundary.
+    /// - [`ResumeMode::Unverified`] → a known but unprovable resume: anchor at
+    ///   current EOF, hydrate conversation, never open the effort gate.
     #[allow(clippy::too_many_arguments)]
     fn open(
         ctx: &PromoteCtx,
@@ -1865,7 +1866,7 @@ impl Hydrator {
         model: Option<&ModelSync>,
         permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
         launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
-        boundary: Option<ResumeBoundary>,
+        mode: ResumeMode,
     ) -> Option<Self> {
         tracing::info!(
             instance_id = %ctx.instance_id.as_id(),
@@ -1902,10 +1903,10 @@ impl Hydrator {
         if let Some(bridge) = permission_bridge {
             mapper = mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
         }
-        let tail = match boundary {
-            Some(boundary) => TranscriptTail::resumed(binding.path.clone(), boundary),
-            None => binding.tail(),
-        };
+        // Open the tail once per epoch (item 7): the boundary/EOF anchor is
+        // computed here and never re-read on later polls. An unverifiable
+        // resume whose file is absent leaves the hydrator unbound this tick.
+        let tail = mode.open_tail(&binding.path)?;
         Some(Self {
             mapper,
             tail,
@@ -1943,22 +1944,30 @@ async fn pump(
             }
         }
     }
-    let read = hydrator.tail.poll().map_err(|_| ())?;
-    // D-056 (4): the tail reports whether these bytes are provenanced to the
-    // current process. An unverified batch (a resume tail displaced by shrink
-    // or replacement) maps for conversation only: keep the effort gate closed
-    // so it cannot set effort/ultracode or settle a fresh switch.
-    hydrator
+    // r4 item 6: a one-poll ENOENT (the bound file is being rotated/recreated)
+    // keeps the hydrator alive at its unverified anchor; the next tick retries.
+    // Only a persistent/other open error degrades the binding.
+    let read = match hydrator.tail.poll() {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(()),
+    };
+    // Apply provenance on EVERY poll, even with no lines: an unverified resume
+    // must close the effort gate before its first record maps, and a
+    // verified→unverified transition emits an explicit read-back-unavailable
+    // edge clearing the projected effective state (item 5).
+    let gate_edges = hydrator
         .mapper
-        .set_effort_current_process(read.provenance == TailProvenance::Current);
+        .apply_effort_provenance(read.provenance == TailProvenance::Current)
+        .map_err(|_| ())?;
     // The mapper buffers an assistant run until something supersedes it, so
     // the last message of a batch would otherwise sit unseen until the next
     // record arrives — which, at the end of a turn, may be minutes away.
     // Flushing at the end of each poll is what makes a finished turn appear.
-    let mut batches: Vec<_> = read
-        .lines
-        .iter()
-        .map(|line| hydrator.mapper.map_line(line))
+    let mut batches: Vec<_> = gate_edges
+        .into_iter()
+        .map(Ok)
+        .chain(read.lines.iter().map(|line| hydrator.mapper.map_line(line)))
         .collect();
     batches.push(hydrator.mapper.flush());
     for batch in batches {

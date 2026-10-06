@@ -2724,10 +2724,11 @@ impl TranscriptMapper {
             body: ObservationPayload::Effort(Box::new(EffortPayload {
                 requested,
                 effective: EffortEffective {
-                    name: None,
-                    ultracode: None,
+                    name: cleared.name,
+                    ultracode: cleared.ultracode,
                     source: cleared.source,
                     observed_at: now()?,
+                    readback_available: Some(false),
                 },
                 raw: None,
             })),
@@ -3126,6 +3127,7 @@ impl TranscriptMapper {
                 ultracode: observed.ultracode,
                 source,
                 observed_at: now()?,
+                readback_available: None,
             },
             raw,
         }));

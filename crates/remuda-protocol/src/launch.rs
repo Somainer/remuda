@@ -357,6 +357,14 @@ pub struct EffortEffective {
     pub source: EffortSource,
     /// When the observation was made.
     pub observed_at: Timestamp,
+    /// D-056 (4): whether effort read-back is available for this process.
+    /// `Some(false)` means a resume boundary that was verified became
+    /// unverifiable mid-run (shrink/replacement/EOF, an exec keeping the shell
+    /// pid, a backward clock step): consumers must clear any projected
+    /// effective level/flag (the UI renders `?`) and must not treat a pending
+    /// switch as applied. Normal observations omit it (`None` = available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback_available: Option<bool>,
 }
 
 /// Effective permission mode, read back from the native TUI status line and

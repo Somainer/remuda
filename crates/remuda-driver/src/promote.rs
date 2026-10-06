@@ -279,35 +279,41 @@ pub fn screen_status(screen: &str) -> Option<ScreenStatus> {
     remuda_screen::screen_status(&ScreenGrid::from_raw(&remuda_screen::screen_tail(screen)))
 }
 
-/// `--session-id <uuid>` / `--resume <uuid>` from an agent's argv, and
-/// whether the flag that carried it was a resume (`--resume` / `-r`).
+/// `--session-id <uuid>` / `--resume [<uuid>]` from an agent's argv, and
+/// whether a resume flag (`--resume` / `-r`) was present.
+///
+/// r4: the resume bit is returned even when the value is not a uuid (so
+/// `--resume latest`, `--resume` with no id, or an unparsable id still gate
+/// the transcript as an UNVERIFIABLE resume rather than a fresh session). The
+/// session id is `Some` only for a uuid-shaped value usable to locate the
+/// deterministic transcript.
 fn session_id_from_argv(argv: &[String]) -> (Option<String>, bool) {
-    let mut resume = false;
+    let mut is_resume = false;
+    let mut session_id: Option<String> = None;
     let mut iter = argv.iter().skip(1);
     while let Some(arg) = iter.next() {
-        let inline = arg
-            .split_once('=')
-            .map(|(flag, inline)| (flag, inline.to_owned()));
-        let value = match inline {
+        let value = match arg.split_once('=') {
             Some((flag, inline)) if is_session_flag(flag) => {
                 if is_resume_flag(flag) {
-                    resume = true;
+                    is_resume = true;
                 }
-                Some(inline)
+                Some(inline.to_owned())
             }
             None if is_session_flag(arg) => {
                 if is_resume_flag(arg) {
-                    resume = true;
+                    is_resume = true;
                 }
                 iter.next().cloned()
             }
             _ => None,
         };
-        if let Some(value) = value.filter(|value| looks_like_uuid(value)) {
-            return (Some(value), resume);
+        if session_id.is_none()
+            && let Some(value) = value.filter(|value| looks_like_uuid(value))
+        {
+            session_id = Some(value);
         }
     }
-    (None, false)
+    (session_id, is_resume)
 }
 
 fn is_session_flag(flag: &str) -> bool {

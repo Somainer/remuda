@@ -285,19 +285,14 @@ impl ClaudePtyDriver {
             reject_bot_bypass(&spec)?;
         }
         let session_id = session.session_id().to_string();
-        // D-056 (4): a resume launch appends to an existing transcript. Capture
-        // the transcript's identity + EOF BEFORE the resumed child spawns (the
-        // start_agent call below), so records written between spawn and the
-        // later hook-driven hydration are still read as current and a rotated
-        // file can never replay history.
-        let resume_boundary = match &session {
-            crate::materializer::SessionAction::Resume {
-                session_id: resumed_id,
-            } => crate::claude_transcript::ResumeBoundary::for_resume(
-                &self.options.native_home,
-                std::path::Path::new(&spec.cwd),
-                resumed_id,
-            ),
+        // Capture the resume session id before `session` moves into the
+        // materialize request; the boundary itself is taken after the final
+        // child env is assembled (so it uses the effective CLAUDE_CONFIG_DIR,
+        // including any extra_env/MCP override) but before the agent runs.
+        let resume_id: Option<String> = match &session {
+            crate::materializer::SessionAction::Resume { session_id } => {
+                Some(session_id.clone())
+            }
             crate::materializer::SessionAction::New { .. } => None,
         };
         let request = MaterializeRequest {
@@ -374,6 +369,29 @@ impl ClaudePtyDriver {
         if let Some(context) = &self.options.agent_mcp {
             env.extend(context.environment()?);
         }
+
+        // D-056 (4), r4 item 3: snapshot the resume boundary from the FINAL
+        // child config dir (an extra_env/MCP CLAUDE_CONFIG_DIR override wins
+        // over the registered home; otherwise the registered native home the
+        // recipe pins), and before the agent runs so even records written
+        // between exec and hydration are read as current.
+        let config_dir = env
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| self.options.native_home.clone());
+        // r4: a resume whose transcript is present is verified; one whose file
+        // is not (or which cannot otherwise be bounded) is Unverified — never
+        // the fresh byte-0 path.
+        let resume_mode = match resume_id.as_deref() {
+            Some(id) => {
+                crate::claude_transcript::ResumeBoundary::mode_for(
+                    &config_dir,
+                    std::path::Path::new(&spec.cwd),
+                    id,
+                )
+            }
+            None => crate::claude_transcript::ResumeMode::Fresh,
+        };
 
         // §9.1 model list: discover the gateway cache / settings the launched
         // session can actually switch to, before the pane exists. The scoped
@@ -599,7 +617,7 @@ impl ClaudePtyDriver {
             Some(Arc::clone(&permission_bridge)),
             launch_permission,
             self.options.media_stager.clone(),
-            resume_boundary,
+            resume_mode,
         );
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
             client: client.clone(),
@@ -1376,10 +1394,8 @@ fn spawn_transcript_pump(
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
-    // Pre-spawn resume boundary: Some for a `--resume` launch, captured from
-    // the deterministic transcript BEFORE the child spawned. `None` is a new
-    // session (live tail from byte 0).
-    resume_boundary: Option<crate::claude_transcript::ResumeBoundary>,
+    // Fresh / verified-resume / unverifiable-resume for this launch.
+    resume_mode: crate::claude_transcript::ResumeMode,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
@@ -1454,18 +1470,13 @@ fn spawn_transcript_pump(
                         mapper =
                             mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
                     }
-                    // D-056 (4): a resume tail starts at the pre-spawn byte
-                    // boundary on the same file identity. Every line it yields
-                    // is therefore a current-process record (or, after a
-                    // shrink/replacement, explicitly unverified); the mapper
-                    // starts in current mode and the per-batch provenance below
-                    // closes it if the boundary is ever invalidated.
-                    hydrator = match resume_boundary {
-                        Some(boundary) => Some((
-                            crate::claude_transcript::TranscriptTail::resumed(path, boundary),
-                            mapper,
-                        )),
-                        None => Some((crate::claude_transcript::TranscriptTail::new(path), mapper)),
+                    // D-056 (4): the mode decides fresh vs proven vs
+                    // unverifiable resume; an unverifiable resume whose
+                    // transcript is still absent leaves the hydrator unbound
+                    // until the file appears — never a byte-0/current tail.
+                    hydrator = match resume_mode.open_tail(&path) {
+                        Some(tail) => Some((tail, mapper)),
+                        None => None,
                     };
                 }
             }
@@ -1484,28 +1495,35 @@ fn spawn_transcript_pump(
                         use crate::claude_transcript::TailProvenance;
                         let (mut tail, mut mapper) = hydrated;
                         // The tail reports whether these bytes are provenanced
-                        // to the current process; an unverified (displaced
-                        // resume) batch maps for conversation only, never
-                        // setting effort/ultracode or settling a switch.
-                        let read = match tail.poll() {
-                            Ok(read) => read,
+                        // to the current process; an unverified batch maps for
+                        // conversation only, and a verified→unverified
+                        // transition emits an explicit read-back-unavailable
+                        // edge that clears the projected effective state.
+                        let (provenance, poll_failed) = match tail.poll() {
+                            Ok(read) => (read.provenance, read.lines),
                             Err(error) => {
                                 tracing::debug!(%error, "transcript tail unreadable this poll");
-                                crate::claude_transcript::TailRead {
-                                    lines: Vec::new(),
-                                    provenance: TailProvenance::Current,
-                                }
+                                let p = if tail.verified() {
+                                    TailProvenance::Current
+                                } else {
+                                    TailProvenance::Unverified
+                                };
+                                (p, Vec::new())
                             }
                         };
-                        mapper.set_effort_current_process(
-                            read.provenance == TailProvenance::Current,
-                        );
+                        let gate_edges = mapper
+                            .apply_effort_provenance(provenance == TailProvenance::Current)
+                            .expect("gate provenance is infallible");
                         // Flush the buffered assistant run at the end of the
                         // batch: the mapper holds a run open until superseded,
                         // so the final message of a finished turn would
                         // otherwise wait for the next record to arrive.
-                        let mut batches: Vec<_> =
-                            read.lines.iter().map(|line| mapper.map_line(line)).collect();
+                        let mut batches: Vec<Result<Vec<Observation>, DriverError>> =
+                            Vec::new();
+                        if !gate_edges.is_empty() {
+                            batches.push(Ok(gate_edges));
+                        }
+                        batches.extend(poll_failed.iter().map(|line| mapper.map_line(line)));
                         batches.push(mapper.flush());
                         (tail, mapper, batches)
                     })

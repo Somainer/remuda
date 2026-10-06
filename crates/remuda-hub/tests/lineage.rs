@@ -1160,6 +1160,79 @@ async fn a_sessionless_launch_failure_resumes_via_fresh_recovery() -> Result<()>
     Ok(())
 }
 
+/// r3 item 4: an immediate retry of a sessionless fresh recovery returns the
+/// SAME successor (replayed) before the successor reports a session — no new
+/// generation and no extra command.
+#[tokio::test]
+async fn a_retried_fresh_recovery_replays_the_same_successor_before_it_reports_a_session()
+-> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    node.appends.send((
+        x.clone(),
+        json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-06T01:00:00.000Z",
+            "payload": {
+                "type": "native", "topic": "session",
+                "nativeName": "native-driver-start-failed",
+                "status": { "state": "known", "value": "failed" },
+                "severity": "error", "affectsCompletion": true,
+                "relatedIds": { "reasonCode": "native-driver-start-failed" }
+            }
+        }),
+    ))?;
+    ctx.wait_until(&x, |v| v["lifecycle"] == json!("failed"))
+        .await?;
+
+    // First resume: fresh recovery X (gen 1) -> Y (gen 2), one create.
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(first["replayed"], json!(false));
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.create");
+
+    // Immediate retry addressed to X, before Y reports any session.
+    let second: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        second["replayed"],
+        json!(true),
+        "retry is an idempotent replay"
+    );
+    assert_eq!(
+        second["instance"]["instanceId"],
+        json!(y),
+        "the retry returns the same successor"
+    );
+
+    // No third generation, no second forwarded command.
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(lineage["generation"], json!(2));
+    assert_eq!(lineage["chapters"].as_array().unwrap().len(), 2);
+    let extra = tokio::time::timeout(Duration::from_millis(150), node.next_frame()).await;
+    assert!(extra.is_err(), "the replay forwards no extra command");
+    Ok(())
+}
+
 /// A resume addressed to an already-fenced chapter returns its existing
 /// successor idempotently (r2-8): it must not fence the live chapter or mint
 /// another generation.

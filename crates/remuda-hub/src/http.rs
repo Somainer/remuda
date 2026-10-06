@@ -1895,6 +1895,22 @@ async fn resume_lineage(
         .get_instance_read(lineage.current_instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
+    // ma-lineage round 3 item 4: if the owner addressed an OLDER chapter, the
+    // continuation its successor already represents is the answer — resolve
+    // that idempotent replay HERE, before any launch requirement (host link,
+    // native session) is checked or a new launch is prepared. A repeat resume
+    // of a sessionless predecessor must not hit the fresh-recovery validation
+    // or 409 against the not-yet-sessioned successor. The store re-verifies
+    // addressed-vs-current transactionally, so a chapter superseded between
+    // this read and the fence still converges the same way.
+    if addressed.instance_id != current.instance_id {
+        return Ok(Json(json!({
+            "instance": current,
+            "hostId": current.host_id,
+            "mode": mode.as_str(),
+            "replayed": true
+        })));
+    }
     let host = state
         .store
         .get_host(current.host_id.clone())

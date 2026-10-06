@@ -32,6 +32,11 @@ pub struct UsageEventRow {
     pub model: Option<String>,
     /// Usage scope (`turn` / `session` / …).
     pub scope: String,
+    /// Native scope id (the assistant message id for a turn snapshot). Drives
+    /// durable re-hydration dedupe: the same transcript re-mapped after a
+    /// rebind re-emits the same `(scope, scope_id)`, and INSERT OR IGNORE on
+    /// the partial unique index drops the duplicate projection.
+    pub scope_id: Option<String>,
     /// Snapshot vs delta.
     pub mode: String,
     /// Total tokens when known.
@@ -61,6 +66,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             profile_id TEXT,
             model TEXT,
             scope TEXT NOT NULL,
+            scope_id TEXT,
             mode TEXT NOT NULL,
             total_tokens INTEGER,
             input_tokens INTEGER,
@@ -72,6 +78,9 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             observed_at TEXT NOT NULL,
             PRIMARY KEY (instance_id, seq)
          );
+         CREATE UNIQUE INDEX IF NOT EXISTS usage_events_scope_dedupe
+             ON usage_events(instance_id, scope, scope_id)
+             WHERE scope_id IS NOT NULL;
          CREATE INDEX IF NOT EXISTS usage_events_profile_model
              ON usage_events(profile_id, model);
          CREATE INDEX IF NOT EXISTS usage_events_instance ON usage_events(instance_id);",
@@ -79,6 +88,8 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // Rows created before the context rollup carried no cache counters.
     crate::store::ensure_column(conn, "usage_events", "cache_read_tokens", "INTEGER")?;
     crate::store::ensure_column(conn, "usage_events", "cache_write_tokens", "INTEGER")?;
+    // Context-window rollup (c-ctxusage RC1): durable per-turn dedupe key.
+    crate::store::ensure_column(conn, "usage_events", "scope_id", "TEXT")?;
     Ok(())
 }
 
@@ -87,16 +98,17 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
-            (instance_id, seq, profile_id, model, scope, mode, total_tokens,
+            (instance_id, seq, profile_id, model, scope, scope_id, mode, total_tokens,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
              cost_usd, accounting, observed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             row.instance_id,
             row.seq,
             row.profile_id,
             row.model,
             row.scope,
+            row.scope_id,
             row.mode,
             row.total_tokens,
             row.input_tokens,
@@ -155,6 +167,10 @@ pub fn project_usage_event(
             .and_then(Value::as_str)
             .unwrap_or("turn")
             .to_string(),
+        scope_id: payload
+            .get("scopeId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         mode: payload
             .get("mode")
             .and_then(Value::as_str)
@@ -529,6 +545,42 @@ mod tests {
     }
 
     #[test]
+    fn re_hydration_dedupes_on_instance_scope_scope_id() {
+        // c-ctxusage RC1: a re-bound transcript re-emits the same per-message
+        // usage snapshot with a NEW journal seq. The durable key is
+        // (instance_id, scope, scope_id): the second projection is ignored so
+        // re-hydration never double-counts.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        let record = |seq: i64, scope_id: &str, tokens: u64| {
+            let mut rec = usage_record(seq, tokens, Some("0.01"));
+            rec.event["payload"]["scopeId"] = json!(scope_id);
+            rec
+        };
+        // First mapper pass: two distinct messages.
+        let r1 = project_usage_event(&record(1, "msg-a", 100), None, None).unwrap();
+        let r2 = project_usage_event(&record(2, "msg-b", 200), None, None).unwrap();
+        assert!(insert_usage_event(&conn, &r1).unwrap());
+        assert!(insert_usage_event(&conn, &r2).unwrap());
+        // A fresh mapper re-hydrates the file: new seqs, same scope ids.
+        let r1b = project_usage_event(&record(3, "msg-a", 100), None, None).unwrap();
+        let r2b = project_usage_event(&record(4, "msg-b", 200), None, None).unwrap();
+        assert!(
+            !insert_usage_event(&conn, &r1b).unwrap(),
+            "msg-a duplicate ignored"
+        );
+        assert!(
+            !insert_usage_event(&conn, &r2b).unwrap(),
+            "msg-b duplicate ignored"
+        );
+
+        let total = aggregate_instance(&conn, "ins_test").unwrap();
+        assert_eq!(total.events, 2, "no double counting after re-hydration");
+        assert_eq!(total.total_tokens, 300, "the original two rows, not four");
+    }
+
+    #[test]
     fn projects_folds_and_dedupes_usage_events() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
@@ -618,6 +670,7 @@ mod tests {
             profile_id: None,
             model: None,
             scope: "turn".into(),
+            scope_id: None,
             mode: "snapshot".into(),
             total_tokens: None,
             input_tokens: input,

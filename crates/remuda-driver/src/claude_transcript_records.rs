@@ -170,6 +170,10 @@ pub(crate) struct Group {
     blocks: Vec<(Option<u64>, usize, Value)>,
     /// The record the assembled message inherits its envelope from.
     head: Option<Value>,
+    /// The LAST record's `message.usage` for the group. Every block repeats
+    /// the same usage; we keep the last one explicitly (never a sum) so the
+    /// emitted usage snapshot is the final per-call counters.
+    last_usage: Option<Value>,
     seen: usize,
 }
 
@@ -188,13 +192,22 @@ impl Group {
     /// Start a new run at `key`, carrying `record` as the envelope source.
     pub(crate) fn start(&mut self, key: GroupKey, record: Value) {
         self.key = Some(key);
-        self.head = Some(record);
+        self.head = Some(record.clone());
+        self.last_usage = record
+            .pointer("/message/usage")
+            .filter(|value| value.is_object())
+            .cloned();
         self.blocks.clear();
         self.seen = 0;
     }
 
     /// Buffer one record's content blocks.
     pub(crate) fn push(&mut self, record: &Value, message: &Value) {
+        // The last block record carries the final usage for the message; keep
+        // the most recent object-shaped usage seen.
+        if let Some(usage) = message.get("usage").filter(|value| value.is_object()) {
+            self.last_usage = Some(usage.clone());
+        }
         let index = record.get("apiBlockIndex").and_then(Value::as_u64);
         let Some(blocks) = message.get("content").and_then(Value::as_array) else {
             return;
@@ -209,16 +222,21 @@ impl Group {
     ///
     /// Ordering is by `(apiBlockIndex, arrival)`. Records without the field —
     /// every record in claude 2.1.221 — keep pure file order, which is the
-    /// order Claude appended them in and therefore already correct.
+    /// order Claude appended them in and therefore already correct. The
+    /// assembled message carries the LAST block record's `usage`.
     pub(crate) fn flush(&mut self) -> Option<Value> {
         let mut head = self.head.take()?;
         let mut blocks = std::mem::take(&mut self.blocks);
+        let usage = self.last_usage.take();
         self.key = None;
         self.seen = 0;
         blocks.sort_by_key(|(index, arrival, _)| (index.unwrap_or(0), *arrival));
         let content: Vec<Value> = blocks.into_iter().map(|(_, _, block)| block).collect();
         if let Some(message) = head.get_mut("message").and_then(Value::as_object_mut) {
             message.insert("content".into(), Value::Array(content));
+            if let Some(usage) = usage {
+                message.insert("usage".into(), usage);
+            }
         }
         Some(head)
     }

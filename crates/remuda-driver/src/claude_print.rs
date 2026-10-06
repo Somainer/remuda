@@ -1538,38 +1538,40 @@ fn usage_from_result(
         amount: amount.to_string(),
         currency: "USD".into(),
     });
-    Ok(Some(
-        mapper.observation(
-            Completeness::Structured,
-            NativeRequestKey::None,
-            ObservationPayload::Usage(Box::new(UsagePayload {
-                usage_id: Id::new("obj")?,
-                scope: UsageScope::Turn,
-                scope_id: result
-                    .result_index
-                    .map(|index| index.to_string())
-                    .unwrap_or_else(|| "0".into()),
-                mode: UsageMode::Snapshot,
-                metric_revision: U64(result.result_index.unwrap_or(0) + 1),
-                input_tokens: opt_u64(input),
-                input_accounting: InputAccounting::Unknown,
-                output_tokens: opt_u64(output),
-                reasoning_tokens: unknown("not-emitted"),
-                cache_read_tokens: unknown("not-emitted"),
-                cache_write_tokens: unknown("not-emitted"),
-                total_tokens: match (input, output) {
-                    (Some(a), Some(b)) => Knowledge::Known { value: U64(a + b) },
-                    _ => unknown("partial"),
-                },
-                cost: match cost {
-                    Some(cost) => Knowledge::Known { value: cost },
-                    None => unknown("not-emitted"),
-                },
-                accounting: remuda_protocol::Accounting::Reported,
-                native_fields_ref: None,
-            })),
-        )?,
-    ))
+    Ok(Some(mapper.observation(
+        Completeness::Structured,
+        NativeRequestKey::None,
+        ObservationPayload::Usage(Box::new(UsagePayload {
+            usage_id: Id::new("obj")?,
+            scope: UsageScope::Turn,
+            scope_id: match (result.num_turns, result.result_index) {
+                // Stable across turns AND the two workflow sub-results: the
+                // Hub durably dedupes on (instance, scope, scope_id).
+                (Some(turn), Some(index)) => format!("{turn}:{index}"),
+                (Some(turn), None) => turn.to_string(),
+                (None, Some(index)) => index.to_string(),
+                (None, None) => "0".into(),
+            },
+            mode: UsageMode::Snapshot,
+            metric_revision: U64(result.result_index.unwrap_or(0) + 1),
+            input_tokens: opt_u64(input),
+            input_accounting: InputAccounting::Unknown,
+            output_tokens: opt_u64(output),
+            reasoning_tokens: unknown("not-emitted"),
+            cache_read_tokens: unknown("not-emitted"),
+            cache_write_tokens: unknown("not-emitted"),
+            total_tokens: match (input, output) {
+                (Some(a), Some(b)) => Knowledge::Known { value: U64(a + b) },
+                _ => unknown("partial"),
+            },
+            cost: match cost {
+                Some(cost) => Knowledge::Known { value: cost },
+                None => unknown("not-emitted"),
+            },
+            accounting: remuda_protocol::Accounting::Reported,
+            native_fields_ref: None,
+        })),
+    )?))
 }
 
 fn map_task_started(mapper: &mut Mapper, task: &TaskStarted) -> DriverResult<Vec<Observation>> {
@@ -2806,7 +2808,53 @@ impl TranscriptMapper {
                 }
             }
         }
+        // One usage snapshot per finished assistant message group (RC1).
+        if let Some(usage) = self.usage_from_transcript_group(&value)? {
+            out.push(usage);
+        }
         Ok(out)
+    }
+
+    /// Emit one [`ObservationPayload::Usage`] for a finished assistant message
+    /// group, when the group's (last) record carries `message.usage`.
+    ///
+    /// D-056/context-usage RC1: the native TUI writes usage only into
+    /// transcript records; without this the Hub has no rows for a
+    /// claude-pty/promoted shell session and the context chip stays dead.
+    /// Scope is `Turn`, scope_id = the message id, counters come from the
+    /// LAST block record (never a sum). The Hub durably dedupes on
+    /// `(instance_id, scope, scope_id)` so a re-hydrated transcript cannot
+    /// double-count.
+    fn usage_from_transcript_group(&mut self, value: &Value) -> DriverResult<Option<Observation>> {
+        let event = match crate::usage::claude::usage_from_transcript_record(value) {
+            Some(event) => event,
+            None => return Ok(None),
+        };
+        // The transcript extractor keys the turn on requestId; the chip's
+        // per-message snapshot is keyed on the message id instead.
+        let Some(message_id) = value
+            .pointer("/message/id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return Ok(None);
+        };
+        // Fold the single event into one totals snapshot.
+        let mut totals = crate::usage::UsageTotals::default();
+        totals.add(&event);
+        let mut payload = crate::usage::to_usage_payload(UsageScope::Turn, message_id, 1, &totals);
+        // Deterministic id across a live emit and any re-hydration, so the
+        // event and the Hub projection converge on one row.
+        payload.usage_id = remuda_protocol::Id::derive(
+            "obj",
+            self.mapper.instance_id.as_id().as_str(),
+            &format!("usage:turn:{message_id}"),
+        )?;
+        Ok(Some(self.mapper.observation(
+            Completeness::Structured,
+            remuda_protocol::NativeRequestKey::None,
+            ObservationPayload::Usage(Box::new(payload)),
+        )?))
     }
 
     /// Map one decoded transcript record.

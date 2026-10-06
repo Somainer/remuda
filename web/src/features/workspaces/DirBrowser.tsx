@@ -145,15 +145,27 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
 
   return (
     <Modal open={open} onClose={() => { if (!busy) onClose(); }} initialFocusRef={filterRef}>
-      {/* The modal renders inside the New Session <form>; this inner form
-          swallows Enter (filter, manual path) so it never submits the
-          surrounding page. */}
-      <form
+      {/* The modal portals to the document body but is mounted inside the
+          New Session component tree; a nested <form> here would still bubble
+          its implicit submit to the surrounding page form. Use a plain
+          container and stop Enter at the source on every inner control, so a
+          filter Enter or advanced-path submit can never create a session
+          (c-dirpicker round 3 item 9). */}
+      <div
         className={css.browser}
         data-testid="dir-browser"
-        onSubmit={(event) => {
+        onKeyDown={(event) => {
+          if (event.key !== "Enter") return;
+          // Enter in the manual path field submits only the manual add; any
+          // other control (filter, buttons) just swallows the key.
           event.preventDefault();
-          if (manualOpen) submitManual();
+          event.stopPropagation();
+          if (
+            manualOpen &&
+            (event.target as HTMLElement | null)?.dataset.testid === "dir-browser-manual-path"
+          ) {
+            submitManual();
+          }
         }}
       >
         <h2 className={css.browserTitle}>浏览主机目录</h2>
@@ -249,8 +261,9 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
             取消
           </Button>
           {manualOpen ? (
-            <Button type="submit" variant="primary" data-testid="dir-browser-manual-submit"
-              disabled={busy || disabled || !manualPath.trim()}>
+            <Button type="button" variant="primary" data-testid="dir-browser-manual-submit"
+              disabled={busy || disabled || !manualPath.trim()}
+              onClick={submitManual}>
               {busy ? "添加中…" : "添加该路径"}
             </Button>
           ) : (
@@ -261,7 +274,7 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
             </Button>
           )}
         </div>
-      </form>
+      </div>
     </Modal>
   );
 }

@@ -126,6 +126,28 @@ it("trims only the typed manual path, never a filesystem-selected path", async (
 
 it("Enter in the filter is swallowed by the modal and never submits the page form", async () => {
   const submitted = vi.fn();
+  const { container } = render(
+    <form data-testid="outer-form" onSubmit={(event) => {
+      event.preventDefault();
+      submitted();
+    }}>
+      <DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />
+    </form>,
+  );
+  await screen.findByTestId("dir-browser");
+  // A native Enter keypress in the filter (the browser's implicit submit
+  // path) is stopped at the modal container and never reaches the outer
+  // form.
+  fireEvent.keyDown(screen.getByTestId("dir-browser-filter"), { key: "Enter" });
+  expect(submitted).not.toHaveBeenCalled();
+  // A genuine submit of the outer form itself still fires exactly once.
+  fireEvent.submit(container.querySelector('[data-testid="outer-form"]') as HTMLFormElement);
+  expect(submitted).toHaveBeenCalledOnce();
+});
+
+it("an advanced-path submit adds the path but never submits the outer session form", async () => {
+  const submitted = vi.fn();
+  const register = vi.spyOn(hubStore, "registerWorkspace").mockResolvedValue(workspace);
   render(
     <form onSubmit={(event) => {
       event.preventDefault();
@@ -135,7 +157,16 @@ it("Enter in the filter is swallowed by the modal and never submits the page for
     </form>,
   );
   await screen.findByTestId("dir-browser");
-  fireEvent.keyDown(screen.getByTestId("dir-browser-filter"), { key: "Enter" });
+  fireEvent.click(screen.getByTestId("dir-browser-manual-toggle"));
+  fireEvent.change(screen.getByTestId("dir-browser-manual-path"), { target: { value: "/srv/app" } });
+  // Native Enter on the manual field.
+  fireEvent.keyDown(screen.getByTestId("dir-browser-manual-path"), { key: "Enter" });
+  await waitFor(() => expect(register).toHaveBeenCalledWith(workspace.hostId, "/srv/app"));
+  expect(submitted).not.toHaveBeenCalled();
+  // Explicit button click likewise adds without submitting the page.
+  register.mockClear();
+  fireEvent.click(screen.getByTestId("dir-browser-manual-submit"));
+  await waitFor(() => expect(register).toHaveBeenCalledWith(workspace.hostId, "/srv/app"));
   expect(submitted).not.toHaveBeenCalled();
 });
 

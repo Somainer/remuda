@@ -271,6 +271,11 @@
 
   .crumb {
     min-height: var(--touch, 44px);
+    /* Round 3 item 14: short labels ("/", "/a") still get a 44px touch
+       target, not just touch height. */
+    min-width: var(--touch, 44px);
+    padding-left: var(--space-2);
+    padding-right: var(--space-2);
   }
 
   .browserFilter {

@@ -1534,13 +1534,19 @@ async fn follow_session(
                                 {
                                     return;
                                 }
-                                // Advance to the page high-water mark (the
-                                // first page is newest-first, later pages
-                                // oldest-first, so take the max rather than
-                                // the last element).
+                                // Advance to the composite high-water mark
+                                // (updated_at + id): a tie on the same
+                                // millisecond still orders by id, so a multi-page
+                                // burst settled in one transaction loses no row.
+                                // The first page is newest-first, later pages
+                                // oldest-first, so take the max, not the last.
+                                let token = crate::store::Store::settlement_cursor_of(
+                                    &updated_at,
+                                    &iid,
+                                );
                                 high_water = Some(match high_water {
-                                    Some(prev) if prev > updated_at => prev,
-                                    _ => updated_at,
+                                    Some(prev) if prev > token => prev,
+                                    _ => token,
                                 });
                             }
                             settlement_cursor = high_water;

@@ -1362,6 +1362,11 @@ impl Settlement {
 /// an unbounded recovery frame; followers page forward from their cursor.
 pub(crate) const SETTLEMENT_LAG_PAGE: u32 = 512;
 
+/// Separator inside an opaque settlement lag cursor (`updated_at` + SEP +
+/// `id`). RFC3339 timestamps and wire ids never contain the ASCII unit
+/// separator, so the token round-trips unambiguously.
+const SETTLEMENT_CURSOR_SEP: char = '\u{1f}';
+
 /// One row of the `worktree_leases` table (task-model t-pool).
 ///
 /// Identity is `(host_id, workspace_id, dir_key)`: the Space key plus the
@@ -4238,20 +4243,41 @@ impl Store {
     }
 
     /// c-cardsettle r5 item 6: one BOUNDED page (at most
-    /// [`SETTLEMENT_LAG_PAGE`] live rows + tombstones, oldest first) of
-    /// terminal interactions strictly newer than a per-follower delivery
-    /// cursor. The lag recovery sends this page BEFORE its gap frame and then
-    /// advances the cursor to the page high-water mark, so repeated lag bursts
-    /// page forward instead of re-running a fixed time window. With no cursor
-    /// (a fresh connection's first recovery) the most recent bounded page is
-    /// returned regardless of age — an older lost settlement is still
-    /// authoritative and must not resurrect a card.
+    /// [`SETTLEMENT_LAG_PAGE`] live rows + tombstones) of terminal
+    /// interactions strictly after a per-follower delivery cursor. The cursor
+    /// is the opaque token [`settlement_cursor_of`] built from the last row a
+    /// follower already received; it is a COMPOSITE `(updated_at, id)` key so
+    /// rows one transaction settled in the same millisecond cannot be skipped
+    /// across a page boundary. The lag recovery sends this page BEFORE its gap
+    /// frame and then advances the cursor to the page high-water mark, so
+    /// repeated lag bursts page forward instead of re-running a fixed time
+    /// window. With no cursor (a fresh connection's first recovery) the most
+    /// recent bounded page is returned regardless of age — an older lost
+    /// settlement is still authoritative and must not resurrect a card.
     pub async fn invalidated_interactions_after(
         &self,
         cursor: Option<String>,
     ) -> Result<Vec<(String, String, String, String)>, StoreError> {
         self.invalidated_interactions_page(None, cursor, SETTLEMENT_LAG_PAGE)
             .await
+    }
+
+    /// Build the opaque lag-recovery cursor for a delivered row.
+    #[must_use]
+    pub(crate) fn settlement_cursor_of(updated_at: &str, id: &str) -> String {
+        format!("{updated_at}{SETTLEMENT_CURSOR_SEP}{id}")
+    }
+
+    /// Parse an opaque cursor into its `(updated_at, id)` parts. A malformed
+    /// token (never one we issued) starts the follower over from the newest
+    /// page rather than silently filtering everything out.
+    fn parse_settlement_cursor(cursor: Option<&str>) -> (Option<&str>, Option<&str>) {
+        match cursor.map(|token| token.split_once(SETTLEMENT_CURSOR_SEP)) {
+            Some(Some((updated_at, id))) if !updated_at.is_empty() && !id.is_empty() => {
+                (Some(updated_at), Some(id))
+            }
+            _ => (None, None),
+        }
     }
 
     /// Shared bounded page over live invalidated rows UNION ALL tombstones.
@@ -4266,14 +4292,18 @@ impl Store {
     ) -> Result<Vec<(String, String, String, String)>, StoreError> {
         let limit = i64::from(limit);
         self.run_named("invalidated_interactions_page", move |conn| {
-            // r5 item 6: cursor + bounded LIMIT bound both age (from the
-            // follower's durable position) and count. A cursor-less first
+            // r5 item 6: composite cursor + bounded LIMIT bound both age (from
+            // the follower's durable position) and count. A cursor-less first
             // recovery pages the NEWEST bounded rows (what a burst just
             // overwrote); subsequent pages walk strictly forward ascending.
-            let order = if cursor.is_some() {
-                "updated_at ASC"
+            // A token present but unparseable behaves like "no durable
+            // position": recover the newest bounded page.
+            let (cursor_ts, cursor_id) = Self::parse_settlement_cursor(cursor.as_deref());
+            let paged = cursor_ts.is_some();
+            let order = if paged {
+                "updated_at ASC, id ASC"
             } else {
-                "updated_at DESC"
+                "updated_at DESC, id DESC"
             };
             let sql = format!(
                 "SELECT instance_id, id, COALESCE(
@@ -4286,7 +4316,7 @@ impl Store {
                  FROM interactions
                  WHERE state = 'invalidated'
                    AND (?1 IS NULL OR julianday(updated_at) >= julianday('now','-' || ?1 || ' minutes'))
-                   AND (?2 IS NULL OR updated_at > ?2)
+                   AND (?2 IS NULL OR (updated_at, id) > (?2, ?3))
                  UNION ALL
                  SELECT instance_id, id,
                         CASE WHEN reason = '' THEN 'generation-ended' ELSE reason END,
@@ -4294,19 +4324,22 @@ impl Store {
                  FROM interaction_tombstones
                  WHERE state = 'invalidated'
                    AND (?1 IS NULL OR julianday(updated_at) >= julianday('now','-' || ?1 || ' minutes'))
-                   AND (?2 IS NULL OR updated_at > ?2)
+                   AND (?2 IS NULL OR (updated_at, id) > (?2, ?3))
                  ORDER BY {order}
-                 LIMIT ?3"
+                 LIMIT ?4"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![window_mins, cursor, limit], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
+            let rows = stmt.query_map(
+                params![window_mins, cursor_ts, cursor_id, limit],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
@@ -7784,20 +7817,25 @@ mod tests {
         // No-cursor pages are newest-first.
         assert_eq!(first.first().map(|(_, id, _, _)| id), Some(&fresh_int));
 
-        // Paging strictly forward from the newest cursor yields nothing.
-        let newest = match store
-            .invalidated_interactions_after(first.first().map(|(_, _, _, ts)| ts.clone()))
-            .await
-            .expect("page from newest")
-            .as_slice()
-        {
-            [] => first.first().map(|(_, _, _, ts)| ts.clone()).unwrap(),
-            _ => panic!("no settlement is newer than the newest row"),
+        // Paging strictly forward from the newest row's composite cursor
+        // yields nothing.
+        let newest_token = {
+            let (_, newest_id, _, newest_ts) = first.first().expect("newest row");
+            Store::settlement_cursor_of(newest_ts, newest_id)
         };
-        // Paging from the OLD row's timestamp returns everything newer
+        assert!(
+            store
+                .invalidated_interactions_after(Some(newest_token))
+                .await
+                .expect("page from newest")
+                .is_empty(),
+            "no settlement is newer than the newest row"
+        );
+        // Paging from the OLD row's composite cursor returns everything newer
         // (oldest-first across cursor pages), but not the old row itself.
+        let aged_cursor = Store::settlement_cursor_of(&aged_ts, &aged_int);
         let onward = store
-            .invalidated_interactions_after(Some(aged_ts))
+            .invalidated_interactions_after(Some(aged_cursor))
             .await
             .expect("page after old cursor");
         let onward_ids: Vec<String> = onward.iter().map(|(_, id, _, _)| id.clone()).collect();
@@ -7811,7 +7849,38 @@ mod tests {
             "cursor pages walk oldest-first"
         );
         assert!(onward.len() <= SETTLEMENT_LAG_PAGE as usize);
-        let _ = newest;
+
+        // r5 item 6 tie edge: another invalidated row with the SAME
+        // updated_at as the aged row but a different id is not skipped by a
+        // cursor taken on the aged row.
+        let tied = seed_acknowledged_instance(&store, &host).await;
+        let tied_int = seed_pending_interaction(&store, &host, &tied.instance_id).await;
+        let (_, _) = store
+            .settle_instance_exited(tied.instance_id.clone(), "x".into())
+            .await
+            .expect("settle tied");
+        store
+            .run_named("backdate_to_aged", {
+                let aged_ts = aged_ts.clone();
+                let tied_int = tied_int.clone();
+                move |conn| {
+                    conn.execute(
+                        "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
+                        params![aged_ts, tied_int],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("backdate tied row to the same millisecond");
+        let after_tie = store
+            .invalidated_interactions_after(Some(Store::settlement_cursor_of(&aged_ts, &aged_int)))
+            .await
+            .expect("tie page");
+        assert!(
+            after_tie.iter().any(|(_, id, _, _)| id == &tied_int),
+            "a same-millisecond row with a later id follows the cursor"
+        );
         let _ = deleted_id;
         store.close().await;
     }

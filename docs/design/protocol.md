@@ -1088,6 +1088,8 @@ type InteractionAnswer =
 
 `ObservationPayload` 是 §5.2 的 Message/Thought/ToolCall/ToolResult、§5.3 三种 workflow、§5.4 三种 interaction 和本表 variants 的联合。`InteractionEntity` 即 §2.6 全字段加 EntityMeta。host/workspace lifecycle 使用相同 payload，但 envelope 放在独立 `RegistryEvent`：`{schemaVersion:1,eventId,hostId,journalId,seq,observedAt,kind:"lifecycle",payload}`，不伪造 instanceId。Hub Command 入口事件另有自己的 journal，Node 镜像不能让同一实体出现两个权威 revision。
 
+根轮状态投影（D-057 OA6，ma-sdk-state）：结构化 stdio 引擎（claude-sdk、claude-print，共享同一 mapper）在用户帧写入原生进程之后发 `topic=turn, nativeName=turn_started, status=working`，活动态翻为 working；同 topic 的 `nativeName=result` 在没有排队后续轮（relatedIds.queuedTurnCount=0）时是该根轮的结算结束——status `turn_done` 与 status `error`（例如 API 429）都只把 activity 置回 idle，**不**改 lifecycle。turn 级错误在实例投影上留下一个加性标记 lastTurnError（at=该 result 观测时间，text=原生错误文本截断 200 字符），下一次 turn_started 清除；实例保持 running 并保留全部 grant（含 address-owner），可原位重试。唯一的终态来自显式进程结束证据：topic=session 的原生退出/EOF、PTY 消失、未启动即被拒的 launch（reasonCode native-driver-start-failed/start-fail）或 Node 报告实例消失。即使 result 带 affectsCompletion=true，turn 错误本身也不是进程结束——一次性 print 子进程结束时由驱动另发一条 topic=session 退出事件。Node 仅对 print/sdk 引擎自身的 turn 事件应用该 activity 规则（按 source.driverKind 限定），hook/screen 路径不套用。
+
 `ArtifactLocator` 为 `{type:"blob",objectId:Id,digest:Digest}`、`{type:"workspace-file",workspaceId:Id,relativePath:string,revision:U64,digest:Knowledge<Digest>}`、`{type:"native",nativeUri:string}` 或 `{type:"url",url:string}`。可读 workspace-file 路径由 Node 按注册根解析，拒绝 `..`、越界 symlink 和跨 host 路径；下载校验 revision/digest 防止读错版本。native URI/URL 不自动抓取或执行。HTML 预览使用独立 origin 与 sandbox；TTY 的 clipboard/URL/escape sequences 不在 Hub 或普通 DOM 执行。Artifact 工具的调用只产生 declared，文件/API 的读回证据才产生 available；普通文件产物不能声称复现了 Claude 原生 Artifact 功能。
 
 usage 每个 scope 用 metricRevision 更新；snapshot 覆盖旧 snapshot，不累加。只有原生明示 delta 才累加。Claude 多条 result 可能是累计 cost，Codex resume 会重发 thread 累计量，agy total 未必包含 cache/reasoning；保持原生统计口径，不用字段相加“修正”上游总量。没有 usage 时所有相关值 unknown，不是 0。Claude Workflow 样例、Codex usage/resume、agy sample
@@ -1109,7 +1111,7 @@ Grok ACP `_meta.usage.inputTokens` 已知包含 cache，故 inputAccounting=tota
 | `type:stream_event` 的 message_start/content_block_start | message/thought/tool_call open，记录 native message ID、block index | completeness=partial |
 | stream_event 的 text_delta / thinking_delta / input_json_delta | 对应 node append；input JSON 未完整前存 inputTextDelta | 不能把半个 JSON 当工具的可执行参数 |
 | stream_event 的 content_block_stop/message_delta/message_stop | 关闭 block、更新 stop_reason/usage 候选 | message_stop 是模型消息结束，不是 Run 成功；等完整 assistant/result |
-| `type:result` | lifecycle/native turn/result；message final 若仅 result 有文本且未与完整 assistant 重复；usage snapshot | `subtype`, `is_error`, `terminal_reason`, `result_index`, `origin` 保留；只按 §5.8 推进 Run |
+| `type:result` | lifecycle/native turn/result；message final 若仅 result 有文本且未与完整 assistant 重复；usage snapshot | `subtype`, `is_error`, `terminal_reason`, `result_index`, `origin` 保留；只按 §5.8 推进 Run。D-057 OA6：status 为 error 的 result 仅结束该根轮（activity idle + lastTurnError 标记），不是进程/启动失败；终态只来自独立的 session 退出事件 |
 | `system/hook_started` | lifecycle/native hook/started，hook_id/name/event | 它表示 hook 命令启动，不等于相应工具已经开始 |
 | `system/hook_response` / 版本支持的 hook_progress | lifecycle/native hook/response/progress，exit_code/outcome/output 引用 | hook 输出与原生 tool_result 分开；不是 approval answer ACK |
 | `system/permission_denied` | lifecycle/native permission/denied，tool_use_id、decision reason | 原生自动拒绝提示；没有待答 request，不生成批准按钮 |

@@ -5517,6 +5517,13 @@ fn apply_instance_projection(
             .get("severity")
             .and_then(Value::as_str)
             .unwrap_or("");
+        // NOTE (ma-sdk-state): the print/sdk engine's turn lifecycle events
+        // (topic=turn: turn_started / result) are emitted at severity=info,
+        // so they never enter this process-failure fold. Turn activity and the
+        // lastTurnError marker are derived in `derive_instance_state` /
+        // `apply_instance_lifecycle`. The broader process-end classifier
+        // (turn/error-severity/session-exit split) lands with c-cardsettle;
+        // this branch intentionally does not duplicate it.
         let failed = severity == "error"
             || native_name.contains("error")
             || native_name == "exit"
@@ -8755,8 +8762,7 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
             && match (native_name, status) {
                 ("result", Some("error")) => true,
                 ("result", Some("turn_done")) => {
-                    payload.get("affectsCompletion").and_then(Value::as_bool)
-                        == Some(true)
+                    payload.get("affectsCompletion").and_then(Value::as_bool) == Some(true)
                 }
                 _ => false,
             };
@@ -8777,8 +8783,8 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
     // is never process-end. This generic fold must only catch real start
     // failures; topic=turn (handled above) and other non-session topics are
     // excluded so a literal status `error` cannot mark a live instance failed.
-    let turn_topic = payload_type == "native"
-        && payload.get("topic").and_then(Value::as_str) == Some("turn");
+    let turn_topic =
+        payload_type == "native" && payload.get("topic").and_then(Value::as_str) == Some("turn");
     let start_failed = !turn_topic
         && !native_event_is_subagent(payload)
         && (reason == "native-driver-start-failed"
@@ -8821,6 +8827,11 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
                 activity = normalize_activity(status);
             }
             "exited" => lifecycle = Some("exited"),
+            // NOTE (ma-sdk-state): turn events (topic=turn) are handled by the
+            // turn arm above and never reach here. Broader OA6 splitting of a
+            // bare failed/error native STATUS on session/diagnostic topics is
+            // owned by c-cardsettle's classifier; this branch keeps the
+            // existing fold.
             "failed" | "error" => lifecycle = Some("failed"),
             _ => {}
         }
@@ -8885,7 +8896,10 @@ fn turn_error_projection(event: &Value, now: &str) -> Option<String> {
     {
         return None;
     }
-    let name = payload.get("nativeName").and_then(Value::as_str).unwrap_or("");
+    let name = payload
+        .get("nativeName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let status = knowledge_value(payload.get("status"));
     if name == "turn_started" && status == Some("working") {
         return Some(String::new());
@@ -8919,10 +8933,7 @@ fn turn_error_projection(event: &Value, now: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|at| !at.is_empty())
         .unwrap_or(now);
-    Some(
-        json!({ "at": at, "text": text })
-            .to_string(),
-    )
+    Some(json!({ "at": at, "text": text }).to_string())
 }
 
 fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {

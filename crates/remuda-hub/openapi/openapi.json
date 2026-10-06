@@ -1525,6 +1525,19 @@
               "null"
             ]
           },
+          "lastTurnError": {
+            "description": "D-057 OA6 (ma-sdk-state): additive marker for the most recent settled root-turn failure (an API error such as 429 on the turn result) while the process stays running. Never a lifecycle: the instance keeps running and retryable in place; the next turn start clears it. Display text only, truncated to 200 characters. Absent after a clean turn end.",
+            "additionalProperties": true,
+            "properties": {
+              "at": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
           "lifecycle": {
             "description": "Derived from Node lifecycle observations in journal.append. Create default is requested, not running.",
             "enum": [

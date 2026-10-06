@@ -431,4 +431,53 @@ describe("WorkflowTimelineCard", () => {
       vi.useRealTimers();
     }
   });
+
+  it("exposes a labelled progressbar with final now/max on a terminal run", () => {
+    const agents4 = ["a", "b", "c", "d"].map((id) => member({ memberId: id, state: "completed" as const }));
+    renderCard(
+      <WorkflowTimelineCard
+        run={run({
+          state: "completed",
+          totals: totalsBlock({ done: 4, total: 4 }),
+        })}
+        phases={[phase()]}
+        members={agents4}
+      />,
+    );
+    const meter = screen.getByTestId("workflow-progress-meter");
+    expect(meter.getAttribute("role")).toBe("progressbar");
+    expect(meter.getAttribute("aria-label")).toContain("demo-wf");
+    expect(meter.getAttribute("aria-valuemin")).toBe("0");
+    expect(meter.getAttribute("aria-valuemax")).toBe("4");
+    expect(meter.getAttribute("aria-valuenow")).toBe("4");
+    expect(meter.getAttribute("data-provisional")).toBe("0");
+    expect(meter.getAttribute("aria-valuetext")).toBe("4 of 4 agents done");
+  });
+
+  it("exposes a provisional progressbar with no final max while the run is alive", () => {
+    const agents8 = [
+      ...["a", "b", "c"].map((id) => member({ memberId: id, state: "completed" as const })),
+      member({ memberId: "d", state: "failed" as const }),
+      ...["e", "f", "g"].map((id) => member({ memberId: id, state: "running" as const })),
+      member({ memberId: "h", state: "queued" as const }),
+    ];
+    renderCard(
+      <WorkflowTimelineCard
+        run={run({
+          state: "running",
+          totals: totalsBlock({ done: 4, failed: 1, running: 3, total: 8 }),
+        })}
+        phases={[phase()]}
+        members={agents8}
+      />,
+    );
+    const meter = screen.getByTestId("workflow-progress-meter");
+    // While provisional, do NOT claim a final max.
+    expect(meter.getAttribute("aria-valuemax")).toBeNull();
+    expect(meter.getAttribute("aria-valuenow")).toBe("5"); // 4 done + 1 failed
+    expect(meter.getAttribute("data-provisional")).toBe("1");
+    expect(meter.getAttribute("aria-valuetext")).toBe(
+      "5 of at least 8 agents done, still running; 1 failed",
+    );
+  });
 });

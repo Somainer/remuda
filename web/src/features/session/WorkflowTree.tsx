@@ -66,7 +66,15 @@ function PhaseGroup({ phase, members }: { phase: WorkflowPhasePayload; members: 
       <summary
         className={css.wfPhase}
         aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
+        // React owns the disclosure state. Without preventDefault the native
+        // <summary> activation toggles details.open ITSELF on the first click
+        // and then React flips state on the second, so after two clicks the
+        // real details.open / body visibility / chevron / aria-expanded
+        // desync. Suppress the native toggle and drive `open` solely from here.
+        onClick={(event) => {
+          event.preventDefault();
+          setOpen((value) => !value);
+        }}
       >
         <span>{knowledgeValue(phase.label) ?? phase.phaseId}</span>
       </summary>

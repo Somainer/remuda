@@ -413,13 +413,13 @@ function projectPhase(
   // final N/N between spawning iterations (or while members with a null
   // phaseId all completed), and the run may still spawn into it or into the
   // synthetic "unphased" bucket. The count is final only once the run is
-  // terminal — the phase's own state does not get a vote. An empty seeded
-  // phase has nothing spawned yet: plain 0/0, no `+`.
+  // terminal — the phase's own state does not get a vote. A LIVE phase gets
+  // `+` even with zero members (0/0+): the run may still spawn into it.
   const provisional = runLive;
   const countText =
     !runLive && fullyDone
       ? `${total}/${total} 完成`
-      : `${terminal}/${total}${runLive && total > 0 ? "+" : ""}`;
+      : `${terminal}/${total}${runLive ? "+" : ""}`;
 
   return {
     id,

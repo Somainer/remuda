@@ -398,6 +398,29 @@ describe("phase meta wording", () => {
     expect(card.phases[0].countText).toBe("2/2 完成");
   });
 
+  it("a live phase with zero members still shows a provisional 0/0+", () => {
+    // Round 3: the run is alive but the phase has no members yet (and no
+    // queued rows either). It may still spawn into this phase, so the count
+    // carries the provisional "+" even at total 0 rather than plain 0/0.
+    const card = projectWorkflow({
+      run: run({ state: "running" }),
+      phases: [phase({ phaseId: "p1", state: "running" })],
+      members: [],
+    });
+    expect(card.phases[0].countText).toBe("0/0+");
+    expect(card.phases[0].provisional).toBe(true);
+  });
+
+  it("a terminal phase with zero members is plain 0/0 (no +)", () => {
+    const card = projectWorkflow({
+      run: run({ state: "completed" }),
+      phases: [phase({ phaseId: "p1", state: "completed" })],
+      members: [],
+    });
+    expect(card.phases[0].countText).toBe("0/0");
+    expect(card.phases[0].provisional).toBe(false);
+  });
+
   it("keeps a completed-looking phase provisional while the run is still alive", () => {
     // Dynamic run between iterations: the phase says completed and every
     // spawned member is done, but the run itself has not terminated. The count
@@ -756,13 +779,14 @@ describe("dynamic growing total", () => {
     expect(finished.phases[1].provisional).toBe(false);
   });
 
-  it("shows a plain 0/0 for an empty seeded phase, not 0/0+", () => {
-    // The producer seeds queued phase observations before any member exists.
+  it("shows a provisional 0/0+ for an empty seeded phase in a live run", () => {
+    // The producer seeds queued phase observations before any member exists;
+    // a live run may still spawn into the phase, so it reads 0/0+ (round 3).
     const card = cardFor(
       [],
       [phase({ phaseId: "p1", label: known("DeepRead"), state: "queued" })],
     );
-    expect(card.phases[0].countText).toBe("0/0");
+    expect(card.phases[0].countText).toBe("0/0+");
     expect(card.phases[0].provisional).toBe(true);
   });
 

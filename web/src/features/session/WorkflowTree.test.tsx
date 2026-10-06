@@ -94,7 +94,7 @@ describe("WorkflowTree phase chevron", () => {
     const user = userEvent.setup();
     renderTree();
     const runDetails = screen.getByTestId("workflow-tree");
-    const phase = screen.getAllByTestId("workflow-phase")[0];
+    const phase = screen.getAllByTestId("workflow-phase")[0] as HTMLDetailsElement;
     const summary = phase.querySelector(":scope > summary")!;
 
     // The chevron glyph is driven by the phase's OWN details state, so the
@@ -112,5 +112,33 @@ describe("WorkflowTree phase chevron", () => {
     expect(phase).toHaveAttribute("open");
     expect(phase).toHaveAttribute("data-open", "1");
     expect(summary).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("two summary clicks do not double-toggle the native details (React owns it)", async () => {
+    // Round 3: the native <summary> activation used to toggle details.open
+    // ITSELF and React flipped state too, so after two clicks the real
+    // details.open / body visibility desynced from aria-expanded. The summary
+    // now preventDefault()s and React owns the disclosure. jsdom reflects a
+    // user click onto details.open when there is no preventDefault, so this
+    // fails on the old handler.
+    const user = userEvent.setup();
+    renderTree();
+    const phase = screen.getAllByTestId("workflow-phase")[0] as HTMLDetailsElement;
+    const summary = phase.querySelector(":scope > summary")!;
+    const body = phase.querySelector(":scope > ul")!;
+
+    expect(phase.open).toBe(true);
+    expect(summary).toHaveAttribute("aria-expanded", "true");
+
+    await user.click(summary);
+    expect(phase.open).toBe(false);
+    expect(summary).toHaveAttribute("aria-expanded", "false");
+    expect(body).not.toBeVisible();
+
+    // Second click reopens both the DOM details and React state.
+    await user.click(summary);
+    expect(phase.open).toBe(true);
+    expect(summary).toHaveAttribute("aria-expanded", "true");
+    expect(body).toBeVisible();
   });
 });

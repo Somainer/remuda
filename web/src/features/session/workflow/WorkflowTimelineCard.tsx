@@ -612,6 +612,32 @@ function DetailedCard({
           ) : null}
         </span>
       </button>
+      {/* Accessible progress meter, OUTSIDE the disclosure button (a
+          progressbar must not nest in a button). Final runs expose a real
+          now/max; while the run is alive the denominator is provisional, so
+          we never claim a final max and state the partial count in
+          valuetext ("N of at least M agents done, still running; K failed"). */}
+      <div
+        className={css.srOnly}
+        role="progressbar"
+        aria-label={`Workflow ${card.name} progress`}
+        aria-valuemin={0}
+        aria-valuenow={terminal}
+        {...(card.provisional
+          ? {
+              "aria-valuetext": `${terminal} of at least ${card.knownCount} agents done, still running${
+                card.totals.failed > 0 ? `; ${card.totals.failed} failed` : ""
+              }`,
+            }
+          : {
+              "aria-valuemax": card.knownCount,
+              "aria-valuetext": `${terminal} of ${card.knownCount} agents done${
+                card.totals.failed > 0 ? `; ${card.totals.failed} failed` : ""
+              }`,
+            })}
+        data-testid="workflow-progress-meter"
+        data-provisional={card.provisional ? "1" : "0"}
+      />
       {open ? (
         <div id={bodyId}>
           {running && card.live ? (

@@ -1,59 +1,65 @@
 //! Descriptor-relative access to filesystem trees an adversary controls the
-//! contents of (c-resumehome round 3).
+//! contents of (c-resumehome rounds 3–4).
 //!
-//! Every path reached through this module starts at an already-open **trusted
-//! directory fd** and walks one component at a time with
-//! `openat(…, O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC)`. A symlink *anywhere* below
-//! the trusted root fails the walk (`ELOOP`/`ENOTDIR`), so:
+//! Every path reached through this module starts at a **trusted anchor** that
+//! is realpath'd ONCE when pinned, and every component BELOW the anchor is
+//! walked with `openat(…, O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC)`. System mount
+//! symlinks ABOVE trusted roots are therefore harmless — on macOS `/tmp`,
+//! `/var` and `/private/var/tmp` differ — while a symlink anywhere inside an
+//! anchored tree always fails:
 //!
 //! - a symlinked `projects/` or `<session>/` directory can never redirect
-//!   writes outside the managed home;
-//! - a symlinked leaf (`<S>.jsonl`, a sidecar, a source transcript) is never
-//!   opened or copied through;
-//! - there is no path-based `stat`→`open` window: leaves are opened
-//!   `O_NOFOLLOW`, then `fstat` runs on the **opened fd**, and bytes are read
-//!   from that same fd;
-//! - non-regular leaves (FIFO, socket, device) are identified on the opened fd
-//!   and never read or blocked on;
+//!   writes outside the pinned home;
+//! - a symlinked leaf (`<S>.jsonl`, a sidecar, the transcript source) is
+//!   never opened or copied through;
+//! - leaves are classified with an exact `(mode & S_IFMT)` comparison: a
+//!   socket (0140000) or other special file never matches `S_IFREG`;
+//! - leaves are `fstatat`-classified before they are opened, and regular
+//!   leaves (append included) open with `O_NONBLOCK` so a FIFO cannot block
+//!   the opener; the opened descriptor is `fstat`-rechecked before use;
 //! - every file a walk creates is `O_EXCL` relative to a pinned directory fd
-//!   and published with `renameat`, never through a path string.
+//!   and every publish is a `renameat` between pinned fds, never a path
+//!   string;
+//! - copies read the OPENED descriptor and enforce a live byte cap, so a
+//!   file that grows after enumeration cannot push a copy over budget.
 //!
-//! Names passed to any method on [`DirFd`] must be exactly one path
-//! component (no `/`, no `.`/`..`); the walk decides component order.
+//! Names passed to single-component methods must be one opaque component (no
+//! `/`, no NUL, no `.`/`..`). Multi-component walks additionally reject
+//! `..`/`.` components explicitly; escaping an anchor is impossible.
 //!
-//! Self-contained: only `std` + `nix` ("fs"), no Remuda knowledge. The
-//! c-dirpicker directory picker builds the same Linux/macOS pattern (macOS has
-//! no `O_PATH`; the flags used here — `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` — work
-//! on both). When that lands, extract this crate into the shared home both
-//! use.
+//! Self-contained: only `std` + `nix` ("fs","dir"), no Remuda knowledge.
+//! The c-dirpicker directory picker builds the same Linux/macOS pattern
+//! (macOS uses the same flags; no `O_PATH` is needed there). When that
+//! lands, extract this crate into the shared home both use.
+
 #![cfg(unix)]
 // The crate owns the workspace's one audited openat(2) fd transfer
-// (`File::from_raw_fd` in `own_fd`); see Cargo.toml for why it does not
-// inherit the workspace's `forbid(unsafe_code)` lint.
+// (`File::from_raw_fd`); see Cargo.toml for why it does not inherit the
+// workspace `forbid(unsafe_code)` lint.
 #![allow(unsafe_code)]
 #![deny(missing_docs)]
 
 use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::fcntl::AtFlags;
-use nix::fcntl::OFlag;
-use nix::sys::stat::FileStat;
-use nix::sys::stat::Mode;
+use nix::fcntl::{AtFlags, OFlag};
+use nix::sys::stat::{FileStat, Mode};
 use std::fs::File;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// What a directory entry is, classified without following links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafKind {
-    /// `S_ISREG` — the only kind [`DirFd::open_regular_leaf`] accepts.
+    /// `S_ISREG` exactly — the only kind [`DirFd::open_regular_leaf`] accepts.
     Regular,
     /// `S_ISLNK` — always rejected by this module.
     Symlink,
     /// `S_ISDIR`.
     Directory,
-    /// FIFO, socket, char/block device, anything else — never read.
+    /// FIFO, socket, char/block device, whiteout, anything else — never read
+    /// or copied, skipped by callers and reported instead.
     Other,
 }
 
@@ -62,10 +68,19 @@ pub enum LeafKind {
 pub struct Entry {
     /// Single-component file name.
     pub name: Vec<u8>,
-    /// Class from `fstatat(AT_SYMLINK_NOFOLLOW)`.
+    /// Class from `fstatat(AT_SYMLINK_NOFOLLOW)` / the opened fd.
     pub kind: LeafKind,
     /// Size in bytes (0 for non-files).
     pub len: u64,
+}
+
+impl Entry {
+    /// Exact regular-file test (`S_IFMT == S_IFREG`): a socket (0140000) is
+    /// not a regular file.
+    #[must_use]
+    pub fn is_regular(&self) -> bool {
+        self.kind == LeafKind::Regular
+    }
 }
 
 /// A leaf opened `O_NOFOLLOW`, with the classification of the **opened fd**.
@@ -82,10 +97,9 @@ pub struct OpenedLeaf {
 impl OpenedLeaf {
     /// The `(st_dev, st_ino)` pair of the opened file description. Two leaves
     /// are the same on-disk file iff their pairs match — read from the opened
-    /// fds, so symlink swaps after opening cannot change the verdict.
+    /// fds, so a symlink swap after opening cannot change the verdict.
     pub fn identity(&self) -> Result<(u64, u64), FdError> {
-        let stat = nix::sys::stat::fstat(self.file.as_raw_fd())
-            .map_err(|error| FdError::new("<opened fd>", FdErrorKind::Other(error.to_string())))?;
+        let stat = fstat_fd(self.file.as_raw_fd())?;
         Ok((dev_of(&stat), ino_of(&stat)))
     }
 }
@@ -102,8 +116,7 @@ impl AsRawFd for DirFd {
     }
 }
 
-/// Failures from an fd walk. Messages name the offending component so callers
-/// can surface a clear refusal.
+/// Failures from an fd walk. Messages name the offending component.
 #[derive(Debug)]
 pub struct FdError {
     /// Single-component name (or display path) the walk rejected.
@@ -145,10 +158,6 @@ impl FdError {
             other => FdErrorKind::Other(other.to_string()),
         };
         Self { at, kind }
-    }
-
-    fn io_path(at: &Path, error: Errno) -> Self {
-        Self::io(at.to_string_lossy().as_bytes(), error)
     }
 
     /// Whether the walk hit a symlink component.
@@ -196,10 +205,10 @@ fn check_component(name: &[u8]) -> Result<(), FdError> {
         || name == b".."
         || name.iter().any(|&byte| byte == b'/' || byte == 0)
     {
-        Err(FdError {
-            at: String::from_utf8_lossy(name).into_owned(),
-            kind: FdErrorKind::BadComponent,
-        })
+        Err(FdError::new(
+            String::from_utf8_lossy(name),
+            FdErrorKind::BadComponent,
+        ))
     } else {
         Ok(())
     }
@@ -210,13 +219,17 @@ unsafe fn own_fd(fd: RawFd) -> File {
     unsafe { File::from_raw_fd(fd) }
 }
 
+/// Exact S_IFMT classification: `(mode & S_IFMT) == <type>`. A bitmask test
+/// like `(mode & S_IFREG) == S_IFREG` falsely matches sockets (0140000) and
+/// macOS whiteouts; this never does.
 fn classify(stat: &FileStat) -> (LeafKind, u64) {
     let mode = stat.st_mode;
-    let kind = if nix::sys::stat::SFlag::S_IFLNK.bits() & mode == nix::libc::S_IFLNK {
+    let ifmt = mode & nix::libc::S_IFMT;
+    let kind = if ifmt == nix::libc::S_IFLNK {
         LeafKind::Symlink
-    } else if nix::sys::stat::SFlag::S_IFREG.bits() & mode == nix::libc::S_IFREG {
+    } else if ifmt == nix::libc::S_IFREG {
         LeafKind::Regular
-    } else if nix::sys::stat::SFlag::S_IFDIR.bits() & mode == nix::libc::S_IFDIR {
+    } else if ifmt == nix::libc::S_IFDIR {
         LeafKind::Directory
     } else {
         LeafKind::Other
@@ -226,6 +239,10 @@ fn classify(stat: &FileStat) -> (LeafKind, u64) {
     #[allow(clippy::unnecessary_cast)]
     let len = stat.st_size as u64;
     (kind, len)
+}
+
+fn fstat_fd(fd: RawFd) -> Result<FileStat, FdError> {
+    nix::sys::stat::fstat(fd).map_err(|error| FdError::new("<fd>", FdErrorKind::Other(error.to_string())))
 }
 
 #[allow(clippy::unnecessary_cast)]
@@ -242,11 +259,16 @@ const DIR_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
     .union(OFlag::O_NOFOLLOW)
     .union(OFlag::O_CLOEXEC);
-// `O_NONBLOCK` matters: without it, opening a FIFO `O_RDONLY` blocks until a
-// writer appears — that was item 4's unbounded hang. With it the open returns
-// immediately, and the post-open `fstat` then proves whether the fd is regular
-// anyway, so a stat→open swap to a FIFO cannot block either.
+// `O_NONBLOCK` matters for leaves: without it, opening a FIFO `O_RDONLY`
+// (or `O_WRONLY`) blocks until the other end appears. Every leaf open below
+// includes it, and the fstatat/fstat checks still require a regular file, so
+// a stat→open swap to a FIFO can neither block nor be read.
 const LEAF_FLAGS: OFlag = OFlag::O_RDONLY
+    .union(OFlag::O_NOFOLLOW)
+    .union(OFlag::O_CLOEXEC)
+    .union(OFlag::O_NONBLOCK);
+const APPEND_FLAGS: OFlag = OFlag::O_WRONLY
+    .union(OFlag::O_APPEND)
     .union(OFlag::O_NOFOLLOW)
     .union(OFlag::O_CLOEXEC)
     .union(OFlag::O_NONBLOCK);
@@ -259,74 +281,155 @@ const DIR_MODE: Mode = Mode::from_bits_truncate(0o700);
 const FILE_MODE: Mode = Mode::from_bits_truncate(0o600);
 
 impl DirFd {
-    /// Pin an existing trusted directory, refusing a symlink at `path`
-    /// itself (`O_NOFOLLOW`).
-    pub fn open_root(path: &Path) -> Result<Self, FdError> {
-        let fd = nix::fcntl::openat(Some(nix::libc::AT_FDCWD), path, DIR_FLAGS, Mode::empty())
-            .map_err(|error| FdError::io_path(path, error))?;
+    /// Pin a TRUSTED ANCHOR directory.
+    ///
+    /// Unlike every other entry in the module, symlinks IN the anchor path
+    /// itself are resolved once with `realpath`/`canonicalize`: the anchor is
+    /// configured by trusted setup (a managed native home, a test allocation
+    /// base), and on macOS system paths like `/tmp → /private/tmp` and
+    /// `/var → /private/var` are mount symlinks an O_NOFOLLOW walk from `/`
+    /// cannot cross. The canonical path is then opened with
+    /// `O_NOFOLLOW|O_DIRECTORY`; everything BELOW it is walked link-free.
+    pub fn anchor_existing(path: &Path) -> Result<Self, FdError> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|error| FdError::new(path.display().to_string(), errno_kind(error)))?;
+        let fd = nix::fcntl::openat(
+            Some(nix::libc::AT_FDCWD),
+            &canonical,
+            DIR_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(|error| match error {
+            Errno::ELOOP => FdError::new(canonical.display().to_string(), FdErrorKind::Symlink),
+            Errno::ENOTDIR => FdError::new(canonical.display().to_string(), FdErrorKind::NotDirectory),
+            Errno::ENOENT => FdError::new(canonical.display().to_string(), FdErrorKind::Missing),
+            other => FdError::new(canonical.display().to_string(), FdErrorKind::Other(other.to_string())),
+        })?;
         Ok(Self {
             file: unsafe { own_fd(fd) },
         })
+    }
+
+    /// Pin an anchor, creating it 0700 if absent.
+    ///
+    /// The deepest EXISTING ancestor is realpath'd once (crossing its system
+    /// mount symlinks); every component below that ancestor is created
+    /// `mkdirat` + `O_NOFOLLOW`, so a symlink under the anchor cannot be
+    /// created through even when the anchor path did not previously exist.
+    pub fn anchor_or_create(path: &Path) -> Result<Self, FdError> {
+        if !path.is_absolute() {
+            return Err(FdError::new(path.display().to_string(), FdErrorKind::BadComponent));
+        }
+        // Find the deepest existing ancestor.
+        let mut existing = path.to_path_buf();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        loop {
+            if existing.is_dir() {
+                break;
+            }
+            let name = match existing.file_name().map(std::ffi::OsStr::to_owned) {
+                Some(name) => name,
+                None => {
+                    return Err(FdError::new(
+                        path.display().to_string(),
+                        FdErrorKind::BadComponent,
+                    ));
+                }
+            };
+            tail.push(name);
+            let parent = match existing.parent() {
+                Some(parent) if parent != existing => parent.to_path_buf(),
+                _ => {
+                    return Err(FdError::new(
+                        path.display().to_string(),
+                        FdErrorKind::BadComponent,
+                    ));
+                }
+            };
+            existing = parent;
+        }
+        let mut current = Self::anchor_existing(&existing)?;
+        for part in tail.into_iter().rev() {
+            current = current.ensure_subdir(part.as_bytes())?;
+        }
+        Ok(current)
     }
 
     /// Whether this opened directory is world-writable (`S_IWOTH`), read from
     /// the opened fd — no path re-stat.
     pub fn is_world_writable(&self) -> Result<bool, FdError> {
-        let stat = nix::sys::stat::fstat(self.as_raw_fd())
-            .map_err(|error| FdError::new("<dir fd>", FdErrorKind::Other(error.to_string())))?;
+        let stat = fstat_fd(self.as_raw_fd())?;
         Ok(stat.st_mode & nix::libc::S_IWOTH != 0)
     }
 
-    /// Open this directory's own parent (`..`) with the same
-    /// `O_NOFOLLOW|O_DIRECTORY` flags. Used by callers that need to climb a
-    /// REAL directory tree (as opposed to a user-supplied multi-component
-    /// name, which [`Self::subdir`] deliberately rejects).
-    pub fn open_parent(&self) -> Result<Self, FdError> {
-        let fd = nix::fcntl::openat(Some(self.as_raw_fd()), "..", DIR_FLAGS, Mode::empty())
-            .map_err(|error| FdError::io(b"..", error))?;
+    /// Owner uid of the opened directory (callers compare against `geteuid`).
+    pub fn uid(&self) -> Result<u32, FdError> {
+        let stat = fstat_fd(self.as_raw_fd())?;
+        #[allow(clippy::unnecessary_cast)]
+        Ok(stat.st_uid as u32)
+    }
+
+    /// Mode bits of the opened directory.
+    pub fn mode(&self) -> Result<u32, FdError> {
+        let stat = fstat_fd(self.as_raw_fd())?;
+        #[allow(clippy::unnecessary_cast)]
+        Ok(stat.st_mode as u32)
+    }
+
+    /// The `(st_dev, st_ino)` pair of this directory fd.
+    pub fn dir_identity(&self) -> Result<(u64, u64), FdError> {
+        let stat = fstat_fd(self.as_raw_fd())?;
+        Ok((dev_of(&stat), ino_of(&stat)))
+    }
+
+    /// Open a duplicate fd on this same directory ("."), used to obtain an
+    /// owned [`DirFd`] without consuming `self` at the start of a walk.
+    fn self_dir(&self) -> Result<Self, FdError> {
+        let fd = nix::fcntl::openat(Some(self.as_raw_fd()), &b"."[..], DIR_FLAGS, Mode::empty())
+            .map_err(|error| FdError::io(b".", error))?;
         Ok(Self {
             file: unsafe { own_fd(fd) },
         })
     }
 
-    /// Pin an EXISTING absolute `path`, walking every component from `/` with
-    /// `O_NOFOLLOW|O_DIRECTORY` and creating nothing. A symlink anywhere on
-    /// the path (not just its final component) fails the walk, and a missing
-    /// component returns [`FdErrorKind::Missing`].
-    pub fn open_existing_abs(path: &Path) -> Result<Self, FdError> {
-        if !path.is_absolute() {
-            return Err(FdError {
-                at: path.display().to_string(),
-                kind: FdErrorKind::BadComponent,
-            });
-        }
-        let mut current = Self::open_root(Path::new("/"))?;
+    /// Walk an existing relative `path` below this pinned anchor; every hop is
+    /// `O_NOFOLLOW|O_DIRECTORY`. `.`/`..` components and absolute/root
+    /// prefixes are refused, so the result can never leave the anchor.
+    pub fn subpath(&self, path: &Path) -> Result<Self, FdError> {
+        let mut current = self.self_dir()?;
         for component in path.components() {
-            let Component::Normal(part) = component else {
-                continue;
-            };
-            current = current.subdir(part.as_bytes())?;
+            match component {
+                Component::Normal(part) => {
+                    current = current.subdir(part.as_bytes())?;
+                }
+                Component::CurDir | Component::ParentDir | Component::RootDir
+                | Component::Prefix(_) => {
+                    return Err(FdError::new(
+                        path.display().to_string(),
+                        FdErrorKind::BadComponent,
+                    ));
+                }
+            }
         }
         Ok(current)
     }
 
-    /// Pin `path`, creating every missing component from `/` with
-    /// `mkdirat` + an `O_NOFOLLOW` revalidation. The filesystem root is the
-    /// trust anchor; every component below it is walked, so a symlink in the
-    /// middle of the path is refused instead of being created through.
-    pub fn open_or_create_abs(path: &Path) -> Result<Self, FdError> {
-        if !path.is_absolute() {
-            return Err(FdError {
-                at: path.display().to_string(),
-                kind: FdErrorKind::BadComponent,
-            });
-        }
-        let mut current = Self::open_root(Path::new("/"))?;
+    /// Walk/create a relative `path` below this pinned anchor.
+    pub fn ensure_subpath(&self, path: &Path) -> Result<Self, FdError> {
+        let mut current = self.self_dir()?;
         for component in path.components() {
-            let Component::Normal(part) = component else {
-                continue;
-            };
-            current = current.ensure_subdir(part.as_bytes())?;
+            match component {
+                Component::Normal(part) => {
+                    current = current.ensure_subdir(part.as_bytes())?;
+                }
+                Component::CurDir | Component::ParentDir | Component::RootDir
+                | Component::Prefix(_) => {
+                    return Err(FdError::new(
+                        path.display().to_string(),
+                        FdErrorKind::BadComponent,
+                    ));
+                }
+            }
         }
         Ok(current)
     }
@@ -343,13 +446,13 @@ impl DirFd {
                 LeafKind::Directory => {}
                 LeafKind::Symlink => {
                     return Err(FdError::new(
-                        String::from_utf8_lossy(name).into_owned(),
+                        String::from_utf8_lossy(name),
                         FdErrorKind::Symlink,
                     ));
                 }
                 LeafKind::Regular | LeafKind::Other => {
                     return Err(FdError::new(
-                        String::from_utf8_lossy(name).into_owned(),
+                        String::from_utf8_lossy(name),
                         FdErrorKind::NotDirectory,
                     ));
                 }
@@ -394,52 +497,49 @@ impl DirFd {
     }
 
     /// Open a leaf `O_NOFOLLOW` and classify the **opened fd** with `fstat`.
-    /// The returned [`OpenedLeaf::file`] is the descriptor to read or verify.
     ///
-    /// The entry is classified with `fstatat` BEFORE the open: a FIFO/device
-    /// is never even opened (`O_NONBLOCK` in the flags is the second line of
-    /// defence against a stat→open swap), and the post-open `fstat` confirms
-    /// the fd itself.
+    /// The entry is `fstatat`-classified BEFORE the open: a FIFO/device is
+    /// never even opened (`O_NONBLOCK` in the flags is the second line of
+    /// defence), and the post-open `fstat` confirms the fd itself.
     pub fn open_leaf(&self, name: &[u8]) -> Result<OpenedLeaf, FdError> {
         check_component(name)?;
         let pre = self
             .classify_leaf(name)?
             .ok_or_else(|| FdError::io(name, Errno::ENOENT))?;
         if !matches!(pre.kind, LeafKind::Regular | LeafKind::Other) {
-            return Err(FdError {
-                at: String::from_utf8_lossy(name).into_owned(),
-                kind: match pre.kind {
+            return Err(FdError::new(
+                String::from_utf8_lossy(name),
+                match pre.kind {
                     LeafKind::Symlink => FdErrorKind::Symlink,
                     LeafKind::Directory => FdErrorKind::NotDirectory,
                     LeafKind::Other | LeafKind::Regular => unreachable!(),
                 },
-            });
+            ));
         }
         let fd = nix::fcntl::openat(Some(self.as_raw_fd()), name, LEAF_FLAGS, Mode::empty())
             .map_err(|error| FdError::io(name, error))?;
         let file = unsafe { own_fd(fd) };
-        let stat =
-            nix::sys::stat::fstat(file.as_raw_fd()).map_err(|error| FdError::io(name, error))?;
+        let stat = fstat_fd(file.as_raw_fd())?;
         let (kind, len) = classify(&stat);
         Ok(OpenedLeaf { file, kind, len })
     }
 
     /// Open a leaf and require it to be a real regular file on the opened fd.
-    /// Symlinks never reach here (`O_NOFOLLOW`), and a FIFO/device is refused
-    /// rather than read or blocked on.
+    /// Symlinks never reach here (`O_NOFOLLOW`), and a FIFO/device/socket is
+    /// refused rather than read or blocked on.
     pub fn open_regular_leaf(&self, name: &[u8]) -> Result<OpenedLeaf, FdError> {
         let leaf = self.open_leaf(name)?;
         match leaf.kind {
             LeafKind::Regular => Ok(leaf),
-            other => Err(FdError {
-                at: String::from_utf8_lossy(name).into_owned(),
-                kind: match other {
+            other => Err(FdError::new(
+                String::from_utf8_lossy(name),
+                match other {
                     LeafKind::Symlink => FdErrorKind::Symlink,
                     LeafKind::Directory => FdErrorKind::NotDirectory,
                     LeafKind::Other => FdErrorKind::Other("not a regular file".into()),
                     LeafKind::Regular => unreachable!(),
                 },
-            }),
+            )),
         }
     }
 
@@ -453,22 +553,34 @@ impl DirFd {
     }
 
     /// Open an existing regular leaf for appending
-    /// (`O_WRONLY|O_APPEND|O_NOFOLLOW`). Symlinks and non-regular entries are
-    /// refused; absence is [`FdErrorKind::Missing`].
+    /// (`O_WRONLY|O_APPEND|O_NOFOLLOW|O_NONBLOCK`).
+    ///
+    /// The entry is `fstatat`-classified first, so a FIFO never blocks the
+    /// open; the post-open `fstat` requires a regular file on the fd. Absence
+    /// is [`FdErrorKind::Missing`], a symlink is [`FdErrorKind::Symlink`].
     pub fn open_append_leaf(&self, name: &[u8]) -> Result<File, FdError> {
         check_component(name)?;
-        let flags = OFlag::O_WRONLY
-            .union(OFlag::O_APPEND)
-            .union(OFlag::O_NOFOLLOW)
-            .union(OFlag::O_CLOEXEC);
-        let fd = nix::fcntl::openat(Some(self.as_raw_fd()), name, flags, FILE_MODE)
+        let pre = self
+            .classify_leaf(name)?
+            .ok_or_else(|| FdError::io(name, Errno::ENOENT))?;
+        if pre.kind != LeafKind::Regular {
+            return Err(FdError::new(
+                String::from_utf8_lossy(name),
+                match pre.kind {
+                    LeafKind::Symlink => FdErrorKind::Symlink,
+                    LeafKind::Directory => FdErrorKind::NotDirectory,
+                    LeafKind::Other => FdErrorKind::Other("not a regular file".into()),
+                    LeafKind::Regular => unreachable!(),
+                },
+            ));
+        }
+        let fd = nix::fcntl::openat(Some(self.as_raw_fd()), name, APPEND_FLAGS, FILE_MODE)
             .map_err(|error| FdError::io(name, error))?;
         let file = unsafe { own_fd(fd) };
-        let stat =
-            nix::sys::stat::fstat(file.as_raw_fd()).map_err(|error| FdError::io(name, error))?;
+        let stat = fstat_fd(file.as_raw_fd())?;
         if classify(&stat).0 != LeafKind::Regular {
             return Err(FdError::new(
-                String::from_utf8_lossy(name).into_owned(),
+                String::from_utf8_lossy(name),
                 FdErrorKind::Other("not a regular file".into()),
             ));
         }
@@ -563,19 +675,49 @@ impl DirFd {
     }
 }
 
+fn errno_kind(error: std::io::Error) -> FdErrorKind {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        FdErrorKind::Missing
+    } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+        FdErrorKind::Symlink
+    } else {
+        FdErrorKind::Other(error.to_string())
+    }
+}
+
 /// Copy at most `cap` bytes from `src` to `dst`, failing the moment one more
-/// byte would cross the cap (a "success" never returns a partial over-cap
-/// copy). The caller supplies the hashing writer so provenance hashes the
-/// bytes ACTUALLY copied, not a later re-open of the source path.
-pub fn copy_capped<R: std::io::Read, W: std::io::Write>(
+/// byte would cross the cap. The caller supplies the hashing writer so
+/// provenance hashes the bytes ACTUALLY copied. Callers that enumerated a
+/// file earlier should pass the REMAINING aggregate budget (not the file's
+/// recorded length) so a file that grows after enumeration cannot push the
+/// total copy over the cap; the actual number of bytes copied is returned
+/// and must be what the caller charges.
+pub fn copy_capped<R: ?Sized, W: ?Sized>(
     src: &mut R,
     dst: &mut W,
     cap: u64,
-) -> std::io::Result<u64> {
+) -> std::io::Result<u64>
+where
+    R: Read,
+    W: Write,
+{
     let mut buf = vec![0_u8; 64 * 1024];
     let mut total: u64 = 0;
     loop {
-        let read = src.read(&mut buf)?;
+        let max_remaining = usize::try_from(cap.saturating_sub(total)).unwrap_or(usize::MAX);
+        if max_remaining == 0 {
+            // Probe for one extra byte: EOF means the copy is exactly at the
+            // cap; any byte means it would exceed it.
+            let extra = src.read(&mut buf[..1])?;
+            if extra == 0 {
+                dst.flush()?;
+                return Ok(total);
+            }
+            return Err(std::io::Error::other(format!(
+                "resume staging size limit exceeded: more than {cap} bytes"
+            )));
+        }
+        let read = src.take(max_remaining as u64).read(&mut buf)?;
         if read == 0 {
             dst.flush()?;
             return Ok(total);
@@ -595,19 +737,19 @@ pub fn copy_capped<R: std::io::Read, W: std::io::Write>(
 
 /// A writer that fans every byte out to two writers (the file and a hash),
 /// so a copy can be hashed without a second read of the source.
-pub struct TeeWriter<'a, A, B> {
-    first: &'a mut A,
-    second: &'a mut B,
+pub struct TeeWriter<'a, R, W> {
+    first: &'a mut R,
+    second: &'a mut W,
 }
 
-impl<'a, A: std::io::Write, B: std::io::Write> TeeWriter<'a, A, B> {
-    /// Fan every write out to `first` and `second`.
-    pub fn new(first: &'a mut A, second: &'a mut B) -> Self {
+impl<'a, R: Write, W: Write> TeeWriter<'a, R, W> {
+    /// Fan writes into `first` and `second`.
+    pub fn new(first: &'a mut R, second: &'a mut W) -> Self {
         Self { first, second }
     }
 }
 
-impl<A: std::io::Write, B: std::io::Write> std::io::Write for TeeWriter<'_, A, B> {
+impl<R: Write, W: Write> Write for TeeWriter<'_, R, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.first.write_all(buf)?;
         self.second.write_all(buf)?;
@@ -625,15 +767,26 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn tempdir() -> tempfile::TempDir {
-        tempfile::tempdir().expect("tempdir")
+    fn tempdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/remuda-fdsafe-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn anchor(tmp: &std::path::Path) -> DirFd {
+        DirFd::anchor_existing(tmp).expect("anchor")
     }
 
     #[test]
     fn walks_real_components_and_creates_children() {
         let tmp = tempdir();
-        let root = DirFd::open_root(tmp.path()).expect("root");
-        let sub = root.ensure_subdir(b"projects").expect("mkdir");
+        let sub = anchor(&tmp).ensure_subdir(b"projects").expect("mkdir");
         let mut file = sub.create_leaf_excl(b"a.jsonl").expect("excl create");
         file.write_all(b"{}").expect("write");
         let leaf = sub.open_regular_leaf(b"a.jsonl").expect("regular leaf");
@@ -642,104 +795,130 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_at_every_level_is_refused() {
+    fn anchor_crosses_a_system_mount_symlink_but_rejects_links_below() {
+        // /tmp is a symlink to /private/tmp on macOS and real on Linux; the
+        // anchor resolves it either way.
         let tmp = tempdir();
-        let outside = tmp.path().join("outside.jsonl");
-        std::fs::write(&outside, b"secret").expect("outside");
-        let root = DirFd::open_root(tmp.path()).expect("root");
-
-        // Symlinked intermediate directory.
-        std::os::unix::fs::symlink(tmp.path(), tmp.path().join("linkdir")).expect("symlink dir");
-        assert_eq!(
-            root.subdir(b"linkdir")
-                .expect_err("symlinked dir refused")
-                .kind,
-            FdErrorKind::Symlink
-        );
-
-        // Symlinked leaf, even though it points at a regular file.
-        std::os::unix::fs::symlink(&outside, tmp.path().join("leaf.jsonl")).expect("symlink");
-        let error = root
-            .open_regular_leaf(b"leaf.jsonl")
-            .expect_err("symlink refused");
-        assert_eq!(error.kind, FdErrorKind::Symlink);
-        assert!(error.is_symlink());
-    }
-
-    #[test]
-    fn dotdot_and_multi_component_names_are_rejected_upfront() {
-        let tmp = tempdir();
-        let root = DirFd::open_root(tmp.path()).expect("root");
-        assert_eq!(
-            root.subdir(b"../x").unwrap_err().kind,
-            FdErrorKind::BadComponent
-        );
-        assert_eq!(
-            root.open_regular_leaf(b"a/b").unwrap_err().kind,
-            FdErrorKind::BadComponent
-        );
-    }
-
-    #[test]
-    fn a_fifo_is_classified_other_and_never_opened_as_regular() {
-        let tmp = tempdir();
-        let root = DirFd::open_root(tmp.path()).expect("root");
-        let fifo = tmp.path().join("pipe");
-        nix::unistd::mkfifo(&fifo, Mode::from_bits_truncate(0o600)).expect("mkfifo");
-        let entry = root
-            .classify_leaf(b"pipe")
-            .expect("stat")
-            .expect("fifo listed");
-        assert_eq!(entry.kind, LeafKind::Other);
+        let project = &tmp.join("real-dir");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        use std::os::unix::fs::symlink;
+        symlink(&project, &tmp.join("linkdir")).expect("symlink dir");
+        assert!(anchor(&tmp).subdir(b"linkdir").is_err());
+        // A multi-component walk refuses parent/root components.
         assert!(matches!(
-            root.open_regular_leaf(b"pipe").unwrap_err().kind,
-            FdErrorKind::Other(_)
+            anchor(&tmp)
+                .ensure_subpath(std::path::Path::new("a/../../x"))
+                .err()
+                .map(|e| e.kind),
+            Some(FdErrorKind::BadComponent)
+        ));
+        assert!(matches!(
+            anchor(&tmp)
+                .ensure_subpath(std::path::Path::new("/etc"))
+                .err()
+                .map(|e| e.kind),
+            Some(FdErrorKind::BadComponent)
         ));
     }
 
     #[test]
-    fn copy_capped_stops_at_the_budget_plus_one_byte() {
+    fn a_fifo_is_classified_other_and_never_opened() {
         let tmp = tempdir();
-        let root = DirFd::open_root(tmp.path()).expect("root");
+        let root = anchor(&tmp);
+        let fifo = &tmp.join("pipe");
+        nix::unistd::mkfifo(fifo.as_os_str(), Mode::from_bits_truncate(0o600)).expect("mkfifo");
+        let entry = root.classify_leaf(b"pipe").expect("stat").expect("entry");
+        assert_eq!(entry.kind, LeafKind::Other);
+        let error = root.open_regular_leaf(b"pipe").expect_err("fifo refused");
+        assert!(matches!(error.kind, FdErrorKind::Other(_)));
+    }
+
+    /// Opening a FIFO for append must return promptly instead of blocking:
+    /// the fstatat pre-classification rejects it before any open.
+    #[test]
+    fn open_append_leaf_never_blocks_on_a_fifo() {
+        let tmp = tempdir();
+        let root = anchor(&tmp);
+        nix::unistd::mkfifo(tmp.join("hose").as_os_str(), Mode::from_bits_truncate(0o600)).expect("mkfifo");
+        let started = std::time::Instant::now();
+        let result = root.open_append_leaf(b"hose");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "append blocked");
+        assert!(result.is_err(), "fifo append refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_domain_socket_is_not_a_regular_file() {
+        use std::os::unix::net::UnixListener;
+        let tmp = tempdir();
+        let root = anchor(&tmp);
+        let _listener = UnixListener::bind(&tmp.join("sock")).expect("bind");
+        let entry = root.classify_leaf(b"sock").expect("stat").expect("entry");
+        assert_eq!(entry.kind, LeafKind::Other);
+        assert!(root.open_regular_leaf(b"sock").is_err());
+    }
+
+    #[test]
+    fn copy_capped_stops_at_the_budget() {
+        let tmp = tempdir();
+        let root = anchor(&tmp);
         let mut src = root.create_leaf_excl(b"src").expect("src");
         src.write_all(b"0123456789").expect("write src");
-        let src_leaf = root.open_regular_leaf(b"src").expect("open src");
-        let mut src_file = src_leaf.file;
+        let mut src = root.open_regular_leaf(b"src").expect("open src");
         let mut dst = root.create_leaf_excl(b"dst").expect("dst");
-        let error = copy_capped(&mut src_file, &mut dst, 5).expect_err("cap enforced");
-        assert!(error.to_string().contains("size limit exceeded"), "{error}");
-        // Nothing was written before the cap check failed; the partial temp
-        // file was never renamed to a final name by the caller.
-        assert_eq!(
-            root.classify_leaf(b"dst")
-                .expect("stat")
-                .expect("entry")
-                .len,
-            0
-        );
+        let error = copy_capped(&mut src.file, &mut dst, 5).expect_err("cap enforced");
+        assert!(error.to_string().contains("size limit exceeded"));
+        // An exact-fit copy succeeds.
+        let mut src = root.open_regular_leaf(b"src").expect("reopen src");
+        let mut dst2 = root.create_leaf_excl(b"dst2").expect("dst2");
+        let n = copy_capped(&mut src.file, &mut dst2, 10).expect("exact cap");
+        assert_eq!(n, 10);
     }
 
     #[test]
-    fn private_tree_removal_unlinks_symlinks_without_following_them() {
+    fn copy_capped_detects_a_file_that_grew_past_the_remaining_budget() {
+        // Reader pretends to grow: first chunk 8 bytes, second attempt finds 3
+        // more although only 2 remain under the cap.
+        struct GrowingReader;
+        impl Read for GrowingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                static POS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+                let pos = POS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let chunks: [&[u8]; 2] = [b"01234567", b"abc"];
+                let n = (pos as usize).min(chunks.len() - 1);
+                let take = buf.len().min(chunks[n].len());
+                buf[..take].copy_from_slice(&chunks[n][..take]);
+                Ok(take)
+            }
+        }
         let tmp = tempdir();
-        let root = DirFd::open_root(tmp.path()).expect("root");
+        let root = anchor(&tmp);
+        let mut dst = root.create_leaf_excl(b"grown").expect("dst");
+        let mut reader = GrowingReader;
+        let error = copy_capped(&mut reader, &mut dst, 10).expect_err("growth caught");
+        assert!(error.to_string().contains("size limit exceeded"));
+    }
+
+    #[test]
+    fn private_tree_removal_unlinks_symlinks_without_following() {
+        let tmp = tempdir();
+        let root = anchor(&tmp);
         let temp = root.ensure_subdir(b"tmp-1").expect("temp");
         temp.create_leaf_excl(b"a").expect("a");
-        std::os::unix::fs::symlink("/etc/passwd", tmp.path().join("tmp-1/link")).expect("symlink");
+        std::os::unix::fs::symlink("/etc/passwd", &tmp.join("tmp-1/link")).expect("link");
         root.remove_private_tree(b"tmp-1").expect("rmtree");
-        assert!(root.classify_leaf(b"tmp-1").expect("stat").is_none());
+        assert!(!&tmp.join("tmp-1").exists());
+        assert!(std::path::Path::new("/etc/passwd").exists(), "target untouched");
     }
 
     #[test]
-    fn open_or_create_walks_from_root_and_rejects_a_mid_path_symlink() {
+    fn open_or_create_anchor_handles_missing_leaf_components() {
         let tmp = tempdir();
-        let base = tmp.path().join("safe/d");
-        std::fs::create_dir_all(&base).expect("mkdirs");
-        let walked = DirFd::open_or_create_abs(&base.join("deeper")).expect("walk");
-        walked.create_leaf_excl(b"x").expect("file");
-        // Replace an intermediate with a symlink: the next walk must fail.
-        std::fs::rename(base.join("deeper"), base.join("deeper.real")).expect("rename");
-        std::os::unix::fs::symlink("/etc", base.join("deeper")).expect("link");
-        assert!(DirFd::open_or_create_abs(&base.join("deeper")).is_err());
+        let target = &tmp.join("a/b/c");
+        let dir = DirFd::anchor_or_create(&target).expect("anchor create");
+        dir.create_leaf_excl(b"x").expect("leaf");
+        assert!(target.join("x").is_file());
+        // Re-open is idempotent.
+        DirFd::anchor_or_create(&target).expect("re-anchor");
     }
 }

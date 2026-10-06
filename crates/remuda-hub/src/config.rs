@@ -31,6 +31,18 @@ pub struct HubConfig {
     pub listen: SocketAddr,
     /// Device pairing access code. Empty means generate. Never enrolls a Node (D-018).
     pub bootstrap_token: String,
+    /// Path to the `--access-code-file` the non-empty `bootstrap_token` was
+    /// read from, if any (c-bootstrap-dev). When set, `resolve_bootstrap`
+    /// re-persists the token and re-stamps on startup whenever the file is
+    /// newer than the stored stamp or the token differs, so a working code
+    /// never silently expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_token_file: Option<PathBuf>,
+    /// True when the non-empty `bootstrap_token` came from
+    /// `REMUDA_BOOTSTRAP_TOKEN` rather than a file. Same re-persist behaviour
+    /// as a file source, minus the mtime check (env has no file mtime).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bootstrap_token_from_env: bool,
     /// Bootstrap access-code lifetime in hours; `0` disables expiry.
     #[serde(default = "default_bootstrap_ttl_hours")]
     pub bootstrap_ttl_hours: u64,
@@ -191,6 +203,8 @@ impl Default for HubConfig {
             data_dir: PathBuf::from("./data"),
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             bootstrap_token: String::new(),
+            bootstrap_token_file: None,
+            bootstrap_token_from_env: false,
             bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
             enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: true,
@@ -225,6 +239,8 @@ impl HubConfig {
             data_dir,
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             bootstrap_token: format!("boot-{}", Uuid::new_v4().simple()),
+            bootstrap_token_file: None,
+            bootstrap_token_from_env: false,
             bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
             enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: false,

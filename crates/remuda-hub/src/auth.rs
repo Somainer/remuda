@@ -86,11 +86,26 @@ fn write_private(path: &Path, contents: &str) -> Result<(), HubError> {
 }
 
 /// Resolve the bootstrap access code, generating one when the config is empty.
+///
+/// c-bootstrap-dev: when the token is explicitly provided via
+/// `--access-code-file` (`config.bootstrap_token_file`) or
+/// `REMUDA_BOOTSTRAP_TOKEN` (`config.bootstrap_token_from_env`), it is
+/// re-persisted and re-stamped at startup whenever:
+/// 1. it differs from the persisted `bootstrap-token`, or
+/// 2. (file source only) the access-code file's mtime is newer than the
+///    stored `bootstrap-issued-at` stamp — the file was rotated out-of-band.
+///
+/// This keeps a working access-code file valid across restarts instead of
+/// silently expiring after the TTL (D-018 stamp only refreshed on first
+/// write).
 pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<(), HubError> {
-    let path = config.data_dir.join("bootstrap-token");
+    let token_path = config.data_dir.join("bootstrap-token");
+    let explicit = !config.bootstrap_token.is_empty()
+        && (config.bootstrap_token_file.is_some() || config.bootstrap_token_from_env);
+
     if config.bootstrap_token.is_empty() {
-        if path.is_file() {
-            config.bootstrap_token = std::fs::read_to_string(&path)
+        if token_path.is_file() {
+            config.bootstrap_token = std::fs::read_to_string(&token_path)
                 .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
                 .trim()
                 .to_string();
@@ -104,7 +119,40 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<(), HubError> {
         }
         config.bootstrap_token = random_token();
     }
-    if !path.is_file() {
+
+    // Decide whether the explicit/generated token must be (re-)persisted.
+    let mut needs_persist = !token_path.is_file();
+
+    if explicit {
+        let persisted = if token_path.is_file() {
+            std::fs::read_to_string(&token_path)
+                .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
+                .trim()
+                .to_string()
+        } else {
+            String::new()
+        };
+        // (1) The provided code differs from what is persisted.
+        if persisted != config.bootstrap_token {
+            needs_persist = true;
+        }
+        // (2) The access-code file is newer than the stored stamp.
+        if let Some(file_path) = &config.bootstrap_token_file
+            && let Ok(file_meta) = std::fs::metadata(file_path)
+            && let Some(stamp_text) =
+                std::fs::read_to_string(config.data_dir.join("bootstrap-issued-at")).ok()
+            && let Ok(stamp) = time::OffsetDateTime::parse(
+                stamp_text.trim(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            && let Ok(file_mtime) = file_meta.modified()
+            && time::OffsetDateTime::from(file_mtime) > stamp
+        {
+            needs_persist = true;
+        }
+    }
+
+    if needs_persist {
         persist_bootstrap(&config.data_dir, &config.bootstrap_token)?;
     }
     Ok(())
@@ -362,5 +410,91 @@ mod tests {
             bootstrap_issued_at(dir.path()).is_some(),
             "resolve must backfill the issued-at stamp"
         );
+    }
+
+    /// c-bootstrap-dev (a): an explicit access-code-file code that differs
+    /// from the persisted token re-persists and re-stamps at startup, so a
+    /// stale TTL stamp never expires a working code.
+    #[test]
+    fn explicit_access_code_file_refreshes_stamp_when_token_changes() {
+        let dir = tempfile::tempdir().expect("data dir");
+        // Old persisted code with an expired stamp.
+        persist_bootstrap(dir.path(), "old-code").expect("persist");
+        write_private(
+            &dir.path().join("bootstrap-issued-at"),
+            "2000-01-01T00:00:00.000Z",
+        )
+        .expect("backdate");
+        assert!(!bootstrap_within_ttl(dir.path(), 24));
+
+        // The access-code file carries a NEW code.
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "new-code-from-file").expect("code file");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "new-code-from-file".to_owned();
+        config.bootstrap_token_file = Some(code_file);
+        config.bootstrap_token_from_env = false;
+        resolve_bootstrap(&mut config).expect("resolve");
+
+        // The persisted token and stamp are refreshed.
+        let stored = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
+        assert_eq!(stored.trim(), "new-code-from-file");
+        assert!(
+            bootstrap_within_ttl(dir.path(), 24),
+            "the stamp must be refreshed for the new explicit code"
+        );
+    }
+
+    /// c-bootstrap-dev (a): even when the code is unchanged, an access-code
+    /// file newer than the stored stamp triggers re-stamp (out-of-band
+    /// rotation by redeploy/touch).
+    #[test]
+    fn explicit_access_code_file_restamps_when_file_is_newer() {
+        let dir = tempfile::tempdir().expect("data dir");
+        persist_bootstrap(dir.path(), "same-code").expect("persist");
+        write_private(
+            &dir.path().join("bootstrap-issued-at"),
+            "2000-01-01T00:00:00.000Z",
+        )
+        .expect("stamp");
+
+        // The code file is created NOW (mtime 2026), clearly newer than the
+        // 2000 stamp, even though its content is unchanged.
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "same-code").expect("code file");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_token_file = Some(code_file);
+        resolve_bootstrap(&mut config).expect("resolve");
+
+        assert!(
+            bootstrap_within_ttl(dir.path(), 24),
+            "a newer access-code file must refresh the stamp"
+        );
+    }
+
+    /// c-bootstrap-dev (a): an env-sourced token that differs is also
+    /// re-persisted (no mtime check for env).
+    #[test]
+    fn env_bootstrap_token_refreshes_stamp_when_different() {
+        let dir = tempfile::tempdir().expect("data dir");
+        persist_bootstrap(dir.path(), "old-env-code").expect("persist");
+        write_private(
+            &dir.path().join("bootstrap-issued-at"),
+            "2000-01-01T00:00:00.000Z",
+        )
+        .expect("backdate");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "new-env-code".to_owned();
+        config.bootstrap_token_file = None;
+        config.bootstrap_token_from_env = true;
+        resolve_bootstrap(&mut config).expect("resolve");
+
+        let stored = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
+        assert_eq!(stored.trim(), "new-env-code");
+        assert!(bootstrap_within_ttl(dir.path(), 24));
     }
 }

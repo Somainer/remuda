@@ -4,6 +4,7 @@
 //! web/dist when present and otherwise uses the crate's fallback page.
 
 use crate::{Shutdown, config::Config, dispatcher};
+use anyhow::Context;
 use clap::{Args as ClapArgs, Subcommand};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -54,10 +55,33 @@ impl Args {
 }
 
 /// `remuda hub rotate-bootstrap`: mint a new device pairing access code.
+///
+/// c-bootstrap-dev (b): if the data dir contains a `dev-hub/` subdirectory
+/// (the layout `remuda dev` writes), rotate there, not in the outer dev
+/// root. Refuse when the target directory has no persisted bootstrap-token
+/// (the running hub relies on an explicit `--access-code-file`, which
+/// rotation cannot change).
 fn rotate_bootstrap(config: &Config) -> anyhow::Result<()> {
-    let token = remuda_hub::rotate_bootstrap(&config.data_dir)?;
+    let dev_hub = config.data_dir.join("dev-hub");
+    let target_dir = if dev_hub.is_dir() {
+        tracing::debug!(
+            path = %dev_hub.display(),
+            "rotating in remuda dev hub data directory"
+        );
+        dev_hub
+    } else {
+        config.data_dir.clone()
+    };
+    let token_file = target_dir.join("bootstrap-token");
+    anyhow::ensure!(
+        token_file.is_file(),
+        "no persisted bootstrap-token in {} — the running Hub may be using an explicit \
+         --access-code-file; rotate that file instead (stopping the Hub first)",
+        target_dir.display()
+    );
+    let token = remuda_hub::rotate_bootstrap(&target_dir)?;
     tracing::info!(
-        path = %config.data_dir.join("bootstrap-token").display(),
+        path = %token_file.display(),
         "rotated device pairing access code"
     );
     println!("{token}");
@@ -65,17 +89,27 @@ fn rotate_bootstrap(config: &Config) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn start(config: &Config) -> anyhow::Result<remuda_hub::RunningHub> {
-    let bootstrap_token = config
-        .hub
-        .bootstrap_token
-        .as_ref()
-        .map(|reference| reference.resolve().map(|secret| secret.into_string()))
-        .transpose()?
-        .unwrap_or_default();
+    let (bootstrap_token, bootstrap_token_file, bootstrap_token_from_env) =
+        match config.hub.bootstrap_token.as_ref() {
+            Some(crate::config::SecretRef::File(path)) => {
+                let token = std::fs::read_to_string(path)
+                    .with_context(|| format!("cannot read access-code file {}", path.display()))?
+                    .trim()
+                    .to_string();
+                (token, Some(path.clone()), false)
+            }
+            Some(crate::config::SecretRef::Env(var)) => {
+                let token = std::env::var(var).with_context(|| format!("{var} is not set"))?;
+                (token, None, true)
+            }
+            None => (String::new(), None, false),
+        };
     remuda_hub::spawn(remuda_hub::HubConfig {
         data_dir: config.data_dir.clone(),
         listen: config.hub.listen,
         bootstrap_token,
+        bootstrap_token_file,
+        bootstrap_token_from_env,
         cookie_secure: config.hub.cookie_secure,
         public_origin: config.hub.public_origin.clone(),
         trusted_proxies: config.hub.trusted_proxies.clone(),

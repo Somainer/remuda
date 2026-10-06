@@ -53,6 +53,28 @@ listener. Device/bootstrap credentials follow the existing CLI resolution;
 a configured Hub bootstrap secret is also supported. Use a device token or
 access-code/bootstrap file; do not place credentials in URLs.
 
+### Bootstrap access code lifetime (`remuda dev`)
+
+When the Hub starts under `remuda dev --access-code-file F` (or with
+`REMUDA_BOOTSTRAP_TOKEN` set), the provided code is persisted into the dev
+Hub data directory (`<data-dir>/dev-hub/bootstrap-token`) together with an
+issue timestamp. On every restart the Hub re-reads the explicit code and:
+
+- re-persists it and re-stamps the timestamp when the code differs from the
+  persisted token (the file was replaced), or
+- (file source only) when the access-code file's mtime is newer than the
+  stored timestamp (the file was edited/rotated out of band).
+
+This keeps a working access-code file valid across restarts; it does not
+silently expire after the default 24-hour TTL (`DEFAULT_BOOTSTRAP_TTL_HOURS`,
+set to `0` to disable TTL entirely).
+
+`remuda hub rotate-bootstrap --data-dir D` detects the dev layout and writes
+to `D/dev-hub/`. It refuses when that directory has no persisted
+`bootstrap-token` — in that case the Hub is using an explicit
+`--access-code-file` and rotation must change that file instead (stop the
+Hub, replace the file, restart).
+
 ## Live instances across hosts
 
 ```sh

@@ -845,50 +845,59 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
 
-        // The fstatat classification opens no descriptor by design; prove it
-        // under sustained concurrent load, where a leak accumulates into a
-        // steady-state rise rather than a one-off fd-cache fluctuation.
+        // Count only descriptors whose opened target lives inside THIS temp
+        // tree, so concurrent tests in the same binary (sockets, other
+        // tempdirs) cannot perturb the measurement. Every listing opens the
+        // root and its walk components; the root is the only target under
+        // this tree, and fstatat classification opens nothing.
         let root = tempfile::tempdir().unwrap();
         for index in 0..40 {
             fs::create_dir_all(root.path().join(format!("sub-{index:02}"))).unwrap();
         }
         let roots = roots_for(&root);
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::new();
-        for _ in 0..4 {
-            let roots = roots.clone();
-            let stop = stop.clone();
-            handles.push(std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let result = list_directories(&roots, &[], request(None, false)).unwrap();
-                    assert_eq!(result.dirs.len(), 40);
-                }
-            }));
-        }
-        let open_fds = || {
+        let canonical_root = fs::canonicalize(root.path()).unwrap();
+        let fds_under_root = || -> usize {
             fs::read_dir("/proc/self/fd")
                 .unwrap()
-                .filter(Result::is_ok)
+                .filter_map(Result::ok)
+                .filter_map(|entry| fs::read_link(entry.path()).ok())
+                .filter(|target| target.starts_with(&canonical_root))
                 .count()
         };
-        // Warm up lazy fds.
-        for _ in 0..10 {
-            list_directories(&roots, &[], request(None, false)).unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(300));
-        let early = open_fds();
-        std::thread::sleep(Duration::from_millis(900));
-        let late = open_fds();
-        stop.store(true, Ordering::Relaxed);
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        // A leaked fd accumulates continuously under load; allow a small
-        // scheduler tolerance, never the growth of hundreds of leaked opens.
-        assert!(
-            late <= early + 4,
-            "fd count grew under load: {early} -> {late}"
+
+        // Quiescent baseline after a warm listing: no descriptor survives.
+        list_directories(&roots, &[], request(None, false)).unwrap();
+        assert_eq!(
+            fds_under_root(),
+            0,
+            "a completed listing left a descriptor open"
         );
+
+        let burst = |millis: u64| {
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let roots = roots.clone();
+                let stop = stop.clone();
+                handles.push(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let result = list_directories(&roots, &[], request(None, false)).unwrap();
+                        assert_eq!(result.dirs.len(), 40);
+                    }
+                }));
+            }
+            std::thread::sleep(Duration::from_millis(millis));
+            stop.store(true, Ordering::Relaxed);
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        };
+        // Two bursts: after every worker returns an fstatat-based walk must
+        // have leaked zero descriptors, with no accumulation across runs.
+        burst(800);
+        assert_eq!(fds_under_root(), 0, "fds leaked after the first burst");
+        burst(800);
+        assert_eq!(fds_under_root(), 0, "fds accumulated across bursts");
     }
 
     #[test]

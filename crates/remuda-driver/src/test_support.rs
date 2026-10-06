@@ -127,17 +127,21 @@ pub fn mapper_with_bridge(
     .with_effort_bridge(Arc::clone(&bridge.inner), None)
 }
 
-/// Put a mapper in pre-launch history mode, as the resume transcript pump
-/// does for a `--resume` launch (D-056 (4)).
+/// Put a mapper in pre-launch (unverified/history) mode, as a resume
+/// transcript pump does for a batch whose current-process provenance cannot be
+/// established (D-056 (4)).
 #[must_use]
 pub fn resume_mapper(mapper: TranscriptMapper) -> TranscriptMapper {
-    mapper.following_history()
+    let mut mapper = mapper;
+    mapper.set_effort_current_process(false);
+    mapper
 }
 
-/// Flip the mapper's effort tracker into current-process mode, as the resume
-/// pump does immediately before mapping the first appended records.
-pub fn mark_current_process(mapper: &mut TranscriptMapper) {
-    mapper.mark_current_process();
+/// Set the mapper's current-process provenance, as the transcript pump does
+/// per tail batch (`true` for current-process records, `false` for an
+/// unverified/displaced resume batch).
+pub fn mark_current_process(mapper: &mut TranscriptMapper, current: bool) {
+    mapper.set_effort_current_process(current);
 }
 
 /// Whether the mapper is accepting current-process effort records.

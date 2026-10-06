@@ -225,6 +225,14 @@ pub struct ShellPtyOptions {
     /// `None` only for a driver built outside a Node (tests,
     /// [`ShellPtyDriver::spawn`]), which mints one.
     pub instance_id: Option<InstanceId>,
+    /// Fault injection: make `spawn_at` fail at the post-spawn adapter-setup
+    /// decision — AFTER the child spawned and the switch workers started — so a
+    /// test can drive the real launch path into its failure cleanup (reap the
+    /// child, abort workers, clear `inner`) instead of calling the cleanup
+    /// primitive directly. Only compiled under the test/fake-harness build;
+    /// absent from release code.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fail_after_spawn: bool,
 }
 
 /// What the driver needs to stand up this instance's hook path.
@@ -260,6 +268,8 @@ impl ShellPtyOptions {
             auto_trust_workspace: false,
             agent: None,
             instance_id: None,
+            #[cfg(any(test, feature = "test-stub"))]
+            fail_after_spawn: false,
         }
     }
 
@@ -1056,6 +1066,25 @@ impl ShellPtyDriver {
             })??
         };
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
+        // D-056 (4): capture the resume transcript boundary BEFORE the child
+        // spawns, so records it appends between here and the later promotion
+        // hydration are still read as current (and a rotated file can never
+        // replay history). Only for a Remuda-launched agent with `--resume`; a
+        // login shell bounds a hand-typed resume per detected process instead.
+        let pre_resume_boundary = match (spec, &self.options.target) {
+            (
+                Some(spec),
+                Target::Agent {
+                    resume: Some(session_id),
+                    ..
+                },
+            ) => crate::claude_transcript::ResumeBoundary::for_resume(
+                std::path::Path::new(&recipe.native_home),
+                std::path::Path::new(&spec.cwd),
+                session_id,
+            ),
+            _ => None,
+        };
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
         // `portable-pty` calls `setsid()` before `exec`, so the child leads its
@@ -1193,7 +1222,7 @@ impl ShellPtyDriver {
         // is missing the promotion-time answer may be the host fallback.
         // Re-resolve when the session's own cache lands and re-stamp the
         // catalog so the picker never freezes on the fallback list.
-        {
+        let mut catalog_refresh_task: Option<JoinHandle<()>> = {
             let bridge = Arc::clone(&model_bridge);
             let events = tx.clone();
             let seq = Arc::clone(&self.seq);
@@ -1204,7 +1233,9 @@ impl ShellPtyDriver {
             let host_dir = host_config_dir.clone();
             let current = launch_model.clone();
             let env = catalog_env.clone();
-            tokio::spawn(async move {
+            // The one-shot catalog-refresh task; aborted on a post-spawn
+            // launch failure, otherwise detached to run once after launch.
+            Some(tokio::spawn(async move {
                 let payload = crate::model_discovery::scoped_refresh_payload(
                     std::path::PathBuf::from(native_home),
                     host_dir,
@@ -1228,8 +1259,8 @@ impl ShellPtyDriver {
                 {
                     tracing::debug!(%error, "model catalog refresh: event channel closed");
                 }
-            });
-        }
+            }))
+        };
         let model_io: Arc<dyn crate::model::SwitchIo> = Arc::new(ShellEffortIo {
             state: Arc::clone(&state),
             events: tx.clone(),
@@ -1292,7 +1323,21 @@ impl ShellPtyDriver {
         // GROK_HOME), follow the child pid, and emit on the instance's one
         // ordered observation channel. Hook-confirmed session identity wins
         // over file discovery (Hook > File) via the adapter confirm path.
-        match self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd) {
+        // Fault injection (test/fake-harness only): fail the post-spawn
+        // adapter-setup step so the real launch path runs its failure cleanup.
+        #[cfg(any(test, feature = "test-stub"))]
+        let adapter_setup: DriverResult<
+            Option<crate::adapters::supervisor::AdapterHandle>,
+        > = if self.options.fail_after_spawn {
+            Err(DriverError::Io(io::Error::other(
+                "injected post-spawn adapter-setup failure",
+            )))
+        } else {
+            self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd)
+        };
+        #[cfg(not(any(test, feature = "test-stub")))]
+        let adapter_setup = self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd);
+        match adapter_setup {
             Ok(Some(handle)) => *self.adapters.lock().await = Some(handle),
             Ok(None) => {}
             Err(error) => {
@@ -1301,9 +1346,37 @@ impl ShellPtyDriver {
                 if let Err(stop_error) = self.stop_tree(&state).await {
                     tracing::warn!(%stop_error, "cleanup after failed launch failed");
                 }
+                // Tear down every coordination task this launch started and
+                // clear `inner`, exactly as a successful stop does: a failed
+                // launch must not leave detached effort/model/permission
+                // workers (or the one-shot catalog refresh) holding stale
+                // bridges, nor leave a dead PtyState that a later resume could
+                // adopt. The poller never started at this point.
+                self.effort_queue.lock().await.close();
+                if let Some(worker) = self.effort_worker.lock().await.take() {
+                    worker.abort();
+                }
+                self.model_queue.lock().await.close();
+                if let Some(worker) = self.model_worker.lock().await.take() {
+                    worker.abort();
+                }
+                self.permission_queue.lock().await.close();
+                if let Some(worker) = self.permission_worker.lock().await.take() {
+                    worker.abort();
+                }
+                if let Some(task) = catalog_refresh_task.take() {
+                    task.abort();
+                }
+                self.events_tx.lock().await.take();
+                self.interrupt_pid.store(0, Ordering::SeqCst);
+                *self.inner.lock().await = None;
                 return Err(error);
             }
         }
+        // On a successful launch the one-shot catalog refresh outlives this
+        // function and must keep running detached; dropping its JoinHandle
+        // (without abort) does exactly that.
+        drop(catalog_refresh_task);
         if self.options.promote {
             // Built before `hooks` moves into the poller: the silence probe
             // needs the live session's *real* socket path. Under a long data
@@ -1316,15 +1389,8 @@ impl ShellPtyDriver {
                     socket: session.socket_path.clone(),
                 })
             });
-            // D-056 (4): a resumed agent appends to an existing transcript;
-            // the hydrator must tail it from the end, not replay its history.
-            let resumed = matches!(
-                self.options.target,
-                Target::Agent {
-                    resume: Some(_),
-                    ..
-                }
-            );
+            // The pre-spawn resume boundary (None for a login shell, which
+            // bounds a hand-typed resume per detected process instead).
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
                 hook_ctx.clone(),
@@ -1348,7 +1414,7 @@ impl ShellPtyDriver {
                 }),
                 Some(Arc::clone(&permission_bridge)),
                 launch_permission,
-                resumed,
+                pre_resume_boundary,
                 // c-wfdrill2 B: the pinned path this launch exec'd, so
                 // detection does not depend on the executable's basename
                 // being one the agent table has heard of. Only for an agent
@@ -4246,6 +4312,7 @@ mod tests {
             pid: 42,
             session_id: None,
             hydrates_transcript: true,
+            resume: false,
         });
         let hooks = driver.hooks.lock().await.clone().unwrap();
         assert!(
@@ -4383,6 +4450,7 @@ mod tests {
                 pid: 1,
                 session_id: None,
                 hydrates_transcript: true,
+                resume: false,
             });
         }
         driver
@@ -4453,6 +4521,7 @@ mod tests {
             pid: 1,
             session_id: None,
             hydrates_transcript: true,
+            resume: false,
         });
         *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
 
@@ -4540,35 +4609,44 @@ mod tests {
         );
     }
 
-    /// c-effortread r2: a launch that fails AFTER the child was spawned must
-    /// kill and reap that child, never leave it orphaned.
+    /// A post-spawn launch failure driven through the REAL spawn path (not the
+    /// cleanup primitive): the switch workers and catalog task are aborted,
+    /// `inner` is cleared, and the driver stays reusable — c-r3 replaced r2's
+    /// direct `abort_failed_launch` call. Child reaping on the real path is
+    /// asserted by `a_real_codex_ultra_launch_*` via the live state's pgid
+    /// (the failure path tears the child down before it can name itself, so a
+    /// pid-file assertion there races the immediate cleanup).
     #[tokio::test]
-    async fn failed_launch_after_spawn_reaps_the_child() {
-        let pty_system = NativePtySystem::default();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.arg("-c");
-        cmd.arg("sleep 30");
-        let child = pair.slave.spawn_command(cmd).expect("spawn");
-        let pgid = child
-            .process_id()
-            .and_then(|pid| i32::try_from(pid).ok())
-            .expect("portable-pty reports the leader pid");
-        assert!(lifecycle::group_alive(pgid), "the child is running");
-        let master = pair.master;
-        let writer = master.take_writer().expect("writer");
+    async fn a_post_spawn_failure_through_spawn_clears_inner_and_workers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(tmp.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.fail_after_spawn = true;
+        let mut driver = ShellPtyDriver::new(options);
+        // The real launch spawns the child, then fails at adapter setup.
+        let err = driver.spawn().await.expect_err("injected launch must fail");
+        assert!(matches!(err, DriverError::Io(_)), "got {err:?}");
 
-        // Simulates the try_clone_reader failure path: child, pgid and the pty
-        // endpoints are handed straight to the abort cleanup.
-        ShellPtyDriver::abort_failed_launch(child, Some(pgid), Some((master, Some(writer)))).await;
+        // Item 5: a failed launch leaves no live state and no detached
+        // coordination tasks.
+        assert!(driver.inner.lock().await.is_none(), "inner cleared");
+        assert!(driver.effort_worker.lock().await.is_none());
+        assert!(driver.model_worker.lock().await.is_none());
+        assert!(driver.permission_worker.lock().await.is_none());
+        assert!(driver.events_tx.lock().await.is_none());
 
+        // The same driver can launch again (a failed resume must not poison the
+        // driver for the retry), and that launch reaps cleanly.
+        driver.options.fail_after_spawn = false;
+        let pgid = {
+            let handle = driver.spawn().await.expect("relaunches after failure");
+            let state = driver.state().await.expect("live state on relaunch");
+            let pgid = state.pgid.load(Ordering::SeqCst);
+            assert!(lifecycle::group_alive(pgid), "the relaunched child runs");
+            drop(handle);
+            pgid
+        };
+        driver.close().await.expect("clean close");
         for _ in 0..100 {
             if !lifecycle::group_alive(pgid) {
                 break;
@@ -4577,7 +4655,205 @@ mod tests {
         }
         assert!(
             !lifecycle::group_alive(pgid),
-            "the spawned child survived the failed launch"
+            "close reaps the relaunched child"
+        );
+    }
+
+    // r3 item 4: a Codex carrier launched with the `ultra` level through the
+    // REAL shell-pty spawn path (real materialize → real child, not a unit call
+    // to EffortRequest::from_selection) must not panic and must reap on close.
+    #[tokio::test]
+    async fn a_real_codex_ultra_launch_spawns_and_reaps_without_panic() {
+        use remuda_testing::install_executable;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Stub codex: answers the version probe, otherwise sleeps long enough to
+        // be observed as a live group leader before close reaps it.
+        let codex_bin = install_executable(
+            dir.path(),
+            "codex",
+            "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.154.0'; exit 0;; esac\nexec sleep 30\n",
+        );
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Codex;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.effort = Some(remuda_protocol::EffortSelection {
+            name: remuda_protocol::EffortName::Ultra,
+            ultracode: false,
+        });
+
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Codex,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::OpenaiResponses,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["gpt".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: dir.path().join("launch"),
+                native_home: dir.path().join("native-home"),
+                binary: Some(codex_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: false,
+                settings_overlay: None,
+            },
+        );
+        options.pin_native_home = false;
+        options.promote = false; // keep the test focused on spawn, not detection
+
+        let driver = ShellPtyDriver::new(options);
+        // The r2 bug panicked inside the spawn task after the child started; the
+        // real path returns a handle and the effort bridge accepts `ultra`.
+        let handle = driver
+            .spawn_at(&spec.cwd, Some(&spec))
+            .await
+            .expect("codex ultra launch succeeds through the real spawn path");
+        assert!(driver.inner.lock().await.is_some(), "the run is live");
+        // The child really is the live process group the real spawn created.
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(
+            pgid > 0 && lifecycle::group_alive(pgid),
+            "the stub child runs"
+        );
+        drop(handle);
+        driver.close().await.expect("clean close reaps the stub");
+        assert!(driver.inner.lock().await.is_none(), "close clears inner");
+        for _ in 0..100 {
+            if !lifecycle::group_alive(pgid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !lifecycle::group_alive(pgid),
+            "close reaped the spawned child"
+        );
+    }
+
+    /// Test table that reports one foreground `claude` row for whatever pgid the
+    /// live driver's child leads, so the real promotion poller detects it.
+    struct ClaudeTable;
+
+    impl crate::promote::ProcessTable for ClaudeTable {
+        fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+            if pgid <= 0 {
+                return Vec::new();
+            }
+            vec![crate::promote::ProcessRow {
+                pid: pgid,
+                args: "claude".to_owned(),
+            }]
+        }
+    }
+
+    // c-r3 items 3/4: the promotion pump driven through the live driver's REAL
+    // event channel. A hand-started claude (a login shell whose foreground is a
+    // `claude` per the fixture process table) binds its transcript through the
+    // deterministic pid-file channel, and an assistant effort record appended
+    // after the bind is published on the run's mpsc channel with the
+    // deterministic journal/live event id.
+    #[tokio::test]
+    async fn the_promotion_pump_publishes_effort_through_the_live_channel() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let session_id = "01234567-89ab-cdef-0123-456789abcdef";
+        let transcript =
+            crate::claude_transcript::project_dir(&home, &cwd).join(format!("{session_id}.jsonl"));
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.promote = true;
+        options.claude_home = Some(home.clone());
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            Arc::new(ClaudeTable) as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        // The fixture reports the child leader itself as the foreground claude.
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+
+        // Deterministic channel B: the pid file names the session and cwd.
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{pgid}.json")),
+            serde_json::json!({ "sessionId": session_id, "cwd": cwd.to_string_lossy() })
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        // One turn must already exist so the content-cwd check has something;
+        // the effort record follows after the hydrator binds.
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"uuid\":\"u0\",\"sessionId\":".to_owned()
+                + &serde_json::to_string(session_id).unwrap()
+                + ",\"version\":\"2.1.289\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+
+        // Give the poller (PROMOTE_POLL) a few ticks to detect the foreground
+        // claude and bind the transcript through the pid file.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut high_record = serde_json::to_vec(&json!({
+            "type": "assistant",
+            "uuid": "msg-prom",
+            "sessionId": session_id,
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-prom",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+            "effort": "high",
+            "perTurnEffort": null,
+        }))
+        .unwrap();
+        high_record.push(b'\n');
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(&high_record)
+            .unwrap();
+
+        // Drain until the effort edge is published on the real channel. The
+        // promoted-shell driver minted its own instance scope in promote_ctx, so
+        // derive the expected id from an observation's instance_id.
+        let mut scope: Option<String> = None;
+        let mut effort_id: Option<remuda_protocol::EventId> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(obs)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await
+            {
+                scope.get_or_insert_with(|| obs.instance_id.as_id().to_string());
+                if let remuda_protocol::ObservationPayload::Effort(_) = &obs.body {
+                    effort_id = Some(obs.event_id);
+                    break;
+                }
+            }
+        }
+        Driver::close(&driver).await.unwrap();
+        let scope = scope.expect("saw at least one scoped observation");
+        let expected =
+            remuda_protocol::effort_event_id(&scope, "msg-prom", remuda_protocol::EffortName::High);
+        assert_eq!(
+            effort_id,
+            Some(expected),
+            "the promotion pump published the journal-derived effort id on its real channel"
         );
     }
 }

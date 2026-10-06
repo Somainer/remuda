@@ -27,9 +27,9 @@ use super::{PROMOTE_POLL, PtyState};
 use crate::claude_print::TranscriptMapper;
 use crate::claude_pty::now_ts;
 use crate::claude_transcript::{
-    SessionStartReport, TranscriptBinding, TranscriptCandidate, TranscriptTail, bind_by_pid_file,
-    bind_by_session_id, bind_manual, cwd_matches, list_candidates, recorded_cwd,
-    transcript_belongs_to_cwd,
+    ResumeBoundary, SessionStartReport, TailProvenance, TranscriptBinding, TranscriptCandidate,
+    TranscriptTail, bind_by_pid_file, bind_by_session_id, bind_manual, cwd_matches,
+    list_candidates, recorded_cwd, transcript_belongs_to_cwd,
 };
 use crate::error::{DriverError, DriverResult};
 use crate::promote::{
@@ -790,10 +790,10 @@ pub(super) fn spawn(
     model: Option<ModelSync>,
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
-    // D-056 (4): a `--resume` launch appends to an existing transcript, so the
-    // hydrator tails from the end; pre-launch history never replays into the
-    // current process's effort state.
-    resume: bool,
+    // Pre-spawn resume boundary for a Remuda-launched `--resume` agent,
+    // captured before the child spawned. `None` for a login shell (where a
+    // hand-typed resume is bounded per detected process instead).
+    pre_resume_boundary: Option<ResumeBoundary>,
     // The exact executable this launch exec'd, when Remuda launched one
     // (c-wfdrill2 B). `None` for a login shell.
     alias: Option<LaunchAlias>,
@@ -1284,6 +1284,11 @@ pub(super) fn spawn(
             match (&promote.kind, &found) {
                 // Claude is the only kind that hydrates a transcript in the MVP.
                 (Some(AgentKind::Claude), Some(found)) if found.hydrates_transcript => {
+                    // Prefer the launch-time boundary; a hand-typed resume in a
+                    // login shell has none, so derive one from the detected
+                    // process's own start time and argv resume provenance.
+                    let epoch_boundary =
+                        pre_resume_boundary.or_else(|| shell_resume_boundary(&ctx, found));
                     maintain_binding(
                         &bindings,
                         &ctx,
@@ -1297,7 +1302,7 @@ pub(super) fn spawn(
                         model.as_ref(),
                         permission_bridge.as_ref(),
                         launch_permission,
-                        resume,
+                        epoch_boundary,
                     )
                     .await;
                 }
@@ -1486,6 +1491,30 @@ fn current_turn_interrupted(grid: &remuda_screen::ScreenGrid) -> Option<bool> {
 }
 
 /// One tick of the deterministic binding state machine for a promoted Claude.
+/// Boundary for an agent that resumed itself inside a login shell (a hand-typed
+/// `claude --resume <id>`): Remuda did not launch it, so there is no pre-spawn
+/// snapshot. Use the foreground process's verifiable start instant against the
+/// deterministic transcript's record timestamps (D-056 (4): records the resumed
+/// process wrote before it was promoted are still its own; older ones are
+/// history). `None` for a non-resume process, or when start time/transcript
+/// cannot be established (the caller then tails live from byte 0 — there is
+/// nothing older than the live shell epoch to gate against there).
+fn shell_resume_boundary(ctx: &PromoteCtx, found: &Detected) -> Option<ResumeBoundary> {
+    if !found.resume {
+        return None;
+    }
+    let session_id = found.session_id.as_deref()?;
+    let started = crate::promote::process_started_at(found.pid)?;
+    let path = ResumeBoundary::session_path(&ctx.claude_home, &ctx.cwd, session_id);
+    let boundary = ResumeBoundary::at_process_start(&path, started)?;
+    tracing::info!(
+        pid = found.pid,
+        %session_id,
+        "hand-typed resume detected; bounding transcript at process start"
+    );
+    Some(boundary)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn maintain_binding(
     bindings: &BindingHandle,
@@ -1500,7 +1529,7 @@ async fn maintain_binding(
     model: Option<&ModelSync>,
     permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
-    resume: bool,
+    boundary: Option<ResumeBoundary>,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -1624,7 +1653,7 @@ async fn maintain_binding(
             model,
             permission_bridge,
             launch_permission,
-            resume,
+            boundary,
         );
     }
     if let Some(active) = hydrator.as_mut() {
@@ -1767,6 +1796,7 @@ async fn sample(state: &PtyState, table: &dyn ProcessTable, alias: Option<&Launc
             pid: 0,
             session_id: None,
             hydrates_transcript: kind == AgentKind::Claude,
+            resume: false,
         }),
     }
 }
@@ -1789,6 +1819,14 @@ fn promote_from_hook_binding(
     if binding.pid <= 0 || !rows.iter().any(|row| row.pid == binding.pid) {
         return None;
     }
+    // The hook payload names the session; whether it was a `--resume` comes
+    // from the foreground process's own argv (the SessionStart payload does
+    // not carry it), so a hand-typed resume in a login shell is gated too.
+    let resume = rows
+        .iter()
+        .find(|row| row.pid == binding.pid)
+        .map(|row| crate::promote::resume_provenance(&row.args).1)
+        .unwrap_or(false);
     Some(Detected {
         kind,
         pid: binding.pid,
@@ -1796,6 +1834,7 @@ fn promote_from_hook_binding(
         hydrates_transcript: crate::promote::AGENT_TABLE
             .iter()
             .any(|entry| entry.kind == kind && entry.hydrates_transcript),
+        resume,
     })
 }
 
@@ -1808,8 +1847,15 @@ struct Hydrator {
 }
 
 impl Hydrator {
-    /// Start replay at byte 0 of the bound transcript, or at its current end
-    /// for a `--resume` launch (D-056 (4): only this process's records count).
+    /// Open the bound transcript for one detected foreground process /
+    /// promotion epoch.
+    ///
+    /// `boundary` is the verified resume boundary for THIS epoch:
+    /// - `None` → a new (or non-resume) process: live tail from byte 0.
+    /// - `Some(boundary)` → a resume: tail from the pre-spawn EOF, or from the
+    ///   foreground process's start when it was only discovered later. Bytes
+    ///   before the boundary stay history and never reach the mapper, so the
+    ///   mapper starts in current-process mode.
     #[allow(clippy::too_many_arguments)]
     fn open(
         ctx: &PromoteCtx,
@@ -1819,12 +1865,13 @@ impl Hydrator {
         model: Option<&ModelSync>,
         permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
         launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
-        resume: bool,
+        boundary: Option<ResumeBoundary>,
     ) -> Option<Self> {
         tracing::info!(
             instance_id = %ctx.instance_id.as_id(),
             session = %binding.session_id,
             source = binding.source.as_wire(),
+            resumed = boundary.is_some(),
             "hydrating promoted terminal from its bound Claude transcript"
         );
         let mut mapper = TranscriptMapper::new(
@@ -1855,16 +1902,13 @@ impl Hydrator {
         if let Some(bridge) = permission_bridge {
             mapper = mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
         }
-        if resume {
-            mapper = mapper.following_history();
-        }
+        let tail = match boundary {
+            Some(boundary) => TranscriptTail::resumed(binding.path.clone(), boundary),
+            None => binding.tail(),
+        };
         Some(Self {
             mapper,
-            tail: if resume {
-                binding.tail_from_end()
-            } else {
-                binding.tail()
-            },
+            tail,
             pending,
         })
     }
@@ -1899,17 +1943,20 @@ async fn pump(
             }
         }
     }
-    let lines = hydrator.tail.poll().map_err(|_| ())?;
-    // D-056 (4): on a resume tail, the first appended lines are the first
-    // current-process records; flip the tracker before any of them maps.
-    if !lines.is_empty() && !hydrator.mapper.is_current_process() {
-        hydrator.mapper.mark_current_process();
-    }
+    let read = hydrator.tail.poll().map_err(|_| ())?;
+    // D-056 (4): the tail reports whether these bytes are provenanced to the
+    // current process. An unverified batch (a resume tail displaced by shrink
+    // or replacement) maps for conversation only: keep the effort gate closed
+    // so it cannot set effort/ultracode or settle a fresh switch.
+    hydrator
+        .mapper
+        .set_effort_current_process(read.provenance == TailProvenance::Current);
     // The mapper buffers an assistant run until something supersedes it, so
     // the last message of a batch would otherwise sit unseen until the next
     // record arrives — which, at the end of a turn, may be minutes away.
     // Flushing at the end of each poll is what makes a finished turn appear.
-    let mut batches: Vec<_> = lines
+    let mut batches: Vec<_> = read
+        .lines
         .iter()
         .map(|line| hydrator.mapper.map_line(line))
         .collect();
@@ -2129,6 +2176,7 @@ mod tests {
             pid,
             session_id: session_id.map(str::to_owned),
             hydrates_transcript: true,
+            resume: false,
         }
     }
 
@@ -2336,6 +2384,7 @@ mod tests {
             pid: 43,
             session_id: None,
             hydrates_transcript: false,
+            resume: false,
         };
         let events = transition(&mut state, Some(&codex), &now);
         assert_eq!(names(&events), vec![DEMOTED, DETECTED, PROMOTED]);

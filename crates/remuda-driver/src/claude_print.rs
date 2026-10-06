@@ -2656,26 +2656,29 @@ impl TranscriptMapper {
         self
     }
 
-    /// D-056 (4): engage pre-launch history mode for a mapper following a
-    /// `--resume` transcript whose tail started at end-of-file. State-mutating
-    /// records mapped before [`Self::mark_current_process`] change nothing and
-    /// cannot settle a switch. The caller marks at the first record appended
-    /// after launch.
-    #[must_use]
-    pub(crate) fn following_history(mut self) -> Self {
-        self.effort.begin_history();
-        self
-    }
-
-    /// Flip the effort tracker into current-process mode (idempotent). Called
-    /// by the resume pump immediately before mapping the first records appended
-    /// after launch.
-    pub(crate) fn mark_current_process(&mut self) {
-        self.effort.mark_current_process();
+    /// Set whether the records about to be mapped are provenanced to THIS
+    /// process (D-056 (4)).
+    ///
+    /// The transcript pumps call this before each batch from the tail's
+    /// provenance: `true` for bytes at/after the verified resume boundary (or
+    /// any live-tail read), `false` for a resume tail displaced by a
+    /// shrink/replacement whose current-process provenance can no longer be
+    /// established — those records hydrate conversation but must never set
+    /// effort/ultracode or settle a fresh switch, so read-back stays unknown.
+    /// A live (non-resume) mapper is current by default.
+    pub(crate) fn set_effort_current_process(&mut self, current: bool) {
+        if current {
+            self.effort.mark_current_process();
+        } else {
+            self.effort.begin_history();
+        }
     }
 
     /// Whether the effort tracker is accepting current-process records (D-056
-    /// (4)). A resume mapper starts false until its first appended batch.
+    /// (4)). False for a resume tail that has not reached (or has lost) its
+    /// current-process boundary. Test-only: production pumps drive provenance
+    /// through [`Self::set_effort_current_process`].
+    #[cfg(any(test, feature = "test-stub"))]
     pub(crate) fn is_current_process(&self) -> bool {
         self.effort.is_current_process()
     }

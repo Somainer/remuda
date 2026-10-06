@@ -285,10 +285,21 @@ impl ClaudePtyDriver {
             reject_bot_bypass(&spec)?;
         }
         let session_id = session.session_id().to_string();
-        // D-056 (4): a resume launch appends to an existing transcript; the
-        // pump tails from its launch-time end. Captured before `session` moves
-        // into the materialize request.
-        let resumed = matches!(session, SessionAction::Resume { .. });
+        // D-056 (4): a resume launch appends to an existing transcript. Capture
+        // the transcript's identity + EOF BEFORE the resumed child spawns (the
+        // start_agent call below), so records written between spawn and the
+        // later hook-driven hydration are still read as current and a rotated
+        // file can never replay history.
+        let resume_boundary = match &session {
+            crate::materializer::SessionAction::Resume {
+                session_id: resumed_id,
+            } => crate::claude_transcript::ResumeBoundary::for_resume(
+                &self.options.native_home,
+                std::path::Path::new(&spec.cwd),
+                resumed_id,
+            ),
+            crate::materializer::SessionAction::New { .. } => None,
+        };
         let request = MaterializeRequest {
             spec: &spec,
             profile: &self.options.profile,
@@ -588,7 +599,7 @@ impl ClaudePtyDriver {
             Some(Arc::clone(&permission_bridge)),
             launch_permission,
             self.options.media_stager.clone(),
-            resumed,
+            resume_boundary,
         );
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
             client: client.clone(),
@@ -1365,7 +1376,10 @@ fn spawn_transcript_pump(
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
-    resume: bool,
+    // Pre-spawn resume boundary: Some for a `--resume` launch, captured from
+    // the deterministic transcript BEFORE the child spawned. `None` is a new
+    // session (live tail from byte 0).
+    resume_boundary: Option<crate::claude_transcript::ResumeBoundary>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
@@ -1440,21 +1454,18 @@ fn spawn_transcript_pump(
                         mapper =
                             mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
                     }
-                    // D-056 (4): a resume launch appends to an existing
-                    // transcript. Tail from its launch-time end AND keep the
-                    // effort tracker in history mode until the first appended
-                    // record, so even a record that beats the offset snapshot
-                    // can neither set state nor settle a fresh switch.
-                    if resume {
-                        mapper = mapper.following_history();
-                    }
-                    hydrator = if resume {
-                        Some((
-                            crate::claude_transcript::TranscriptTail::new_at_end(path),
+                    // D-056 (4): a resume tail starts at the pre-spawn byte
+                    // boundary on the same file identity. Every line it yields
+                    // is therefore a current-process record (or, after a
+                    // shrink/replacement, explicitly unverified); the mapper
+                    // starts in current mode and the per-batch provenance below
+                    // closes it if the boundary is ever invalidated.
+                    hydrator = match resume_boundary {
+                        Some(boundary) => Some((
+                            crate::claude_transcript::TranscriptTail::resumed(path, boundary),
                             mapper,
-                        ))
-                    } else {
-                        Some((crate::claude_transcript::TranscriptTail::new(path), mapper))
+                        )),
+                        None => Some((crate::claude_transcript::TranscriptTail::new(path), mapper)),
                     };
                 }
             }
@@ -1470,20 +1481,31 @@ fn spawn_transcript_pump(
                         TranscriptMapper,
                         Vec<Result<Vec<Observation>, DriverError>>,
                     ) {
+                        use crate::claude_transcript::TailProvenance;
                         let (mut tail, mut mapper) = hydrated;
-                        let lines = tail.poll().unwrap_or_default();
-                        // D-056 (4): the first appended lines are the first
-                        // current-process records; flip the tracker before any
-                        // of them maps. Idempotent on later polls.
-                        if !lines.is_empty() && !mapper.is_current_process() {
-                            mapper.mark_current_process();
-                        }
+                        // The tail reports whether these bytes are provenanced
+                        // to the current process; an unverified (displaced
+                        // resume) batch maps for conversation only, never
+                        // setting effort/ultracode or settling a switch.
+                        let read = match tail.poll() {
+                            Ok(read) => read,
+                            Err(error) => {
+                                tracing::debug!(%error, "transcript tail unreadable this poll");
+                                crate::claude_transcript::TailRead {
+                                    lines: Vec::new(),
+                                    provenance: TailProvenance::Current,
+                                }
+                            }
+                        };
+                        mapper.set_effort_current_process(
+                            read.provenance == TailProvenance::Current,
+                        );
                         // Flush the buffered assistant run at the end of the
                         // batch: the mapper holds a run open until superseded,
                         // so the final message of a finished turn would
                         // otherwise wait for the next record to arrive.
                         let mut batches: Vec<_> =
-                            lines.iter().map(|line| mapper.map_line(line)).collect();
+                            read.lines.iter().map(|line| mapper.map_line(line)).collect();
                         batches.push(mapper.flush());
                         (tail, mapper, batches)
                     })
@@ -2567,6 +2589,89 @@ mod tests {
             published.event_id, deterministic,
             "the live TUI channel must publish the mapper's deterministic id"
         );
+    }
+
+    /// c-r3 item 4: the claude-pty transcript pump driven through its REAL
+    /// output channel (the spawned pump task + mpsc receiver), not by calling
+    /// the emit helper on a hand-built observation. An effort edge read off the
+    /// channel carries the mapper/journal-derived deterministic event id.
+    #[tokio::test]
+    async fn the_transcript_pump_publishes_effort_ids_on_its_real_channel() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let transcript = dir.path().join("effort-session.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::to_string(&json!({
+                "type": "assistant",
+                "uuid": "msg-pump",
+                "sessionId": "effort-session",
+                "version": "2.1.289",
+                "message": {
+                    "id": "msg-pump",
+                    "role": "assistant",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "ok"}],
+                },
+                "effort": "high",
+                "perTurnEffort": null,
+            }))
+            .expect("json")
+                + "\n",
+        )
+        .expect("write transcript");
+
+        let instance = InstanceId::new();
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            session_id: "effort-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        // The id the journal tailer derives for the same record — the pump's
+        // real output must match it.
+        // The mapper prefixes the bare message id internally as
+        // `effort:<message-id>:<name>`, so the journal derivation takes the id.
+        let expected = remuda_protocol::effort_event_id(
+            instance.as_id().as_str(),
+            "msg-pump",
+            remuda_protocol::EffortName::High,
+        );
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let seq = Arc::new(AtomicU64::new(0));
+        let slot: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(Some(
+            transcript.to_string_lossy().into_owned(),
+        )));
+        // A live (new-session) boundary: the pump reads from byte 0 as current.
+        let task =
+            spawn_transcript_pump(slot, tx, ctx, seq, None, None, None, None, None, None, None);
+
+        // Drain the real channel until the effort edge arrives.
+        let mut found: Option<Observation> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(obs)) if matches!(obs.body, ObservationPayload::Effort(_)) => {
+                    found = Some(obs);
+                    break;
+                }
+                Ok(Some(_)) | Err(_) => continue,
+                Ok(None) => break,
+            }
+        }
+        task.abort();
+        let effort = found.expect("the real pump published an effort observation");
+        assert_eq!(
+            effort.event_id, expected,
+            "the pump's real channel carries the journal-derived deterministic id"
+        );
+        let ObservationPayload::Effort(payload) = effort.body else {
+            panic!("effort payload");
+        };
+        assert_eq!(payload.effective.name, remuda_protocol::EffortName::High);
     }
 }
 

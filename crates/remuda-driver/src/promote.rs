@@ -131,6 +131,10 @@ pub struct Detected {
     pub session_id: Option<String>,
     /// This kind hydrates structured messages from a transcript.
     pub hydrates_transcript: bool,
+    /// The argv resumed an existing session (`--resume <id>` / `-r <id>`), as
+    /// opposed to starting a new one with `--session-id`. A hand-typed resume
+    /// inside a login shell is gated the same way as a Remuda-launched one.
+    pub resume: bool,
 }
 
 /// Reads the foreground process group of a live PTY.
@@ -222,11 +226,13 @@ pub fn detect(rows: &[ProcessRow], alias: Option<&LaunchAlias>) -> Option<Detect
         // Exact identity first: this is the path we exec'd, so no name table
         // has to have heard of it.
         if let Some(alias) = alias.filter(|alias| alias.path == *program) {
+            let (session_id, resume) = session_id_from_argv(&argv);
             return Some(Detected {
                 kind: alias.kind,
                 pid: row.pid,
-                session_id: session_id_from_argv(&argv),
+                session_id,
                 hydrates_transcript: hydrates_transcript(alias.kind),
+                resume,
             });
         }
         let base = basename(program);
@@ -235,11 +241,13 @@ pub fn detect(rows: &[ProcessRow], alias: Option<&LaunchAlias>) -> Option<Detect
         }
         for entry in AGENT_TABLE {
             if entry.names.contains(&base.as_str()) {
+                let (session_id, resume) = session_id_from_argv(&argv);
                 return Some(Detected {
                     kind: entry.kind,
                     pid: row.pid,
-                    session_id: session_id_from_argv(&argv),
+                    session_id,
                     hydrates_transcript: entry.hydrates_transcript,
+                    resume,
                 });
             }
         }
@@ -271,24 +279,88 @@ pub fn screen_status(screen: &str) -> Option<ScreenStatus> {
     remuda_screen::screen_status(&ScreenGrid::from_raw(&remuda_screen::screen_tail(screen)))
 }
 
-/// `--session-id <uuid>` / `--resume <uuid>` from an agent's argv.
-fn session_id_from_argv(argv: &[String]) -> Option<String> {
+/// `--session-id <uuid>` / `--resume <uuid>` from an agent's argv, and
+/// whether the flag that carried it was a resume (`--resume` / `-r`).
+fn session_id_from_argv(argv: &[String]) -> (Option<String>, bool) {
+    let mut resume = false;
     let mut iter = argv.iter().skip(1);
     while let Some(arg) = iter.next() {
-        let value = match arg.split_once('=') {
-            Some((flag, inline)) if is_session_flag(flag) => Some(inline.to_owned()),
-            _ if is_session_flag(arg) => iter.next().cloned(),
+        let inline = arg
+            .split_once('=')
+            .map(|(flag, inline)| (flag, inline.to_owned()));
+        let value = match inline {
+            Some((flag, inline)) if is_session_flag(flag) => {
+                if is_resume_flag(flag) {
+                    resume = true;
+                }
+                Some(inline)
+            }
+            None if is_session_flag(arg) => {
+                if is_resume_flag(arg) {
+                    resume = true;
+                }
+                iter.next().cloned()
+            }
             _ => None,
         };
         if let Some(value) = value.filter(|value| looks_like_uuid(value)) {
-            return Some(value);
+            return (Some(value), resume);
         }
     }
-    None
+    (None, false)
 }
 
 fn is_session_flag(flag: &str) -> bool {
     matches!(flag, "--session-id" | "--resume" | "-r")
+}
+
+fn is_resume_flag(flag: &str) -> bool {
+    matches!(flag, "--resume" | "-r")
+}
+
+/// Resume provenance parsed from one process's raw `ps args=` line. Returns
+/// `(session_id, is_resume)`; used by the hook-binding path where the
+/// SessionStart payload names the session but not whether the agent resumed.
+#[must_use]
+pub(crate) fn resume_provenance(args: &str) -> (Option<String>, bool) {
+    session_id_from_argv(&split_argv(args))
+}
+
+/// Wall-clock instant a local process started (its `starttime` since boot).
+///
+/// Used to derive a verifiable resume boundary for an agent discovered only
+/// after it launched (a `claude --resume` typed into a login shell): transcript
+/// records at/after this instant are the process's own, older ones are history.
+/// Linux reads `/proc/stat` btime and `/proc/<pid>/stat` starttime; returns
+/// `None` where the platform exposes neither, in which case the caller bounds
+/// conservatively at detection-time EOF (no history replay, possibly late).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn process_started_at(pid: i32) -> Option<time::OffsetDateTime> {
+    if pid <= 0 {
+        return None;
+    }
+    let boot_secs: i64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) can contain spaces/parens; the remaining fields start
+    // after the final ')'. starttime is field 22 overall → index 19 after comm.
+    let after = stat.rsplit_once(')')?.1.split_whitespace();
+    let starttime_ticks: f64 = after.clone().nth(19)?.parse().ok()?;
+    // USER_HZ is 100 on every Linux platform Remuda targets; sysconf would need
+    // a direct libc link for no real portability gain.
+    const CLK_TCK: f64 = 100.0;
+    let secs = boot_secs as f64 + starttime_ticks / CLK_TCK;
+    time::OffsetDateTime::from_unix_timestamp_nanos((secs * 1_000_000_000.0) as i128).ok()
+}
+
+/// Process start time is not derivable portably off Linux.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn process_started_at(_pid: i32) -> Option<time::OffsetDateTime> {
+    None
 }
 
 fn looks_like_uuid(value: &str) -> bool {
@@ -536,6 +608,43 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
         assert_eq!(detect(&foreground, None).unwrap().pid, 200);
         assert!(detect(&parse_grouped_rows(output, 100), None).is_none());
         assert!(parse_grouped_rows(output, 300).is_empty());
+    }
+
+    /// c-r3 item 3: a hand-typed `claude --resume <id>` in a login shell must
+    /// carry resume provenance, so the promotion hydrator bounds it at the
+    /// process start instead of replaying history from byte 0. `--session-id`
+    /// (a brand-new session) is NOT a resume.
+    #[test]
+    fn detection_marks_a_hand_typed_resume_but_not_a_new_session_id() {
+        let id = "01234567-89ab-cdef-0123-456789abcdef";
+        let resumed = detect(
+            &parse_grouped_rows(&format!("  7 7 /usr/local/bin/claude --resume {id}\n"), 7),
+            None,
+        )
+        .expect("resume detected");
+        assert!(resumed.resume, "--resume sets the resume gate");
+        assert_eq!(resumed.session_id.as_deref(), Some(id));
+
+        let short = detect(
+            &parse_grouped_rows(&format!("  8 8 /usr/local/bin/claude -r {id}\n"), 8),
+            None,
+        )
+        .expect("short flag detected");
+        assert!(short.resume, "-r is also a resume");
+
+        let fresh = detect(
+            &parse_grouped_rows(
+                &format!("  9 9 /usr/local/bin/claude --session-id {id}\n"),
+                9,
+            ),
+            None,
+        )
+        .expect("new session detected");
+        assert!(
+            !fresh.resume,
+            "--session-id starts a new session, not a resume"
+        );
+        assert_eq!(fresh.session_id.as_deref(), Some(id));
     }
 
     #[cfg(unix)]

@@ -311,6 +311,7 @@ fn tailing_a_growing_transcript_hydrates_only_the_new_lines() {
     let first: Vec<_> = tail
         .poll()
         .expect("poll")
+        .lines
         .iter()
         .flat_map(|line| mapper.map_line(line).expect("map"))
         .collect();
@@ -326,6 +327,7 @@ fn tailing_a_growing_transcript_hydrates_only_the_new_lines() {
     let mut rest: Vec<_> = tail
         .poll()
         .expect("poll")
+        .lines
         .iter()
         .flat_map(|line| mapper.map_line(line).expect("map"))
         .collect();
@@ -346,7 +348,7 @@ fn tailing_a_growing_transcript_hydrates_only_the_new_lines() {
         ]
     );
     // Nothing new means nothing re-emitted.
-    assert!(tail.poll().expect("poll").is_empty());
+    assert!(tail.poll().expect("poll").lines.is_empty());
 }
 
 /// The SessionStart hook payload shape (D-028 P1 shim → `remuda hook emit`).

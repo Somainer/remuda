@@ -110,13 +110,6 @@ impl TranscriptBinding {
     pub fn tail(&self) -> TranscriptTail {
         TranscriptTail::new(self.path.clone())
     }
-
-    /// An incremental reader over the bound file starting at its current end —
-    /// for a `--resume` launch, whose file is all pre-launch history (D-056 (4)).
-    #[must_use]
-    pub fn tail_from_end(&self) -> TranscriptTail {
-        TranscriptTail::new_at_end(self.path.clone())
-    }
 }
 
 /// `~/.claude/sessions/<pid>.json` as Claude writes it at process startup.
@@ -492,46 +485,277 @@ fn read_head(path: &Path, max: u64) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// Stable filesystem identity of one transcript file (device + inode).
+///
+/// A byte length alone cannot tell a same-path *replacement* (Claude recreates
+/// the file, a rotation, an editor save) from an append: the replacement may be
+/// longer, shorter or equal. Identity makes that distinction verifiable, which
+/// is what keeps a resumed process from replaying a rotated file as current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    /// `st_dev` on Unix; 0 where the platform exposes no stable device id.
+    pub dev: u64,
+    /// `st_ino` on Unix; 0 where the platform exposes no stable inode.
+    pub ino: u64,
+}
+
+impl FileIdentity {
+    /// Identity of an existing file.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn of(path: &Path) -> Option<Self> {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| Self::from_metadata(&metadata))
+    }
+
+    /// Identity from already-read metadata.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+
+    /// Identity of an existing file (non-Unix fallback: no stable identity).
+    #[cfg(not(unix))]
+    #[must_use]
+    pub fn of(_path: &Path) -> Option<Self> {
+        Some(Self { dev: 0, ino: 0 })
+    }
+
+    /// Identity from metadata (non-Unix fallback: no stable identity).
+    #[cfg(not(unix))]
+    #[must_use]
+    pub fn from_metadata(_metadata: &std::fs::Metadata) -> Self {
+        Self { dev: 0, ino: 0 }
+    }
+}
+
+/// How many leading bytes of the transcript are fingerprinted to tell a
+/// same-path *replacement* (rotate/swap) from a genuine append. Inode + length
+/// alone cannot: on tmpfs a delete+create hands the freed inode straight back,
+/// and a longer replacement passes every length check. Claude transcripts are
+/// append-only, so the head never changes on a real resume; a swapped file
+/// rewrites it from record one.
+const HEAD_PROBE: u64 = 8 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeadFingerprint {
+    /// Number of leading bytes hashed (`min(file_len, HEAD_PROBE)` at capture).
+    len: u64,
+    hash: u64,
+}
+
+fn fingerprint_bytes(buf: &[u8], file_len: u64) -> HeadFingerprint {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let n = (file_len.min(HEAD_PROBE) as usize).min(buf.len());
+    if n == 0 {
+        return HeadFingerprint { len: 0, hash: 0 };
+    }
+    let mut hasher = DefaultHasher::new();
+    hasher.write(&buf[..n]);
+    HeadFingerprint {
+        len: n as u64,
+        hash: hasher.finish(),
+    }
+}
+
+fn hash_head(path: &Path, file_len: u64) -> Option<HeadFingerprint> {
+    use std::io::Read;
+    let n = file_len.min(HEAD_PROBE);
+    if n == 0 {
+        return Some(HeadFingerprint { len: 0, hash: 0 });
+    }
+    let mut buf = vec![0_u8; n as usize];
+    let mut file = std::fs::File::open(path).ok()?;
+    file.read_exact(&mut buf).ok()?;
+    Some(fingerprint_bytes(&buf, file_len))
+}
+
+/// The verified byte boundary at which a *resumed* process's own records begin.
+///
+/// Captured either before the resumed child is spawned (the transcript's EOF at
+/// that instant — its device/inode and length) or, when a hand-typed resume is
+/// only discovered later, from process-start provenance (the first record
+/// written at/after the foreground process started). Everything before
+/// `start` on `identity` is pre-launch history and must never set current
+/// effort/ultracode or settle a fresh switch (D-056 (4)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeBoundary {
+    /// File identity the boundary was measured on.
+    pub identity: FileIdentity,
+    /// First byte offset that may belong to the new process.
+    pub start: u64,
+    /// Fingerprint of the file head at capture, to reject a same-path
+    /// replacement that reused the inode and grew the file.
+    head: Option<HeadFingerprint>,
+}
+
+impl ResumeBoundary {
+    /// Snapshot `path` as it is RIGHT BEFORE a resumed child spawns: its
+    /// identity plus current EOF. `None` when the file does not exist yet (a
+    /// resume that creates its transcript — the pump then treats every byte of
+    /// the file that first appears as current, because there is no history).
+    #[must_use]
+    pub fn snapshot(path: &Path) -> Option<Self> {
+        let identity = FileIdentity::of(path)?;
+        let start = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let head = hash_head(path, start);
+        Some(Self {
+            identity,
+            start,
+            head,
+        })
+    }
+
+    /// Deterministic transcript path Claude writes for `session_id` in `cwd`.
+    #[must_use]
+    pub fn session_path(claude_home: &Path, cwd: &Path, session_id: &str) -> PathBuf {
+        project_dir(claude_home, cwd).join(format!("{session_id}.jsonl"))
+    }
+
+    /// Pre-spawn snapshot of the deterministic `<id>.jsonl` for a resume.
+    #[must_use]
+    pub fn for_resume(claude_home: &Path, cwd: &Path, session_id: &str) -> Option<Self> {
+        Self::snapshot(&Self::session_path(claude_home, cwd, session_id))
+    }
+
+    /// Boundary for a resume discovered only after its process started (a
+    /// `claude --resume <id>` typed into a login shell): the first whole record
+    /// whose top-level `timestamp` is at/after `started_at`, measured as a byte
+    /// offset so the tail can seek straight to it. Records the resumed process
+    /// wrote before it was promoted are current (timestamp ≥ process start) and
+    /// are NOT lost; older records are history. `None` when the file cannot be
+    /// read or its identity established.
+    #[must_use]
+    pub fn at_process_start(path: &Path, started_at: time::OffsetDateTime) -> Option<Self> {
+        use serde_json::Value;
+        let identity = FileIdentity::of(path)?;
+        let bytes = std::fs::read(path).ok()?;
+        // Offset just past the last history line; equals EOF when every record
+        // seen so far predates the process (the common "promote before any
+        // record" case).
+        let mut start = 0usize;
+        let mut cursor = 0usize;
+        while cursor < bytes.len() {
+            let nl = bytes[cursor..].iter().position(|b| *b == b'\n')?;
+            let line_end = cursor + nl + 1;
+            let line = &bytes[cursor..cursor + nl];
+            let at = serde_json::from_slice::<Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("timestamp")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .and_then(|ts| record_timestamp(&ts));
+            if at.is_some_and(|at| at >= started_at) {
+                // This line is the first the running process wrote.
+                start = cursor;
+                break;
+            }
+            start = line_end;
+            cursor = line_end;
+        }
+        let total = bytes.len() as u64;
+        Some(Self {
+            identity,
+            start: start as u64,
+            head: Some(fingerprint_bytes(&bytes, total)),
+        })
+    }
+}
+
+/// Parse a transcript record's RFC3339 `timestamp` to an instant.
+fn record_timestamp(value: &str) -> Option<time::OffsetDateTime> {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(value, &Rfc3339).ok()
+}
+
 /// Incremental reader over one transcript file.
 ///
 /// Holds a byte offset and hands back whole lines only, so a half-written tail
 /// is read on the next poll rather than parsed as truncated JSON.
+///
+/// A tail is either:
+/// - **live** (`new`): a non-resume process owns the file from byte 0; every
+///   read line is a current-process record.
+/// - **resumed** (`resumed`): it carries a [`ResumeBoundary`]. Reads at/after
+///   the boundary on the SAME file identity are current. If the file is
+///   replaced (different dev/inode) or shrunk below the cursor, the boundary is
+///   unverifiable from then on: the tail keeps following appends so
+///   conversation hydration survives, but reports them [`TailProvenance::Unverified`]
+///   and never re-opens the current-process gate (no effort applied, no fresh
+///   switch settled) — read-back degrades to unknown rather than trusting a
+///   rotated file. There is no respawn inside one driver run (D-026 resume is a
+///   new driver/instance), so no later event can re-prove provenance here.
 #[derive(Debug)]
 pub struct TranscriptTail {
     path: PathBuf,
     offset: u64,
     partial: String,
+    resume: Option<ResumeState>,
+}
+
+#[derive(Debug)]
+struct ResumeState {
+    /// File identity that must hold for reads past `start` to be trusted.
+    identity: FileIdentity,
+    /// Fingerprint of the file head at boundary capture.
+    head: Option<HeadFingerprint>,
+    /// Set once the tracked file shrank, was replaced, or vanished.
+    displaced: bool,
+}
+
+/// Whether a batch of lines is provenanced to the current process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailProvenance {
+    /// Lines are records of the current process; the read-back gate may open.
+    Current,
+    /// Resume tail displaced by a shrink/replacement: provenance unknown, the
+    /// gate must stay closed. Lines (if any) hydrate messages only.
+    Unverified,
+}
+
+/// One poll: the whole lines appended since the last call and their provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailRead {
+    /// Whole newline-terminated records appended since the last poll.
+    pub lines: Vec<String>,
+    /// Whether those lines are provenanced to the current process.
+    pub provenance: TailProvenance,
 }
 
 impl TranscriptTail {
-    /// Start at the beginning of `path`.
+    /// Start at the beginning of `path`, treating every record as current.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
             offset: 0,
             partial: String::new(),
+            resume: None,
         }
     }
 
-    /// Start at the current end of `path`, following only appends.
-    ///
-    /// D-056 (4): a `--resume` launch reuses the previous session's transcript,
-    /// whose bytes are all pre-launch history — replaying them would let old
-    /// verdicts set the current effort state and could even settle a fresh
-    /// switch whose command words match a replayed slash record. Tail from the
-    /// end so the first line read is the first record THIS process appends.
-    /// A file that is missing or unstatable is treated as empty: the resumed
-    /// process creates/appends it and the first poll binds at 0.
+    /// Follow a resumed transcript whose new-process records begin at
+    /// `boundary` (captured before spawn, or derived from process start).
     #[must_use]
-    pub fn new_at_end(path: PathBuf) -> Self {
-        let offset = std::fs::metadata(&path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+    pub fn resumed(path: PathBuf, boundary: ResumeBoundary) -> Self {
         Self {
             path,
-            offset,
+            offset: boundary.start,
             partial: String::new(),
+            resume: Some(ResumeState {
+                identity: boundary.identity,
+                head: boundary.head,
+                displaced: false,
+            }),
         }
     }
 
@@ -541,30 +765,123 @@ impl TranscriptTail {
         &self.path
     }
 
+    /// Whether this is a resume tail whose boundary was invalidated by a shrink
+    /// or replacement (read-back must stay unknown for the rest of the run).
+    #[must_use]
+    pub fn displaced(&self) -> bool {
+        self.resume.as_ref().is_some_and(|state| state.displaced)
+    }
+
     /// Read whatever whole lines have been appended since the last call.
     ///
-    /// A file that shrank was rotated or truncated, so reading restarts at 0.
+    /// A live tail whose file shrank restarts at 0. A resume tail that shrinks
+    /// or changes identity becomes [`TailProvenance::Unverified`] and follows
+    /// only future appends; it never replays the restarted bytes as current.
     /// An open error (the bound file was deleted) is surfaced to the caller,
     /// which marks the binding degraded rather than silently rebinding.
-    pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(&self.path)?;
-        let len = file.metadata()?.len();
+    pub fn poll(&mut self) -> std::io::Result<TailRead> {
+        let mut file = match std::fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) => {
+                // The bound file vanished mid-run: an unbridgeable
+                // discontinuity for a resume tail. Even if a later recreate
+                // happens to reuse the same inode number (tmpfs frees and
+                // hands it straight back), its bytes are not provenanced to
+                // this process — degrade now, keep the error visible.
+                if let Some(state) = self.resume.as_mut() {
+                    state.displaced = true;
+                }
+                return Err(error);
+            }
+        };
+        let metadata = file.metadata()?;
+        let len = metadata.len();
+
+        // A resume tail keeps the boundary honest.
+        if let Some(state) = self.resume.as_mut() {
+            let identity = FileIdentity::from_metadata(&metadata);
+            // A same-path replacement can reuse the inode (tmpfs) AND grow the
+            // file, so identity/length alone miss it — the head fingerprint
+            // catches a rewrite of the transcript's first record.
+            let head_intact = match state.head {
+                Some(probe) if !state.displaced => {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut buf = vec![0_u8; probe.len as usize];
+                    file.seek(SeekFrom::Start(0))
+                        .ok()
+                        .and_then(|_| file.read_exact(&mut buf).ok())
+                        .is_some_and(|()| fingerprint_bytes(&buf, probe.len) == probe)
+                }
+                _ => true,
+            };
+            if !state.displaced && (!head_intact || identity != state.identity || len < self.offset)
+            {
+                // Rotated/recreated/truncated across the verified boundary.
+                // Anchor at the present EOF so the new (unverifiable) bytes are
+                // not replayed; only appends after this instant come back, and
+                // they stay Unverified for the rest of the run.
+                state.displaced = true;
+                self.offset = len;
+                self.partial.clear();
+                return Ok(TailRead {
+                    lines: Vec::new(),
+                    provenance: TailProvenance::Unverified,
+                });
+            }
+            if state.displaced {
+                // Following a displaced file for message hydration only: skip
+                // any gap/truncation and never report the lines as current.
+                if len < self.offset {
+                    self.offset = len;
+                    self.partial.clear();
+                }
+                let lines = Self::read_lines(&mut file, len, &mut self.offset, &mut self.partial)?;
+                return Ok(TailRead {
+                    lines,
+                    provenance: TailProvenance::Unverified,
+                });
+            }
+            // Trustworthy resume: the read cursor starts at the spawn/process
+            // boundary, so every byte beyond it is a current-process record.
+            let lines = Self::read_lines(&mut file, len, &mut self.offset, &mut self.partial)?;
+            return Ok(TailRead {
+                lines,
+                provenance: TailProvenance::Current,
+            });
+        }
+
+        // Live tail: a shorter file was rotated or truncated, so restart at 0.
         if len < self.offset {
             self.offset = 0;
             self.partial.clear();
         }
-        if len == self.offset {
+        let lines = Self::read_lines(&mut file, len, &mut self.offset, &mut self.partial)?;
+        Ok(TailRead {
+            lines,
+            provenance: TailProvenance::Current,
+        })
+    }
+
+    /// Seek to `offset`, read through `len`, advance the cursor and split off
+    /// the complete newline-terminated lines, holding any partial tail.
+    fn read_lines(
+        file: &mut std::fs::File,
+        len: u64,
+        offset: &mut u64,
+        partial: &mut String,
+    ) -> std::io::Result<Vec<String>> {
+        use std::io::{Read, Seek, SeekFrom};
+        if len == *offset {
             return Ok(Vec::new());
         }
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = Vec::with_capacity((len - self.offset) as usize);
+        file.seek(SeekFrom::Start(*offset))?;
+        let mut buf = Vec::with_capacity((len - *offset) as usize);
         let read = file.read_to_end(&mut buf)? as u64;
-        self.offset += read;
-        self.partial.push_str(&String::from_utf8_lossy(&buf));
+        *offset += read;
+        partial.push_str(&String::from_utf8_lossy(&buf));
         let mut lines = Vec::new();
-        while let Some(index) = self.partial.find('\n') {
-            let line: String = self.partial.drain(..=index).collect();
+        while let Some(index) = partial.find('\n') {
+            let line: String = partial.drain(..=index).collect();
             let line = line.trim_end_matches(['\n', '\r']).to_owned();
             if !line.is_empty() {
                 lines.push(line);
@@ -595,6 +912,22 @@ mod tests {
         }
         let mut file = std::fs::File::create(path).expect("create");
         file.write_all(body.as_bytes()).expect("write");
+    }
+
+    /// Append WITHOUT truncating (the production resume path only appends).
+    /// `File::create` truncates and would turn an append test into a rotation
+    /// test, so resume-tail tests must go through this.
+    fn append(path: &Path, body: &str) {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open append");
+        file.write_all(body.as_bytes()).expect("append");
     }
 
     fn slug_file(tmp: &Path, cwd: &Path, session: &str) -> PathBuf {
@@ -784,47 +1117,177 @@ mod tests {
         let path = tmp.path().join("t.jsonl");
         write(&path, "{\"a\":1}\n{\"b\":2}\n{\"parti");
         let mut tail = TranscriptTail::new(path.clone());
-        assert_eq!(tail.poll().expect("poll"), vec!["{\"a\":1}", "{\"b\":2}"]);
+        assert_eq!(
+            tail.poll().expect("poll").lines,
+            vec!["{\"a\":1}", "{\"b\":2}"]
+        );
         // The partial line is held back until its newline arrives.
-        assert_eq!(tail.poll().expect("poll"), Vec::<String>::new());
+        assert_eq!(tail.poll().expect("poll").lines, Vec::<String>::new());
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .expect("append");
         file.write_all(b"al\":3}\n").expect("write");
-        assert_eq!(tail.poll().expect("poll"), vec!["{\"partial\":3}"]);
+        assert_eq!(tail.poll().expect("poll").lines, vec!["{\"partial\":3}"]);
     }
 
     #[test]
-    fn truncation_restarts_the_tail_at_zero() {
+    fn truncation_restarts_a_live_tail_at_zero() {
         let tmp = tempfile::tempdir().expect("tmp");
         let path = tmp.path().join("t.jsonl");
         write(&path, "{\"a\":1}\n{\"b\":2}\n");
         let mut tail = TranscriptTail::new(path.clone());
-        assert_eq!(tail.poll().expect("poll").len(), 2);
+        assert_eq!(tail.poll().expect("poll").lines.len(), 2);
         write(&path, "{\"c\":3}\n");
-        assert_eq!(tail.poll().expect("poll"), vec!["{\"c\":3}"]);
+        assert_eq!(tail.poll().expect("poll").lines, vec!["{\"c\":3}"]);
     }
 
     #[test]
-    fn a_resume_tail_reads_only_appended_history_not_the_prior_session() {
-        // D-056 (4): the tail snapshot is the transcript length as it was when
-        // this process launched; every byte already on disk is pre-launch
-        // history and must never be replayed into current-process state.
+    fn a_resume_tail_reads_only_records_appended_after_the_pre_spawn_boundary() {
+        // D-056 (4): the boundary is the transcript's identity + EOF captured
+        // BEFORE the resumed child spawns; bytes already on disk stay history
+        // and bytes appended after (even before the hydrator binds) are read.
         let tmp = tempfile::tempdir().expect("tmp");
         let path = tmp.path().join("t.jsonl");
         write(&path, "{\"old\":1}\n{\"old\":2}\n");
-        let mut tail = TranscriptTail::new_at_end(path.clone());
-        assert_eq!(tail.poll().expect("poll"), Vec::<String>::new());
-        // Only bytes appended AFTER the snapshot come back.
-        write(&path, "{\"new\":3}\n");
-        assert_eq!(tail.poll().expect("poll"), vec!["{\"new\":3}"]);
-        assert_eq!(tail.poll().expect("poll"), Vec::<String>::new());
+        let boundary = ResumeBoundary::snapshot(&path).expect("boundary");
+        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
+        assert_eq!(tail.poll().expect("poll").lines, Vec::<String>::new());
+        // Records appended between spawn and the (later) hydrator bind are not
+        // skipped: the boundary cursor is the spawn-time EOF, not bind-time.
+        append(&path, "{\"new\":3}\n");
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.lines, vec!["{\"new\":3}"]);
+        assert_eq!(read.provenance, TailProvenance::Current);
+        assert!(!tail.displaced());
+    }
 
-        // A missing file snapshots at 0 and follows once it appears.
-        let absent = tmp.path().join("never.jsonl");
-        let mut waiting = TranscriptTail::new_at_end(absent.clone());
-        write(&absent, "{\"first\":1}\n");
-        assert_eq!(waiting.poll().expect("poll"), vec!["{\"first\":1}"]);
+    /// Build a record line with an RFC3339 timestamp `secs` seconds past epoch.
+    fn ts_record(secs: i64, body: &str) -> String {
+        use time::format_description::well_known::Rfc3339;
+        let at = time::OffsetDateTime::from_unix_timestamp(secs).expect("ts");
+        format!(
+            "{{\"timestamp\":\"{}\",\"body\":{}}}\n",
+            at.format(&Rfc3339).expect("fmt"),
+            serde_json::to_string(body).expect("json")
+        )
+    }
+
+    #[test]
+    fn a_process_start_boundary_keeps_records_the_resumed_process_already_wrote() {
+        // Discovered-later resume (a `claude --resume` typed into a login
+        // shell): records the process wrote before promotion are current.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("t.jsonl");
+        write(&path, "");
+        append(&path, &ts_record(100, "history-a"));
+        append(&path, &ts_record(200, "history-b"));
+        // The foreground process started at t=150 and already appended one
+        // current record before the poller bound the transcript.
+        let started = time::OffsetDateTime::from_unix_timestamp(150).expect("start");
+        let boundary = ResumeBoundary::at_process_start(&path, started).expect("boundary");
+        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.lines, vec![ts_record(200, "history-b").trim_end()]);
+        assert_eq!(read.provenance, TailProvenance::Current);
+        // A later current record is read too.
+        append(&path, &ts_record(250, "current-c"));
+        assert_eq!(
+            tail.poll().expect("poll").lines,
+            vec![ts_record(250, "current-c").trim_end()]
+        );
+    }
+
+    #[test]
+    fn a_shorter_replacement_does_not_replay_history_as_current() {
+        // Item 2: the file is replaced by something SHORTER (rotation/truncation).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("t.jsonl");
+        write(&path, "{\"old\":1}\n{\"old\":2}\n{\"old\":3}\n");
+        let boundary = ResumeBoundary::snapshot(&path).expect("boundary");
+        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
+        assert!(tail.poll().expect("poll").lines.is_empty());
+        // Replace with a shorter file carrying a stale ultracode verdict.
+        write(&path, "{\"old\":\"short\"}\n");
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.lines, Vec::<String>::new(), "restart bytes suppressed");
+        assert_eq!(read.provenance, TailProvenance::Unverified);
+        assert!(tail.displaced());
+        // Even later appends stay unverified: the gate never reopens.
+        append(&path, "{\"also\":\"new\"}\n");
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.lines, vec!["{\"also\":\"new\"}"]);
+        assert_eq!(read.provenance, TailProvenance::Unverified);
+    }
+
+    #[test]
+    fn an_equal_or_longer_replacement_does_not_replay_history_as_current() {
+        // Item 2: same-length or LONGER replacement (the dangerous case a byte
+        // comparison alone misses). On tmpfs delete+create frequently REUSES
+        // the freed inode, so this is caught by the head fingerprint (the
+        // swapped file rewrites the first record), not by identity or length.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("t.jsonl");
+        write(&path, "{\"old\":1}\n");
+        let boundary = ResumeBoundary::snapshot(&path).expect("boundary");
+        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
+        assert!(tail.poll().expect("poll").lines.is_empty());
+
+        // Longer replacement at the same path (inode may be reused on tmpfs).
+        std::fs::remove_file(&path).expect("remove");
+        write(
+            &path,
+            "{\"replayed\":\"ultracode-on-longer-please\"}\n{\"x\":2}\n",
+        );
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.lines, Vec::<String>::new());
+        assert_eq!(read.provenance, TailProvenance::Unverified);
+        assert!(tail.displaced());
+
+        // A second, equal-length swap keeps read-back unverified.
+        std::fs::remove_file(&path).expect("remove");
+        write(&path, "{\"replayed\":\"ultracode-on-equal\"}\n");
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.provenance, TailProvenance::Unverified);
+    }
+
+    #[test]
+    fn a_genuine_append_that_keeps_the_head_stays_current_even_if_the_inode_is_reused() {
+        // The head fingerprint must NOT false-positive on a normal append: a
+        // resumed process only ever appends, leaving the head byte-identical.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("t.jsonl");
+        write(&path, "{\"old\":1}\n");
+        let boundary = ResumeBoundary::snapshot(&path).expect("boundary");
+        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
+        assert!(tail.poll().expect("poll").lines.is_empty());
+        append(&path, "{\"new\":2}\n");
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.lines, vec!["{\"new\":2}"]);
+        assert_eq!(read.provenance, TailProvenance::Current);
+        assert!(!tail.displaced());
+    }
+
+    #[test]
+    fn a_resume_tail_that_disappears_errors_then_degrades_when_the_file_returns() {
+        // Item 2: while absent, poll is an error (the caller degrades, never
+        // silently rebinds); when it returns under a new inode there is no
+        // current-process provenance, so read-back stays unverified rather than
+        // trusting the (possibly replayed) bytes.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("t.jsonl");
+        write(&path, "{\"old\":1}\n");
+        let boundary = ResumeBoundary::snapshot(&path).expect("boundary");
+        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
+        assert!(tail.poll().expect("poll").lines.is_empty());
+        std::fs::remove_file(&path).expect("remove");
+        assert!(tail.poll().is_err(), "missing file is a poll error");
+        // Recreated at the SAME identity (e.g. an atomic rewrite that reused the
+        // inode is not representable on Unix; here a plain reopen with new
+        // identity must displace, so assert the conservative outcome).
+        append(&path, "{\"new\":1}\n");
+        let read = tail.poll().expect("poll");
+        // New identity after a delete => unverified, regardless of length.
+        assert_eq!(read.provenance, TailProvenance::Unverified);
     }
 }

@@ -1,5 +1,4 @@
 import { expect, test, type Page } from "@playwright/test";
-import { build } from "vite";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import net from "node:net";
@@ -104,12 +103,37 @@ test.beforeAll(async () => {
   const startedAt = Date.now();
   // The actual production build: same config the app ships with, redirected to
   // a temp dir so the working tree's gitignored dist/ is never touched.
-  await build({
-    root: webRoot,
-    configFile: path.join(webRoot, "vite.config.ts"),
-    logLevel: "error",
-    build: { outDir, emptyOutDir: true },
-  });
+  //
+  // Run it as a CHILD PROCESS with an explicitly scrubbed build env, never by
+  // mutating this runner's process.env. The gate runs e2e with VITE_HUB_URL
+  // exported (e.g. `VITE_HUB_URL=http://127.0.0.1:60180 pnpm run test:e2e:hub`);
+  // Vite statically bakes that into a production bundle, so without overriding
+  // it here the built app's bootstrap would call the SHARED gate Hub instead
+  // of this test's ephemeral same-origin serve Hub (origin/CORS reject, the
+  // SessionList wait times out). Pin the real-backend base to same-origin
+  // (empty — hubBase()/filesApi resolve to "" in a prod build) and turn the
+  // mock fixture layer off. These values are scoped to the child only.
+  const buildEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    VITE_API_BASE: "",
+    VITE_HUB_URL: "",
+    VITE_MOCK: "0",
+  };
+  await promisify(execFile)(
+    process.execPath,
+    [
+      path.join(webRoot, "node_modules/vite/bin/vite.js"),
+      "build",
+      "--config",
+      path.join(webRoot, "vite.config.ts"),
+      "--outDir",
+      outDir,
+      "--emptyOutDir",
+      "--logLevel",
+      "error",
+    ],
+    { cwd: webRoot, env: buildEnv, timeout: 240_000, maxBuffer: 8 * 1024 * 1024 },
+  );
   const buildMs = Date.now() - startedAt;
   // Visible in the gate log as the evidence-run timing (devbox: ~1.5 s).
   console.log(`[pwa-realbuild] vite build finished in ${buildMs} ms`);

@@ -299,6 +299,16 @@ it("a workflows-disabled refusal is process-scoped and clears on a positive on r
   expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
 });
 
+it("an unsolicited ultracode refusal disables the switch with no client pending", async () => {
+  const ctx = await startFollowing("unsolicited-refuse");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // No setEffort — the refusal arrives for a configure posted outside the UI.
+  ctx.receive(configureLifecycle(2, "effort-degraded:ultracode:ultracode-workflows-disabled"));
+  const refusal = hubStore.effortRefusalOf(ctx.instance.id);
+  expect(refusal?.scope).toBe("process");
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
 it("the model-scoped refusal expires when the model changes", async () => {
   const ctx = await startFollowing("model-expiry");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);

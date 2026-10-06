@@ -1145,8 +1145,16 @@ class HubStore {
       return;
     }
     // degraded
-    if (!current) return;
-    if (!effortLifecycleMatches(current, parsed.word)) return;
+    const isUltraRefusal =
+      parsed.reason === ULTRA_MODEL_REASON || parsed.reason === ULTRA_WORKFLOWS_REASON;
+    // An ultracode refusal disables the switch even when no client pending
+    // exists (the configure can be posted outside the UI, and a refusal can
+    // race the indicator). A LEVEL degradation must match the in-flight
+    // request so a stale reject for a replaced request is ignored.
+    if (!isUltraRefusal) {
+      if (!current) return;
+      if (!effortLifecycleMatches(current, parsed.word)) return;
+    }
     const pendingNext = { ...this.state.effortPending };
     delete pendingNext[instanceId];
     // The push-down ended via a lifecycle, not a projected read-back: no settled
@@ -1154,27 +1162,25 @@ class HubStore {
     this.settledEffortPushdown.delete(instanceId);
     // The native side refused: revert the affected axes to the last observed
     // state (or drop the optimistic request so the record default returns).
+    // An unsolicited ultracode refusal (no pending) leaves the tier untouched.
     const effective = this.state.effortEffective[instanceId];
     const effort = { ...this.state.effort };
-    if (effective) {
-      const instance = this.state.instances.find((row) => row.id === instanceId);
-      const kind = (instance?.kind ?? "claude") as EffortKind;
-      const selection = effortFromRecord(
-        kind,
-        effective.name,
-        null,
-        effective.ultracode === true,
-      );
-      if (selection) effort[instanceId] = selection;
-    } else {
-      delete effort[instanceId];
+    if (current) {
+      if (effective) {
+        const instance = this.state.instances.find((row) => row.id === instanceId);
+        const kind = (instance?.kind ?? "claude") as EffortKind;
+        const selection = effortFromRecord(kind, effective.name, null, effective.ultracode === true);
+        if (selection) effort[instanceId] = selection;
+      } else {
+        delete effort[instanceId];
+      }
     }
     // D-056 stable reason codes. The two ultracode refusals also DISABLE the
     // switch (model- or process-scoped); the others are plain rejections the
     // user can immediately retry.
     let toastReason: string = parsed.reason;
     const refusalPatch: Partial<HubState> = {};
-    if (parsed.reason === ULTRA_MODEL_REASON || parsed.reason === ULTRA_WORKFLOWS_REASON) {
+    if (isUltraRefusal) {
       const scope = parsed.reason === ULTRA_MODEL_REASON ? "model" : "process";
       const modelId =
         scope === "model"

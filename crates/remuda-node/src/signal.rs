@@ -194,7 +194,10 @@ pub fn engine_turn_activity(observation: &Observation) -> Option<remuda_protocol
     // print process heuristic, false on the first turn of the long-lived sdk
     // child). A result of either status idles only when it ends the root turn;
     // an intermediate workflow result or a queued follow-up turn returns None.
-    let settled_root_turn = native.related_ids.get("settledRootTurn").map(String::as_str)
+    let settled_root_turn = native
+        .related_ids
+        .get("settledRootTurn")
+        .map(String::as_str)
         == Some("true");
     match (native.native_name.as_str(), status.as_str()) {
         ("turn_started", "working") => Some(Activity::Working),
@@ -747,14 +750,14 @@ mod tests {
     ) -> Observation {
         let mut obs = observation(SourceChannel::Stdout, name, Some("s"), related);
         obs.source.driver_kind = driver;
-        if let ObservationPayload::Lifecycle(payload) = &mut obs.body {
-            if let LifecyclePayload::Native(native) = payload.as_mut() {
-                native.topic = LifecycleTopic::Turn;
-                native.status = Knowledge::Known {
-                    value: status.into(),
-                };
-                native.affects_completion = affects_completion;
-            }
+        if let ObservationPayload::Lifecycle(payload) = &mut obs.body
+            && let LifecyclePayload::Native(native) = payload.as_mut()
+        {
+            native.topic = LifecycleTopic::Turn;
+            native.status = Knowledge::Known {
+                value: status.into(),
+            };
+            native.affects_completion = affects_completion;
         }
         obs
     }
@@ -770,7 +773,10 @@ mod tests {
             &[("settledRootTurn", "true")],
             false,
         );
-        assert_eq!(engine_turn_activity(&first), Some(remuda_protocol::Activity::Idle));
+        assert_eq!(
+            engine_turn_activity(&first),
+            Some(remuda_protocol::Activity::Idle)
+        );
 
         // Same for a first-turn error (retryable in place).
         let first_err = engine_turn(
@@ -780,36 +786,47 @@ mod tests {
             &[("settledRootTurn", "true"), ("lastError", "API 429")],
             false,
         );
-        assert_eq!(engine_turn_activity(&first_err), Some(remuda_protocol::Activity::Idle));
+        assert_eq!(
+            engine_turn_activity(&first_err),
+            Some(remuda_protocol::Activity::Idle)
+        );
     }
 
     #[test]
     fn turn_started_marks_working_and_unsettled_results_keep_it() {
         let started = engine_turn(DriverKind::ClaudeSdk, "turn_started", "working", &[], false);
-        assert_eq!(engine_turn_activity(&started), Some(remuda_protocol::Activity::Working));
+        assert_eq!(
+            engine_turn_activity(&started),
+            Some(remuda_protocol::Activity::Working)
+        );
 
         // An intermediate workflow result / queued turn carries no flag.
-        let intermediate = engine_turn(
-            DriverKind::ClaudeSdk,
-            "result",
-            "turn_done",
-            &[],
-            false,
-        );
+        let intermediate = engine_turn(DriverKind::ClaudeSdk, "result", "turn_done", &[], false);
         assert_eq!(engine_turn_activity(&intermediate), None);
-        let intermediate_err =
-            engine_turn(DriverKind::ClaudeSdk, "result", "error", &[], false);
+        let intermediate_err = engine_turn(DriverKind::ClaudeSdk, "result", "error", &[], false);
         assert_eq!(engine_turn_activity(&intermediate_err), None);
     }
 
     #[test]
     fn engine_turn_activity_is_scoped_to_the_structured_carriers() {
-        // A hook-channel event that looks like a turn result is ignored.
-        let mut via_hook = engine_turn(DriverKind::ClaudeSdk, "result", "turn_done", &[("settledRootTurn", "true")], false);
-        via_hook.source.channel = SourceChannel::Hook;
-        assert_eq!(engine_turn_activity(&via_hook), None);
-        // A non-engine driver kind is ignored.
-        let pty = engine_turn(DriverKind::ShellPty, "result", "turn_done", &[("settledRootTurn", "true")], false);
+        // Only the print/sdk drivers emit these turn events; a generic PTY
+        // carrier never gets root-turn activity from them (hook/file activity
+        // is folded separately and gates on its own channel/topic).
+        let pty = engine_turn(
+            DriverKind::ShellPty,
+            "result",
+            "turn_done",
+            &[("settledRootTurn", "true")],
+            false,
+        );
         assert_eq!(engine_turn_activity(&pty), None);
+        let generic = engine_turn(
+            DriverKind::GenericPty,
+            "result",
+            "turn_done",
+            &[("settledRootTurn", "true")],
+            false,
+        );
+        assert_eq!(engine_turn_activity(&generic), None);
     }
 }

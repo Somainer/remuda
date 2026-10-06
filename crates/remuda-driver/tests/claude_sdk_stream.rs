@@ -332,10 +332,7 @@ fn the_recorded_print_stream_still_assembles_on_sdk() {
 }
 
 /// Collect the native `turn/result` lifecycles emitted by replaying `source`.
-fn result_natives(
-    source: &str,
-    driver: DriverKind,
-) -> Vec<remuda_protocol::NativeLifecycle> {
+fn result_natives(source: &str, driver: DriverKind) -> Vec<remuda_protocol::NativeLifecycle> {
     let (_mapper, obs) = replay(source, driver);
     obs.into_iter()
         .filter_map(|o| match o.body {
@@ -411,5 +408,8 @@ fn a_workflow_intermediate_result_does_not_settle_until_its_final() {
         !settles_root_turn(&wf[0]),
         "the workflow's index-0 result is intermediate"
     );
-    assert!(settles_root_turn(&wf[1]), "the workflow's final result settles");
+    assert!(
+        settles_root_turn(&wf[1]),
+        "the workflow's final result settles"
+    );
 }

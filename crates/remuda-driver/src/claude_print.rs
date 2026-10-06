@@ -283,6 +283,13 @@ impl NativeIds {
 struct Inner {
     live: Mutex<Option<Live>>,
     mapper: Mutex<Mapper>,
+    /// D-057 OA6 r2 item 2: serializes (a) writing a user frame + emitting its
+    /// `turn_started` on the send task and (b) mapping + emitting every stdout
+    /// frame (including a turn's `result`) on the reader task into ONE total
+    /// order, so a `result` can never be published before the `turn_started`
+    /// of its own turn. Mapping and emission each had their own lock, which let
+    /// the two tasks interleave their publishes; this spans both.
+    turn_order: tokio::sync::Mutex<()>,
     policy: Mutex<PermissionPolicy>,
     events: Mutex<Option<mpsc::Sender<Observation>>>,
     closed: AtomicBool,
@@ -361,6 +368,7 @@ impl ClaudePrintDriver {
                     media_stager,
                     open_workflows: 0,
                 }),
+                turn_order: tokio::sync::Mutex::new(()),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
                 closed: AtomicBool::new(false),
@@ -659,16 +667,21 @@ impl Driver for ClaudePrintDriver {
         };
         match input {
             DriverInput::Prompt(prompt) => {
+                // D-057 OA6 r2 item 2: hold the single turn-ordering lock
+                // across the stdin WRITE (which now completes on write, not
+                // queue), the turn_started mapping and its emission, so a
+                // result read for this turn on the reader task cannot be mapped
+                // or published first.
+                let _order = self.inner.turn_order.lock().await;
                 let client_message_id = prompt.native_client_message_id.clone();
                 live.process
                     .send_user(prompt_content(&prompt.blocks)?)
                     .await
                     .map_err(map_wire)?;
-                // D-057 OA6 (ma-sdk-state): the written user frame is the turn
-                // start. Emit it only after the native process accepted the
-                // frame, so activity can never flip to `working` for a prompt
-                // that never reached the child. The matching `result`
-                // (`map_result`) is the only settled root-turn end evidence.
+                // D-057 OA6: the written user frame is the turn start. Because
+                // send_user resolves only after the line reached the child's
+                // stdin (r2 item 3), activity never flips to `working` for a
+                // prompt that was merely queued or failed to write.
                 let turn_started = {
                     let mut mapper = self.inner.mapper.lock().await;
                     mapper.turn_started(&client_message_id)?
@@ -975,6 +988,12 @@ async fn handle_frame(inner: &Inner, frame: Outbound) -> DriverResult<()> {
     // staging bridge parks until the Hub answers; running it on a blocking
     // thread keeps the tokio worker (and every other frame) moving.
     let frame = prefold_user_frame(inner, frame).await?;
+    // D-057 OA6 r2 item 2: hold the turn-ordering lock across mapping AND
+    // emission of this stdout frame, pairing with the send task's lock around
+    // the user write + turn_started emit. This section touches no `live` lock,
+    // so it cannot deadlock against a sender (whose lock order is live then
+    // turn_order). Control/image work above is intentionally outside the lock.
+    let _order = inner.turn_order.lock().await;
     let observations = {
         let mut mapper = inner.mapper.lock().await;
         map_outbound(&mut mapper, &frame)?

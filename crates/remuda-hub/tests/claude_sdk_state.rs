@@ -243,8 +243,7 @@ impl FakeNode {
             });
             use futures::FutureExt;
             if body.catch_unwind().await.is_err() {
-                *task_error_for_task.lock().await =
-                    Some("fake-node task panicked".to_string());
+                *task_error_for_task.lock().await = Some("fake-node task panicked".to_string());
             }
         });
         Self {
@@ -403,8 +402,7 @@ impl Ctx {
     /// append instead of sleeping, so a "must NOT change" assertion is only
     /// made once the event has actually been folded).
     async fn durable_seq(&self, id: &str) -> u64 {
-        self.get_instance(id)
-            .await["durableSeq"]
+        self.get_instance(id).await["durableSeq"]
             .as_str()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
@@ -484,7 +482,8 @@ async fn an_error_result_leaves_running_idle_with_a_marker_and_keeps_the_seat_gr
     let seq = ctx.durable_seq(&id).await;
     node.append(&id, turn_started());
     ctx.after_append(&id, seq).await;
-    ctx.wait_until(&id, |v| v["activity"] == json!("working")).await;
+    ctx.wait_until(&id, |v| v["activity"] == json!("working"))
+        .await;
 
     // Settled FIRST-turn ERROR (a 429): turn ended, process alive.
     let seq = ctx.durable_seq(&id).await;
@@ -543,7 +542,8 @@ async fn a_queued_or_intermediate_result_does_not_idle_or_mark() -> Result<()> {
     let seq0 = ctx.durable_seq(&id).await;
     node.append(&id, turn_started());
     ctx.after_append(&id, seq0).await;
-    ctx.wait_until(&id, |v| v["activity"] == json!("working")).await;
+    ctx.wait_until(&id, |v| v["activity"] == json!("working"))
+        .await;
 
     // Another prompt is already queued: the error result is not settled -> no
     // idle, no marker, still working.
@@ -570,7 +570,10 @@ async fn a_queued_or_intermediate_result_does_not_idle_or_mark() -> Result<()> {
     // An intermediate ERROR result (r2 item 5): same settlement decision, error
     // or success, does not settle the root while the workflow is open.
     let seq = ctx.durable_seq(&id).await;
-    node.append(&id, turn_result("error", 0, 0, false, Some("workflow boom")));
+    node.append(
+        &id,
+        turn_result("error", 0, 0, false, Some("workflow boom")),
+    );
     let view = ctx.after_append(&id, seq).await;
     assert_eq!(
         view["activity"],

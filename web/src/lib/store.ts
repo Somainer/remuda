@@ -1028,8 +1028,12 @@ class HubStore {
   /** Apply one transcript-read-back effort observation to the live map.
    *  Settles the in-flight request per-axis and, when the change came from the
    *  terminal side, moves the slider/switch to the observed axes (single
-   *  source of truth; never calls configure, so no push-down ping-pong). */
-  private noteEffortObservation(instanceId: Id, observation: Observation): boolean {
+   *  source of truth; never calls configure, so no push-down ping-pong).
+   *
+   *  `live` = false for replayed history (reconnect/catch-up): it HYDRATES
+   *  effective state only and never settles/clears a pending, folds the
+   *  optimistic selection, records or clears a refusal, or toasts (D-056 r2). */
+  private noteEffortObservation(instanceId: Id, observation: Observation, live = true): boolean {
     const parsed = effectiveFromObservation(observation);
     if (!parsed) return false;
     const view = parsed.effective;
@@ -1041,11 +1045,26 @@ class HubStore {
         [instanceId]: view,
       },
     };
-    // A positive switch read-back clears the process-scoped refusal and lets
-    // the model-scoped one clear too (the model clearly supports it now).
+
+    // Replayed history is read-only with respect to request-scoped state.
+    if (!live) {
+      this.emit(patch);
+      return true;
+    }
+
+    // A positive switch read-back clears a refusal only with process-local
+    // evidence for the SAME model: a success on model B must not erase model
+    // A's model-scoped refusal (D-056 r2 §5).
     if (view.ultracode === true && this.state.effortRefusal[instanceId]) {
-      patch.effortRefusal = { ...this.state.effortRefusal };
-      delete patch.effortRefusal[instanceId];
+      const refusal = this.state.effortRefusal[instanceId];
+      const currentModel =
+        this.state.modelEffective[instanceId]?.id ?? this.state.models[instanceId] ?? null;
+      const sameModel =
+        refusal.scope !== "model" || refusal.modelId == null || refusal.modelId === currentModel;
+      if (sameModel) {
+        patch.effortRefusal = { ...this.state.effortRefusal };
+        delete patch.effortRefusal[instanceId];
+      }
     }
     const pending = this.state.effortPending[instanceId];
     const hydratedAt = this.settledEffortPushdown.get(instanceId);
@@ -1097,8 +1116,11 @@ class HubStore {
     return true;
   }
 
-  /** Fold one `instance.configure` effort lifecycle into the pending map. */
-  private noteEffortLifecycle(instanceId: Id, observation: Observation) {
+  /** Fold one `instance.configure` effort lifecycle into the pending map.
+   *  Replayed (`live=false`) lifecycles are ignored entirely: they never
+   *  queue, apply, degrade, toast, touch pending, or record a refusal. */
+  private noteEffortLifecycle(instanceId: Id, observation: Observation, live = true) {
+    if (!live) return;
     const payload = observation.payload as
       | { type?: string; nativeName?: string; status?: unknown }
       | undefined;
@@ -2458,9 +2480,10 @@ class HubStore {
     });
     // §9.1: the Hub record usually already carries the latest effective level;
     // replay history effort edges too so a reconnect before refresh is honest.
+    // live=false: hydrate effective only, never settle pending/refusal.
     for (const event of history) {
-      this.noteEffortObservation(instanceId, event);
-      this.noteEffortLifecycle(instanceId, event);
+      this.noteEffortObservation(instanceId, event, false);
+      this.noteEffortLifecycle(instanceId, event, false);
       // History replay hydrates observed model state only; it must not settle a
       // push-down pending or fold the selection (those belong to live events).
       this.noteModelObservation(instanceId, event, false);
@@ -2541,9 +2564,10 @@ class HubStore {
         // Load-earlier rows land above every loaded node. Merge by seq rather
         // than trusting arrival order: assemble/Transcript anchor on it.
         const merged = current.concat(fresh).sort((a, b) => Number(a.seq) - Number(b.seq));
+        // Prepended rows are HISTORY, not live frames: hydrate effective only.
         for (const event of fresh) {
-          this.noteEffortObservation(instanceId, event);
-          this.noteEffortLifecycle(instanceId, event);
+          this.noteEffortObservation(instanceId, event, false);
+          this.noteEffortLifecycle(instanceId, event, false);
           this.noteModelObservation(instanceId, event, false);
           this.noteModelLifecycle(instanceId, event, false);
           this.notePermissionObservation(instanceId, event);
@@ -3564,10 +3588,41 @@ class HubStore {
       // this read races. Bounded by one network round trip — no timer.
       await this.refresh().catch(() => undefined);
     } catch (error) {
-      const pending = { ...this.state.effortPending };
-      delete pending[instanceId];
-      this.emit({ effortPending: pending });
-      throw error;
+      // A failed configure (offline node, network, 4xx) must not leave an
+      // optimistic tier/flag, an unhandled rejection, or a stuck indicator.
+      // Roll back ONLY when this is still the current request: a later switch
+      // has already replaced it, and reverting would clobber the newer choice.
+      const stillCurrent =
+        (this.state.effortPending[instanceId]?.nonce ?? -1) === nonce;
+      const nextPatch: Partial<HubState> = {
+        effortPending: { ...this.state.effortPending },
+      };
+      delete nextPatch.effortPending![instanceId];
+      if (stillCurrent) {
+        const effective = this.state.effortEffective[instanceId];
+        const effState = { ...this.state.effort };
+        if (effective) {
+          const inst = this.state.instances.find((row) => row.id === instanceId);
+          const kind = (inst?.kind ?? "claude") as EffortKind;
+          const reverted = effortFromRecord(
+            kind,
+            effective.name,
+            null,
+            effective.ultracode === true,
+          );
+          if (reverted) effState[instanceId] = reverted;
+          else delete effState[instanceId];
+        } else {
+          delete effState[instanceId];
+        }
+        nextPatch.effort = effState;
+      }
+      this.emit(nextPatch);
+      this.toast(
+        `effort 切换失败：${error instanceof Error ? error.message : String(error)}`,
+      );
+      // Do NOT rethrow: the UI already shows the failure via the toast and the
+      // rolled-back state; an unhandled promise rejection would crash tests.
     }
   }
 

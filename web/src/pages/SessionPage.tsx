@@ -885,16 +885,17 @@ export function SessionPage({
             // D-056 coupled-build linkage lives HERE (the slider never moves
             // itself): on 2.1.203–2.1.283 sliding away from xhigh turns the
             // switch off; on ≥2.1.284 the flag is orthogonal and rides along.
+            // Return the promise (the store owns failure: it rolls back and
+            // toasts; it never rejects) rather than voiding it.
             if (
               next.kind === "claude"
               && hubStore.effortVersionGate(instance.id) === "coupled"
               && (hubStore.effortOf(instance.id).ultracode === true)
               && next.index !== CLAUDE_XHIGH_INDEX
             ) {
-              void hubStore.setEffort(instance.id, { ...next, ultracode: false });
-              return;
+              return hubStore.setEffort(instance.id, { ...next, ultracode: false });
             }
-            void hubStore.setEffort(instance.id, next);
+            return hubStore.setEffort(instance.id, next);
           }}
           onUltracode={(on) => {
             // Coupled build: turning the switch on also moves the slider to
@@ -905,15 +906,14 @@ export function SessionPage({
               && hubStore.effortVersionGate(instance.id) === "coupled"
             ) {
               const current = hubStore.effortOf(instance.id, instance.kind);
-              void hubStore.setEffort(instance.id, {
+              return hubStore.setEffort(instance.id, {
                 ...current,
                 index: CLAUDE_XHIGH_INDEX,
                 name: "xhigh",
                 ultracode: true,
               });
-              return;
             }
-            void hubStore.setUltracode(instance.id, on);
+            return hubStore.setUltracode(instance.id, on);
           }}
           // The store owns the failure mouth: it reverts modelPending and
           // toasts the Hub/Node reason. Return the promise (never void it) so

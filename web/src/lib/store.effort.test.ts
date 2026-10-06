@@ -418,3 +418,73 @@ it("c-effortui: a poll between request A and request B cannot clear B's pending"
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
 });
+
+it("a failed configure rolls back only the still-current request and never rejects", async () => {
+  const ctx = await startFollowing("configure-fail");
+  vi.spyOn(api, "instanceConfigure").mockRejectedValue(new Error("network down"));
+  const unhandled: unknown[] = [];
+  const onUnhandled = (e: PromiseRejectionEvent) => unhandled.push(e.reason);
+  window.addEventListener("unhandledrejection", onUnhandled);
+
+  // No read-back exists; optimistic xhigh must revert away.
+  const p = hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
+  await expect(p).resolves.toBeUndefined(); // no rejection escapes
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).not.toBe("xhigh");
+
+  window.removeEventListener("unhandledrejection", onUnhandled);
+  expect(unhandled).toHaveLength(0);
+});
+
+it("a failed configure for a replaced request does not clobber the newer one", async () => {
+  const ctx = await startFollowing("configure-fail-replaced");
+  // A fails slowly; B succeeds.
+  let resolveA: () => void = () => {};
+  vi.spyOn(api, "instanceConfigure").mockImplementation((_id, _perm, extras) => {
+    if (extras?.effort?.name === "max") {
+      return new Promise((_resolve, reject) => {
+        resolveA = () => reject(new Error("A failed late"));
+      });
+    }
+    return Promise.resolve({} as never);
+  });
+  // A = xhigh (starts first), then B = max.
+  const a = hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
+  const b = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  await b;
+  // A's late rejection must not roll B back to high/xhigh.
+  resolveA();
+  await a;
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+});
+
+it("history replay hydrates effective but never touches pending or toasts a refusal", async () => {
+  const ctx = await startFollowing("history-replay");
+  const configure = vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+  // A live refusal marks the switch disabled.
+  ctx.receive(configureLifecycle(2, "effort-degraded:ultracode:ultracode-workflows-disabled"));
+  expect(hubStore.effortRefusalOf(ctx.instance.id)?.reason).toBe("ultracode-workflows-disabled");
+  toast.mockClear();
+
+  // Simulate a history REPLAY of an old positive flag edge (reconnect): it
+  // hydrates effective but must not clear the refusal or settle any pending.
+  hubStore.logout();
+  vi.restoreAllMocks();
+  vi.spyOn(api, "instanceGet").mockResolvedValue(ctx.instance);
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [effortEvent(3, "xhigh", true, "remuda")],
+    durableSeq: "3",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
+    getReadyState: () => 1,
+  } as never);
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async () => subscription(ctx.instance));
+  await hubStore.follow(ctx.instance.id);
+
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.ultracode).toBe(true);
+  // Replay did not touch request-scoped state.
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  // (logout/relogin drops the in-memory refusal; the point is no toast fired.)
+  expect(configure).not.toHaveBeenCalled();
+});

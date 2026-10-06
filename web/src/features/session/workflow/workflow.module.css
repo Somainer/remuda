@@ -49,7 +49,8 @@
   height: 14px;
   transition: transform 140ms ease;
 }
-.head[aria-expanded="true"] .chev { transform: rotate(90deg); }
+.head[aria-expanded="true"] .chev,
+.phaseHead[aria-expanded="true"] .chev { transform: rotate(90deg); }
 .card[data-flat="1"] .chev { visibility: hidden; }
 
 .ico {
@@ -131,7 +132,9 @@
   color: var(--fg-faint);
 }
 
-/* Dotted 72px progress rail with an accent fill. */
+/* Progress rail with layered segments: a terminal fill (done colour, with
+   dotted holes) plus red failed / muted killed slices positioned at their
+   share. An unknown total renders the provisional fill hatched. */
 .rail {
   position: relative;
   display: block;
@@ -146,15 +149,41 @@
   background-image: radial-gradient(circle, var(--fg-muted) 1px, transparent 1.35px);
   background-size: 4px 4px;
 }
-.railFill {
+.railFill,
+.railFail,
+.railKill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
   display: block;
-  height: 100%;
+}
+.railFill {
+  left: 0;
   background-color: var(--wf-accent);
   /* Holes punched in the accent reveal the muted track dots beneath. */
   background-image: radial-gradient(circle, transparent 1.2px, var(--wf-accent) 1.35px);
   background-size: 4px 4px;
   transition: width 240ms ease;
 }
+.railFail {
+  background: var(--danger-fg);
+  transition: left 240ms ease, width 240ms ease;
+}
+.railKill {
+  background: var(--fg-faint);
+  transition: left 240ms ease, width 240ms ease;
+}
+.rail[data-total="provisional"] .railFill {
+  background-color: color-mix(in srgb, var(--wf-accent) 38%, transparent);
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent 0 2px,
+    var(--wf-accent) 2px 4px
+  );
+}
+/* Failed/killed/unknown words ride the meta line after the count. */
+.railBad { color: var(--danger-fg); }
+.railMute { color: var(--fg-faint); }
 
 /* Live / result line under the header: sans, tabular numerals. */
 .live {
@@ -348,6 +377,7 @@
 }
 .more button:hover { color: var(--fg-strong); text-decoration: underline; }
 .more button:focus-visible { outline: 1px solid var(--focus); outline-offset: 1px; }
+.moreCaret { margin-right: 2px; }
 
 .note {
   color: var(--fg-muted);

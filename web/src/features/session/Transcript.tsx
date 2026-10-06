@@ -31,6 +31,7 @@ import { UsageFooter } from "./UsageFooter";
 import { OpaqueRow } from "./OpaqueRow";
 import { ObservedChangeRow } from "./ObservedChangeRow";
 import { NestedToolContext, SubagentFolds, type NestedToolState } from "./subagent/SubagentRows";
+import { CompactToolFold } from "./CompactToolFold";
 import css from "./transcript.module.css";
 import session from "./toolCard.module.css";
 import { DEFAULT_ROW, OVERSCAN, indexAtOffset, rowOffsets, visibleRange } from "./virtualWindow";
@@ -1505,7 +1506,7 @@ function renderNode(
   }
   if (node.type === "compact") {
     return (
-      <CompactFold
+      <CompactToolFold
         toolCount={node.toolCount}
         thoughtCount={node.thoughtCount}
         expandTick={opts.expandTick ?? 0}
@@ -1539,7 +1540,7 @@ function renderNode(
             </details>
           ) : null,
         )}
-      </CompactFold>
+      </CompactToolFold>
     );
   }
   if (node.type === "error") {
@@ -1657,33 +1658,4 @@ function caretRect(node: Text): DOMRect | null {
   const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
   const rect = rects && rects.length ? rects[rects.length - 1] : null;
   return rect && rect.height > 0 ? rect : null;
-}
-
-function CompactFold({
-  toolCount,
-  thoughtCount,
-  expandTick,
-  hitChildId,
-  children,
-}: {
-  toolCount: number;
-  thoughtCount: number;
-  expandTick: number;
-  hitChildId: string | null;
-  children: ReactNode;
-}) {
-  const [open, setOpen] = useState(false);
-  // A search hit inside the fold opens it and keeps it open.
-  useEffect(() => {
-    if (expandTick > 0) setOpen(true);
-  }, [expandTick]);
-  return (
-    <div data-testid="compact-fold-wrap" data-hit-child={hitChildId ?? undefined}>
-      <button className={session.fold} data-testid="compact-fold" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <span>▸</span>
-        <span>{open ? "收起过程" : `${toolCount} 次工具 · ${thoughtCount} 段思考`}</span>
-      </button>
-      {open ? <div className={css.foldBody}>{children}</div> : null}
-    </div>
-  );
 }

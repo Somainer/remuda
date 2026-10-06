@@ -379,9 +379,11 @@ test("a model refusal disables only the switch, never ends the session", async (
     index: 2,
   });
   await openPopover(page);
-  await expect(page.getByTestId("effort-ultracode")).toHaveAttribute("data-disabled", "1", { timeout: 10_000 });
+  const row = page.getByTestId("effort-ultracode");
+  await expect(row).toHaveAttribute("data-disabled", "1", { timeout: 10_000 });
+  await expect(row).toHaveAttribute("data-reason", "ultracode-unavailable-for-model");
   await expect(page.getByTestId("effort-ultracode-switch")).toBeDisabled();
-  await expect(page.getByTestId("effort-ultracode-reason")).toContain("ultracode");
+  await expect(page.getByTestId("effort-ultracode-reason")).toContainText(/ultracode/i);
   // The tier axis stays usable (a refused switch is a configure outcome only).
   await expect(page.getByTestId("effort-slider")).not.toHaveAttribute("aria-disabled", "true");
   await page.keyboard.press("Escape");

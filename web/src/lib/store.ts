@@ -1114,12 +1114,34 @@ class HubStore {
     if (!parsed) return;
     const current = this.state.effortPending[instanceId];
     if (parsed.kind === "queued") {
-      if (!current) return;
-      // A queued lifecycle belongs to the REQUEST in flight only. A late
-      // `effort-queued` for request A after the user replaced it with B names
-      // different axes and is dropped — it must never overwrite B's pending
-      // indicator nor stamp B's threshold (c-effortui A→B race).
-      if (!effortLifecycleMatches(current, parsed.word)) return;
+      let current = this.state.effortPending[instanceId];
+      if (current) {
+        // A queued lifecycle belongs to the REQUEST in flight only. A late
+        // `effort-queued` for request A after the user replaced it with B names
+        // different axes and is dropped — it must never overwrite B's pending
+        // indicator nor stamp B's threshold (c-effortui A→B race).
+        if (!effortLifecycleMatches(current, parsed.word)) return;
+      } else {
+        // No client-side pending (the configure was posted outside the UI):
+        // still surface 排队中 from the lifecycle's own axes.
+        const request = effortLifecycleRequest(parsed.word);
+        const instance = this.state.instances.find((row) => row.id === instanceId);
+        const kind = (instance?.kind ?? "claude") as EffortKind;
+        const fallbackSelection =
+          effortFromRecord(kind, request.name ?? null, null, request.ultracode === true)
+          ?? effortAt(kind, DEFAULT_EFFORT_INDEX, request.ultracode === true);
+        current = {
+          nonce: (this.state.effortNonces[instanceId] ?? 0) + 1,
+          name: fallbackSelection.name,
+          ultracode: fallbackSelection.ultracode === true,
+          queued: true,
+          at: Date.now(),
+          thresholdObservedAt: this.state.effortEffective[instanceId]?.observedAt ?? null,
+          levelSettled: false,
+          flagSettled: false,
+        };
+        this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: current.nonce } });
+      }
       // Provenance: the threshold is stamped from THIS request's queued
       // lifecycle; an earlier timestamp survives only for the same request
       // (a duplicate queued edge), never across requests.

@@ -1321,6 +1321,10 @@ async fn follow_session(
     let mut rx = state.bus.subscribe();
     // c-cardsettle: separate receiver on the dedicated settlement bus.
     let mut settlement_rx = state.settlement_bus.subscribe();
+    // c-cardsettle r5 item 6: this follower's durable delivery cursor — the
+    // updated_at of the newest settlement row already recovered to it. Lag
+    // pages strictly forward from it, bounded by SETTLEMENT_LAG_PAGE.
+    let mut settlement_cursor: Option<String> = None;
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
     for id in &instance_ids {
         state.followers.watch(device_id.clone(), id.clone()).await;
@@ -1486,16 +1490,20 @@ async fn follow_session(
                             // c-cardsettle r4 item 6 / r5 item 6: one or more
                             // settlement notices were overwritten. Recover the
                             // AUTHORITATIVE terminal ids from durable storage
-                            // in BOUNDED pages and re-send each as a settlement
-                            // notice BEFORE the gap, so the client pins them
-                            // before it reconciles (an older in-flight inbox
-                            // response cannot resurrect a card). On a QUERY
-                            // ERROR we do NOT send a bare gap — close the
-                            // follower so it reconnects and resyncs from the
-                            // durable list/replay rather than trusting a gap.
-                            let terminal = match state
+                            // as one BOUNDED page strictly after this
+                            // follower's delivery cursor and re-send each as a
+                            // settlement notice BEFORE the gap, so the client
+                            // pins them before it reconciles (an older
+                            // in-flight inbox response cannot resurrect a
+                            // card). On a QUERY ERROR we do NOT send a bare
+                            // gap — close the follower so it reconnects and
+                            // resyncs from the durable list/replay rather than
+                            // trusting a gap.
+                            let page = match state
                                 .store
-                                .recent_invalidated_interactions()
+                                .invalidated_interactions_after(
+                                    settlement_cursor.clone(),
+                                )
                                 .await
                             {
                                 Ok(rows) => rows,
@@ -1504,7 +1512,8 @@ async fn follow_session(
                                     return;
                                 }
                             };
-                            for (sid, iid, reason) in terminal {
+                            let mut high_water = settlement_cursor.clone();
+                            for (sid, iid, reason, updated_at) in page {
                                 if !instance_ids.is_empty()
                                     && !instance_ids.iter().any(|id| id == &sid)
                                 {
@@ -1525,7 +1534,16 @@ async fn follow_session(
                                 {
                                     return;
                                 }
+                                // Advance to the page high-water mark (the
+                                // first page is newest-first, later pages
+                                // oldest-first, so take the max rather than
+                                // the last element).
+                                high_water = Some(match high_water {
+                                    Some(prev) if prev > updated_at => prev,
+                                    _ => updated_at,
+                                });
                             }
+                            settlement_cursor = high_water;
                             let gap = json!({ "type": "gap", "reason": "settlement-backpressure" });
                             if out_tx
                                 .send(FollowMsg::Text(gap.to_string()))

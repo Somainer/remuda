@@ -1357,6 +1357,11 @@ impl Settlement {
     }
 }
 
+/// c-cardsettle r5 item 6: bound on one settlement lag-recovery page (live
+/// rows and tombstones counted together), so a lag burst can never produce
+/// an unbounded recovery frame; followers page forward from their cursor.
+pub(crate) const SETTLEMENT_LAG_PAGE: u32 = 512;
+
 /// One row of the `worktree_leases` table (task-model t-pool).
 ///
 /// Identity is `(host_id, workspace_id, dir_key)`: the Space key plus the
@@ -4221,32 +4226,83 @@ impl Store {
     pub async fn recent_invalidated_interactions(
         &self,
     ) -> Result<Vec<(String, String, String)>, StoreError> {
-        self.run_named("recent_invalidated_interactions", move |conn| {
-            // r5 item 6: bounded page (LIMIT 512) so a lag burst cannot
-            // produce an unbounded recovery frame; the 5-minute window plus
-            // LIMIT bounds both age and count.
-            let mut stmt = conn.prepare(
+        let rows = self
+            .invalidated_interactions_page(Some(5), None, SETTLEMENT_LAG_PAGE)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(instance_id, interaction_id, reason, _updated_at)| {
+                (instance_id, interaction_id, reason)
+            })
+            .collect())
+    }
+
+    /// c-cardsettle r5 item 6: one BOUNDED page (at most
+    /// [`SETTLEMENT_LAG_PAGE`] live rows + tombstones, oldest first) of
+    /// terminal interactions strictly newer than a per-follower delivery
+    /// cursor. The lag recovery sends this page BEFORE its gap frame and then
+    /// advances the cursor to the page high-water mark, so repeated lag bursts
+    /// page forward instead of re-running a fixed time window. With no cursor
+    /// (a fresh connection's first recovery) the most recent bounded page is
+    /// returned regardless of age — an older lost settlement is still
+    /// authoritative and must not resurrect a card.
+    pub async fn invalidated_interactions_after(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<Vec<(String, String, String, String)>, StoreError> {
+        self.invalidated_interactions_page(None, cursor, SETTLEMENT_LAG_PAGE)
+            .await
+    }
+
+    /// Shared bounded page over live invalidated rows UNION ALL tombstones.
+    /// The reconnect snapshot is bounded by a recent WINDOW; the lag cursor
+    /// path is windowless (an older lost settlement is still authoritative)
+    /// and pages from the cursor. `limit` bounds rows AND tombstones together.
+    async fn invalidated_interactions_page(
+        &self,
+        window_mins: Option<i64>,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<(String, String, String, String)>, StoreError> {
+        let limit = i64::from(limit);
+        self.run_named("invalidated_interactions_page", move |conn| {
+            // r5 item 6: cursor + bounded LIMIT bound both age (from the
+            // follower's durable position) and count. A cursor-less first
+            // recovery pages the NEWEST bounded rows (what a burst just
+            // overwrote); subsequent pages walk strictly forward ascending.
+            let order = if cursor.is_some() {
+                "updated_at ASC"
+            } else {
+                "updated_at DESC"
+            };
+            let sql = format!(
                 "SELECT instance_id, id, COALESCE(
                     json_extract(payload_json,
                         '$.payload.entity.resolution.value.reason'),
                     json_extract(payload_json,
                         '$.payload.interaction.resolution.value.reason'),
-                    'generation-ended')
+                    'generation-ended'),
+                    updated_at
                  FROM interactions
                  WHERE state = 'invalidated'
-                   AND julianday(updated_at) >= julianday('now','-5 minutes')
+                   AND (?1 IS NULL OR julianday(updated_at) >= julianday('now','-' || ?1 || ' minutes'))
+                   AND (?2 IS NULL OR updated_at > ?2)
                  UNION ALL
-                 SELECT instance_id, id, 'generation-ended'
+                 SELECT instance_id, id, 'generation-ended', updated_at
                  FROM interaction_tombstones
                  WHERE state = 'invalidated'
-                   AND julianday(updated_at) >= julianday('now','-5 minutes')
-                 LIMIT 512",
-            )?;
-            let rows = stmt.query_map(params![], |row| {
+                   AND (?1 IS NULL OR julianday(updated_at) >= julianday('now','-' || ?1 || ' minutes'))
+                   AND (?2 IS NULL OR updated_at > ?2)
+                 ORDER BY {order}
+                 LIMIT ?3"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![window_mins, cursor, limit], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?;
             let mut out = Vec::new();
@@ -7637,6 +7693,208 @@ mod tests {
             "pending rows are not settlements"
         );
         store.close().await;
+    }
+
+    /// c-cardsettle r5 item 6: the lag recovery cursor replaces the fixed
+    /// 5-minute window for a follower that MISSED notices. An older lost
+    /// settlement (beyond the reconnect snapshot window) is still recovered on
+    /// the first cursor page; pages move strictly forward from the cursor;
+    /// tombstones page with live rows; pending rows never appear.
+    #[tokio::test]
+    async fn lag_cursor_recovers_an_older_lost_settlement_and_pages_forward() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "lag-cursor").await;
+
+        // Fresh live invalidated row.
+        let fresh = seed_acknowledged_instance(&store, &host).await;
+        let fresh_int = seed_pending_interaction(&store, &host, &fresh.instance_id).await;
+        let (_, _) = store
+            .settle_instance_exited(fresh.instance_id.clone(), "x".into())
+            .await
+            .expect("settle");
+
+        // OLD live invalidated row, 2 hours back: outside the reconnect
+        // snapshot window but a lost settlement the lag cursor must recover.
+        let aged = seed_acknowledged_instance(&store, &host).await;
+        let aged_int = seed_pending_interaction(&store, &host, &aged.instance_id).await;
+        let (_, _) = store
+            .settle_instance_exited(aged.instance_id.clone(), "x".into())
+            .await
+            .expect("settle");
+        backdate_interaction(&store, &aged_int, 2).await;
+        let aged_ts = interaction_updated_at(&store, &aged_int).await;
+
+        // OLD tombstone (deleted instance), also 2 hours back.
+        let deleted = seed_acknowledged_instance(&store, &host).await;
+        let deleted_int = seed_pending_interaction(&store, &host, &deleted.instance_id).await;
+        let (_, _) = store
+            .settle_instance_exited(deleted.instance_id.clone(), "x".into())
+            .await
+            .expect("settle");
+        let deleted_id = deleted.instance_id.clone();
+        assert!(store.delete_instance(deleted.instance_id).await.expect("delete"));
+        backdate_tombstone(&store, &deleted_int, 2).await;
+
+        // A still-pending row is never a settlement.
+        let pending = seed_acknowledged_instance(&store, &host).await;
+        let pending_int = seed_pending_interaction(&store, &host, &pending.instance_id).await;
+
+        // The reconnect snapshot window still excludes the old rows.
+        let snapshot_ids: std::collections::HashSet<String> = store
+            .recent_invalidated_interactions()
+            .await
+            .expect("snapshot")
+            .into_iter()
+            .map(|(_, id, _)| id)
+            .collect();
+        assert!(snapshot_ids.contains(&fresh_int));
+        assert!(!snapshot_ids.contains(&aged_int));
+        assert!(!snapshot_ids.contains(&deleted_int));
+
+        // First lag page (no cursor): bounded authoritative page INCLUDING the
+        // old lost settlement and the old tombstone, excluding the pending row.
+        let first = store
+            .invalidated_interactions_after(None)
+            .await
+            .expect("first page");
+        let first_ids: std::collections::HashSet<String> =
+            first.iter().map(|(_, id, _, _)| id.clone()).collect();
+        assert!(first_ids.contains(&fresh_int), "fresh settlement recovered");
+        assert!(
+            first_ids.contains(&aged_int),
+            "the older lost settlement is recovered even outside the window"
+        );
+        assert!(
+            first_ids.contains(&deleted_int),
+            "an old tombstone is recovered with live rows"
+        );
+        assert!(!first_ids.contains(&pending_int), "pending never recovered");
+        // No-cursor pages are newest-first.
+        assert_eq!(first.first().map(|(_, id, _, _)| id), Some(&fresh_int));
+
+        // Paging strictly forward from the newest cursor yields nothing.
+        let newest = match store
+            .invalidated_interactions_after(first.first().map(|(_, _, _, ts)| ts.clone()))
+            .await
+            .expect("page from newest")
+            .as_slice()
+        {
+            [] => first.first().map(|(_, _, _, ts)| ts.clone()).unwrap(),
+            _ => panic!("no settlement is newer than the newest row"),
+        };
+        // Paging from the OLD row's timestamp returns everything newer
+        // (oldest-first across cursor pages), but not the old row itself.
+        let onward = store
+            .invalidated_interactions_after(Some(aged_ts))
+            .await
+            .expect("page after old cursor");
+        let onward_ids: Vec<String> = onward.iter().map(|(_, id, _, _)| id.clone()).collect();
+        assert!(onward_ids.contains(&fresh_int));
+        assert!(!onward_ids.contains(&aged_int), "cursor is exclusive");
+        assert!(
+            onward.iter().map(|(_, _, _, ts)| ts).is_sorted_by(|a, b| a <= b),
+            "cursor pages walk oldest-first"
+        );
+        assert!(onward.len() <= SETTLEMENT_LAG_PAGE as usize);
+        let _ = newest;
+        let _ = deleted_id;
+        store.close().await;
+    }
+
+    /// c-cardsettle r5 item 6: the lag page is hard-bounded for live rows and
+    /// tombstones together, even with a backlog larger than the page.
+    #[tokio::test]
+    async fn lag_cursor_page_is_bounded_for_rows_and_tombstones() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let total = SETTLEMENT_LAG_PAGE + 20;
+        store
+            .run_named("seed_invalidated_backlog", move |conn| {
+                {
+                    let mut stmt = conn.prepare(
+                        "INSERT INTO interactions
+                            (id, instance_id, host_id, kind, state, blocking,
+                             payload_json, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 'approval', 'invalidated', 0, '{}',
+                                 ?4, ?4)",
+                    )?;
+                    for n in 0..total {
+                        let stamp = format!("2026-09-01T00:{n:04}.000Z");
+                        stmt.execute(params![
+                            format!("int_backlog_{n:05}"),
+                            "ins_backlog",
+                            "hst_backlog",
+                            stamp
+                        ])?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed");
+        let page = store
+            .invalidated_interactions_after(None)
+            .await
+            .expect("bounded page");
+        assert_eq!(
+            page.len(),
+            SETTLEMENT_LAG_PAGE as usize,
+            "rows and tombstones are bounded together by one LIMIT"
+        );
+        // Newest-first: the newest 20 must all be present, the oldest 20 gone.
+        let ids: std::collections::HashSet<String> =
+            page.iter().map(|(_, id, _, _)| id.clone()).collect();
+        assert!(ids.contains(&format!("int_backlog_{:05}", total - 1)));
+        assert!(ids.contains(&format!("int_backlog_{:05}", total - 20)));
+        assert!(!ids.contains("int_backlog_00000"));
+        assert!(!ids.contains(&format!("int_backlog_{:05}", 19)));
+        store.close().await;
+    }
+
+    /// Read one interaction's durable updated_at (lag cursor test helper).
+    async fn interaction_updated_at(store: &Store, interaction_id: &str) -> String {
+        let interaction_id = interaction_id.to_owned();
+        store
+            .run_named("interaction_updated_at", move |conn| {
+                conn.query_row(
+                    "SELECT updated_at FROM interactions WHERE id = ?1",
+                    params![interaction_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(StoreError::from)
+            })
+            .await
+            .expect("updated_at")
+            .expect("interaction row")
+    }
+
+    /// Backdate a delete-instance tombstone (lag cursor test helper).
+    async fn backdate_tombstone(store: &Store, interaction_id: &str, hours: i64) {
+        let interaction_id = interaction_id.to_owned();
+        store
+            .run_named("backdate_tombstone", move |conn| {
+                let then = time::OffsetDateTime::now_utc() - time::Duration::hours(hours);
+                let stamp = format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+                    then.year(),
+                    u8::from(then.month()),
+                    then.day(),
+                    then.hour(),
+                    then.minute(),
+                    then.second()
+                );
+                conn.execute(
+                    "UPDATE interaction_tombstones SET updated_at = ?1, created_at = ?1
+                     WHERE id = ?2",
+                    params![stamp, interaction_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("backdate tombstone");
     }
 
     async fn backdate_interaction(store: &Store, interaction_id: &str, hours: i64) {

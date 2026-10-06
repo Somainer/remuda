@@ -226,3 +226,92 @@ node `resume_home.rs` 11 (recorded-missing refusal; verified it fails with the
 r2 fallback restored), sandbox unit 4, `fake_home_guard.rs` 4 mandatory
 process tests. `cargo fmt`, four-crate `clippy -D warnings`, and the
 driver/node/testing suites are green.
+
+## Round 3 → Round 4 hardening (2026-10-07)
+
+Review of `69af1f88` (codex REJECT, grok REJECT; remuda-fdsafe direction
+accepted). Round 4 moves the trust boundary from "walk every path from `/`"
+to a **realpath-once trusted anchor + `O_NOFOLLOW` walk below it**, closes
+the hardlink/re-open/type/FIFO gaps, and tightens fake-root authorisation.
+
+### remuda-fdsafe (items 1, 5, 6, 7, 10)
+
+- **Trusted-root anchors (item 1).** `DirFd::anchor_existing` /
+  `anchor_or_create` canonicalize the deepest existing ancestor ONCE (so
+  macOS `/tmp → /private/tmp`, `/var → /private/var` mount symlinks are
+  crossed), then walk/create every component below it with
+  `O_NOFOLLOW|O_DIRECTORY`. `subpath`/`ensure_subpath` walk relative paths
+  and reject `RootDir`/`ParentDir`/`CurDir` components explicitly (item 7),
+  so an absolute path containing `..` cannot escape the anchor.
+- **Exact S_IFMT typing (item 5).** Classification is
+  `(mode & S_IFMT) == S_IFREG/S_IFDIR/S_IFLNK`; a unix socket (0140000) and
+  char/block devices classify `Other` and are never read/copied.
+- **FIFO-safe leaves (item 6).** `fstatat(AT_SYMLINK_NOFOLLOW)` precedes
+  every open; read and append leaves use `O_NONBLOCK` and re-`fstat` the
+  opened fd. A FIFO can never block an open.
+- **Live byte budget (item 10).** `copy_capped` streams against the caller's
+  REMAINING aggregate budget and probes one extra byte at the cap; it
+  returns the real byte count. A file grown after enumeration fails the
+  aggregate cap instead of overflowing it.
+- `create_subdir_excl` returns a distinct EEXIST error (never adopts or
+  deletes an existing name); directory uid/mode/identity accessors.
+
+### Driver staging (items 2, 4, 9, 10, 11)
+
+- **Hardlink no-op tightened (item 2).** Same-file is a no-op ONLY when the
+  source and destination leaves share `(dev,ino)` AND live in the SAME
+  pinned directory fd (the inherited home). A cross-directory hardlink is a
+  different retained file: the staged copy replaces it with an independent
+  inode at publish.
+- **Held fd end to end (item 4).** The source `OpenedLeaf` opened during
+  validation is streamed and hashed straight through `build_verify_and_publish`;
+  the source name is never re-opened after validation. Sizes/hashes are the
+  actual streamed values.
+- **Recoverable publish (item 9).** A retained transcript with NO marker but
+  byte-identical (size+sha) to the just-streamed source is accepted and the
+  marker written — recovering a crash between transcript rename and marker
+  write. An existing non-matching marker remains a hard conflict. Two
+  `cfg(test)` thread-local seams inject crashes after-stage and
+  pre-marker without the workspace-forbidden `env::set_var`.
+- **Aggregate charging (item 10).** Sidecars are no longer charged at
+  enumeration; the real stream charges actual bytes via `StageAccount`
+  against the remaining budget.
+- **Cleanup assertion (item 11).** The after-stage seam leaves a populated
+  private tree; the regression asserts the caller removes it and publishes
+  nothing. Skipped sidecars surface from the Node materializer
+  (`crates/remuda-node/src/native.rs`) as `tracing::warn` launch
+  diagnostics naming the skipped entry and session.
+
+### Fake sandbox/harness (items 3, 8)
+
+- **Exclusive randomised allocation (item 8).** `TempHome::allocate`
+  `mkdirat`s a fresh randomised 0700 name, verifies uid+mode on the opened
+  fd, and removes only what it created. A planted 0777 dir at a predictable
+  name is never adopted or deleted (EEXIST → new name). A sentinel is
+  trusted only in a directory owned by this euid that is not
+  world-writable and is not `/tmp`, `/var/tmp` or `/private/tmp` itself, so a
+  planted `/tmp/.remuda-fake-root` authorises nothing.
+- **fd-resolved Claude home.** Explicit `CLAUDE_CONFIG_DIR` is the anchor;
+  implicit `$HOME/.claude` anchors `$HOME` and WALKs the fallback
+  link-free, so a symlinked `.claude` inside an allocated home is refused
+  (this was the symlink the r3 anchor canonicalized through).
+- **Harness writes (item 3).** Every resume append
+  (`open_resume` claude/codex/grok), settings merge, events log,
+  active-sessions and usage.json write goes through fd-relative
+  `open_append_file`/`write_allowed_file`. A real fake-harness `--resume`
+  with the whole home replaced by a symlink to an external directory
+  appends zero bytes to the target.
+
+Tests: fdsafe 10; driver `claude_transcript` 42 (6 new round-4: cross-home
+hardlink replaced, same-dir inode no-op, socket sidecar skipped, pre-marker
+crash recovered, post-enumeration growth capped, populated stage cleanup);
+`fake_home_guard` 6 (real fake-process FIFO resume bounded, allocation never
+the mount); `fake_harness` 25 (symlinked-home resume appends nothing).
+fmt + four-crate clippy `-D warnings` clean; gated `nice cargo test
+--workspace` green under gate-e2e with `TMPDIR=/tmp`.
+
+macOS-specific code paths (to be run on the Mac before gating): the anchor
+`canonicalize` (`remuda-fdsafe/src/lib.rs:302`), the
+`/private/var/folders` fixed-temp base (`sandbox.rs:51-63`), and the
+POSIX flags shared by Linux/macOS (`O_NOFOLLOW|O_DIRECTORY|O_NONBLOCK`,
+`fstatat(AT_SYMLINK_NOFOLLOW)`, exact `S_IFMT`, `lib.rs:234,267-286,522`).

@@ -4288,7 +4288,9 @@ impl Store {
                    AND (?1 IS NULL OR julianday(updated_at) >= julianday('now','-' || ?1 || ' minutes'))
                    AND (?2 IS NULL OR updated_at > ?2)
                  UNION ALL
-                 SELECT instance_id, id, 'generation-ended', updated_at
+                 SELECT instance_id, id,
+                        CASE WHEN reason = '' THEN 'generation-ended' ELSE reason END,
+                        updated_at
                  FROM interaction_tombstones
                  WHERE state = 'invalidated'
                    AND (?1 IS NULL OR julianday(updated_at) >= julianday('now','-' || ?1 || ' minutes'))
@@ -8901,6 +8903,101 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r5 item 8: the real driver demotion retirement
+    /// (shell_pty promotion `invalidate_picker` → entity lifecycle
+    /// entityType=interaction, state=invalidated, reasonCode=agent-demoted)
+    /// replays as agent-demoted — on the live row, in the lag/snapshot
+    /// recovery, and on the delete-tombstone — never mislabelled
+    /// generation-ended.
+    #[tokio::test]
+    async fn a_demotion_replays_as_agent_demoted_not_generation_ended() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "demotion-reason").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        // The exact shell_pty retire_payload("invalidated", "agent-demoted")
+        // entity lifecycle.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity",
+                        "entityType": "interaction",
+                        "entityId": int_id,
+                        "revision": "3",
+                        "previousState": "pending",
+                        "state": "invalidated",
+                        "reasonCode": "agent-demoted",
+                        "evidenceEventIds": [],
+                        "entity": {
+                            "id": int_id,
+                            "state": "invalidated",
+                            "blocking": false,
+                            "answerable": false,
+                            "resolution": {
+                                "state": "known",
+                                "value": { "reason": "agent-demoted", "eventIds": [] }
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("demotion replay");
+
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        assert_eq!(
+            reason.as_deref(),
+            Some("agent-demoted"),
+            "a demotion stores its reason on the durable row"
+        );
+
+        // The snapshot/lag recovery carries the demotion reason through.
+        let recent = store
+            .recent_invalidated_interactions()
+            .await
+            .expect("recent");
+        let recovered = recent
+            .iter()
+            .find(|(_, id, _)| id == &int_id)
+            .expect("demotion row in recovery");
+        assert_eq!(recovered.2, "agent-demoted");
+
+        // Deleting the instance tombstones the row WITH its real reason (the
+        // already-invalidated demotion row is not re-stamped by the settle).
+        let (_, _) = store
+            .settle_instance_exited(instance.instance_id.clone(), "x".into())
+            .await
+            .expect("settle");
+        assert!(
+            store
+                .delete_instance(instance.instance_id.clone())
+                .await
+                .expect("delete")
+        );
+        let page = store
+            .invalidated_interactions_after(None)
+            .await
+            .expect("cursor page");
+        let tomb = page
+            .iter()
+            .find(|(_, id, _, _)| id == &int_id)
+            .expect("tombstone recovered");
+        assert_eq!(
+            tomb.2, "agent-demoted",
+            "the tombstone labels a demotion as agent-demoted, not generation-ended"
+        );
+        store.close().await;
+    }
+
     /// c-cardsettle r5 item 4 (OA6): the print/SDK mapper's REAL root turn
     /// failure (claude_print `map_result`: topic=turn, nativeName=result,
     /// status=error, resultIndex/numTurns) appended through the Hub ENDS THE
@@ -10478,8 +10575,30 @@ fn apply_interaction_event(
                 entity.get("state").and_then(Value::as_str),
             )
         {
+            // c-cardsettle r5 item 8: the entity lifecycle's reasonCode names
+            // WHY the interaction left pending (a transcript picker demotion
+            // is agent-demoted). Carry it as the entity resolution reason so
+            // reconnect/lag replay and the delete-tombstone label the row
+            // correctly instead of defaulting to generation-ended.
+            let payload_json = match event
+                .pointer("/payload/reasonCode")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty())
+            {
+                Some(reason_code) if matches!(state, "invalidated" | "expired") => {
+                    let mut stamped = event.clone();
+                    if let Some(value) = stamped
+                        .pointer_mut("/payload/entity/resolution/value")
+                        .filter(|value| value.is_object())
+                    {
+                        value["reason"] = json!(reason_code);
+                    }
+                    stamped.to_string()
+                }
+                _ => event.to_string(),
+            };
             conn.execute("UPDATE interactions SET state = ?1, blocking = 0, payload_json = ?2, updated_at = ?3 WHERE id = ?4",
-                params![state, event.to_string(), now_rfc3339(), id])?;
+                params![state, payload_json, now_rfc3339(), id])?;
         }
         return Ok(());
     }

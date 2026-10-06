@@ -212,8 +212,11 @@ test("removes a directory after confirmation and refuses it while a session is l
   if (!workspaces.some((row) => row.root === `${canonicalRoot()}/beta`)) {
     workspaces = await registerByPath(page, host, `${canonicalRoot()}/beta`);
   }
-  const beta = workspaces.find((row) => row.root === `${BROWSE_ROOT}/beta`);
+  const beta = workspaces.find((row) => row.root === `${canonicalRoot()}/beta`);
   expect(beta).toBeTruthy();
+  // Every later lookup (row filter, aria name, DELETE body) uses the root the
+  // fixture actually reported — round 4 item 8.
+  const betaRoot = beta!.root;
 
   // Start a live session in the directory.
   const created = await apiJson<{ instance: { instanceId?: string; id?: string } }>(
@@ -245,17 +248,17 @@ test("removes a directory after confirmation and refuses it while a session is l
   const hostWorkspaces = page.getByTestId("host-workspaces");
   const betaRow = hostWorkspaces
     .getByTestId("host-workspace")
-    .filter({ hasText: beta!.root });
+    .filter({ hasText: betaRoot });
   await expect(betaRow).toBeVisible();
 
   // First removal: the Hub refuses with the reason, shown inline; files stay.
-  await betaRow.getByRole("button", { name: `移除目录 ${beta!.root}` }).click();
+  await betaRow.getByRole("button", { name: `移除目录 ${betaRoot}` }).click();
   await expect(hostWorkspaces.getByRole("alert")).toContainText("live session", { timeout: 20_000 });
   const blocked = await apiStatus(
     page,
     "DELETE",
     `/v1/hosts/${host}/workspaces`,
-    { path: beta!.root },
+    { path: betaRoot },
   );
   expect(blocked.status).toBe(409);
   expect(blocked.body).toContain("live session");
@@ -278,8 +281,8 @@ test("removes a directory after confirmation and refuses it while a session is l
   expect(history.status).toBe(200);
 
   // Second removal settles and the row disappears (files are never deleted).
-  await betaRow.getByRole("button", { name: `移除目录 ${beta!.root}` }).click();
+  await betaRow.getByRole("button", { name: `移除目录 ${betaRoot}` }).click();
   await expect(betaRow).toBeHidden({ timeout: 20_000 });
   workspaces = await listWorkspaces(page, host);
-  expect(workspaces.some((row) => row.root === beta!.root)).toBe(false);
+  expect(workspaces.some((row) => row.root === betaRoot)).toBe(false);
 });

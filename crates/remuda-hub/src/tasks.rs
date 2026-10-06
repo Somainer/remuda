@@ -366,6 +366,28 @@ async fn create_task(
     let budget = budget_from(body.budget);
     let class = class_from(body.class.as_deref())?;
     let binding_request = body.workspace_binding;
+    // c-dirpicker round 4 item 5: validate the binding ids (and mode) BEFORE
+    // the task row is created, so a malformed binding returns 400 without
+    // leaving a task behind (no rollback needed).
+    let admission_target: Option<(HostId, WorkspaceId)> = match binding_request.as_ref() {
+        Some(request) => {
+            if request.mode.as_str() != "reuse" && request.mode.as_str() != "pool" {
+                return Err(HubError::BadRequest(format!(
+                    "workspaceBinding.mode must be `reuse` or `pool` (got {:?})",
+                    request.mode
+                )));
+            }
+            let host_id = HostId::try_from(request.host_id.clone()).map_err(|error| {
+                HubError::BadRequest(format!("workspaceBinding.hostId: {error}"))
+            })?;
+            let workspace_id =
+                WorkspaceId::try_from(request.workspace_id.clone()).map_err(|error| {
+                    HubError::BadRequest(format!("workspaceBinding.workspaceId: {error}"))
+                })?;
+            Some((host_id, workspace_id))
+        }
+        None => None,
+    };
     let task = state
         .store
         .create_task(
@@ -396,23 +418,11 @@ async fn create_task(
     //
     // c-dirpicker round 3 item 6: hold the per-workspace unbind lock for the
     // whole bind+publish so an unregister DELETE cannot observe this task's
-    // workspace before its binding is durable.
-    let admission_target: Option<(HostId, WorkspaceId)> = match binding_request.as_ref() {
-        Some(request) => {
-            let host_id = HostId::try_from(request.host_id.clone()).map_err(|error| {
-                HubError::BadRequest(format!("workspaceBinding.hostId: {error}"))
-            })?;
-            let workspace_id =
-                WorkspaceId::try_from(request.workspace_id.clone()).map_err(|error| {
-                    HubError::BadRequest(format!("workspaceBinding.workspaceId: {error}"))
-                })?;
-            Some((host_id, workspace_id))
-        }
-        None => None,
-    };
+    // workspace before its binding is durable. Ids/mode were validated before
+    // the task row was created (round 4 item 5).
     let _admission_guard = if let Some((host_id, workspace_id)) = &admission_target {
         Some(
-            crate::workspaces::hold_admission_lock(
+            crate::workspaces::hold_workspace_operation(
                 host_id.as_id().as_str(),
                 workspace_id.as_id().as_str(),
             )

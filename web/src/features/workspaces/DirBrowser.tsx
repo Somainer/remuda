@@ -130,39 +130,46 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
     [hostId, onClose, onRegistered],
   );
 
-  /// Validate and submit the advanced manually-typed path. Typed input is the
-  /// only place whitespace is trimmed.
+  /// Whether the typed manual value is an absolute path after leading
+  /// whitespace is ignored (trailing/internal content is preserved verbatim;
+  /// the Node decides whether such a directory exists).
+  const manualLooksAbsolute = useMemo(
+    () => manualPath.trimStart().startsWith("/"),
+    [manualPath],
+  );
+
+  /// Submit the advanced manually-typed path verbatim; leading whitespace
+  /// never makes a path non-absolute, but a trailing space (a legal filename
+  /// byte) is preserved — the Node is the authority on existence.
   const submitManual = useCallback(() => {
-    const typed = manualPath.trim();
-    if (!typed.startsWith("/")) {
+    if (!manualLooksAbsolute) {
       setError("请输入这台主机上的绝对路径，例如 /opt/projects/app");
       return;
     }
-    void registerPath(typed);
-  }, [manualPath, registerPath]);
+    void registerPath(manualPath);
+  }, [manualPath, manualLooksAbsolute, registerPath]);
 
   if (!open) return null;
 
   return (
     <Modal open={open} onClose={() => { if (!busy) onClose(); }} initialFocusRef={filterRef}>
-      {/* The modal portals to the document body but is mounted inside the
-          New Session component tree; a nested <form> here would still bubble
-          its implicit submit to the surrounding page form. Use a plain
-          container and stop Enter at the source on every inner control, so a
-          filter Enter or advanced-path submit can never create a session
-          (c-dirpicker round 3 item 9). */}
+      {/* The modal portals to document.body (outside any form), so Enter no
+          longer submits a surrounding form. Intercept Enter ONLY on the two
+          text inputs: the filter ignores it, the manual path triggers the
+          manual add. Enter on a focused row, breadcrumb or button is left
+          alone so keyboard activation works natively (round 4 item 6). */}
       <div
         className={css.browser}
         data-testid="dir-browser"
         onKeyDown={(event) => {
           if (event.key !== "Enter") return;
-          // Enter in the manual path field submits only the manual add; any
-          // other control (filter, buttons) just swallows the key.
+          const target = event.target as HTMLElement | null;
+          if (target?.tagName !== "INPUT") return;
           event.preventDefault();
           event.stopPropagation();
           if (
             manualOpen &&
-            (event.target as HTMLElement | null)?.dataset.testid === "dir-browser-manual-path"
+            target.dataset.testid === "dir-browser-manual-path"
           ) {
             submitManual();
           }
@@ -262,7 +269,7 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
           </Button>
           {manualOpen ? (
             <Button type="button" variant="primary" data-testid="dir-browser-manual-submit"
-              disabled={busy || disabled || !manualPath.trim()}
+              disabled={busy || disabled || !manualLooksAbsolute}
               onClick={submitManual}>
               {busy ? "添加中…" : "添加该路径"}
             </Button>

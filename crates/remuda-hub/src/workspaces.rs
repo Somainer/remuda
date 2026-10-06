@@ -24,72 +24,67 @@ fn unbind_locks() -> &'static std::sync::Mutex<HashMap<String, UnbindLock>> {
     LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// Per-`(host, workspace)` unbind lock plus a settled epoch for pruning
-/// idle entries (round 3 item 13). The map entry is removed once its
-/// operation has settled AND nobody is queued: a later caller lazily
-/// recreates it.
+/// One per-workspace serialization mutex plus a settled flag.
 struct UnbindLock {
     mutex: Arc<AsyncMutex<()>>,
-    /// Whether the operation using this entry has fully settled. Pruning
-    /// must skip an entry whose guard is still held even after settle.
+    /// Set when the holding operation fully settles (or is rejected); the
+    /// entry becomes prunable only then AND when the map is the sole holder
+    /// of the Arc (no waiter cloned it).
     settled: std::sync::atomic::AtomicBool,
 }
 
-/// Get or create the per-workspace lock, opportunistically pruning entries
-/// whose lock is uncontended and marked settled. `settled=false` marks the
-/// entry as busy until `mark_settled` after the operation completes; waiters
-/// copying the Arc keep it alive until they acquire.
-fn unbind_lock(host_id: &str, workspace_id: &str) -> Arc<AsyncMutex<()>> {
-    let key = format!("{host_id}\u{1f}{workspace_id}");
-    let mut map = unbind_locks().lock().unwrap();
-    // Opportunistic prune: remove finished, uncontended entries so the map
-    // does not grow without bound. try_lock succeeds on a settled entry with
-    // no waiter; the guard is released immediately, so an arriving peer that
-    // raced the prune simply recreates a fresh lock below.
-    map.retain(|_key, lock| {
-        if !lock.settled.load(std::sync::atomic::Ordering::Acquire) {
-            return true;
-        }
-        match lock.mutex.try_lock() {
-            Ok(guard) => {
-                drop(guard);
-                false
-            }
-            Err(_) => true,
-        }
-    });
-    let lock = map.entry(key).or_insert_with(|| UnbindLock {
-        mutex: Arc::new(AsyncMutex::new(())),
-        settled: std::sync::atomic::AtomicBool::new(false),
-    });
-    lock.settled
-        .store(false, std::sync::atomic::Ordering::Release);
-    lock.mutex.clone()
+/// RAII guard for one unbind/admission operation. Acquiring clones the mutex
+/// Arc (so the entry can never be pruned while a caller is queued or
+/// holding), and Drop marks the entry settled on EVERY exit path — success,
+/// rejection, or early return (c-dirpicker round 4 item 4).
+pub(crate) struct OperationGuard {
+    key: String,
+    // The held guard is declared before the Arc so it is dropped first,
+    // releasing the mutex before the Arc clone goes.
+    _held: tokio::sync::OwnedMutexGuard<()>,
+    _arc: Arc<AsyncMutex<()>>,
 }
 
-/// Mark one unbind/admission operation settled, making its lock prunable
-/// once no guard is held. Called after prepare→settle (or after the binding
-/// txn for a task admission).
-fn mark_lock_settled(host_id: &str, workspace_id: &str) {
-    let key = format!("{host_id}\u{1f}{workspace_id}");
-    let map = unbind_locks().lock().unwrap();
-    if let Some(lock) = map.get(&key) {
-        lock.settled
-            .store(true, std::sync::atomic::Ordering::Release);
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        if let Some(lock) = unbind_locks().lock().unwrap().get(&self.key) {
+            lock.settled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
-/// Hold the per-workspace unbind serialization lock for one binding
-/// admission (c-dirpicker round 3 item 6). Task creation binds a workspace
-/// under the same lock the DELETE/unregister holds through prepare→settle,
-/// so a task binding cannot be published in the check→unbind window; the
-/// occupancy query inside the DELETE then cannot miss it. The held guard
-/// also keeps idle mutex entries reachable while awaited.
-pub(crate) async fn hold_admission_lock(
-    host_id: &str,
-    workspace_id: &str,
-) -> tokio::sync::OwnedMutexGuard<()> {
-    unbind_lock(host_id, workspace_id).lock_owned().await
+/// Acquire the per-workspace serialization lock for one unregister or
+/// binding admission, pruning only entries that are settled AND held by the
+/// map alone (`Arc::strong_count == 1`). A waiter that cloned the Arc but
+/// has not acquired the mutex yet still bumps strong_count, so its entry can
+/// never be pruned out from under it and replaced by a new mutex (which would
+/// split serialization).
+pub(crate) async fn hold_workspace_operation(host_id: &str, workspace_id: &str) -> OperationGuard {
+    let key = format!("{host_id}\u{1f}{workspace_id}");
+    let arc = {
+        let mut map = unbind_locks().lock().unwrap();
+        // Opportunistic prune of settled entries the map uniquely owns.
+        map.retain(|_key, lock| {
+            !(lock.settled.load(std::sync::atomic::Ordering::Acquire)
+                && Arc::strong_count(&lock.mutex) == 1)
+        });
+        let lock = map.entry(key.clone()).or_insert_with(|| UnbindLock {
+            mutex: Arc::new(AsyncMutex::new(())),
+            settled: std::sync::atomic::AtomicBool::new(false),
+        });
+        lock.settled
+            .store(false, std::sync::atomic::Ordering::Release);
+        lock.mutex.clone()
+        // map lock released here; strong_count is at least 2 while `arc`
+        // lives, so no other acquire can prune this entry.
+    };
+    let held = arc.clone().lock_owned().await;
+    OperationGuard {
+        key,
+        _held: held,
+        _arc: arc,
+    }
 }
 
 /// Stable substrings the Node's unregister prepare emits for occupancy/race
@@ -100,6 +95,9 @@ const NODE_UNREGISTER_CONFLICT_MARKERS: &[&str] = &[
     "live session(s)",
     "being unregistered",
     "was replaced after unregister prepare",
+    // Node unregister commit re-counts occupancy (round 4 item 10).
+    "gained occupancy after unregister prepare",
+    "no longer registered",
 ];
 
 fn node_unregister_conflict(reason: &str) -> Option<&str> {
@@ -340,6 +338,8 @@ async fn workspace_id_for_path(
     path: &str,
 ) -> Result<Option<String>, HubError> {
     let host = host_id.to_owned();
+    // Passed verbatim: a registered directory name may really end in a space,
+    // and trimming would turn it into a different path (round 4 item 3).
     let normalized = normalize_absolute(path);
     let (_, workspaces) = state
         .store
@@ -362,25 +362,24 @@ async fn workspace_id_for_path(
     if lexical_match.is_some() {
         return Ok(lexical_match);
     }
-    // Ask the Node for the authoritative canonical identity of this path. A
-    // symlink alias (or any name the lexical pass could not equate) resolves
-    // to the same canonical root the Node registered; an unreadable or
-    // out-of-policy path returns 400 and the DELETE proceeds without a
-    // Hub-side workspace id to the Node's own prepare rejection.
-    if state.nodes.kind_of(host_id).await.is_some() {
-        let browse =
-            crate::http::call_node(state, host_id, "host.dirs.list", json!({"path": path})).await;
-        if let Ok(answer) = browse
-            && let Some(canonical) = answer.get("path").and_then(Value::as_str)
-        {
-            let found = workspaces
-                .iter()
-                .find(|workspace| workspace["root"].as_str() == Some(canonical))
-                .and_then(|workspace| workspace["workspaceId"].as_str().map(str::to_owned));
-            return Ok(found);
-        }
-    }
-    Ok(None)
+    // Ask the Node for the authoritative canonical identity of this path,
+    // using unregister's own path semantics (path verbatim). This resolves
+    // real names the lexical pass cannot equate (e.g. one ending in a
+    // space). Fail closed (round 4 item 3): if the Node refuses — a symlink
+    // escape, a missing/unreadable directory, an out-of-policy path — the
+    // Hub must not skip the occupancy guard and hope the prepare rejects it,
+    // because that would miss an active task. Surface the Node's refusal.
+    let answer =
+        crate::http::call_node(state, host_id, "host.dirs.list", json!({"path": path})).await?;
+    let Some(canonical) = answer.get("path").and_then(Value::as_str) else {
+        return Err(HubError::BadRequest(
+            "the Node could not resolve the directory to a registered workspace".into(),
+        ));
+    };
+    Ok(workspaces
+        .iter()
+        .find(|workspace| workspace["root"].as_str() == Some(canonical))
+        .and_then(|workspace| workspace["workspaceId"].as_str().map(str::to_owned)))
 }
 
 /// Lexically normalize an absolute path the way the Node's `canonicalize`
@@ -430,20 +429,15 @@ async fn mutate(
     // the Node's prepared-workspace create block closes the rest of the
     // window. Unknown paths skip the lock and fall through to the Node's
     // prepare rejection.
-    let unbind_key = if method == "workspace.unregister" {
-        workspace_id_for_path(state, &id, body.path.trim()).await?
+    if let Some(workspace_id) = if method == "workspace.unregister" {
+        workspace_id_for_path(state, &id, &body.path).await?
     } else {
         None
-    };
-    let unbind_arc = unbind_key
-        .as_ref()
-        .map(|workspace_id| unbind_lock(&id, workspace_id));
-    let _unbind_guard = match &unbind_arc {
-        Some(lock) => Some(lock.lock().await),
-        None => None,
-    };
-    if let Some(workspace_id) = &unbind_key {
-        let (sessions, tasks) = workspace_users(state, &id, workspace_id).await?;
+    } {
+        // RAII: held across every exit (success, occupancy refusal, Node
+        // rejection) and marked settled on Drop, so prune never splits a waiter.
+        let _operation_guard = hold_workspace_operation(&id, &workspace_id).await;
+        let (sessions, tasks) = workspace_users(state, &id, &workspace_id).await?;
         if sessions > 0 || tasks > 0 {
             let mut reasons = Vec::new();
             if sessions > 0 {
@@ -506,23 +500,30 @@ async fn mutate(
         .store
         .mark_settlement_timed_out(command.command_id.clone())
         .await?;
-    let settled = crate::http::call_node(
+    // Round 4 item 10: the Node re-counts occupancy at commit and can refuse
+    // if a session/reservation raced in after prepare; map that conflict to
+    // 409 like the prepare markers, instead of the generic channel 400.
+    let settled = match crate::http::call_node(
         state,
         &id,
         method,
         json!({"path": body.path, "commandId": command.command_id, "phase": "commit"}),
     )
-    .await?;
+    .await
+    {
+        Ok(answer) => answer,
+        Err(HubError::BadRequest(reason)) if node_unregister_conflict(&reason).is_some() => {
+            return Err(HubError::Conflict(reason));
+        }
+        Err(error) => return Err(error),
+    };
     require_phase(&settled, &command.command_id, "settled")?;
-    let workspace_id = settled.get("workspaceId").cloned();
-    observe_snapshot(state, &id, settled, Some(command.command_id)).await?;
+    observe_snapshot(state, &id, settled.clone(), Some(command.command_id)).await?;
     let mut response = snapshot_view(&state.store, id.clone()).await?;
-    if let Some(workspace_id) = workspace_id.and_then(|value| value.as_str().map(str::to_owned)) {
-        // The operation is fully settled; the per-workspace lock can be
-        // pruned once this guard drops.
-        mark_lock_settled(&id, &workspace_id);
-        response["workspaceId"] = json!(workspace_id);
+    if let Some(workspace_id) = settled.get("workspaceId").cloned() {
+        response["workspaceId"] = workspace_id;
     }
+    // `_operation_guard` drops here (success) and marks the entry settled.
     Ok(Json(response))
 }
 
@@ -688,33 +689,50 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn idle_settled_unbind_locks_are_pruned_busy_ones_kept() {
-        // Round 3 item 13: after settle an uncontended entry disappears on
-        // the next acquire; an unsettled entry always stays; a settled entry
-        // with a held guard stays until the guard drops.
-        let _a = hold_admission_lock("hst-prune", "wsp-a").await;
-        // A mere holder without settle is not pruned by another acquire.
-        let _b = hold_admission_lock("hst-prune", "wsp-b").await;
-        mark_lock_settled("hst-prune", "wsp-b");
-        // Acquiring an unrelated lock triggers opportunistic pruning; wsp-b
-        // is settled but its guard `_b` is still held, so it survives.
-        let _c = unbind_lock("hst-prune", "wsp-c");
-        {
-            let map = unbind_locks().lock().unwrap();
-            assert!(map.contains_key("hst-prune\u{1f}wsp-a"));
-            assert!(map.contains_key("hst-prune\u{1f}wsp-b"));
-            assert!(map.contains_key("hst-prune\u{1f}wsp-c"));
-        }
-        drop(_b);
-        // Now wsp-b is settled AND uncontended; the next acquire prunes it.
-        let _d = unbind_lock("hst-prune", "wsp-d");
-        {
-            let map = unbind_locks().lock().unwrap();
-            assert!(!map.contains_key("hst-prune\u{1f}wsp-b"));
-            assert!(map.contains_key("hst-prune\u{1f}wsp-a"));
-            assert!(map.contains_key("hst-prune\u{1f}wsp-c"));
-            assert!(map.contains_key("hst-prune\u{1f}wsp-d"));
-        }
+    async fn settled_locks_prune_when_unique_but_not_while_a_waiter_holds_the_arc() {
+        // Round 4 item 4: prune requires settled AND Arc::strong_count == 1,
+        // so a waiter that cloned the Arc while queued cannot have its mutex
+        // replaced out from under it.
+        let key_of = |workspace: &str| format!("hst-prune4\u{1f}{workspace}");
+        let contains = |workspace: &str| {
+            unbind_locks()
+                .lock()
+                .unwrap()
+                .contains_key(&key_of(workspace))
+        };
+
+        // A holds the mutex; B queues behind it (it clones the Arc before
+        // parking on lock_owned).
+        let a = hold_workspace_operation("hst-prune4", "wsp").await;
+        let waiter = tokio::spawn(hold_workspace_operation("hst-prune4", "wsp"));
+        // Let B run until it parks on the contested mutex.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // B is queued, A not settled: an unrelated acquire prunes nothing of
+        // wsp (unsettled entries always stay).
+        let _other = hold_workspace_operation("hst-prune4", "other").await;
+        assert!(contains("wsp"));
+
+        // A settles and releases; B acquires the SAME mutex.
+        drop(a);
+        let b = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("queued waiter acquires")
+            .expect("waiter task");
+
+        // B holds the (settled) entry; an unrelated acquire must not prune it
+        // because the map is not the sole Arc holder (B cloned it).
+        let _other2 = hold_workspace_operation("hst-prune4", "other2").await;
+        assert!(
+            contains("wsp"),
+            "settled entry with a queued/holding waiter must survive prune"
+        );
+
+        // B settles: now the map uniquely owns the Arc and it becomes prunable.
+        drop(b);
+        let _other3 = hold_workspace_operation("hst-prune4", "other3").await;
+        assert!(!contains("wsp"), "settled sole-owner entry must be pruned");
     }
 
     /// Minimal tables carrying only the columns the usage guard reads.

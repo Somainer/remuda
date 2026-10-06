@@ -39,6 +39,16 @@ struct Mutation {
     settled: bool,
 }
 
+/// Test-only async barrier between create resolution and occupancy
+/// reservation (c-dirpicker round 4 item 2). Defined here so both the
+/// runtime field and the workspace mutation tests share the type.
+#[cfg(test)]
+pub(crate) type CreateBarrierFn = std::sync::Arc<
+    dyn Fn(&WorkspaceId) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub(crate) struct WorkspaceRegistry {
     state: RegistryState,
     file: Option<PathBuf>,
@@ -65,10 +75,12 @@ impl WorkspaceRegistry {
         }
         // Canonicalize once at policy load and pin each root's identity; a
         // later symlinked/replaced ancestor is refused by the directory
-        // browser (c-dirpicker round 3).
+        // browser (c-dirpicker round 3). Identity is mandatory on unix
+        // (round 4 item 1): an un-stat-able root fails policy load instead of
+        // silently browsing unpinned.
         let roots = configured_roots
             .iter()
-            .map(|root| canonical_directory(root).map(crate::dir_browser::AllowedRoot::new))
+            .map(|root| canonical_directory(root).and_then(crate::dir_browser::AllowedRoot::new))
             .collect::<Result<Vec<_>, _>>()?;
         let file = config
             .workspace_registry
@@ -127,19 +139,34 @@ impl WorkspaceRegistry {
     /// closure too. The counter has its own mutex because the returned guard
     /// releases the slot after the registry guard was dropped (the create
     /// holds it across an await).
+    ///
+    /// Round 4 item 2: this also re-validates *membership* under the same
+    /// write lock. A create resolves its workspace earlier (a slow
+    /// canonicalize/worktree probe) while only holding a read lock; an
+    /// unregister can commit and remove the membership in that window.
+    /// Checking both membership and unbinding here, atomically with the
+    /// reservation, closes the gap.
     pub(crate) fn reserve_locked(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<WorkspaceReservation, NodeError> {
+        let root_path = self
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.meta.id == workspace_id)
+            .ok_or_else(|| {
+                NodeError::Conflict(format!(
+                    "workspace {} is no longer registered on this Node",
+                    workspace_id.as_id()
+                ))
+            })?
+            .root_path
+            .clone();
         if self.state.unbinding.contains(workspace_id) {
             return Err(NodeError::Conflict(format!(
                 "workspace {} is being unregistered; wait for it to settle before starting a session",
-                self.state
-                    .workspaces
-                    .iter()
-                    .find(|workspace| &workspace.meta.id == workspace_id)
-                    .map(|workspace| workspace.root_path.clone())
-                    .unwrap_or_default()
+                root_path
             )));
         }
         *self
@@ -1703,6 +1730,75 @@ mod tests {
             json!({"commandId": "remove-failed", "path": workspace.root_path, "phase": "commit"}),
         )
         .unwrap();
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_after_resolution_is_refused_when_unregister_committed_in_the_gap() {
+        // Round 4 item 2: resolve_workspace_cwd runs (slow fs resolution)
+        // before the occupancy reservation. A barrier parks the create right
+        // after resolution; an unregister commits in that window; when the
+        // create resumes, the SAME write-lock step that reserves also
+        // re-checks membership and refuses it.
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(root.path().to_path_buf())
+            .with_workspace_roots(vec![root.path().to_path_buf()])
+            .with_workspace_registry(data.path().to_path_buf());
+        let node = crate::DevNode::new(&config).unwrap();
+        let workspace = node.workspaces().unwrap()[0].clone();
+        let workspace_id = workspace.meta.id.clone();
+        let root_path = workspace.root_path.clone();
+
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (reached2, release2) = (reached.clone(), release.clone());
+        let barrier: CreateBarrierFn = std::sync::Arc::new(move |_id| {
+            let (reached, release) = (reached2.clone(), release2.clone());
+            Box::pin(async move {
+                reached.notify_one();
+                release.notified().await;
+            })
+        });
+        node.set_create_reservation_barrier(barrier).await;
+
+        let node_for_create = node.clone();
+        let create = tokio::spawn(async move {
+            let request: crate::CreateInstanceRequest = serde_json::from_value(json!({
+                "workspaceId": workspace_id,
+                "kind": "terminal",
+                "driver": "shell-pty",
+                "args": ["/bin/true"],
+                "prompt": "",
+            }))
+            .unwrap();
+            node_for_create.create_instance(request).await
+        });
+
+        // Wait until the create is parked between resolution and reservation.
+        reached.notified().await;
+        // Commit an unregister for the resolved workspace.
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "gap-unregister", "path": root_path, "phase": "prepare"}),
+        )
+        .unwrap();
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "gap-unregister", "path": root_path, "phase": "commit"}),
+        )
+        .unwrap();
+        // Release the parked create.
+        release.notify_one();
+
+        let result = create.await.expect("create task joins");
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("no longer registered"),
+            "create after a committed unregister must be refused at the \
+             membership+reservation step, got: {error}"
+        );
         node.shutdown().await.unwrap();
     }
 

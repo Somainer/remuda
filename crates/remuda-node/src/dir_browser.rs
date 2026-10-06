@@ -55,15 +55,16 @@ fn refused() -> NodeError {
 /// A configured allowlist root: canonical path plus the (dev, ino) identity
 /// pinned when the workspace policy was loaded. The identity lets a
 /// request-time walk detect an ancestor that became a symlink or a different
-/// real directory after Node startup (c-dirpicker round 3).
+/// real directory after Node startup (c-dirpicker round 3). Round 4 item 1:
+/// on unix the identity is mandatory — policy load fails for a root whose
+/// metadata cannot be read, instead of silently disabling pinning.
 #[derive(Clone)]
 pub(crate) struct AllowedRoot {
     /// Canonical path of the root.
     pub(crate) path: PathBuf,
-    /// Pinned inode identity on unix; absent where inode identity is not
-    /// available (non-unix fallback builds).
+    /// Pinned inode identity on unix.
     #[cfg(unix)]
-    pub(crate) identity: Option<RootIdentity>,
+    pub(crate) identity: RootIdentity,
 }
 
 /// Pinned root identity for an [`AllowedRoot`]. Both fields are normalized
@@ -84,17 +85,26 @@ impl AllowedRoot {
         Self { path }
     }
 
+    /// Construct from a canonical path that has just been canonicalized by
+    /// the caller. On unix the identity is required: a root whose metadata
+    /// cannot be stat'd is rejected rather than admitted unpinned.
     #[cfg(unix)]
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Result<Self, NodeError> {
         use std::os::unix::fs::MetadataExt;
-        // Cast through u64 (do not copy the raw fields): Darwin st_dev is i32.
-        // The cast is a no-op on Linux and allowed for portability.
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            NodeError::InvalidConfig(format!(
+                "allowed workspace root {} is not accessible: {error}",
+                path.display()
+            ))
+        })?;
+        // Cast through u64 (no-op on Linux's 64-bit dev_t, required for
+        // Darwin's i32 dev_t).
         #[allow(clippy::unnecessary_cast)]
-        let identity = std::fs::metadata(&path).ok().map(|metadata| RootIdentity {
+        let identity = RootIdentity {
             dev: MetadataExt::dev(&metadata) as u64,
             ino: MetadataExt::ino(&metadata) as u64,
-        });
-        Self { path, identity }
+        };
+        Ok(Self { path, identity })
     }
 }
 
@@ -324,24 +334,19 @@ mod imp {
                 anchor = open_component(Some(anchor.0), &cstr)?;
             }
         }
-        if let Some(identity) = &pin.identity {
-            let stat = fstat(anchor.0).map_err(nix_err)?;
-            // Compare in u64: Darwin st_dev is i32 and would not typecheck
-            // against the pinned u64 identity without the cast (a no-op cast
-            // on Linux, hence the scoped allow).
-            #[allow(clippy::unnecessary_cast)]
-            let same = stat.st_dev as u64 == identity.dev && stat.st_ino as u64 == identity.ino;
-            if !same {
-                return Err(refused());
-            }
+        // The pin was built from metadata at policy load; verify the opened
+        // root fd still has exactly that identity (portable u64 compare).
+        let stat = fstat(anchor.0).map_err(nix_err)?;
+        #[allow(clippy::unnecessary_cast)]
+        let stat_identity = RootIdentity {
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+        };
+        if pin.identity != stat_identity {
+            return Err(refused());
         }
-        // RootFd needs an owned pin; the caller borrowed it. The pin is small
-        // and only roots configured for this Node are cloned.
         Ok(RootFd {
-            pin: AllowedRoot {
-                path: pin.path.clone(),
-                identity: pin.identity,
-            },
+            pin: pin.clone(),
             fd: anchor,
         })
     }
@@ -642,7 +647,7 @@ mod tests {
     }
 
     fn roots_for(dir: &tempfile::TempDir) -> Vec<AllowedRoot> {
-        vec![AllowedRoot::new(fs::canonicalize(dir.path()).unwrap())]
+        vec![AllowedRoot::new(fs::canonicalize(dir.path()).unwrap()).unwrap()]
     }
 
     #[test]
@@ -779,7 +784,7 @@ mod tests {
         fs::create_dir_all(outside.path().join("stolen")).unwrap();
         let canonical = fs::canonicalize(root.path()).unwrap();
         let target = canonical.join("a");
-        let roots = vec![AllowedRoot::new(canonical.clone())];
+        let roots = vec![AllowedRoot::new(canonical.clone()).unwrap()];
 
         // Swap the verified directory for a symlink AFTER the lexical
         // containment check but BEFORE its component open (test seam).
@@ -823,7 +828,7 @@ mod tests {
         fs::create_dir_all(outside.path().join("elsewhere")).unwrap();
         let canonical = fs::canonicalize(base.path().join("parent/root")).unwrap();
         // Pin the identity at policy load.
-        let roots = vec![AllowedRoot::new(canonical.clone())];
+        let roots = vec![AllowedRoot::new(canonical.clone()).unwrap()];
         // Baseline listing works.
         assert!(list_directories(&roots, &[], request(None, false)).is_ok());
         // Replace the root's PARENT with a symlink to an outside tree.
@@ -951,7 +956,7 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             paths.push(fs::canonicalize(&dir).unwrap());
         }
-        let root = vec![AllowedRoot::new(fs::canonicalize(base.path()).unwrap())];
+        let root = vec![AllowedRoot::new(fs::canonicalize(base.path()).unwrap()).unwrap()];
         let result = list_directories(&root, &paths, request(None, false)).unwrap();
         assert_eq!(result.workspaces.len(), HOST_DIRS_MAX_SHORTCUTS);
         assert!(result.truncated);
@@ -963,7 +968,7 @@ mod tests {
         fs::create_dir_all(root.path().join("one")).unwrap();
         let canonical_root = fs::canonicalize(root.path()).unwrap();
         let registered = vec![canonical_root.join("one")];
-        let roots = vec![AllowedRoot::new(canonical_root.clone())];
+        let roots = vec![AllowedRoot::new(canonical_root.clone()).unwrap()];
         let result = list_directories(&roots, &registered, request(None, false)).unwrap();
         assert_eq!(result.workspaces, vec![registered[0].display().to_string()]);
     }

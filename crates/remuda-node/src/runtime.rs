@@ -121,6 +121,13 @@ pub(crate) struct DevNodeInner {
     /// proxy-side egress contexts, and the live carrier link's frame broker.
     pub(crate) api_relay: Arc<crate::api_relay::ApiRelayState>,
     diagnostics: std::sync::RwLock<crate::DoctorContext>,
+    /// Test-only barrier fired after workspace/cwd resolution and before the
+    /// occupancy reservation in instance create (c-dirpicker round 4 item 2),
+    /// so a test can commit an unregister in that window and prove the create
+    /// is then refused. None outside tests.
+    #[cfg(test)]
+    pub(crate) create_reservation_barrier:
+        tokio::sync::RwLock<Option<crate::workspace::CreateBarrierFn>>,
 }
 
 /// In-process Node used by the development REST/JSON-RPC/WS surface.
@@ -243,8 +250,20 @@ impl DevNode {
                 gate: crate::gate::GateRegistry::new(),
                 api_relay: crate::api_relay::ApiRelayState::new(),
                 diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
+                #[cfg(test)]
+                create_reservation_barrier: tokio::sync::RwLock::new(None),
             }),
         })
+    }
+
+    /// Install the create reservation test barrier (c-dirpicker round 4
+    /// item 2).
+    #[cfg(test)]
+    pub(crate) async fn set_create_reservation_barrier(
+        &self,
+        barrier: crate::workspace::CreateBarrierFn,
+    ) {
+        *self.inner.create_reservation_barrier.write().await = Some(barrier);
     }
 
     /// Return the local development Host registry record.
@@ -735,11 +754,17 @@ impl DevNode {
         let (workspace, workspace_root) =
             self.resolve_workspace_cwd(request.workspace_id.as_ref(), request.cwd.as_deref())?;
         let workspace_id = workspace.meta.id.clone();
+        // c-dirpicker round 4 item 2 test barrier: after slow resolution,
+        // before the atomic membership+reservation step.
+        #[cfg(test)]
+        if let Some(barrier) = self.inner.create_reservation_barrier.read().await.clone() {
+            barrier(&workspace_id).await;
+        }
         // c-dirpicker round 3 item 6: reserve occupancy under the registry's
         // write lock, atomically with the unregister-unbinding check, and
         // hold it until the instance row is durable (or any failure drops
-        // the guard). An unregister prepare in between counts this and
-        // refuses; an unregister already prepared refuses the create here.
+        // the guard). Round 4 item 2: the same step re-validates membership,
+        // closing the resolve→unregister-commit race.
         // Held (not just an underscore binding) until the end of this
         // function: its Drop releases the occupancy reservation after the
         // instance row is durable or this create returns an error.

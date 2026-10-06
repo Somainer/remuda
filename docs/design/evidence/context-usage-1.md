@@ -21,13 +21,20 @@ on hover.
 
 ## Data model — Hub-computed additive rollup
 
-The Node usage adapters (`remuda-driver/src/usage/*`) already append protocol
-`UsagePayload` observations (`inputTokens`, `outputTokens`, `cacheReadTokens`,
-`cacheWriteTokens`, …, every counter wrapped in `Knowledge`). The Hub already persisted
-them into `usage_events` (`usage_store.rs`). What was missing was a per-session
-projection. Added `InstanceUsageRollup`, computed inside `load_instance` from the
-durable table (recomputed on read, so TPM windows never go stale; nothing redundant is
-stored on the instance row):
+The print-mode (`claude --print` / SDK) Node usage adapter
+(`remuda-driver/src/usage/*`) appends protocol `UsagePayload` observations
+(`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, …, every
+counter wrapped in `Knowledge`). The Hub persists them into `usage_events`
+(`usage_store.rs`). What was missing until c-ctxusage RC1 was emission from the
+**native TUI carriers**: `claude-pty` and promoted shell-pty map transcripts
+through `TranscriptMapper`, which ignored `message.usage`, so those sessions
+had no usage rows at all. The mapper now emits one `Usage` payload per finished
+assistant message group (last record's usage, scope `Turn`, scope_id = the
+message id), and `usage_events` dedupes on `(instance_id, scope, scope_id)` so
+a re-hydrated transcript cannot double-count. The per-session projection is
+`InstanceUsageRollup`, computed inside `load_instance` from the durable table
+(recomputed on read, so TPM windows never go stale; nothing redundant is stored
+on the instance row):
 
 | Wire field (camelCase) | Meaning |
 | --- | --- |

@@ -111,7 +111,7 @@ print 退役条件引用的是「连续 3 次全绿」的 parity gate；本次�
 
 ## 7. 后续接入清单（非本 PR 范围）
 
-- [ ] claude transcript tail 接入：`TranscriptTail` 新行 → `usage_from_transcript_line` → per-instance aggregator；turn 边界由现有 lifecycle 信号确定。
+- [x] claude transcript tail 接入：`TranscriptMapper` 在每个 assistant 消息组结束时发一个 `Usage`（scope `Turn`、scope_id = message.id、取该组最后一条记录的 usage），`claude-pty` 与 promoted shell-pty 由此产出 usage；Hub 侧 `usage_events` 按 `(instance_id, scope, scope_id)` 去重，re-hydration 不重复计数（c-ctxusage RC1，2026-10）。
 - [ ] codex：`RolloutTail` 全量喂 `CodexUsage`（可无脑喂，累计快照会被拒）。
 - [ ] grok：tail `usage.json`（整文件 snapshot）+ `updates.jsonl`；首次真实 `usage.json` 复核偏差 4。
 - [ ] 每次发负载带 `PRICE_TABLE_REVISION` 可追溯性（待协议字段，偏差 7）。

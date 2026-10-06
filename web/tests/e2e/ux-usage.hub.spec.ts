@@ -188,9 +188,9 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   // cannot open a popover.
   const chip = page.getByTestId("context-chip");
   await expect(chip).toHaveText("—");
-  expect(chip).toHaveAttribute("data-has-popover", "0");
+  await expect(chip).toHaveAttribute("data-has-popover", "0");
   await chip.click();
-  expect(await page.getByTestId("context-usage-popover").count()).toBe(0);
+  await expect(page.getByTestId("context-usage-popover")).toHaveCount(0);
 
   // Turn 1 — the recorded sequence's first row (4794 / 260 / 29496 read).
   // Next-request context = 4794 + 29496 = 34290 → 17% of the 200k window.
@@ -283,7 +283,7 @@ test("context chip popover becomes a sheet at 390 px touch width", async ({ brow
     await chip.click();
     const sheet = narrow.getByTestId("context-usage-popover");
     await expect(sheet).toBeVisible();
-    expect(sheet).toHaveAttribute("data-mobile", "1");
+    await expect(sheet).toHaveAttribute("data-mobile", "1");
     // Close affordance exists and dismisses the sheet.
     await narrow.getByTestId("context-usage-close").click();
     await expect(sheet).toHaveCount(0);

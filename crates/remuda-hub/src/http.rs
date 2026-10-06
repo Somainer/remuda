@@ -1930,21 +1930,21 @@ async fn resume_lineage(
             }
         }
     }
-    // ma-lineage round 2: a LIVE chapter with no reported native session is
-    // not safe to continue — relaunching blank from the origin spec would
-    // silently discard the conversation the still-running process holds.
-    // Refuse with a clear 409; the owner retries once the chapter reports a
-    // session (or after real process-end evidence, where the origin-spec
-    // recovery is correct).
-    if recovery_session.is_none() {
-        let process_end = matches!(current.lifecycle.as_str(), "exited" | "closed");
-        if !process_end {
-            return Err(HubError::Conflict(
-                "the current chapter has not reported a native session to continue; \
-                 retry once it has, or close it first"
-                    .into(),
-            ));
-        }
+    // ma-lineage round 2 item 9 + round 3 item 3 (OA6): a chapter with no
+    // native session is continued only when there is explicit process-end
+    // evidence. A LIVE chapter (no session yet) is refused with a clear 409 —
+    // relaunching blank would discard the conversation the running process
+    // holds. But an ATTESTED LAUNCH FAILURE (the Node rejected create, or the
+    // create was never acknowledged, so the process never started) IS
+    // process-end evidence ("a launch that never started"), exactly like an
+    // exited/closed chapter; it must take the fresh-recovery path, not 409.
+    if recovery_session.is_none() && !crate::store::instance_row_has_process_end_evidence(&current)
+    {
+        return Err(HubError::Conflict(
+            "the current chapter has not reported a native session to continue; \
+             retry once it has, or close it first"
+                .into(),
+        ));
     }
     let (mut spec, operation) = match recovery_session {
         Some(session_id) => {
@@ -2082,17 +2082,16 @@ async fn resume_lineage(
             (resumed.fenced, resumed.successor, resumed.command)
         }
     };
-    // D-057 OA6 (ma-lineage round 2): `failed` is turn-level, not process
-    // termination — a live predecessor after a retryable SDK turn error is
-    // still running its process, and fencing it without closing the process
-    // would leave two live chapters. Only genuine process-end evidence
-    // (exited/closed) means there is nothing to stop, so close unless that
-    // evidence exists. A `failed` chapter on a host with a live link MUST be
-    // closed; a `requested`/`starting` chapter that never started is not
-    // process-end either, but closing it is harmless and idempotent.
+    // D-057 OA6 (ma-lineage): close the fenced predecessor's process only when
+    // it could still be running. Terminal lifecycle is explicit process-end
+    // evidence — an exited/closed process has nothing to stop, and a `failed`
+    // chapter is an attested launch failure (the process never started,
+    // round 3 item 3), also nothing to close. A still-live chapter
+    // (ready/running/requested/starting) on a host with a live link MUST be
+    // closed so two chapters never run at once.
     let host_live = state.nodes.kind_of(&fenced.host_id).await.is_some();
-    let has_process_end_evidence = matches!(fenced.lifecycle.as_str(), "exited" | "closed");
-    if host_live && !has_process_end_evidence {
+    let predecessor_process_ended = crate::store::instance_row_has_process_end_evidence(&fenced);
+    if host_live && !predecessor_process_ended {
         // Until ma-fence lands, the old process loses Hub authority through
         // its deleted launch credential; the Hub still forwards the existing
         // instance.close so the live process stops.

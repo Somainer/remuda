@@ -1105,6 +1105,61 @@ async fn an_error_severity_event_then_ready_leaves_ended_at_null() -> Result<()>
     Ok(())
 }
 
+/// r3 item 3: an ATTESTED LAUNCH FAILURE (the launch never started, no native
+/// session) is process-end evidence; the owner's resume takes the
+/// fresh-recovery path (instance.create), not the live-chapter 409.
+#[tokio::test]
+async fn a_sessionless_launch_failure_resumes_via_fresh_recovery() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // Deliberately NO session: the child never initialized. Drain the create.
+    // Then the Node attests the launch failed (it rejects before init).
+    node.appends.send((
+        x.clone(),
+        json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-06T01:00:00.000Z",
+            "payload": {
+                "type": "native", "topic": "session",
+                "nativeName": "native-driver-start-failed",
+                "status": { "state": "known", "value": "failed" },
+                "severity": "error", "affectsCompletion": true,
+                "relatedIds": {
+                    "reasonCode": "native-driver-start-failed",
+                    "lastError": "agent process exited during startup"
+                }
+            }
+        }),
+    ))?;
+    ctx.wait_until(&x, |v| v["lifecycle"] == json!("failed"))
+        .await?;
+    let failed = ctx.get_instance(&x, &ctx.human).await?;
+    assert!(failed["nativeSessionId"].is_null());
+
+    // Resume a sessionless, launch-failed chapter: fresh recovery (200, not
+    // 409), and the queued command is a fresh instance.create.
+    let recovered: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(recovered["instance"]["generation"], json!(2));
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(
+        method, "instance.create",
+        "an attested launch failure relaunches fresh"
+    );
+    assert!(
+        params["spec"]
+            .get("resumeSessionId")
+            .is_none_or(|v| v.is_null()),
+        "fresh recovery must not carry a resume session id"
+    );
+    Ok(())
+}
+
 /// A resume addressed to an already-fenced chapter returns its existing
 /// successor idempotently (r2-8): it must not fence the live chapter or mint
 /// another generation.

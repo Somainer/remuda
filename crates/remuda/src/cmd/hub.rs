@@ -73,12 +73,9 @@ fn rotate_bootstrap(config: &Config) -> anyhow::Result<()> {
         config.data_dir.clone()
     };
     let token_file = target_dir.join("bootstrap-token");
-    anyhow::ensure!(
-        token_file.is_file(),
-        "no persisted bootstrap-token in {} — the running Hub may be using an explicit \
-         --access-code-file; rotate that file instead (stopping the Hub first)",
-        target_dir.display()
-    );
+    // rotate_bootstrap performs the authoritative provenance-marker check and
+    // refuses (without writing) when no token exists or an explicit file/env
+    // governs the persisted code.
     let token = remuda_hub::rotate_bootstrap(&target_dir)?;
     tracing::info!(
         path = %token_file.display(),
@@ -89,18 +86,30 @@ fn rotate_bootstrap(config: &Config) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn start(config: &Config) -> anyhow::Result<remuda_hub::RunningHub> {
+    // c-bootstrap-dev round 2: resolve through SecretRef::resolve so
+    // trailing-whitespace normalisation and empty-secret rejection apply
+    // uniformly (a manual read regressed both). The secret value is NEVER put
+    // in an error: SecretRef::resolve names only the env var / file path, and
+    // the file context adds the path only. Provenance for the hub's marker is
+    // derived from the reference separately.
     let (bootstrap_token, bootstrap_token_file, bootstrap_token_from_env) =
         match config.hub.bootstrap_token.as_ref() {
             Some(crate::config::SecretRef::File(path)) => {
-                let token = std::fs::read_to_string(path)
-                    .with_context(|| format!("cannot read access-code file {}", path.display()))?
-                    .trim()
-                    .to_string();
-                (token, Some(path.clone()), false)
+                let secret = crate::config::SecretRef::File(path.clone())
+                    .resolve()
+                    .with_context(|| format!("cannot read access-code file {}", path.display()))?;
+                (secret.into_string(), Some(path.clone()), false)
             }
-            Some(crate::config::SecretRef::Env(var)) => {
-                let token = std::env::var(var).with_context(|| format!("{var} is not set"))?;
-                (token, None, true)
+            Some(crate::config::SecretRef::Env(_var)) => {
+                // Re-resolve the same reference; the error names only the env
+                // var, never its value.
+                let secret = config
+                    .hub
+                    .bootstrap_token
+                    .as_ref()
+                    .expect("matched Some")
+                    .resolve()?;
+                (secret.into_string(), None, true)
             }
             None => (String::new(), None, false),
         };

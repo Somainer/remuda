@@ -58,22 +58,26 @@ access-code/bootstrap file; do not place credentials in URLs.
 When the Hub starts under `remuda dev --access-code-file F` (or with
 `REMUDA_BOOTSTRAP_TOKEN` set), the provided code is persisted into the dev
 Hub data directory (`<data-dir>/dev-hub/bootstrap-token`) together with an
-issue timestamp. On every restart the Hub re-reads the explicit code and:
+issue timestamp, and a provenance marker
+(`bootstrap-token-source-explicit`) records that the code's source of truth is
+the file/env.
 
-- re-persists it and re-stamps the timestamp when the code differs from the
-  persisted token (the file was replaced), or
-- (file source only) when the access-code file's mtime is newer than the
-  stored timestamp (the file was edited/rotated out of band).
-
-This keeps a working access-code file valid across restarts; it does not
-silently expire after the default 24-hour TTL (`DEFAULT_BOOTSTRAP_TTL_HOURS`,
-set to `0` to disable TTL entirely).
+An explicit code does **not** skip the TTL. On a restart the issue timestamp
+is refreshed **only** when the supplied code changed (the file was replaced)
+or — for a file source — the file's mtime is newer than the stored stamp.
+Starting with an untouched file or an unchanged env var simply reuses the
+existing stamp, so that code still expires after `bootstrap_ttl_hours`
+(default **24**; set to `0` to disable expiry entirely).
 
 `remuda hub rotate-bootstrap --data-dir D` detects the dev layout and writes
-to `D/dev-hub/`. It refuses when that directory has no persisted
-`bootstrap-token` — in that case the Hub is using an explicit
-`--access-code-file` and rotation must change that file instead (stop the
-Hub, replace the file, restart).
+to `D/dev-hub/`. It refuses (non-zero exit, token and stamp untouched) when
+that directory has no persisted `bootstrap-token`, or when the explicit-source
+marker is present — in that case the running Hub uses an operator-supplied
+`--access-code-file` / env and rotation cannot change it: stop the Hub,
+replace the file/env, and restart. A hub-generated token — including a
+restored data dir with a token and no explicit source — rotates normally.
+Starting the Hub once with no explicit code removes the marker and adopts the
+persisted token as hub-generated.
 
 ## Live instances across hosts
 

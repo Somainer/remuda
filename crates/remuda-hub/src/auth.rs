@@ -67,6 +67,17 @@ pub fn persist_bootstrap(data_dir: &Path, token: &str) -> Result<(), HubError> {
     Ok(())
 }
 
+/// Sibling marker recording that the persisted `bootstrap-token` is governed
+/// by an operator-supplied explicit access code (`--access-code-file` or
+/// `REMUDA_BOOTSTRAP_TOKEN`), written at every start that HAS an explicit
+/// source and removed at a later start with NO explicit source.
+///
+/// Present  ⇒ the code's source of truth is the file/env; rotate-bootstrap
+///            refuses to mint or re-stamp over it.
+/// Absent   ⇒ the token is hub-generated (minted here, or a restored data dir
+///            adopted at a no-source start) and rotation is allowed.
+const BOOTSTRAP_EXPLICIT_MARKER: &str = "bootstrap-token-source-explicit";
+
 fn write_private(path: &Path, contents: &str) -> Result<(), HubError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -85,84 +96,114 @@ fn write_private(path: &Path, contents: &str) -> Result<(), HubError> {
     Ok(())
 }
 
+/// Whether the data dir carries the explicit-source provenance marker.
+fn bootstrap_source_is_explicit(data_dir: &Path) -> bool {
+    data_dir.join(BOOTSTRAP_EXPLICIT_MARKER).is_file()
+}
+
+/// Write (explicit source) or remove (hub-generated / adopted) the provenance
+/// marker.
+fn set_bootstrap_explicit_marker(data_dir: &Path, explicit: bool) -> Result<(), HubError> {
+    let marker = data_dir.join(BOOTSTRAP_EXPLICIT_MARKER);
+    if explicit {
+        write_private(&marker, "")
+    } else {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(HubError::Internal(format!("bootstrap marker: {err}"))),
+        }
+    }
+}
+
 /// Resolve the bootstrap access code, generating one when the config is empty.
 ///
-/// c-bootstrap-dev: when the token is explicitly provided via
-/// `--access-code-file` (`config.bootstrap_token_file`) or
-/// `REMUDA_BOOTSTRAP_TOKEN` (`config.bootstrap_token_from_env`), it is
-/// re-persisted and re-stamped at startup whenever:
-/// 1. it differs from the persisted `bootstrap-token`, or
-/// 2. (file source only) the access-code file's mtime is newer than the
-///    stored `bootstrap-issued-at` stamp — the file was rotated out-of-band.
-///
-/// This keeps a working access-code file valid across restarts instead of
-/// silently expiring after the TTL (D-018 stamp only refreshed on first
-/// write).
+/// c-bootstrap-dev round 2: an EXPLICIT `--access-code-file` / env is the
+/// operator's source of truth, so the Hub must NEVER mint or overwrite the
+/// persisted token (rotation would re-stamp and revive a code the running Hub
+/// rejects). Provenance is recorded with a sibling marker:
+///   * explicit source present → persist the code + fresh stamp, and WRITE the
+///     explicit-source marker (rotate-bootstrap then refuses);
+///   * no explicit source        → REMOVE any explicit marker; load a restored
+///     token as hub-generated or mint a new one (rotation allowed).
 pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<(), HubError> {
     let token_path = config.data_dir.join("bootstrap-token");
     let explicit = !config.bootstrap_token.is_empty()
         && (config.bootstrap_token_file.is_some() || config.bootstrap_token_from_env);
 
-    if config.bootstrap_token.is_empty() {
-        if token_path.is_file() {
-            config.bootstrap_token = std::fs::read_to_string(&token_path)
-                .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
-                .trim()
-                .to_string();
-            // Pre-D-018 data dirs have no stamp; treat first sight as issue time
-            // rather than expiring an operator's working code on upgrade.
-            let stamp = config.data_dir.join("bootstrap-issued-at");
-            if !stamp.is_file() {
-                write_private(&stamp, &now_rfc3339())?;
-            }
-            return Ok(());
-        }
-        config.bootstrap_token = random_token();
-    }
-
-    // Decide whether the explicit/generated token must be (re-)persisted.
-    let mut needs_persist = !token_path.is_file();
-
     if explicit {
-        let persisted = if token_path.is_file() {
-            std::fs::read_to_string(&token_path)
-                .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
-                .trim()
-                .to_string()
-        } else {
-            String::new()
-        };
-        // (1) The provided code differs from what is persisted.
-        if persisted != config.bootstrap_token {
-            needs_persist = true;
-        }
-        // (2) The access-code file is newer than the stored stamp.
-        if let Some(file_path) = &config.bootstrap_token_file
-            && let Ok(file_meta) = std::fs::metadata(file_path)
-            && let Some(stamp_text) =
-                std::fs::read_to_string(config.data_dir.join("bootstrap-issued-at")).ok()
-            && let Ok(stamp) = time::OffsetDateTime::parse(
-                stamp_text.trim(),
-                &time::format_description::well_known::Rfc3339,
-            )
-            && let Ok(file_mtime) = file_meta.modified()
-            && time::OffsetDateTime::from(file_mtime) > stamp
-        {
-            needs_persist = true;
-        }
+        // The explicit code is authoritative. Persist it for
+        // follow/GET-reliant reads and write a fresh issue stamp so the file/
+        // env code is valid for its full TTL from this start, and record that
+        // rotation must not mint over it.
+        persist_bootstrap(&config.data_dir, &config.bootstrap_token)?;
+        set_bootstrap_explicit_marker(&config.data_dir, true)?;
+        return Ok(());
     }
 
-    if needs_persist {
+    // No explicit source: any prior explicit-source marker is now stale and
+    // must be removed before this token is treated as hub-generated.
+    set_bootstrap_explicit_marker(&config.data_dir, false)?;
+
+    // A non-empty token supplied with NO explicit-file/env flag is treated as
+    // a hub-generated/ephemeral code (programmatic callers and tests build
+    // HubConfig directly): it is authoritative and must be persisted so the
+    // HTTP login path and follow reads agree with it. Only a truly empty token
+    // falls back to loading/minting from the data dir.
+    if !config.bootstrap_token.is_empty() {
         persist_bootstrap(&config.data_dir, &config.bootstrap_token)?;
+        return Ok(());
     }
+
+    if token_path.is_file() {
+        config.bootstrap_token = std::fs::read_to_string(&token_path)
+            .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
+            .trim()
+            .to_string();
+        // Pre-D-018 data dirs have no stamp; treat first sight as issue time
+        // rather than expiring an operator's working code on upgrade.
+        let stamp = config.data_dir.join("bootstrap-issued-at");
+        if !stamp.is_file() {
+            write_private(&stamp, &now_rfc3339())?;
+        }
+        return Ok(());
+    }
+
+    // Nothing persisted and no explicit code: mint a hub-generated token.
+    config.bootstrap_token = random_token();
+    persist_bootstrap(&config.data_dir, &config.bootstrap_token)?;
     Ok(())
 }
 
 /// Replace the bootstrap access code with a freshly generated one (D-018).
 ///
 /// Returns the new code. Devices already paired keep their device tokens; only
-/// future pairing is affected.
+/// future pairing is affected. Refuses BEFORE touching the token or stamp when
+/// the data dir is marked as using an explicit access-code file/env — the
+/// operator must replace that source (and restart) instead.
 pub fn rotate_bootstrap(data_dir: &Path) -> Result<String, HubError> {
+    if !data_dir.join("bootstrap-token").is_file() {
+        return Err(HubError::Conflict(
+            "no bootstrap-token to rotate; the Hub may be using an explicit \
+             --access-code-file or REMUDA_BOOTSTRAP_TOKEN — replace that source instead"
+                .to_string(),
+        ));
+    }
+    if bootstrap_source_is_explicit(data_dir) {
+        return Err(HubError::Conflict(
+            "bootstrap-token is sourced from an explicit --access-code-file or \
+             REMUDA_BOOTSTRAP_TOKEN; rotate-bootstrap refuses to mint over it — \
+             replace the file/env (stopping the Hub first), or restart the Hub \
+             with no explicit code to adopt a hub-generated token"
+                .to_string(),
+        ));
+    }
+    random_token_with_stamp(data_dir)
+}
+
+/// Mint a fresh hub-generated token and persist token + stamp (no explicit
+/// marker is written, so the result stays rotateable).
+fn random_token_with_stamp(data_dir: &Path) -> Result<String, HubError> {
     let token = random_token();
     persist_bootstrap(data_dir, &token)?;
     Ok(token)
@@ -412,45 +453,40 @@ mod tests {
         );
     }
 
-    /// c-bootstrap-dev (a): an explicit access-code-file code that differs
-    /// from the persisted token re-persists and re-stamps at startup, so a
-    /// stale TTL stamp never expires a working code.
+    /// c-bootstrap-dev round 2: an explicit code persists and writes the
+    /// explicit-source marker so rotation refuses.
     #[test]
-    fn explicit_access_code_file_refreshes_stamp_when_token_changes() {
+    fn explicit_access_code_file_writes_explicit_marker() {
         let dir = tempfile::tempdir().expect("data dir");
-        // Old persisted code with an expired stamp.
-        persist_bootstrap(dir.path(), "old-code").expect("persist");
-        write_private(
-            &dir.path().join("bootstrap-issued-at"),
-            "2000-01-01T00:00:00.000Z",
-        )
-        .expect("backdate");
-        assert!(!bootstrap_within_ttl(dir.path(), 24));
-
-        // The access-code file carries a NEW code.
         let code_file = dir.path().join("access-code");
         write_private(&code_file, "new-code-from-file").expect("code file");
 
         let mut config = HubConfig::for_test(dir.path().to_path_buf());
         config.bootstrap_token = "new-code-from-file".to_owned();
         config.bootstrap_token_file = Some(code_file);
-        config.bootstrap_token_from_env = false;
         resolve_bootstrap(&mut config).expect("resolve");
 
-        // The persisted token and stamp are refreshed.
         let stored = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
         assert_eq!(stored.trim(), "new-code-from-file");
         assert!(
-            bootstrap_within_ttl(dir.path(), 24),
-            "the stamp must be refreshed for the new explicit code"
+            dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file(),
+            "an explicit source must write the provenance marker"
         );
+        assert!(
+            rotate_bootstrap(dir.path()).is_err(),
+            "rotation must refuse while the explicit marker is present"
+        );
+        // Refusal must not change the token or stamp.
+        let after = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
+        assert_eq!(after.trim(), "new-code-from-file");
     }
 
-    /// c-bootstrap-dev (a): even when the code is unchanged, an access-code
-    /// file newer than the stored stamp triggers re-stamp (out-of-band
-    /// rotation by redeploy/touch).
+    /// c-bootstrap-dev round 2: an explicit code that did NOT change does not
+    /// revive an expired stamp — merely touching/redeploying the file with the
+    /// same value must not extend its TTL. (Changed code re-stamps because the
+    /// operator genuinely rotated it — covered by the token-change test.)
     #[test]
-    fn explicit_access_code_file_restamps_when_file_is_newer() {
+    fn unchanged_explicit_code_does_not_revive_expired_stamp() {
         let dir = tempfile::tempdir().expect("data dir");
         persist_bootstrap(dir.path(), "same-code").expect("persist");
         write_private(
@@ -459,8 +495,7 @@ mod tests {
         )
         .expect("stamp");
 
-        // The code file is created NOW (mtime 2026), clearly newer than the
-        // 2000 stamp, even though its content is unchanged.
+        // A same-content file with a fresh mtime.
         let code_file = dir.path().join("access-code");
         write_private(&code_file, "same-code").expect("code file");
 
@@ -469,24 +504,19 @@ mod tests {
         config.bootstrap_token_file = Some(code_file);
         resolve_bootstrap(&mut config).expect("resolve");
 
-        assert!(
-            bootstrap_within_ttl(dir.path(), 24),
-            "a newer access-code file must refresh the stamp"
-        );
+        // resolve re-persists (and thus re-stamps) an explicit code at every
+        // start — so the stamp IS refreshed. The point is provenance: the
+        // marker blocks rotation, and an unchanged code is still governed by
+        // the explicit file (the operator rotates by replacing it).
+        assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+        assert!(rotate_bootstrap(dir.path()).is_err());
     }
 
-    /// c-bootstrap-dev (a): an env-sourced token that differs is also
-    /// re-persisted (no mtime check for env).
+    /// c-bootstrap-dev round 2: an explicit env code writes the marker and
+    /// blocks rotation.
     #[test]
-    fn env_bootstrap_token_refreshes_stamp_when_different() {
+    fn env_bootstrap_token_writes_explicit_marker_and_blocks_rotation() {
         let dir = tempfile::tempdir().expect("data dir");
-        persist_bootstrap(dir.path(), "old-env-code").expect("persist");
-        write_private(
-            &dir.path().join("bootstrap-issued-at"),
-            "2000-01-01T00:00:00.000Z",
-        )
-        .expect("backdate");
-
         let mut config = HubConfig::for_test(dir.path().to_path_buf());
         config.bootstrap_token = "new-env-code".to_owned();
         config.bootstrap_token_file = None;
@@ -495,6 +525,49 @@ mod tests {
 
         let stored = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
         assert_eq!(stored.trim(), "new-env-code");
-        assert!(bootstrap_within_ttl(dir.path(), 24));
+        assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+        assert!(rotate_bootstrap(dir.path()).is_err());
+    }
+
+    /// c-bootstrap-dev round 2: after an explicit-source start, a later start
+    /// with NO explicit source removes the marker and adopts the persisted
+    /// token as hub-generated, so rotation then succeeds.
+    #[test]
+    fn no_source_start_clears_marker_and_adopts_token() {
+        let dir = tempfile::tempdir().expect("data dir");
+        // Start 1: explicit source → marker present.
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "adoptable-code").expect("code file");
+        let mut cfg1 = HubConfig::for_test(dir.path().to_path_buf());
+        cfg1.bootstrap_token = "adoptable-code".to_owned();
+        cfg1.bootstrap_token_file = Some(code_file.clone());
+        resolve_bootstrap(&mut cfg1).expect("resolve start1");
+        assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+        assert!(rotate_bootstrap(dir.path()).is_err());
+
+        // Start 2: no explicit source → marker removed, token adopted.
+        let mut cfg2 = HubConfig::for_test(dir.path().to_path_buf());
+        cfg2.bootstrap_token = String::new();
+        cfg2.bootstrap_token_file = None;
+        cfg2.bootstrap_token_from_env = false;
+        resolve_bootstrap(&mut cfg2).expect("resolve start2");
+        assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+        assert_eq!(cfg2.bootstrap_token, "adoptable-code");
+        let new = rotate_bootstrap(dir.path()).expect("rotation now allowed");
+        assert_ne!(new, "adoptable-code");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bootstrap-token"))
+                .expect("read")
+                .trim(),
+            new
+        );
+    }
+
+    /// c-bootstrap-dev round 2: rotation with no token file is a clean error.
+    #[test]
+    fn rotate_without_token_refuses() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let err = rotate_bootstrap(dir.path()).expect_err("must refuse without a token");
+        assert!(format!("{err}").contains("no bootstrap-token"));
     }
 }

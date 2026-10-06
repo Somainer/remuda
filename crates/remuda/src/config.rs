@@ -1241,4 +1241,51 @@ secret_refs = { token = "env:UNREAD_TEST_SECRET" }
             "Secret([redacted])"
         );
     }
+
+    /// c-bootstrap-dev round 2 (item 2): SecretRef::resolve normalises
+    /// trailing whitespace/newlines from the referenced secret.
+    #[test]
+    fn secret_ref_resolve_trims_trailing_whitespace() {
+        let fixture = Fixture::new("");
+        let path = fixture.0.join("access-code");
+        std::fs::write(&path, "  the-code-with-padding  \n\n").expect("write file");
+        let resolved = SecretRef::File(path).resolve().expect("file resolves");
+        assert_eq!(resolved.into_string(), "the-code-with-padding");
+        // Debug of a reference never prints the resolved value.
+        assert_eq!(
+            format!("{:?}", Secret("private".into())),
+            "Secret([redacted])"
+        );
+    }
+
+    /// c-bootstrap-dev round 2 (item 2): whitespace-only/empty referenced
+    /// secrets are rejected, not treated as empty-but-valid (covers the shared
+    /// trim+empty path used by BOTH file and env resolution).
+    #[test]
+    fn secret_ref_resolve_rejects_empty_after_trim() {
+        let fixture = Fixture::new("");
+        let path = fixture.0.join("empty-code");
+        std::fs::write(&path, "  \n\t ").expect("write blank file");
+        let err = SecretRef::File(path)
+            .resolve()
+            .expect_err("blank file rejected");
+        assert!(format!("{err}").contains("empty"), "got: {err}");
+    }
+
+    /// c-bootstrap-dev round 2 (item 2): a missing env var surfaces an error
+    /// that names only the variable — never a value — so a non-UTF-8 or secret
+    /// env value cannot leak into an error string (std::env::var's VarError is
+    /// discarded, only the reference name is formatted).
+    #[test]
+    fn secret_ref_missing_env_error_names_only_the_variable() {
+        let key = "REMUDA_TEST_SECRET_DEFINITELY_UNSET_42";
+        // Ensure unset (read is safe; no write needed).
+        let err = SecretRef::Env(key.into())
+            .resolve()
+            .expect_err("unset env rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains(key), "error names the var: {msg}");
+        // No assignment operator / value payload.
+        assert!(!msg.contains('='), "error carries no value: {msg}");
+    }
 }

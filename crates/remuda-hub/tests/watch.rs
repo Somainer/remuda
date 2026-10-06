@@ -716,14 +716,14 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
             .unwrap()
             .to_string()
     };
+    // ── Stage 1: the failed TURN only ──────────────────────────────────────
+    // The print driver reports the errored result frame; the process itself
+    // is still alive (the driver emits a SEPARATE session exit only later).
     ctx.node.append_journal(
         &instance_id,
         &[
             assistant_error_event("API Error: 400 requested model is not available"),
             turn_error_event(),
-            // r4: the turn error alone is not terminal; the one-shot process
-            // then emits a real native session exit.
-            session_exit_event(),
         ],
     );
 
@@ -745,6 +745,62 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
     // Failed is a watch-only state: the durable lifecycle is untouched.
     assert_eq!(row["state"]["state"], "working");
     assert!(row["watch"]["observedAt"].is_string(), "{row}");
+
+    // r5 item 5: a failed TURN is not a process death — the live child still
+    // accepts a REAL next prompt through the command path.
+    let (status, instance) = ctx
+        .request("GET", &format!("/v1/instances/{instance_id}"), None)
+        .await;
+    assert_eq!(status, 200, "{instance}");
+    assert_ne!(
+        instance["lifecycle"], "failed",
+        "the turn error alone keeps the process alive: {instance}"
+    );
+
+    let prompt_body = json!({
+        "operation": "instance.send",
+        "payload": {
+            "instanceId": instance_id,
+            "input": {
+                "type": "prompt",
+                "mode": "new-turn",
+                "blocks": [{ "type": "text", "text": "please retry the task" }]
+            },
+            "completionScope": "native-turn"
+        }
+    });
+    let (status, receipt) = ctx
+        .request(
+            "POST",
+            &format!("/v1/instances/{instance_id}/commands"),
+            Some(prompt_body),
+        )
+        .await;
+    assert_eq!(status, 200, "the live child accepts another prompt: {receipt}");
+    assert!(
+        receipt["command"]["commandId"].is_string(),
+        "the command receipt names the accepted command: {receipt}"
+    );
+    // The receipt is real: the fake Node received instance.send for THIS
+    // instance carrying the retry prompt.
+    let sends = ctx.node.payloads("instance.send");
+    let delivered = sends
+        .iter()
+        .any(|payload| payload["instanceId"] == json!(instance_id));
+    assert!(
+        delivered,
+        "the retry prompt was delivered to the child: {sends:?}"
+    );
+
+    // ── Stage 2: the driver's REAL session exit settles the card ───────────
+    ctx.node.append_journal(&instance_id, &[session_exit_event()]);
+
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_eq!(
+        row["watch"]["status"], "failed",
+        "the real session exit settles as failed: {row}"
+    );
 
     // The Hub instance row itself converged to failed from the journal.
     let (status, instance) = ctx

@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
     let rpc_gate = std::env::temp_dir().join(format!("remuda-e2e-rpc-gate-{}", addr.port()));
     let _ = std::fs::remove_file(&rpc_gate);
     let (ready_tx, ready_rx) = oneshot::channel();
-    let node = tokio::spawn(fake_node(
+    let mut node = tokio::spawn(fake_node(
         addr,
         enroll,
         host_id.clone(),
@@ -141,7 +141,24 @@ async fn main() -> Result<()> {
     }
     println!("HUB_E2E_READY {line}");
     let _ = io::stdout().flush();
-    tokio::signal::ctrl_c().await.ok();
+    // Supervise the fake Node: the harness is only correct while that task is
+    // alive. A journal.append ack timeout, an `error` ack, a queue overflow
+    // (see wait_frame_ack), or a dropped socket used to surface later as
+    // unrelated offline/status flakes; instead print the causal error and exit
+    // non-zero so the gate reports the real failure. Normal shutdown is ctrl-c.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        outcome = &mut node => {
+            let detail = match outcome {
+                Ok(Ok(())) => "fake Node task completed unexpectedly while the harness was running".to_string(),
+                Ok(Err(err)) => format!("fake Node task returned an error: {err:#}"),
+                Err(err) => format!("fake Node task panicked or was cancelled: {err}"),
+            };
+            eprintln!("FATAL hub_e2e fake Node exited before shutdown: {detail}");
+            let _ = io::stderr().flush();
+            std::process::exit(1);
+        }
+    }
     let _ = std::fs::remove_file(&rpc_gate);
     if let Some(gate) = &route_down_gate {
         let _ = std::fs::remove_file(gate);
@@ -1465,6 +1482,59 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
+                    // c-hubfakeack determinism regression (`__ackbarrier__:hold`
+                    // followed by `__ackbarrier__:next`): the hold command parks
+                    // its append-ack wait until a FURTHER Hub RPC is buffered,
+                    // forcing the swallowed-frame race structurally; both reply
+                    // `accepted:true` so the Hub marks the row accepted from the
+                    // RPC reply itself (not via later journal reconcile).
+                    if prompt.starts_with("__ackbarrier__:") {
+                        if prompt.contains(":hold") {
+                            append_n = append_command_user_barrier(
+                                &mut ws,
+                                &mut frame_queue,
+                                addr.port(),
+                                &instance_id,
+                                append_n,
+                                prompt,
+                                command_id,
+                            )
+                            .await?;
+                        } else {
+                            append_n = append_command_user(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                prompt,
+                                command_id,
+                            )
+                            .await?;
+                        }
+                        append_n = append_journal(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "assistant",
+                            &format!("echo: {prompt}"),
+                        )
+                        .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({
+                                "accepted": true,
+                                "command": {
+                                    "state": "accepted",
+                                    "commandId": command_id.unwrap_or(""),
+                                }
+                            }),
+                        )
+                        .await?;
+                        continue;
+                    }
                     // c-journalpage bounded-window seeding hook:
                     // `__journal_burst__:<n>` appends n assistant message
                     // events in one batched journal.append frame (plus idle),
@@ -2585,31 +2655,170 @@ async fn fake_node(
     Ok(())
 }
 
+/// Total time one journal append may take to be acknowledged. This is an
+/// ABSOLUTE budget: it must not reset per received frame, or a steady trickle
+/// of unrelated frames (interaction.list polls every ~2 s, pipelined RPCs)
+/// would let a missing ack park the Node in the append handler forever and
+/// grow the stash without bound.
+const FRAME_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on frames stashed behind one ack wait. Hitting it is a LOUD harness
+/// failure, never an unbounded queue.
+const PENDING_FRAME_QUEUE_CAP: usize = 4096;
+/// c-hubfakeack determinism barrier: how long the marked send waits for the
+/// NEXT Hub RPC to already be on the wire while its own append ack is
+/// outstanding.
+const ACK_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Classify a frame against the wanted append-ack id.
+///
+/// - `Some(Ok(()))`  — a matching SUCCESS response (object `result`, no error)
+/// - `Some(Err(_))`  — a matching response carrying an `error`, or no result
+///   object (a rejected/failed append must never be hidden as success)
+/// - `None`          — not the wanted response (a Hub RPC or a stale ack)
+fn classify_ack_frame(value: &Value, want: &str) -> Option<Result<()>> {
+    if value.get("method").is_some() {
+        return None;
+    }
+    if value.get("id").and_then(Value::as_str) != Some(want) {
+        return None;
+    }
+    if let Some(error) = value.get("error") {
+        return Some(Err(anyhow!("append ack {want} was an RPC error: {error}")));
+    }
+    if !value.get("result").is_some_and(Value::is_object) {
+        return Some(Err(anyhow!(
+            "append ack {want} carried no result object: {value}"
+        )));
+    }
+    Some(Ok(()))
+}
+
 /// Read frames until the Hub acknowledges the journal append with id `want`.
 ///
-/// Any other frame read while waiting — a stale fire-and-forget append ack or
-/// an unrelated Hub RPC like the web poll's interaction.list — is stashed in
-/// `queue` for the main loop to process, so waiting on durability can never
-/// swallow an RPC.
-async fn wait_frame_ack(
-    ws: &mut NodeWs,
-    queue: &mut std::collections::VecDeque<String>,
-    want: &str,
-) -> Result<()> {
+/// Uses ONE absolute deadline (`FRAME_ACK_TIMEOUT` from the first call),
+/// blocking only for the time remaining each iteration. Before blocking it
+/// scans `queue` for an already-buffered matching ack (the determinism
+/// barrier and nested appends can stash the ack ahead of unrelated RPCs).
+///
+/// Every other frame — a stale fire-and-forget append ack or an unrelated Hub
+/// RPC like the web poll's interaction.list — is stashed in `queue` for the
+/// main loop to process, so waiting on durability can never swallow an RPC.
+/// A missing ack, an `error` ack, or an over-capacity queue is a loud error
+/// that the spawn supervisor turns into a non-zero harness exit.
+async fn wait_frame_ack(ws: &mut NodeWs, queue: &mut FrameQueue, want: &str) -> Result<()> {
+    let deadline = Instant::now() + FRAME_ACK_TIMEOUT;
     loop {
-        let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => text,
-            Ok(_) => anyhow::bail!("hub connection closed waiting for append ack {want}"),
-            Err(_) => anyhow::bail!("timed out waiting for append ack {want}"),
-        };
-        let value: Value = serde_json::from_str(&frame)?;
-        let matched =
-            value.get("method").is_none() && value.get("id").and_then(Value::as_str) == Some(want);
-        if matched {
+        // 1. Already-buffered match (the ack may be queued ahead of RPCs).
+        if let Some(pos) = queue.iter().position(|frame| {
+            serde_json::from_str::<Value>(frame)
+                .map(|v| classify_ack_frame(&v, want).is_some())
+                .unwrap_or(false)
+        }) {
+            let frame = queue.remove(pos).context("frame queue position vanished")?;
+            let value: Value = serde_json::from_str(&frame)?;
+            classify_ack_frame(&value, want).expect("frame just matched")?;
             return Ok(());
         }
-        queue.push_back(frame.to_string());
+        // 2. Block for the REMAINING time only — the deadline never extends.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "timed out after {} ms waiting for append ack {want} ({} frame(s) queued)",
+                FRAME_ACK_TIMEOUT.as_millis(),
+                queue.len()
+            );
+        }
+        let frame = match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => text,
+            Ok(_) => anyhow::bail!("hub connection closed waiting for append ack {want}"),
+            Err(_) => {
+                anyhow::bail!(
+                    "timed out after {} ms waiting for append ack {want} ({} frame(s) queued)",
+                    FRAME_ACK_TIMEOUT.as_millis(),
+                    queue.len()
+                )
+            }
+        };
+        let value: Value = serde_json::from_str(&frame)?;
+        match classify_ack_frame(&value, want) {
+            Some(Ok(())) => return Ok(()),
+            Some(Err(reason)) => return Err(reason),
+            None => {
+                if queue.len() >= PENDING_FRAME_QUEUE_CAP {
+                    anyhow::bail!(
+                        "pending frame queue overflow (>{PENDING_FRAME_QUEUE_CAP}) waiting for append ack {want}"
+                    );
+                }
+                queue.push_back(frame.to_string());
+            }
+        }
     }
+}
+
+/// c-hubfakeack determinism barrier (test-only): do not let an append ack
+/// complete until a FURTHER Hub→Node RPC has actually arrived on the socket
+/// and been stashed. This makes the "RPC buffered behind an outstanding ack"
+/// race structural instead of relying on scheduler timing: the marked send
+/// parks here, and the Hub (which pipelines instance.send over independent
+/// in-flight slots) forwards the next command into this wait. Every frame —
+/// including an ack that arrives early — is queued; the caller then runs the
+/// normal [`wait_frame_ack`], which resolves from the queue. Writes a marker
+/// file (counting intervening RPCs) so the Playwright spec can prove the
+/// intervening RPC really was queued, not merely that two sends succeeded.
+///
+/// If no further RPC arrives within the barrier window the Node is mis-wired
+/// or the Hub serialised — a loud error rather than a silent pass.
+async fn ensure_intervening_rpc(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    want: &str,
+    method_match: &str,
+    marker: &std::path::Path,
+) -> Result<()> {
+    // Count a matching RPC already queued (e.g. forwarded before the append);
+    // other RPCs (interaction.list polls, …) are still stashed but do not count.
+    let mut intervening = queue
+        .iter()
+        .filter(|f| {
+            serde_json::from_str::<Value>(f)
+                .map(|v| v.get("method").and_then(Value::as_str) == Some(method_match))
+                .unwrap_or(false)
+        })
+        .count() as u64;
+    let deadline = Instant::now() + ACK_BARRIER_TIMEOUT;
+    while intervening == 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "ack barrier: no {method_match} RPC arrived behind append ack {want} within {} ms",
+                ACK_BARRIER_TIMEOUT.as_millis()
+            );
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text)?;
+                if value.get("method").and_then(Value::as_str) == Some(method_match) {
+                    intervening += 1;
+                }
+                // Stash EVERYTHING (including an early ack and other RPCs) for
+                // wait_frame_ack / the dispatch loop.
+                if queue.len() >= PENDING_FRAME_QUEUE_CAP {
+                    anyhow::bail!("pending frame queue overflow in ack barrier for {want}");
+                }
+                queue.push_back(text.to_string());
+            }
+            Ok(_) => anyhow::bail!("hub connection closed during ack barrier for {want}"),
+            Err(_) => {
+                anyhow::bail!(
+                    "ack barrier: no {method_match} RPC arrived behind append ack {want} within {} ms",
+                    ACK_BARRIER_TIMEOUT.as_millis()
+                )
+            }
+        }
+    }
+    std::fs::write(marker, intervening.to_string())
+        .with_context(|| format!("write ack barrier marker {}", marker.display()))?;
+    Ok(())
 }
 
 /// Journal the entity lifecycle a terminal-answered question settles with:
@@ -3628,9 +3837,11 @@ async fn append_uo6b_epoch_live(
 
 /// One full-shape user message observation. A composer/command send carries
 /// `command_id` (C2 correlation); a natively typed prompt omits it.
-async fn append_user_message(
+/// Send one command/user journal message frame and return its `j{seq}` id;
+/// does NOT wait for the append ack (callers drive [`wait_frame_ack`],
+/// possibly behind the determinism barrier).
+async fn send_user_message_frame(
     ws: &mut NodeWs,
-    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     text: &str,
@@ -3673,7 +3884,49 @@ async fn append_user_message(
         .into(),
     ))
     .await?;
+    Ok(seq)
+}
+
+async fn append_user_message(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+    command_id: Option<&str>,
+    node: &str,
+) -> Result<u64> {
+    let seq = send_user_message_frame(ws, instance_id, n, text, command_id, node).await?;
     wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
+    Ok(seq)
+}
+
+/// c-hubfakeack barrier command: append the user frame, then force a FURTHER
+/// Hub RPC to be buffered behind this append's outstanding ack before
+/// matching it. Proves the queue-and-drain path under a guaranteed race and
+/// that the ack itself is an explicit success (wait_frame_ack rejects an
+/// `error` ack). The marker file reports how many intervening RPCs were
+/// stashed.
+async fn append_command_user_barrier(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    port: u16,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+    command_id: Option<&str>,
+) -> Result<u64> {
+    let node = command_id
+        .map(|id| {
+            id.strip_prefix("cmd_")
+                .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
+        })
+        .unwrap_or_else(|| format!("obj_legacy_{n}"));
+    let seq = send_user_message_frame(ws, instance_id, n, text, command_id, &node).await?;
+    let want = format!("j{seq}");
+    let marker = std::env::temp_dir().join(format!("remuda-e2e-ackbarrier-{port}-{seq}"));
+    ensure_intervening_rpc(ws, queue, &want, "instance.send", &marker).await?;
+    wait_frame_ack(ws, queue, &want).await?;
     Ok(seq)
 }
 

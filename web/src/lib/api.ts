@@ -265,6 +265,7 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     launchedBy?: string | null;
     signalTier?: string | null;
     lastError?: string | null;
+    lastTurnError?: { at?: unknown; text?: unknown };
     usageRollup?: unknown;
     apiRoute?: components["schemas"]["ApiRoute"] | null;
   };
@@ -322,6 +323,15 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     durableSeq: rec.durableSeq as U64,
     exit: { state: "not-applicable" },
     lastError: typeof extra.lastError === "string" ? extra.lastError : null,
+    // D-057 OA6: additive last root-turn-error marker, cleared by the next
+    // turn start. Drives the live-row turn-error display (not lastError).
+    lastTurnError:
+      extra.lastTurnError && typeof extra.lastTurnError.text === "string"
+        ? {
+            at: typeof extra.lastTurnError.at === "string" ? extra.lastTurnError.at : "",
+            text: extra.lastTurnError.text,
+          }
+        : undefined,
     launchedBy,
     cwd: extra.cwd ?? rec.workspaceId ?? null,
     name: extra.name ?? rec.title ?? null,

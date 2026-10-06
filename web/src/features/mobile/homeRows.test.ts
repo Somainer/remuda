@@ -217,20 +217,67 @@ describe("buildHomeGroups body text", () => {
     expect(row.bodyDetail).toBeNull();
   });
 
-  it("falls back to the latest native severity=error lifecycle event when lastError is absent", () => {
+  it("falls back to the latest non-turn severity=error lifecycle event when lastError is absent", () => {
     const instance = session("ins-event-error", { lifecycle: "running", activity: known("idle") });
     const events = [
       {
         kind: "lifecycle",
         payload: {
           type: "native",
-          nativeName: "turn_error",
+          topic: "session",
+          nativeName: "native_exit_error",
           severity: "error",
           status: { state: "known", value: "Upstream 500" },
         },
       },
     ] as unknown as Observation[];
     expect(homeError(instance, events)).toBe("Upstream 500");
+  });
+
+  it("(OA6) shows lastTurnError on a live row as a non-failure and ignores turn-result lastError as a process error", () => {
+    // A settled turn error: the durable marker carries the text; the row is
+    // idle/running and must NOT read as a process failure (bodyIsError false).
+    const groups = build(
+      named([
+        session("ins-turn-error", {
+          lifecycle: "running",
+          activity: known("idle"),
+          lastTurnError: { at: "2026-10-06T00:00:00Z", text: "API Error: 429" },
+        }),
+      ]),
+    );
+    const row = groups[0].rows[0];
+    expect(row.status).toBe("idle");
+    expect(row.body).toBe("API Error: 429");
+    expect(row.bodyIsError).toBe(false, "a retryable turn error is not a red process failure");
+
+    // A severity-info topic=turn result with a lastError related id is NOT a
+    // process error in the homeError fallback.
+    const instance = session("ins-turn-info", { lifecycle: "running", activity: known("idle") });
+    const events = [
+      {
+        kind: "lifecycle",
+        payload: {
+          type: "native",
+          topic: "turn",
+          nativeName: "result",
+          severity: "info",
+          status: { state: "known", value: "error" },
+          relatedIds: { lastError: "API Error: 429 turn", settledRootTurn: "true" },
+        },
+      },
+    ] as unknown as Observation[];
+    expect(homeError(instance, events)).toBeNull();
+    // And it must not outlive the marker once the next turn clears it.
+    const cleared = build(
+      named([
+        session("ins-turn-cleared", {
+          lifecycle: "running",
+          activity: known("working"),
+        }),
+      ]),
+    );
+    expect(cleared[0].rows[0].bodyIsError).toBe(false);
   });
 
   it("keeps 状态待确认 for disconnected/unknown rows even when an error text exists", () => {

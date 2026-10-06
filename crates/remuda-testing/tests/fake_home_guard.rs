@@ -28,7 +28,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 fn run_turn(envs: Vec<(String, String)>) -> FakeClaudeProcess {
     let mut opts = SpawnOptions::bundled(ScriptKind::Ok);
     opts.extra_envs = envs;
-    let child = spawn_fake_claude(opts).expect("spawn fake-claude");
+    let mut child = spawn_fake_claude(opts).expect("spawn fake-claude");
     child
         .recv_until(TIMEOUT, |v| is_system_subtype(v, "init"))
         .expect("system/init");

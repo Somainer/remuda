@@ -131,23 +131,25 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
   );
 
   /// Whether the typed manual value is an absolute path after leading
-  /// whitespace is ignored (trailing/internal content is preserved verbatim;
-  /// the Node decides whether such a directory exists).
+  /// whitespace is dropped (used only to enable/disable the submit button).
   const manualLooksAbsolute = useMemo(
     () => manualPath.trimStart().startsWith("/"),
     [manualPath],
   );
 
-  /// Submit the advanced manually-typed path verbatim; leading whitespace
-  /// never makes a path non-absolute, but a trailing space (a legal filename
-  /// byte) is preserved — the Node is the authority on existence.
+  /// Submit the advanced manually-typed path. Round 5 item 6: validity and
+  /// the value sent come from the SAME string — leading whitespace is
+  /// dropped only (a path typed with an accidental leading space is still
+  /// usable), while trailing/internal whitespace is preserved verbatim (the
+  /// Node is the authority on whether such a directory exists).
   const submitManual = useCallback(() => {
-    if (!manualLooksAbsolute) {
+    const submitted = manualPath.trimStart();
+    if (!submitted.startsWith("/")) {
       setError("请输入这台主机上的绝对路径，例如 /opt/projects/app");
       return;
     }
-    void registerPath(manualPath);
-  }, [manualPath, manualLooksAbsolute, registerPath]);
+    void registerPath(submitted);
+  }, [manualPath, registerPath]);
 
   if (!open) return null;
 

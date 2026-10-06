@@ -199,7 +199,9 @@ test("adds a directory by browsing the host filesystem", async ({ page }) => {
   await expect(browser).toBeHidden();
 
   const workspaces = await listWorkspaces(page, host);
-  const alpha = workspaces.find((row) => row.root === `${canonicalRoot()}/alpha`);
+  // Find the alpha workspace by SUFFIX (the fixture reports the canonical
+  // root; do not guess /private/tmp — round 5 item 7).
+  const alpha = workspaces.find((row) => row.root.endsWith("/alpha"));
   expect(alpha, JSON.stringify(workspaces)).toBeTruthy();
 
   // The new workspace is selected in the picker.
@@ -209,10 +211,13 @@ test("adds a directory by browsing the host filesystem", async ({ page }) => {
 test("removes a directory after confirmation and refuses it while a session is live", async ({ page }) => {
   const host = await fakeHost(page);
   let workspaces = await listWorkspaces(page, host);
-  if (!workspaces.some((row) => row.root === `${canonicalRoot()}/beta`)) {
+  let beta = workspaces.find((row) => row.root.endsWith("/beta"));
+  if (!beta) {
+    // Register through the exact path the fixture seeds (use the seed
+    // constant only to CREATE; the returned row is authoritative).
     workspaces = await registerByPath(page, host, `${canonicalRoot()}/beta`);
+    beta = workspaces.find((row) => row.root.endsWith("/beta"));
   }
-  const beta = workspaces.find((row) => row.root === `${canonicalRoot()}/beta`);
   expect(beta).toBeTruthy();
   // Every later lookup (row filter, aria name, DELETE body) uses the root the
   // fixture actually reported — round 4 item 8.

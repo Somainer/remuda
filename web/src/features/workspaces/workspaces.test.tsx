@@ -104,6 +104,23 @@ it("keeps manual absolute-path entry as an advanced option", async () => {
   await waitFor(() => expect(register).toHaveBeenCalledWith(workspace.hostId, "/srv/app"));
 });
 
+it("registers a Node listing path that really ends in a space verbatim", async () => {
+  // Round 5 item 3: hostDirsList returns a canonical path with a real trailing
+  // space (a legal filename byte); use-this-folder must register exactly
+  // that string, with no trim.
+  const spaced = "/srv/remuda-e2e ";
+  vi.mocked(api.hostDirsList).mockResolvedValue(
+    listing({ path: spaced, home: spaced, roots: [spaced], dirs: [] }),
+  );
+  const register = vi.spyOn(hubStore, "registerWorkspace").mockResolvedValue(workspace);
+  render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);
+  await screen.findByTestId("dir-browser");
+  fireEvent.click(screen.getByTestId("dir-browser-use"));
+  await waitFor(() =>
+    expect(register).toHaveBeenCalledWith(workspace.hostId, spaced),
+  );
+});
+
 it("sends a filesystem-selected path verbatim and a typed path verbatim (no trim)", async () => {
   const register = vi.spyOn(hubStore, "registerWorkspace").mockResolvedValue(workspace);
   render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);
@@ -204,6 +221,61 @@ it("the use-this-folder button keyboard-activates and registers the listing path
 	await user.keyboard("{Enter}");
 	await waitFor(() =>
 		expect(register).toHaveBeenCalledWith(workspace.hostId, "/home/dev"),
+	);
+});
+
+it("Shift+Tab from the first modal control wraps to the last and never reaches the session form", async () => {
+	// Round 5 item 5: the real nesting is Sheet(session form) -> portalled
+	// browser modal. Shift+Tab on the first focusable modal control must wrap
+	// to the LAST modal control, never to a control in the outer form.
+	const user = userEvent.setup();
+	const outerFirst = document.createElement("button");
+	outerFirst.type = "button";
+	outerFirst.dataset.testid = "outer-first";
+	outerFirst.textContent = "outer first";
+	document.body.appendChild(outerFirst);
+	const submitted = vi.fn();
+	try {
+		render(
+			<form onSubmit={(event) => {
+				event.preventDefault();
+				submitted();
+			}}>
+				<button type="button" data-testid="form-before">form before</button>
+				<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />
+			</form>,
+		);
+		await screen.findByTestId("dir-browser");
+		// Focus the filter (first focusable control after the panel itself).
+		const filter = screen.getByTestId("dir-browser-filter") as HTMLElement;
+		filter.focus();
+		expect(document.activeElement).toBe(filter);
+		// Shift+Tab must wrap to the last modal control, not leave the modal.
+		await user.tab({ shift: true });
+		const active = document.activeElement;
+		const modal = document.querySelector('[role="dialog"]');
+		expect(modal, "portalled dialog exists").toBeTruthy();
+		expect(modal!.contains(active), "focus stays inside the modal after Shift+Tab").toBe(true);
+		expect((active as HTMLElement).dataset.testid ?? "", "wrapped to a modal control").not.toBe("form-before");
+		expect(submitted).not.toHaveBeenCalled();
+	} finally {
+		outerFirst.remove();
+	}
+});
+
+it("drops only leading whitespace from a typed path, keeping trailing whitespace", async () => {
+	// Round 5 item 6: validity and the sent value derive from one string —
+	// "  /srv/app  " enables the button, registers as "/srv/app  ".
+	const register = vi.spyOn(hubStore, "registerWorkspace").mockResolvedValue(workspace);
+	render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);
+	await screen.findByTestId("dir-browser");
+	fireEvent.click(screen.getByTestId("dir-browser-manual-toggle"));
+	const input = screen.getByTestId("dir-browser-manual-path");
+	fireEvent.change(input, { target: { value: "   /srv/app  " } });
+	expect((screen.getByTestId("dir-browser-manual-submit") as HTMLButtonElement).disabled).toBe(false);
+	fireEvent.click(screen.getByTestId("dir-browser-manual-submit"));
+	await waitFor(() =>
+		expect(register).toHaveBeenCalledWith(workspace.hostId, "/srv/app  "),
 	);
 });
 

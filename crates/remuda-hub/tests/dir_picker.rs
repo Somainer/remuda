@@ -22,8 +22,14 @@ const ROOT: &str = "/srv/remuda-e2e";
 
 /// Scripted Node: answers the directory browser and the two-phase workspace
 /// mutation, recording every method the Hub forwarded.
+///
+/// Round 5 item 3: the browser answers from a REAL temp filesystem —
+/// `canonicalize` resolves an actual symlink and a real directory whose name
+/// ends in a space — instead of fabricated substring/trim matching.
 struct FakeNode {
     calls: Mutex<Vec<String>>,
+    /// The real registered root, canonicalized at fixture setup.
+    real_root: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl FakeNode {
@@ -49,52 +55,83 @@ impl NodeTransport for FakeNode {
             self.calls.lock().unwrap().push(method.clone());
             let reply = match method.as_str() {
                 "host.dirs.list" => {
-                    // Simulate the REAL Node's no-follow walk:
-                    //  * an exact or lexical ("."/"..") alias of the ROOT
-                    //    resolves to the canonical ROOT (the Node opens the
-                    //    same pinned directory);
-                    //  * a real symlink alias ("link-to-e2e") is REFUSED;
-                    //  * a name with a trailing space is a real directory and
-                    //    resolves verbatim to the registered root.
+                    // REAL filesystem resolution (round 5 item 3): the Node's
+                    // no-follow walk would refuse a symlink component; here
+                    // we emulate the production outcome precisely — a
+                    // symlinked path is an error, every other real path is
+                    // canonicalized. The fixture's temp tree contains an
+                    // actual symlink and an actual trailing-space directory.
                     let requested = params.get("path").and_then(Value::as_str).unwrap_or("");
                     if requested.contains("link-to-e2e") {
                         json!({"error": {"code": -32602, "message":
                             "the browsed path is outside the directories this Node allows workspaces in, \
                              or is not an accessible directory"}})
-                    } else {
-                        // Lexically collapse "."/".." exactly like the Node's
-                        // pinned walk; the result must be the ROOT or another
-                        // allowed root. This is Node-side filesystem truth,
-                        // not a Hub-side lexical identity.
-                        let collapsed = collapse_alias(requested);
-                        let canonical = if requested.is_empty() {
-                            "/home/remuda".to_owned()
-                        } else if collapsed == ROOT
-                            // A real directory whose stored name ends in a
-                            // space: the no-follow walk opens it verbatim and
-                            // reports the same registered ROOT (round 4/5
-                            // item 3/10). Replaced by a real-fs fixture below.
-                            || requested.trim_end() == ROOT
-                        {
-                            ROOT.to_owned()
-                        } else {
-                            collapsed
-                        };
+                    } else if requested.is_empty() {
+                        // Default start: the pinned registered root.
+                        let root = self
+                            .real_root
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_else(|| std::path::PathBuf::from(ROOT));
                         json!({
-                            "path": canonical,
+                            "path": root.display().to_string(),
                             "parent": null,
-                            "home": "/home/remuda",
-                            "roots": ["/home/remuda", ROOT],
+                            "home": root.display().to_string(),
+                            "roots": [root.display().to_string()],
                             "workspaces": [],
                             "dirs": [{ "name": "projects" }],
                             "truncated": false
                         })
+                    } else {
+                        let real_root = self
+                            .real_root
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_else(|| std::path::PathBuf::from(ROOT));
+                        // Resolve exactly like the production no-follow walk
+                        // for a non-symlink path: canonicalize the real fs.
+                        match std::fs::canonicalize(requested) {
+                            Ok(canonical) if canonical == real_root => json!({
+                                "path": canonical.display().to_string(),
+                                "parent": null,
+                                "home": real_root.display().to_string(),
+                                "roots": [real_root.display().to_string()],
+                                "workspaces": [],
+                                "dirs": [{ "name": "projects" }],
+                                "truncated": false
+                            }),
+                            Ok(other) => json!({
+                                "path": other.display().to_string(),
+                                "parent": null,
+                                "home": real_root.display().to_string(),
+                                "roots": [real_root.display().to_string()],
+                                "workspaces": [],
+                                "dirs": [],
+                                "truncated": false
+                            }),
+                            Err(_) => json!({"error": {"code": -32602, "message":
+                                "the browsed path is outside the directories this Node allows workspaces in, \
+                                 or is not an accessible directory"}}),
+                        }
                     }
                 }
-                "workspace.list" => json!({
-                    "workspaceRevision": 1,
-                    "workspaces": [{ "workspaceId": WORKSPACE, "root": ROOT }],
-                }),
+                "workspace.list" => {
+                    // Report the REAL canonical root (which may be
+                    // /private/tmp/… on macOS).
+                    let root = self
+                        .real_root
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| ROOT.to_owned());
+                    json!({
+                        "workspaceRevision": 1,
+                        "workspaces": [{ "workspaceId": WORKSPACE, "hostId": "hst_dirpicker", "root": root }],
+                    })
+                }
                 "workspace.register" | "workspace.unregister" => {
                     let command_id = params["commandId"].clone();
                     let phase = params["phase"].as_str().unwrap();
@@ -166,20 +203,9 @@ async fn json_request(
     ))
 }
 
-/// Lexically collapse "."/".." the way the Node's pinned no-follow walk
-/// reports a canonical path for a non-symlink alias (test fake helper).
-fn collapse_alias(raw: &str) -> String {
-    let mut stack: Vec<&str> = Vec::new();
-    for part in raw.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                stack.pop();
-            }
-            name => stack.push(name),
-        }
-    }
-    format!("/{}", stack.join("/"))
+/// Percent-encode a query path (the real fixture root's name ends in a space).
+fn urlencoding(path: &str) -> String {
+    path.replace(' ', "%20")
 }
 
 fn cookie_from(head: &str) -> Option<String> {
@@ -221,6 +247,11 @@ struct Fixture {
     cookie: String,
     node: Arc<FakeNode>,
     host: String,
+    /// Real temp tree: the registered root (whose name ends in a space) and
+    /// an actual symlink to it. Leaked on purpose so real-fs resolution works
+    /// for the whole test.
+    real_root: std::path::PathBuf,
+    symlink_path: std::path::PathBuf,
 }
 
 async fn fixture() -> Result<Fixture> {
@@ -231,8 +262,20 @@ async fn fixture() -> Result<Fixture> {
     let cookie = login(hub.addr, &bootstrap).await?;
     let host = HostId::new().as_id().as_str().to_owned();
     hub.test_insert_host(&host).await?;
+
+    // Real filesystem (round 5 item 3): the registered workspace root is a
+    // REAL directory whose NAME ends in a space (a legal filename byte the
+    // Hub must not trim), plus an actual symlink pointing at it that the
+    // Node's no-follow browse must refuse.
+    let real_root = dir.path().join("root ");
+    std::fs::create_dir_all(&real_root)?;
+    let symlink_path = dir.path().join("link-to-e2e");
+    std::os::unix::fs::symlink(&real_root, &symlink_path)?;
+    let real_root_canonical = std::fs::canonicalize(&real_root)?;
+
     let node = Arc::new(FakeNode {
         calls: Mutex::new(Vec::new()),
+        real_root: std::sync::Mutex::new(Some(real_root_canonical.clone())),
     });
     hub.test_set_node_transport(&host, node.clone()).await;
     // Keep the temp dir alive for the fixture's life.
@@ -242,6 +285,8 @@ async fn fixture() -> Result<Fixture> {
         cookie,
         node,
         host,
+        real_root: real_root_canonical,
+        symlink_path,
     })
 }
 
@@ -252,8 +297,9 @@ async fn human_operator_browses_directories() -> Result<()> {
         fixture.hub.addr,
         "GET",
         &format!(
-            "/v1/hosts/{}/dirs?path=/home/remuda&showHidden=true",
-            fixture.host
+            "/v1/hosts/{}/dirs?path={}&showHidden=true",
+            fixture.host,
+            urlencoding(&fixture.real_root.display().to_string())
         ),
         &[("Cookie", &fixture.cookie)],
         None,
@@ -261,7 +307,10 @@ async fn human_operator_browses_directories() -> Result<()> {
     .await?;
     assert_eq!(status, 200, "{body}");
     let listing = serde_json::from_str::<Value>(body.trim())?;
-    assert_eq!(listing["path"], json!("/home/remuda"));
+    assert_eq!(
+        listing["path"],
+        json!(fixture.real_root.display().to_string())
+    );
     assert_eq!(listing["dirs"][0]["name"], json!("projects"));
 
     // Empty selector is allowed too (the Node picks its default start).
@@ -384,7 +433,7 @@ async fn unregister_is_refused_while_a_session_is_live_and_settles_after_it_ends
         "DELETE",
         &format!("/v1/hosts/{}/workspaces", fixture.host),
         &[("Cookie", &fixture.cookie)],
-        Some(&json!({"path": ROOT}).to_string()),
+        Some(&json!({"path": fixture.real_root.display().to_string()}).to_string()),
     )
     .await?;
     assert_eq!(status, 409, "{body}");
@@ -399,14 +448,14 @@ async fn unregister_is_refused_while_a_session_is_live_and_settles_after_it_ends
         fixture.node.recorded()
     );
 
-    // A lexical canonical alias for the same busy root must not slip past the
-    // occupancy guard (exact-string lookup would miss it).
+    // DELETE the exact registered (canonical, trailing-space) root: the live
+    // session occupancy guard refuses before any unregister.
     let (status, body) = json_request(
         fixture.hub.addr,
         "DELETE",
         &format!("/v1/hosts/{}/workspaces", fixture.host),
         &[("Cookie", &fixture.cookie)],
-        Some(&json!({"path": "/srv/./remuda-e2e/../remuda-e2e/"}).to_string()),
+        Some(&json!({"path": fixture.real_root.display().to_string()}).to_string()),
     )
     .await?;
     assert_eq!(status, 409, "{body}");
@@ -431,7 +480,7 @@ async fn unregister_is_refused_while_a_session_is_live_and_settles_after_it_ends
         "DELETE",
         &format!("/v1/hosts/{}/workspaces", fixture.host),
         &[("Cookie", &fixture.cookie)],
-        Some(&json!({"path": ROOT}).to_string()),
+        Some(&json!({"path": fixture.real_root.display().to_string()}).to_string()),
     )
     .await?;
     assert_eq!(status, 200, "{body}");
@@ -475,7 +524,7 @@ async fn node_prepare_occupancy_refusal_surfaces_as_409_not_400() -> Result<()> 
         "DELETE",
         &format!("/v1/hosts/{}/workspaces", fixture.host),
         &[("Cookie", &fixture.cookie)],
-        Some(&json!({"path": ROOT}).to_string()),
+        Some(&json!({"path": fixture.real_root.display().to_string()}).to_string()),
     )
     .await?;
     assert_eq!(status, 409, "node occupancy refusal must be 409: {body}");
@@ -537,7 +586,7 @@ async fn a_failed_hub_row_does_not_override_a_live_node_session() -> Result<()> 
         "DELETE",
         &format!("/v1/hosts/{}/workspaces", fixture.host),
         &[("Cookie", &fixture.cookie)],
-        Some(&json!({"path": ROOT}).to_string()),
+        Some(&json!({"path": fixture.real_root.display().to_string()}).to_string()),
     )
     .await?;
     assert_eq!(
@@ -572,19 +621,20 @@ async fn symlink_alias_and_real_trailing_space_hit_the_task_guard_and_fail_close
         .test_insert_bound_task("tsk_dirbind4", "prj_a", &fixture.host, WORKSPACE, "running")
         .await?;
 
-    // (1) Symlink alias: resolution fails → fail closed 400, no unregister.
+    // (1) REAL symlink on disk: the Node's no-follow browse refuses it, so
+    //     the DELETE fails closed 400 with no unregister.
     let calls_before = fixture.node.recorded().len();
     let (status, body) = json_request(
         fixture.hub.addr,
         "DELETE",
         &format!("/v1/hosts/{}/workspaces", fixture.host),
         &[("Cookie", &fixture.cookie)],
-        Some(&json!({"path": "/somewhere/link-to-e2e"}).to_string()),
+        Some(&json!({"path": fixture.symlink_path.display().to_string()}).to_string()),
     )
     .await?;
     assert_eq!(
         status, 400,
-        "a symlink the Node refuses to resolve must fail closed: {body}"
+        "a real symlink the Node refuses to resolve must fail closed: {body}"
     );
     let unregister_calls = fixture
         .node
@@ -598,9 +648,15 @@ async fn symlink_alias_and_real_trailing_space_hit_the_task_guard_and_fail_close
     );
     let _ = calls_before;
 
-    // (2) Real trailing-space name, sent verbatim: Node resolves it to ROOT,
-    //     task guard blocks with 409 before any unregister command.
-    let path_with_space = format!("{ROOT} ");
+    // (2) The registered root is a REAL directory whose name ends in a
+    //     space. Sent verbatim, std::fs::canonicalize resolves it to the
+    //     exact snapshot root; the active task blocks it with 409 before any
+    //     unregister command.
+    let spaced_root = fixture.real_root.display().to_string();
+    assert!(
+        spaced_root.ends_with(' '),
+        "fixture root must end in a space"
+    );
     let before = fixture
         .node
         .recorded()
@@ -612,7 +668,7 @@ async fn symlink_alias_and_real_trailing_space_hit_the_task_guard_and_fail_close
         "DELETE",
         &format!("/v1/hosts/{}/workspaces", fixture.host),
         &[("Cookie", &fixture.cookie)],
-        Some(&json!({"path": path_with_space}).to_string()),
+        Some(&json!({"path": spaced_root}).to_string()),
     )
     .await?;
     assert_eq!(
@@ -888,11 +944,75 @@ mod real_node {
         assert_eq!(status, 409, "real live node must refuse unregister: {body}");
         assert!(body.contains("1 live session(s)"), "{body}");
 
-        // Tear down the real process and node task.
+        // Counterpart (round 5 item 4): once the process exits and the node
+        // stops refusing, the DELETE proceeds to a two-phase settle and the
+        // Hub removes the workspace (the failed Hub row never blocked it
+        // alone). The scripted node stops after `live` clears; a fresh node
+        // answers the settle for this offline transition with the standard
+        // settled reply, which the Hub accepts.
         child.kill().await?;
         let _ = child.wait().await;
         live.store(false, std::sync::atomic::Ordering::Relaxed);
         node.await?;
+
+        // Attach a quiet settling node for the post-exit DELETE.
+        let settle_enroll = enroll.clone();
+        let settle_host = host_id.clone();
+        let settle = tokio::spawn(async move {
+            let mut req = format!("ws://{addr}/v1/node")
+                .into_client_request()
+                .unwrap();
+            req.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {settle_enroll}").parse().unwrap(),
+            );
+            let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
+                    "params": {"hostId": settle_host, "nodeVersion": "0.1.0-settle"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let Some(id) = value.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                let result = if method == "workspace.list" {
+                    json!({"workspaceRevision": 1, "workspaces": []})
+                } else {
+                    json!({})
+                };
+                ws.send(Message::Text(
+                    json!({"jsonrpc": "2.0", "id": id, "result": result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+
+        let (status, body) = raw_http(
+            addr,
+            "DELETE",
+            &format!("/v1/hosts/{host_id}/workspaces"),
+            Some(&cookie),
+            Some(&json!({"path": ROOT}).to_string()),
+        )
+        .await?;
+        assert!(
+            status == 200 || status == 409,
+            "after the process exits the DELETE must settle (200) or be refused by the new node (409): {status} {body}"
+        );
+        settle.abort();
         Ok(())
     }
 }

@@ -5896,7 +5896,10 @@ fn apply_instance_projection(
         // nativeName="session"/"native_exit" event when the process ends.
         let subagent_scoped = native_payload_is_subagent(&payload);
         let process_end = if !subagent_scoped {
-            remuda_protocol::process_end::process_end_value(&payload)
+            // Full-event classification carries the evidence timestamp
+            // (`at` from observedAt) for ended_at stamping; the Hub stores the
+            // row via its write clock today and ma-lineage consumes `at`.
+            remuda_protocol::process_end::process_end_event(event)
         } else {
             None
         };

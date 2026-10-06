@@ -19,8 +19,8 @@
 //! classifier matches the REAL driver event shapes.
 
 use crate::enums::{LifecycleTopic, Severity};
-use crate::observation::NativeLifecycle;
-use crate::scalar::Knowledge;
+use crate::observation::{LifecyclePayload, NativeLifecycle, Observation, ObservationPayload};
+use crate::scalar::{Knowledge, Timestamp};
 use serde_json::Value;
 
 /// Whether a process ended, and how.
@@ -35,15 +35,36 @@ pub enum ProcessEndKind {
     Failed,
 }
 
-/// Evidence that a process ended, returned by [`process_end`] /
-/// [`entity_process_end`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Evidence that a process ended, returned by [`process_end_event`] /
+/// [`process_end_observation`] (and the payload-only [`process_end`] /
+/// [`process_end_value`] / [`entity_process_end`]).
+///
+/// `at` is the evidence timestamp to stamp `ended_at` with; the full-event /
+/// full-observation classifiers populate it from `observedAt`. The
+/// payload-only classifiers leave it `None` — the caller then stamps its own
+/// write clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessEnd {
     /// Clean exit vs failed/gone/never-started.
     pub kind: ProcessEndKind,
+    /// Evidence timestamp (`observedAt`) for `ended_at` stamping, when the
+    /// caller supplied the whole event/observation rather than just the
+    /// payload.
+    pub at: Option<Timestamp>,
 }
 
 impl ProcessEnd {
+    fn new(kind: ProcessEndKind) -> Self {
+        Self { kind, at: None }
+    }
+
+    /// Attach the evidence timestamp this end was observed at.
+    #[must_use]
+    pub fn with_at(mut self, at: Option<Timestamp>) -> Self {
+        self.at = at;
+        self
+    }
+
     /// The instance lifecycle string this evidence writes.
     #[must_use]
     pub fn lifecycle(&self) -> &'static str {
@@ -139,6 +160,40 @@ pub fn process_end(native: &NativeLifecycle) -> Option<ProcessEnd> {
     classify(name, status, severity, reason_code)
 }
 
+/// Classify a full journaled [`Observation`] and, when it is process end,
+/// attach the evidence timestamp (`observedAt`) so the caller can stamp
+/// `ended_at` directly (c-cardsettle r5 addendum A). Returns `None` for
+/// non-lifecycle observations.
+#[must_use]
+pub fn process_end_observation(observation: &Observation) -> Option<ProcessEnd> {
+    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+        return None;
+    };
+    let LifecyclePayload::Native(native) = payload.as_ref() else {
+        return None;
+    };
+    process_end(native.as_ref()).map(|end| end.with_at(Some(observation.observed_at.clone())))
+}
+
+/// Classify a full journaled EVENT (the Hub's JSON shape: `kind=lifecycle`,
+/// `payload` the native lifecycle) and attach its `observedAt` as the
+/// evidence timestamp. Tolerant of the timestamp being absent or
+/// malformed — classification still succeeds, `at` is then `None` and the
+/// caller stamps its own write clock.
+#[must_use]
+pub fn process_end_event(event: &Value) -> Option<ProcessEnd> {
+    if event.get("kind").and_then(Value::as_str) != Some("lifecycle") {
+        return None;
+    }
+    let payload = event.get("payload")?;
+    let end = process_end_value(payload)?;
+    let at = event
+        .get("observedAt")
+        .and_then(Value::as_str)
+        .and_then(|raw| Timestamp::try_from(raw.to_owned()).ok());
+    Some(end.with_at(at))
+}
+
 /// Shared classifier body from the extracted fields.
 fn classify(
     raw_name: &str,
@@ -158,15 +213,11 @@ fn classify(
         || name.contains("start-fail")
         || (name == GENERIC_STARTUP_ERROR_NAME && severity == Severity::Error)
     {
-        return Some(ProcessEnd {
-            kind: ProcessEndKind::Failed,
-        });
+        return Some(ProcessEnd::new(ProcessEndKind::Failed));
     }
     // Node reports the instance gone → Failed.
     if name == INSTANCE_GONE_NAME || name == AGENT_GONE_NAME {
-        return Some(ProcessEnd {
-            kind: ProcessEndKind::Failed,
-        });
+        return Some(ProcessEnd::new(ProcessEndKind::Failed));
     }
 
     // Real process-exit event names.
@@ -177,12 +228,10 @@ fn classify(
     }
     if let Some(status) = status {
         return match status {
-            "exited" | "clean" => Some(ProcessEnd {
-                kind: ProcessEndKind::Exited,
-            }),
-            "failed" | "error" | "crashed" | "killed" | "terminated" => Some(ProcessEnd {
-                kind: ProcessEndKind::Failed,
-            }),
+            "exited" | "clean" => Some(ProcessEnd::new(ProcessEndKind::Exited)),
+            "failed" | "error" | "crashed" | "killed" | "terminated" => {
+                Some(ProcessEnd::new(ProcessEndKind::Failed))
+            }
             // status is an agent/pane id (generic_pty failure_lifecycle sets
             // it to the pane id): fall back to severity.
             _ => severity_fallback(severity),
@@ -195,12 +244,8 @@ fn classify(
 /// severity=error a failed one.
 fn severity_fallback(severity: Severity) -> Option<ProcessEnd> {
     match severity {
-        Severity::Error => Some(ProcessEnd {
-            kind: ProcessEndKind::Failed,
-        }),
-        _ => Some(ProcessEnd {
-            kind: ProcessEndKind::Exited,
-        }),
+        Severity::Error => Some(ProcessEnd::new(ProcessEndKind::Failed)),
+        _ => Some(ProcessEnd::new(ProcessEndKind::Exited)),
     }
 }
 
@@ -219,12 +264,8 @@ pub fn entity_process_end(entity_type: Option<&str>, state: Option<&str>) -> Opt
         return None;
     }
     match state {
-        Some("exited") => Some(ProcessEnd {
-            kind: ProcessEndKind::Exited,
-        }),
-        Some("failed") => Some(ProcessEnd {
-            kind: ProcessEndKind::Failed,
-        }),
+        Some("exited") => Some(ProcessEnd::new(ProcessEndKind::Exited)),
+        Some("failed") => Some(ProcessEnd::new(ProcessEndKind::Failed)),
         _ => None,
     }
 }
@@ -531,13 +572,15 @@ mod tests {
         assert_eq!(
             entity_process_end(Some("instance"), Some("exited")),
             Some(ProcessEnd {
-                kind: ProcessEndKind::Exited
+                kind: ProcessEndKind::Exited,
+                at: None
             })
         );
         assert_eq!(
             entity_process_end(Some("instance"), Some("failed")),
             Some(ProcessEnd {
-                kind: ProcessEndKind::Failed
+                kind: ProcessEndKind::Failed,
+                at: None
             })
         );
         // r5 item 1: workflow run/phase/member entities NEVER end the root.
@@ -580,7 +623,8 @@ mod tests {
         assert_eq!(
             process_end_value(&shell),
             Some(ProcessEnd {
-                kind: ProcessEndKind::Exited
+                kind: ProcessEndKind::Exited,
+                at: None
             })
         );
         let print = serde_json::json!({
@@ -593,7 +637,8 @@ mod tests {
         assert_eq!(
             process_end_value(&print),
             Some(ProcessEnd {
-                kind: ProcessEndKind::Exited
+                kind: ProcessEndKind::Exited,
+                at: None
             })
         );
         let configure = serde_json::json!({
@@ -604,5 +649,52 @@ mod tests {
             "status": {"state": "known", "value": "error"},
         });
         assert_eq!(process_end_value(&configure), None);
+    }
+
+    #[test]
+    fn full_event_classifier_carries_the_evidence_timestamp() {
+        // addendum A: ProcessEnd { kind, at } — the full-event classifier
+        // populates `at` from observedAt for ended_at stamping.
+        let event = serde_json::json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-06T09:42:51.731Z",
+            "payload": {
+                "type": "native",
+                "topic": "session",
+                "nativeName": "native_exit",
+                "severity": "info",
+                "status": {"state": "known", "value": "exited"}
+            }
+        });
+        let end = process_end_event(&event).expect("clean exit is process end");
+        assert_eq!(end.kind, ProcessEndKind::Exited);
+        assert_eq!(
+            end.at,
+            Some(Timestamp::try_from("2026-10-06T09:42:51.731Z".to_owned()).unwrap())
+        );
+
+        // A malformed timestamp never blocks classification; `at` is left None.
+        let mut bad_ts = event.clone();
+        bad_ts["observedAt"] = serde_json::json!("not-a-timestamp");
+        let end = process_end_event(&bad_ts).expect("still classified");
+        assert_eq!(end.kind, ProcessEndKind::Exited);
+        assert_eq!(end.at, None);
+
+        // A turn error is not process end even through the full-event entry.
+        let turn = serde_json::json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-06T09:42:51.731Z",
+            "payload": {
+                "type": "native",
+                "topic": "turn",
+                "nativeName": "result",
+                "status": {"state": "known", "value": "error"}
+            }
+        });
+        assert_eq!(process_end_event(&turn), None);
+        assert_eq!(
+            process_end_event(&serde_json::json!({"kind": "message"})),
+            None
+        );
     }
 }

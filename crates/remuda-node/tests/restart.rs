@@ -207,9 +207,15 @@ async fn fake_claude_kill_mid_session_replays_identical_folds() {
     assert!(
         matches!(
             listed.items[0].lifecycle,
-            InstanceLifecycle::Ready | InstanceLifecycle::Failed
+            InstanceLifecycle::Ready | InstanceLifecycle::Failed | InstanceLifecycle::Exited
         ),
-        "kill mid-session must persist Ready or Failed, got {:?}",
+        // c-cardsettle r5 addendum: the print/SDK child's stdin closes when the
+        // node is killed; this fake exits 0, so its reader emits the REAL
+        // topic=session/nativeName=session status=exited event before shutdown
+        // and the Node now classifies that as the clean process end it is
+        // (r4 ignored print exits entirely and left the row Ready). Failed is
+        // still possible if the kill beat the EOF observation.
+        "kill mid-session must persist Ready, Failed or a clean Exited, got {:?}",
         listed.items[0].lifecycle
     );
 

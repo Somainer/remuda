@@ -2584,12 +2584,14 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
     // Only a real Failed process end returns a reason; Exited is not a failure;
     // everything else (configure/turn/severity=error on a live process) returns
     // None so record_task_exit never appends entity state=failed.
-    use remuda_protocol::process_end::{ProcessEndKind, process_end};
+    use remuda_protocol::process_end::{ProcessEndKind, process_end_observation};
     // Subagent scope is never the main process, regardless of the event.
     if is_subagent_observation(native) {
         return None;
     }
-    let end = process_end(native)?;
+    // The full-observation variant carries the evidence timestamp (`at`) for
+    // ended_at stamping; only Failed ends the task with entity state=failed.
+    let end = process_end_observation(observation)?;
     if end.kind != ProcessEndKind::Failed {
         return None;
     }
@@ -2644,8 +2646,8 @@ fn native_exit(observation: &remuda_protocol::Observation) -> Option<NativeExit>
     // c-cardsettle r5 addendum (OA6): use the SHARED process-end classifier.
     // Accept BOTH the shell-pty (native_exit) and print/SDK (session) real
     // exit events, classified Exited vs Failed by the classifier.
-    use remuda_protocol::process_end::{ProcessEndKind, process_end};
-    let end = process_end(native)?;
+    use remuda_protocol::process_end::{ProcessEndKind, process_end_observation};
+    let end = process_end_observation(observation)?;
     let Knowledge::Known { value: _status } = &native.status else {
         return None;
     };

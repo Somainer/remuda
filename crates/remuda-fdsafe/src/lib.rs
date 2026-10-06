@@ -268,6 +268,27 @@ impl DirFd {
         })
     }
 
+    /// Pin an EXISTING absolute `path`, walking every component from `/` with
+    /// `O_NOFOLLOW|O_DIRECTORY` and creating nothing. A symlink anywhere on
+    /// the path (not just its final component) fails the walk, and a missing
+    /// component returns [`FdErrorKind::Missing`].
+    pub fn open_existing_abs(path: &Path) -> Result<Self, FdError> {
+        if !path.is_absolute() {
+            return Err(FdError {
+                at: path.display().to_string(),
+                kind: FdErrorKind::BadComponent,
+            });
+        }
+        let mut current = Self::open_root(Path::new("/"))?;
+        for component in path.components() {
+            let Component::Normal(part) = component else {
+                continue;
+            };
+            current = current.subdir(part.as_bytes())?;
+        }
+        Ok(current)
+    }
+
     /// Pin `path`, creating every missing component from `/` with
     /// `mkdirat` + an `O_NOFOLLOW` revalidation. The filesystem root is the
     /// trust anchor; every component below it is walked, so a symlink in the

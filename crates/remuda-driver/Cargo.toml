@@ -28,6 +28,7 @@ remuda-claude-wire.workspace = true
 remuda-herdr.workspace = true
 remuda-protocol.workspace = true
 remuda-screen.workspace = true
+remuda-fdsafe.workspace = true
 remuda-signal.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -122,25 +122,35 @@ pub(crate) fn resolve_resume_transcript(
         }
     }
     if let Knowledge::Known { value } = &parent.native_ref.transcript {
-        let path = PathBuf::from(value.source_path.trim());
-        if !value.source_path.trim().is_empty() {
-            match readable_regular_file(&path) {
+        let recorded = value.source_path.trim();
+        if !recorded.is_empty() {
+            let path = PathBuf::from(recorded);
+            // Round 3 item 8: a non-empty recorded transcript is authoritative.
+            // If it is missing, not a regular file (a FIFO/symlink/…), or
+            // unreadable, refuse BEFORE any row is created — never silently fall
+            // back to a stale same-session file in a managed home, which could
+            // replay the wrong (older) conversation.
+            return match readable_regular_file(&path) {
                 Ok(true) => {
                     lookup.path = Some(path);
-                    return Ok(lookup);
+                    Ok(lookup)
                 }
-                Ok(false) => lookup.checked.push(path),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => lookup.checked.push(path),
-                Err(err) => {
-                    return Err(crate::NodeError::Conflict(format!(
-                        "cannot resume session {session_id}: predecessor transcript {} is not \
-                         readable before acceptance: {err}",
-                        path.display()
-                    )));
-                }
-            }
+                Ok(false) => Err(crate::NodeError::Conflict(format!(
+                    "cannot resume session {session_id}: the recorded predecessor transcript {} \
+                     is missing or is not a readable regular file; refusing to fall back to a \
+                     stale managed-home transcript",
+                    path.display()
+                ))),
+                Err(err) => Err(crate::NodeError::Conflict(format!(
+                    "cannot resume session {session_id}: the recorded predecessor transcript {} \
+                     cannot be read before acceptance: {err}",
+                    path.display()
+                ))),
+            };
         }
     }
+    // No recording yet (structured drivers report late): only then is the
+    // durable launch recipe allowed to name the transcript.
     if let Some(recipe) = store.launch_recipe(&parent_id)? {
         let path = remuda_driver::claude_transcript::project_dir(
             Path::new(recipe.native_home.trim()),
@@ -170,26 +180,39 @@ pub(crate) fn resolve_resume_transcript(
 }
 
 /// Whether `path` is an existing regular file that this process can actually
-/// open for reading (review item 6).
+/// open for reading (review item 6; round 3 item 8).
 ///
-/// `Path::is_file` only stats and follows symlinks, so a transcript whose
-/// permissions deny reading would pass acceptance and fail only later inside
-/// the staging factory. This performs the open the copy will need, using
-/// `symlink_metadata` first so a symlink is never accepted as the source.
-/// `Ok(false)` means absent or not a readable regular file candidate; an
-/// `Err` other than [`std::io::ErrorKind::NotFound`] names the real failure.
+/// The check is descriptor-relative (`remuda-fdsafe`): the parent directory
+/// chain is walked `O_NOFOLLOW|O_DIRECTORY` and the leaf is classified, opened
+/// `O_NOFOLLOW|O_NONBLOCK` and `fstat`-confirmed as a regular file on the
+/// opened fd. A symlink (even to a regular file), a FIFO (which plain
+/// `is_file`+`open` would block on), or any other special file is therefore
+/// refused just like a permission error. `Ok(false)` means absent or a
+/// non-regular leaf; an `Err` other than [`std::io::ErrorKind::NotFound`]
+/// names the real failure.
 fn readable_regular_file(path: &Path) -> std::io::Result<bool> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
+    use remuda_fdsafe::{DirFd, FdErrorKind};
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
     };
-    if !metadata.is_file() {
+    let Some(parent) = absolute.parent() else {
         return Ok(false);
-    }
-    match std::fs::OpenOptions::new().read(true).open(path) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
+    };
+    let Some(name) = absolute.file_name() else {
+        return Ok(false);
+    };
+    let dir = match DirFd::open_existing_abs(parent) {
+        Ok(dir) => dir,
+        Err(error) if error.kind == FdErrorKind::Missing => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    match dir.open_regular_leaf(name.as_encoded_bytes()) {
+        Ok(_leaf) => Ok(true),
+        Err(error) if matches!(error.kind, FdErrorKind::Missing | FdErrorKind::Symlink) => {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
     }
 }

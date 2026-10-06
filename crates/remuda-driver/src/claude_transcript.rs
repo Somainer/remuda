@@ -87,62 +87,6 @@ pub fn is_safe_session_id(session_id: &str) -> bool {
         }
 }
 
-/// Normalize a path lexically (`.` removed, `..` pops), never touching the
-/// filesystem, so symlinks cannot influence a containment verdict.
-fn normalize_lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-/// Verify `child` stays inside `base` using lexical components only — no
-/// `canonicalize`, so an untrusted symlink at either path is never followed
-/// (c-resumehome, review item 1). Both paths must be absolute; a verdict on
-/// relative paths would depend on the caller's cwd.
-fn ensure_within(base: &Path, child: &Path) -> std::io::Result<()> {
-    if !base.is_absolute() || !child.is_absolute() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "resume staging containment needs absolute paths (base {}, child {})",
-                base.display(),
-                child.display()
-            ),
-        ));
-    }
-    let base = normalize_lexical(base);
-    let child = normalize_lexical(child);
-    if child.starts_with(&base) {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "resume staging path {} escapes its root {}",
-                child.display(),
-                base.display()
-            ),
-        ))
-    }
-}
-
-/// True when `path` itself is a symlink (its target is not followed).
-fn is_symlink(path: &Path) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
 /// Construct an [`std::io::Error`] with kind [`std::io::ErrorKind::InvalidInput`].
 fn invalid_input(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
@@ -492,6 +436,13 @@ pub fn cwd_matches(path: &Path, terminal_cwd: &Path) -> bool {
     same_dir(Path::new(&found), terminal_cwd)
 }
 
+// ============================ resume staging ============================
+//
+// Everything below reaches the filesystem through descriptor-relative walks
+// (remuda-fdsafe): see [`stage_for_resume`] for the safety contract.
+use remuda_fdsafe::{DirFd, FdErrorKind, LeafKind};
+use std::os::unix::ffi::OsStrExt;
+
 /// What [`stage_for_resume`] made visible inside the resume launch's home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedResume {
@@ -499,6 +450,10 @@ pub struct StagedResume {
     pub transcript: PathBuf,
     /// Side directories copied beside it (subagent transcripts, memory, …).
     pub sidecar_dirs: Vec<PathBuf>,
+    /// Non-regular source entries (symlinks, FIFOs, sockets, devices) that were
+    /// skipped: `"kind:project-relative/path"`. A skipped entry is never opened
+    /// for reading or reproduced, and a symlink's target is never touched.
+    pub skipped: Vec<String>,
 }
 
 /// Make a predecessor conversation visible inside a new launch's config home.
@@ -510,31 +465,46 @@ pub struct StagedResume {
 /// session ID". The source is always the predecessor's *recorded* transcript
 /// path — never a newest-file guess.
 ///
-/// Copy semantics, deliberately not a hardlink: the resumed process appends
-/// to the transcript, and a hardlink would append those turns into the
-/// predecessor's file too (and links fail across filesystems). The predecessor
-/// stays byte-frozen.
+/// # Filesystem safety (c-resumehome round 3)
 ///
-/// Copied when present beside the transcript:
-/// - `<session>/` — subagent transcripts and tool-result payloads;
-/// - `memory/` — the project memory Claude reloads on SessionStart.
+/// Every path is reached through `remuda-fdsafe` descriptor-relative walks:
 ///
-/// The copy is bounded (review item 7): at most 256 MiB of regular-file
-/// bytes, 10 000 files and 32 directory levels, transcript included.
-/// Exceeding any bound is a clear error before the transcript is published.
+/// - trusted roots (the predecessor project dir, the new home) are pinned as
+///   directory fds; every intermediate component is opened
+///   `O_NOFOLLOW|O_DIRECTORY`, so a symlinked `projects/` or `<session>/` can
+///   never redirect staging, and an in-tree sidecar link (`exfil ->
+///   ../bridge/passwd`) is never resolved;
+/// - leaves are classified with `fstatat(AT_SYMLINK_NOFOLLOW)`, opened
+///   `O_NOFOLLOW|O_NONBLOCK`, and re-classified by `fstat` on the opened fd —
+///   there is no stat→open window, and a FIFO can neither block nor be copied;
+/// - the whole conversation is copied into a private `.stage-…` temp tree,
+///   verified against a complete manifest (names, sizes, sha256 read back from
+///   the temp fds), and only then renamed into place one file at a time. A
+///   crash leaves either the previous complete file or an unpublished temp
+///   tree, never a partial file under a final name;
+/// - provenance is the sha256 of the bytes ACTUALLY streamed, not a second
+///   read of the source path;
+/// - the complete selected conversation — retained files included — is charged
+///   against the limits before the transcript is published.
 ///
-/// Existing destination files are kept ONLY with provenance (review item 4):
-/// an existing `<session>.jsonl` is preserved when a sibling staging marker
-/// proves this launch's predecessor staged it (source path plus size/sha256); a
-/// file without that proof is a foreign conversation and aborts staging with a
-/// clear conflict. The transcript is published through a same-directory temp
-/// file plus rename, so a crashed copy is never seen as a complete
-/// conversation; sidecars merge first and never overwrite.
+/// A destination symlink is refused even when it points at the source file;
+/// the inherited-home no-op happens only after that check, on a
+/// `(st_dev, st_ino)` identity read from both opened fds.
 ///
-/// The destination file is always named `<session_id>.jsonl` — the exact name
-/// `claude --resume <session_id>` looks for — even when the recorded source
-/// path carries a different file name (a promoted session moved outside the
-/// managed home keeps whatever name the hook reported).
+/// # Limits
+///
+/// At most 256 MiB of regular-file bytes, 10 000 files and 32 sidecar
+/// directory levels, transcript included. The transcript size is refused
+/// before a single byte is hashed.
+///
+/// # Existing destinations
+///
+/// An existing `<session>.jsonl` is kept ONLY when a sibling staging marker
+/// proves this launch staged it from exactly this predecessor (source path,
+/// size, streamed sha256); the child's appended turns are preserved. Anything
+/// else is a clear conflict. Sidecar destinations are accepted only when
+/// byte-identical to the selected source; mismatches are refused, never
+/// overwritten.
 pub fn stage_for_resume(
     source_transcript: &Path,
     target_home: &Path,
@@ -548,6 +518,127 @@ pub fn stage_for_resume(
         session_id,
         DEFAULT_STAGE_LIMITS,
     )
+}
+
+/// Bounds on a resume staging copy (review item 7). A predecessor home is
+/// untrusted input: without caps, a huge transcript or an enormous sidecar
+/// tree could fill the child instance's disk or pin the staging worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StageLimits {
+    /// Total regular-file bytes in the complete conversation, transcript
+    /// included and retained files included.
+    max_bytes: u64,
+    /// Total regular files in the complete conversation.
+    max_files: u64,
+    /// Directory depth below a sidecar root.
+    max_depth: u32,
+}
+
+/// 256 MiB / 10 000 files / 32 levels: well above a real conversation with
+/// subagent transcripts and project memory, bounded against abuse.
+const DEFAULT_STAGE_LIMITS: StageLimits = StageLimits {
+    max_bytes: 256 * 1024 * 1024,
+    max_files: 10_000,
+    max_depth: 32,
+};
+
+/// Running tally charged against [`StageLimits`] for the COMPLETE selected
+/// conversation: every selected file is charged before streaming or
+/// publishing starts, retained destinations included (round 3 item 6).
+#[derive(Debug, Default)]
+struct CopyBudget {
+    files: u64,
+    bytes: u64,
+}
+
+impl CopyBudget {
+    fn note_file(&mut self, limits: &StageLimits) -> std::io::Result<()> {
+        let next = self
+            .files
+            .checked_add(1)
+            .ok_or_else(|| limit_exceeded("file count overflow while staging"))?;
+        if next > limits.max_files {
+            return Err(limit_exceeded(format!(
+                "resume staging file count limit exceeded: more than {} files",
+                limits.max_files
+            )));
+        }
+        self.files = next;
+        Ok(())
+    }
+
+    fn charge_bytes(&mut self, size: u64, limits: &StageLimits) -> std::io::Result<()> {
+        let next = self
+            .bytes
+            .checked_add(size)
+            .ok_or_else(|| limit_exceeded("byte count overflow while staging"))?;
+        if next > limits.max_bytes {
+            return Err(limit_exceeded(format!(
+                "resume staging size limit exceeded: more than {} bytes",
+                limits.max_bytes
+            )));
+        }
+        self.bytes = next;
+        Ok(())
+    }
+}
+
+fn limit_exceeded(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::other(message.into())
+}
+
+/// Dot-directory holding per-session provenance markers next to the slug dir.
+const STAGING_MARKER_DIR: &str = ".remuda-staging";
+/// Prefix of the per-attempt private temp tree, also inside the slug dir.
+const STAGING_TMP_PREFIX: &str = ".stage-";
+
+/// Provenance recorded next to a staged transcript (review item 4). The sha is
+/// computed over the bytes actually streamed into the child home (round 3
+/// item 3), never re-read from the source path.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StagingProvenance {
+    /// Marker format version.
+    version: u32,
+    /// Absolute path of the predecessor transcript this copy came from.
+    source: String,
+    /// Source size in bytes at staging time.
+    source_size: u64,
+    /// Lower-hex SHA-256 of the streamed source bytes.
+    source_sha256: String,
+}
+
+impl StagingProvenance {
+    fn new(source: &Path, source_size: u64, source_sha256: &str) -> Self {
+        Self {
+            version: 1,
+            source: source.display().to_string(),
+            source_size,
+            source_sha256: source_sha256.to_owned(),
+        }
+    }
+
+    fn covers(&self, source: &Path, source_size: u64, source_sha256: &str) -> bool {
+        self.version == 1
+            && self.source == source.display().to_string()
+            && self.source_size == source_size
+            && self.source_sha256 == source_sha256
+    }
+}
+
+/// One verified file in the private temp tree. `rel` is relative to the slug
+/// directory, `/`-separated, e.g. `<S>/subagents/side.jsonl` or `<S>.jsonl`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ManifestEntry {
+    rel: String,
+    size: u64,
+    sha256: String,
+}
+
+/// The complete temp-tree manifest, verified before anything is published.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StagingManifest {
+    version: u32,
+    entries: Vec<ManifestEntry>,
 }
 
 fn stage_for_resume_with_limits(
@@ -564,533 +655,768 @@ fn stage_for_resume_with_limits(
              (expected a UUID-style token)"
         )));
     }
-    // `symlink_metadata`, not `metadata`: a staged transcript must be a real
-    // regular file, never a link the resume could follow somewhere else. The
-    // original error kind is preserved (a missing file stays `NotFound`).
-    let metadata = source_transcript.symlink_metadata().map_err(|err| {
-        std::io::Error::new(
-            err.kind(),
-            format!(
-                "resume transcript not found at {}: {err}",
-                source_transcript.display()
-            ),
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(invalid_input(format!(
-            "resume transcript is not a regular file: {}",
-            source_transcript.display()
+
+    // ---- Source: pin the predecessor project dir, component by component
+    // from `/`, and open the transcript as a real regular leaf. No symlink
+    // component anywhere on the path is followed.
+    let source_abs = absolutize(source_transcript);
+    let source_dir_path = source_abs
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            invalid_input(format!(
+                "resume transcript path has no parent directory: {}",
+                source_abs.display()
+            ))
+        })?;
+    let source_name = source_abs
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .ok_or_else(|| {
+            invalid_input(format!(
+                "resume transcript path has no file name: {}",
+                source_abs.display()
+            ))
+        })?;
+    let src_dir_fd = DirFd::open_existing_abs(source_dir_path)?;
+    let src_leaf = src_dir_fd.open_regular_leaf(source_name.as_bytes())?;
+    let source_size = src_leaf.len;
+    let src_identity = src_leaf.identity()?;
+    // Round 3 item 7: refuse an oversized transcript before reading/hashing.
+    if source_size > limits.max_bytes {
+        return Err(limit_exceeded(format!(
+            "resume staging size limit exceeded: predecessor transcript is {source_size} bytes, \
+             more than the {} byte cap",
+            limits.max_bytes
         )));
     }
-    let source_name = source_transcript.file_name().ok_or_else(|| {
-        invalid_input(format!(
-            "resume transcript path has no file name: {}",
-            source_transcript.display()
-        ))
-    })?;
-    let dest_dir = project_dir(target_home, target_cwd);
-    // Lexical containment only: the managed home (and any partial retry state
-    // inside it) must not be able to redirect staging through a symlink.
-    ensure_within(target_home, &dest_dir)?;
-    let dest_transcript = dest_dir.join(format!("{session_id}.jsonl"));
-    ensure_within(&dest_dir, &dest_transcript)?;
-    std::fs::create_dir_all(&dest_dir)?;
-    if is_symlink(&dest_dir)? {
-        return Err(invalid_input(format!(
-            "resume staging directory {} is a symlink, not a real directory",
-            dest_dir.display()
-        )));
-    }
 
-    // Inherited-home resume (or a replayed build): the conversation already
-    // lives where the new process will look. Nothing to stage, and no
-    // provenance marker is required — it is not a Remuda-made copy.
-    if same_path(&dest_transcript, source_transcript) {
-        return Ok(StagedResume {
-            transcript: dest_transcript,
-            sidecar_dirs: Vec::new(),
-        });
-    }
+    // ---- Destination: walk/create `home/projects/<slug>` with every
+    // intermediate opened O_NOFOLLOW|O_DIRECTORY.
+    let resolved_cwd =
+        std::fs::canonicalize(target_cwd).unwrap_or_else(|_| target_cwd.to_path_buf());
+    let slug = encode_project_dir(&resolved_cwd);
+    let dest_home_fd = DirFd::open_or_create_abs(&absolutize(target_home))?;
+    let projects_fd = dest_home_fd.ensure_subdir(b"projects")?;
+    let dest_dir_fd = projects_fd.ensure_subdir(slug.as_bytes())?;
+    let dest_dir = project_dir(target_home, &resolved_cwd);
+    let transcript_name = format!("{session_id}.jsonl");
+    let transcript_name_bytes = transcript_name.as_bytes().to_vec();
+    let dest_transcript = dest_dir.join(&transcript_name);
 
-    let (source_size, source_sha256) = sha256_file(source_transcript)?;
-    let marker_path = provenance_marker_path(&dest_dir, session_id);
-
-    // Classify any existing destination transcript without following it.
-    match std::fs::symlink_metadata(&dest_transcript) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
+    // Round 3 item 1: classify the destination leaf BEFORE any same-file
+    // identity check. A symlinked `<S>.jsonl` pointing at the predecessor is a
+    // refusal, not an inherited-home no-op.
+    let existing = dest_dir_fd.classify_leaf(&transcript_name_bytes)?;
+    let retained = match existing {
+        Some(entry) if entry.kind == LeafKind::Symlink => {
             return Err(invalid_input(format!(
-                "resume destination {} is a symlink, not a real file",
+                "resume destination {} is a symlink, not a real file; refusing to stage through it",
                 dest_transcript.display()
             )));
         }
-        Ok(metadata) if !metadata.is_file() => {
+        Some(entry) if entry.kind != LeafKind::Regular => {
             return Err(invalid_input(format!(
                 "resume destination {} is not a regular file",
                 dest_transcript.display()
             )));
         }
-        Ok(_) => {
-            // Review item 4: keep an existing destination ONLY when provenance
-            // proves this launch staged it from exactly this predecessor.
-            // Anything else (a stale same-session file, a foreign home that
-            // already held this id) is a conflict, never a silent overwrite.
-            let Some(provenance) = read_staging_provenance(&marker_path)? else {
-                return Err(invalid_input(format!(
-                    "resume destination {} already exists without Remuda staging provenance for \
-                     predecessor {}; refusing to overwrite a conversation this launch did not \
-                     stage (resume in a fresh native home or remove the stale file)",
-                    dest_transcript.display(),
-                    source_transcript.display()
-                )));
-            };
-            if !provenance.covers(source_transcript, source_size, &source_sha256) {
-                return Err(invalid_input(format!(
-                    "resume destination {} exists but its staging provenance does not match \
-                     predecessor {} (size {source_size}, sha256 {source_sha256}); refusing to \
-                     overwrite",
-                    dest_transcript.display(),
-                    source_transcript.display()
-                )));
+        Some(_) => {
+            let dest_leaf = dest_dir_fd.open_regular_leaf(&transcript_name_bytes)?;
+            if dest_leaf.identity()? == src_identity {
+                // Inherited home: the conversation already lives exactly where
+                // the new process looks. Nothing is staged, no marker needed.
+                return Ok(StagedResume {
+                    transcript: dest_transcript,
+                    sidecar_dirs: Vec::new(),
+                    skipped: Vec::new(),
+                });
             }
-            // Proven: the child's own staged copy (possibly already appended
-            // to by an earlier launch attempt). Merge any missing sidecars,
-            // never touch the transcript. The merge stays bounded even though
-            // the transcript itself is not recopied.
-            let mut budget = CopyBudget::default();
-            let sidecar_dirs = copy_resume_sidecars(
-                source_transcript,
-                source_name,
-                &dest_dir,
-                session_id,
-                &limits,
-                &mut budget,
-            )?;
-            return Ok(StagedResume {
-                transcript: dest_transcript,
-                sidecar_dirs,
-            });
+            // A different regular file: it survives ONLY with valid
+            // provenance, checked after the source has been streamed (the
+            // marker is validated against the streamed sha, not a path re-read).
+            true
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
-    }
+        None => false,
+    };
 
-    // Fresh staging. The transcript counts against the budget first (review
-    // item 7). Sidecars merge next (idempotent: a crashed earlier attempt may
-    // have left parts), provenance is published after them, and the transcript
-    // is published LAST through a same-directory temp file + rename — until
-    // that rename lands, the conversation is visibly absent and
-    // `claude --resume` fails its lookup rather than reading a partial copy.
+    // ---- Private temp tree for this attempt, inside the pinned slug dir.
+    let tmp_name = format!(
+        "{STAGING_TMP_PREFIX}{session_id}-{}",
+        uuid::Uuid::new_v4().as_simple()
+    );
+    let tmp_name_bytes = tmp_name.as_bytes().to_vec();
+    let temp_fd = dest_dir_fd.ensure_subdir(&tmp_name_bytes)?;
+
     let mut budget = CopyBudget::default();
-    budget.charge(source_size, &limits)?;
-    let sidecar_dirs = copy_resume_sidecars(
+    let mut skipped: Vec<String> = Vec::new();
+    let outcome = build_verify_and_publish(
+        &src_dir_fd,
+        &source_name,
         source_transcript,
-        source_name,
-        &dest_dir,
         session_id,
+        &dest_dir,
+        &dest_dir_fd,
+        &temp_fd,
+        &transcript_name,
+        source_size,
+        retained,
         &limits,
         &mut budget,
-    )?;
-    write_staging_provenance(
-        &marker_path,
-        &StagingProvenance::new(source_transcript, source_size, &source_sha256),
-    )?;
-    publish_transcript_atomic(source_transcript, &dest_transcript, session_id)?;
+        &mut skipped,
+    );
 
+    // Round 3 item 6: a failed attempt's unpublished temp tree is ALWAYS
+    // discarded — a later retry must not charge or trust its leftovers.
+    if let Err(error) = dest_dir_fd.remove_private_tree(&tmp_name_bytes) {
+        tracing::debug!(%error, "resume staging temp tree cleanup failed");
+    }
+    let sidecar_dirs = outcome?;
     Ok(StagedResume {
         transcript: dest_transcript,
         sidecar_dirs,
+        skipped,
     })
 }
 
-/// Directory (inside the destination project slug) holding per-session
-/// provenance markers. Dot-prefixed so Claude's transcript globs never read
-/// it; the fake and the real CLI only open `<session>.jsonl`.
-const STAGING_MARKER_DIR: &str = ".remuda-staging";
-
-/// Provenance recorded next to a staged transcript (review item 4).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct StagingProvenance {
-    /// Marker format version.
-    version: u32,
-    /// Absolute path of the predecessor transcript this copy came from.
-    source: String,
-    /// Source size in bytes at staging time.
-    source_size: u64,
-    /// Lower-hex SHA-256 of the source at staging time.
-    source_sha256: String,
-}
-
-impl StagingProvenance {
-    fn new(source: &Path, source_size: u64, source_sha256: &str) -> Self {
-        Self {
-            version: 1,
-            source: source.to_string_lossy().into_owned(),
-            source_size,
-            source_sha256: source_sha256.to_owned(),
-        }
-    }
-
-    /// Whether this marker proves the destination was staged from `source`
-    /// with exactly the predecessor content currently on disk.
-    fn covers(&self, source: &Path, source_size: u64, source_sha256: &str) -> bool {
-        self.version == 1
-            && self.source == source.to_string_lossy()
-            && self.source_size == source_size
-            && self.source_sha256 == source_sha256
-    }
-}
-
-fn provenance_marker_path(dest_dir: &Path, session_id: &str) -> PathBuf {
-    dest_dir
-        .join(STAGING_MARKER_DIR)
-        .join(format!("{session_id}.json"))
-}
-
-/// Read and validate a provenance marker; `None` means absent (a corrupt or
-/// older-format marker is treated as absent — fail closed on the existing
-/// destination).
-fn read_staging_provenance(path: &Path) -> std::io::Result<Option<StagingProvenance>> {
-    match std::fs::read_to_string(path) {
-        Ok(body) => Ok(serde_json::from_str::<StagingProvenance>(&body)
-            .ok()
-            .filter(|marker| marker.version == 1)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-/// Write the marker via a same-directory temp file + rename, so a crash can
-/// leave either the old marker or the new one, never a torn write.
-fn write_staging_provenance(path: &Path, provenance: &StagingProvenance) -> std::io::Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        invalid_input(format!(
-            "provenance path has no directory: {}",
-            path.display()
-        ))
-    })?;
-    std::fs::create_dir_all(dir)?;
-    if is_symlink(dir)? {
-        return Err(invalid_input(format!(
-            "provenance directory {} is a symlink",
-            dir.display()
-        )));
-    }
-    let tmp = dir.join(format!(".marker-tmp-{}", uuid::Uuid::new_v4()));
-    let body = serde_json::to_vec_pretty(provenance).map_err(std::io::Error::other)?;
-    let outcome = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
-    if outcome.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    outcome
-}
-
-/// Copy `source` to `dest` via a same-directory temp file plus atomic rename.
-fn publish_transcript_atomic(source: &Path, dest: &Path, session_id: &str) -> std::io::Result<()> {
-    let dir = dest.parent().ok_or_else(|| {
-        invalid_input(format!(
-            "transcript destination has no directory: {}",
-            dest.display()
-        ))
-    })?;
-    let tmp = dir.join(format!(
-        ".transcript-tmp-{session_id}-{}",
-        uuid::Uuid::new_v4()
-    ));
-    let outcome = (|| {
-        std::fs::copy(source, &tmp)?;
-        // Flush the staged bytes before the rename makes them visible.
-        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-            let _ = file.sync_all();
-        }
-        std::fs::rename(&tmp, dest)
-    })();
-    if outcome.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    outcome
-}
-
-/// SHA-256 (lower hex) and byte size of a regular file read in bounded chunks.
-fn sha256_file(path: &Path) -> std::io::Result<(u64, String)> {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let size = std::io::copy(&mut file, &mut hasher)?;
-    Ok((size, format!("{:x}", hasher.finalize())))
-}
-
-/// Copy the per-session sidecar dir (`<dir>/<S>/` first, file stem fallback)
-/// and the project-global `memory/` next to the staged transcript.
-fn copy_resume_sidecars(
-    source_transcript: &Path,
+/// Copy the whole selected conversation into `temp_fd`, verify its manifest,
+/// then publish into `dest_dir_fd`. On any error nothing published is left
+/// half-written: files land via `renameat`, sidecars land before the
+/// transcript, and the caller removes the temp tree.
+#[allow(clippy::too_many_arguments)]
+fn build_verify_and_publish(
+    src_dir_fd: &DirFd,
     source_name: &std::ffi::OsStr,
-    dest_dir: &Path,
+    source_transcript: &Path,
     session_id: &str,
+    dest_dir: &Path,
+    dest_dir_fd: &DirFd,
+    temp_fd: &DirFd,
+    transcript_name: &str,
+    source_size: u64,
+    retained: bool,
     limits: &StageLimits,
     budget: &mut CopyBudget,
+    skipped: &mut Vec<String>,
 ) -> std::io::Result<Vec<PathBuf>> {
-    let source_dir = source_transcript.parent().unwrap_or_else(|| Path::new("/"));
-    let mut sidecar_dirs = Vec::new();
-    // The per-session directory is keyed by the native session id: a
-    // promoted/renamed transcript can carry a different file name while its
-    // `<S>/` sidecar dir keeps the native id (review item 3), so `<dir>/<S>/`
-    // is looked up FIRST and the file stem is only a fallback for older
-    // promoted layouts.
-    let mut per_session_sources: Vec<std::ffi::OsString> = vec![session_id.into()];
+    use std::io::Write;
+
+    let mut seeds: Vec<ManifestEntry> = Vec::new();
+    let mut published_roots: Vec<PathBuf> = Vec::new();
+
+    // (1) Transcript. Count + bytes are charged BEFORE streaming; the stream
+    // independently refuses to cross the byte cap.
+    budget.note_file(limits)?;
+    budget.charge_bytes(source_size, limits)?;
+    let transcript_src = src_dir_fd.open_regular_leaf(source_name.as_bytes())?;
+    let mut transcript_tmp = temp_fd.create_leaf_excl(transcript_name.as_bytes())?;
+    let transcript_sha = stream_hashed(
+        &mut &transcript_src.file,
+        &mut transcript_tmp,
+        source_size,
+        limits,
+    )?;
+    drop(transcript_tmp);
+    seeds.push(ManifestEntry {
+        rel: transcript_name.to_owned(),
+        size: source_size,
+        sha256: transcript_sha.clone(),
+    });
+
+    // (2) Sidecar roots. `<dir>/<S>/` first (a renamed transcript keeps the
+    // native id on its sidecar dir), the file-stem dir only for older layouts,
+    // then project-global `memory/`.
+    let mut candidates: Vec<std::ffi::OsString> = vec![session_id.into()];
     if let Some(stem) = Path::new(source_name)
         .file_stem()
-        .map(std::ffi::OsStr::to_os_string)
+        .map(std::ffi::OsString::from)
         .filter(|stem| stem != session_id)
     {
-        per_session_sources.push(stem);
+        candidates.push(stem);
     }
-    for source_side_name in per_session_sources {
-        let source_side = source_dir.join(&source_side_name);
-        match std::fs::symlink_metadata(&source_side) {
-            Ok(metadata) if metadata.is_dir() => {
-                let dest_side = dest_dir.join(session_id);
-                ensure_within(dest_dir, &dest_side)?;
-                copy_dir_merge(source_dir, &source_side, &dest_side, 0, limits, budget)?;
-                sidecar_dirs.push(dest_side);
-                break;
+    candidates.push("memory".into());
+
+    let mut session_root_taken = false;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let is_memory = index == candidates.len() - 1;
+        let root_name = candidate.as_bytes();
+        let root_label = String::from_utf8_lossy(root_name).into_owned();
+        let entry = match src_dir_fd.classify_leaf(root_name)? {
+            Some(entry) => entry,
+            None => continue,
+        };
+        match entry.kind {
+            LeafKind::Directory => {
+                // For the per-session slot only the first existing root wins;
+                // `memory` is its own independent root.
+                if !is_memory && session_root_taken {
+                    continue;
+                }
+                let root_fd = src_dir_fd.subdir(root_name)?;
+                let mut files: Vec<(String, u64)> = Vec::new();
+                enumerate_regular(
+                    &root_fd,
+                    "",
+                    0,
+                    &root_label,
+                    limits,
+                    budget,
+                    skipped,
+                    &mut files,
+                )?;
+                for (rel, size) in files {
+                    copy_sidecar_seed(
+                        &root_fd,
+                        &root_label,
+                        &rel,
+                        size,
+                        temp_fd,
+                        limits,
+                        &mut seeds,
+                    )?;
+                }
+                if !is_memory {
+                    session_root_taken = true;
+                }
+                published_roots.push(dest_dir.join(&root_label));
             }
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(invalid_input(format!(
-                    "resume sidecar {} is a symlink, not a real directory",
-                    source_side.display()
-                )));
-            }
-            _ => continue,
+            // Round 3 items 2/4: a symlinked or non-regular sidecar ROOT is
+            // skipped and reported, never opened and never recreated; the
+            // transcript still stages.
+            LeafKind::Symlink => skipped.push(format!("symlink:{root_label}")),
+            LeafKind::Other => skipped.push(format!("non-regular:{root_label}")),
+            LeafKind::Regular => skipped.push(format!("non-directory:{root_label}")),
         }
     }
-    let memory_side = source_dir.join("memory");
-    if let Ok(metadata) = std::fs::symlink_metadata(&memory_side)
-        && metadata.is_dir()
-    {
-        let dest_side = dest_dir.join("memory");
-        ensure_within(dest_dir, &dest_side)?;
-        copy_dir_merge(source_dir, &memory_side, &dest_side, 0, limits, budget)?;
-        sidecar_dirs.push(dest_side);
-    } else if let Ok(metadata) = std::fs::symlink_metadata(&memory_side)
-        && metadata.file_type().is_symlink()
-    {
-        return Err(invalid_input(format!(
-            "resume sidecar {} is a symlink, not a real directory",
-            memory_side.display()
-        )));
-    }
-    Ok(sidecar_dirs)
-}
 
-/// Path equality after canonicalization, falling back to lexical equality.
-fn same_path(a: &Path, b: &Path) -> bool {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canon(a) == canon(b)
-}
+    // (3) Write + verify the manifest against the temp tree itself.
+    let manifest = StagingManifest {
+        version: 1,
+        entries: seeds.clone(),
+    };
+    let body = serde_json::to_vec_pretty(&manifest).map_err(std::io::Error::other)?;
+    temp_fd
+        .create_leaf_excl(b".manifest.json")?
+        .write_all(&body)?;
+    verify_temp_tree(temp_fd, &seeds)?;
 
-/// Maximum symlink hops followed while resolving one staged link, so a link
-/// cycle cannot hang the walk.
-const MAX_LINK_HOPS: usize = 32;
-
-/// Bounds on a resume staging copy (review item 7). A predecessor home is
-/// untrusted input: without caps, a huge transcript or an enormous sidecar
-/// tree could fill the child instance's disk or pin the staging worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StageLimits {
-    /// Total regular-file bytes staged (transcript included).
-    max_bytes: u64,
-    /// Total regular files staged (transcript included).
-    max_files: u64,
-    /// Directory depth below a sidecar root.
-    max_depth: u32,
-}
-
-/// 256 MiB / 10 000 files / 32 levels: well above a real conversation with
-/// subagent transcripts and project memory, bounded against abuse.
-const DEFAULT_STAGE_LIMITS: StageLimits = StageLimits {
-    max_bytes: 256 * 1024 * 1024,
-    max_files: 10_000,
-    max_depth: 32,
-};
-
-/// Running tally charged against [`StageLimits`].
-#[derive(Debug, Default)]
-struct CopyBudget {
-    files: u64,
-    bytes: u64,
-}
-
-impl CopyBudget {
-    fn charge(&mut self, size: u64, limits: &StageLimits) -> std::io::Result<()> {
-        let next_files = self
-            .files
-            .checked_add(1)
-            .ok_or_else(|| limit_exceeded("file count overflow while staging"))?;
-        let next_bytes = self
-            .bytes
-            .checked_add(size)
-            .ok_or_else(|| limit_exceeded("byte count overflow while staging"))?;
-        if next_files > limits.max_files {
-            return Err(limit_exceeded(format!(
-                "resume staging file count limit exceeded: more than {} files",
-                limits.max_files
+    // (4) A retained destination transcript now has to prove provenance
+    // against the source bytes we actually streamed.
+    if retained {
+        let marker = read_staging_provenance(dest_dir_fd, transcript_name)?.ok_or_else(|| {
+            invalid_input(format!(
+                "resume destination {dest_transcript} already exists without Remuda staging \
+                     provenance for predecessor {source}; refusing to keep or overwrite a \
+                     conversation this launch did not stage (resume in a fresh native home or \
+                     remove the stale file)",
+                dest_transcript = dest_dir.join(transcript_name).display(),
+                source = source_transcript.display()
+            ))
+        })?;
+        if !marker.covers(source_transcript, source_size, &transcript_sha) {
+            return Err(invalid_input(format!(
+                "resume destination {} exists but its staging provenance does not match \
+                 predecessor {} (size {source_size}, sha256 {transcript_sha}); refusing to \
+                 overwrite",
+                dest_dir.join(transcript_name).display(),
+                source_transcript.display()
             )));
         }
-        if next_bytes > limits.max_bytes {
+    }
+
+    // (5) Publish: empty root dirs first, then sidecars (identical files are
+    // kept, foreign/diverging files are a conflict), transcript last.
+    for root in &published_roots {
+        let name = root
+            .file_name()
+            .map(std::ffi::OsStr::as_bytes)
+            .unwrap_or_default()
+            .to_vec();
+        dest_dir_fd.ensure_subdir(&name)?;
+    }
+    for seed in &seeds {
+        if seed.rel == transcript_name {
+            continue;
+        }
+        publish_one_seed(temp_fd, dest_dir_fd, seed)?;
+    }
+    if !retained {
+        // Re-check right before the rename: the destination must still be
+        // absent, otherwise fail closed instead of replacing it.
+        if dest_dir_fd
+            .classify_leaf(transcript_name.as_bytes())?
+            .is_some()
+        {
+            return Err(invalid_input(format!(
+                "resume destination {} appeared during staging without provenance; refusing to \
+                 overwrite",
+                dest_dir.join(transcript_name).display()
+            )));
+        }
+        temp_fd.rename(
+            transcript_name.as_bytes(),
+            dest_dir_fd,
+            transcript_name.as_bytes(),
+        )?;
+    } else {
+        // The retained transcript is never replaced; drop its temp copy.
+        let _ = temp_fd.unlink_file(transcript_name.as_bytes());
+    }
+
+    // (6) Provenance marker last (a reader sees the transcript before the
+    // marker can validate it; the reverse order would validate nothing).
+    write_staging_provenance(
+        dest_dir_fd,
+        transcript_name,
+        &StagingProvenance::new(source_transcript, source_size, &transcript_sha),
+    )?;
+
+    Ok(published_roots)
+}
+
+/// Recursively classify a source sidecar directory. Regular files are
+/// pre-charged (count + recorded size) and collected with paths RELATIVE TO
+/// THE ROOT (not including its label); directories are descended within the
+/// depth cap; symlinks and other non-regular entries are skipped and reported
+/// with the root label prefix — never opened, never followed.
+fn enumerate_regular(
+    dir_fd: &DirFd,
+    rel_inside: &str,
+    depth: u32,
+    root_label: &str,
+    limits: &StageLimits,
+    budget: &mut CopyBudget,
+    skipped: &mut Vec<String>,
+    files: &mut Vec<(String, u64)>,
+) -> std::io::Result<()> {
+    for entry in dir_fd.entries()? {
+        let rel = if rel_inside.is_empty() {
+            String::from_utf8_lossy(&entry.name).into_owned()
+        } else {
+            format!("{rel_inside}/{}", String::from_utf8_lossy(&entry.name))
+        };
+        match entry.kind {
+            LeafKind::Directory => {
+                if depth >= limits.max_depth {
+                    return Err(limit_exceeded(format!(
+                        "resume staging depth limit exceeded: more than {} nested directories",
+                        limits.max_depth
+                    )));
+                }
+                let sub = dir_fd.subdir(&entry.name)?;
+                enumerate_regular(
+                    &sub,
+                    &rel,
+                    depth + 1,
+                    root_label,
+                    limits,
+                    budget,
+                    skipped,
+                    files,
+                )?;
+            }
+            LeafKind::Regular => {
+                budget.note_file(limits)?;
+                budget.charge_bytes(entry.len, limits)?;
+                files.push((rel, entry.len));
+            }
+            LeafKind::Symlink => skipped.push(format!("symlink:{root_label}/{rel}")),
+            LeafKind::Other => skipped.push(format!("non-regular:{root_label}/{rel}")),
+        }
+    }
+    Ok(())
+}
+
+/// Reopen one enumerated sidecar file through the fd walk (a swap to a
+/// symlink between enumeration and open is refused here), stream it into the
+/// temp tree under `<root_label>/<rel>`, and record its slug-relative manifest
+/// entry.
+fn copy_sidecar_seed(
+    root_fd: &DirFd,
+    root_label: &str,
+    rel: &str,
+    expected_size: u64,
+    temp_fd: &DirFd,
+    limits: &StageLimits,
+    seeds: &mut Vec<ManifestEntry>,
+) -> std::io::Result<()> {
+    let inside: Vec<&[u8]> = rel.split('/').map(str::as_bytes).collect();
+    // Source: walk from the root fd along the root-relative chain.
+    let mut source_chain: Vec<DirFd> = Vec::new();
+    for component in &inside[..inside.len().saturating_sub(1)] {
+        let base = source_chain.last().unwrap_or(root_fd);
+        source_chain.push(base.subdir(component)?);
+    }
+    let source_parent = source_chain.last().unwrap_or(root_fd);
+    let leaf = source_parent.open_regular_leaf(*inside.last().unwrap())?;
+
+    // Destination in the temp tree mirrors the slug: root label first.
+    let root_bytes = root_label.as_bytes();
+    let mut temp_chain: Vec<DirFd> = Vec::new();
+    {
+        let base = temp_chain.last().unwrap_or(temp_fd);
+        temp_chain.push(base.ensure_subdir(root_bytes)?);
+    }
+    for component in &inside[..inside.len().saturating_sub(1)] {
+        let base = temp_chain.last().unwrap_or(temp_fd);
+        temp_chain.push(base.ensure_subdir(component)?);
+    }
+    let temp_parent = temp_chain.last().unwrap_or(temp_fd);
+    let mut out = temp_parent.create_leaf_excl(*inside.last().unwrap())?;
+    let sha = stream_hashed(&mut &leaf.file, &mut out, expected_size, limits)?;
+    seeds.push(ManifestEntry {
+        rel: format!("{root_label}/{rel}"),
+        size: expected_size,
+        sha256: sha,
+    });
+    Ok(())
+}
+
+/// Stream `src` to `dst`, SHA-256-ing every byte actually copied. The byte cap
+/// is enforced on the live byte count (independent of the pre-charged
+/// budget), and the stream must end at exactly the size the entry was
+/// classified with — a grown or swapped file is a hard error.
+fn stream_hashed<R: ?Sized, W: ?Sized>(
+    src: &mut R,
+    dst: &mut W,
+    expected_size: u64,
+    limits: &StageLimits,
+) -> std::io::Result<String>
+where
+    R: std::io::Read,
+    W: std::io::Write,
+{
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0_u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let read = src.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        let next = total
+            .checked_add(read as u64)
+            .ok_or_else(|| limit_exceeded("byte count overflow while staging"))?;
+        if next > limits.max_bytes {
             return Err(limit_exceeded(format!(
                 "resume staging size limit exceeded: more than {} bytes",
                 limits.max_bytes
             )));
         }
-        self.files = next_files;
-        self.bytes = next_bytes;
-        Ok(())
+        hasher.update(&buf[..read]);
+        dst.write_all(&buf[..read])?;
+        total = next;
     }
-}
-
-fn limit_exceeded(message: impl Into<String>) -> std::io::Error {
-    std::io::Error::other(message.into())
-}
-
-/// Recursively merge `src` into `dst`, never overwriting destination files.
-///
-/// Symlinks are never recreated (c-resumehome, review item 2): a link recreated
-/// in the child's home could point back at the predecessor's files or outside
-/// the managed home, and the resumed process would then write through it. A
-/// link is followed hop by hop — every hop containment-checked against `root`
-/// — and its target is copied as an independent file only when the final
-/// target is a regular file. Escaping links, directory links, broken links and
-/// cycles are hard errors, never silently skipped.
-fn copy_dir_merge(
-    root: &Path,
-    src: &Path,
-    dst: &Path,
-    depth: u32,
-    limits: &StageLimits,
-    budget: &mut CopyBudget,
-) -> std::io::Result<()> {
-    if depth > limits.max_depth {
-        return Err(limit_exceeded(format!(
-            "resume staging depth limit exceeded: more than {} nested directories",
-            limits.max_depth
+    dst.flush()?;
+    if total != expected_size {
+        return Err(std::io::Error::other(format!(
+            "resume staging source file changed size while copying: classified {expected_size}, \
+             read {total}"
         )));
     }
-    // Check before `create_dir_all`: on a broken directory symlink
-    // `create_dir_all` follows the link and creates its external target.
-    if is_symlink(dst)? {
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Walk the temp tree and prove every manifest entry is present at exactly the
+/// recorded size and sha256, with no unrecorded regular file.
+fn verify_temp_tree(temp_fd: &DirFd, seeds: &[ManifestEntry]) -> std::io::Result<()> {
+    use std::collections::HashMap;
+    let mut expected: HashMap<String, &ManifestEntry> =
+        seeds.iter().map(|seed| (seed.rel.clone(), seed)).collect();
+    verify_dir(temp_fd, String::new(), &mut expected)?;
+    if !expected.is_empty() {
+        let missing: Vec<&str> = expected.keys().map(String::as_str).collect();
         return Err(invalid_input(format!(
-            "resume staging destination {} is a symlink, not a real directory",
-            dst.display()
+            "resume staging manifest verification failed; missing temp entries: {}",
+            missing.join(", ")
         )));
     }
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let source = entry.path();
-        let dest = dst.join(entry.file_name());
-        // Classify with `symlink_metadata`: on some filesystems a read_dir
-        // d_type of "file" can hide a link, and `is_dir`/`exists` follow links.
-        let file_type = std::fs::symlink_metadata(&source)?.file_type();
-        if file_type.is_symlink() {
-            copy_linked_file(root, &source, &dest, limits, budget)?;
-        } else if file_type.is_dir() {
-            copy_dir_merge(root, &source, &dest, depth + 1, limits, budget)?;
-        } else if !lexically_exists(&dest)? {
-            let size = std::fs::symlink_metadata(&source)?.len();
-            budget.charge(size, limits)?;
-            std::fs::copy(&source, &dest)?;
+    Ok(())
+}
+
+fn verify_dir(
+    dir_fd: &DirFd,
+    prefix: String,
+    expected: &mut std::collections::HashMap<String, &ManifestEntry>,
+) -> std::io::Result<()> {
+    for entry in dir_fd.entries()? {
+        let name = String::from_utf8_lossy(&entry.name).into_owned();
+        if prefix.is_empty() && name == ".manifest.json" {
+            continue;
+        }
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match entry.kind {
+            LeafKind::Directory => {
+                let sub = dir_fd.subdir(&entry.name)?;
+                verify_dir(&sub, rel, expected)?;
+            }
+            LeafKind::Regular => {
+                let seed = match expected.remove(&rel) {
+                    Some(seed) => seed,
+                    None => {
+                        return Err(invalid_input(format!(
+                            "resume staging manifest verification failed; unrecorded temp file {rel}"
+                        )));
+                    }
+                };
+                let leaf = dir_fd.open_regular_leaf(&entry.name)?;
+                if leaf.len != seed.size {
+                    return Err(invalid_input(format!(
+                        "resume staging manifest verification failed; {rel} size {} != {}",
+                        leaf.len, seed.size
+                    )));
+                }
+                let mut file = &leaf.file;
+                let sha = hash_reader(&mut file)?;
+                if sha != seed.sha256 {
+                    return Err(invalid_input(format!(
+                        "resume staging manifest verification failed; {rel} sha256 mismatch"
+                    )));
+                }
+            }
+            // The temp tree is built entirely by this process with EXCL
+            // creates, so any link or special file is an intrusion.
+            LeafKind::Symlink | LeafKind::Other => {
+                return Err(invalid_input(format!(
+                    "resume staging manifest verification failed; non-regular temp entry {rel}"
+                )));
+            }
         }
     }
     Ok(())
 }
 
-/// Copy one symlink entry as an independent file, when and only when every hop
-/// of its target chain stays inside `root` and ends at a regular file.
-fn copy_linked_file(
-    root: &Path,
-    link: &Path,
-    dest: &Path,
-    limits: &StageLimits,
-    budget: &mut CopyBudget,
+fn hash_reader<R: ?Sized>(reader: &mut R) -> std::io::Result<String>
+where
+    R: std::io::Read,
+{
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            return Ok(format!("{:x}", hasher.finalize()));
+        }
+        hasher.update(&buf[..read]);
+    }
+}
+
+/// Split a `/`-relative path into single byte components.
+fn rel_components(rel: &str) -> Vec<&[u8]> {
+    rel.split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::as_bytes)
+        .collect()
+}
+
+/// Publish one sidecar file: an identical existing destination is kept (and
+/// the temp copy dropped); a missing destination gets the temp file renamed
+/// into place after creating real parent directories; a symlink, special file
+/// or diverging regular file is a hard conflict.
+fn publish_one_seed(
+    temp_fd: &DirFd,
+    dest_dir_fd: &DirFd,
+    seed: &ManifestEntry,
 ) -> std::io::Result<()> {
-    if lexically_exists(dest)? {
-        // Never overwrite a destination entry, including a destination link.
-        return Ok(());
-    }
-    let target = resolve_link_within(root, link)?;
-    let metadata = std::fs::symlink_metadata(&target)?;
-    if !metadata.is_file() {
+    let components = rel_components(&seed.rel);
+    let Some((&last, parent_components)) = components.split_last() else {
         return Err(invalid_input(format!(
-            "symlink {} resolves to {} inside the staged project, which is not a regular file",
-            link.display(),
-            target.display()
+            "empty staging relpath: {}",
+            seed.rel
         )));
+    };
+
+    // Existing destination? Walk the real parent chain; a missing intermediate
+    // means "not present yet".
+    let mut dest_chain: Vec<DirFd> = Vec::new();
+    let mut existed = true;
+    for &component in parent_components {
+        let base = dest_chain.last().unwrap_or(dest_dir_fd);
+        match base.subdir(component) {
+            Ok(next) => dest_chain.push(next),
+            Err(error) if error.kind == FdErrorKind::Missing => {
+                existed = false;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
-    budget.charge(metadata.len(), limits)?;
-    std::fs::copy(&target, dest)?;
+    let dest_parent = dest_chain.last().unwrap_or(dest_dir_fd);
+    if existed {
+        // Parents exist; the leaf itself may still be absent.
+        match dest_parent.classify_leaf(last)? {
+            None => { /* absent — fall through to the rename */ }
+            Some(entry) if entry.kind == LeafKind::Regular => {
+                // Verify identity of the bytes already at the destination.
+                let leaf = dest_parent.open_regular_leaf(last)?;
+                if leaf.len != seed.size {
+                    return Err(invalid_input(format!(
+                        "resume sidecar {} already exists with a different size; refusing to \
+                         overwrite an unverified file",
+                        seed.rel
+                    )));
+                }
+                let mut file = &leaf.file;
+                let sha = hash_reader(&mut file)?;
+                if sha != seed.sha256 {
+                    return Err(invalid_input(format!(
+                        "resume sidecar {} already exists with different content; refusing to \
+                         overwrite an unverified file",
+                        seed.rel
+                    )));
+                }
+                // Identical: drop the temp copy, keep the destination.
+                unlink_temp_relative(temp_fd, &components)?;
+                return Ok(());
+            }
+            Some(_) => {
+                return Err(invalid_input(format!(
+                    "resume sidecar destination {} is a symlink or non-regular file; refusing \
+                     to stage through it",
+                    seed.rel
+                )));
+            }
+        }
+    }
+
+    // Missing: create real destination parent dirs (O_NOFOLLOW revalidation).
+    let mut publish_chain: Vec<DirFd> = Vec::new();
+    for &component in parent_components {
+        let base = publish_chain.last().unwrap_or(dest_dir_fd);
+        publish_chain.push(base.ensure_subdir(component)?);
+    }
+    let publish_parent = publish_chain.last().unwrap_or(dest_dir_fd);
+
+    // Open the temp parent and rename the leaf across the two pinned fds.
+    let mut temp_chain: Vec<DirFd> = Vec::new();
+    for &component in parent_components {
+        let base = temp_chain.last().unwrap_or(temp_fd);
+        temp_chain.push(base.subdir(component)?);
+    }
+    let temp_parent = temp_chain.last().unwrap_or(temp_fd);
+    temp_parent.rename(last, publish_parent, last)?;
     Ok(())
 }
 
-/// Resolve `start` without trusting any single `canonicalize`, enforcing that
-/// every link in the chain stays lexically inside `root`.
-fn resolve_link_within(root: &Path, start: &Path) -> std::io::Result<PathBuf> {
-    let root = normalize_lexical(root);
-    let mut current = start.to_path_buf();
-    for _ in 0..=MAX_LINK_HOPS {
-        let normalized = normalize_lexical(&current);
-        if !normalized.is_absolute() || !normalized.starts_with(&root) {
+/// Unlink one file at `components` below `root`, ignoring a missing entry
+/// (idempotent cleanup of already-published temp copies).
+fn unlink_temp_relative(root: &DirFd, components: &[&[u8]]) -> std::io::Result<()> {
+    let Some((&last, parents)) = components.split_last() else {
+        return Ok(());
+    };
+    let mut chain: Vec<DirFd> = Vec::new();
+    for &component in parents {
+        let base = chain.last().unwrap_or(root);
+        chain.push(base.subdir(component)?);
+    }
+    let parent = chain.last().unwrap_or(root);
+    match parent.unlink_file(last) {
+        Ok(())
+        | Err(remuda_fdsafe::FdError {
+            kind: FdErrorKind::Missing,
+            ..
+        }) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Read the provenance marker for `transcript_name` through the pinned fd.
+/// `Ok(None)`: no marker directory or marker file (a corrupt marker also
+/// reads as absent — fail closed).
+fn read_staging_provenance(
+    dest_dir_fd: &DirFd,
+    transcript_name: &str,
+) -> std::io::Result<Option<StagingProvenance>> {
+    let marker_dir = match dest_dir_fd.subdir(STAGING_MARKER_DIR.as_bytes()) {
+        Ok(dir) => dir,
+        Err(error) if error.kind == FdErrorKind::Missing => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let marker_name = marker_filename(transcript_name);
+    let leaf = match marker_dir.open_regular_leaf(marker_name.as_bytes()) {
+        Ok(leaf) => leaf,
+        Err(error) if error.kind == FdErrorKind::Missing => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let body = {
+        use std::io::Read;
+        let mut buf = String::new();
+        (&leaf.file).read_to_string(&mut buf)?;
+        buf
+    };
+    let marker = serde_json::from_str::<StagingProvenance>(&body)
+        .ok()
+        .filter(|marker| marker.version == 1);
+    Ok(marker)
+}
+
+/// Write the marker via an `O_EXCL` temp file in the marker directory and a
+/// final `renameat`; a symlink or special file at either path is refused.
+fn write_staging_provenance(
+    dest_dir_fd: &DirFd,
+    transcript_name: &str,
+    provenance: &StagingProvenance,
+) -> std::io::Result<()> {
+    let marker_dir = dest_dir_fd.ensure_subdir(STAGING_MARKER_DIR.as_bytes())?;
+    let marker_name = marker_filename(transcript_name);
+    // An existing marker must be a real regular file.
+    match marker_dir.classify_leaf(marker_name.as_bytes())? {
+        Some(entry) if entry.kind != LeafKind::Regular => {
             return Err(invalid_input(format!(
-                "symlink {} escapes the staged project directory {} via {}",
-                start.display(),
-                root.display(),
-                current.display()
+                "staging provenance marker {} is not a regular file",
+                marker_name
             )));
         }
-        let metadata = match std::fs::symlink_metadata(&normalized) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "symlink {} is broken (dangling target {})",
-                        start.display(),
-                        current.display()
-                    ),
-                ));
-            }
-            Err(err) => return Err(err),
-        };
-        if !metadata.file_type().is_symlink() {
-            return Ok(normalized);
-        }
-        let target = std::fs::read_link(&normalized)?;
-        current = if target.is_absolute() {
-            target
-        } else {
-            normalized
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .join(target)
-        };
+        _ => {}
     }
-    Err(invalid_input(format!(
-        "symlink {} is a link cycle (more than {MAX_LINK_HOPS} hops)",
-        start.display()
-    )))
+    let tmp_name = format!(
+        ".marker-tmp-{}-{}",
+        transcript_name.trim_end_matches(".jsonl"),
+        uuid::Uuid::new_v4().as_simple()
+    );
+    use std::io::Write;
+    let body = serde_json::to_vec_pretty(provenance).map_err(std::io::Error::other)?;
+    marker_dir
+        .create_leaf_excl(tmp_name.as_bytes())?
+        .write_all(&body)?;
+    match marker_dir.rename(tmp_name.as_bytes(), &marker_dir, marker_name.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = marker_dir.unlink_file(tmp_name.as_bytes());
+            Err(error.into())
+        }
+    }
 }
 
-/// Whether a path exists, checked without following a terminal symlink.
-fn lexically_exists(path: &Path) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
+/// `<session>.jsonl` → `<session>.json` marker file name.
+fn marker_filename(transcript_name: &str) -> String {
+    transcript_name
+        .strip_suffix('l')
+        .map_or_else(|| transcript_name.to_owned(), str::to_owned)
+}
+
+/// Make a path absolute against the process cwd without following symlinks
+/// beyond what the kernel itself does when opening it.
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }
 
 /// Compare two directories the way Claude resolves them (canonical, no symlinks).
 fn same_dir(a: &Path, b: &Path) -> bool {
-    same_path(a, b)
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
 }
 
 /// First cwd-bearing record's value, the first user timestamp, and an excerpt
@@ -1661,7 +1987,11 @@ mod tests {
         // First staging publishes the transcript plus provenance marker.
         let first = stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
         assert!(
-            provenance_marker_path(dest.parent().unwrap(), session).is_file(),
+            dest.parent()
+                .unwrap()
+                .join(STAGING_MARKER_DIR)
+                .join(format!("{session}.json"))
+                .is_file(),
             "a provenance marker is published"
         );
         // The resumed instance appended its own turn to its staged copy.

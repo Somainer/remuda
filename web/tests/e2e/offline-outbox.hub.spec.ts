@@ -452,44 +452,45 @@ test("a committed POST whose browser response is lost retries with replayed:true
 });
 
 /**
- * c-hubfakeack round 2: DETERMINISTIC proof that a Hub->Node RPC buffered
- * behind an outstanding journal.append ack is never swallowed.
+ * c-hubfakeack round 3: DETERMINISTIC proof that a Hub->Node RPC buffered
+ * behind an outstanding journal.append ack is QUEUED AND ANSWERED, not merely
+ * observed.
  *
  * The `__ackbarrier__:hold` command makes the fake Node park its append-ack
- * wait until a FURTHER Hub->Node RPC is actually on the socket; it records
- * that RPC in a marker file ("<count> <method>"). The mounted session page's
- * ~2 s interaction.list poll supplies that RPC regardless of whether the Hub
- * pipelines command forwards (it serialises a second instance.send behind the
- * first turn, so the poll — the exact frame the original discard swallowed —
- * is the reliable trigger). The held command replies `accepted:true`, so the
- * Hub clears it from the RPC REPLY itself (state accepted / resolution clear),
- * not via later journal reconcile. A normal follow-up send then proves the
- * queued RPC was drained and the Node stayed healthy.
- *
- * Fails on the pre-fix fake: no barrier arm (it replies the non-accepted
- * `{ok:true}`, so the synchronous row is not accepted), no marker, and its
- * 2 s `ws.next()` discard swallows the intervening poll RPC.
+ * wait until an `interaction.list` RPC is buffered. The spec itself fires
+ * GET /v1/interactions while the hold POST is in flight, so the intervening
+ * RPC is deterministic (it does not depend on the page's ~2 s background
+ * poll). The fake writes TWO markers:
+ *   - remuda-e2e-ackqueue-<port> the instant the interaction.list is buffered
+ *     ("<jsonrpcId> interaction.list");
+ *   - remuda-e2e-ackreply-<port> ONLY when the dispatch loop actually sends
+ *     that same id's JSON-RPC reply.
+ * Recording the frame is therefore not enough: a frame that is queued and then
+ * dropped leaves the reply marker absent forever. The held command itself
+ * replies accepted:true, so its row clears from the RPC reply (state
+ * accepted / resolution clear), not later journal reconcile.
  */
-test("an RPC buffered behind an append ack is queued, answered accepted and journaled (ack barrier)", async ({
+test("an RPC buffered behind an append ack is queued AND answered, with correlated markers (ack barrier)", async ({
   page,
 }) => {
   const instanceId = await createSession(page, "ack barrier seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   const api = await hubApi(page);
 
-  // Marker files are scoped by the effective HUB listen port (the fake derives
-  // it from HUB_E2E_LISTEN, NOT the Vite origin port), like playwright.hub.
   const effectiveHubUrl =
     process.env.VITE_HUB_URL ?? `http://${process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880"}`;
   const hubPort = new URL(effectiveHubUrl).port;
-  const markerPrefix = `remuda-e2e-ackbarrier-${hubPort}-`;
-  const sweepMarkers = async () => {
+  const queueName = `remuda-e2e-ackqueue-${hubPort}`;
+  const replyName = `remuda-e2e-ackreply-${hubPort}`;
+  const readMarker = async (name: string): Promise<string> => {
     const entries = await readdir(os.tmpdir()).catch(() => [] as string[]);
-    await Promise.all(
-      entries
-        .filter((e) => e.startsWith(markerPrefix))
-        .map((e) => rm(path.join(os.tmpdir(), e), { force: true }).catch(() => undefined)),
-    );
+    const entry = entries.find((e) => e === name);
+    return entry ? readFile(path.join(os.tmpdir(), entry), "utf8").catch(() => "") : "";
+  };
+  const sweepMarkers = async () => {
+    for (const name of [queueName, replyName]) {
+      await rm(path.join(os.tmpdir(), name), { force: true }).catch(() => undefined);
+    }
   };
   await sweepMarkers();
 
@@ -517,46 +518,49 @@ test("an RPC buffered behind an append ack is queued, answered accepted and jour
         error: String(err),
       }));
 
-  // The held send parks its ack until another Hub RPC is buffered, then is
-  // answered accepted straight from the RPC reply.
-  const hold = await post("__ackbarrier__:hold");
+  // Fire the held send, then drive the intervening interaction.list ourselves
+  // (the Hub forwards GET /v1/interactions as the node interaction.list RPC).
+  // Retry briefly so one lands while the hold is parked behind its ack; the
+  // tracked GET is answered 200 only if its frame was actually queued+serviced.
+  const holdPromise = post("__ackbarrier__:hold");
+  const rpcIdOf = (content: string) => content.replace(/\s+interaction\.list\s*$/, "").trim();
+  let polled200 = 0;
+  const driveInteractions = (async () => {
+    for (let i = 0; i < 25; i += 1) {
+      if (await readMarker(replyName)) break;
+      const res = await api.get("/v1/interactions").catch(() => null);
+      if (res?.ok) polled200 += 1;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  })();
 
-  // The fake wrote a marker only after a further Hub->Node RPC was actually
-  // buffered behind the hold's outstanding ack. Content is "<count> <method>"
-  // (e.g. "1 interaction.list"). The old fake never writes it.
-  let markerContent = "";
-  await expect
-    .poll(
-      async () => {
-        const entries = await readdir(os.tmpdir()).catch(() => [] as string[]);
-        const marker = entries.find((e) => e.startsWith(markerPrefix));
-        if (!marker) return "";
-        markerContent = await readFile(path.join(os.tmpdir(), marker), "utf8").catch(() => "");
-        return markerContent;
-      },
-      { timeout: 20_000 },
-    )
-    .not.toBe("");
-  const [, interveningCount, interveningMethod] =
-    /^(\d+)\s+(\S+)$/.exec(markerContent.trim()) ?? [];
-  expect(Number(interveningCount), `intervening RPC count in "${markerContent}"`).toBeGreaterThanOrEqual(1);
-  expect(interveningMethod, `RPC method in "${markerContent}"`).toContain(".");
+  // Queue marker appears first (frame buffered) …
+  await expect.poll(() => readMarker(queueName), { timeout: 10_000 }).not.toBe("");
+  const queued = await readMarker(queueName);
+  expect(queued, `queue marker "${queued}"`).toMatch(/^.*\sinteraction\.list$/);
 
-  // The held command was cleared by the RPC REPLY itself, synchronously — a
-  // swallowed-but-appended RPC could only converge this row via the journal.
+  // … the held send resolves accepted straight from its RPC reply …
+  const hold = await holdPromise;
   expect(hold.status, `unexpected status ${JSON.stringify(hold)}`).toBe(200);
   expect(hold.commandId, `missing commandId ${JSON.stringify(hold)}`).toBeTruthy();
   expect(hold.state, `row not accepted from the RPC reply: ${JSON.stringify(hold)}`).toBe("accepted");
   expect(hold.resolution).toBe("clear");
+
+  // … and the REPLY marker appears for the SAME json-rpc id. A recorded-then-
+  // discarded frame can never produce it.
+  await expect.poll(() => readMarker(replyName), { timeout: 10_000 }).not.toBe("");
+  const replied = await readMarker(replyName);
+  expect(replied, `reply marker "${replied}"`).toMatch(/^.*\sinteraction\.list$/);
+  expect(rpcIdOf(replied), "reply RPC id must match the queued frame").toBe(rpcIdOf(queued));
+  await driveInteractions;
+  expect(polled200, "the tracked interaction.list must reach the client as HTTP 200").toBeGreaterThan(0);
+
   await expect
     .poll(() => hubJournalMessageCount(api, instanceId, hold.commandId!), { timeout: 30_000 })
     .toBe(1);
 
-  // After the barrier drained, an ordinary send runs and converges normally —
-  // the generic fake arm answers `{ok:true}`, so the hub returns this row as
-  // queued/unknown synchronously and settles it from the journal (exactly like
-  // every normal composer send). Its delivery proves the queued intervening
-  // RPC did not wedge the single-writer node.
+  // An ordinary follow-up send still delivers, proving the drain didn't wedge
+  // the single-writer node.
   const after = await post("ack barrier follow up");
   expect(after.status).toBe(200);
   expect(after.commandId, `missing follow-up commandId ${JSON.stringify(after)}`).toBeTruthy();
@@ -565,7 +569,6 @@ test("an RPC buffered behind an append ack is queued, answered accepted and jour
     .toBe(1);
   await expectDelivered(page, after.commandId);
 
-  // One ledger row per id.
   const rows = await hubCommands(api, instanceId);
   for (const cid of [hold.commandId, after.commandId]) {
     expect(rows.filter((c) => c.operation === "instance.send" && c.id === cid)).toHaveLength(1);

@@ -875,6 +875,14 @@ async fn fake_node(
     // web poll's interaction.list). Never drop RPCs: reprocess them as soon
     // as the current handler returns.
     let mut frame_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // c-hubfakeack round 3: the JSON-RPC id of the interaction.list an
+    // __ackbarrier__:hold is currently parked behind its append ack. The
+    // interaction.list arm writes a reply marker only when it actually answers
+    // THIS id, so the e2e can prove the queued frame was drained and replied
+    // to — recording the frame alone cannot pass (a recorded-then-discarded
+    // frame leaves no reply marker).
+    let tracked_ack_reply: std::sync::Arc<tokio::sync::Mutex<Option<Value>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
     // Parked frames re-enter this loop verbatim once the gate file is removed;
     // they are then processed by their normal arm, so the reply is exactly the
     // ungated one. The park task never touches the socket itself.
@@ -1494,6 +1502,7 @@ async fn fake_node(
                                 &mut ws,
                                 &mut frame_queue,
                                 addr.port(),
+                                tracked_ack_reply.clone(),
                                 &instance_id,
                                 append_n,
                                 prompt,
@@ -2212,7 +2221,29 @@ async fn fake_node(
                         })
                         .cloned()
                         .collect();
+                    // Capture whether THIS list answers the ack barrier BEFORE
+                    // send_rpc_ok moves `id`.
+                    let is_tracked = tracked_ack_reply.lock().await.as_ref() == Some(&id);
                     send_rpc_ok(&mut ws, id, json!({ "items": items })).await?;
+                    // c-hubfakeack round 3: write the REPLY marker now that the
+                    // dispatch loop has actually answered the parked
+                    // interaction.list. A recorded-but-discarded frame never
+                    // reaches this point, so the marker proves the queued RPC
+                    // was serviced (not merely observed).
+                    if is_tracked {
+                        let reply_marker = std::env::temp_dir()
+                            .join(format!("remuda-e2e-ackreply-{}", addr.port()));
+                        let _ = std::fs::write(
+                            &reply_marker,
+                            tracked_ack_reply
+                                .lock()
+                                .await
+                                .clone()
+                                .map(|v| format!("{v} interaction.list"))
+                                .unwrap_or_else(|| " interaction.list".into()),
+                        );
+                        *tracked_ack_reply.lock().await = None;
+                    }
                     // A scripted terminal answer starts its timer here: the
                     // card has now been listed to a client at least once, so
                     // the spec's "pending after the form is visible" assertion
@@ -2665,9 +2696,19 @@ const FRAME_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// failure, never an unbounded queue.
 const PENDING_FRAME_QUEUE_CAP: usize = 4096;
 /// c-hubfakeack determinism barrier: how long the marked send waits for the
-/// NEXT Hub RPC to already be on the wire while its own append ack is
-/// outstanding.
-const ACK_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
+/// NEXT interaction.list RPC to already be on the wire while its own append
+/// ack is outstanding. The spec issues that GET itself, so the frame is
+/// present within milliseconds. This is deliberately WELL BELOW the Hub's
+/// 5 s command-accept budget (DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS): a missed RPC
+/// fails loudly in the Node before the Hub gives up and returns reconciling.
+const ACK_BARRIER_TIMEOUT: Duration = Duration::from_millis(2_000);
+/// Test-only negative control: HUB_E2E_ACK_DISCARD=1 makes the barrier RECORD
+/// the intervening interaction.list (and its marker) but DROP the frame,
+/// reproducing the old swallowed-frame bug while keeping the new markers. The
+/// reply marker must then never appear, proving the test has real power.
+fn ack_discard_enabled() -> bool {
+    std::env::var("HUB_E2E_ACK_DISCARD").as_deref() == Ok("1")
+}
 
 /// Classify a frame against the wanted append-ack id.
 ///
@@ -2768,62 +2809,84 @@ async fn wait_frame_ack(ws: &mut NodeWs, queue: &mut FrameQueue, want: &str) -> 
 ///
 /// If no further RPC arrives within the barrier window the Node is mis-wired
 /// or the Hub serialised — a loud error rather than a silent pass.
-/// A frame's Hub->Node request method, or None for a journal ack / other
-/// response (frames without a `method`).
-fn frame_rpc_method(frame: &str) -> Option<String> {
-    serde_json::from_str::<Value>(frame)
-        .ok()
-        .and_then(|v| v.get("method").and_then(Value::as_str).map(str::to_owned))
+/// The interaction.list frame the ack barrier is waiting for, if `frame` is
+/// one: returns its parsed JSON-RPC id.
+fn interaction_list_id(frame: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(frame).ok()?;
+    if value.get("method").and_then(Value::as_str) == Some("interaction.list") {
+        value.get("id").cloned()
+    } else {
+        None
+    }
 }
 
+/// Park behind the append ack `want` until an `interaction.list` RPC is
+/// buffered (the spec issues that GET itself). Records the RPC's id in
+/// `tracked` and writes the QUEUE marker (`<id> interaction.list`) the moment
+/// the frame arrives. Under HUB_E2E_ACK_DISCARD=1 the frame is recorded but
+/// then DROPPED (negative control): the interaction.list arm can never answer
+/// it, so the separate REPLY marker never appears even though the queue marker
+/// does — exactly the gap this regression must catch.
 async fn ensure_intervening_rpc(
     ws: &mut NodeWs,
     queue: &mut FrameQueue,
     want: &str,
-    marker: &std::path::Path,
+    port: u16,
+    tracked: std::sync::Arc<tokio::sync::Mutex<Option<Value>>>,
 ) -> Result<()> {
-    // Any Hub->Node REQUEST already queued (a frame carrying a method; not a
-    // journal ack response) satisfies the barrier. A mounted session page's
-    // ~2 s interaction.list poll reliably produces one even when the Hub
-    // serialises a second instance.send behind the first turn's reply.
-    let mut first_method = queue.iter().find_map(|f| frame_rpc_method(f));
+    let queue_marker = std::env::temp_dir().join(format!("remuda-e2e-ackqueue-{port}"));
+    let record = |rpc_id: &Value| {
+        let body = format!("{rpc_id} interaction.list");
+        std::fs::write(&queue_marker, body)
+            .with_context(|| format!("write ack queue marker {}", queue_marker.display()))
+    };
+
+    // 1. Already buffered ahead of the wait.
+    let mut found: Option<(Value, String)> = queue
+        .iter()
+        .find_map(|f| interaction_list_id(f).map(|id| (id, f.clone())));
+
     let deadline = Instant::now() + ACK_BARRIER_TIMEOUT;
-    while first_method.is_none() {
+    while found.is_none() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             anyhow::bail!(
-                "ack barrier: no Hub RPC arrived behind append ack {want} within {} ms",
+                "ack barrier: no interaction.list arrived behind append ack {want} within {} ms",
                 ACK_BARRIER_TIMEOUT.as_millis()
             );
         }
         match tokio::time::timeout(remaining, ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
-                first_method = frame_rpc_method(&text);
-                // Stash EVERYTHING (including an early ack and every RPC) for
-                // wait_frame_ack / the dispatch loop — never drop a frame.
-                if queue.len() >= PENDING_FRAME_QUEUE_CAP {
+                let text = text.to_string();
+                if let Some(id) = interaction_list_id(&text) {
+                    found = Some((id, text));
+                } else if queue.len() < PENDING_FRAME_QUEUE_CAP {
+                    // A journal ack or other RPC: stash for the dispatch loop.
+                    queue.push_back(text);
+                } else {
                     anyhow::bail!("pending frame queue overflow in ack barrier for {want}");
                 }
-                queue.push_back(text.to_string());
             }
             Ok(_) => anyhow::bail!("hub connection closed during ack barrier for {want}"),
             Err(_) => {
                 anyhow::bail!(
-                    "ack barrier: no Hub RPC arrived behind append ack {want} within {} ms",
+                    "ack barrier: no interaction.list arrived behind append ack {want} within {} ms",
                     ACK_BARRIER_TIMEOUT.as_millis()
                 )
             }
         }
     }
-    let method = first_method.expect("a matching RPC was observed");
-    // Marker content: "<count> <firstMethod>" — request frames queued when the
-    // first one landed, plus its method for a strong, inspectable proof.
-    let queued_requests = queue
-        .iter()
-        .filter(|f| frame_rpc_method(f).is_some())
-        .count();
-    std::fs::write(marker, format!("{queued_requests} {method}"))
-        .with_context(|| format!("write ack barrier marker {}", marker.display()))?;
+
+    let (rpc_id, frame) = found.expect("an interaction.list was observed");
+    record(&rpc_id)?;
+    *tracked.lock().await = Some(rpc_id);
+    if ack_discard_enabled() {
+        // NEGATIVE CONTROL: record + marker written, frame deliberately
+        // dropped — no reply marker can ever appear for this id.
+        tracing::warn!("HUB_E2E_ACK_DISCARD=1: dropping queued interaction.list behind {want}");
+    } else if !queue.iter().any(|f| f == &frame) && queue.len() < PENDING_FRAME_QUEUE_CAP {
+        queue.push_back(frame);
+    }
     Ok(())
 }
 /// Journal the entity lifecycle a terminal-answered question settles with:
@@ -3912,10 +3975,12 @@ async fn append_user_message(
 /// that the ack itself is an explicit success (wait_frame_ack rejects an
 /// `error` ack). The marker file reports how many intervening RPCs were
 /// stashed.
+#[allow(clippy::too_many_arguments)]
 async fn append_command_user_barrier(
     ws: &mut NodeWs,
     queue: &mut FrameQueue,
     port: u16,
+    tracked: std::sync::Arc<tokio::sync::Mutex<Option<Value>>>,
     instance_id: &str,
     n: u64,
     text: &str,
@@ -3929,8 +3994,7 @@ async fn append_command_user_barrier(
         .unwrap_or_else(|| format!("obj_legacy_{n}"));
     let seq = send_user_message_frame(ws, instance_id, n, text, command_id, &node).await?;
     let want = format!("j{seq}");
-    let marker = std::env::temp_dir().join(format!("remuda-e2e-ackbarrier-{port}-{seq}"));
-    ensure_intervening_rpc(ws, queue, &want, &marker).await?;
+    ensure_intervening_rpc(ws, queue, &want, port, tracked).await?;
     wait_frame_ack(ws, queue, &want).await?;
     Ok(seq)
 }

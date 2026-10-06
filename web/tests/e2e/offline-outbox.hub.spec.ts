@@ -1,5 +1,5 @@
 import { expect, request as apiRequest, test, type APIRequestContext, type Browser, type Page } from "@playwright/test";
-import { rm, readdir, writeFile } from "node:fs/promises";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { login } from "./hub-auth";
@@ -931,4 +931,130 @@ test.describe("full offline SW restore (PNA/LNA loopback exemption for this harn
     await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
     await expectDelivered(page, commandId);
   });
+});
+/**
+ * c-hubfakeack round 3: DETERMINISTIC proof that a Hub->Node RPC buffered
+ * behind an outstanding journal.append ack is QUEUED AND ANSWERED, not merely
+ * observed.
+ *
+ * The `__ackbarrier__:hold` command makes the fake Node park its append-ack
+ * wait until an `interaction.list` RPC is buffered. The spec itself fires
+ * GET /v1/interactions while the hold POST is in flight, so the intervening
+ * RPC is deterministic (it does not depend on the page's ~2 s background
+ * poll). The fake writes TWO markers:
+ *   - remuda-e2e-ackqueue-<port> the instant the interaction.list is buffered
+ *     ("<jsonrpcId> interaction.list");
+ *   - remuda-e2e-ackreply-<port> ONLY when the dispatch loop actually sends
+ *     that same id's JSON-RPC reply.
+ * Recording the frame is therefore not enough: a frame that is queued and then
+ * dropped leaves the reply marker absent forever. The held command itself
+ * replies accepted:true, so its row clears from the RPC reply (state
+ * accepted / resolution clear), not later journal reconcile.
+ */
+test("an RPC buffered behind an append ack is queued AND answered, with correlated markers (ack barrier)", async ({
+  page,
+}) => {
+  const instanceId = await createSession(page, "ack barrier seed");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const api = await hubApi(page);
+
+  const effectiveHubUrl =
+    process.env.VITE_HUB_URL ?? `http://${process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880"}`;
+  const hubPort = new URL(effectiveHubUrl).port;
+  const queueName = `remuda-e2e-ackqueue-${hubPort}`;
+  const replyName = `remuda-e2e-ackreply-${hubPort}`;
+  const readMarker = async (name: string): Promise<string> => {
+    const entries = await readdir(os.tmpdir()).catch(() => [] as string[]);
+    const entry = entries.find((e) => e === name);
+    return entry ? readFile(path.join(os.tmpdir(), entry), "utf8").catch(() => "") : "";
+  };
+  const sweepMarkers = async () => {
+    for (const name of [queueName, replyName]) {
+      await rm(path.join(os.tmpdir(), name), { force: true }).catch(() => undefined);
+    }
+  };
+  await sweepMarkers();
+
+  const post = (prompt: string) =>
+    api
+      .post(`/v1/instances/${instanceId}/commands`, {
+        data: { operation: "instance.send", payload: { prompt } },
+      })
+      .then(async (res) => {
+        const body = (await res.json().catch(() => ({}))) as {
+          command?: { commandId?: string; state?: string; resolution?: string };
+        };
+        return {
+          status: res.status(),
+          commandId: body.command?.commandId ?? null,
+          state: body.command?.state ?? null,
+          resolution: body.command?.resolution ?? null,
+        };
+      })
+      .catch((err: unknown) => ({
+        status: -1,
+        commandId: null,
+        state: null,
+        resolution: null,
+        error: String(err),
+      }));
+
+  // Fire the held send, then drive the intervening interaction.list ourselves
+  // (the Hub forwards GET /v1/interactions as the node interaction.list RPC).
+  // Retry briefly so one lands while the hold is parked behind its ack; the
+  // tracked GET is answered 200 only if its frame was actually queued+serviced.
+  const holdPromise = post("__ackbarrier__:hold");
+  const rpcIdOf = (content: string) => content.replace(/\s+interaction\.list\s*$/, "").trim();
+  let polled200 = 0;
+  const driveInteractions = (async () => {
+    for (let i = 0; i < 25; i += 1) {
+      if (await readMarker(replyName)) break;
+      const res = await api.get("/v1/interactions").catch(() => null);
+      // NOTE: Playwright's APIResponse.ok is a METHOD, not a boolean — call
+      // status() explicitly so an HTTP 500 is not mistaken for success.
+      if (res?.status() === 200) polled200 += 1;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  })();
+
+  // Queue marker appears first (frame buffered) …
+  await expect.poll(() => readMarker(queueName), { timeout: 10_000 }).not.toBe("");
+  const queued = await readMarker(queueName);
+  expect(queued, `queue marker "${queued}"`).toMatch(/^.*\sinteraction\.list$/);
+
+  // … the held send resolves accepted straight from its RPC reply …
+  const hold = await holdPromise;
+  expect(hold.status, `unexpected status ${JSON.stringify(hold)}`).toBe(200);
+  expect(hold.commandId, `missing commandId ${JSON.stringify(hold)}`).toBeTruthy();
+  expect(hold.state, `row not accepted from the RPC reply: ${JSON.stringify(hold)}`).toBe("accepted");
+  expect(hold.resolution).toBe("clear");
+
+  // … and the REPLY marker appears for the SAME json-rpc id. A recorded-then-
+  // discarded frame can never produce it.
+  await expect.poll(() => readMarker(replyName), { timeout: 10_000 }).not.toBe("");
+  const replied = await readMarker(replyName);
+  expect(replied, `reply marker "${replied}"`).toMatch(/^.*\sinteraction\.list$/);
+  expect(rpcIdOf(replied), "reply RPC id must match the queued frame").toBe(rpcIdOf(queued));
+  await driveInteractions;
+  expect(polled200, "the tracked interaction.list must reach the client as HTTP 200").toBeGreaterThan(0);
+
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, hold.commandId!), { timeout: 30_000 })
+    .toBe(1);
+
+  // An ordinary follow-up send still delivers, proving the drain didn't wedge
+  // the single-writer node.
+  const after = await post("ack barrier follow up");
+  expect(after.status).toBe(200);
+  expect(after.commandId, `missing follow-up commandId ${JSON.stringify(after)}`).toBeTruthy();
+  await expect
+    .poll(() => hubJournalMessageCount(api, instanceId, after.commandId!), { timeout: 30_000 })
+    .toBe(1);
+  await expectDelivered(page, after.commandId);
+
+  const rows = await hubCommands(api, instanceId);
+  for (const cid of [hold.commandId, after.commandId]) {
+    expect(rows.filter((c) => c.operation === "instance.send" && c.id === cid)).toHaveLength(1);
+  }
+  await sweepMarkers();
 });

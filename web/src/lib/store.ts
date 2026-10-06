@@ -1648,20 +1648,30 @@ class HubStore {
       // If that drained the instance, run the post-delivery resync/screen chain
       // exactly once.
       if (!box.pendingFor(instanceId).length) {
-        // Journal resync + bubble settlement are Hub-bound and link-relevant:
-        // run them on the journal chain the follow reopen joins. The SCREEN
-        // read is a Node RPC that can stall for its whole REST timeout under
-        // load — it rides the separate screen chain, so it can never hold the
-        // instance lock nor head-of-line the socket reopen (c-reconnfu gate
-        // flake: the banner stayed in recovering behind a parked /screen).
+        // Bubble settlement always runs on the journal chain the follow reopen
+        // joins. The REST resumeAfterReconnect is skipped only while THIS
+        // instance's link is actively recovering: resumeConnection's
+        // reopenFollow runs the authoritative catch-up on this same chain, so
+        // a second resync here would enqueue AHEAD of the socket reopen and,
+        // under load, push it past the 20 s recovering watchdog (queued row
+        // journaled but the journal banner never cleared — c-reconnfu gate
+        // flake). A LIVE send keeps its belt-and-suspenders resync (screens
+        // still order behind it), and an unbound background flush has no follow
+        // at all, so it still needs the resync.
+        const drainJournalId =
+          this.state.instances.find((i) => i.id === instanceId)?.journalId ?? null;
+        const followOwnsCatchup =
+          drainJournalId !== null &&
+          this.connectionBoundJournal === drainJournalId &&
+          (this.connectionState === "offline" || this.connectionState === "recovering");
         await this.chainReconcile(instanceId, async () => {
-          const client = this.journals.get(
-            this.state.instances.find((i) => i.id === instanceId)?.journalId ?? "",
-          );
-          try {
-            await client?.resumeAfterReconnect();
-          } catch {
-            /* machine owns the failure */
+          const client = drainJournalId ? this.journals.get(drainJournalId) : undefined;
+          if (!followOwnsCatchup) {
+            try {
+              await client?.resumeAfterReconnect();
+            } catch {
+              /* machine owns the failure */
+            }
           }
           const events = this.state.events[instanceId] ?? [];
           this.settleFromJournal(instanceId, events);

@@ -335,6 +335,14 @@ pub fn ensure_path_in_temp(path: &Path, allow_env: &str) -> std::io::Result<()> 
     adopt_or_refuse_file(path, allow_env)
 }
 
+/// Reject a DIRECTORY write target: the directory itself (not its parent) is
+/// adopted/marked when it lives under a fixed system temp. Use this for
+/// config/transcript HOME directories, where adopting the parent (often `/tmp`
+/// itself) would be wrong.
+pub fn ensure_dir_in_temp(dir: &Path, allow_env: &str) -> std::io::Result<()> {
+    adopt_or_refuse(dir, allow_env)
+}
+
 /// See [`ensure_path_in_temp`] — current name kept for callers that think of
 /// the check as "inside an allocated root" rather than "in the temp tree".
 pub fn ensure_allowed(path: &Path, allow_env: &str) -> std::io::Result<()> {

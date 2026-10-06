@@ -427,7 +427,9 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
     }
     if let Some(dir) = std::env::var_os("FAKE_CLAUDE_TRANSCRIPT_DIR").filter(|v| !v.is_empty()) {
         let dir = PathBuf::from(dir);
-        ensure_path_in_temp(&dir)?;
+        // A DIRECTORY target: adopt the directory itself, never its (possibly
+        // shared) mount parent.
+        crate::sandbox::ensure_dir_in_temp(&dir, ALLOW_HOME_WRITE_ENV)?;
         // Same descriptor walk as the projects layout: no symlinked parent
         // can redirect the create.
         let dir_fd = remuda_fdsafe::DirFd::open_or_create_abs(&crate::sandbox::normalize(&dir))
@@ -495,11 +497,6 @@ const ALLOW_HOME_WRITE_ENV: &str = "FAKE_CLAUDE_ALLOW_HOME_WRITE";
 fn sandboxed_transcript_home() -> Result<Option<PathBuf>, FakeClaudeError> {
     crate::sandbox::sandboxed_home("CLAUDE_CONFIG_DIR", "HOME", ".claude", ALLOW_HOME_WRITE_ENV)
         .map_err(FakeClaudeError::from)
-}
-
-/// Refuse to use a write target outside the per-test temp tree.
-fn ensure_path_in_temp(path: &Path) -> Result<(), FakeClaudeError> {
-    crate::sandbox::ensure_path_in_temp(path, ALLOW_HOME_WRITE_ENV).map_err(FakeClaudeError::from)
 }
 
 fn emit(value: &Value) -> Result<(), FakeClaudeError> {

@@ -197,9 +197,7 @@ pub fn engine_turn_activity(observation: &Observation) -> Option<remuda_protocol
     match (native.native_name.as_str(), status.as_str()) {
         ("turn_started", "working") => Some(Activity::Working),
         ("result", "error") if queued == 0 => Some(Activity::Idle),
-        ("result", "turn_done") if native.affects_completion && queued == 0 => {
-            Some(Activity::Idle)
-        }
+        ("result", "turn_done") if native.affects_completion && queued == 0 => Some(Activity::Idle),
         _ => None,
     }
 }

@@ -1512,26 +1512,18 @@ fn truncate_char_boundary(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
     }
-    let mut end = text.len();
-    let mut taken = 0usize;
-    for (index, ch) in text.char_indices() {
-        if taken == max {
-            end = index;
-            break;
-        }
-        taken += 1;
-        end = index + ch.len_utf8();
-    }
-    text[..end].to_owned()
+    text.char_indices()
+        .nth(max)
+        .map_or_else(|| text.to_owned(), |(index, _)| text[..index].to_owned())
 }
 
 /// Human-readable text for an error `result` frame (an API error such as 429),
 /// or `None` when the frame carries nothing worth showing.
 fn turn_error_text(result: &ResultMessage) -> Option<String> {
-    if let Some(text) = result.result.as_ref().and_then(Value::as_str) {
-        if !text.trim().is_empty() {
-            return Some(text.trim().to_owned());
-        }
+    if let Some(text) = result.result.as_ref().and_then(Value::as_str)
+        && !text.trim().is_empty()
+    {
+        return Some(text.trim().to_owned());
     }
     result
         .subtype
@@ -1560,10 +1552,11 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
     // the turn lifecycle (severity stays info) so the projection can show an
     // additive turn-error marker without ever reading the turn failure as a
     // process/start failure.
-    if is_turn_error
-        && let Some(text) = turn_error_text(result)
-    {
-        related.insert("lastError".into(), truncate_char_boundary(&text, TURN_ERROR_MAX_CHARS));
+    if is_turn_error && let Some(text) = turn_error_text(result) {
+        related.insert(
+            "lastError".into(),
+            truncate_char_boundary(&text, TURN_ERROR_MAX_CHARS),
+        );
     }
     // Workflow emits result_index 0 then 1; the first is not process completion
     // (stream-json §5: do not tear down on the first result).

@@ -256,14 +256,24 @@ async fn one_turn_emits_the_observation_sequence_in_order() {
         assert_eq!(obs.source.channel, SourceChannel::Stdout);
     }
 
-    // Ordering: the session lifecycle from `system/init` precedes the assembled
-    // message, which precedes the turn's `result` and its usage.
+    // The session lifecycle from `system/init`, the `turn_started` emitted
+    // right after the user frame is written, the assembled assistant message,
+    // and the turn's settled `result` + usage are all present. The mpsc pump
+    // buffers observations, so delivery order between session/message and the
+    // post-write turn_started is not asserted; the causal relationship that
+    // matters for the working→idle projection is turn_started before result.
     let session_at = events
         .iter()
         .position(|o| {
             lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("started")
         })
         .expect("session started lifecycle");
+    let turn_started_at = events
+        .iter()
+        .position(|o| {
+            lifecycle_named(o) == Some("turn_started") && lifecycle_status(o) == Some("working")
+        })
+        .expect("turn_started/working after the user frame");
     let message_at = events
         .iter()
         .position(|o| matches!(o.body, ObservationPayload::Message(_)))
@@ -273,15 +283,102 @@ async fn one_turn_emits_the_observation_sequence_in_order() {
         .position(|o| lifecycle_status(o) == Some("turn_done"))
         .expect("turn_done");
     assert!(
-        session_at < message_at && message_at < result_at,
-        "out of order: session={session_at} message={message_at} result={result_at}"
+        session_at < result_at && message_at < result_at && turn_started_at < result_at,
+        "session/message/turn_started must all precede the result: session={session_at} \
+         start={turn_started_at} message={message_at} result={result_at}"
     );
+    // The turn_started event carries the native client message id so a later
+    // fold can join the command to the turn (D-057 ma-sdk-state).
+    use remuda_protocol::LifecyclePayload as LP;
+    let started = events
+        .iter()
+        .find(|o| lifecycle_named(o) == Some("turn_started"))
+        .expect("turn_started observation");
+    if let ObservationPayload::Lifecycle(lp) = &started.body
+        && let LP::Native(native) = lp.as_ref()
+    {
+        assert!(
+            native.related_ids.contains_key("nativeClientMessageId"),
+            "turn_started must carry the native client message id"
+        );
+    }
     // usage rides the terminal result (§2.5, `usage_from_result`).
     let usage_at = events
         .iter()
         .position(|o| matches!(o.body, ObservationPayload::Usage(_)))
         .expect("usage from result");
     assert!(usage_at > message_at, "usage must follow the message");
+
+    driver.close().await.expect("close");
+}
+
+/// A settled result `error` (an API error such as 429) maps to a
+/// `turn/result` lifecycle at status `error` with the native text on a
+/// `lastError` related id and severity info — turn-level, never process
+/// failure (D-057 OA6, ma-sdk-state).
+#[tokio::test]
+async fn an_error_result_carries_turn_level_last_error_at_info_severity() {
+    let body = r#"{"type":"assistant","message":{"id":"msg_err","type":"message","role":"assistant","model":"fake","content":[{"type":"text","text":"retry please"}]},"session_id":"__SESSION__","uuid":"aaaaaaaa-0000-4000-8000-aaaaaaaaaaa1"}
+{"type":"result","subtype":"success","is_error":true,"duration_ms":1,"num_turns":1,"result":"API Error: 429 try again","stop_reason":"end_turn","total_cost_usd":0,"usage":{"input_tokens":1,"output_tokens":1},"modelUsage":{},"permission_denials":[],"session_id":"__SESSION__","uuid":"aaaaaaaa-0000-4000-8000-aaaaaaaaaaa2","result_index":1,"queued_turn_count":0}
+{"turn":"end"}
+"#;
+    let script_path = std::env::temp_dir().join(format!(
+        "ma-sdk-state-error-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    tokio::fs::write(&script_path, body)
+        .await
+        .expect("write script");
+
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_CLAUDE_SCRIPT".to_owned(),
+        script_path.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+    driver.send(prompt("one")).await.expect("send");
+    let events = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        obs.iter()
+            .any(|o| lifecycle_named(o) == Some("result") && lifecycle_status(o) == Some("error"))
+    })
+    .await;
+
+    use remuda_protocol::{LifecyclePayload as LP, Severity};
+    let error_result = events
+        .iter()
+        .find(|o| lifecycle_named(o) == Some("result") && lifecycle_status(o) == Some("error"))
+        .expect("turn/result error");
+    let native = match &error_result.body {
+        ObservationPayload::Lifecycle(lp) => match lp.as_ref() {
+            LP::Native(native) => native,
+            other => panic!("expected native lifecycle, got {other:?}"),
+        },
+        other => panic!("expected lifecycle, got {other:?}"),
+    };
+    assert_eq!(native.topic, remuda_protocol::LifecycleTopic::Turn);
+    assert_eq!(
+        native.severity,
+        Severity::Info,
+        "a turn error is not an error-severity event"
+    );
+    assert_eq!(
+        native.related_ids.get("lastError").map(String::as_str),
+        Some("API Error: 429 try again"),
+        "native error text is carried for the additive turn-error marker"
+    );
+    assert_eq!(
+        native
+            .related_ids
+            .get("queuedTurnCount")
+            .map(String::as_str),
+        Some("0")
+    );
 
     driver.close().await.expect("close");
 }

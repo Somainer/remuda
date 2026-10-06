@@ -96,21 +96,20 @@ impl WorkflowProducer {
                     _ => Vec::new(),
                 }
             }
-            // c-cardsettle r4 item 5: a subagent's StopFailure with
-            // outcome=failed marks THAT workflow member failed. Root is
-            // untouched.
-            "StopFailure"
-                if related
-                    .get("outcome")
-                    .map(String::as_str)
-                    .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"))
-                    && related.get("agentId").is_some() =>
-            {
-                self.agent_failed(
-                    related.get("agentId").map(String::as_str),
-                    related.get("agentTranscriptPath").map(Path::new),
-                )
-            }
+            // c-cardsettle r4 item 5 / r5 item 2: a StopFailure carrying a
+            // non-empty agentId is THAT workflow member's failure. StopFailure
+            // is always a failed stop (unlike SubagentStop, which fires for
+            // completed/failed/killed alike), so an explicit outcome tag is NOT
+            // required — the live fold does not stamp outcome for a subagent
+            // event, so requiring it meant a pre-SubagentStart StopFailure
+            // (the owner's recorded order) never marked the member. The member
+            // is resolved from agentId even without a transcript path or a
+            // prior SubagentStart (agent_failed creates it). Root StopFailure
+            // (no agentId) falls through and ends the root turn elsewhere.
+            "StopFailure" if related.get("agentId").is_some() => self.agent_failed(
+                related.get("agentId").map(String::as_str),
+                related.get("agentTranscriptPath").map(Path::new),
+            ),
             _ => Vec::new(),
         };
         envelopes

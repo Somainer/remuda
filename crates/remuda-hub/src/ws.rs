@@ -1483,20 +1483,27 @@ async fn follow_session(
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // c-cardsettle r4 item 6: one or more settlement
-                            // notices were overwritten. A gap frame alone is
-                            // not enough — an older in-flight inbox response
-                            // can resurrect the card because only pinned ids
-                            // are protected. Recover the AUTHORITATIVE
-                            // terminal ids from durable storage (live rows and
-                            // tombstones) and re-send each as a settlement
+                            // c-cardsettle r4 item 6 / r5 item 6: one or more
+                            // settlement notices were overwritten. Recover the
+                            // AUTHORITATIVE terminal ids from durable storage
+                            // in BOUNDED pages and re-send each as a settlement
                             // notice BEFORE the gap, so the client pins them
-                            // before it reconciles.
-                            let terminal = state
+                            // before it reconciles (an older in-flight inbox
+                            // response cannot resurrect a card). On a QUERY
+                            // ERROR we do NOT send a bare gap — close the
+                            // follower so it reconnects and resyncs from the
+                            // durable list/replay rather than trusting a gap.
+                            let terminal = match state
                                 .store
                                 .recent_invalidated_interactions()
                                 .await
-                                .unwrap_or_default();
+                            {
+                                Ok(rows) => rows,
+                                Err(error) => {
+                                    tracing::error!(%error, "settlement lag recovery query failed; closing follower");
+                                    return;
+                                }
+                            };
                             for (sid, iid, reason) in terminal {
                                 if !instance_ids.is_empty()
                                     && !instance_ids.iter().any(|id| id == &sid)

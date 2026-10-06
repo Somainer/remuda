@@ -2572,39 +2572,17 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
     let LifecyclePayload::Native(native) = payload.as_ref() else {
         return None;
     };
-    // c-cardsettle r4 items 1+2 (OA6): terminal ONLY from explicit
-    // process-end evidence. Subagent events (agentId) and ALL non-session
-    // topics — including topic=turn even when affectsCompletion=true — never
-    // end the process. A one-shot print/SDK driver's `result` error is a TURN
-    // failure; the driver emits a SEPARATE topic=session native_exit/EOF when
-    // the child process actually ends. The legacy `shell`/`error`/`gone`
-    // names on topic=session (generic_pty.sh failure_lifecycle, pane exit,
-    // startup failure) remain terminal.
-    if is_subagent_observation(native) || native.topic != remuda_protocol::LifecycleTopic::Session {
+    // c-cardsettle r5 addendum (OA6): use the SHARED process-end classifier.
+    // Only a real Failed process end returns a reason; Exited is not a failure;
+    // everything else (configure/turn/severity=error on a live process) returns
+    // None so record_task_exit never appends entity state=failed.
+    use remuda_protocol::process_end::{ProcessEndKind, process_end};
+    // Subagent scope is never the main process, regardless of the event.
+    if is_subagent_observation(native) {
         return None;
     }
-    let name = native.native_name.to_ascii_lowercase();
-    // r4 item 2: only EXPLICIT process-end evidence. A name proving the
-    // process is gone (native_exit/exit/gone/agent_not_ready/shell) or a
-    // launch that never started (reasonCode native-driver-start-failed /
-    // start-fail name). Bare severity=error / generic "error" name is a
-    // transient error the process survives.
-    let reason_code = native
-        .related_ids
-        .get("reasonCode")
-        .map(String::as_str)
-        .unwrap_or("");
-    let explicit_process_exit = name == "exit"
-        || name.contains("exit")
-        || name.contains("gone")
-        || name.contains("agent_not_ready")
-        || name.contains("shell");
-    let startup_failed = reason_code == "native-driver-start-failed"
-        || name == "native-driver-start-failed"
-        || name == "error"
-        || name.contains("start-fail");
-    let failed = explicit_process_exit || startup_failed;
-    if !failed {
+    let end = process_end(native)?;
+    if end.kind != ProcessEndKind::Failed {
         return None;
     }
     if let Some(message) = native.related_ids.get("lastError")
@@ -2650,24 +2628,31 @@ fn native_exit(observation: &remuda_protocol::Observation) -> Option<NativeExit>
     let LifecyclePayload::Native(native) = payload.as_ref() else {
         return None;
     };
-    if native.native_name != remuda_driver::shell_pty::NATIVE_EXIT {
-        return None;
-    }
     // r3 item 8: a subagent's exit observation is the subagent's row, never
     // the main process.
     if is_subagent_observation(native) {
         return None;
     }
-    let Knowledge::Known { value: state } = &native.status else {
+    // c-cardsettle r5 addendum (OA6): use the SHARED process-end classifier.
+    // Accept BOTH the shell-pty (native_exit) and print/SDK (session) real
+    // exit events, classified Exited vs Failed by the classifier.
+    use remuda_protocol::process_end::{ProcessEndKind, process_end};
+    let end = process_end(native)?;
+    let Knowledge::Known { value: _status } = &native.status else {
         return None;
     };
+    // Map the classifier outcome to the status string record_native_exit uses.
+    let state = match end.kind {
+        ProcessEndKind::Exited => "exited",
+        ProcessEndKind::Failed => "failed",
+    };
     Some(NativeExit {
-        state: state.clone(),
+        state: state.to_string(),
         reason: native
             .related_ids
             .get("reason")
             .cloned()
-            .unwrap_or_else(|| state.clone()),
+            .unwrap_or_else(|| state.to_string()),
     })
 }
 
@@ -2707,14 +2692,22 @@ fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &N
     {
         tracing::error!(%error, "native exit lifecycle not appended");
     }
+    // c-cardsettle r5 addendum: a Failed exit stays Failed; a clean exit is
+    // Exited. Do not unconditionally overwrite Failed with Exited (equal-rank
+    // overwrite turned non-zero exits / signals into clean exits).
+    let end_lifecycle = if exit.state == "failed" {
+        InstanceLifecycle::Failed
+    } else {
+        InstanceLifecycle::Exited
+    };
     if let Err(error) = store.set_instance_state(
         instance_id,
-        Some(InstanceLifecycle::Exited),
+        Some(end_lifecycle),
         Some(Knowledge::Known {
             value: Activity::Idle,
         }),
     ) {
-        tracing::error!(%error, "instance not marked exited after its process ended");
+        tracing::error!(%error, "instance not marked after its process ended");
     }
 }
 

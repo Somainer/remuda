@@ -2386,8 +2386,15 @@ impl Store {
             // of fanning out to all connected Nodes.
             tx.execute(
                 "INSERT OR IGNORE INTO interaction_tombstones
-                    (id, instance_id, host_id, state, created_at, updated_at)
-                 SELECT id, instance_id, host_id, state, created_at, updated_at
+                    (id, instance_id, host_id, state, reason, created_at, updated_at)
+                 SELECT id, instance_id, host_id, state,
+                        COALESCE(
+                            json_extract(payload_json,
+                                '$.payload.entity.resolution.value.reason'),
+                            json_extract(payload_json,
+                                '$.payload.interaction.resolution.value.reason'),
+                            'generation-ended'),
+                        created_at, updated_at
                  FROM interactions WHERE instance_id = ?1",
                 params![&instance_id],
             )?;
@@ -4215,6 +4222,9 @@ impl Store {
         &self,
     ) -> Result<Vec<(String, String, String)>, StoreError> {
         self.run_named("recent_invalidated_interactions", move |conn| {
+            // r5 item 6: bounded page (LIMIT 512) so a lag burst cannot
+            // produce an unbounded recovery frame; the 5-minute window plus
+            // LIMIT bounds both age and count.
             let mut stmt = conn.prepare(
                 "SELECT instance_id, id, COALESCE(
                     json_extract(payload_json,
@@ -4229,7 +4239,8 @@ impl Store {
                  SELECT instance_id, id, 'generation-ended'
                  FROM interaction_tombstones
                  WHERE state = 'invalidated'
-                   AND julianday(updated_at) >= julianday('now','-5 minutes')",
+                   AND julianday(updated_at) >= julianday('now','-5 minutes')
+                 LIMIT 512",
             )?;
             let rows = stmt.query_map(params![], |row| {
                 Ok((
@@ -5331,6 +5342,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             instance_id TEXT NOT NULL,
             host_id TEXT NOT NULL,
             state TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'generation-ended',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -5500,6 +5512,15 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // exact HTTP status and body; NULL for 200 rows and pre-round-2 data.
     ensure_column(&conn, "commands", "settlement_http_status", "INTEGER")?;
     ensure_column(&conn, "commands", "settlement_http_body", "TEXT")?;
+    // c-cardsettle r5 item 8: tombstones retain the real invalidation reason
+    // so reconnect/lag replay labels a demotion as agent-demoted, not
+    // generation-ended.
+    ensure_column(
+        &conn,
+        "interaction_tombstones",
+        "reason",
+        "TEXT NOT NULL DEFAULT 'generation-ended'",
+    )?;
     // One-time cleanup of the round-2 shape: a failed delivery was briefly a
     // fourth `state='failed'` value held in a `reason` column. Fold any rows an
     // older build persisted into the §2.5 form (`settled` + a `rejected`
@@ -5809,46 +5830,20 @@ fn apply_instance_projection(
             }
         }
         let native_name = name.to_ascii_lowercase();
-        // c-cardsettle r4 item 1+2 (OA6): terminal ONLY from explicit
-        // process-end evidence. Subagent-scoped events (agentId) and ALL
-        // non-session topics (turn/configuration/hook/task/plan/diagnostic)
-        // are never terminal regardless of severity or affectsCompletion —
-        // a topic=turn result error is a turn failure, not a process exit;
-        // the print/SDK driver emits a separate topic=session native_exit
-        // when the process actually ends.
-        let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
-        let reason_code = payload
-            .get("relatedIds")
-            .and_then(|r| r.get("reasonCode"))
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("reasonCode").and_then(Value::as_str))
-            .unwrap_or("");
+        // c-cardsettle r5 addendum (OA6): terminal ONLY from the SHARED
+        // process-end classifier (remuda_protocol::process_end), driven by the
+        // REAL driver shapes. No name-substring, no severity or
+        // affectsCompletion heuristic. Subagent-scoped native events never end
+        // the root. The print/SDK driver emits a separate topic=session
+        // nativeName="session"/"native_exit" event when the process ends.
         let subagent_scoped = native_payload_is_subagent(&payload);
-        // r4 item 2: only EXPLICIT process-end evidence on topic=session is
-        // terminal — a name proving the process is gone (native_exit/exit/
-        // gone/agent_not_ready/shell), or a launch that never started
-        // (reasonCode native-driver-start-failed / a start-fail name).
-        // Bare severity=error or a generic "error" name is NOT enough: a
-        // transient session error the process survives
-        // (transient_runtime_error) must keep the session running.
-        let explicit_process_exit = native_name == "exit"
-            || native_name.contains("exit")
-            || native_name.contains("gone")
-            || native_name.contains("agent_not_ready")
-            || native_name.contains("shell");
-        // A launch that never started: the driver's emit_startup_failure
-        // emits topic=session native_name="error" (EXACT — a transient
-        // error the process survives uses a distinct name like
-        // transient_runtime_error, which contains "error" but is not equal).
-        let startup_failed = reason_code == "native-driver-start-failed"
-            || native_name == "native-driver-start-failed"
-            || native_name == "error"
-            || native_name.contains("start-fail");
-        let nonterminal_observation =
-            subagent_scoped || topic != "session" || !(explicit_process_exit || startup_failed);
-        let failed = !nonterminal_observation && (explicit_process_exit || startup_failed);
-        if failed {
-            lifecycle = Some("failed");
+        let process_end = if !subagent_scoped {
+            remuda_protocol::process_end::process_end_value(&payload)
+        } else {
+            None
+        };
+        if let Some(end) = process_end {
+            lifecycle = Some(end.lifecycle());
             last_error = payload
                 .pointer("/relatedIds/lastError")
                 .and_then(Value::as_str)
@@ -5860,6 +5855,7 @@ fn apply_instance_projection(
                         .map(str::to_string)
                 });
         }
+        let _ = native_name;
     }
     if let Some(lifecycle) = lifecycle {
         // c-cardsettle: capture the EFFECTIVE lifecycle before this write so
@@ -7866,7 +7862,7 @@ mod tests {
                 host.clone(),
                 running.instance_id.clone(),
                 Some(1),
-                json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+                json!({"kind":"lifecycle","payload":{"type":"entity","entityType":"instance","state":"ready"}}),
             )
             .await
             .expect("ready");
@@ -7897,7 +7893,7 @@ mod tests {
                 host.clone(),
                 gone.instance_id.clone(),
                 Some(1),
-                json!({"kind":"lifecycle","payload":{"type":"entity","state":"exited"}}),
+                json!({"kind":"lifecycle","payload":{"type":"entity","entityType":"instance","state":"exited"}}),
             )
             .await
             .expect("exited");
@@ -8404,17 +8400,9 @@ mod tests {
                     "severity":"error","affectsCompletion":false,
                     "status":{"state":"known","value":"error"}}}),
             ),
-            // r4 item 2: even the one-shot print driver's final result error
-            // at topic=turn + affectsCompletion=true is NOT terminal — it is a
-            // turn failure; the driver emits a separate topic=session exit.
-            (
-                "print-final-result-error-turn-level",
-                json!({"kind":"lifecycle","payload":{
-                    "type":"native","topic":"turn","nativeName":"result",
-                    "affectsCompletion":true,
-                    "status":{"state":"known","value":"error"},
-                    "relatedIds":{"resultIndex":"1","numTurns":"1"}}}),
-            ),
+            // r5 item 4: a ROOT topic=turn result error ENDS THE TURN
+            // (idle) but not the process; asserted separately below alongside
+            // the root StopFailure. Excluded from the own-scope cases loop.
             // Subagent lifecycle marker on session topic, severity error.
             (
                 "subagent-session-error",
@@ -8472,6 +8460,36 @@ mod tests {
             "root StopFailure ends the turn (idle), retryable"
         );
 
+        // r5 item 4: a ROOT print/SDK topic=turn result error also ends the
+        // TURN (idle), lifecycle stays running — a failed turn is retryable.
+        let root_result_error = json!({"kind":"lifecycle","payload":{
+            "type":"native","topic":"turn","nativeName":"result",
+            "affectsCompletion":true,
+            "status":{"state":"known","value":"error"},
+            "relatedIds":{"resultIndex":"1","numTurns":"1"}}});
+        let (r_life, r_act) = derive_instance_state(&root_result_error);
+        assert_eq!(
+            r_life,
+            Some("running"),
+            "root result error keeps lifecycle running"
+        );
+        assert_eq!(
+            r_act,
+            Some("idle"),
+            "root result error ends the turn (idle)"
+        );
+        // A SUBAGENT result error stays own-scope (no idle).
+        let sub_result = json!({"kind":"lifecycle","payload":{
+            "type":"native","topic":"turn","nativeName":"result",
+            "status":{"state":"known","value":"error"},
+            "relatedIds":{"agentId":"a1"}}});
+        let (s_life, s_act) = derive_instance_state(&sub_result);
+        assert_eq!(s_life, None);
+        assert_eq!(
+            s_act, None,
+            "a subagent result error never sets root activity"
+        );
+
         // The signals that DO end it via the DERIVED start-fail/entity rules.
         // (severity=error native exits are projected as failed by
         // apply_instance_projection; native_terminal_projection_... covers that
@@ -8517,12 +8535,34 @@ mod tests {
         enroll_labeled(&store, host.clone(), "cardsettle-subagent").await;
         let instance = seed_acknowledged_instance(&store, &host).await;
         let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+        // r5 item 3: seed the root as actively WORKING (not just ready), so we
+        // can prove a subagent StopFailure with remudaActivity=idle does not
+        // flip the root's activity.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"agent_status",
+                    "status":{"state":"known","value":"working"}}}),
+            )
+            .await
+            .expect("seed working");
+        // Capture the pre-fixture lifecycle AND activity.
+        let before = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get before")
+            .expect("row");
+        assert_eq!(before.lifecycle, "running");
+        assert_eq!(before.activity, "working", "seeded root is working");
         let watermark = store
             .read_journal(instance.instance_id.clone(), 0, None)
             .await
             .expect("watermark")
             .durable_seq;
-        assert_eq!(watermark, 2, "seeded ready + interaction occupy seq 1-2");
+        assert_eq!(watermark, 3, "ready + interaction + working occupy seq 1-3");
 
         let events: Vec<Value> =
             serde_json::from_str(include_str!("../tests/fixtures/subagent-hook-events.json"))
@@ -8568,26 +8608,19 @@ mod tests {
             "the first post-watermark event is the subagent StopFailure, not discarded"
         );
 
-        // Capture the pre-fixture activity (the root's own pending approval
-        // leaves it "blocked"); the subagent fixture must not change it.
-        let activity_before = store
+        // Assert the post-state EQUALS the captured pre-state literally.
+        let row = store
             .get_instance(instance.instance_id.clone())
             .await
-            .expect("get before")
-            .expect("row")
-            .activity;
-        let row = store
-            .get_instance(instance.instance_id)
-            .await
-            .expect("get")
+            .expect("get after")
             .expect("row");
         assert_eq!(
-            row.lifecycle, "running",
-            "a subagent StopFailure never ends the main instance"
+            row.lifecycle, before.lifecycle,
+            "lifecycle unchanged: a subagent StopFailure never ends the root"
         );
         assert_eq!(
-            row.activity, activity_before,
-            "a subagent event does not stamp the root's activity (stays {activity_before})"
+            row.activity, before.activity,
+            "activity unchanged: stays working (a subagent remudaActivity=idle never idles the root)"
         );
         let (state, _) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "pending", "the main session's card stays pending");
@@ -10202,6 +10235,20 @@ fn normalize_lifecycle(state: &str) -> Option<&'static str> {
     }
 }
 
+/// c-cardsettle r5 item 4 (OA6): whether a ROOT topic=turn native event ends
+/// the TURN failed — a `result` with status/error, or a root StopFailure whose
+/// `relatedIds.outcome` is "failed". Subagent scope and configure/diagnostic
+/// topics are filtered by the caller before invoking this.
+fn root_turn_failed(payload: &Value, native_name: &str, status: Option<&str>) -> bool {
+    let outcome_failed = payload
+        .pointer("/relatedIds/outcome")
+        .and_then(Value::as_str)
+        .is_some_and(|o| o.eq_ignore_ascii_case("failed"));
+    let result_error = native_name == "result" && status == Some("error");
+    let stop_failure = native_name == "stopfailure" && outcome_failed;
+    result_error || stop_failure
+}
+
 fn normalize_activity(status: &str) -> Option<&'static str> {
     match status {
         "idle" | "done" => Some("idle"),
@@ -10232,10 +10279,6 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         .unwrap_or("");
     let payload = event.get("payload").unwrap_or(event);
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
-    let reason = payload
-        .get("reasonCode")
-        .and_then(Value::as_str)
-        .unwrap_or("");
     let native_name = payload
         .get("nativeName")
         .and_then(Value::as_str)
@@ -10277,35 +10320,71 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         .or_else(|| knowledge_value(payload.pointer("/entity/activity")))
         .or_else(|| event.get("activity").and_then(Value::as_str));
 
-    // c-cardsettle r3 addendum: a failure that is NOT evidence the process
-    // ended must never fold the lifecycle. Turn-level / configure / hook /
-    // diagnostic / subagent-scoped failures keep the session running; only a
-    // real start failure (reason native-driver-start-failed / start-fail
-    // c-cardsettle r4 item 2 (OA6): terminal lifecycle comes ONLY from
-    // explicit process-end evidence — an exit/EOF event (nativeName
-    // exit/gone/agent_not_ready/shell on topic=session), a launch that never
-    // started (native-driver-start-failed/start-fail), an entity
-    // state=failed/exited, or the Node reporting the instance gone. A TURN
-    // result error on topic=turn — even with affectsCompletion=true (the
-    // one-shot print/SDK driver's heuristic) — is NOT process-end: the driver
-    // emits a SEPARATE native exit/EOF event when the process actually ends.
-    // A failed turn at most ends the turn (activity idle/retryable).
-    let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
-    let informational_topic = payload_type == "native"
-        && matches!(
-            topic,
-            "turn" | "hook" | "task" | "plan" | "configuration" | "diagnostic"
-        );
+    // r5 item 1: only INSTANCE-lifecycle entities fold root lifecycle;
+    // workflow run/phase/member observations never fold the root (they are a
+    // distinct ObservationPayload kind and never reach lifecycle derivation;
+    // this gate additionally rejects a command/interaction entity). An
+    // INSTANCE entity lifecycle serialises with a flattened top-level
+    // "instance" key (LifecycleEntity::Instance, serde tag="instance"). Bare
+    // entity events with only a state (driver shorthand / tests) and no other
+    // entity key are treated as the instance.
+    let non_instance_entity_keys = [
+        "host", "workspace", "run", "command", "interaction",
+    ];
+    let explicit_entity_type = payload.get("entityType").and_then(Value::as_str);
+    let is_instance_entity = payload_type == "entity"
+        && match explicit_entity_type {
+            // An explicit entityType is authoritative.
+            Some("instance") => true,
+            Some(_) => false,
+            // No entityType: a flattened "instance" key is the real driver
+            // entity; a bare state-only entity (driver shorthand) with no
+            // other entity key is the instance.
+            None => {
+                payload.get("instance").is_some()
+                    || !non_instance_entity_keys
+                        .iter()
+                        .any(|key| payload.get(*key).is_some())
+            }
+        };
     let subagent_scoped = payload_type == "native" && native_payload_is_subagent(payload);
-    let start_failed = !subagent_scoped
-        && !informational_topic
-        && (reason == "native-driver-start-failed"
-            || native_name == "native-driver-start-failed"
-            || native_name.contains("start-fail")
-            || entity_state == Some("failed"));
-    if start_failed && (kind == "lifecycle" || payload_type == "native" || payload_type == "entity")
+    let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
+
+    // c-cardsettle r5 addendum (OA6): process-end via the SHARED classifier.
+    // Native event → process_end(); instance entity → entity_process_end().
+    // Anything else (turn result/StopFailure, configure/diagnostic, subagent,
+    // workflow member) is NOT a process end.
+    let native_end: Option<remuda_protocol::process_end::ProcessEnd> =
+        if payload_type == "native" && !subagent_scoped {
+            remuda_protocol::process_end::process_end_value(payload)
+        } else {
+            None
+        };
+    if let Some(end) = native_end {
+        return (Some(end.lifecycle()), None);
+    }
+    let entity_end = if is_instance_entity {
+        remuda_protocol::process_end::entity_process_end(
+            payload.get("entityType").and_then(Value::as_str),
+            entity_state,
+        )
+    } else {
+        None
+    };
+    if let Some(end) = entity_end {
+        return (Some(end.lifecycle()), None);
+    }
+
+    // c-cardsettle r5 item 4 (OA6): a ROOT (non-subagent) `topic=turn`
+    // result/status error ENDS THE TURN with outcome failed: activity becomes
+    // idle (composer retryable), lifecycle stays running. A subagent,
+    // configure or diagnostic error is excluded (own scope).
+    if payload_type == "native"
+        && topic == "turn"
+        && !subagent_scoped
+        && root_turn_failed(payload, native_name, status)
     {
-        return (Some("failed"), None);
+        return (Some("running"), Some("idle"));
     }
 
     if kind == "interaction.requested" || kind == "interactionRequested" {
@@ -10314,18 +10393,19 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
 
     let mut lifecycle = None;
     let mut activity = None;
-    if let Some(state) = entity_state {
+    // c-cardsettle r5 item 1 (OA6): root lifecycle/activity derive ONLY from
+    // INSTANCE-lifecycle entities. A workflow run/phase/member entity — e.g. a
+    // workflow.member state=failed — belongs to that member's row, never the
+    // root. Non-terminal instance entity states (ready/running/idle/…) still
+    // project activity; terminal ones returned above via the classifier.
+    if is_instance_entity && let Some(state) = entity_state {
         lifecycle = normalize_lifecycle(state);
     }
-    let herdr_idle_proof = native_name == "agent_status"
+    let herdr_idle_proof = is_instance_entity
+        || native_name == "agent_status"
         || native_name == "session"
-        || payload_type == "native"
-        || payload.get("entityType").and_then(Value::as_str) == Some("instance");
+        || payload_type == "native";
     if herdr_idle_proof && let Some(status) = status {
-        // c-cardsettle r4: a literal failed/error native status on a
-        // turn/hook/configure/diagnostic/subagent event is NOT a process end.
-        // Only a real process-end event (topic=session exit/gone, which
-        // apply_instance_projection handles independently) is terminal.
         match status {
             "starting" | "started" => {
                 lifecycle = Some(if status == "starting" {
@@ -10338,10 +10418,8 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
                 lifecycle = Some("running");
                 activity = normalize_activity(status);
             }
-            "exited" => lifecycle = Some("exited"),
-            // r4: native status failed/error never maps to lifecycle failed
-            // here; real exits are projected by apply_instance_projection.
-            "failed" | "error" => {}
+            // r5: exited/failed status is process-end, already returned via
+            // the classifier above; never infer it from a bare status here.
             _ => {}
         }
     }
@@ -10446,12 +10524,25 @@ mod derive_tests {
 
     #[test]
     fn entity_ready_is_running_not_idle() {
+        // r5 item 1: only entityType=instance entities fold root lifecycle.
         let (life, act) = derive_instance_state(&json!({
             "kind": "lifecycle",
-            "payload": { "type": "entity", "state": "ready", "reasonCode": "driver-started" }
+            "payload": {
+                "type": "entity", "entityType": "instance",
+                "state": "ready", "reasonCode": "driver-started"
+            }
         }));
         assert_eq!(life, Some("running"));
         assert_eq!(act, None);
+        // A non-instance entity (workflow member) does NOT fold.
+        let (life2, _) = derive_instance_state(&json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "entity", "entityType": "workflow.member",
+                "state": "ready"
+            }
+        }));
+        assert_eq!(life2, None, "a workflow.member entity never folds the root");
     }
 
     #[test]
@@ -10470,15 +10561,25 @@ mod derive_tests {
 
     #[test]
     fn start_failure_marks_failed() {
+        // r5: an INSTANCE entity failed is process end; a workflow.member
+        // failed is not.
         let (life, _) = derive_instance_state(&json!({
             "kind": "lifecycle",
             "payload": {
-                "type": "entity",
+                "type": "entity", "entityType": "instance",
                 "state": "failed",
                 "reasonCode": "native-driver-start-failed"
             }
         }));
         assert_eq!(life, Some("failed"));
+        let (life2, _) = derive_instance_state(&json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "entity", "entityType": "workflow.member",
+                "state": "failed"
+            }
+        }));
+        assert_eq!(life2, None, "a workflow.member failed never fails the root");
     }
 
     #[test]

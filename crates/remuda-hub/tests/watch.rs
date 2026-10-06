@@ -681,19 +681,21 @@ fn turn_error_event() -> Value {
     })
 }
 
-/// The real process-end evidence the print/generic driver emits (topic=session,
-/// nativeName=exit) after a one-shot process terminates. THIS — not the turn
-/// result error — is what marks the instance lifecycle failed.
+/// The real process-end evidence the PRINT/SDK driver emits from `emit_exit`
+/// (crates/remuda-driver/src/claude_print.rs): topic=session,
+/// nativeName="session", status "exited" (clean) or "failed" (non-zero). It
+/// follows the turn-result error; THIS — not the turn result — is the process
+/// end. Here the one-shot process failed its first turn, so status=failed.
 fn session_exit_event() -> Value {
     json!({
         "kind": "lifecycle",
         "payload": {
             "type": "native",
             "topic": "session",
-            "nativeName": "exit",
+            "nativeName": "session",
             "severity": "error",
             "affectsCompletion": true,
-            "status": { "value": "failed" },
+            "status": { "state": "known", "value": "failed" },
             "relatedIds": { "lastError": "pane exited; agent process is gone" },
         },
     })

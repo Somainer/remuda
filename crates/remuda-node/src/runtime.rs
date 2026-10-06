@@ -735,6 +735,15 @@ impl DevNode {
         let (workspace, workspace_root) =
             self.resolve_workspace_cwd(request.workspace_id.as_ref(), request.cwd.as_deref())?;
         let workspace_id = workspace.meta.id.clone();
+        // c-dirpicker round 3 item 6: reserve occupancy under the registry's
+        // write lock, atomically with the unregister-unbinding check, and
+        // hold it until the instance row is durable (or any failure drops
+        // the guard). An unregister prepare in between counts this and
+        // refuses; an unregister already prepared refuses the create here.
+        // Held (not just an underscore binding) until the end of this
+        // function: its Drop releases the occupancy reservation after the
+        // instance row is durable or this create returns an error.
+        let _held_workspace_reservation = self.reserve_workspace(&workspace_id)?;
         if host_id != self.inner.host.meta.id {
             return Err(NodeError::InvalidRequest(
                 "create hostId is not the local development Host".to_owned(),

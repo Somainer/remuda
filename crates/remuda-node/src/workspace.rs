@@ -10,6 +10,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -43,6 +44,12 @@ pub(crate) struct WorkspaceRegistry {
     file: Option<PathBuf>,
     roots: Vec<crate::dir_browser::AllowedRoot>,
     host_id: HostId,
+    /// In-memory (never persisted) occupancy reservations held by instance
+    /// creates from admission until their row is durably inserted (or the
+    /// create fails and the guard drops). Unregister prepare counts them
+    /// together with live instances, so a create that passed admission but
+    /// has not inserted yet cannot be overtaken by an unbind (round 3 item 6).
+    reservations: Arc<std::sync::Mutex<std::collections::HashMap<WorkspaceId, u32>>>,
 }
 
 impl WorkspaceRegistry {
@@ -79,6 +86,7 @@ impl WorkspaceRegistry {
             file,
             roots,
             host_id,
+            reservations: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         // Persisted entries may be deleted, unmounted, or disallowed by a tightened
         // policy. Keep them listable/removable; session and worktree admission
@@ -111,6 +119,50 @@ impl WorkspaceRegistry {
         json!({"workspaceRevision": self.state.revision, "workspaces": self.state.workspaces.iter().map(|workspace| {
             json!({"workspaceId": workspace.meta.id, "hostId": workspace.host_id, "root": workspace.root_path})
         }).collect::<Vec<_>>()})
+    }
+
+    /// Reserve one occupancy slot. The caller MUST hold the registry's write
+    /// guard (see [`DevNode::reserve_workspace`]); this never takes the
+    /// registry RwLock itself, so it is safe to call from inside [`mutate`]'s
+    /// closure too. The counter has its own mutex because the returned guard
+    /// releases the slot after the registry guard was dropped (the create
+    /// holds it across an await).
+    pub(crate) fn reserve_locked(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceReservation, NodeError> {
+        if self.state.unbinding.contains(workspace_id) {
+            return Err(NodeError::Conflict(format!(
+                "workspace {} is being unregistered; wait for it to settle before starting a session",
+                self.state
+                    .workspaces
+                    .iter()
+                    .find(|workspace| &workspace.meta.id == workspace_id)
+                    .map(|workspace| workspace.root_path.clone())
+                    .unwrap_or_default()
+            )));
+        }
+        *self
+            .reservations
+            .lock()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .entry(workspace_id.clone())
+            .or_insert(0) += 1;
+        Ok(WorkspaceReservation {
+            workspace_id: workspace_id.clone(),
+            table: self.reservations.clone(),
+            released: false,
+        })
+    }
+
+    /// Current in-flight create reservations for a workspace. Caller holds
+    /// the registry write lock; the reservation table is locked only for the
+    /// read.
+    fn reservation_count_locked(&self, workspace_id: &WorkspaceId) -> u32 {
+        self.reservations
+            .lock()
+            .map(|map| map.get(workspace_id).copied().unwrap_or(0))
+            .unwrap_or(0)
     }
 
     fn validate(&self, path: &Path) -> Result<PathBuf, NodeError> {
@@ -281,6 +333,23 @@ impl WorkspaceRegistry {
                         }
                         canonical
                     };
+                    // Round 3 item 7: an unregister already prepared against
+                    // this canonical directory cannot be overtaken by a
+                    // register; the caller must let the unregister settle.
+                    if method == "workspace.register"
+                        && self.state.unbinding.iter().any(|id| {
+                            self.state.workspaces.iter().any(|workspace| {
+                                &workspace.meta.id == id
+                                    && Path::new(&workspace.root_path) == canonical
+                            })
+                        })
+                    {
+                        return Err(NodeError::Conflict(
+                            "an unregister for this workspace is already prepared; \
+                             let it settle before registering again"
+                                .into(),
+                        ));
+                    }
                     let existing = self
                         .state
                         .workspaces
@@ -291,13 +360,16 @@ impl WorkspaceRegistry {
                     let workspace_id = existing.unwrap_or_default();
                     if method == "workspace.unregister" {
                         // Atomic with the write lock: a session entering in
-                        // another thread must take this same lock to resolve
-                        // its cwd, so it cannot slip in between the check and
-                        // the unbinding mark.
+                        // another thread must take this same lock to reserve
+                        // occupancy, so it cannot slip in between the check
+                        // and the unbinding mark. Both live instances and
+                        // in-flight create reservations count.
                         let live = live_sessions(&workspace_id)?;
-                        if live > 0 {
+                        let reservations = self.reservation_count_locked(&workspace_id) as usize;
+                        let occupancy = live + reservations;
+                        if occupancy > 0 {
                             return Err(NodeError::Conflict(format!(
-                                "workspace {} is still used by {live} live session(s); \
+                                "workspace {} is still used by {occupancy} live session(s); \
                                  end them before removing the directory (session history is kept)",
                                 params.path
                             )));
@@ -337,9 +409,19 @@ impl WorkspaceRegistry {
                             .find(|workspace| Path::new(&workspace.root_path) == canonical)
                         {
                             command.workspace_id = existing.meta.id.clone();
-                            // A committed (re)registration settles any pending
-                            // unbind mark against the surviving identity.
-                            next.unbinding.remove(&command.workspace_id);
+                            // Round 3 item 7: never clear another command's
+                            // unbinding mark. If a different unregister is
+                            // prepared against this identity, this register
+                            // cannot settle — the unregister must commit (or
+                            // fail) first, otherwise its later commit would
+                            // re-add/remove against a mark the register hid.
+                            if next.unbinding.contains(&command.workspace_id) {
+                                return Err(NodeError::Conflict(
+                                    "an unregister for this workspace is already prepared; \
+                                     let it settle before registering again"
+                                        .into(),
+                                ));
+                            }
                         } else {
                             // A prepared idempotent register must not resurrect a removed
                             // membership identity that an older unregister may still target.
@@ -361,6 +443,21 @@ impl WorkspaceRegistry {
                             return Err(NodeError::Conflict(
                                 "workspace was replaced after unregister prepare".into(),
                             ));
+                        }
+                        // Re-count at commit (defence in depth): prepare
+                        // blocked any create with a reservation and the
+                        // unbinding mark refused new ones, so this should be
+                        // zero; refuse the unbind rather than remove a
+                        // membership that gained occupancy since prepare.
+                        let live_at_commit = live_sessions(&command.workspace_id)?;
+                        let reserved_at_commit =
+                            self.reservation_count_locked(&command.workspace_id) as usize;
+                        if live_at_commit + reserved_at_commit > 0 {
+                            return Err(NodeError::Conflict(format!(
+                                "workspace {} gained occupancy after unregister prepare; \
+                                 the removal did not settle",
+                                command.canonical.display()
+                            )));
                         }
                         let previous_len = next.workspaces.len();
                         next.workspaces
@@ -392,6 +489,43 @@ impl WorkspaceRegistry {
             WorkspaceMutationPhase::Commit => "settled",
         });
         Ok(result)
+    }
+}
+
+/// One held occupancy reservation for an in-flight instance create
+/// (c-dirpicker round 3 item 6). Releases the slot on drop, so every failed
+/// create path frees its reservation; a successful create drops it after the
+/// instance row is durable (the live row then counts in its place).
+pub(crate) struct WorkspaceReservation {
+    workspace_id: WorkspaceId,
+    table: Arc<std::sync::Mutex<std::collections::HashMap<WorkspaceId, u32>>>,
+    released: bool,
+}
+
+impl WorkspaceReservation {
+    /// Release the slot explicitly after a durable insert; idempotent with
+    /// Drop.
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Ok(mut table) = self.table.lock()
+            && let Some(count) = table.get_mut(&self.workspace_id)
+        {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                table.remove(&self.workspace_id);
+            }
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for WorkspaceReservation {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -558,6 +692,21 @@ impl DevNode {
             })
     }
 
+    /// Reserve occupancy for an instance create on a workspace, atomically
+    /// with the unbinding check (both take the registry write lock). The
+    /// guard must be held until the instance row is durable; it releases on
+    /// any failure. See [`WorkspaceRegistry::reserve_locked`].
+    pub(crate) fn reserve_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceReservation, NodeError> {
+        self.inner
+            .workspace_registry
+            .write()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .reserve_locked(workspace_id)
+    }
+
     pub(crate) fn resolve_workspace_cwd(
         &self,
         workspace_id: Option<&WorkspaceId>,
@@ -682,6 +831,127 @@ mod tests {
             },
             |_workspace_id| Ok(0),
         )
+    }
+
+    #[test]
+    fn a_held_create_reservation_blocks_unregister_prepare_then_frees_it() {
+        // Round 3 item 6: a create that reserved occupancy (admission passed,
+        // durable insert not finished yet) must make unregister prepare
+        // refuse; releasing the reservation unblocks it.
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(root.path().to_path_buf())
+            .with_workspace_roots(vec![root.path().to_path_buf()])
+            .with_workspace_registry(data.path().to_path_buf());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace_id = registry.state.workspaces[0].meta.id.clone();
+
+        let reservation = registry.reserve_locked(&workspace_id).unwrap();
+        // Held reservation counts as occupancy even with zero live instances.
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "blocked-unregister".into(),
+                    path: registry.state.workspaces[0].root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                },
+                |_id| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 live session(s)"), "{error}");
+
+        // Create failed/finished: the guard drops and the unregister prepares.
+        drop(reservation);
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "allowed-unregister".into(),
+                    path: registry.state.workspaces[0].root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                },
+                |_id| Ok(0),
+            )
+            .unwrap();
+        // The unbinding mark is now set: a fresh create reservation is
+        // refused too.
+        assert!(registry.reserve_locked(&workspace_id).is_err());
+    }
+
+    #[test]
+    fn register_cannot_clear_another_commands_unbinding_mark() {
+        // Round 3 item 7: once an unregister is prepared against a workspace,
+        // neither a register prepare nor (if one existed) its commit can
+        // settle/clear the mark — the unregister must finish first.
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(root.path().to_path_buf())
+            .with_workspace_roots(vec![root.path().to_path_buf()])
+            .with_workspace_registry(data.path().to_path_buf());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let root_path = registry.state.workspaces[0].root_path.clone();
+
+        // Prepare the unregister with no live sessions.
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "u1".into(),
+                    path: root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                },
+                |_id| Ok(0),
+            )
+            .unwrap();
+        assert!(
+            registry
+                .state
+                .unbinding
+                .contains(&registry.state.workspaces[0].meta.id)
+        );
+
+        // A register for the same directory is refused at prepare.
+        let register_error = registry
+            .mutate(
+                "workspace.register",
+                WorkspaceMutationParams {
+                    command_id: "r1".into(),
+                    path: root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                },
+                |_id| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            register_error.contains("already prepared"),
+            "{register_error}"
+        );
+        // The mark survived the refused register.
+        assert!(
+            registry
+                .state
+                .unbinding
+                .contains(&registry.state.workspaces[0].meta.id)
+        );
+
+        // The unregister commits and clears its own mark.
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "u1".into(),
+                    path: root_path.clone(),
+                    phase: WorkspaceMutationPhase::Commit,
+                },
+                |_id| Ok(0),
+            )
+            .unwrap();
+        assert!(registry.state.unbinding.is_empty());
     }
 
     #[test]

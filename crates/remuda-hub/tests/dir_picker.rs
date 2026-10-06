@@ -48,15 +48,25 @@ impl NodeTransport for FakeNode {
         Box::pin(async move {
             self.calls.lock().unwrap().push(method.clone());
             let reply = match method.as_str() {
-                "host.dirs.list" => json!({
-                    "path": params.get("path").and_then(Value::as_str).unwrap_or("/home/remuda"),
-                    "parent": null,
-                    "home": "/home/remuda",
-                    "roots": ["/home/remuda", "/srv"],
-                    "workspaces": [],
-                    "dirs": [{ "name": "projects" }, { "name": "tools" }],
-                    "truncated": false,
-                }),
+                "host.dirs.list" => {
+                    // The Node answers with the authoritative canonical path
+                    // (it resolves symlinks and odd names on its own
+                    // filesystem): anything under /srv is the one registered
+                    // root; everything else echoes the requested path.
+                    let requested = params.get("path").and_then(Value::as_str);
+                    let canonical = requested
+                        .filter(|path| path.starts_with("/srv"))
+                        .unwrap_or("/home/remuda");
+                    json!({
+                        "path": canonical,
+                        "parent": null,
+                        "home": "/home/remuda",
+                        "roots": ["/home/remuda", "/srv"],
+                        "workspaces": [],
+                        "dirs": [{ "name": "projects" }, { "name": "tools" }],
+                        "truncated": false,
+                    })
+                }
                 "workspace.list" => json!({
                     "workspaceRevision": 1,
                     "workspaces": [{ "workspaceId": WORKSPACE, "root": ROOT }],
@@ -495,6 +505,49 @@ async fn a_failed_hub_row_does_not_override_a_live_node_session() -> Result<()> 
         "live Node session must win over a failed-looking Hub row: {body}"
     );
     assert!(body.contains("1 live session(s)"), "{body}");
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn task_only_alias_and_trailing_space_paths_still_hit_the_task_guard() -> Result<()> {
+    // Round 3 item 8: no instance rows, only an active task binding. The
+    // DELETE uses (1) a lexical alias and (2) a trailing-space name that the
+    // lexical pass cannot equate but the Node's authoritative browse
+    // resolves to the registered root. Both must be refused 409 before the
+    // Node is ever sent an unregister command.
+    let fixture = fixture().await?;
+    let _ = json_request(
+        fixture.hub.addr,
+        "GET",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        None,
+    )
+    .await?;
+    fixture
+        .hub
+        .test_insert_bound_task("tsk_dirbind", "prj_a", &fixture.host, WORKSPACE, "running")
+        .await?;
+
+    for alias in ["/srv/./remuda-e2e", &format!("{ROOT} ")] {
+        let calls_before = fixture.node.recorded().len();
+        let (status, body) = json_request(
+            fixture.hub.addr,
+            "DELETE",
+            &format!("/v1/hosts/{}/workspaces", fixture.host),
+            &[("Cookie", &fixture.cookie)],
+            Some(&json!({"path": alias}).to_string()),
+        )
+        .await?;
+        assert_eq!(status, 409, "alias {alias:?} must be refused: {body}");
+        assert!(body.contains("active task(s)"), "{body}");
+        assert_eq!(
+            fixture.node.recorded().len(),
+            calls_before,
+            "the alias refusal must never reach the Node for {alias:?}"
+        );
+    }
     fixture.hub.shutdown().await;
     Ok(())
 }

@@ -614,6 +614,55 @@ impl RunningHub {
         Ok(())
     }
 
+    /// Test-only seam: insert a running task bound to a workspace, so the
+    /// unregister occupancy guard's task branch can be exercised without the
+    /// full create/lease flow.
+    #[doc(hidden)]
+    pub async fn test_insert_bound_task(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        host_id: &str,
+        workspace_id: &str,
+        state: &str,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let (task_id, project_id, host_id, workspace_id, state) = (
+            task_id.to_owned(),
+            project_id.to_owned(),
+            host_id.to_owned(),
+            workspace_id.to_owned(),
+            state.to_owned(),
+        );
+        store
+            .run_named("test_insert_bound_task", move |conn| {
+                conn.execute(
+                    "INSERT INTO tasks (id, project_id, title, state, doc_json, created_at, updated_at)
+                     VALUES (?1, ?2, 'bound', ?3, ?4, '2026-10-05T00:00:00Z', '2026-10-05T00:00:00Z')",
+                    rusqlite::params![
+                        task_id,
+                        project_id,
+                        state,
+                        serde_json::json!({
+                            "workspaceBinding": {
+                                "hostId": host_id,
+                                "workspaceId": workspace_id,
+                                "mode": "reuse"
+                            }
+                        })
+                        .to_string()
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
     /// Mint a single-use Node enroll token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/hosts/enroll-token`, used by

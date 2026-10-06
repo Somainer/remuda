@@ -19,16 +19,77 @@ use tokio::sync::Mutex as AsyncMutex;
 /// directory cannot both pass the check before either commits (round 2
 /// item 6). The Node additionally blocks new sessions on a prepared
 /// workspace, closing the check→unbind window end to end.
-fn unbind_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>> {
-    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
-        OnceLock::new();
+fn unbind_locks() -> &'static std::sync::Mutex<HashMap<String, UnbindLock>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, UnbindLock>>> = OnceLock::new();
     LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Per-`(host, workspace)` unbind lock plus a settled epoch for pruning
+/// idle entries (round 3 item 13). The map entry is removed once its
+/// operation has settled AND nobody is queued: a later caller lazily
+/// recreates it.
+struct UnbindLock {
+    mutex: Arc<AsyncMutex<()>>,
+    /// Whether the operation using this entry has fully settled. Pruning
+    /// must skip an entry whose guard is still held even after settle.
+    settled: std::sync::atomic::AtomicBool,
+}
+
+/// Get or create the per-workspace lock, opportunistically pruning entries
+/// whose lock is uncontended and marked settled. `settled=false` marks the
+/// entry as busy until `mark_settled` after the operation completes; waiters
+/// copying the Arc keep it alive until they acquire.
 fn unbind_lock(host_id: &str, workspace_id: &str) -> Arc<AsyncMutex<()>> {
     let key = format!("{host_id}\u{1f}{workspace_id}");
     let mut map = unbind_locks().lock().unwrap();
-    map.entry(key).or_default().clone()
+    // Opportunistic prune: remove finished, uncontended entries so the map
+    // does not grow without bound. try_lock succeeds on a settled entry with
+    // no waiter; the guard is released immediately, so an arriving peer that
+    // raced the prune simply recreates a fresh lock below.
+    map.retain(|_key, lock| {
+        if !lock.settled.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        match lock.mutex.try_lock() {
+            Ok(guard) => {
+                drop(guard);
+                false
+            }
+            Err(_) => true,
+        }
+    });
+    let lock = map.entry(key).or_insert_with(|| UnbindLock {
+        mutex: Arc::new(AsyncMutex::new(())),
+        settled: std::sync::atomic::AtomicBool::new(false),
+    });
+    lock.settled
+        .store(false, std::sync::atomic::Ordering::Release);
+    lock.mutex.clone()
+}
+
+/// Mark one unbind/admission operation settled, making its lock prunable
+/// once no guard is held. Called after prepare→settle (or after the binding
+/// txn for a task admission).
+fn mark_lock_settled(host_id: &str, workspace_id: &str) {
+    let key = format!("{host_id}\u{1f}{workspace_id}");
+    let map = unbind_locks().lock().unwrap();
+    if let Some(lock) = map.get(&key) {
+        lock.settled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Hold the per-workspace unbind serialization lock for one binding
+/// admission (c-dirpicker round 3 item 6). Task creation binds a workspace
+/// under the same lock the DELETE/unregister holds through prepare→settle,
+/// so a task binding cannot be published in the check→unbind window; the
+/// occupancy query inside the DELETE then cannot miss it. The held guard
+/// also keeps idle mutex entries reachable while awaited.
+pub(crate) async fn hold_admission_lock(
+    host_id: &str,
+    workspace_id: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    unbind_lock(host_id, workspace_id).lock_owned().await
 }
 
 /// Stable substrings the Node's unregister prepare emits for occupancy/race
@@ -265,16 +326,20 @@ pub(crate) fn count_workspace_users(
 
 /// Map an absolute root path to the workspace id in the host's last observed
 /// snapshot, so the path-bodied DELETE route can run the usage guard.
+///
+/// Round 3 item 8: a lexical normalization only handles `.`/`..` aliases;
+/// it cannot resolve a symlink or prove that a name with trailing spaces is
+/// the same directory. The Node owns the filesystem, so for any request
+/// path that does not lexically match a canonical snapshot root we ask the
+/// Node to resolve it via a no-side-effects directory browse, then match on
+/// the canonical path the Node reports. Selected paths themselves are never
+/// modified; this is read-only identity resolution.
 async fn workspace_id_for_path(
     state: &AppState,
     host_id: &str,
     path: &str,
 ) -> Result<Option<String>, HubError> {
     let host = host_id.to_owned();
-    // Lexically normalize the request (no filesystem: the path lives on the
-    // Node) so a `/a/./b` or `/a/x/../b` alias of a canonical snapshot root
-    // cannot skip the occupancy guard. Snapshot roots are already canonical,
-    // and the Node canonicalizes the same alias again at prepare.
     let normalized = normalize_absolute(path);
     let (_, workspaces) = state
         .store
@@ -282,15 +347,40 @@ async fn workspace_id_for_path(
             load_snapshot(conn, &host)
         })
         .await?;
-    Ok(workspaces
-        .iter()
-        .find(|workspace| {
-            workspace["root"]
-                .as_str()
-                .map(|root| normalize_absolute(root) == normalized)
-                .unwrap_or(false)
-        })
-        .and_then(|workspace| workspace["workspaceId"].as_str().map(str::to_owned)))
+    let lexical_match = normalized.as_ref().and_then(|normalized| {
+        workspaces
+            .iter()
+            .find(|workspace| {
+                workspace["root"]
+                    .as_str()
+                    .and_then(normalize_absolute)
+                    .as_deref()
+                    == Some(normalized.as_str())
+            })
+            .and_then(|workspace| workspace["workspaceId"].as_str().map(str::to_owned))
+    });
+    if lexical_match.is_some() {
+        return Ok(lexical_match);
+    }
+    // Ask the Node for the authoritative canonical identity of this path. A
+    // symlink alias (or any name the lexical pass could not equate) resolves
+    // to the same canonical root the Node registered; an unreadable or
+    // out-of-policy path returns 400 and the DELETE proceeds without a
+    // Hub-side workspace id to the Node's own prepare rejection.
+    if state.nodes.kind_of(host_id).await.is_some() {
+        let browse =
+            crate::http::call_node(state, host_id, "host.dirs.list", json!({"path": path})).await;
+        if let Ok(answer) = browse
+            && let Some(canonical) = answer.get("path").and_then(Value::as_str)
+        {
+            let found = workspaces
+                .iter()
+                .find(|workspace| workspace["root"].as_str() == Some(canonical))
+                .and_then(|workspace| workspace["workspaceId"].as_str().map(str::to_owned));
+            return Ok(found);
+        }
+    }
+    Ok(None)
 }
 
 /// Lexically normalize an absolute path the way the Node's `canonicalize`
@@ -426,9 +516,12 @@ async fn mutate(
     require_phase(&settled, &command.command_id, "settled")?;
     let workspace_id = settled.get("workspaceId").cloned();
     observe_snapshot(state, &id, settled, Some(command.command_id)).await?;
-    let mut response = snapshot_view(&state.store, id).await?;
-    if let Some(workspace_id) = workspace_id {
-        response["workspaceId"] = workspace_id;
+    let mut response = snapshot_view(&state.store, id.clone()).await?;
+    if let Some(workspace_id) = workspace_id.and_then(|value| value.as_str().map(str::to_owned)) {
+        // The operation is fully settled; the per-workspace lock can be
+        // pruned once this guard drops.
+        mark_lock_settled(&id, &workspace_id);
+        response["workspaceId"] = json!(workspace_id);
     }
     Ok(Json(response))
 }
@@ -593,6 +686,36 @@ pub fn load_snapshot(conn: &Connection, id: &str) -> Result<(i64, Vec<Value>), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idle_settled_unbind_locks_are_pruned_busy_ones_kept() {
+        // Round 3 item 13: after settle an uncontended entry disappears on
+        // the next acquire; an unsettled entry always stays; a settled entry
+        // with a held guard stays until the guard drops.
+        let _a = hold_admission_lock("hst-prune", "wsp-a").await;
+        // A mere holder without settle is not pruned by another acquire.
+        let _b = hold_admission_lock("hst-prune", "wsp-b").await;
+        mark_lock_settled("hst-prune", "wsp-b");
+        // Acquiring an unrelated lock triggers opportunistic pruning; wsp-b
+        // is settled but its guard `_b` is still held, so it survives.
+        let _c = unbind_lock("hst-prune", "wsp-c");
+        {
+            let map = unbind_locks().lock().unwrap();
+            assert!(map.contains_key("hst-prune\u{1f}wsp-a"));
+            assert!(map.contains_key("hst-prune\u{1f}wsp-b"));
+            assert!(map.contains_key("hst-prune\u{1f}wsp-c"));
+        }
+        drop(_b);
+        // Now wsp-b is settled AND uncontended; the next acquire prunes it.
+        let _d = unbind_lock("hst-prune", "wsp-d");
+        {
+            let map = unbind_locks().lock().unwrap();
+            assert!(!map.contains_key("hst-prune\u{1f}wsp-b"));
+            assert!(map.contains_key("hst-prune\u{1f}wsp-a"));
+            assert!(map.contains_key("hst-prune\u{1f}wsp-c"));
+            assert!(map.contains_key("hst-prune\u{1f}wsp-d"));
+        }
+    }
 
     /// Minimal tables carrying only the columns the usage guard reads.
     fn seeded_conn() -> Connection {

@@ -28,7 +28,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 fn run_turn(envs: Vec<(String, String)>) -> FakeClaudeProcess {
     let mut opts = SpawnOptions::bundled(ScriptKind::Ok);
     opts.extra_envs = envs;
-    let mut child = spawn_fake_claude(opts).expect("spawn fake-claude");
+    let child = spawn_fake_claude(opts).expect("spawn fake-claude");
     child
         .recv_until(TIMEOUT, |v| is_system_subtype(v, "init"))
         .expect("system/init");
@@ -227,7 +227,7 @@ fn resume_of_a_fifo_transcript_fails_without_blocking() {
     )];
 
     let started = Instant::now();
-    let mut child = spawn_fake_claude(opts).expect("spawn fake-claude");
+    let child = spawn_fake_claude(opts).expect("spawn fake-claude");
     let init = child.recv_until(Duration::from_secs(3), |v| is_system_subtype(v, "init"));
     assert!(
         init.is_err(),

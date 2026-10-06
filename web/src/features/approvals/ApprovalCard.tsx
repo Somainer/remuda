@@ -15,6 +15,7 @@ import {
 } from "./approvalRows";
 import { QuestionForm } from "./QuestionForm";
 import { ElicitationCard } from "./ElicitationCard";
+import { InteractionDeadline } from "./InteractionDeadline";
 import { PtyQuestionAnswers } from "../../components/PtyQuestionAnswers";
 import css from "./decision.module.css";
 
@@ -278,6 +279,8 @@ export const DecisionCard = memo(function DecisionCard({
           {submitError}
         </p>
       ) : null}
+
+      {review ? <InteractionDeadline interaction={item} /> : null}
 
       {!compactQuestion && !answering && review && review.allowFeedback ? (
         <textarea

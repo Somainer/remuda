@@ -1305,6 +1305,12 @@ class HubStore {
     this.connectionStateOverride = state;
   }
 
+  /** Test-only: replace slices and emit, so stores subscribing to hubStore
+   * (e.g. the question-alert watcher) can be driven without a live Hub. */
+  setSlicesForTest(slices: Partial<HubState>): void {
+    this.emit(slices);
+  }
+
   /** Test-only: drive the pagehide/pageshow lifecycle (BFCache, iOS). */
   async pageShowForTest(persisted: boolean): Promise<void> {
     this.onPageHide();

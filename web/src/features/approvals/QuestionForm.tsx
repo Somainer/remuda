@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { Interaction, InteractionAnswer, QuestionField } from "../../types/interaction";
 import { composing } from "../../lib/viewport";
+import { InteractionDeadline } from "./InteractionDeadline";
 import css from "./decision.module.css";
 
 type FieldAnswer = { optionIds: string[]; text: string | null };
@@ -244,6 +245,7 @@ export function QuestionForm({
         </button>
       </div>
       <div className={css.approvalHint}>提交一次 InteractionAnswer · 多设备以第一次为准</div>
+      <InteractionDeadline interaction={interaction} />
     </section>
   );
 }

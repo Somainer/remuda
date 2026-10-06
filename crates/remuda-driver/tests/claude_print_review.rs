@@ -66,6 +66,7 @@ fn driver_for(
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&launch).unwrap();
     std::fs::create_dir_all(&home).unwrap();
+    remuda_testing::sandbox::TempHome::adopt(tmp.path()).unwrap();
     let cwd = tmp.path().canonicalize().unwrap();
     let mut extra = BTreeMap::new();
     extra.insert(
@@ -366,6 +367,7 @@ async fn bot_dont_ask_is_rejected_at_start() {
     options.origin = InputOrigin::Bot;
     std::fs::create_dir_all(&options.launch_dir).unwrap();
     std::fs::create_dir_all(&options.native_home).unwrap();
+    remuda_testing::sandbox::TempHome::adopt(tmp.path()).unwrap();
     spec.cwd = tmp
         .path()
         .canonicalize()

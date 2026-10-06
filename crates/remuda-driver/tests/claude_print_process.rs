@@ -72,6 +72,8 @@ fn driver_for(
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&launch).unwrap();
     std::fs::create_dir_all(&home).unwrap();
+    // Round 3: the fake persists only inside an allocated (sentinel) root.
+    remuda_testing::sandbox::TempHome::adopt(tmp.path()).unwrap();
     let mut extra = BTreeMap::new();
     extra.insert(
         "FAKE_CLAUDE_SCRIPT".into(),
@@ -415,6 +417,7 @@ async fn bot_bypass_is_rejected() {
     options.origin = InputOrigin::Bot;
     std::fs::create_dir_all(&options.launch_dir).unwrap();
     std::fs::create_dir_all(&options.native_home).unwrap();
+    remuda_testing::sandbox::TempHome::adopt(tmp.path()).unwrap();
     let driver = ClaudePrintDriver::new(options);
     let mut spec = load_spec();
     spec.cwd = tmp

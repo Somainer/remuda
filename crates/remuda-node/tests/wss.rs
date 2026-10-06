@@ -657,6 +657,7 @@ async fn wss_create_is_accepted_before_ten_second_fake_herdr_start() {
     .expect("fake herdr");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
+    remuda_testing::sandbox::TempHome::adopt(dir.path()).expect("adopt wss herdr root");
     let mut node_config = DevServerConfig::loopback(0);
     node_config.workspace_root = workspace;
     node_config.workspace_roots = Some(remuda_testing::test_workspace_roots!());
@@ -815,6 +816,7 @@ async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
     let dir = tempfile::tempdir().expect("tmp");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
+    remuda_testing::sandbox::TempHome::adopt(dir.path()).expect("adopt wss root");
 
     let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub")))
         .await
@@ -1412,6 +1414,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
     // configuration, skills, or macOS permissions.
     let claude_config = dir.path().join("claude-config");
     std::fs::create_dir_all(&claude_config).unwrap();
+    remuda_testing::sandbox::TempHome::adopt(dir.path()).expect("adopt approval wss root");
     let config = DevServerConfig::loopback(0)
         .with_workspace_root(workspace)
         .with_workspace_roots(remuda_testing::test_workspace_roots!());

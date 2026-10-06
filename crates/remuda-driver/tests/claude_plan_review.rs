@@ -84,6 +84,8 @@ fn replay_driver(fixture_name: &str) -> (TempDir, ClaudePrintDriver, InstanceSpe
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&launch).unwrap();
     std::fs::create_dir_all(&home).unwrap();
+    // Round 3: the fake persists only inside an allocated (sentinel) root.
+    remuda_testing::sandbox::TempHome::adopt(tmp.path()).unwrap();
     let mut extra = BTreeMap::new();
     extra.insert(
         "FAKE_CLAUDE_FIXTURE".into(),

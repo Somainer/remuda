@@ -68,7 +68,9 @@ fn driver_for(kind: ScriptKind) -> (tempfile::TempDir, ClaudeSdkDriver, Instance
     driver_with_env(kind, BTreeMap::new())
 }
 
-/// [`driver_for`] plus extra child env (`FAKE_CLAUDE_*` knobs).
+/// [`driver_for`] plus extra child env (`FAKE_CLAUDE_*` knobs). The fixture
+/// root is exposed so env-targeted files (argv/pid records) can live inside
+/// the allocated fake home.
 fn driver_with_env(
     kind: ScriptKind,
     env: BTreeMap<String, String>,
@@ -78,12 +80,27 @@ fn driver_with_env(
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&launch).unwrap();
     std::fs::create_dir_all(&home).unwrap();
+    remuda_testing::sandbox::TempHome::adopt(tmp.path()).unwrap();
     let mut extra = BTreeMap::new();
     extra.insert(
         "FAKE_CLAUDE_SCRIPT".into(),
         script_path(kind).to_string_lossy().into_owned(),
     );
     extra.extend(env);
+    // Rewrite argv/pid record paths into the allocated fixture root: the fake
+    // round-3 sandbox refuses such files outside an allocated root.
+    for key in ["FAKE_CLAUDE_ARGV_FILE", "FAKE_CLAUDE_GRANDCHILD_PID_FILE"] {
+        if let Some(value) = extra.get(key) {
+            let name = std::path::Path::new(value)
+                .file_name()
+                .map(std::ffi::OsString::from)
+                .unwrap_or_else(|| std::ffi::OsString::from(format!("{key}.out")));
+            extra.insert(
+                key.to_owned(),
+                tmp.path().join(name).to_string_lossy().into_owned(),
+            );
+        }
+    }
     let mut options =
         ClaudeSdkOptions::new(profile(), launch, home, BinarySource::Pinned(pin_fake()));
     options.origin = InputOrigin::Human;
@@ -184,20 +201,18 @@ fn turn_done_count(obs: &[Observation]) -> usize {
 /// `-p` ever comes back (§2.1).
 #[tokio::test]
 async fn the_child_is_launched_without_dash_p() {
-    let recorded = std::env::temp_dir().join(format!(
-        "remuda-sdk-argv-{}-{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
     let mut env = BTreeMap::new();
+    // The driver fixture rewrites this basename into its allocated root.
+    let recorded_name = "remuda-sdk-argv.txt";
     env.insert(
         "FAKE_CLAUDE_ARGV_FILE".into(),
-        recorded.to_string_lossy().into_owned(),
+        std::path::Path::new("/var/empty")
+            .join(recorded_name)
+            .to_string_lossy()
+            .into_owned(),
     );
-    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let (tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let recorded = tmp.path().join(recorded_name);
     let _handle = driver.start(spec).await.expect("start");
 
     let argv: Vec<String> = std::fs::read_to_string(&recorded)
@@ -546,22 +561,20 @@ async fn a_cooperative_child_exits_on_stdin_eof_with_one_exit_lifecycle() {
 #[cfg(unix)]
 #[tokio::test]
 async fn close_kills_a_child_that_ignores_both_eof_and_sigterm() {
-    let grandchild_pid_file = std::env::temp_dir().join(format!(
-        "remuda-sdk-grandchild-{}-{}.pid",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let grandchild_pid_name = "remuda-sdk-grandchild.pid";
     let mut env = BTreeMap::new();
     env.insert("FAKE_CLAUDE_IGNORE_EOF".into(), "1".into());
     env.insert("FAKE_CLAUDE_IGNORE_SIGTERM".into(), "1".into());
     env.insert(
         "FAKE_CLAUDE_GRANDCHILD_PID_FILE".into(),
-        grandchild_pid_file.to_string_lossy().into_owned(),
+        // The driver fixture rewrites this basename into its allocated root.
+        std::path::Path::new("/var/empty")
+            .join(grandchild_pid_name)
+            .to_string_lossy()
+            .into_owned(),
     );
-    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let (tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let grandchild_pid_file = tmp.path().join(grandchild_pid_name);
     let handle = driver.start(spec).await.expect("start");
     let pid = handle
         .ack()

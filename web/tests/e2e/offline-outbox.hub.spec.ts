@@ -529,7 +529,9 @@ test("an RPC buffered behind an append ack is queued AND answered, with correlat
     for (let i = 0; i < 25; i += 1) {
       if (await readMarker(replyName)) break;
       const res = await api.get("/v1/interactions").catch(() => null);
-      if (res?.ok) polled200 += 1;
+      // NOTE: Playwright's APIResponse.ok is a METHOD, not a boolean — call
+      // status() explicitly so an HTTP 500 is not mistaken for success.
+      if (res?.status() === 200) polled200 += 1;
       await new Promise((r) => setTimeout(r, 200));
     }
   })();

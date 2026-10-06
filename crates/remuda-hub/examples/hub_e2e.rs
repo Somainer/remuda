@@ -2841,10 +2841,20 @@ async fn ensure_intervening_rpc(
             .with_context(|| format!("write ack queue marker {}", queue_marker.display()))
     };
 
-    // 1. Already buffered ahead of the wait.
-    let mut found: Option<(Value, String)> = queue
+    // 1. Already buffered ahead of the wait; remember its QUEUE POSITION so the
+    // discard negative control can remove THAT entry (removing only a clone
+    // would leave the original queued, answered, and wrongly reply-marked).
+    let mut found: Option<(Value, String, Option<usize>)> = queue
         .iter()
-        .find_map(|f| interaction_list_id(f).map(|id| (id, f.clone())));
+        .position(|f| interaction_list_id(f).is_some())
+        .map(|pos| {
+            let frame = &queue[pos];
+            (
+                interaction_list_id(frame).expect("just matched"),
+                frame.clone(),
+                Some(pos),
+            )
+        });
 
     let deadline = Instant::now() + ACK_BARRIER_TIMEOUT;
     while found.is_none() {
@@ -2858,8 +2868,10 @@ async fn ensure_intervening_rpc(
         match tokio::time::timeout(remaining, ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
                 let text = text.to_string();
-                if let Some(id) = interaction_list_id(&text) {
-                    found = Some((id, text));
+                if interaction_list_id(&text).is_some() {
+                    // A frame just read: not in the queue yet (position None).
+                    let id = interaction_list_id(&text).expect("matched above");
+                    found = Some((id, text, None));
                 } else if queue.len() < PENDING_FRAME_QUEUE_CAP {
                     // A journal ack or other RPC: stash for the dispatch loop.
                     queue.push_back(text);
@@ -2877,16 +2889,27 @@ async fn ensure_intervening_rpc(
         }
     }
 
-    let (rpc_id, frame) = found.expect("an interaction.list was observed");
+    let (rpc_id, frame, queued_pos) = found.expect("an interaction.list was observed");
     record(&rpc_id)?;
     *tracked.lock().await = Some(rpc_id);
     if ack_discard_enabled() {
-        // NEGATIVE CONTROL: record + marker written, frame deliberately
-        // dropped — no reply marker can ever appear for this id.
-        tracing::warn!("HUB_E2E_ACK_DISCARD=1: dropping queued interaction.list behind {want}");
-    } else if !queue.iter().any(|f| f == &frame) && queue.len() < PENDING_FRAME_QUEUE_CAP {
+        // NEGATIVE CONTROL: record + marker written, then REMOVE the frame for
+        // real. If it was already queued, drop the entry at its captured
+        // position; otherwise simply do not enqueue the freshly read frame.
+        if let Some(pos) = queued_pos {
+            if pos < queue.len() && queue[pos] == frame {
+                queue.remove(pos);
+            } else if let Some(eq) = queue.iter().position(|f| f == &frame) {
+                queue.remove(eq);
+            }
+        }
+        tracing::warn!("HUB_E2E_ACK_DISCARD=1: dropped queued interaction.list behind {want}");
+    } else if queued_pos.is_none() && queue.len() < PENDING_FRAME_QUEUE_CAP {
+        // Normal mode, freshly read frame: enqueue it, preserving order.
         queue.push_back(frame);
     }
+    // Normal mode with queued_pos = Some: the frame is already in the queue at
+    // its original position; leave it there (do not move it to the back).
     Ok(())
 }
 /// Journal the entity lifecycle a terminal-answered question settles with:

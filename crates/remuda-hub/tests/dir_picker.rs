@@ -17,25 +17,56 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const WORKSPACE: &str = "wsp_dirpicker";
+// Real branded-id spellings (project member validation parses them).
+const WORKSPACE: &str = "wsp_01993ab0-0000-7000-8000-0000000000a1";
+const WORKSPACE2: &str = "wsp_01993ab0-0000-7000-8000-0000000000a2";
 const ROOT: &str = "/srv/remuda-e2e";
 
-/// Scripted Node: answers the directory browser and the two-phase workspace
-/// mutation, recording every method the Hub forwarded.
+/// Scripted Node: answers the directory browser, the read-only
+/// `workspace.resolve` RPC and the two-phase workspace mutation, recording
+/// every method the Hub forwarded.
 ///
-/// Round 5 item 3: the browser answers from a REAL temp filesystem —
-/// `canonicalize` resolves an actual symlink and a real directory whose name
-/// ends in a space — instead of fabricated substring/trim matching.
+/// Round 6 item 1: identity for a removal comes from `workspace.resolve`,
+/// which resolves with unregister's REALPATH semantics. `host.dirs.list`
+/// stays a BROWSE view: it collapses `..` LEXICALLY before its no-follow
+/// walk, so `/allowed/link/../proj` names a different real directory than
+/// resolve does. This scripted node emulates both production outcomes on a
+/// REAL temp filesystem (actual symlink, actual trailing-space directory).
 struct FakeNode {
     calls: Mutex<Vec<String>>,
-    /// The real registered root, canonicalized at fixture setup.
-    real_root: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// The real registered roots, canonicalized at fixture setup:
+    /// `root ` (a name ending in a space) and `other/proj`.
+    real_roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl FakeNode {
     fn recorded(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
+
+    fn real_roots(&self) -> Vec<std::path::PathBuf> {
+        self.real_roots.lock().unwrap().clone()
+    }
+}
+
+/// Lexical `..` collapse, mirroring the production directory browser's
+/// pre-walk normalization (dir_browser.rs `lexical_normalize`): no filesystem
+/// access, clamped at `/`.
+fn lexical_normalize(raw: &str) -> String {
+    if !raw.starts_with('/') {
+        return raw.to_owned();
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            name => stack.push(name),
+        }
+    }
+    format!("/{}", stack.join("/"))
 }
 
 impl NodeTransport for FakeNode {
@@ -55,60 +86,38 @@ impl NodeTransport for FakeNode {
             self.calls.lock().unwrap().push(method.clone());
             let reply = match method.as_str() {
                 "host.dirs.list" => {
-                    // REAL filesystem resolution (round 5 item 3): the Node's
-                    // no-follow walk would refuse a symlink component; here
-                    // we emulate the production outcome precisely — a
-                    // symlinked path is an error, every other real path is
-                    // canonicalized. The fixture's temp tree contains an
-                    // actual symlink and an actual trailing-space directory.
+                    // The BROWSE view. Empty selector starts at the first
+                    // registered root; any other selector is normalized
+                    // LEXICALLY (collapsing `..` without touching the disk)
+                    // and then canonicalized, exactly like the production
+                    // no-follow walk does. A lexical `..` therefore lands on
+                    // a different real directory than `workspace.resolve`.
                     let requested = params.get("path").and_then(Value::as_str).unwrap_or("");
-                    if requested.contains("link-to-e2e") {
-                        json!({"error": {"code": -32602, "message":
-                            "the browsed path is outside the directories this Node allows workspaces in, \
-                             or is not an accessible directory"}})
-                    } else if requested.is_empty() {
-                        // Default start: the pinned registered root.
-                        let root = self
-                            .real_root
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .unwrap_or_else(|| std::path::PathBuf::from(ROOT));
+                    let roots = self.real_roots();
+                    let first = roots
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| std::path::PathBuf::from(ROOT));
+                    if requested.is_empty() {
                         json!({
-                            "path": root.display().to_string(),
+                            "path": first.display().to_string(),
                             "parent": null,
-                            "home": root.display().to_string(),
-                            "roots": [root.display().to_string()],
+                            "home": first.display().to_string(),
+                            "roots": roots.iter().map(|p| json!(p.display().to_string())).collect::<Vec<_>>(),
                             "workspaces": [],
                             "dirs": [{ "name": "projects" }],
                             "truncated": false
                         })
                     } else {
-                        let real_root = self
-                            .real_root
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .unwrap_or_else(|| std::path::PathBuf::from(ROOT));
-                        // Resolve exactly like the production no-follow walk
-                        // for a non-symlink path: canonicalize the real fs.
-                        match std::fs::canonicalize(requested) {
-                            Ok(canonical) if canonical == real_root => json!({
+                        let lexical = lexical_normalize(requested);
+                        match std::fs::canonicalize(&lexical) {
+                            Ok(canonical) => json!({
                                 "path": canonical.display().to_string(),
                                 "parent": null,
-                                "home": real_root.display().to_string(),
-                                "roots": [real_root.display().to_string()],
+                                "home": first.display().to_string(),
+                                "roots": roots.iter().map(|p| json!(p.display().to_string())).collect::<Vec<_>>(),
                                 "workspaces": [],
                                 "dirs": [{ "name": "projects" }],
-                                "truncated": false
-                            }),
-                            Ok(other) => json!({
-                                "path": other.display().to_string(),
-                                "parent": null,
-                                "home": real_root.display().to_string(),
-                                "roots": [real_root.display().to_string()],
-                                "workspaces": [],
-                                "dirs": [],
                                 "truncated": false
                             }),
                             Err(_) => json!({"error": {"code": -32602, "message":
@@ -117,32 +126,73 @@ impl NodeTransport for FakeNode {
                         }
                     }
                 }
+                "workspace.resolve" => {
+                    // The REMOVAL identity view: REALPATH semantics (the same
+                    // canonicalize the production unregister prepare uses),
+                    // matched against the registered roots. A lexical-`..`
+                    // alias through a symlink resolves to the symlink target's
+                    // real sibling, which is the point of round 6 item 1.
+                    let requested = params.get("path").and_then(Value::as_str).unwrap_or("");
+                    let resolved = std::fs::canonicalize(requested).ok().and_then(|canonical| {
+                        self.real_roots()
+                            .iter()
+                            .enumerate()
+                            .find(|(_, root)| *root == &canonical)
+                            .map(|(index, root)| (index, root.clone()))
+                    });
+                    match resolved {
+                        Some((0, root)) => json!({
+                            "workspaceId": WORKSPACE,
+                            "canonicalRoot": root.display().to_string(),
+                        }),
+                        Some((_, root)) => json!({
+                            "workspaceId": WORKSPACE2,
+                            "canonicalRoot": root.display().to_string(),
+                        }),
+                        None => json!({"error": {"code": -32602, "message":
+                            format!("workspace {requested} is not registered")}}),
+                    }
+                }
                 "workspace.list" => {
-                    // Report the REAL canonical root (which may be
+                    // Report the REAL canonical roots (which may be
                     // /private/tmp/… on macOS).
-                    let root = self
-                        .real_root
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| ROOT.to_owned());
+                    let roots = self.real_roots();
+                    let workspaces = roots
+                        .iter()
+                        .enumerate()
+                        .map(|(index, root)| {
+                            json!({
+                                "workspaceId": if index == 0 { WORKSPACE } else { WORKSPACE2 },
+                                "hostId": "hst_dirpicker",
+                                "root": root.display().to_string(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
                     json!({
                         "workspaceRevision": 1,
-                        "workspaces": [{ "workspaceId": WORKSPACE, "hostId": "hst_dirpicker", "root": root }],
+                        "workspaces": workspaces,
                     })
                 }
                 "workspace.register" | "workspace.unregister" => {
                     let command_id = params["commandId"].clone();
                     let phase = params["phase"].as_str().unwrap();
+                    let workspace_id = params
+                        .get("workspaceId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(WORKSPACE);
                     json!({
                         "workspaceRevision": if phase == "commit" { 2 } else { 1 },
                         "workspaces": [],
-                        "workspaceId": WORKSPACE,
+                        "workspaceId": workspace_id,
                         "commandId": command_id,
                         "phase": if phase == "prepare" { "prepared" } else { "settled" },
                     })
                 }
+                "worktree.lease" => json!({
+                    "mode": "reuse",
+                    "dirKey": ".",
+                    "name": ".",
+                }),
                 other => {
                     json!({"error": {"code": -32601, "message": format!("unexpected {other}")}})
                 }
@@ -247,11 +297,18 @@ struct Fixture {
     cookie: String,
     node: Arc<FakeNode>,
     host: String,
-    /// Real temp tree: the registered root (whose name ends in a space) and
-    /// an actual symlink to it. Leaked on purpose so real-fs resolution works
-    /// for the whole test.
+    /// Registered root whose name ends in a real trailing space.
     real_root: std::path::PathBuf,
+    /// A real symlink to `real_root`.
     symlink_path: std::path::PathBuf,
+    /// The codex/grok tree: a second registered root reached only by
+    /// realpath through a symlink plus `..`.
+    alias_root: std::path::PathBuf,
+    alias_other: std::path::PathBuf,
+    /// `<tmp>/allowed/link` → `<tmp>/other`; lexical `..` lands on
+    /// `allowed/proj`, realpath lands on `other/proj` (`alias_root`).
+    alias_link: std::path::PathBuf,
+    alias_dotdot: std::path::PathBuf,
 }
 
 async fn fixture() -> Result<Fixture> {
@@ -263,19 +320,38 @@ async fn fixture() -> Result<Fixture> {
     let host = HostId::new().as_id().as_str().to_owned();
     hub.test_insert_host(&host).await?;
 
-    // Real filesystem (round 5 item 3): the registered workspace root is a
-    // REAL directory whose NAME ends in a space (a legal filename byte the
-    // Hub must not trim), plus an actual symlink pointing at it that the
-    // Node's no-follow browse must refuse.
+    // (1) A REAL directory whose NAME ends in a space (a legal filename byte
+    //     the Hub must not trim), plus an actual symlink to it.
     let real_root = dir.path().join("root ");
     std::fs::create_dir_all(&real_root)?;
     let symlink_path = dir.path().join("link-to-e2e");
     std::os::unix::fs::symlink(&real_root, &symlink_path)?;
     let real_root_canonical = std::fs::canonicalize(&real_root)?;
 
+    // (2) The codex/grok two-real-dirs tree (round 6 item 1):
+    //
+    //     allowed/proj       — real dir A (what a LEXICAL `..` collapse sees)
+    //     other/proj         — real dir B, the REGISTERED workspace
+    //     allowed/link       — real symlink → other/proj (B itself)
+    //
+    //     `allowed/link/../proj` realpaths to `/other/proj` (unregister's
+    //     semantics: resolve the symlink, then apply `..`) but lexically
+    //     normalizes to `/allowed/proj` (the browse view collapses `..` with
+    //     no filesystem access). Pointing the link at B (not at `other`) is
+    //     what makes the `..` land back inside B.
+    let alias_other = dir.path().join("other");
+    let alias_root = alias_other.join("proj");
+    let alias_allowed = dir.path().join("allowed");
+    std::fs::create_dir_all(&alias_root)?;
+    std::fs::create_dir_all(alias_allowed.join("proj"))?;
+    let alias_link = alias_allowed.join("link");
+    std::os::unix::fs::symlink(&alias_root, &alias_link)?;
+    let alias_dotdot = alias_allowed.join("link/../proj");
+    let alias_root = std::fs::canonicalize(alias_root)?;
+
     let node = Arc::new(FakeNode {
         calls: Mutex::new(Vec::new()),
-        real_root: std::sync::Mutex::new(Some(real_root_canonical.clone())),
+        real_roots: std::sync::Mutex::new(vec![real_root_canonical.clone(), alias_root.clone()]),
     });
     hub.test_set_node_transport(&host, node.clone()).await;
     // Keep the temp dir alive for the fixture's life.
@@ -287,6 +363,10 @@ async fn fixture() -> Result<Fixture> {
         host,
         real_root: real_root_canonical,
         symlink_path,
+        alias_root,
+        alias_other,
+        alias_link,
+        alias_dotdot,
     })
 }
 
@@ -600,13 +680,12 @@ async fn a_failed_hub_row_does_not_override_a_live_node_session() -> Result<()> 
 
 #[tokio::test]
 async fn symlink_alias_and_real_trailing_space_hit_the_task_guard_and_fail_closed() -> Result<()> {
-    // Round 4 item 3: no instance rows, only an active task binding.
-    //  * a real symlink alias cannot be resolved to the registered root by
-    //    the Node (no-follow browse refuses), so the DELETE fails closed with
-    //    400 — it must NOT skip the task guard and proceed to unregister;
-    //  * a registered directory whose name REALLY ends in a space is sent
-    //    verbatim; the Node's browse resolves it (trim_end in the fake, but
-    //    the Hub never trims), so the active task blocks it with 409.
+    // Round 6: removal identity comes from workspace.resolve, which follows
+    // realpath. A REAL symlink to the registered root therefore resolves to
+    // the registered workspace, and an active task on it blocks the DELETE
+    // with 409 before any unregister. A registered directory whose name
+    // REALLY ends in a space is sent verbatim and blocks the same way; its
+    // trimmed spelling resolves to nothing and fails closed with 400.
     let fixture = fixture().await?;
     let _ = json_request(
         fixture.hub.addr,
@@ -621,9 +700,8 @@ async fn symlink_alias_and_real_trailing_space_hit_the_task_guard_and_fail_close
         .test_insert_bound_task("tsk_dirbind4", "prj_a", &fixture.host, WORKSPACE, "running")
         .await?;
 
-    // (1) REAL symlink on disk: the Node's no-follow browse refuses it, so
-    //     the DELETE fails closed 400 with no unregister.
-    let calls_before = fixture.node.recorded().len();
+    // (1) REAL symlink on disk: resolve follows it to the registered root;
+    //     the active task on that exact workspace blocks removal.
     let (status, body) = json_request(
         fixture.hub.addr,
         "DELETE",
@@ -633,36 +711,28 @@ async fn symlink_alias_and_real_trailing_space_hit_the_task_guard_and_fail_close
     )
     .await?;
     assert_eq!(
-        status, 400,
-        "a real symlink the Node refuses to resolve must fail closed: {body}"
+        status, 409,
+        "a symlink resolving to the occupied workspace must hit the task guard: {body}"
     );
-    let unregister_calls = fixture
-        .node
-        .recorded()
-        .iter()
-        .filter(|method| method.as_str() == "workspace.unregister")
-        .count();
-    assert_eq!(
-        unregister_calls, 0,
-        "no unregister after a failed resolution"
+    assert!(body.contains("active task(s)"), "{body}");
+    assert!(
+        !fixture
+            .node
+            .recorded()
+            .iter()
+            .any(|method| method == "workspace.unregister"),
+        "no unregister for the blocked symlink: {:?}",
+        fixture.node.recorded()
     );
-    let _ = calls_before;
 
     // (2) The registered root is a REAL directory whose name ends in a
-    //     space. Sent verbatim, std::fs::canonicalize resolves it to the
-    //     exact snapshot root; the active task blocks it with 409 before any
-    //     unregister command.
+    //     space. Sent verbatim it matches the exact snapshot root; the active
+    //     task blocks it with 409 before any unregister command.
     let spaced_root = fixture.real_root.display().to_string();
     assert!(
         spaced_root.ends_with(' '),
         "fixture root must end in a space"
     );
-    let before = fixture
-        .node
-        .recorded()
-        .iter()
-        .filter(|m| m.as_str() == "workspace.unregister")
-        .count();
     let (status, body) = json_request(
         fixture.hub.addr,
         "DELETE",
@@ -676,345 +746,143 @@ async fn symlink_alias_and_real_trailing_space_hit_the_task_guard_and_fail_close
         "trailing-space registered root must be task-blocked: {body}"
     );
     assert!(body.contains("active task(s)"), "{body}");
-    let after = fixture
-        .node
-        .recorded()
-        .iter()
-        .filter(|m| m.as_str() == "workspace.unregister")
-        .count();
-    assert_eq!(
-        before, after,
+    assert!(
+        !fixture
+            .node
+            .recorded()
+            .iter()
+            .any(|method| method == "workspace.unregister"),
         "no unregister may be sent for the blocked path"
+    );
+
+    // (3) The same bytes WITHOUT the trailing space name a different (absent)
+    //     directory: resolve refuses, the DELETE fails closed 400 and no
+    //     unregister is sent. The Hub never trims.
+    let trimmed_root = spaced_root.trim_end();
+    let (status, body) = json_request(
+        fixture.hub.addr,
+        "DELETE",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        Some(&json!({"path": trimmed_root}).to_string()),
+    )
+    .await?;
+    assert_eq!(
+        status, 400,
+        "trimmed spelling must not match the spaced root: {body}"
+    );
+    assert!(
+        !fixture
+            .node
+            .recorded()
+            .iter()
+            .any(|method| method == "workspace.unregister"),
+        "no unregister after a failed resolution"
     );
 
     fixture.hub.shutdown().await;
     Ok(())
 }
 
-mod real_node {
-    use super::*;
-    use futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
-    async fn raw_http(
-        addr: SocketAddr,
-        method: &str,
-        path: &str,
-        cookie: Option<&str>,
-        body: Option<&str>,
-    ) -> Result<(u16, String)> {
-        let mut stream = TcpStream::connect(addr).await?;
-        let content_length = body.map(str::len).unwrap_or(0);
-        let mut head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {content_length}\r\n"
-        );
-        if body.is_some() {
-            head.push_str("Content-Type: application/json\r\n");
-        }
-        if let Some(cookie) = cookie {
-            head.push_str(&format!("Cookie: {cookie}\r\n"));
-        }
-        head.push_str("\r\n");
-        stream.write_all(head.as_bytes()).await?;
-        if let Some(body) = body {
-            stream.write_all(body.as_bytes()).await?;
-        }
-        let mut buf = Vec::new();
-        AsyncReadExt::read_to_end(&mut stream, &mut buf).await?;
-        let split = buf
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .context("header terminator")?;
-        let head_text = String::from_utf8_lossy(&buf[..split]).to_string();
-        let status = head_text
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
-        Ok((
-            status,
-            String::from_utf8_lossy(&buf[split + 4..]).to_string(),
-        ))
-    }
-
-    async fn login(addr: SocketAddr, bootstrap: &str) -> Result<String> {
-        let body = json!({"bootstrapToken": bootstrap, "deviceName": "realnode-phone"}).to_string();
-        let mut stream = TcpStream::connect(addr).await?;
-        stream
-            .write_all(
-                format!(
-                    "POST /v1/login HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
-                     Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .await?;
-        let mut buf = Vec::new();
-        AsyncReadExt::read_to_end(&mut stream, &mut buf).await?;
-        let split = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .context("headers")?;
-        let head = String::from_utf8_lossy(&buf[..split]).to_string();
-        assert!(head.contains(" 200 "), "{head}");
-        super::cookie_from(&head).context("set-cookie")
-    }
-
-    async fn enroll_token(addr: SocketAddr, cookie: &str) -> Result<String> {
-        let (status, rest) = raw_http(
-            addr,
-            "POST",
-            "/v1/hosts/enroll-token",
-            Some(cookie),
-            Some("{}"),
-        )
+#[tokio::test]
+async fn symlink_dotdot_alias_counts_the_realpath_workspace_not_the_lexical_one() -> Result<()> {
+    // Round 6 item 1, the exact codex/grok case: TWO real directories, a REAL
+    // symlink and `..`, an active task and NO session.
+    //
+    //   allowed/link/../proj
+    //     lexical normalization (browse) → allowed/proj   (unregistered dir A)
+    //     realpath          (unregister) → other/proj     (registered ws B)
+    //
+    // Identity MUST come from workspace.resolve (realpath): the active task
+    // bound to B blocks the DELETE with 409 and no `workspace.unregister`
+    // frame is ever sent. With the identity call reverted to host.dirs.list,
+    // the guard counts A, sees nothing, and settles an unregister of B — this
+    // test fails there (200 + an unregister call).
+    let fixture = fixture().await?;
+    // Observe the two-workspace snapshot like the page's GET would.
+    let (status, listing) = json_request(
+        fixture.hub.addr,
+        "GET",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{listing}");
+    fixture
+        .hub
+        .test_insert_bound_task("tsk_dotdot", "prj_b", &fixture.host, WORKSPACE2, "running")
         .await?;
-        anyhow::ensure!(status == 200, "enroll-token {status}");
-        let value: Value = serde_json::from_str(rest.trim())?;
-        value["token"]
-            .as_str()
-            .map(str::to_owned)
-            .context("enroll token")
-    }
 
-    /// Scripted node over a REAL websocket: announces a live workspace and
-    /// refuses unregister prepare while `live` is set (a real child process
-    /// the test owns keeps that claim honest).
-    async fn serve_live_node(
-        addr: SocketAddr,
-        enroll: String,
-        host_id: String,
-        live: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Result<()> {
-        let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
-        req.headers_mut()
-            .insert("Authorization", format!("Bearer {enroll}").parse()?);
-        let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
-        ws.send(Message::Text(
-            json!({
-                "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
-                "params": {
-                    "hostId": host_id, "nodeVersion": "0.1.0-realnode",
-                    "host": {
-                        "workspaceRevision": 1,
-                        "workspaces": [{ "workspaceId": WORKSPACE, "hostId": host_id, "root": ROOT }],
-                        "herdr": { "version": "0.9.0" }
-                    }
-                }
-            })
-            .to_string()
-            .into(),
-        ))
-        .await?;
-        // Wait for the hello result.
-        loop {
-            let Some(Ok(Message::Text(text))) = ws.next().await else {
-                continue;
-            };
-            let value: Value = serde_json::from_str(&text)?;
-            if value.get("id").and_then(Value::as_str) == Some("hello") {
-                anyhow::ensure!(value.get("result").is_some(), "hello rejected: {text}");
-                break;
-            }
-        }
-        while live.load(std::sync::atomic::Ordering::Relaxed) {
-            let frame = tokio::time::timeout(Duration::from_millis(200), ws.next()).await;
-            let Ok(Some(Ok(Message::Text(text)))) = frame else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            let Some(id) = value.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-            // JSON-RPC errors travel at the frame top level (the Hub's
-            // call_node reads response.error there).
-            let frame = match method {
-                "workspace.unregister" => json!({
-                    "error": {
-                        "code": -32602,
-                        "message": format!(
-                            "workspace {ROOT} is still used by 1 live session(s); \
-                             end them before removing the directory (session history is kept)"
-                        )
-                    }
-                }),
-                "workspace.list" => json!({
-                    "result": {
-                        "workspaceRevision": 1,
-                        "workspaces": [{ "workspaceId": WORKSPACE, "hostId": host_id, "root": ROOT }]
-                    }
-                }),
-                "host.dirs.list" => json!({
-                    "result": {
-                        "path": ROOT, "parent": null, "home": ROOT,
-                        "roots": [ROOT], "workspaces": [], "dirs": [], "truncated": false
-                    }
-                }),
-                other => json!({
-                    "error": {"code": -32601, "message": format!("unexpected {other}")}
-                }),
-            };
-            let response = if let Some(error) = frame.get("error") {
-                json!({"jsonrpc": "2.0", "id": id, "error": error})
-            } else {
-                json!({"jsonrpc": "2.0", "id": id, "result": frame.get("result")})
-            };
-            ws.send(Message::Text(response.to_string().into())).await?;
-        }
-        Ok(())
-    }
+    // First, demonstrate the two production views disagree on this path: the
+    // browse RPC lexically lands on dir A while resolve realpaths to B.
+    let (status, browse) = json_request(
+        fixture.hub.addr,
+        "GET",
+        &format!(
+            "/v1/hosts/{}/dirs?path={}",
+            fixture.host,
+            urlencoding(&fixture.alias_dotdot.display().to_string())
+        ),
+        &[("Cookie", &fixture.cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{browse}");
+    let browse: Value = serde_json::from_str(browse.trim())?;
+    let lexical_a =
+        std::fs::canonicalize(fixture.alias_other.parent().unwrap().join("allowed/proj"))
+            .unwrap()
+            .display()
+            .to_string();
+    assert_eq!(browse["path"].as_str(), Some(lexical_a.as_str()));
 
-    #[tokio::test]
-    async fn a_real_attached_node_refuses_unregister_while_its_process_is_alive() -> Result<()> {
-        // Round 4 item 9: a REAL websocket node holds an actual child process.
-        // The Hub row says failed (stale), but the Node's prepare refuses due
-        // to the live process; the Hub surfaces 409.
-        let dir = tempfile::tempdir()?;
-        let config = HubConfig::for_test(dir.path().join("data"));
-        let bootstrap = config.bootstrap_token.clone();
-        let hub = remuda_hub::spawn(config).await?;
-        let addr = hub.addr;
-        let cookie = login(addr, &bootstrap).await?;
-        let enroll = enroll_token(addr, &cookie).await?;
-        let host = HostId::new();
-        let host_id = host.as_id().to_string();
+    let before = fixture.node.recorded();
+    let (status, body) = json_request(
+        fixture.hub.addr,
+        "DELETE",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        Some(&json!({"path": fixture.alias_dotdot.display().to_string()}).to_string()),
+    )
+    .await?;
+    assert_eq!(
+        status, 409,
+        "realpath-resolved workspace B has an active task; must be 409: {body}"
+    );
+    assert!(body.contains("active task(s)"), "{body}");
+    let after = fixture.node.recorded();
+    assert!(
+        after.iter().any(|method| method == "workspace.resolve"),
+        "identity must be established with workspace.resolve: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .skip(before.len())
+            .any(|method| method == "workspace.unregister"),
+        "the occupied workspace must never be unregistered: {after:?}"
+    );
+    // The occupied workspace is still in the snapshot.
+    let (status, view) = json_request(
+        fixture.hub.addr,
+        "GET",
+        &format!("/v1/hosts/{}/workspaces", fixture.host),
+        &[("Cookie", &fixture.cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{view}");
+    let view: Value = serde_json::from_str(view.trim())?;
+    assert!(
+        view["workspaces"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["workspaceId"] == WORKSPACE2)),
+        "{view}"
+    );
 
-        // The real process the node "runs" for the duration of the test.
-        let mut child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "trap 'exit 0' TERM; while :; do sleep 0.2; done"])
-            .spawn()?;
-        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let node = {
-            let live = live.clone();
-            let enroll = enroll.clone();
-            let host_id = host_id.clone();
-            tokio::spawn(async move {
-                serve_live_node(addr, enroll, host_id, live)
-                    .await
-                    .map_err(|e| tracing::warn!("live node ended: {e}"))
-                    .ok();
-            })
-        };
-
-        // Wait for the node to come online through the Hub's own GET.
-        for _ in 0..50 {
-            let (status, body) = raw_http(
-                addr,
-                "GET",
-                &format!("/v1/hosts/{host_id}"),
-                Some(&cookie),
-                None,
-            )
-            .await?;
-            if status == 200 && body.contains("\"online\":true") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        // Only the Hub row says failed.
-        let instance = hub
-            .store()
-            .expect("store")
-            .insert_instance(
-                host_id.clone(),
-                Some(WORKSPACE.to_owned()),
-                "assistant".into(),
-                "shell-pty".into(),
-                Some("stale failed row; real node process is alive".to_owned()),
-                json!({}),
-            )
-            .await?;
-        hub.test_mark_instance_failed(&instance.instance_id).await?;
-
-        let (status, body) = raw_http(
-            addr,
-            "DELETE",
-            &format!("/v1/hosts/{host_id}/workspaces"),
-            Some(&cookie),
-            Some(&json!({"path": ROOT}).to_string()),
-        )
-        .await?;
-        assert_eq!(status, 409, "real live node must refuse unregister: {body}");
-        assert!(body.contains("1 live session(s)"), "{body}");
-
-        // Counterpart (round 5 item 4): once the process exits and the node
-        // stops refusing, the DELETE proceeds to a two-phase settle and the
-        // Hub removes the workspace (the failed Hub row never blocked it
-        // alone). The scripted node stops after `live` clears; a fresh node
-        // answers the settle for this offline transition with the standard
-        // settled reply, which the Hub accepts.
-        child.kill().await?;
-        let _ = child.wait().await;
-        live.store(false, std::sync::atomic::Ordering::Relaxed);
-        node.await?;
-
-        // Attach a quiet settling node for the post-exit DELETE.
-        let settle_enroll = enroll.clone();
-        let settle_host = host_id.clone();
-        let settle = tokio::spawn(async move {
-            let mut req = format!("ws://{addr}/v1/node")
-                .into_client_request()
-                .unwrap();
-            req.headers_mut().insert(
-                "Authorization",
-                format!("Bearer {settle_enroll}").parse().unwrap(),
-            );
-            let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-            ws.send(Message::Text(
-                json!({
-                    "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
-                    "params": {"hostId": settle_host, "nodeVersion": "0.1.0-settle"}
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-            while let Some(Ok(Message::Text(text))) = ws.next().await {
-                let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                    continue;
-                };
-                let Some(id) = value.get("id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-                let result = if method == "workspace.list" {
-                    json!({"workspaceRevision": 1, "workspaces": []})
-                } else {
-                    json!({})
-                };
-                ws.send(Message::Text(
-                    json!({"jsonrpc": "2.0", "id": id, "result": result})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
-            }
-        });
-
-        let (status, body) = raw_http(
-            addr,
-            "DELETE",
-            &format!("/v1/hosts/{host_id}/workspaces"),
-            Some(&cookie),
-            Some(&json!({"path": ROOT}).to_string()),
-        )
-        .await?;
-        assert!(
-            status == 200 || status == 409,
-            "after the process exits the DELETE must settle (200) or be refused by the new node (409): {status} {body}"
-        );
-        settle.abort();
-        Ok(())
-    }
+    fixture.hub.shutdown().await;
+    Ok(())
 }
 
 // ── Round 4 item 5: invalid binding ids reject before a task row exists ────
@@ -1093,6 +961,250 @@ mod invalid_binding {
             before, after,
             "a rejected binding must never leave a task row ({before} -> {after})"
         );
+        fixture.hub.shutdown().await;
+        Ok(())
+    }
+}
+
+// ── Round 6 item 3: the REAL DELETE × POST /v1/tasks race ──────────────────
+//
+// Both handlers are driven over HTTP; a test-only barrier parks one handler
+// at a production line (DELETE: after the occupancy query, before prepare,
+// holding the per-workspace guard; task create: after acquiring the same
+// guard, before publishing the binding). No scripted timing.
+
+mod race {
+    use super::*;
+
+    async fn poll_tasks(addr: SocketAddr, cookie: &str, project_id: &str) -> Result<Vec<Value>> {
+        let (status, body) = json_request(
+            addr,
+            "GET",
+            &format!("/v1/tasks?project={project_id}"),
+            &[("Cookie", cookie)],
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        Ok(serde_json::from_str::<Value>(body.trim())?
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Observe the snapshot, create a project whose member is the fixture's
+    /// trailing-space workspace, and return the project id.
+    async fn project_on_workspace(fixture: &Fixture, workspace: &str) -> Result<String> {
+        let (status, body) = json_request(
+            fixture.hub.addr,
+            "GET",
+            &format!("/v1/hosts/{}/workspaces", fixture.host),
+            &[("Cookie", &fixture.cookie)],
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = json_request(
+            fixture.hub.addr,
+            "POST",
+            "/v1/projects",
+            &[("Cookie", &fixture.cookie)],
+            Some(
+                &json!({
+                    "name": format!("race-{workspace}"),
+                    "members": [{ "hostId": fixture.host, "workspaceId": workspace }],
+                })
+                .to_string(),
+            ),
+        )
+        .await?;
+        assert_eq!(status, 200, "project create: {body}");
+        Ok(serde_json::from_str::<Value>(body.trim())?["id"]
+            .as_str()
+            .context("project id")?
+            .to_owned())
+    }
+
+    #[tokio::test]
+    async fn binding_is_not_published_until_the_unregister_settles() -> Result<()> {
+        // DELETE parks holding the guard (occupancy already passed). The
+        // concurrent task create acquires the SAME guard and must wait: its
+        // row exists but its binding is unpublished until the DELETE settles.
+        let fixture = fixture().await?;
+        let project_id = project_on_workspace(&fixture, WORKSPACE).await?;
+        let root = fixture.real_root.display().to_string();
+
+        let (reached, release_delete) =
+            fixture
+                .hub
+                .test_arm_race_barrier(true, &fixture.host, WORKSPACE);
+
+        let addr = fixture.hub.addr;
+        let cookie = fixture.cookie.clone();
+        let host = fixture.host.clone();
+        let root_task = root.clone();
+        let delete_task = tokio::spawn(async move {
+            json_request(
+                addr,
+                "DELETE",
+                &format!("/v1/hosts/{host}/workspaces"),
+                &[("Cookie", &cookie)],
+                Some(&json!({"path": root_task}).to_string()),
+            )
+            .await
+        });
+        // Wait until the DELETE has passed the occupancy query and parked.
+        reached.notified().await;
+
+        // Now the task create enters; it parks on the same guard after
+        // inserting its row.
+        let body = json!({
+            "projectId": project_id,
+            "title": "racer",
+            "intent": "racer intent",
+            "workspaceBinding": {
+                "mode": "reuse",
+                "hostId": fixture.host,
+                "workspaceId": WORKSPACE,
+            },
+        })
+        .to_string();
+        let addr = fixture.hub.addr;
+        let cookie = fixture.cookie.clone();
+        let create_task = tokio::spawn(async move {
+            json_request(
+                addr,
+                "POST",
+                "/v1/tasks",
+                &[("Cookie", &cookie)],
+                Some(&body),
+            )
+            .await
+        });
+
+        // While the DELETE holds the guard, the binding must stay
+        // unpublished even if the task row already exists. Give the handler
+        // a real chance to over-publish, then check repeatedly.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        while tokio::time::Instant::now() < deadline {
+            let items = poll_tasks(fixture.hub.addr, &fixture.cookie, &project_id).await?;
+            assert!(
+                items.iter().all(|item| {
+                    item.get("workspaceBinding")
+                        .is_none_or(|binding| binding.is_null())
+                }),
+                "binding published while the unregister guard was held: {items:#?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !create_task.is_finished(),
+            "task create must be waiting on the guard"
+        );
+
+        // Settle the DELETE first; it wins the window (its occupancy query
+        // passed before the binding existed).
+        let _ = release_delete.send(());
+        let (status, body) = delete_task.await??;
+        assert_eq!(status, 200, "DELETE that won the guard must settle: {body}");
+
+        // The waiter then binds and publishes.
+        let (status, created) = create_task.await??;
+        assert_eq!(status, 200, "task create after settle: {created}");
+        let created: Value = serde_json::from_str(created.trim())?;
+        assert_eq!(
+            created["workspaceBinding"]["workspaceId"].as_str(),
+            Some(WORKSPACE),
+            "the binding is published only after the DELETE settled"
+        );
+
+        fixture.hub.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_binding_that_wins_the_guard_first_makes_the_delete_refuse_409() -> Result<()> {
+        // Reverse ordering: the task create parks holding the guard with its
+        // binding unpublished; the DELETE cannot resolve past its guard. When
+        // the create settles first, the DELETE counts the now-active task and
+        // returns 409 without any unregister frame.
+        let fixture = fixture().await?;
+        let project_id = project_on_workspace(&fixture, WORKSPACE).await?;
+        let root = fixture.real_root.display().to_string();
+
+        let (bind_reached, release_bind) =
+            fixture
+                .hub
+                .test_arm_race_barrier(false, &fixture.host, WORKSPACE);
+
+        let body = json!({
+            "projectId": project_id,
+            "title": "winner",
+            "intent": "winner intent",
+            "workspaceBinding": {
+                "mode": "reuse",
+                "hostId": fixture.host,
+                "workspaceId": WORKSPACE,
+            },
+        })
+        .to_string();
+        let addr = fixture.hub.addr;
+        let cookie = fixture.cookie.clone();
+        let create_task = tokio::spawn(async move {
+            json_request(
+                addr,
+                "POST",
+                "/v1/tasks",
+                &[("Cookie", &cookie)],
+                Some(&body),
+            )
+            .await
+        });
+        bind_reached.notified().await;
+
+        let addr = fixture.hub.addr;
+        let cookie = fixture.cookie.clone();
+        let host = fixture.host.clone();
+        let root_delete = root.clone();
+        let delete_task = tokio::spawn(async move {
+            json_request(
+                addr,
+                "DELETE",
+                &format!("/v1/hosts/{host}/workspaces"),
+                &[("Cookie", &cookie)],
+                Some(&json!({"path": root_delete}).to_string()),
+            )
+            .await
+        });
+        // The DELETE must be queued behind the binding; give it a real chance
+        // to wrongly run its occupancy query early.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !delete_task.is_finished(),
+            "DELETE must wait while the binding holds the guard"
+        );
+
+        // Publish the binding; the DELETE then counts the task and refuses.
+        let _ = release_bind.send(());
+        let (status, created) = create_task.await??;
+        assert_eq!(status, 200, "{created}");
+        let (status, body) = delete_task.await??;
+        assert_eq!(
+            status, 409,
+            "a DELETE arriving while the binding wins must refuse 409: {body}"
+        );
+        assert!(body.contains("active task(s)"), "{body}");
+        assert!(
+            !fixture
+                .node
+                .recorded()
+                .iter()
+                .any(|method| method == "workspace.unregister"),
+            "the refused DELETE must never unregister: {:?}",
+            fixture.node.recorded()
+        );
+
         fixture.hub.shutdown().await;
         Ok(())
     }

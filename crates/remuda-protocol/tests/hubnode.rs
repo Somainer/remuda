@@ -133,9 +133,11 @@ fn ws_bearer_and_stdio_auth_are_documented() {
 fn workspace_methods_require_explicit_mutation_phase() {
     use remuda_protocol::hubnode::{
         WorkspaceMutationParams, WorkspaceMutationPhase, WorkspaceRegistryResult,
+        WorkspaceResolveParams, WorkspaceResolveResult,
     };
     for method in [
         "workspace.list",
+        "workspace.resolve",
         "workspace.register",
         "workspace.unregister",
     ] {
@@ -143,11 +145,40 @@ fn workspace_methods_require_explicit_mutation_phase() {
         assert_eq!(kind.as_str(), method);
         assert!(!kind.is_instance());
     }
+    // Round 6 item 1: the read-only resolve RPC round-trips its identity
+    // result, and an unregister carries the optional resolved workspaceId.
+    let resolve_params: WorkspaceResolveParams = serde_json::from_value(serde_json::json!({
+        "path": "/allowed/link/../proj"
+    }))
+    .unwrap();
+    assert_eq!(resolve_params.path, "/allowed/link/../proj");
+    let resolve_result: WorkspaceResolveResult = serde_json::from_value(serde_json::json!({
+        "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000abc",
+        "canonicalRoot": "/srv/proj"
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&resolve_result).unwrap(),
+        serde_json::json!({
+            "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000abc",
+            "canonicalRoot": "/srv/proj"
+        })
+    );
     let params: WorkspaceMutationParams = serde_json::from_value(serde_json::json!({
         "commandId":"cmd-workspace", "path":"/home/dev/project", "phase":"prepare"
     }))
     .unwrap();
     assert_eq!(params.phase, WorkspaceMutationPhase::Prepare);
+    assert!(params.workspace_id.is_none());
+    let verified: WorkspaceMutationParams = serde_json::from_value(serde_json::json!({
+        "commandId":"cmd-workspace", "path":"/srv/proj", "phase":"prepare",
+        "workspaceId":"wsp_01993ab0-0000-7000-8000-000000000abc"
+    }))
+    .unwrap();
+    assert_eq!(
+        verified.workspace_id.as_deref(),
+        Some("wsp_01993ab0-0000-7000-8000-000000000abc")
+    );
     assert!(
         serde_json::from_value::<WorkspaceMutationParams>(serde_json::json!({
             "commandId":"cmd-workspace", "path":"/home/dev/project"

@@ -431,6 +431,19 @@ async fn create_task(
     } else {
         None
     };
+    // Round 6 item 3: test-only park point after the guard is acquired and
+    // before the binding is published (the task row exists but has no binding
+    // while parked). No-op in production.
+    if let Some((host_id, workspace_id)) = &admission_target {
+        state
+            .race_barriers
+            .wait_if_armed(
+                crate::workspaces::RacePhase::TaskBind,
+                host_id.as_id().as_str(),
+                workspace_id.as_id().as_str(),
+            )
+            .await;
+    }
     let sharing = if let Some(request) = binding_request.as_ref() {
         match bind_task_directory(&state, &body.project_id, &task, request).await {
             Ok((binding, sharing)) => {

@@ -995,6 +995,39 @@ async fn fake_node(
                 // c-dirpicker: two-phase membership mutations behind the
                 // trigger; an untriggered harness answers "unknown method",
                 // exactly the shape an older Node gives the Hub.
+                // c-dirpicker round 6 item 1: read-only identity resolution,
+                // using the same canonicalize+containment+membership logic as
+                // the mutation arm below.
+                "workspace.resolve" if dir_picker_enabled() => {
+                    let path = params.get("path").and_then(Value::as_str).unwrap_or("");
+                    let resolved = (|| {
+                        let canonical = std::fs::canonicalize(path).ok()?;
+                        if !canonical
+                            .starts_with(std::fs::canonicalize(DIRPICKER_BROWSE_ROOT).ok()?)
+                        {
+                            return None;
+                        }
+                        let root = canonical.display().to_string();
+                        let row = workspace_rows
+                            .iter()
+                            .find(|row| row["root"].as_str() == Some(root.as_str()))?;
+                        Some(json!({
+                            "workspaceId": row["workspaceId"],
+                            "canonicalRoot": root,
+                        }))
+                    })();
+                    match resolved {
+                        Some(result) => send_rpc_ok(&mut ws, id, result).await?,
+                        None => {
+                            send_rpc_error(
+                                &mut ws,
+                                id,
+                                &format!("workspace {path} is not registered"),
+                            )
+                            .await?
+                        }
+                    }
+                }
                 "workspace.register" | "workspace.unregister" if dir_picker_enabled() => {
                     let path = params.get("path").and_then(Value::as_str).unwrap_or("");
                     let phase = params.get("phase").and_then(Value::as_str).unwrap_or("");
@@ -1019,6 +1052,30 @@ async fn fake_node(
                         continue;
                     }
                     let canonical = canonical?;
+                    let root_display = canonical.display().to_string();
+                    let existing = workspace_rows
+                        .iter()
+                        .position(|row| row["root"].as_str() == Some(root_display.as_str()));
+                    // Round 6 item 1: an unregister carries the resolved
+                    // workspaceId; verify id+root at both phases before
+                    // removing anything, exactly like the production Node.
+                    let expected_id = params.get("workspaceId").and_then(Value::as_str);
+                    if method == "workspace.unregister" {
+                        let matches = existing.is_some_and(|index| {
+                            expected_id.is_none()
+                                || expected_id == workspace_rows[index]["workspaceId"].as_str()
+                        });
+                        if !matches {
+                            send_rpc_error(
+                                &mut ws,
+                                id,
+                                "workspace unregister identity does not match the resolved \
+                                 workspace",
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
                     if phase == "prepare" {
                         send_rpc_ok(
                             &mut ws,
@@ -1026,6 +1083,9 @@ async fn fake_node(
                             json!({
                                 "workspaceRevision": workspace_revision,
                                 "workspaces": workspace_rows,
+                                "workspaceId": existing
+                                    .map(|index| workspace_rows[index]["workspaceId"].clone())
+                                    .unwrap_or(Value::Null),
                                 "commandId": command_id,
                                 "phase": "prepared",
                             }),
@@ -1033,10 +1093,6 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    let root_display = canonical.display().to_string();
-                    let existing = workspace_rows
-                        .iter()
-                        .position(|row| row["root"].as_str() == Some(root_display.as_str()));
                     let workspace_id;
                     if method == "workspace.register" {
                         if let Some(index) = existing {

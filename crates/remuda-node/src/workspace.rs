@@ -1,7 +1,9 @@
 //! Durable Node-owned workspace membership and registration policy (D-023).
 
 use crate::{DevNode, DevServerConfig, NodeError};
-use remuda_protocol::hubnode::{WorkspaceMutationParams, WorkspaceMutationPhase};
+use remuda_protocol::hubnode::{
+    WorkspaceMutationParams, WorkspaceMutationPhase, WorkspaceResolveParams,
+};
 use remuda_protocol::{HostId, Workspace, WorkspaceId, path_guard};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -192,6 +194,53 @@ impl WorkspaceRegistry {
             .unwrap_or(0)
     }
 
+    /// Resolve an unregister candidate with the ONLY identity semantics an
+    /// unregister accepts:
+    /// * an absolute path;
+    /// * the exact stored canonical root, matched byte-for-byte (a real
+    ///   trailing space is a different name; nothing is trimmed);
+    /// * anything else goes through [`canonical_directory`] — a real `realpath`
+    ///   with the access probe, never a lexical `..` collapse
+    ///   (`/allowed/link/../p` resolves where the symlink actually points);
+    /// * the result must match a currently registered workspace.
+    ///
+    /// Returns `(workspaceId, canonicalRoot)`. This is the single resolution
+    /// function shared by unregister prepare AND the read-only
+    /// `workspace.resolve` RPC (c-dirpicker round 6 item 1): the two can never
+    /// disagree, so do not duplicate it.
+    pub(crate) fn resolve_unregister(
+        &self,
+        candidate: &str,
+    ) -> Result<(WorkspaceId, PathBuf), NodeError> {
+        let path = Path::new(candidate);
+        if !path.is_absolute() {
+            return Err(NodeError::InvalidRequest(
+                "workspace path must be absolute".into(),
+            ));
+        }
+        // A deleted project remains removable using its stored canonical
+        // absolute path; for that exact string the root is trusted verbatim.
+        let canonical = if self
+            .state
+            .workspaces
+            .iter()
+            .any(|workspace| Path::new(&workspace.root_path) == path)
+        {
+            path.to_path_buf()
+        } else {
+            canonical_directory(path)?
+        };
+        let workspace = self
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| Path::new(&workspace.root_path) == canonical)
+            .ok_or_else(|| {
+                NodeError::InvalidRequest(format!("workspace {} is not registered", path.display()))
+            })?;
+        Ok((workspace.meta.id.clone(), canonical))
+    }
+
     fn validate(&self, path: &Path) -> Result<PathBuf, NodeError> {
         let canonical = canonical_directory(path)?;
         if !self
@@ -327,38 +376,43 @@ impl WorkspaceRegistry {
         match params.phase {
             WorkspaceMutationPhase::Prepare => {
                 if command.is_none() {
-                    let canonical = if method == "workspace.register" {
-                        self.validate(Path::new(&params.path))?
+                    let (canonical, workspace_id, was_registered) = if method
+                        == "workspace.register"
+                    {
+                        let canonical = self.validate(Path::new(&params.path))?;
+                        let existing = self
+                            .state
+                            .workspaces
+                            .iter()
+                            .find(|workspace| Path::new(&workspace.root_path) == canonical)
+                            .map(|workspace| workspace.meta.id.clone());
+                        let was_registered = existing.is_some();
+                        (canonical, existing.unwrap_or_default(), was_registered)
                     } else {
-                        // A deleted project remains removable using its stored canonical absolute path.
-                        let path = Path::new(&params.path);
-                        if !path.is_absolute() {
-                            return Err(NodeError::InvalidRequest(
-                                "workspace path must be absolute".into(),
-                            ));
+                        // Same function the read-only workspace.resolve RPC
+                        // runs — never a second, drift-able resolution path
+                        // (round 6 item 1).
+                        let (workspace_id, canonical) = self.resolve_unregister(&params.path)?;
+                        // When the Hub prepared from a resolve result, it
+                        // must send the exact stored root bytes in `path`
+                        // plus the resolved id. Verify both before anything
+                        // is marked: an alias that realpaths to the root is
+                        // rejected here, and an id/root mismatch means the
+                        // identity moved.
+                        if let Some(expected) = params.workspace_id.as_deref() {
+                            if expected != workspace_id.as_id().as_str()
+                                || Path::new(&params.path) != canonical
+                            {
+                                return Err(NodeError::Conflict(format!(
+                                    "workspace unregister identity does not match the resolved \
+                                         workspace (expected {}@{}, got {})",
+                                    workspace_id.as_id(),
+                                    canonical.display(),
+                                    params.path
+                                )));
+                            }
                         }
-                        let canonical = if self
-                            .state
-                            .workspaces
-                            .iter()
-                            .any(|workspace| Path::new(&workspace.root_path) == path)
-                        {
-                            path.to_path_buf()
-                        } else {
-                            canonical_directory(path)?
-                        };
-                        if !self
-                            .state
-                            .workspaces
-                            .iter()
-                            .any(|workspace| Path::new(&workspace.root_path) == canonical)
-                        {
-                            return Err(NodeError::InvalidRequest(format!(
-                                "workspace {} is not registered",
-                                path.display()
-                            )));
-                        }
-                        canonical
+                        (canonical, workspace_id, true)
                     };
                     // Round 3 item 7: an unregister already prepared against
                     // this canonical directory cannot be overtaken by a
@@ -377,14 +431,6 @@ impl WorkspaceRegistry {
                                 .into(),
                         ));
                     }
-                    let existing = self
-                        .state
-                        .workspaces
-                        .iter()
-                        .find(|workspace| Path::new(&workspace.root_path) == canonical)
-                        .map(|workspace| workspace.meta.id.clone());
-                    let was_registered = existing.is_some();
-                    let workspace_id = existing.unwrap_or_default();
                     if method == "workspace.unregister" {
                         // Atomic with the write lock: a session entering in
                         // another thread must take this same lock to reserve
@@ -463,6 +509,20 @@ impl WorkspaceRegistry {
                             next.revision += 1;
                         }
                     } else {
+                        // Round 6 item 1: the Hub re-sends the exact stored
+                        // root and the resolved id at commit; verify both
+                        // before removing. Anything that changed between the
+                        // phases refuses rather than unbinding.
+                        if let Some(expected) = params.workspace_id.as_deref() {
+                            if expected != command.workspace_id.as_id().as_str()
+                                || Path::new(&params.path) != command.canonical
+                            {
+                                return Err(NodeError::Conflict(
+                                    "workspace unregister identity changed between prepare and commit"
+                                        .into(),
+                                ));
+                            }
+                        }
                         if next.workspaces.iter().any(|workspace| {
                             Path::new(&workspace.root_path) == command.canonical
                                 && workspace.meta.id != command.workspace_id
@@ -658,7 +718,7 @@ fn display_roots<'a>(roots: impl Iterator<Item = &'a Path>) -> String {
 pub(crate) fn is_workspace_method(method: &str) -> bool {
     matches!(
         method,
-        "workspace.list" | "workspace.register" | "workspace.unregister"
+        "workspace.list" | "workspace.resolve" | "workspace.register" | "workspace.unregister"
     )
 }
 
@@ -686,6 +746,23 @@ impl DevNode {
     pub(crate) fn workspace_rpc(&self, method: &str, params: Value) -> Result<Value, NodeError> {
         if method == "workspace.list" {
             return self.workspace_snapshot();
+        }
+        // c-dirpicker round 6 item 1: read-only, Node-authoritative identity
+        // for a pending unregister. It runs the SAME resolve_unregister
+        // function prepare uses, takes only the read lock, and mutates
+        // nothing; the Hub calls it before taking its occupancy guard.
+        if method == "workspace.resolve" {
+            let request: WorkspaceResolveParams = serde_json::from_value(params)?;
+            let registry = self
+                .inner
+                .workspace_registry
+                .read()
+                .map_err(|_| NodeError::StorePoisoned)?;
+            let (workspace_id, canonical_root) = registry.resolve_unregister(&request.path)?;
+            return Ok(json!({
+                "workspaceId": workspace_id,
+                "canonicalRoot": canonical_root.display().to_string(),
+            }));
         }
         // The unregister occupancy check runs inside the registry's mutate
         // under its write lock (the callback below), so it and the unbinding
@@ -855,6 +932,7 @@ mod tests {
                 command_id: command.into(),
                 path: path.display().to_string(),
                 phase,
+                workspace_id: None,
             },
             |_workspace_id| Ok(0),
         )
@@ -883,6 +961,7 @@ mod tests {
                     command_id: "blocked-unregister".into(),
                     path: registry.state.workspaces[0].root_path.clone(),
                     phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: None,
                 },
                 |_id| Ok(0),
             )
@@ -899,6 +978,7 @@ mod tests {
                     command_id: "allowed-unregister".into(),
                     path: registry.state.workspaces[0].root_path.clone(),
                     phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: None,
                 },
                 |_id| Ok(0),
             )
@@ -930,6 +1010,7 @@ mod tests {
                     command_id: "u1".into(),
                     path: root_path.clone(),
                     phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: None,
                 },
                 |_id| Ok(0),
             )
@@ -949,6 +1030,7 @@ mod tests {
                     command_id: "r1".into(),
                     path: root_path.clone(),
                     phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: None,
                 },
                 |_id| Ok(0),
             )
@@ -974,6 +1056,7 @@ mod tests {
                     command_id: "u1".into(),
                     path: root_path.clone(),
                     phase: WorkspaceMutationPhase::Commit,
+                    workspace_id: None,
                 },
                 |_id| Ok(0),
             )

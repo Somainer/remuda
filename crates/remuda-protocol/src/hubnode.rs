@@ -35,6 +35,9 @@ pub const METHOD_WORKSPACE_LIST: &str = "workspace.list";
 pub const METHOD_WORKSPACE_REGISTER: &str = "workspace.register";
 /// Prepare or commit persistent workspace removal.
 pub const METHOD_WORKSPACE_UNREGISTER: &str = "workspace.unregister";
+/// Read-only Node-authoritative resolution of an unregister candidate path
+/// (c-dirpicker round 6 item 1).
+pub const METHOD_WORKSPACE_RESOLVE: &str = "workspace.resolve";
 /// Provision a worker's worktree and per-worker target directory (M1 batch 5a).
 pub const METHOD_WORKER_PROVISION: &str = "worker.provision";
 /// Reclaim a worker's tab, worktree and target directory (M1 batch 5a).
@@ -212,6 +215,8 @@ pub enum HubNodeMethod {
     WorkspaceRegister,
     /// [`METHOD_WORKSPACE_UNREGISTER`].
     WorkspaceUnregister,
+    /// [`METHOD_WORKSPACE_RESOLVE`].
+    WorkspaceResolve,
     /// [`METHOD_WORKER_PROVISION`].
     WorkerProvision,
     /// [`METHOD_WORKER_REMOVE`].
@@ -286,6 +291,14 @@ pub struct WorkspaceMutationParams {
     pub path: String,
     /// Required: commit without a durable prepare is rejected.
     pub phase: WorkspaceMutationPhase,
+    /// c-dirpicker round 6 item 1: on an unregister the Hub sends the
+    /// workspace identity its read-only `workspace.resolve` call established,
+    /// alongside the *exact stored canonical root bytes* in `path`. The Node
+    /// verifies both at prepare and again at commit before removing anything,
+    /// so a `..`/symlink alias can never settle a different workspace.
+    /// Absent on register and on older-Hub unregisters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 /// Registered root projected into a host's inventory.
@@ -317,6 +330,33 @@ pub struct WorkspaceRegistryResult {
     /// `prepared` or `settled`; absent on reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+}
+
+/// Read-only, Node-authoritative resolution of an unregister candidate path
+/// (c-dirpicker round 6 item 1).
+///
+/// `host.dirs.list` must never be used to identify a removal target: its
+/// pinned-root no-follow walk is a browse view, and its lexical `..` handling
+/// can name a different real directory than the `realpath` semantics
+/// `workspace.unregister` resolves with. This RPC runs the *exact same
+/// resolution function* the unregister prepare uses, mutates nothing, and
+/// returns the stored identity so the Hub can take its occupancy guard and
+/// count users against the right workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceResolveParams {
+    /// Absolute directory on the Node filesystem, sent verbatim.
+    pub path: String,
+}
+
+/// Identity the Node resolved a [`WorkspaceResolveParams`] candidate to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceResolveResult {
+    /// Stable membership id stored on the Node.
+    pub workspace_id: String,
+    /// The exact stored canonical root bytes, byte-for-byte.
+    pub canonical_root: String,
 }
 
 /// Shared selector for the read-only host-file RPCs: a registered workspace
@@ -1451,6 +1491,7 @@ impl HubNodeMethod {
             Self::WorkspaceList => METHOD_WORKSPACE_LIST,
             Self::WorkspaceRegister => METHOD_WORKSPACE_REGISTER,
             Self::WorkspaceUnregister => METHOD_WORKSPACE_UNREGISTER,
+            Self::WorkspaceResolve => METHOD_WORKSPACE_RESOLVE,
             Self::WorkerProvision => METHOD_WORKER_PROVISION,
             Self::WorkerRemove => METHOD_WORKER_REMOVE,
             Self::InstanceCreate => METHOD_INSTANCE_CREATE,
@@ -1492,6 +1533,7 @@ impl HubNodeMethod {
             METHOD_WORKSPACE_LIST => Self::WorkspaceList,
             METHOD_WORKSPACE_REGISTER => Self::WorkspaceRegister,
             METHOD_WORKSPACE_UNREGISTER => Self::WorkspaceUnregister,
+            METHOD_WORKSPACE_RESOLVE => Self::WorkspaceResolve,
             METHOD_WORKER_PROVISION => Self::WorkerProvision,
             METHOD_WORKER_REMOVE => Self::WorkerRemove,
             METHOD_INSTANCE_CREATE => Self::InstanceCreate,

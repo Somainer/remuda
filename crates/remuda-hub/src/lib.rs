@@ -115,6 +115,9 @@ pub struct AppState {
     /// When the pinned-ref retention sweep last ran. Per-Hub rather than a
     /// process static so concurrent instances (tests) never starve each other.
     gate_ref_swept_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Round 6 item 3: test-only park points in the real unregister/task-bind
+    /// handlers; empty (no-op) in production.
+    pub(crate) race_barriers: crate::workspaces::RaceBarriers,
 }
 
 impl AppState {
@@ -515,6 +518,40 @@ impl RunningHub {
         crate::gatequeue::reconcile(&self.state).await;
     }
 
+    /// Test helper (round 6 item 3): arm a one-shot park point in the REAL
+    /// unregister DELETE handler (`unregister == true`; right after the
+    /// occupancy query, before the prepare RPC) or the REAL POST /v1/tasks
+    /// handler (`false`; after the per-workspace guard is acquired, before the
+    /// binding is published). Returns `(reached, release)`: the handler
+    /// notifies `reached` when it parks and continues once `release` is sent.
+    #[doc(hidden)]
+    pub fn test_arm_race_barrier(
+        &self,
+        unregister: bool,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let phase = if unregister {
+            crate::workspaces::RacePhase::Unregister
+        } else {
+            crate::workspaces::RacePhase::TaskBind
+        };
+        self.state.race_barriers.insert(
+            phase,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into
@@ -823,6 +860,7 @@ async fn spawn_inner(
         agent_approvals: agent_approvals::AgentApprovals::new()?,
         challenges: passkeys::ChallengeStore::default(),
         gate_ref_swept_at: Arc::new(std::sync::Mutex::new(None)),
+        race_barriers: crate::workspaces::RaceBarriers::default(),
     };
     store.expire_lost_hosts(config.host_lost_grace_ms).await?;
     // A Hub restart must not inherit yesterday's unacknowledged creates: they

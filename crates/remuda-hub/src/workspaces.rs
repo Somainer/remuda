@@ -87,6 +87,64 @@ pub(crate) async fn hold_workspace_operation(host_id: &str, workspace_id: &str) 
     }
 }
 
+/// One armed test barrier: the production handler signals `reached` when it
+/// parks, then waits for `release` before continuing.
+pub(crate) struct BarrierSlot {
+    pub(crate) reached: Arc<tokio::sync::Notify>,
+    pub(crate) release: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Test-only race barriers driving the REAL DELETE and POST /v1/tasks
+/// handlers (round 6 item 3). The handler-side cost when nothing is armed is
+/// one uncontended mutex lock and an empty-map lookup; production never arms.
+#[derive(Default, Clone)]
+pub(crate) struct RaceBarriers {
+    /// Parks the unregister handler right after the occupancy query passes
+    /// and before the command is queued / prepare is sent.
+    unregister: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks task creation right after it acquires the per-workspace guard
+    /// and before the binding is published.
+    task_bind: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+}
+
+impl RaceBarriers {
+    /// Install `slot` for one (host, workspace) key.
+    pub(crate) fn insert(&self, phase: RacePhase, key: (String, String), slot: BarrierSlot) {
+        let table = match phase {
+            RacePhase::Unregister => &self.unregister,
+            RacePhase::TaskBind => &self.task_bind,
+        };
+        table.lock().unwrap().insert(key, slot);
+    }
+
+    /// If a barrier is armed for this key, signal that the handler reached
+    /// the park point and wait for release. One-shot (removed on entry).
+    pub(crate) async fn wait_if_armed(&self, phase: RacePhase, host_id: &str, workspace_id: &str) {
+        let slot = {
+            let table = match phase {
+                RacePhase::Unregister => &self.unregister,
+                RacePhase::TaskBind => &self.task_bind,
+            };
+            table
+                .lock()
+                .unwrap()
+                .remove(&(host_id.to_owned(), workspace_id.to_owned()))
+        };
+        if let Some(slot) = slot {
+            slot.reached.notify_waiters();
+            // Park until the test releases; a dropped sender (test failed
+            // away) closes the channel and the handler proceeds.
+            let _ = slot.release.await;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RacePhase {
+    Unregister,
+    TaskBind,
+}
+
 /// Stable substrings the Node's unregister prepare emits for occupancy/race
 /// refusals. These must reach the operator as 409 rather than the channel's
 /// generic 400; keep them in sync with the Node messages in
@@ -98,6 +156,9 @@ const NODE_UNREGISTER_CONFLICT_MARKERS: &[&str] = &[
     // Node unregister commit re-counts occupancy (round 4 item 10).
     "gained occupancy after unregister prepare",
     "no longer registered",
+    // Round 6 item 1: the resolved id/root must match at both phases.
+    "identity does not match the resolved workspace",
+    "identity changed between prepare and commit",
 ];
 
 fn node_unregister_conflict(reason: &str) -> Option<&str> {
@@ -324,15 +385,18 @@ pub(crate) fn count_workspace_users(
 
 /// Resolve an unregister DELETE `path` to the Node-authoritative
 /// `(workspaceId, canonicalRoot)` BEFORE taking the operation lock or
-/// counting occupancy (round 5 item 2).
+/// counting occupancy (round 5 item 2; round 6 item 1).
 ///
 /// The exact stored snapshot root matches byte-for-byte (a real trailing
 /// space is a different name; no trimming). Anything else is resolved by the
-/// Node with unregister's own semantics: a no-follow directory browse
-/// returns the canonical path the Node opened, mapped to the snapshot
-/// workspace. A lexical `..` collapse is NEVER identity (`/allowed/link/../A`
-/// can resolve through a symlink elsewhere). A Node refusal (symlink escape,
-/// missing, out-of-policy) returns the error; unregister is not called.
+/// Node through the READ-ONLY `workspace.resolve` RPC, which runs the exact
+/// same resolution function as unregister prepare (`realpath` semantics on
+/// the real filesystem). A lexical `..` collapse is NEVER identity:
+/// `/allowed/link/../A` resolves where the symlink actually points, so the
+/// browse RPC (`host.dirs.list`, whose walk collapses `..` lexically) is no
+/// longer used to identify a removal target. A Node refusal (symlink
+/// escape, missing, out-of-policy) returns the error; unregister is not
+/// called and no snapshot is observed.
 async fn workspace_identity_for_path(
     state: &AppState,
     host_id: &str,
@@ -357,26 +421,41 @@ async fn workspace_identity_for_path(
         return Ok(Some((id.to_owned(), path.to_owned())));
     }
 
-    // (2) Node-authoritative resolution of the exact path.
+    // (2) Node-authoritative resolution of the exact path via the read-only
+    //     unregister-twin RPC. Any error (offline host aside, which call_node
+    //     raises on its own) refuses the DELETE before the lock and before any
+    //     `workspace.unregister` frame is sent.
     let answer =
-        crate::http::call_node(state, host_id, "host.dirs.list", json!({"path": path})).await?;
-    let Some(canonical) = answer.get("path").and_then(Value::as_str) else {
-        return Err(HubError::BadRequest(
-            "the Node could not resolve the directory to a registered workspace".into(),
-        ));
-    };
-    Ok(workspaces
-        .iter()
-        .find(|workspace| workspace["root"].as_str() == Some(canonical))
-        .map(|workspace| {
-            (
-                workspace["workspaceId"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-                canonical.to_owned(),
+        crate::http::call_node(state, host_id, "workspace.resolve", json!({"path": path})).await?;
+    let workspace_id = answer
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HubError::BadRequest(
+                "the Node could not resolve the directory to a registered workspace".into(),
             )
-        }))
+        })?;
+    let canonical_root = answer
+        .get("canonicalRoot")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HubError::BadRequest("the Node resolved no canonical workspace root".into())
+        })?;
+    // Cross-check the Node's answer against the observed snapshot: identity
+    // and stored root must both be present there, otherwise the Hub projection
+    // and the Node disagree and the unregister refuses.
+    let known = workspaces.iter().any(|workspace| {
+        workspace["workspaceId"].as_str() == Some(workspace_id)
+            && workspace["root"].as_str() == Some(canonical_root)
+    });
+    if !known {
+        return Err(HubError::BadRequest(
+            "the Node resolved a workspace the Hub has not observed; refresh workspaces before \
+             retrying"
+                .into(),
+        ));
+    }
+    Ok(Some((workspace_id.to_owned(), canonical_root.to_owned())))
 }
 
 /// Lexical normalization helper used only by unit tests now that unregister
@@ -457,8 +536,25 @@ async fn mutate(
                 reasons.join(" and ")
             )));
         }
+        // Round 6 item 3: test-only park point between the occupancy query
+        // and the prepare call, while the per-workspace guard is held. A
+        // no-op in production (nothing armed).
+        state
+            .race_barriers
+            .wait_if_armed(RacePhase::Unregister, &id, workspace_id)
+            .await;
     }
-    let mut payload = json!({"path": body.path});
+    // Round 6 item 1: an unregister prepared from a resolve result sends the
+    // EXACT stored canonical root bytes (never the operator's alias string)
+    // plus the resolved workspaceId; the Node verifies both at prepare and at
+    // commit before removing anything.
+    let (node_path, node_workspace_id) = match &unbind_identity {
+        Some((workspace_id, canonical_root)) if method == "workspace.unregister" => {
+            (canonical_root.clone(), Some(workspace_id.clone()))
+        }
+        _ => (body.path.clone(), None),
+    };
+    let mut payload = json!({"path": node_path});
     crate::agent_scope::stamp(&mut payload, &device);
     let (command, _) = state
         .store
@@ -468,13 +564,15 @@ async fn mutate(
         .store
         .mark_forward_intent(command.command_id.clone())
         .await?;
-    let prepared = crate::http::call_node(
-        state,
-        &id,
-        method,
-        json!({"path": body.path, "commandId": command.command_id, "phase": "prepare"}),
-    )
-    .await;
+    let mut rpc_params = json!({
+        "path": node_path,
+        "commandId": command.command_id,
+        "phase": "prepare",
+    });
+    if let Some(workspace_id) = &node_workspace_id {
+        rpc_params["workspaceId"] = json!(workspace_id);
+    }
+    let prepared = crate::http::call_node(state, &id, method, rpc_params).await;
     let prepared = match prepared {
         Err(HubError::BadRequest(reason)) if method == "workspace.unregister" => {
             // The Node enforces the same occupancy rule at prepare (its view
@@ -507,14 +605,15 @@ async fn mutate(
     // Round 4 item 10: the Node re-counts occupancy at commit and can refuse
     // if a session/reservation raced in after prepare; map that conflict to
     // 409 like the prepare markers, instead of the generic channel 400.
-    let settled = match crate::http::call_node(
-        state,
-        &id,
-        method,
-        json!({"path": body.path, "commandId": command.command_id, "phase": "commit"}),
-    )
-    .await
-    {
+    let mut commit_params = json!({
+        "path": node_path,
+        "commandId": command.command_id,
+        "phase": "commit",
+    });
+    if let Some(workspace_id) = &node_workspace_id {
+        commit_params["workspaceId"] = json!(workspace_id);
+    }
+    let settled = match crate::http::call_node(state, &id, method, commit_params).await {
         Ok(answer) => answer,
         Err(HubError::BadRequest(reason)) if node_unregister_conflict(&reason).is_some() => {
             return Err(HubError::Conflict(reason));

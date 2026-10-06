@@ -26,16 +26,16 @@ test.skip(
   "set HUB_E2E_DIR_PICKER=1 for the c-dirpicker harness",
 );
 
-const BROWSE_ROOT = "/tmp/remuda-dirpicker";
-
-/// The fake Node answers with canonical paths; on macOS /tmp is a symlink
-/// to /private/tmp, so compare against the canonical root the server sees.
-function canonicalRoot(): string {
-  // /private/tmp exists on macOS; elsewhere /tmp is real.
-  return process.platform === "darwin" && BROWSE_ROOT.startsWith("/tmp/")
-    ? `/private${BROWSE_ROOT}`
-    : BROWSE_ROOT;
+/// The fixture root AS THE NODE REPORTS IT, read once from a real
+/// `host.dirs.list` response (round 6 item 6). Never recompute it with a
+/// platform guess like `/private/tmp`: every path the spec sends — browsing,
+/// register fallback, cleanup DELETE — uses these exact bytes.
+async function fixtureRoot(page: Page, host: string): Promise<string> {
+  const listing = await apiJson<{ path: string }>(page, "GET", `/v1/hosts/${host}/dirs`);
+  if (!listing.path) throw new Error("fixture host.dirs.list returned no path");
+  return listing.path;
 }
+
 const createdInstances: string[] = [];
 
 async function apiJson<T>(page: Page, method: string, path: string, body?: unknown): Promise<T> {
@@ -123,14 +123,19 @@ test.afterAll(async ({ browser }) => {
     }
     const host = await fakeHost(page).catch(() => null);
     if (host) {
-      for (const path of [`${canonicalRoot()}/alpha`, `${canonicalRoot()}/beta`]) {
-        await page.request
-          .fetch(`/v1/hosts/${host}/workspaces`, {
-            method: "DELETE",
-            headers: { "content-type": "application/json" },
-            data: { path },
-          })
-          .catch(() => undefined);
+      // Read the fixture root ONCE from the Node and reuse those exact bytes
+      // for every cleanup DELETE (round 6 item 6).
+      const root = await fixtureRoot(page, host).catch(() => null);
+      if (root) {
+        for (const path of [`${root}/alpha`, `${root}/beta`]) {
+          await page.request
+            .fetch(`/v1/hosts/${host}/workspaces`, {
+              method: "DELETE",
+              headers: { "content-type": "application/json" },
+              data: { path },
+            })
+            .catch(() => undefined);
+        }
       }
     }
   } finally {
@@ -210,12 +215,14 @@ test("adds a directory by browsing the host filesystem", async ({ page }) => {
 
 test("removes a directory after confirmation and refuses it while a session is live", async ({ page }) => {
   const host = await fakeHost(page);
+  // The one fixture root, read from the Node's own listing (round 6 item 6).
+  const root = await fixtureRoot(page, host);
   let workspaces = await listWorkspaces(page, host);
   let beta = workspaces.find((row) => row.root.endsWith("/beta"));
   if (!beta) {
-    // Register through the exact path the fixture seeds (use the seed
-    // constant only to CREATE; the returned row is authoritative).
-    workspaces = await registerByPath(page, host, `${canonicalRoot()}/beta`);
+    // Register using the exact bytes the Node just reported; the returned row
+    // stays authoritative for every later lookup.
+    workspaces = await registerByPath(page, host, `${root}/beta`);
     beta = workspaces.find((row) => row.root.endsWith("/beta"));
   }
   expect(beta).toBeTruthy();

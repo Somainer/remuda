@@ -2,6 +2,9 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
+import { WorkspaceRegistration } from "../features/workspaces/WorkspaceRegistration";
+import { api } from "../lib/api";
+import * as store from "../lib/store";
 import { Sheet } from "./Sheet";
 import { focusableIn } from "./useFocusTrap";
 
@@ -192,6 +195,104 @@ describe("useFocusTrap via Sheet", () => {
     const scrim = screen.getByTestId("overlay").parentElement!;
     await user.click(scrim);
     expect(screen.queryByTestId("overlay")).toBeNull();
+  });
+});
+
+describe("portalled DirBrowser inside the New Session sheet form", () => {
+  // Round 6 item 2: React synthetic events bubble THROUGH portals to React
+  // ancestors, so a Tab in the portalled DirBrowser modal reached the
+  // Sheet's trap and refocused the sheet. The innermost trap now owns Tab and
+  // the outer trap ignores events whose DOM target is not in its container.
+  const listing = {
+    path: "/srv/proj",
+    parent: null,
+    home: "/srv/proj",
+    roots: ["/srv/proj"],
+    workspaces: [],
+    dirs: [{ name: "alpha" }],
+    truncated: false,
+  };
+
+  function SessionHarness() {
+    return (
+      <Sheet open onClose={() => undefined} testId="new-session-sheet" labelledBy="new-session-title">
+        <h2 id="new-session-title">新建会话</h2>
+        {/* A VALID session form: Enter in a real field submits and creates. */}
+        <form
+          data-testid="session-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void store.hubStore.create({ hostId: "hst_x" } as never);
+          }}
+        >
+          <input data-testid="new-session-cwd" defaultValue="" />
+          <WorkspaceRegistration hostId="hst_x" />
+          <button type="submit" data-testid="new-session-start">
+            启动
+          </button>
+        </form>
+      </Sheet>
+    );
+  }
+
+  async function openBrowser() {
+    vi.spyOn(api, "hostDirsList").mockResolvedValue(listing);
+    render(<SessionHarness />);
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue({} as never);
+    await userEvent.click(screen.getByTestId("workspace-add"));
+    screen.getByTestId("dir-browser");
+    return { create };
+  }
+
+  it("keeps Tab and Shift+Tab in the portalled modal at both boundaries", async () => {
+    const user = userEvent.setup();
+    await openBrowser();
+    // The modal panel is the active dialog; it lives in a portal, outside the
+    // sheet panel's DOM subtree.
+    const dialog = screen.getByTestId("dir-browser");
+    const inModal = () => {
+      const active = document.activeElement;
+      return active instanceof Node && dialog.contains(active);
+    };
+    const visible = focusableIn(dialog as HTMLElement);
+    const first = visible[0] as HTMLElement;
+    const last = visible[visible.length - 1] as HTMLElement;
+    first.focus();
+    expect(inModal(), `first is ${document.activeElement?.getAttribute("data-testid")}`).toBe(true);
+
+    // Forward boundary: Tab on the last control wraps to the first INSIDE
+    // the modal, never landing back on a sheet/form control.
+    last.focus();
+    await user.tab();
+    expect(
+      inModal(),
+      `after Tab wrap active=${document.activeElement?.getAttribute("data-testid")}`,
+    ).toBe(true);
+    expect(document.activeElement).not.toBe(screen.getByTestId("new-session-cwd"));
+    expect(document.activeElement).not.toBe(screen.getByTestId("workspace-add"));
+    expect(document.activeElement).not.toBe(screen.getByTestId("new-session-start"));
+
+    // Backward boundary: Shift+Tab on the first wraps to the last, still in
+    // the modal.
+    first.focus();
+    await user.tab({ shift: true });
+    expect(
+      inModal(),
+      `after Shift+Tab wrap active=${document.activeElement?.getAttribute("data-testid")}`,
+    ).toBe(true);
+    expect(document.activeElement).not.toBe(screen.getByTestId("new-session-cwd"));
+  });
+
+  it("never submits the session form (hubStore.create) for Enter in the modal", async () => {
+    const user = userEvent.setup();
+    const { create } = await openBrowser();
+    // Focus moves into the modal on open; Enter there must not create.
+    await user.keyboard("{Enter}");
+    screen.getByTestId("dir-browser-filter").focus();
+    await user.keyboard("{Enter}");
+    expect(create).not.toHaveBeenCalled();
+    // The modal is still open (it did not close or hand the key outward).
+    expect(screen.getByRole("dialog")).toBeTruthy();
   });
 });
 

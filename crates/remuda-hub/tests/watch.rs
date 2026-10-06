@@ -776,7 +776,10 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
             Some(prompt_body),
         )
         .await;
-    assert_eq!(status, 200, "the live child accepts another prompt: {receipt}");
+    assert_eq!(
+        status, 200,
+        "the live child accepts another prompt: {receipt}"
+    );
     assert!(
         receipt["command"]["commandId"].is_string(),
         "the command receipt names the accepted command: {receipt}"
@@ -793,7 +796,8 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
     );
 
     // ── Stage 2: the driver's REAL session exit settles the card ───────────
-    ctx.node.append_journal(&instance_id, &[session_exit_event()]);
+    ctx.node
+        .append_journal(&instance_id, &[session_exit_event()]);
 
     let observed = ctx.observe().await;
     let row = &observed["items"][0];

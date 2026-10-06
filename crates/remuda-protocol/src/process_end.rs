@@ -308,7 +308,10 @@ mod tests {
                     SHELL_PTY_EXIT_NAME,
                     Some("failed"),
                     Severity::Error,
-                    &[("signal", "SIGKILL"), ("reason", "native-exit-signal-SIGKILL")],
+                    &[
+                        ("signal", "SIGKILL"),
+                        ("reason", "native-exit-signal-SIGKILL"),
+                    ],
                 ),
                 Some(ProcessEndKind::Failed),
             ),
@@ -493,7 +496,13 @@ mod tests {
             // failure.
             (
                 "error name info severity",
-                native(LifecycleTopic::Session, "error", Some("hmm"), Severity::Info, &[]),
+                native(
+                    LifecycleTopic::Session,
+                    "error",
+                    Some("hmm"),
+                    Severity::Info,
+                    &[],
+                ),
                 None,
             ),
             // severity=error alone on session never ends a process.

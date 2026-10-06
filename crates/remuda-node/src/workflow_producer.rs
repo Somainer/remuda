@@ -458,11 +458,7 @@ mod tests {
             for (key, value) in related {
                 map.insert((*key).to_string(), (*value).to_string());
             }
-            hook_observation_topic(
-                remuda_protocol::LifecycleTopic::Turn,
-                name,
-                map,
-            )
+            hook_observation_topic(remuda_protocol::LifecycleTopic::Turn, name, map)
         };
 
         let mut producer = WorkflowProducer::new(InstanceId::new());
@@ -481,10 +477,7 @@ mod tests {
         // 1) StopFailure beats SubagentStart: agentId present, NO outcome,
         //    NO agentTranscriptPath. Nothing can be emitted yet, but the
         //    failure must be remembered against this agent.
-        let early = producer.on_observation(&hook(
-            "StopFailure",
-            &[("agentId", "early1")],
-        ));
+        let early = producer.on_observation(&hook("StopFailure", &[("agentId", "early1")]));
         assert!(
             early.is_empty(),
             "no run/member context yet: nothing emitted, failure is held"

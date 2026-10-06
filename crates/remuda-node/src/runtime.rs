@@ -2726,9 +2726,7 @@ fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &N
 /// `process_end` evidence is terminal. Subagent scope, configure and
 /// diagnostic topics return None (own scope). Mirrors the Hub's
 /// `root_turn_failed` derivation so Node local state and the Hub agree.
-fn root_turn_failure_activity(
-    observation: &remuda_protocol::Observation,
-) -> Option<Activity> {
+fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Option<Activity> {
     let ObservationPayload::Lifecycle(payload) = &observation.body else {
         return None;
     };
@@ -4064,8 +4062,15 @@ mod tests {
                     related: &[(&str, &str)],
                     status: &str,
                     severity: remuda_protocol::Severity| {
-            let mut observation =
-                native_lifecycle_full(topic, name, "not-applicable", related, severity, false, status);
+            let mut observation = native_lifecycle_full(
+                topic,
+                name,
+                "not-applicable",
+                related,
+                severity,
+                false,
+                status,
+            );
             observation.source.channel = SourceChannel::Hook;
             observation.source.driver_kind = DriverKind::ShellPty;
             observation
@@ -4086,7 +4091,7 @@ mod tests {
         .unwrap();
         // The owner's first event: subagent StopFailure, remudaActivity=idle.
         let before = store.get_instance(&id).unwrap();
-        let before_lifecycle = before.lifecycle.clone();
+        let before_lifecycle = before.lifecycle;
         let before_activity = before.activity.clone();
         tx.send(hook(
             remuda_protocol::LifecycleTopic::Turn,

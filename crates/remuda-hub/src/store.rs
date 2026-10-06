@@ -7736,7 +7736,12 @@ mod tests {
             .await
             .expect("settle");
         let deleted_id = deleted.instance_id.clone();
-        assert!(store.delete_instance(deleted.instance_id).await.expect("delete"));
+        assert!(
+            store
+                .delete_instance(deleted.instance_id)
+                .await
+                .expect("delete")
+        );
         backdate_tombstone(&store, &deleted_int, 2).await;
 
         // A still-pending row is never a settlement.
@@ -7796,7 +7801,10 @@ mod tests {
         assert!(onward_ids.contains(&fresh_int));
         assert!(!onward_ids.contains(&aged_int), "cursor is exclusive");
         assert!(
-            onward.iter().map(|(_, _, _, ts)| ts).is_sorted_by(|a, b| a <= b),
+            onward
+                .iter()
+                .map(|(_, _, _, ts)| ts)
+                .is_sorted_by(|a, b| a <= b),
             "cursor pages walk oldest-first"
         );
         assert!(onward.len() <= SETTLEMENT_LAG_PAGE as usize);
@@ -9210,7 +9218,10 @@ mod tests {
             state, "pending",
             "the root's pending approval stays answerable"
         );
-        assert!(reason.is_none(), "no generation-ended resolution is stamped");
+        assert!(
+            reason.is_none(),
+            "no generation-ended resolution is stamped"
+        );
 
         // The member-failed evidence itself is retained in the journal.
         let page = store
@@ -9219,7 +9230,10 @@ mod tests {
             .expect("read journal");
         let member_failed = page.events.iter().any(|record| {
             record.event.get("kind").and_then(Value::as_str) == Some("workflow.member")
-                && record.event.pointer("/payload/state").and_then(Value::as_str)
+                && record
+                    .event
+                    .pointer("/payload/state")
+                    .and_then(Value::as_str)
                     == Some("failed")
                 && record
                     .event
@@ -10957,9 +10971,7 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
     // "instance" key (LifecycleEntity::Instance, serde tag="instance"). Bare
     // entity events with only a state (driver shorthand / tests) and no other
     // entity key are treated as the instance.
-    let non_instance_entity_keys = [
-        "host", "workspace", "run", "command", "interaction",
-    ];
+    let non_instance_entity_keys = ["host", "workspace", "run", "command", "interaction"];
     let explicit_entity_type = payload.get("entityType").and_then(Value::as_str);
     let is_instance_entity = payload_type == "entity"
         && match explicit_entity_type {

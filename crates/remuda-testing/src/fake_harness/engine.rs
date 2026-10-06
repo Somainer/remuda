@@ -11,7 +11,6 @@
 //! on it instead of racing screen repaints.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -313,11 +312,13 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         .clone()
         .or_else(|| default_home(dialect))
         .ok_or_else(|| RunError::Args("could not resolve a harness home".into()))?;
-    // Review item 8: an explicitly supplied `--home` is still a test write
-    // target — confine it to the temp tree (the deliberate-run knob excepted).
-    crate::sandbox::ensure_path_in_temp(&home, "FAKE_HARNESS_ALLOW_HOME_WRITE")
+    // Round 3 item 9: an explicitly supplied `--home` is accepted only when
+    // the spawn helper allocated it (sentinel root subtree); fixed-temp
+    // ancestry alone is not authorization. The deliberate-run knob excepts a
+    // manual run.
+    crate::sandbox::ensure_home_allocated(&home, "FAKE_HARNESS_ALLOW_HOME_WRITE")
         .map_err(RunError::Io)?;
-    std::fs::create_dir_all(&home)?;
+    remuda_fdsafe::DirFd::open_or_create_abs(&home).map_err(std::io::Error::from)?;
     let session_id = opts
         .session_id
         .clone()
@@ -375,7 +376,33 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
     let events_file = match &events_path {
         Some(path) => {
             crate::sandbox::ensure_path_in_temp(path, "FAKE_HARNESS_ALLOW_HOME_WRITE")?;
-            Some(OpenOptions::new().create(true).append(true).open(path)?)
+            // Open the events log through the descriptor walk too.
+            let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let Some(name) = path.file_name() else {
+                return Err(RunError::Io(std::io::Error::other(
+                    "events path has no file name",
+                )));
+            };
+            let parent_fd =
+                remuda_fdsafe::DirFd::open_or_create_abs(parent).map_err(std::io::Error::from)?;
+            let file = match parent_fd.classify_leaf(name.as_encoded_bytes()) {
+                Ok(Some(entry)) if matches!(entry.kind, remuda_fdsafe::LeafKind::Regular) => {
+                    parent_fd
+                        .open_append_leaf(name.as_encoded_bytes())
+                        .map_err(std::io::Error::from)?
+                }
+                Ok(None) => parent_fd
+                    .create_leaf_excl(name.as_encoded_bytes())
+                    .map_err(std::io::Error::from)?,
+                Ok(_) => {
+                    return Err(RunError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "events path is a symlink or non-regular file",
+                    )));
+                }
+                Err(error) => return Err(RunError::Io(error.into())),
+            };
+            Some(file)
         }
         None => None,
     };

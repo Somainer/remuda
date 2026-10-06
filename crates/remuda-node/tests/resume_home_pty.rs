@@ -223,6 +223,8 @@ fn req(
 }
 
 fn install_fake_harness(root: &Path) -> PathBuf {
+    remuda_testing::sandbox::TempHome::adopt(root).expect("adopt per-test fake root");
+
     let install = root.join("opt/bin");
     std::fs::create_dir_all(&install).expect("bin dir");
     let source = remuda_testing::ensure_workspace_bin("fake-harness");

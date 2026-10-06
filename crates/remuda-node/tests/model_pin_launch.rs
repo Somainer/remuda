@@ -468,6 +468,8 @@ fn find_transcript(projects: &Path) -> Option<PathBuf> {
 /// Install a 0755 fake binary outside the workspace cwd (the override guard
 /// rejects group-writable target-dir files and anything inside the cwd).
 fn install_fake_claude(root: &Path) -> PathBuf {
+    remuda_testing::sandbox::TempHome::adopt(root).expect("adopt per-test fake root");
+
     let install = root.join("opt/bin");
     std::fs::create_dir_all(&install).expect("bin dir");
     let source = remuda_testing::ensure_workspace_bin("fake-harness");

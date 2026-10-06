@@ -4,7 +4,7 @@ use crate::flags::ClaudeFlags;
 use crate::paths::{FIXED_SESSION_ID, init_template};
 use crate::script::{ScriptStep, load_script_from_env, strip_helper_keys, when_filter};
 use serde_json::{Value, json};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -74,9 +74,12 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // `-p` ever came back.
     if let Ok(path) = std::env::var("FAKE_CLAUDE_ARGV_FILE") {
         let target = std::path::Path::new(&path);
-        ensure_path_in_temp(target)?;
         let argv: Vec<String> = std::env::args().skip(1).collect();
-        let _ = std::fs::write(target, argv.join("\n"));
+        crate::sandbox::write_allowed_file(
+            target,
+            argv.join("\n").as_bytes(),
+            ALLOW_HOME_WRITE_ENV,
+        )?;
     }
     // `FAKE_CLAUDE_GRANDCHILD_PID_FILE=<path>`: spawn one long-lived child in
     // **this process's group** and write its pid to the file.
@@ -397,26 +400,55 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
                 format!("resume: no CLAUDE_CONFIG_DIR to look up session {resume_id}"),
             )));
         };
-        let path = remuda_driver::claude_transcript::project_dir(&home, &flags.cwd)
-            .join(format!("{resume_id}.jsonl"));
-        if !path.is_file() {
-            return Err(FakeClaudeError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "No conversation found with session ID: {resume_id} (looked in {})",
-                    path.display()
-                ),
-            )));
-        }
-        return Ok(Some(OpenOptions::new().append(true).open(&path)?));
+        let slug =
+            remuda_driver::claude_transcript::project_dir(std::path::Path::new("/"), &flags.cwd)
+                .file_name()
+                .map(std::ffi::OsString::from)
+                .unwrap_or_default();
+        let file_name = format!("{resume_id}.jsonl");
+        return match crate::sandbox::open_existing_transcript_append(
+            &home,
+            &slug.to_string_lossy(),
+            &file_name,
+        ) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(FakeClaudeError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "No conversation found with session ID: {resume_id} (looked in {}/projects/{})",
+                        home.display(),
+                        slug.to_string_lossy()
+                    ),
+                )))
+            }
+            Err(error) => Err(FakeClaudeError::Io(error)),
+        };
     }
     if let Some(dir) = std::env::var_os("FAKE_CLAUDE_TRANSCRIPT_DIR").filter(|v| !v.is_empty()) {
         let dir = PathBuf::from(dir);
         ensure_path_in_temp(&dir)?;
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{session_id}.jsonl"));
+        // Same descriptor walk as the projects layout: no symlinked parent
+        // can redirect the create.
+        let dir_fd = remuda_fdsafe::DirFd::open_or_create_abs(&crate::sandbox::normalize(&dir))
+            .map_err(std::io::Error::from)?;
+        let file_name = format!("{session_id}.jsonl");
+        let name = file_name.as_bytes();
         return Ok(Some(
-            OpenOptions::new().create(true).append(true).open(path)?,
+            match dir_fd.classify_leaf(name).map_err(std::io::Error::from)? {
+                Some(entry) if matches!(entry.kind, remuda_fdsafe::LeafKind::Regular) => dir_fd
+                    .open_append_leaf(name)
+                    .map_err(std::io::Error::from)?,
+                Some(_) => {
+                    return Err(FakeClaudeError::Io(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("transcript dir entry {file_name} is not a regular file"),
+                    )));
+                }
+                None => dir_fd
+                    .create_leaf_excl(name)
+                    .map_err(std::io::Error::from)?,
+            },
         ));
     }
     // Fresh session: persist under the config home's projects layout, exactly
@@ -426,12 +458,19 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
     // the operator's real ~/.claude.
     match sandboxed_transcript_home()? {
         Some(home) => {
-            let dir = remuda_driver::claude_transcript::project_dir(&home, &flags.cwd);
-            std::fs::create_dir_all(&dir)?;
-            let path = dir.join(format!("{session_id}.jsonl"));
-            Ok(Some(
-                OpenOptions::new().create(true).append(true).open(path)?,
-            ))
+            let slug = remuda_driver::claude_transcript::project_dir(
+                std::path::Path::new("/"),
+                &flags.cwd,
+            )
+            .file_name()
+            .map(std::ffi::OsString::from)
+            .unwrap_or_default();
+            let file = crate::sandbox::append_project_transcript(
+                &home,
+                &slug.to_string_lossy(),
+                &format!("{session_id}.jsonl"),
+            )?;
+            Ok(Some(file))
         }
         None => Ok(None),
     }
@@ -554,19 +593,25 @@ fn block_sigterm() {
 #[cfg(unix)]
 fn spawn_group_grandchild() -> Option<std::process::Child> {
     let pid_path = std::env::var("FAKE_CLAUDE_GRANDCHILD_PID_FILE").ok()?;
-    if ensure_path_in_temp(std::path::Path::new(&pid_path)).is_err() {
-        // Never write a pid file outside the per-test temp tree.
-        return None;
-    }
     // No `process_group`/`setsid`: stay in the fake's group. `sleep` ignores
     // stdin, so it survives EOF like the IGNORE_EOF/IGNORE_SIGTERM parent.
-    let child = std::process::Command::new("sleep")
+    let mut child = std::process::Command::new("sleep")
         .arg("300")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let _ = std::fs::write(&pid_path, child.id().to_string());
+    if crate::sandbox::write_allowed_file(
+        std::path::Path::new(&pid_path),
+        child.id().to_string().as_bytes(),
+        ALLOW_HOME_WRITE_ENV,
+    )
+    .is_err()
+    {
+        // Never write a pid file outside an allocated root.
+        let _ = child.kill();
+        return None;
+    }
     Some(child)
 }

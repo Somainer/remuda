@@ -38,6 +38,8 @@ fn serve_config(workspace: &Path, data: &Path, binary: &Path) -> ServeConfig {
 /// Install a 0755 fake claude outside the workspace cwd: the binary override
 /// guard rejects group-writable target-dir files and anything inside the cwd.
 fn install_fake_claude(root: &Path) -> PathBuf {
+    remuda_testing::sandbox::TempHome::adopt(root).expect("adopt per-test fake root");
+
     let install = root.join("opt/bin");
     std::fs::create_dir_all(&install).expect("bin dir");
     let source = remuda_testing::ensure_workspace_bin("fake-claude");
@@ -545,6 +547,99 @@ async fn resume_uses_the_recorded_transcript_path_even_outside_the_native_home()
             .join("subagents/side.jsonl")
             .is_file(),
         "the renamed transcript's <dir>/<S>/ sidecars are staged by session id"
+    );
+}
+
+/// Round 3 item 8: a non-empty RECORDED transcript path is authoritative. If
+/// that file (B) is missing, a stale same-session file (A) left in the
+/// predecessor's managed home must NOT be substituted — the request is refused
+/// before any instance row is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_recorded_transcript_is_refused_even_when_stale_home_history_exists() {
+    use remuda_node::{LocalStore, MemoryStore, native_driver_registry};
+    use std::sync::Arc;
+
+    let root_dir = tempfile::tempdir().expect("tempdir");
+    let root = root_dir.path().to_path_buf();
+    let data = root.join("data");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let binary = install_fake_claude(&root);
+
+    let store: Arc<MemoryStore> = Arc::new(MemoryStore::new(256));
+    let native = NativeDriverConfig::new(data.clone()).with_claude_binary(binary.clone());
+    let registry = native_driver_registry(native).expect("native registry");
+    let node = DevNode::with_parts(
+        &serve_config(&workspace, &data, &binary).http,
+        store.clone(),
+        registry,
+    )
+    .expect("node");
+
+    let parent_home = root.join("homes/gen-0");
+    std::fs::create_dir_all(&parent_home).expect("home0");
+    let parent = node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "first turn",
+            None,
+            &binary,
+            &parent_home,
+        ))
+        .await
+        .expect("parent create");
+    wait_settled(&node, &parent.command.command_id).await;
+    let parent_id = parent.instance.meta.id.clone();
+    let session = recorded_session(&node, &parent_id).await;
+
+    // A: the stale managed-home transcript — same session, still on disk.
+    let stale = transcript_in(&parent_home, &workspace, &session);
+    assert!(stale.is_file(), "stale home history exists");
+    // B: the recorded path, deliberately missing.
+    let missing = root.join("elsewhere/vanished-conversation.jsonl");
+    assert!(!missing.exists());
+    store
+        .set_native_session(&parent_id, &session, Some(missing.to_str().unwrap()), None)
+        .expect("record the missing transcript path");
+
+    let before: std::collections::BTreeSet<_> = store
+        .list_instances()
+        .expect("list")
+        .iter()
+        .map(|instance| instance.meta.id.clone())
+        .collect();
+
+    let child_home = root.join("homes/gen-1");
+    std::fs::create_dir_all(&child_home).expect("home1");
+    let error = node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "second turn",
+            Some((&parent_id, session.as_str())),
+            &binary,
+            &child_home,
+        ))
+        .await
+        .expect_err("the missing recorded transcript is refused before acceptance");
+    let message = error.to_string();
+    assert!(
+        message.contains("recorded predecessor transcript")
+            && (message.contains("missing") || message.contains("not a readable regular file")),
+        "the refusal names the recorded file, not the stale one: {message}"
+    );
+
+    // No new instance row was created.
+    let after: std::collections::BTreeSet<_> = store
+        .list_instances()
+        .expect("list")
+        .iter()
+        .map(|instance| instance.meta.id.clone())
+        .collect();
+    assert_eq!(before, after, "a refused resume creates no instance row");
+    // The stale transcript was never staged into the child home.
+    assert!(
+        !transcript_in(&child_home, &workspace, &session).exists(),
+        "the stale managed-home history must not be substituted"
     );
 }
 

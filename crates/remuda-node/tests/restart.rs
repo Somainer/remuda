@@ -175,6 +175,8 @@ async fn fake_claude_kill_mid_session_replays_identical_folds() {
     let data = tempfile::tempdir().expect("data dir");
     let claude_config = data.path().join("claude-config");
     std::fs::create_dir_all(&claude_config).expect("isolated Claude config");
+    // Round 3: the fake persists only under an allocated (sentinel) root.
+    remuda_testing::sandbox::TempHome::adopt(data.path()).expect("adopt restart fixture root");
     let http = loopback_config(data.path());
     let mut native = NativeDriverConfig::new(data.path().to_path_buf()).with_claude_binary(fake);
     native.extra_env.insert(

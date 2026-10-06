@@ -12,7 +12,7 @@
 //! `TranscriptTail` / `RolloutTail` / `SessionTail` polls observe records the
 //! same way they do against the real binaries.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -84,16 +84,15 @@ impl ArtifactSet {
         clock: &FakeClock,
     ) -> std::io::Result<(Self, ArtifactPaths)> {
         let paths = artifact_paths(kind, home, &meta, clock);
-        if let Some(parent) = paths.main.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let main = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&paths.main)?;
+        // Every artifact write goes through the descriptor-relative walk: a
+        // symlinked parent or leaf (e.g. projects -> ~/.claude/projects) is
+        // refused instead of written through.
+        let main = crate::sandbox::append_or_create(&paths.main, "FAKE_HARNESS_ALLOW_HOME_WRITE")?;
         let events = if let Some(path) = &paths.events {
-            std::fs::create_dir_all(path.parent().expect("events parent"))?;
-            Some(OpenOptions::new().create(true).append(true).open(path)?)
+            Some(crate::sandbox::append_or_create(
+                path,
+                "FAKE_HARNESS_ALLOW_HOME_WRITE",
+            )?)
         } else {
             None
         };
@@ -106,7 +105,11 @@ impl ArtifactSet {
             grok_seq: 0,
         };
         if let Some(path) = &paths.grok_dir {
-            std::fs::write(path.join("usage.json"), "{}\n")?;
+            crate::sandbox::write_allowed_file(
+                &path.join("usage.json"),
+                b"{}\n",
+                "FAKE_HARNESS_ALLOW_HOME_WRITE",
+            )?;
         }
         Ok((set, paths))
     }
@@ -180,8 +183,7 @@ impl ArtifactSet {
         let Some(path) = self.grok_terminal_path(tool_call_id) else {
             return Ok(None);
         };
-        std::fs::create_dir_all(path.parent().expect("terminal dir"))?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = crate::sandbox::append_or_create(&path, "FAKE_HARNESS_ALLOW_HOME_WRITE")?;
         writeln!(file, "{line}")?;
         file.flush()?;
         Ok(Some(path))
@@ -885,10 +887,7 @@ pub fn codex_session_index(
     name: &str,
     clock: &FakeClock,
 ) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = crate::sandbox::append_or_create(path, "FAKE_HARNESS_ALLOW_HOME_WRITE")?;
     writeln!(
         file,
         "{}",
@@ -1339,12 +1338,13 @@ pub fn grok_write_registry(
         "cwd": meta.cwd.to_string_lossy(),
         "opened_at": clock.rfc3339()
     }]);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(home.join("active_sessions.json"))?;
-    writeln!(file, "{}", body)
+    let mut body_bytes = serde_json::to_vec(&body)?;
+    body_bytes.push(b'\n');
+    crate::sandbox::write_allowed_file(
+        &home.join("active_sessions.json"),
+        &body_bytes,
+        "FAKE_HARNESS_ALLOW_HOME_WRITE",
+    )
 }
 
 #[cfg(test)]
@@ -1566,6 +1566,9 @@ mod tests {
     #[test]
     fn terminal_log_appends_under_the_session_dir() {
         let root = tempfile::tempdir().unwrap();
+        // The artifact writes are authorized only under a marked allocated
+        // root; mark this test's own temp directory.
+        crate::sandbox::TempHome::adopt(root.path()).expect("adopt test root");
         let meta = SessionMeta {
             session_id: "s-1".into(),
             cwd: PathBuf::from("/work"),

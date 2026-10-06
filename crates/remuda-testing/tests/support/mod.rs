@@ -111,6 +111,9 @@ impl HarnessBuilder {
         let owns_home = self.home.is_none();
         let home = self.home.unwrap_or_else(temp_home);
         std::fs::create_dir_all(&home).expect("mkdir home");
+        // Round 3: every fake write must live inside a deliberately allocated
+        // (sentinel-marked) root; the support layer is that spawn helper.
+        remuda_testing::sandbox::TempHome::adopt(&home).expect("adopt harness home");
         let events_path = home.join("events.jsonl");
         cmd.env("HOME", home.clone());
         cmd.env("TERM", "xterm-256color");
@@ -176,6 +179,7 @@ pub fn temp_home() -> PathBuf {
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("mkdir");
+    remuda_testing::sandbox::TempHome::adopt(&dir).expect("adopt temp home");
     dir
 }
 

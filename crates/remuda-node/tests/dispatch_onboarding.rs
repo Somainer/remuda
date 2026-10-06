@@ -100,6 +100,8 @@ fn init_repo(root: &Path) {
 }
 
 fn install_fake_claude(root: &Path) -> PathBuf {
+    remuda_testing::sandbox::TempHome::adopt(root).expect("adopt per-test fake root");
+
     let install = root.join("opt/bin");
     std::fs::create_dir_all(&install).unwrap();
     let dest = install.join("claude");

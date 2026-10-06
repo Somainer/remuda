@@ -117,6 +117,10 @@ async fn start(
 fn native_fixture(path: &Path) -> (ServeConfig, std::path::PathBuf, std::path::PathBuf) {
     // Fake model runs must never preflight the developer's personal config.
     std::fs::create_dir_all(path.join("claude-config")).unwrap();
+    // Round 3: the fake persists only under a deliberately allocated root;
+    // this fixture's temp dir is that root (the config dir, gates and release
+    // all live beneath it).
+    remuda_testing::sandbox::TempHome::adopt(path).expect("adopt daemon fixture root");
     let wrapper = path.join("fake-claude-gated");
     std::fs::write(&wrapper, include_bytes!("fixtures/daemon-fake-claude.sh")).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();

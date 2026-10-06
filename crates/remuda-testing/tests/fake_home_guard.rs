@@ -1,48 +1,27 @@
 //! Guard for the `fake-claude` test double: it must never persist a session
-//! into the operator's real `~/.claude` (c-resumehome review item 8).
+//! outside a deliberately allocated write root (c-resumehome round 3).
 //!
-//! The fake is allowed to write only inside the OS temp tree:
-//! - a non-temp implicit `$HOME` (the operator's home) silently skips
-//!   persistence while the process still runs the turn normally;
-//! - a per-test temp home gets the real `projects/` layout;
-//! - an explicit non-temp `CLAUDE_CONFIG_DIR` is refused loudly at startup.
+//! Round 3 changed the model: authorization is a **sentinel-marked allocated
+//! root** (`remuda_testing::sandbox::TempHome::allocate`), never mere
+//! `$TMPDIR`/`$HOME`/`/tmp` ancestry, and the fake's writes go through an
+//! `O_NOFOLLOW` descriptor walk. These tests are therefore mandatory (no
+//! early `return` on hosts where cargo's scratch lives under `/tmp`) and
+//! placement-independent:
+//!
+//! - every non-authorized home is a sibling of an allocated root under the
+//!   fixed system temp, so the premise holds on every host;
+//! - every assertion names the exact refusal;
+//! - a symlinked `projects` inside an otherwise allocated home proves the
+//!   fd walk, not the path string, is what gates writes.
 
+use remuda_testing::sandbox::TempHome;
 use remuda_testing::{
     FIXED_SESSION_ID, FakeClaudeProcess, ScriptKind, SpawnOptions, is_system_subtype, is_type,
     spawn_fake_claude,
 };
-use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Lexically normalize `path` (no symlink following), making it absolute.
-fn normalized(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap().join(path)
-    };
-    let mut out = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-/// Whether `path` resolves inside the OS temp directory.
-fn is_under_temp(path: &Path) -> bool {
-    let temp = std::fs::canonicalize(std::env::temp_dir())
-        .unwrap_or_else(|_| normalized(&std::env::temp_dir()));
-    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| normalized(path));
-    candidate.starts_with(temp)
-}
 
 /// Boot, initialize and finish one OK turn; the returned child has not yet been
 /// reaped (stdin is still open).
@@ -71,20 +50,8 @@ fn run_turn(envs: Vec<(String, String)>) -> FakeClaudeProcess {
     child
 }
 
-/// A directory outside the temp tree for "operator home" simulations. Cargo's
-/// integration-test scratch lives under the worktree target dir, which is
-/// outside the temp tree on ordinary hosts. Returns `None` on hosts where the
-/// target dir itself is under tmp (the guard premise cannot be simulated).
-fn outside_temp_scratch(label: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("fake-guard-{label}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    (!is_under_temp(&dir)).then_some(dir)
-}
-
 /// First `*.jsonl` found while walking `root`, if any.
-fn first_jsonl(root: &Path) -> Option<PathBuf> {
+fn first_jsonl(root: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop()
         && let Ok(entries) = std::fs::read_dir(dir)
@@ -101,35 +68,45 @@ fn first_jsonl(root: &Path) -> Option<PathBuf> {
     None
 }
 
+/// MANDATORY: a `HOME` outside an allocated root runs the turn normally but
+/// persists nothing under that home. Placement-independent: the home is a
+/// fresh sibling of the allocated root, inside the fixed system temp.
 #[test]
-fn fresh_session_does_not_write_a_non_temp_operator_home() {
-    let Some(operator_home) = outside_temp_scratch("operator") else {
-        eprintln!("skipping: the target scratch dir is itself under the temp tree");
-        return;
-    };
+fn fresh_session_does_not_write_a_non_allocated_operator_home() {
+    let root = TempHome::allocate("guard-operator").expect("allocated root");
+    let operator_home = root.child("operator");
+    std::fs::create_dir_all(&operator_home).expect("operator home");
+    // Strip the sentinel from this subtree so it is plainly not a root: give
+    // the fake a sibling directory instead, which can never carry one.
+    let sibling = root
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("{}-nonroot", std::process::id()));
+    std::fs::create_dir_all(&sibling).expect("sibling home");
+
     let child = run_turn(vec![(
         "HOME".to_owned(),
-        operator_home.to_string_lossy().into_owned(),
+        sibling.to_string_lossy().into_owned(),
     )]);
     let status = child.wait().expect("wait fake-claude");
     assert!(
         status.success(),
-        "with no writable per-test home the turn still runs"
+        "with no writable allocated home the turn still runs"
     );
     assert!(
-        !operator_home.join(".claude").exists(),
-        "the fake must never create a ~/.claude tree in a non-temp operator HOME: {}",
-        operator_home.display()
+        !sibling.join(".claude").exists(),
+        "the fake must never create a ~/.claude tree outside an allocated root: {}",
+        sibling.display()
     );
-    let _ = std::fs::remove_dir_all(&operator_home);
 }
 
+/// MANDATORY: a fresh session persists the real `projects/<slug>/<id>.jsonl`
+/// layout under an allocated root.
 #[test]
-fn fresh_session_persists_under_a_per_test_temp_home() {
-    let root = std::env::temp_dir().join(format!("fake-guard-temp-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("temp root");
-    let fake_home = root.join("testhome");
+fn fresh_session_persists_under_an_allocated_home() {
+    let root = TempHome::allocate("guard-persist").expect("allocated root");
+    let fake_home = root.child("testhome");
     std::fs::create_dir_all(&fake_home).expect("fake home");
 
     let child = run_turn(vec![(
@@ -140,39 +117,80 @@ fn fresh_session_persists_under_a_per_test_temp_home() {
 
     let projects = fake_home.join(".claude/projects");
     let transcript = first_jsonl(&projects)
-        .expect("a HOME inside the temp tree receives the real projects/<slug>/<id>.jsonl layout");
-    let expected = format!("{FIXED_SESSION_ID}.jsonl");
+        .expect("an allocated HOME receives the real projects/<slug>/<id>.jsonl layout");
     assert_eq!(
         transcript.file_name().and_then(std::ffi::OsStr::to_str),
-        Some(expected.as_str())
+        Some(format!("{FIXED_SESSION_ID}.jsonl").as_str())
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
+/// MANDATORY negative process test: an explicit `CLAUDE_CONFIG_DIR` outside
+/// any allocated root is refused loudly with the named reason, before init,
+/// and creates nothing. This runs on every host (no temp-placement skip).
 #[test]
-fn explicit_config_dir_outside_temp_is_refused_loudly() {
-    let Some(foreign) = outside_temp_scratch("explicit") else {
-        eprintln!("skipping: the target scratch dir is itself under the temp tree");
-        return;
-    };
-    let config_dir = foreign.join("managed-home");
+fn explicit_config_dir_outside_an_allocated_root_is_refused_loudly() {
+    let root = TempHome::allocate("guard-explicit").expect("allocated root");
+    // A directory OUTSIDE every fixed system temp mount, so fixed-temp
+    // ancestry can never authorize it. /dev/shm is a writable non-tmp mount
+    // on every Linux CI host; the test is mandatory (never skipped).
+    #[cfg(target_os = "linux")]
+    let foreign_base = std::path::PathBuf::from("/dev/shm");
+    #[cfg(not(target_os = "linux"))]
+    let foreign_base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let foreign = foreign_base.join(format!(
+        "remuda-fake-guard-explicit-{}-{}",
+        std::process::id(),
+        root.path().file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&foreign).expect("foreign dir");
+
     let mut opts = SpawnOptions::bundled(ScriptKind::Ok);
     opts.extra_envs = vec![(
         "CLAUDE_CONFIG_DIR".to_owned(),
-        config_dir.to_string_lossy().into_owned(),
+        foreign.to_string_lossy().into_owned(),
     )];
     let child = spawn_fake_claude(opts).expect("spawn fake-claude");
-    // Transcript resolution happens before the init frame is emitted.
     let init = child.recv_until(Duration::from_secs(2), |v| is_system_subtype(v, "init"));
     assert!(
         init.is_err(),
-        "an explicit non-temp CLAUDE_CONFIG_DIR must stop the fake before init"
+        "an explicit non-allocated CLAUDE_CONFIG_DIR must stop the fake before init"
     );
     let status = child.wait().expect("wait");
     assert!(!status.success(), "the refusal is a non-zero exit");
     assert!(
-        !config_dir.join("projects").exists(),
+        !foreign.join("projects").exists(),
         "nothing is created at the refused config dir"
     );
-    let _ = std::fs::remove_dir_all(&foreign);
+}
+
+/// MANDATORY: inside an allocated home, a symlinked `projects` entry pointing
+/// at a non-allocated directory must not redirect the transcript write. The
+/// fd walk refuses the link, so the fake exits non-zero and no byte lands at
+/// the target.
+#[test]
+fn a_symlinked_projects_inside_the_home_is_refused_not_followed() {
+    use std::os::unix::fs::symlink;
+    let root = TempHome::allocate("guard-symlink").expect("allocated root");
+    let home = root.child("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let sink = root.child("real-projects-sink");
+    std::fs::create_dir_all(&sink).expect("sink dir");
+    symlink(&sink, home.join(".claude")).expect(".claude link");
+
+    let mut opts = SpawnOptions::bundled(ScriptKind::Ok);
+    opts.extra_envs = vec![("HOME".to_owned(), home.to_string_lossy().into_owned())];
+    let child = spawn_fake_claude(opts).expect("spawn fake-claude");
+    // The transcript open is before the init frame; it must fail.
+    let init = child.recv_until(Duration::from_secs(2), |v| is_system_subtype(v, "init"));
+    assert!(
+        init.is_err(),
+        "a symlinked .claude entry must stop the fake"
+    );
+    let status = child.wait().expect("wait");
+    assert!(!status.success(), "the refusal is a non-zero exit");
+    assert!(
+        first_jsonl(&sink).is_none(),
+        "a symlinked .claude entry must never receive transcript bytes: {}",
+        sink.display()
+    );
 }

@@ -51,6 +51,8 @@ fn run_harness(turns: u32, prompts: &[&str]) -> Capture {
     let cwd = dir.path().join("work");
     std::fs::create_dir_all(&home).expect("home");
     std::fs::create_dir_all(&cwd).expect("cwd");
+    // Round 3: the fake writes only inside an allocated (sentinel) root.
+    remuda_testing::sandbox::TempHome::adopt(dir.path()).expect("adopt fixture root");
 
     // Round-trip hook: appends every payload as one JSON line.
     let hook_sh = fixtures_dir().join("fake-harness/hooks/hook.sh");

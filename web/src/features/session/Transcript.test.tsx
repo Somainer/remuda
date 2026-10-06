@@ -1826,6 +1826,40 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
 describe("load-earlier anchor lifecycle round 5", () => {
   const ROW = 96;
   const VIEW = 720;
+  // Active browser-like scroll model: the prototype scrollTop override is
+  // installed once but reads the CURRENT installGeo harness (its closures
+  // differ per test), so each test's clamp/event/onWrite options apply.
+  type ScrollModel = {
+    echoOnWrite: boolean;
+    onWrite?: (v: number) => void;
+    clampHeight?: () => number;
+    total: () => number;
+    clientHeight: () => number;
+    getTop: () => number;
+    setTop: (v: number) => void;
+    queue: () => void;
+    isQueued: () => boolean;
+    clearQueued: () => void;
+  };
+  let activeScroll: ScrollModel | null = null;
+  let protoScrollInstalled = false;
+  // Where jsdom defines the native accessor: restore by defineProperty on the
+  // same object, or by deleting an own override that shadowed a prototype one.
+  const nativeScrollOwner: { desc: PropertyDescriptor; on: Element } | null = (() => {
+    const onH = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop");
+    if (onH) return { desc: onH, on: HTMLElement.prototype };
+    const onE = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+    return onE ? { desc: onE, on: Element.prototype } : null;
+  })();
+  const restoreNativeScrollTop = () => {
+    if (!protoScrollInstalled || !nativeScrollOwner) return;
+    if (nativeScrollOwner.on === HTMLElement.prototype) {
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", nativeScrollOwner.desc);
+    } else {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollTop;
+    }
+    protoScrollInstalled = false;
+  };
 
   function source() {
     return {
@@ -2094,35 +2128,70 @@ describe("load-earlier anchor lifecycle round 5", () => {
     }
     vi.stubGlobal("ResizeObserver", GeoRO);
     const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
-    // Browser-like scroll model: clamp to [0, scrollHeight - clientHeight],
-    // no event when the value does not change, and a programmatic write's
-    // scroll event is delivered next frame (coalesced).
+    // Browser-like scroll model installed on the PROTOTYPE, so it also
+    // intercepts the component's very first-mount restore write (an
+    // element-level override installed after render misses it). Clamp to
+    // [0, scrollHeight - clientHeight], no event when the value does not
+    // change, and a programmatic write's scroll event is delivered next frame
+    // (coalesced). Non-scroller elements keep the native accessor.
     let queued = false;
-    const maxScroll = () => Math.max(0, (opts.clampHeight?.() ?? dynamicTotal * ROW) - VIEW);
-    const dispatchScroll = () => {
-      queued = false;
-      fireEvent.scroll(scroller());
+    const model: ScrollModel = {
+      echoOnWrite,
+      onWrite: opts.onWrite,
+      clampHeight: opts.clampHeight,
+      total: () => dynamicTotal,
+      clientHeight: () => VIEW,
+      getTop: () => top,
+      setTop: (v) => {
+        top = v;
+      },
+      queue: () => {
+        queued = true;
+      },
+      isQueued: () => queued,
+      clearQueued: () => {
+        queued = false;
+      },
     };
-    const defineScroll = () => {
-      const el = scroller();
-      Object.defineProperty(el, "scrollTop", {
+    activeScroll = model;
+    const nativeDesc = nativeScrollOwner?.desc;
+    if (!protoScrollInstalled) {
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", {
         configurable: true,
-        get: () => top,
-        set: (v: number) => {
-          const clamped = Math.max(0, Math.min(v, maxScroll()));
-          if (clamped === top) return;
-          top = clamped;
-          opts.onWrite?.(clamped);
-          if (echoOnWrite && !queued) {
-            queued = true;
-            requestAnimationFrame(dispatchScroll);
+        get(this: HTMLElement) {
+          if (isScroller(this) && activeScroll) return activeScroll.getTop();
+          return nativeDesc?.get?.call(this) as number;
+        },
+        set(this: HTMLElement, v: number) {
+          const m = activeScroll;
+          if (!isScroller(this) || !m) {
+            nativeDesc?.set?.call(this, v);
+            return;
+          }
+          const max = Math.max(0, (m.clampHeight?.() ?? m.total() * ROW) - m.clientHeight());
+          const clamped = Math.max(0, Math.min(v, max));
+          if (clamped === m.getTop()) return;
+          m.setTop(clamped);
+          m.onWrite?.(clamped);
+          if (m.echoOnWrite && !m.isQueued()) {
+            m.queue();
+            const el = this;
+            requestAnimationFrame(() => {
+              m.clearQueued();
+              fireEvent.scroll(el);
+            });
           }
         },
       });
-    };
+      protoScrollInstalled = true;
+    }
+    // Kept for call-site compatibility: the prototype model needs no element
+    // setup and works before render.
+    const defineScroll = () => {};
     // An explicit reader gesture: clamped and dispatched synchronously.
     const scrollTo = (value: number) => {
-      top = Math.max(0, Math.min(value, maxScroll()));
+      const max = Math.max(0, (opts.clampHeight?.() ?? dynamicTotal * ROW) - VIEW);
+      top = Math.max(0, Math.min(value, max));
       fireEvent.scroll(scroller());
     };
     /** Flush the setter's coalesced next-frame scroll event(s). */
@@ -2168,6 +2237,9 @@ describe("load-earlier anchor lifecycle round 5", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    activeScroll = null;
+    // Restore the native scrollTop accessor the geometry stub replaced.
+    restoreNativeScrollTop();
   });
 
   it("a restore whose own scroll event lands mid-flight completes instead of cancelling (item 1)", async () => {
@@ -2722,51 +2794,81 @@ describe("load-earlier anchor lifecycle round 5", () => {
       });
     });
 
-    // UO-6a round 7 item 2: the browser can CLAMP a saved-position restore
-    // write when the tail is short (requested offset beyond
-    // scrollHeight - clientHeight). The echo must record the kept value so
-    // the restore does not cancel its own clamped event and stop refining.
+    // UO-6a round 7 item 2: the browser can CLAMP a load-earlier restore
+    // write when the tail below the armed anchor is shorter than the
+    // viewport (the requested top exceeds scrollHeight - clientHeight). The
+    // echo must record the kept value, not the requested one, or the restore
+    // cancels its own clamped echo and releases the prepend repin.
     describe("round 7 item 2: a clamped restore echo does not self-cancel", () => {
-      it("keeps refining a saved-position restore after its write is clamped", async () => {
+      it("keeps the prepend anchor armed when the repin write is clamped mid-flight", async () => {
+        const user = userEvent.setup();
         const writes: number[] = [];
-        const geo = installGeo(20, {
+        const TAIL = 7;
+        const PREPEND = 40;
+        const geo = installGeo(TAIL, {
           echoOnWrite: true,
           onWrite: (v) => writes.push(v),
         });
         const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
-        const events: Observation[] = [];
-        for (let i = 0; i < 20; i += 1) events.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insSavedClamp"));
-        // Saved position on a deep row (index 19): the estimated jump
-        // requests near 19*ROW, but the short 20-row tail clamps scrollTop
-        // to 20*ROW - VIEW (1200).
-        localStorage.setItem(
-          "runtime.reading.v1.insSavedClamp",
-          JSON.stringify({ anchorId: events[19]!.id, offset: 0, ratio: 1, avgRow: ROW, follow: false }),
-        );
-        vi.spyOn(hubStore, "loadEarlier").mockResolvedValue({ prepended: false, end: false, floor: "1" });
+        const tail: Observation[] = [];
+        for (let i = 0; i < TAIL; i += 1) tail.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insLEClamp"));
+        const older: Observation[] = [];
+        for (let seq = 961; seq <= 1000; seq += 1) older.push(m(seq, seq % 2 ? "user" : "assistant", "insLEClamp"));
+        const g = gate<ReturnType<typeof pageOf>>();
+        const done = gate<void>();
+        makeClient(reg, "insLEClamp", tail, () => g.promise, "1001", "1007");
+        vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (iid) => {
+          const result = await reg.clients[iid]!.loadEarlier();
+          reg.setFloor[iid]?.(reg.clients[iid]!.retainedFloorSeq);
+          await done.promise;
+          return result;
+        });
         render(
-          <MemoryRouter initialEntries={["/s/insSavedClamp"]}>
+          <MemoryRouter initialEntries={["/s/insLEClamp"]}>
             <Routes>
-              <Route path="/s/:instanceId" element={<Driver reg={reg} compact={false} />} />
+              <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
             </Routes>
           </MemoryRouter>,
         );
         geo.defineScroll();
-        // Initial restore commits; the write is clamped to the tail bottom.
-        await act(async () => {});
+        geo.scrollTo(0);
+        await user.click(screen.getByTestId("load-earlier"));
+        // The 40-row prepend lands: the scrollHeight model must already cover
+        // it when the restore writes.
+        geo.setTotal(TAIL + PREPEND);
+        await act(async () => {
+          g.resolve(pageOf(older));
+          await Promise.resolve();
+        });
+        // The anchor lands 40 rows deep: requested 40*ROW=3840, but the 47
+        // rows of content clamp the write to 47*ROW - VIEW = 3792.
+        const clampMax = (TAIL + PREPEND) * ROW - VIEW;
         await geo.nextFrame();
-        const clampedTop = 20 * ROW - VIEW;
-        expect(writes).toContain(clampedTop);
+        expect(writes).toContain(clampMax);
 
-        // The restore survives the clamped echo and keeps refining as rows
-        // measure: after the echo lands the window shifts to show the anchor;
-        // growing a mounted row ABOVE it (ordinal 0) shifts the anchor down,
-        // so the still-active correction loop writes again. A self-cancelled
-        // restore goes permanently silent.
+        // The clamped echo lands mid-flight. Settle the click, then grow a
+        // mounted row BELOW the armed anchor: the still-armed repin recomputes
+        // and scrolls up to hold the anchor (writing again); a restore that
+        // self-cancelled on the clamped echo released the repin and stays
+        // silent (the pin re-write is the same clamped value, also a no-op).
+        await act(async () => {
+          done.resolve();
+          await Promise.resolve();
+        });
         const before = writes.length;
-        geo.growRow(0, ROW + 44);
+        // While pinned at the clamp line nothing can move scrollTop, so grow
+        // the journal below (normal live append): the tail unclamps and a
+        // still-armed repin realizes its outstanding delta toward 40*ROW. A
+        // self-cancelled restore released the repin, so only the pin write to
+        // the new bottom appears and 40*ROW is never written.
+        for (let i = 0; i < 10; i += 1) {
+          reg.events.insLEClamp!.push(m(2001 + i, i % 2 ? "user" : "assistant", "insLEClamp"));
+        }
+        geo.setTotal(TAIL + PREPEND + 10);
+        reg.setEvents.insLEClamp(reg.events.insLEClamp!.slice());
         await act(async () => {});
-        expect(writes.length).toBeGreaterThan(before);
+        expect(writes.length, "the clamped echo self-cancelled the prepend repin").toBeGreaterThan(before);
+        expect(writes).toContain(PREPEND * ROW);
       });
     });
   });

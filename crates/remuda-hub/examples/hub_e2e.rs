@@ -4181,6 +4181,21 @@ fn fake_hook_question(instance_id: &str, host_id: &str, interaction_id: &str) ->
 /// r-ux-comment: prompts mentioning code get an assistant reply containing a
 /// fenced ts block, so the browser spec can quote it with the 评论 action.
 fn code_comment_reply(prompt: &str) -> Option<String> {
+    // Font-swap fixture: a pre-wrap fenced block whose LONG lines cross a wrap
+    // boundary between the fallback monospace and IBM Plex Mono at both the
+    // desktop read measure and the 390px mobile pane, so a real font swap
+    // changes the block's (and thus the transcript row's) HEIGHT, not just
+    // glyph widths. Rendered with soft-wrap on (the spec sets
+    // runtime.code-wrap=1).
+    if prompt.contains("font wrap probe") {
+        let long = "const fontSwapProbe = aaaa9bbb8cccc7dddd6eeee5ffff4gggg3hhhh2iiii1jjjj0kkkk9llll8mmmm7nnnn6oooo5pppp4qqqq3rrrr2ssss1tttt0uuuu9vvvv8wwww7xxxx6yyyy5zzzz4aaaa3bbbb2cccc1dddd0eeee9ffff8gggg7hhhh6iiii5jjjj4kkkk3llll2mmmm1nnnn0oooo9pppp8qqqq7rrrr6ssss5tttt4uuuu3vvvv2wwww1xxxx0;".repeat(4);
+        let mut body = String::from("here is a function that wraps across the fallback and final faces:\n\n```ts src/font_swap_probe.ts\n");
+        for i in 0..4 {
+            body.push_str(&format!("// wrap probe line {i}: {long}\n"));
+        }
+        body.push_str("export function fontSwapProbe(): string {\n  return \"font metrics moved the wrap count\";\n}\n```\n\nask about any wrapped line.");
+        return Some(body);
+    }
     if !prompt.contains("show me code") {
         return None;
     }

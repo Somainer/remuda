@@ -204,6 +204,11 @@ function TranscriptInner({
   // it explicitly (collapse must re-fold even a previously expanded row).
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
 
+  // TEST-ONLY: the font-swap e2e passes ?restoreProbe=1 to observe the
+  // pending-restore phase via a scroller attribute. No product effect.
+  const restoreProbe =
+    typeof window !== "undefined" && new URLSearchParams(window.location.search).has("restoreProbe");
+
   // Bounded-window paging: true while the load-earlier row awaits its page.
   // Declared before the route-switch reset below, which clears it per
   // instance like the other per-route refs.
@@ -604,9 +609,20 @@ function TranscriptInner({
       // opens at the top); a DOM-relative correction is independent of which
       // other rows happen to have been measured.
       const rowEl = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(pending.anchorId)}"]`);
+      // TEST-ONLY (?restoreProbe=1): while the probe web font is still held
+      // (not available), never finalize the restore — neither on a
+      // fallback-face "settled" reading nor on the attempt cap. This keeps the
+      // restore provably pending (data-restore-active="1") until the e2e arm
+      // releases the font, so the swap deterministically lands while the
+      // restore is active. Zero effect without the query parameter.
+      const probeFontReady = () =>
+        !restoreProbe || typeof document === "undefined"
+          ? true
+          : document.fonts.check('400 13px "IBM Plex Mono"');
       if (rowEl) {
         const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - pending.offset;
         if (Math.abs(delta) <= 2) {
+          if (!probeFontReady()) return;
           pendingScroll.current = null;
           restoringRef.current = false;
           return;
@@ -623,7 +639,7 @@ function TranscriptInner({
         }
       }
       pending.tries += 1;
-      if (pending.tries >= 24) {
+      if (pending.tries >= 24 && probeFontReady()) {
         pendingScroll.current = null;
         restoringRef.current = false;
       }
@@ -636,7 +652,7 @@ function TranscriptInner({
       return;
     }
     pending.tries += 1;
-  }, [sizes, nodes, estimate, applyOffset]);
+  }, [sizes, nodes, estimate, applyOffset, restoreProbe]);
 
   // A commit that moves rows above the anchor (padTop re-estimated, a row
   // inserted above) holds the reader the same way a measured growth does. A
@@ -947,6 +963,9 @@ function TranscriptInner({
         ref={scrollerRef}
         className={css.scroller}
         data-testid="transcript-scroller"
+        data-restore-active={
+          restoreProbe ? (pendingScroll.current?.kind === "restore" ? "1" : "0") : undefined
+        }
         onScroll={(event) => {
           const el = event.currentTarget;
           setScrollTop(el.scrollTop);

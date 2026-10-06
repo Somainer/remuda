@@ -8643,6 +8643,127 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r5 item 4 (OA6): the print/SDK mapper's REAL root turn
+    /// failure (claude_print `map_result`: topic=turn, nativeName=result,
+    /// status=error, resultIndex/numTurns) appended through the Hub ENDS THE
+    /// TURN — activity idle, outcome retryable — while lifecycle stays
+    /// running and the pending approval is NOT settled. A subagent result
+    /// error changes nothing. A real session exit afterwards still settles.
+    #[tokio::test]
+    async fn a_root_result_error_ends_the_turn_but_keeps_the_session_live() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-result-error").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"agent_status",
+                    "status":{"state":"known","value":"working"}}}),
+            )
+            .await
+            .expect("seed working");
+
+        // The exact claude_print map_result output for an errored turn.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"result",
+                    "severity":"info",
+                    "nativeId":{"state":"known","value":"sess-1"},
+                    "status":{"state":"known","value":"error"},
+                    "affectsCompletion":true,
+                    "relatedIds":{"resultIndex":"1","numTurns":"1"}}}),
+            )
+            .await
+            .expect("append root result error");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.lifecycle, "running",
+            "a root result error is turn-level: the process stays alive"
+        );
+        assert_eq!(
+            row.activity, "idle",
+            "a root result error ends the turn (composer idle, retryable)"
+        );
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "pending", "the approval stays answerable");
+        assert!(reason.is_none(), "no settlement on a turn failure");
+
+        // A SUBAGENT result error must not even idle the root; a new working
+        // edge brings the root back to working first.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"agent_status",
+                    "status":{"state":"known","value":"working"}}}),
+            )
+            .await
+            .expect("working again");
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"turn","nativeName":"result",
+                    "status":{"state":"known","value":"error"},
+                    "relatedIds":{"agentId":"a1","resultIndex":"2"}}}),
+            )
+            .await
+            .expect("append subagent result error");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.activity, "working",
+            "a subagent result error never idles the root"
+        );
+        assert_eq!(row.lifecycle, "running");
+
+        // The real session exit still settles the card.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","topic":"session","nativeName":"session",
+                    "severity":"error","affectsCompletion":true,
+                    "status":{"state":"known","value":"failed"},
+                    "relatedIds":{"lastError":"pane exited"}}}),
+            )
+            .await
+            .expect("append session exit");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "failed", "the real process exit is terminal");
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated", "the card settles on the real end");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
     /// c-cardsettle r5 item 1 (the owner's bug): feed the REAL
     /// WorkflowJournalTailer agent_failed output through the Hub — both the
     /// synthesized `workflow.member` observation (kind=workflow.member,

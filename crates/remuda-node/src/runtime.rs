@@ -1795,12 +1795,19 @@ async fn pump_one_observation(
     // P6: File turn lifecycles fold only when no hook set activity and
     // only for a kind with a file-tail adapter (codex/grok); the
     // registry is the single lookup rather than another per-kind branch.
-    let activity = hook_activity.or_else(|| match store.get_instance(instance_id) {
-        Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
-            crate::signal::file_activity(&observation)
-        }
-        _ => None,
-    });
+    //
+    // c-cardsettle r5 item 4: finally, a ROOT result/StopFailure turn
+    // failure frees the composer (idle) regardless of channel — print/SDK
+    // events arrive on Stdout/Transcript, which neither the Hook nor the
+    // File fold sees.
+    let activity = hook_activity
+        .or_else(|| match store.get_instance(instance_id) {
+            Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
+                crate::signal::file_activity(&observation)
+            }
+            _ => None,
+        })
+        .or_else(|| root_turn_failure_activity(&observation));
     if let Some(activity) = activity
         && let Err(error) = store.set_instance_state(
             instance_id,
@@ -2709,6 +2716,36 @@ fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &N
     ) {
         tracing::error!(%error, "instance not marked after its process ended");
     }
+}
+
+/// c-cardsettle r5 item 4 (OA6): the activity edge for a ROOT turn that ended
+/// FAILED. The print/SDK mapper emits `topic=turn`, `nativeName=result`,
+/// `status=error` (claude_print `map_result`); the shell hook fold emits a
+/// root `StopFailure` with `outcome=failed`. Both free the composer (idle) so
+/// the human can retry in place; the PROCESS stays alive — only
+/// `process_end` evidence is terminal. Subagent scope, configure and
+/// diagnostic topics return None (own scope). Mirrors the Hub's
+/// `root_turn_failed` derivation so Node local state and the Hub agree.
+fn root_turn_failure_activity(
+    observation: &remuda_protocol::Observation,
+) -> Option<Activity> {
+    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+        return None;
+    };
+    let LifecyclePayload::Native(native) = payload.as_ref() else {
+        return None;
+    };
+    if is_subagent_observation(native) || native.topic != remuda_protocol::LifecycleTopic::Turn {
+        return None;
+    }
+    let outcome_failed = native
+        .related_ids
+        .get("outcome")
+        .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"));
+    let result_error = native.native_name == "result"
+        && matches!(&native.status, remuda_protocol::Knowledge::Known { value } if value == "error");
+    let stop_failure = native.native_name == "StopFailure" && outcome_failed;
+    (result_error || stop_failure).then_some(Activity::Idle)
 }
 
 fn command_parts(
@@ -3825,7 +3862,7 @@ mod tests {
     /// subagent's turn only.
     #[tokio::test]
     async fn subagent_stopfailure_pump_keeps_the_main_instance_running() {
-        use remuda_protocol::DriverKind;
+        use remuda_protocol::{Activity, DriverKind, Knowledge};
         let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
         let instance = fixture_instance(
             InstanceId::new(),
@@ -3931,6 +3968,25 @@ mod tests {
         ))
         .await
         .unwrap();
+        // r5 item 4: the ROOT result error ENDS THE TURN — composer idle —
+        // while the process stays alive.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let failed_turn = store.get_instance(&id).unwrap();
+        assert!(
+            !matches!(
+                failed_turn.lifecycle,
+                InstanceLifecycle::Failed | InstanceLifecycle::Exited
+            ),
+            "a result error never ends the process: {:?}",
+            failed_turn.lifecycle
+        );
+        assert_eq!(
+            failed_turn.activity,
+            Knowledge::Known {
+                value: Activity::Idle
+            },
+            "a root result error ends the turn failed (composer idle)"
+        );
         // The live child is still alive enough to accept another prompt.
         tx.send(native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,

@@ -10,12 +10,13 @@ use futures::FutureExt;
 use remuda_protocol::{
     Acceptance, AcceptanceScope, Activity, ActorRef, ActorType, AgentKind, ClaudeRef, Command,
     CommandAuthority, CommandId, CommandOperation, CommandOrigin, CommandResult, CommandState,
-    CommandTarget, Completeness, Connectivity, Digest as WireDigest, DispatchState,
+    CommandTarget, Completeness, Connectivity, Digest as WireDigest, DispatchState, DriverKind,
     EntityLifecycle, EntityMeta, ExpectedState, Host, HostId, HostState, HostTransport,
     HostTransportMode, Id, Instance, InstanceId, InstanceLifecycle, JournalEvent, Knowledge,
     LifecycleEntity, LifecyclePayload, MessagePhase, MessageRole, NativeRef, NodeReceipt,
     ObservationPayload, Ownership, Page, PathStyle, Platform, ProcessRef, ResolutionState,
-    Settlement, SettlementOutcome, U64, Workspace, WorkspaceId, WorkspaceState, WritePolicy,
+    Settlement, SettlementOutcome, SourceChannel, U64, Workspace, WorkspaceId, WorkspaceState,
+    WritePolicy,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -2736,6 +2737,17 @@ fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Opt
     if is_subagent_observation(native) || native.topic != remuda_protocol::LifecycleTopic::Turn {
         return None;
     }
+    // Shell-pty HOOK events are attributed only when the promoted-hook
+    // tracker verifies ownership (that fold already returns Idle for a bound
+    // root StopFailure). An unbound hook could belong to a different
+    // foreground session, so this channel-agnostic fallback must NOT invent
+    // attribution for it. Print/SDK children own the Stdout/Transcript
+    // channels outright — those are exactly the events this exists for.
+    if observation.source.channel == SourceChannel::Hook
+        && observation.source.driver_kind == DriverKind::ShellPty
+    {
+        return None;
+    }
     let outcome_failed = native
         .related_ids
         .get("outcome")
@@ -3501,6 +3513,82 @@ mod tests {
             "a main StopFailure is turn-level, not a task exit"
         );
         assert!(native_exit(&obs).is_none());
+    }
+
+    /// c-cardsettle r5 item 4: the channel-agnostic root turn-failure edge
+    /// frees the composer for print/SDK Runtime/Stdout channels, but does NOT
+    /// attribute an UNBOUND shell-pty hook (the promoted-hook fold verifies
+    /// ownership itself); subagent/configure stay own-scope.
+    #[test]
+    fn root_turn_failure_activity_is_scoped_like_the_hub_projection() {
+        use remuda_protocol::{DriverKind, SourceChannel};
+        // Root result error on the print/SDK (Runtime) channel → idle.
+        let runtime_result = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1"), ("numTurns", "1")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        );
+        assert_eq!(
+            root_turn_failure_activity(&runtime_result),
+            Some(Activity::Idle)
+        );
+
+        // Root StopFailure outcome=failed on the Runtime channel → idle.
+        let root_stop = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "StopFailure",
+            "not-applicable",
+            &[("outcome", "failed"), ("phase", "turn-ended")],
+            remuda_protocol::Severity::Warning,
+            false,
+            "idle",
+        );
+        assert_eq!(root_turn_failure_activity(&root_stop), Some(Activity::Idle));
+
+        // The SAME root result error arriving on a shell-pty HOOK is not
+        // attributed by this fallback: an unbound hook may belong to another
+        // foreground session (the PromotedHooks fold supplies the edge only
+        // once ownership is verified).
+        let mut hook_result = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        );
+        hook_result.source.channel = SourceChannel::Hook;
+        hook_result.source.driver_kind = DriverKind::ShellPty;
+        assert_eq!(root_turn_failure_activity(&hook_result), None);
+
+        // A SUBAGENT result error is own-scope even on the Runtime channel.
+        let sub_result = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "not-applicable",
+            &[("agentId", "a1"), ("resultIndex", "2")],
+            remuda_protocol::Severity::Error,
+            false,
+            "error",
+        );
+        assert_eq!(root_turn_failure_activity(&sub_result), None);
+
+        // A successful result (status turn_done) changes nothing.
+        let turn_done = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1"), ("numTurns", "1")],
+            remuda_protocol::Severity::Info,
+            false,
+            "turn_done",
+        );
+        assert_eq!(root_turn_failure_activity(&turn_done), None);
     }
 
     /// c-cardsettle r3 item 8: any hook/turn/session observation carrying a

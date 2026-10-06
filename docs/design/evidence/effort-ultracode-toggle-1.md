@@ -65,14 +65,20 @@ PW_CHANNEL=chromium ./node_modules/.bin/playwright test -c playwright.hub.config
   tests/e2e/effort-sync.hub.spec.ts
 ```
 
-截图仅在 `REMUDA_EVIDENCE=1` 时写入本目录；本任务的 390px / 1440px 真机
-（WebKit iPhone）开关页截图在 gated run 落盘后补登：
+截图仅在 `REMUDA_EVIDENCE=1` 时写入本目录；本任务在 gate-e2e.lock 内用 chromium
+抓了两个宽度的开关页（fake 节点会话）：
 
-- `effort-toggle-390.png`（手机 sheet：五档 + 开关）
-- `effort-toggle-1440.png`（桌面 popover：五档 + 开关）
+- `effort-toggle-1-390.png`（窄宽：五档 low/med/high/xhigh/max + 琥珀开关 on）
+- `effort-toggle-1-1440.png`（桌面：锚定 popover，pill + 开关行）
 
-## 真实 Claude Code ≥2.1.284 真机切换
+两张图都显示开关是 pill 下方独立的一行（`role=switch`，on 时琥珀色），
+滑杆只有五个原生档、没有第六个 ultracode tick。390 图是 chromium 窄视口；
+真机手机**选项 sheet**（D-042 触发器，`mobile` prop）由非 hub 的
+mobile-webkit 项目覆盖，真机 WebKit iPhone + 模拟键盘由 owner 复核。
+
+## 真机 Claude Code ≥2.1.284 真机切换
 
 由 owner 在 ≥2.1.284 真机上完成（自动 e2e 只打 fake 节点；web 端按
 D-056 发送 `{name,ultracode}` 并按版本门渲染耦合/解耦文案）。web 侧
 自测点：任意档位开开关滑杆不动；level→flag→level 三连后 chip 各自 settle。
+fake 节点对应的自动化全过（effort-sync.hub.spec.ts，8/8，gate-e2e.lock）。

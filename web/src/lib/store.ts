@@ -662,6 +662,16 @@ class HubStore {
    * not certify B and whose late failure must not take B offline.
    */
   private connectionBindGen = 0;
+  /**
+   * Instances whose last drained send skipped the post-delivery REST
+   * catch-up because THIS instance's follow owned recovery at that moment.
+   * The debt is honoured by the owning follow's resync; if that owner is
+   * rebound away (navigation to another session), fails, or is superseded
+   * before it catches up, one coalesced REST fallback is scheduled for the
+   * abandoned instance so its accepted row can still settle. Cleared once the
+   * instance has caught up and folded its journal.
+   */
+  private reconcileOwed = new Set<Id>();
   private outboxInit: Promise<boolean> | null = null;
 
   /**
@@ -1314,10 +1324,22 @@ class HubStore {
    * must report back with.
    */
   private bindConnection(instanceId: Id, journalId: Id): number {
-    if (this.connectionBoundJournal !== journalId) this.connectionBindGen += 1;
+    const reboundAway =
+      this.connectionBoundJournal !== null && this.connectionBoundJournal !== journalId;
+    const prevBoundTo = this.connectionBoundTo;
+    if (reboundAway) this.connectionBindGen += 1;
     this.connectionBoundTo = instanceId;
     this.connectionBoundJournal = journalId;
     this.connection?.noteBinding(this.connectionBindGen);
+    // The machine now serves a DIFFERENT session. If the instance we just left
+    // had a delivered row whose catch-up was deferred to its (now superseded)
+    // follow, that follow will never service it — run one coalesced REST
+    // fallback for the abandoned instance so its accepted row still settles
+    // (fix-5 item 1). The global offline/recovering flag alone is not
+    // ownership; only a concrete bind-away orphans the debt.
+    if (reboundAway && prevBoundTo && prevBoundTo !== instanceId && this.reconcileOwed.has(prevBoundTo)) {
+      this.runOwedReconcile(prevBoundTo);
+    }
     return this.connectionBindGen;
   }
 
@@ -1534,6 +1556,46 @@ class HubStore {
     await Promise.all([this.refresh().catch(() => undefined), this.refreshHosts().catch(() => undefined)]);
   }
 
+  /**
+   * Whether the bound follow for `instanceId` currently OWNS its post-delivery
+   * journal catch-up: the connection machine is bound to that instance and is
+   * mid-recovery, so reopenFollow's resync is authoritative. Evaluated AT JOB
+   * EXECUTION (not when the drain enqueued), so a state that flips
+   * live→recovering while the job waited behind an earlier slow catch-up is
+   * read correctly instead of using a stale decision.
+   */
+  private followOwnsCatchupNow(instanceId: Id, journalId: Id | null): boolean {
+    return (
+      journalId !== null &&
+      this.connectionBoundJournal === journalId &&
+      this.connectionBoundTo === instanceId &&
+      (this.connectionState === "offline" || this.connectionState === "recovering")
+    );
+  }
+
+  /**
+   * Honour a post-delivery catch-up for an instance that NO follow currently
+   * owns (the binding moved to another session). One coalesced bounded REST
+   * resume per instance on its own journal chain; never drives the global
+   * connection machine (it is bound elsewhere). Idempotent — safe to call when
+   * a follow later takes over.
+   */
+  private runOwedReconcile(instanceId: Id) {
+    void this.chainReconcile(instanceId, async () => {
+      const instance =
+        this.state.instances.find((i) => i.id === instanceId) ??
+        (await api.instanceGet(instanceId).catch(() => null));
+      const client = instance ? this.journals.get(instance.journalId) : undefined;
+      try {
+        await client?.resumeAfterReconnect();
+      } catch {
+        /* bounded REST catch-up; the row also converges on later polls */
+      }
+      this.reconcileOwed.delete(instanceId);
+      this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
+    });
+  }
+
   /** Reopen the follow socket for an already-mounted instance and resync. */
   private async reopenFollow(instanceId: Id) {
     const instance =
@@ -1546,6 +1608,10 @@ class HubStore {
       if (client) {
         await this.openFollowSocket(instance, client, client.appliedSeq);
         await client.resumeAfterReconnect();
+        // This follow just did the authoritative catch-up the drained send was
+        // waiting on; its debt is honoured. Fold the journal now.
+        this.reconcileOwed.delete(instanceId);
+        this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
       } else {
         await this.follow(instanceId);
       }
@@ -1648,33 +1714,28 @@ class HubStore {
       // If that drained the instance, run the post-delivery resync/screen chain
       // exactly once.
       if (!box.pendingFor(instanceId).length) {
-        // Bubble settlement always runs on the journal chain the follow reopen
-        // joins. The REST resumeAfterReconnect is skipped only while THIS
-        // instance's link is actively recovering: resumeConnection's
-        // reopenFollow runs the authoritative catch-up on this same chain, so
-        // a second resync here would enqueue AHEAD of the socket reopen and,
-        // under load, push it past the 20 s recovering watchdog (queued row
-        // journaled but the journal banner never cleared — c-reconnfu gate
-        // flake). A LIVE send keeps its belt-and-suspenders resync (screens
-        // still order behind it), and an unbound background flush has no follow
-        // at all, so it still needs the resync.
         const drainJournalId =
           this.state.instances.find((i) => i.id === instanceId)?.journalId ?? null;
-        const followOwnsCatchup =
-          drainJournalId !== null &&
-          this.connectionBoundJournal === drainJournalId &&
-          (this.connectionState === "offline" || this.connectionState === "recovering");
         await this.chainReconcile(instanceId, async () => {
-          const client = drainJournalId ? this.journals.get(drainJournalId) : undefined;
-          if (!followOwnsCatchup) {
+          // Decide ownership WHEN THIS JOB RUNS, not when the drain enqueued
+          // it: a live→recovering flip while we waited behind an earlier slow
+          // catch-up must be observed here (fix-5 item 2). If THIS instance's
+          // follow currently owns recovery, its reopenFollow resync is
+          // authoritative — record the debt and skip the redundant REST read
+          // (which would otherwise queue ahead of the socket reopen past the
+          // 20 s watchdog). Otherwise run the bounded REST catch-up now.
+          if (this.followOwnsCatchupNow(instanceId, drainJournalId)) {
+            this.reconcileOwed.add(instanceId);
+          } else {
+            const client = drainJournalId ? this.journals.get(drainJournalId) : undefined;
             try {
               await client?.resumeAfterReconnect();
             } catch {
               /* machine owns the failure */
             }
+            this.reconcileOwed.delete(instanceId);
           }
-          const events = this.state.events[instanceId] ?? [];
-          this.settleFromJournal(instanceId, events);
+          this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
         });
         // The screen refresh rides the list scheduler (single-flight +
         // NODE_BUSY back-off) with COALESCING: a slow /screen while sends keep
@@ -2203,6 +2264,7 @@ class HubStore {
     this.connectionBoundTo = null;
     this.connectionBoundJournal = null;
     this.connectionBindGen = 0;
+    this.reconcileOwed.clear();
     this.followReadyState.clear();
     this.followFrameAt.clear();
     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);

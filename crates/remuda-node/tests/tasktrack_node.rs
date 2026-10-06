@@ -33,6 +33,8 @@ const RUN_MARKER: &str = "REMUDA_TASKTRACK_CHILD";
 
 /// Install a 0755 fake binary outside the cwd.
 fn install_fake(root: &Path) -> PathBuf {
+    // Round 3: the fake persists only under an allocated (sentinel) root.
+    remuda_testing::sandbox::TempHome::adopt(root).expect("adopt tasktrack root");
     let install = root.join("opt/bin");
     std::fs::create_dir_all(&install).expect("bin dir");
     let source = remuda_testing::ensure_workspace_bin("fake-harness");

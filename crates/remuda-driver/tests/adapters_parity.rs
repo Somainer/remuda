@@ -451,6 +451,8 @@ struct ParityRun {
 fn run_and_adapt_scenario(kind: AgentKind, scenario: &str, prompt: &str) -> ParityRun {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
+    // Round 3: fake writes need an allocated (sentinel) root.
+    remuda_testing::sandbox::TempHome::adopt(root.path()).expect("adopt parity root");
     let cwd = root.path().join("work");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&cwd).unwrap();

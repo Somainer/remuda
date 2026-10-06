@@ -187,12 +187,20 @@ fn paths_match(a: &Path, b: &Path) -> bool {
 fn cargo_build_testing_bin(name: &str, target_dir: &Path) {
     std::fs::create_dir_all(target_dir)
         .unwrap_or_else(|err| panic!("create cargo target dir {}: {err}", target_dir.display()));
+    // The `remuda` CLI binary lives in its own package; every other bin this
+    // locator builds (fake-claude, fake-harness, fake-herdr, …) is in
+    // remuda-testing.
+    let package = if name == "remuda" {
+        "remuda"
+    } else {
+        "remuda-testing"
+    };
     let status = Command::new(env!("CARGO"))
         .current_dir(workspace_root())
         .args([
             "build",
             "-p",
-            "remuda-testing",
+            package,
             "--bin",
             name,
             "--quiet",
@@ -202,10 +210,10 @@ fn cargo_build_testing_bin(name: &str, target_dir: &Path) {
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_BUILD_TARGET_DIR", target_dir)
         .status()
-        .unwrap_or_else(|err| panic!("cargo build -p remuda-testing --bin {name}: {err}"));
+        .unwrap_or_else(|err| panic!("cargo build -p {package} --bin {name}: {err}"));
     assert!(
         status.success(),
-        "cargo build -p remuda-testing --bin {name} failed with {status}"
+        "cargo build -p {package} --bin {name} failed with {status}"
     );
 }
 

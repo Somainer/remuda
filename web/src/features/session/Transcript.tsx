@@ -937,7 +937,8 @@ function TranscriptInner({
       viewportRef.current = viewport;
       setViewport(viewport);
       if (wasPinned) {
-        programmaticScroll(el, el.scrollHeight);
+        // Internal viewport-change re-pin, not reader navigation.
+        programmaticScroll(el, el.scrollHeight, true);
       }
     };
     measure();
@@ -951,7 +952,7 @@ function TranscriptInner({
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [programmaticScroll]);
 
   useEffect(() => {
     nodesRef.current = nodes;
@@ -1067,7 +1068,10 @@ function TranscriptInner({
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el || !pinRef.current) return;
-    programmaticScroll(el, el.scrollHeight);
+    // Internal re-pin, not an intentional navigation: mark it as our own
+    // write so its echo neither cancels an armed load-earlier restore nor is
+    // mistaken for a reader gesture.
+    programmaticScroll(el, el.scrollHeight, true);
   }, [nodes.length, sizes, programmaticScroll]);
 
   const flushPosition = useCallback((top: number) => {

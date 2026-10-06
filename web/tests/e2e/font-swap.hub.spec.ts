@@ -53,8 +53,9 @@ test.afterEach(async ({ page }) => {
  * goto cannot cancel a parked request out from under the gate.
  */
 function belongsToSessionDocument(route: Route): boolean {
+  // A null frame means no owning document (worker/shared): never park.
   const frame = route.request().frame();
-  if (frame !== frame.page().mainFrame()) return false;
+  if (!frame || frame !== frame.page().mainFrame()) return false;
   return new URL(frame.url()).pathname.startsWith("/s/");
 }
 
@@ -89,16 +90,25 @@ async function gateRoute(
   // A document whose warm disk cache already holds an immutable woff2 would
   // never re-request it: force revalidation (merged onto the request's own
   // headers — continue() replaces, not merges) so a later visit stays gated.
+  let disposed = false;
+  const parked = new Set<Route>();
   const handler = async (route: Route) => {
     // Anything outside the gated session document (the /sessions page being
-    // left, a subframe) flows straight through and never parks.
-    if (!belongsToSessionDocument(route)) return route.continue();
+    // left, a subframe, a null frame) flows straight through and never parks.
+    if (!belongsToSessionDocument(route)) {
+      try {
+        await route.continue();
+      } catch {
+        // cancelled by navigation
+      }
+      return;
+    }
     markArrival?.();
     markArrival = null;
+    parked.add(route);
     await released;
-    // The goto that owned this request may have navigated away while it was
-    // parked; continuing a disposed route rejects — that is expected, not a
-    // test failure.
+    // The goto / dispose that owned this request may have aborted it; that is
+    // expected, not a test failure.
     try {
       await route.continue(
         opts.revalidate
@@ -106,14 +116,34 @@ async function gateRoute(
           : undefined,
       );
     } catch {
-      // Request was aborted by navigation.
+      // Request was aborted by navigation / disposal.
+    } finally {
+      parked.delete(route);
     }
   };
   await page.route(pick, handler);
+  const release = () => open?.();
+  const dispose = async () => {
+    if (disposed) return;
+    disposed = true;
+    release();
+    await page.unroute(pick, handler).catch(() => undefined);
+    // Free anything still parked after unregister (an abandoned test or
+    // navigation); idempotent and never throwing.
+    await Promise.all(
+      [...parked].map(async (route) => {
+        try {
+          await route.continue();
+        } catch {
+          // already disposed
+        }
+      }),
+    );
+  };
   return {
     waitArrival: () => arrival,
-    release: () => open?.(),
-    dispose: () => page.unroute(pick, handler),
+    release,
+    dispose,
   };
 }
 
@@ -135,9 +165,11 @@ async function command(page: Page, instanceId: string, prompt: string): Promise<
 
 /**
  * A session whose transcript mixes monospace (the fenced reply, the header's
- * path and IDs) with a run of sans rows below it.
+ * path and IDs) with a run of sans rows below it. `wrapProbe` asks the fake
+ * node for a pre-wrap fenced block whose LONG lines cross a wrap boundary
+ * between the fallback and final faces (the viewer soft-wrap pref is set).
  */
-async function seedSession(page: Page, longBurst = 0): Promise<string> {
+async function seedSession(page: Page, longBurst = 0, wrapProbe = false): Promise<string> {
   const instanceId = await page.evaluate(async () => {
     const hosts = (await (await fetch("/v1/hosts", { credentials: "include" })).json()) as {
       items?: { hostId?: string; label?: string }[];
@@ -202,7 +234,7 @@ async function seedSession(page: Page, longBurst = 0): Promise<string> {
       .poll(async () => Number((await journalTail(page, instanceId)).durableSeq ?? 0), { timeout: 60_000 })
       .toBeGreaterThanOrEqual(longBurst);
   }
-  await command(page, instanceId, "font swap probe: show me code");
+  await command(page, instanceId, wrapProbe ? "font wrap probe: show me code" : "font swap probe: show me code");
   // The reply must be journaled before the burst lands below it.
   await expect
     .poll(async () => textsAfterLastCode(await journalTail(page, instanceId)), { timeout: 30_000 })
@@ -279,14 +311,12 @@ async function rowOffset(scroller: Locator, n: number): Promise<number | null> {
 
 /**
  * The restore has quiesced: the anchor row's scroller-relative offset has
- * stayed put across several ResizeObserver MEASUREMENT cycles, not merely two
- * animation frames (two rAFs can elapse with no size commit at all, so the
- * font could be released while the restore is still correcting). The
- * transcript's list element resizes whenever rows re-measure (mount heights,
- * the padTop estimate, the font swap); we observe it and require the offset
- * unchanged across consecutive cycles, with a quiet-period fallback and a
- * bounded wait. This is the synchronisation point for a font released
- * strictly around the restore — an event, not a guessed delay.
+ * stayed put across several ResizeObserver MEASUREMENT cycles (two rAFs can
+ * elapse with no size commit at all). Any movement or disappearance of the
+ * anchor INVALIDATES the run (the counter resets), and the final value is
+ * re-validated one frame after the threshold is reached before resolving —
+ * so a resize that lands right at the threshold can't be missed. All timers
+ * and the observer are torn down together (resolve OR timeout), no leaks.
  */
 async function waitAnchorStable(
   page: Page,
@@ -296,9 +326,7 @@ async function waitAnchorStable(
 ): Promise<number> {
   const result = await scroller.evaluate(
     (el, { label, deadlineMs }) =>
-      new Promise<string>((resolve) => {
-        // scroller > .list (spacer + every rendered row): its border box grows
-        // with each measured height and each padTop estimate commit.
+      new Promise<string>((resolvePromise) => {
         const list = el.firstElementChild;
         const offset = (): number | null => {
           const re = new RegExp(`journal_burst_* event ${label}\\b`);
@@ -309,39 +337,69 @@ async function waitAnchorStable(
           return row.getBoundingClientRect().top - el.getBoundingClientRect().top;
         };
         const REQUIRED = 3;
-        let last = offset();
+        let last: number | null = offset();
         let stable = 0;
-        let cycles = 0;
-        let settled: string | null = null;
-        const sample = (source: "ro" | "quiet") => {
-          if (source === "ro") cycles += 1;
-          // No settling on a timer before at least one real measurement cycle.
-          if (source === "quiet" && cycles === 0) return;
-          const next = offset();
-          if (next === null) return;
-          if (last !== null && Math.abs(next - last) <= 1) stable += 1;
-          else stable = 0;
-          last = next;
-          if (stable >= REQUIRED) settled = `stable:${next}`;
+        let settledAt: number | null = null;
+        let revalidating = false;
+        const timers: number[] = [];
+        const setTimer = (fn: TimerHandler, ms: number) => {
+          const id = window.setTimeout(fn, ms);
+          timers.push(id);
+          return id;
         };
-        const ro = new ResizeObserver(() => sample("ro"));
-        if (list) ro.observe(list);
-        // Also sample on a short timer: once size commits stop, the RO simply
-        // goes quiet and that itself has to finish the wait.
-        const quiet = window.setInterval(() => sample("quiet"), 100);
-        const timer = window.setTimeout(() => {
-          window.clearInterval(quiet);
-          ro.disconnect();
-          resolve(settled ?? (last === null ? "missing" : "moving"));
+        let ro: ResizeObserver | null = null;
+        const finish = (value: string) => {
+          timers.forEach((id) => window.clearTimeout(id));
+          ro?.disconnect();
+          resolvePromise(value);
+        };
+        setTimer(() => {
+          finish(settledAt !== null ? `stable:${settledAt}` : last === null ? "missing" : "moving");
         }, deadlineMs);
-        const check = window.setInterval(() => {
-          if (settled === null) return;
-          window.clearInterval(check);
-          window.clearInterval(quiet);
-          window.clearTimeout(timer);
-          ro.disconnect();
-          resolve(settled);
-        }, 30);
+        // Movement/disappearance resets the streak; reaching the threshold
+        // arms a ONE-frame revalidation rather than resolving immediately.
+        const sample = () => {
+          const next = offset();
+          if (next === null) {
+            stable = 0;
+            last = null;
+            return;
+          }
+          if (last !== null && Math.abs(next - last) <= 1) {
+            if (revalidating) return;
+            stable += 1;
+            if (stable >= REQUIRED) {
+              revalidating = true;
+              setTimer(() => {
+                // Re-read after another frame: any movement/removal here
+                // invalidates and restarts the streak.
+                const check = offset();
+                if (check !== null && Math.abs(check - next) <= 1) {
+                  settledAt = check;
+                  finish(`stable:${check}`);
+                } else {
+                  revalidating = false;
+                  stable = 0;
+                }
+              }, 32);
+            }
+          } else {
+            stable = 0;
+            revalidating = false;
+          }
+          last = next;
+        };
+        // Measurement-driven samples (row heights, padTop estimate, font swap
+        // all resize the list element).
+        ro = new ResizeObserver(() => sample());
+        if (list) ro.observe(list);
+        // Quiet fallback: once size commits stop the RO goes silent; poll so
+        // a settled window with no further resize still completes.
+        const tick = () => {
+          if (!revalidating) sample();
+          timers.push(window.setTimeout(tick, 100));
+        };
+        timers.push(window.setTimeout(tick, 100));
       }),
     { label: anchor, deadlineMs: timeout },
   );
@@ -350,20 +408,23 @@ async function waitAnchorStable(
 }
 
 /**
- * The saved anchor has painted on the FALLBACK face for the first time. At
- * this frame the restore's initial estimate jump is on screen but its
- * measurement correction tail has not run: the font released right after this
- * genuinely races the restore, instead of waiting until it has settled.
+ * Deterministic mid-restore barrier: wait until the saved-position restore is
+ * PROVABLY still pending (the scroller's test-only data-restore-active
+ * attribute, live on every commit) AND the saved anchor row is already
+ * painted on the fallback face. Releasing a held font at this point races the
+ * restore's tail; the attribute (not a laid-out row, which the restore may
+ * have settled inside a layout effect before paint) is the source of truth.
  */
-async function waitAnchorRendered(
+async function waitRestoreActiveAndPainted(
   page: Page,
+  scroller: Locator,
   anchor: number,
   { timeout = 15_000 }: { timeout?: number } = {},
 ): Promise<number> {
   const handle = await page.waitForFunction(
     ({ label }) => {
       const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']");
-      if (!el) return null;
+      if (!el || el.getAttribute("data-restore-active") !== "1") return null;
       const re = new RegExp(`journal_burst_* event ${label}\\b`);
       const row = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']")).find((candidate) =>
         re.test(candidate.textContent ?? ""),
@@ -375,6 +436,26 @@ async function waitAnchorRendered(
     { polling: "raf", timeout },
   );
   return handle.jsonValue() as Promise<number>;
+}
+
+/**
+ * Did the font's "loadingdone" event fire while a restore was active? Recorded
+ * in-page (installed via addInitScript before the gated navigation) so the
+ * claim is observed at the actual font-event turn, not reconstructed later.
+ */
+async function addFontEventRecorder(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __swapDuringRestore?: string | null };
+    w.__swapDuringRestore = null;
+    const record = () => {
+      const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']");
+      w.__swapDuringRestore = el?.getAttribute("data-restore-active") ?? "no-scroller";
+    };
+    // loadingdone covers a face that becomes available after a hold; poll a
+    // couple of frames too in case the event predates this listener.
+    document.fonts?.addEventListener("loadingdone", record);
+    requestAnimationFrame(() => requestAnimationFrame(record));
+  });
 }
 
 /**
@@ -416,13 +497,66 @@ async function monoLoaded(page: Page): Promise<boolean> {
   return page.evaluate(() => document.fonts.check('400 13px "IBM Plex Mono"'));
 }
 
-async function afterSwap(page: Page): Promise<void> {
-  await expect.poll(() => monoLoaded(page), { timeout: 10_000 }).toBe(true);
+/**
+ * Wait for the web font to actually be available, with a deadline and a
+ * diagnostic that also fails when the document/page was abandoned (closed or
+ * navigated off the session route) instead of hanging until Playwright's
+ * generic timeout.
+ */
+async function waitFontLoaded(page: Page, scroller: Locator, when: string, timeout = 10_000): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        if (page.isClosed()) return "page-closed";
+        const url = page.mainFrame()?.url() ?? "";
+        if (!/\/s\//.test(url)) return `abandoned-document:${url}`;
+        return (await monoLoaded(page)) ? "loaded" : "waiting";
+      },
+      {
+        timeout,
+        message: `${when}: IBM Plex Mono never became available (deadline ${timeout}ms; page closed or document abandoned?)`,
+      },
+    )
+    .toBe("loaded");
+  void scroller;
+}
+
+async function afterSwap(page: Page, scroller: Locator): Promise<void> {
+  await waitFontLoaded(page, scroller, "afterSwap");
   // Let the virtualiser re-measure and any scroll anchoring settle.
   await page.evaluate(
     () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))),
   );
   await page.waitForTimeout(300);
+}
+
+/**
+ * Height of the mounted transcript ROW containing the wrap-probe fenced
+ * block. A genuine font swap changes glyph advances; with pre-wrap long lines
+ * that cross a wrap boundary this changes the block's (and therefore the
+ * row's) height — the metric that actually exercises re-anchoring, unlike a
+ * non-wrapping <pre> whose height is identical across faces. Returns null if
+ * the block is not mounted in the current virtual window.
+ */
+async function wrapBlockRowHeight(scroller: Locator): Promise<number | null> {
+  return scroller.evaluate((el) => {
+    const blocks = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']"));
+    const block = blocks.find((b) => b.textContent?.includes("wrap probe line 0"));
+    if (!block) return null;
+    const row = block.closest<HTMLElement>("[data-testid='transcript-row']");
+    return (row ?? block).getBoundingClientRect().height;
+  });
+}
+
+/**
+ * Wait until the wrap-probe block is mounted and measure it; asserts soft
+ * wrap is actually on (pre-wrap), otherwise the height probe cannot move.
+ */
+async function waitWrapBlockMeasured(scroller: Locator, when: string): Promise<number> {
+  const height = await expect
+    .poll(() => wrapBlockRowHeight(scroller), { timeout: 15_000, message: `${when}: wrap block never mounted` })
+    .not.toBeNull();
+  return height as number;
 }
 
 /**
@@ -438,12 +572,14 @@ async function savedPositionSurvivesSwap(
   order: "late" | "first",
 ): Promise<void> {
   await page.setViewportSize({ width: 1440, height: 900 });
-  const instanceId = await seedSession(page, longBurst);
+  const instanceId = await seedSession(page, longBurst, true);
+  // Soft-wrap ON so the font swap changes the wrap-probe block's HEIGHT.
+  await page.evaluate(() => localStorage.setItem("runtime.code-wrap", "1"));
 
   await page.goto(`/s/${instanceId}`);
   const scroller = page.getByTestId("transcript-scroller");
   await loaded(page, instanceId);
-  await afterSwap(page);
+  await afterSwap(page, scroller);
 
   // Reach the code block (virtualised out while pinned to the bottom). A
   // short journal walks up as a reader would. In a long window a pixel walk
@@ -454,7 +590,7 @@ async function savedPositionSurvivesSwap(
   if (longBurst > 0) {
     await page.getByTestId("transcript-search-open").click();
     const search = page.getByTestId("transcript-search-input");
-    await search.fill("here is the function");
+    await search.fill("wrap probe line 0");
     await search.press("Enter");
     await expect(page.getByTestId("transcript-search-count")).toHaveText(/^1\//);
     await page.getByTestId("transcript-search-close").click();
@@ -523,10 +659,11 @@ async function savedPositionSurvivesSwap(
   await reinstate();
   await page.goto(`/s/${instanceId}`);
   await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
-  await afterSwap(page);
+  await afterSwap(page, scroller);
   const control = (await rowOffset(scroller, anchor))!;
   const controlInput = await consumed();
   const viewport = await scroller.evaluate((el) => el.clientHeight);
+  const blockControl = await wrapBlockRowHeight(scroller);
 
   // The gated arm: a fresh document (routing also bypasses the HTTP cache)
   // where the swap is forced to land at one exact point relative to the
@@ -534,6 +671,13 @@ async function savedPositionSurvivesSwap(
   let leftByControl: string | null = null;
   let beforeSwap: number | null = null;
   let settled: number;
+  // Height of the transcript row carrying the wrap-probe block, on the
+  // fallback face and after the swap. A meaningful delta PROVES the swap moved
+  // real layout above the anchor (the thing re-anchoring has to correct).
+  let blockFallback: number | null = null;
+  let blockSwapped: number | null = null;
+  // Minimum real height change: more than one 13px/1.6 line of slack.
+  const BLOCK_HEIGHT_DELTA_PX = 20;
   if (order === "late") {
     // Hold every woff2 at the network layer; rows restore on the fallback
     // monospace. Release only once the restored anchor has stopped moving,
@@ -545,48 +689,62 @@ async function savedPositionSurvivesSwap(
     leftByControl = await page.evaluate((key) => localStorage.getItem(key), readingKey);
     await reinstate();
     const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/);
-    await page.goto(`/s/${instanceId}`);
-    await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
-    await fontGate.waitArrival();
-    expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
-    beforeSwap = await waitAnchorStable(page, scroller, anchor);
-    fontGate.release();
-    await afterSwap(page);
-    settled = await waitAnchorStable(page, scroller, anchor);
+    try {
+      await page.goto(`/s/${instanceId}`);
+      await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
+      await fontGate.waitArrival();
+      expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
+      beforeSwap = await waitAnchorStable(page, scroller, anchor);
+      blockFallback = await waitWrapBlockMeasured(scroller, "late arm (fallback)");
+      fontGate.release();
+      await afterSwap(page, scroller);
+      settled = await waitAnchorStable(page, scroller, anchor);
+      blockSwapped = await waitWrapBlockMeasured(scroller, "late arm (swapped)");
+    } finally {
+      await fontGate.dispose();
+    }
   } else {
-    // The swap lands WHILE the restore is still running (a genuinely early
-    // swap, but after fallback paint — not before any row exists). Hold the
-    // woff2 only: the journal loads normally, rows paint on the FALLBACK face,
-    // and the saved-position restore runs on fallback metrics. Release on the
-    // first frame the saved anchor is painted, before its ResizeObserver
-    // measurement tail settles, so the swap races the restore rather than the
-    // first paint. The gate is installed after the /sessions hop and scoped to
-    // this document; the no-cache headers make it a real fetch even though the
-    // control arm cached the woff2.
+    // The swap lands WHILE the restore is provably active. The woff2 is held
+    // at the network layer, so rows paint on the FALLBACK face; the
+    // ?restoreProbe hook keeps the restore PENDING while that font is
+    // unavailable (instead of finalizing on the fallback settle). We release
+    // the font only while data-restore-active="1" AND the anchor is already
+    // painted, then the restore corrects against the final metrics.
     await page.goto("/sessions");
     await expect(page.getByTestId("session-list")).toBeVisible();
     await reinstate();
+    await addFontEventRecorder(page);
     const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
-    await page.goto(`/s/${instanceId}`);
-    await fontGate.waitArrival();
-    // The saved anchor paints on the fallback face; the font is still held, so
-    // this is strictly before the swap (and before the restore's measurement
-    // tail settles).
-    beforeSwap = await waitAnchorRendered(page, anchor);
-    expect(await monoLoaded(page), "rows must paint on the fallback face before the swap").toBe(false);
-    const advanceFallback = await monoAdvance(page);
-    fontGate.release();
-    await afterSwap(page);
-    settled = await waitAnchorStable(page, scroller, anchor);
-    // The swap genuinely changed the face's metrics: glyph advances differ
-    // while the anchor row stayed put.
-    const advanceSwapped = await monoAdvance(page);
-    expect
-      .soft(
-        advanceSwapped !== advanceFallback,
-        `the font swap did not change monospace advances (fallback=${advanceFallback} swapped=${advanceSwapped})`,
-      )
-      .toBe(true);
+    try {
+      await page.goto(`/s/${instanceId}?restoreProbe=1`);
+      await fontGate.waitArrival();
+      // The saved anchor paints on the fallback face while the restore stays
+      // pending (the hook defers finalization until the font is available).
+      beforeSwap = await waitRestoreActiveAndPainted(page, scroller, anchor);
+      expect(await monoLoaded(page), "rows must paint on the fallback face before the swap").toBe(false);
+      blockFallback = await waitWrapBlockMeasured(scroller, "mid arm (fallback)");
+      const advanceFallback = await monoAdvance(page);
+      fontGate.release();
+      await waitFontLoaded(page, scroller, "mid arm release");
+      // The font became available at a turn the restore was still active.
+      await expect
+        .poll(() => page.evaluate(() => (window as unknown as { __swapDuringRestore?: string | null }).__swapDuringRestore), {
+          timeout: 5_000,
+          message: "the held font did not become available while the restore was active",
+        })
+        .toBe("1");
+      // Let the virtualiser re-measure on the final face and the deferred
+      // restore run its correction; then take the settled position.
+      await page.evaluate(
+        () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))),
+      );
+      settled = await waitAnchorStable(page, scroller, anchor);
+      blockSwapped = await waitWrapBlockMeasured(scroller, "mid arm (swapped)");
+      const advanceSwapped = await monoAdvance(page);
+      expect(advanceSwapped, "the held font never swapped to the final face").not.toBe(advanceFallback);
+    } finally {
+      await fontGate.dispose();
+    }
   }
   const armInput = await consumed();
 
@@ -601,12 +759,22 @@ async function savedPositionSurvivesSwap(
   // position than the no-swap restore, and the anchor does not move at the
   // moment the font lands (in BOTH arms — swap racing the restore, and swap
   // after the fallback restore settled).
-  const measured = `order=${order} longBurst=${longBurst} saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} input=${original} leftByControl=${leftByControl}`;
+  const measured = `order=${order} longBurst=${longBurst} saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} blockControl=${blockControl} blockFallback=${blockFallback} blockSwapped=${blockSwapped} input=${original} leftByControl=${leftByControl}`;
   test.info().annotations.push({ type: "font-swap", description: measured });
   console.log(`FONTSWAP ${measured}`);
   // The restore brings the saved row back on screen.
   expect(control, `the saved row restores inside the viewport (${measured})`).toBeGreaterThanOrEqual(0);
   expect(control, `the saved row restores inside the viewport (${measured})`).toBeLessThan(viewport);
+  // The swap must have moved REAL layout: the wrap-probe block's transcript
+  // row changed height by at least a full line between fallback and final
+  // faces. Without this, drift 0 would prove nothing (a non-wrapping <pre>
+  // has identical height across faces).
+  expect(blockFallback, `no fallback block height sampled (${measured})`).not.toBeNull();
+  expect(blockSwapped, `no swapped block height sampled (${measured})`).not.toBeNull();
+  expect(
+    Math.abs(blockSwapped! - blockFallback!),
+    `the swap did not change the wrap-probe row height — drift would be unprovable (${measured})`,
+  ).toBeGreaterThanOrEqual(BLOCK_HEIGHT_DELTA_PX);
   expect(
     Math.abs(settled - saved!),
     `the swap moved the restore further from the saved position than the no-swap control (${measured})`,
@@ -638,7 +806,11 @@ test("a saved position in a bounded long journal survives a late monospace swap"
 test("a pinned transcript stays pinned through a late monospace swap", async ({ page }) => {
   test.setTimeout(120_000);
   await page.setViewportSize({ width: 390, height: 844 });
-  const instanceId = await seedSession(page);
+  // Wrap probe + soft wrap: the swap changes real row heights (measured on
+  // the final revisit) at the 390px pane, so "stays pinned" is asserted
+  // against an actual layout change, not an identical-height block.
+  const instanceId = await seedSession(page, 0, true);
+  await page.evaluate(() => localStorage.setItem("runtime.code-wrap", "1"));
   const scroller = page.getByTestId("transcript-scroller");
   const bottomGap = () => scroller.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
   const assertPinned = (when: string) =>
@@ -648,37 +820,77 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
   // goto. Rows render on the fallback face; the transcript must be pinned on
   // its own (pin re-pins on every size commit) — no manual scroll anywhere.
   const firstGate = await gateRoute(page, /\.woff2(?:\?|$)/);
-  await page.goto(`/s/${instanceId}`);
-  await loaded(page);
-  await firstGate.waitArrival();
-  expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
-  await assertPinned("before the first swap");
-  await expect(page.getByTestId("jump-latest"), "pinned transcript shows no jump-latest chip").not.toBeVisible();
-  firstGate.release();
-  await afterSwap(page);
-  await assertPinned("after the first swap");
-  await expect(page.getByTestId("jump-latest")).not.toBeVisible();
-  await firstGate.dispose();
+  try {
+    await page.goto(`/s/${instanceId}`);
+    await loaded(page);
+    await firstGate.waitArrival();
+    expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
+    await assertPinned("before the first swap");
+    await expect(page.getByTestId("jump-latest"), "pinned transcript shows no jump-latest chip").not.toBeVisible();
+    firstGate.release();
+    await afterSwap(page, scroller);
+    await assertPinned("after the first swap");
+    await expect(page.getByTestId("jump-latest")).not.toBeVisible();
+  } finally {
+    await firstGate.dispose();
+  }
 
   // Leave and come back. On this 390px viewport the router redirects
   // /sessions to the mobile home /m (ViewportGate), so leave there. The
   // final visit gets its OWN fresh closed gate (the first document cached the
   // woff2, so force revalidation): verify the font is genuinely unloaded AND
-  // the transcript is already pinned on fallback before release, then verify
-  // it stays pinned after the swap — again with no manual scroll to hide a
-  // failure.
+  // the transcript is already pinned on fallback before release, that the
+  // swap changes real block height at 390px, and that it stays pinned — with
+  // no manual scroll to hide a failure.
   await page.goto("/m");
   await expect(page.getByTestId("home-list")).toBeVisible();
   const finalGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
-  await page.goto(`/s/${instanceId}`);
-  await expect(page.getByTestId("transcript-row")).not.toHaveCount(0, { timeout: 15_000 });
-  await finalGate.waitArrival();
-  expect(await monoLoaded(page), "the final visit must start with the font unloaded").toBe(false);
-  await assertPinned("the final visit before the swap");
-  await expect(page.getByTestId("jump-latest")).not.toBeVisible();
-  finalGate.release();
-  await afterSwap(page);
-  await assertPinned("the final visit after the swap");
-  await expect(page.getByTestId("jump-latest")).not.toBeVisible();
-  await assertRowsStacked(scroller);
+  try {
+    await page.goto(`/s/${instanceId}`);
+    await expect(page.getByTestId("transcript-row")).not.toHaveCount(0, { timeout: 15_000 });
+    await finalGate.waitArrival();
+    expect(await monoLoaded(page), "the final visit must start with the font unloaded").toBe(false);
+    await assertPinned("the final visit before the swap");
+    await expect(page.getByTestId("jump-latest")).not.toBeVisible();
+    // Scroll the wrap block into view on the FALLBACK face and measure it,
+    // then return to the pinned bottom — via the app's own pin path, not a
+    // raw write, so pin state is legitimate.
+    await scroller.evaluate((el) => {
+      const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
+        b.textContent?.includes("wrap probe line 0"),
+      );
+      block?.scrollIntoView({ block: "center" });
+    });
+    await page.waitForTimeout(200);
+    const blockFallback = await wrapBlockRowHeight(scroller);
+    expect(blockFallback, "wrap block mounted on the fallback face at 390px").not.toBeNull();
+    // Back to the pinned bottom through the jump-latest control.
+    await page.getByTestId("jump-latest").click();
+    await assertPinned("back at the bottom before release");
+
+    finalGate.release();
+    await afterSwap(page, scroller);
+    await assertPinned("the final visit after the swap");
+    await expect(page.getByTestId("jump-latest")).not.toBeVisible();
+
+    // Measure the swapped block (390px) and require a real height change.
+    await scroller.evaluate((el) => {
+      const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
+        b.textContent?.includes("wrap probe line 0"),
+      );
+      block?.scrollIntoView({ block: "center" });
+    });
+    await page.waitForTimeout(200);
+    const blockSwapped = await wrapBlockRowHeight(scroller);
+    expect(blockSwapped, "wrap block mounted on the swapped face at 390px").not.toBeNull();
+    expect(
+      Math.abs(blockSwapped! - blockFallback!),
+      `390px: the swap did not change the wrap-probe row height (fallback=${blockFallback} swapped=${blockSwapped})`,
+    ).toBeGreaterThanOrEqual(20);
+
+    await page.getByTestId("jump-latest").click().catch(() => undefined);
+    await assertRowsStacked(scroller);
+  } finally {
+    await finalGate.dispose();
+  }
 });

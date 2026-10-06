@@ -774,6 +774,51 @@ fn codex_resume_appends_to_the_same_rollout_with_one_session_meta() {
 // Flags
 // ===========================================================================
 
+/// Round 4 item 3: a fake-harness resume must NOT append through a symlinked
+/// home directory entry. The external target stays byte-identical; the resume
+/// exits non-zero.
+#[test]
+#[cfg(unix)]
+fn resume_refuses_to_append_through_a_symlinked_home_projects() {
+    let _serial = support::serial();
+    let home = support::temp_home();
+    let sink = support::temp_home();
+    let external = sink.join("external-rollout.jsonl");
+    std::fs::write(&external, "SEED\n").expect("seed target");
+
+    let session = "00000000-0000-4000-8000-000000000007";
+    // First, a normal run that creates the codex artifacts and records the
+    // session, so the resume has a valid session id to name.
+    {
+        let mut h = HarnessBuilder::new("codex")
+            .home(home.clone())
+            .scenario("ok.json")
+            .arg("--session-id")
+            .arg(session)
+            .spawn();
+        h.submit("first prompt");
+        h.wait_exit(WAIT);
+    }
+    // Replace the whole home with a symlink to the external sink directory.
+    std::fs::remove_dir_all(&home).expect("remove the real home after it was adopted");
+    std::os::unix::fs::symlink(&sink, &home).expect("link home to external sink");
+
+    let mut h = HarnessBuilder::new("codex")
+        .home(home.clone())
+        .scenario("ok.json")
+        .arg("--resume")
+        .arg(session)
+        .spawn();
+    h.submit("second prompt");
+    // The resume must terminate promptly rather than completing the turn.
+    h.wait_exit(WAIT);
+    let after = std::fs::read_to_string(&external).expect("target still readable");
+    assert_eq!(
+        after, "SEED\n",
+        "no append byte reaches the external target through the symlinked home"
+    );
+}
+
 #[test]
 fn binary_rejects_unknown_kind() {
     let _serial = support::serial();

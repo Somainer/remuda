@@ -128,3 +128,101 @@ passes with the placeholder carve-out), the existing `resume_home_pty.rs`
 chain, new `fake_home_guard.rs` (3), sandbox unit tests. `cargo fmt`,
 `cargo clippy --workspace -D warnings`, four-crate suites and a full
 `nice cargo test --workspace` all green.
+
+## Round 3 — descriptor-relative filesystem hardening (owner bug follow-up)
+
+Review of `ac69721d` again REJECTed the staging design: every check was still
+a path-based `stat` followed by a path-based open/copy, so symlinks, a
+stat→open swap, FIFOs and retries could all defeat the round-2 rules.
+
+### Foundation: `remuda-fdsafe` (new self-contained crate)
+
+`crates/remuda-fdsafe/` — only `std` + `nix` ("fs","dir"), no Remuda
+knowledge — exposes the one primitive the staging and the fake sandbox share:
+
+- `DirFd` pins a trusted directory and walks every component from `/` with
+  `openat(O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`; a symlink at ANY level
+  fails with a precise `FdErrorKind::Symlink` (fstatat pre-classification
+  distinguishes it from the kernel's `ENOTDIR` once `O_DIRECTORY` is set);
+- leaves are fstatat-classified, opened `O_NOFOLLOW|O_NONBLOCK` (the
+  NONBLOCK is what stops a FIFO blocking the open), and re-classified by
+  `fstat` on the OPENED fd — no stat→open window; `identity()` returns
+  `(st_dev, st_ino)` from the opened fd for same-file verdicts;
+- `create_leaf_excl`, `open_append_leaf`, `renameat`, `mkdirat`, `unlinkat`
+  are all descriptor-relative; `remove_private_tree` unlinks links without
+  following them. The crate owns the workspace's one audited
+  `File::from_raw_fd` transfer and therefore documents (Cargo.toml) why it
+  does not inherit `forbid(unsafe_code)`. c-dirpicker builds the same
+  Linux/macOS pattern (no `O_PATH` on macOS); this crate is staged as the
+  future shared home.
+
+### Staging rewrite (`stage_for_resume`)
+
+1. **Destination symlinks (item 1).** `projects/<slug>` and every intermediate
+   are created/walked `O_NOFOLLOW`; the destination `<S>.jsonl` is classified
+   as a leaf BEFORE the `(dev,ino)` same-file inherited-home no-op, and an
+   existing destination sidecar that is a symlink aborts publishing.
+2. **Source escapes (item 2).** Sidecar symlinks are no longer hop-resolved at
+   all — every non-regular source entry is skipped and REPORTED in
+   `StagedResume.skipped` (`"kind:rel"`), never opened, never recreated. The
+   `<session>/exfil -> ../bridge/passwd`, `bridge -> /etc` attack lands
+   nowhere; a regression scans every staged byte for `/etc/passwd` content.
+3. **TOCTOU (item 3).** The transcript and every sidecar is read from the
+   opened fd; provenance is the sha256 of the bytes ACTUALLY streamed
+   (`stream_hashed` tees into the file and a Sha256 and re-opens nothing).
+   Regression: rename a different file over the source path after the fd is
+   opened and assert the streamed bytes and hash are the old inode's.
+4. **FIFOs / non-regular leaves (item 4).** Pre-open fstatat means a FIFO is
+   skipped before it is ever opened; `O_NONBLOCK` is the second line of
+   defence. Regression uses `mkfifo` and asserts sub-5s completion, no
+   reproduction, and a report entry.
+5. **Atomic private temp tree + manifest (item 5).** The whole conversation
+   is copied into `<slug>/.stage-<id>-<uuid>/` with EXCL creates, a manifest
+   of `(rel, size, sha256)` is written and verified by re-walking the temp
+   tree (sizes and hashes read back from temp fds; any unrecorded file or
+   non-regular entry fails), and only then are empty root dirs created,
+   sidecars renameat'd into place (identical existing files kept, diverging
+   files a hard conflict), and the transcript published last. A crashed
+   attempt leaves no file under a final name; stale `.stage-*` trees from
+   killed attempts are descriptor-unlinked before every run, and a symlink or
+   regular file wearing the private prefix is refused rather than touched.
+6. **Retries charged from scratch (item 6).** Enumeration charges the
+   COMPLETE selected conversation (count + recorded size, retained files
+   included) before any byte is copied; each attempt starts with a zero
+   budget and removes its own temp tree on failure. Regression repeats
+   staging after a byte-limit and after a file-limit failure.
+7. **Oversized transcript (item 7).** The opened fd's size is refused before
+   the first read or hash; the live byte cap independently aborts streaming.
+8. **Recorded transcript is authoritative (node `resume.rs`, item 8).** A
+   non-empty recorded `nativeTranscriptPath` that is missing, a symlink, a
+   FIFO, or unreadable is now a Conflict refusal BEFORE any instance row is
+   created — no fallback to a stale same-session managed-home file. The
+   recipe-derived path is consulted only when nothing was recorded (as with
+   structured drivers reporting late). `readable_regular_file` is itself an
+   fd walk now. E2E regression: B recorded-missing with A stale-home-present
+   is refused, names the recorded file, creates no row, and stages nothing.
+
+### Fake-home sandbox (items 9–10, `remuda-testing`)
+
+- Authorization is now a **sentinel-marked allocated root**
+  (`.remuda-fake-root`) produced by `sandbox::TempHome::allocate` /
+  `TempHome::adopt`, found by climbing the real ancestor fds; `/tmp` ancestry
+  alone and `$TMPDIR` (even `TMPDIR=$HOME`) authorize nothing, and the shared
+  `/tmp` mount itself plus world-writable dirs cannot be marked.
+- Every fake write (fresh/resume transcript, `FAKE_CLAUDE_TRANSCRIPT_DIR`,
+  argv/pid files, harness home, events log, codex/grok artifacts, terminal
+  logs, active-sessions, usage.json) goes through `remuda-fdsafe` fd walks —
+  a `projects` symlink inside an allocated home cannot redirect a byte.
+- The guard tests are now MANDATORY and placement-independent: the explicit
+  refusal test uses `/dev/shm` (never under `/tmp`), asserts the exact
+  PermissionDenied/non-zero-exit behaviour, and a symlinked-`.claude` test
+  proves the fd walk blocks the create even inside an otherwise authorized
+  home. Test spawn helpers allocate their own roots
+  (`TempHome::adopt(root)` in the shared install/harness support).
+
+Tests: fdsafe unit 7, driver `claude_transcript` unit 35 (8 new round-3
+regressions plus the r2 symlink cases rewritten to the skip+report contract),
+node `resume_home.rs` 11 (recorded-missing refusal; verified it fails with the
+r2 fallback restored), sandbox unit 4, `fake_home_guard.rs` 4 mandatory
+process tests. `cargo fmt`, four-crate `clippy -D warnings`, and the
+driver/node/testing suites are green.

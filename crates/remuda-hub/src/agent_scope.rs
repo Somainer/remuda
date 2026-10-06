@@ -9,7 +9,23 @@ use axum::{
     routing::{get, post},
 };
 use remuda_protocol::InputOrigin;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// D-057 §7.1 / main-agent.md §7.1: the Hub-stamped initiator of an
+/// Agent-initiated mutation. Derived ONLY from the authenticating device's
+/// bound instance (never the request body) and forwarded to Nodes without the
+/// device id. `None` for Human and Bot callers and for Hub-internal cleanup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Initiator {
+    /// The chapter instance that initiated the mutation.
+    pub instance_id: String,
+    /// Lineage the instance belongs to.
+    pub lineage_id: String,
+    /// Chapter generation at authentication time.
+    pub generation: i64,
+}
 
 /// Terminal aliases all resolve to a raw shell on the Node.
 pub fn shell_driver(driver: &str) -> bool {
@@ -48,15 +64,42 @@ pub async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Device, Hub
     Ok(device)
 }
 
+/// D-057 §7.1: resolve the Hub-stamped initiator for an authenticated device.
+/// `None` for Human/Bot callers (no bound instance). For an Agent device — an
+/// agent credential, or a Human token narrowed with `x-remuda-instance-id` —
+/// returns the bound chapter's `{instanceId, lineageId, generation}`. The
+/// authenticating device id is carried alongside by the caller (Hub-only).
+pub async fn initiator_for(
+    state: &AppState,
+    device: &Device,
+) -> Result<Option<Initiator>, HubError> {
+    let Some(instance_id) = device.instance_id.as_deref() else {
+        return Ok(None);
+    };
+    let instance = state
+        .store
+        .get_instance(instance_id.to_string())
+        .await?
+        .ok_or(HubError::Forbidden)?;
+    Ok(Some(Initiator {
+        instance_id: instance.instance_id,
+        lineage_id: instance.lineage_id,
+        generation: instance.generation,
+    }))
+}
+
 pub fn stamp(payload: &mut Value, device: &Device) {
     payload["origin"] = json!(origin(device));
     if let Some(input) = payload.get_mut("input").and_then(Value::as_object_mut) {
         input.insert("origin".into(), json!(origin(device)));
     }
-    // Never accept caller-selected provenance or a credential in JSON.
+    // Never accept caller-selected provenance, a credential, or an initiator
+    // in JSON. D-057 §7.1: the initiator is Hub-stamped from auth, not the body.
     if let Some(object) = payload.as_object_mut() {
         object.remove("agentCredential");
         object.remove("actor");
+        object.remove("initiator");
+        object.remove("initiatorDeviceId");
     }
 }
 

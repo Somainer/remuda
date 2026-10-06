@@ -15,7 +15,7 @@ export type HostMatrix = {
 };
 
 /** Subset of the host CLI entry used for the version-gated preview. */
-type CliEntry = { kind?: string; version?: string };
+type CliEntry = { kind?: string; version?: string; installed?: boolean };
 
 /**
  * Read-only preview of what the PTY will run (D-028 §5.1).
@@ -200,7 +200,9 @@ function matrixDrivers(host: HostMatrix | undefined): MatrixDriver[] {
 
 function cliHasKind(host: HostMatrix | undefined, kind: string): boolean {
   if (!host || !Array.isArray(host.cli)) return false;
-  return host.cli.some((entry: CliEntry) => entry.kind === kind);
+  // An explicitly installed:false CLI entry is an ABSENT binary; matching the
+  // kind alone would make a missing CLI count as installed (c-r2 item 8).
+  return host.cli.some((entry: CliEntry) => entry.kind === kind && entry.installed !== false);
 }
 
 /** The host's reported Claude CLI version, if any (D-056 launch gate). */

@@ -824,10 +824,12 @@ export function SessionList({
                               data-effort-mismatch={mismatch ? "1" : "0"}
                               title={titleParts[0]}
                             >
-                              {effectiveName}
-                              {effort.ultracode && effective?.ultracode !== false
+                              {effectiveName ?? "?"}
+                              {effective?.ultracode === true
                                 ? " · ultracode"
-                                : ""}
+                                : effectiveName
+                                  ? ""
+                                  : " · ?"}
                             </span>
                           </>
                         );

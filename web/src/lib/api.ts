@@ -239,6 +239,7 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     tui?: TuiMode | null;
     effortName?: string | null;
     effortIndex?: number | null;
+    effortUltracode?: boolean | null;
     effortEffective?:
       | {
           name?: string;
@@ -350,6 +351,9 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     tui: extra.tui === "fullscreen" || extra.tui === "default" ? extra.tui : null,
     effortName: typeof extra.effortName === "string" ? extra.effortName : null,
     effortIndex: typeof extra.effortIndex === "number" ? extra.effortIndex : null,
+    // D-056 r2 item 4: the durable orthogonal flag must survive reload even
+    // when its effort event has fallen out of the journal tail.
+    effortUltracode: extra.effortUltracode === true,
     effortEffective:
       extra.effortEffective && typeof extra.effortEffective.name === "string"
         ? {

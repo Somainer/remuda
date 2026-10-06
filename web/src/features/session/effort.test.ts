@@ -324,6 +324,17 @@ describe("per-model default effort (D-056 §6)", () => {
     expect(modelUltracodeCapable("opus", [])).toBe(true);
     expect(lookupModelEffortRow("opus", null)?.id).toBe("claude-opus-5");
   });
+
+  it("resolves Opus 4.7 canonical, alias, dated and context spellings (default xhigh)", () => {
+    for (const id of ["claude-opus-4-7", "opus-4-7", "claude-opus-4-7-20250824", "claude-opus-4-7[1m]"]) {
+      expect(claudeDefaultTier(id, [])?.index).toBe(3);
+      expect(claudeDefaultTier(id, [])?.name).toBe("xhigh");
+      expect(modelUltracodeCapable(id, [])).toBe(true);
+      expect(lookupModelEffortRow(id, null)?.id).toBe("claude-opus-4-7");
+    }
+    // Bare "opus" still means the current Opus 5 (longest/alias, not 4.7).
+    expect(lookupModelEffortRow("opus", null)?.id).toBe("claude-opus-5");
+  });
 });
 
 describe("effortEffective per-axis mismatches", () => {

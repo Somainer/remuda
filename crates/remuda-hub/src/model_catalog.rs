@@ -17,7 +17,7 @@ use remuda_protocol::ModelClass;
 
 /// Bumped whenever a row is added or changed so placement ledgers stay
 /// attributable to the catalog revision they were solved against.
-pub const CATALOG_REVISION: u32 = 3;
+pub const CATALOG_REVISION: u32 = 4;
 
 /// ISO date (YYYY-MM-DD) of the last catalog refresh.
 pub const CATALOG_UPDATED: &str = "2026-09-15";
@@ -184,6 +184,23 @@ static CATALOG: &[CapabilityProfile] = &[
         ultracode_capable: true,
         supports: CLAUDE_SUPPORTS,
         suited_for: &["triage", "docs", "cheap"],
+        status: CapabilityStatus::Published,
+    },
+    // Opus 4.7 (D-056 §6): older frontier; xhigh is its documented default
+    // and it supports the orthogonal ultracode toggle. Dated
+    // (`-YYYYMMDD`) and `[1m]` spellings resolve via the alias/suffix rules.
+    CapabilityProfile {
+        id: "claude-opus-4-7",
+        family: "opus",
+        aliases: &["opus-4-7", "claude-opus-4-7[1m]"],
+        class: ModelClass::Frontier,
+        context_window: 200_000,
+        max_output_tokens: 32_000,
+        effort_levels: CLAUDE_LEVELS,
+        default_effort: Some("xhigh"),
+        ultracode_capable: true,
+        supports: CLAUDE_SUPPORTS,
+        suited_for: &["design-heavy", "rebase", "review"],
         status: CapabilityStatus::Published,
     },
     // ── OpenAI GPT-5 (Codex) ─────────────────────────────────────────

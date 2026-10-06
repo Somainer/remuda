@@ -65,6 +65,24 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
     expect(shellPtyAllowed(host, "grok")).toBe(false);
   });
 
+  it("an installed:false CLI with a launchable shell-pty inventory still refuses", () => {
+    // Round 2 item 8: the missing binary must count as absent even when the
+    // driver matrix would otherwise allow shell-pty.
+    const host: HostMatrix = {
+      cli: [{ kind: "claude", installed: false }],
+      capabilities: { driverInventory: [{ kind: "shell-pty", launchable: true }] },
+    };
+    expect(shellPtyAllowed(host, "claude")).toBe(false);
+  });
+
+  it("an installed:true CLI with a launchable shell-pty inventory allows", () => {
+    const host: HostMatrix = {
+      cli: [{ kind: "claude", installed: true }],
+      capabilities: { driverInventory: [{ kind: "shell-pty", launchable: true }] },
+    };
+    expect(shellPtyAllowed(host, "claude")).toBe(true);
+  });
+
   it("keeps the legacy drivers selectable but secondary", () => {
     expect(legacyDrivers("claude")).toEqual(["claude-pty", "generic-pty", "claude-print"]);
     expect(legacyDrivers("grok")).toEqual(["generic-pty"]);

@@ -519,6 +519,9 @@ const CLAUDE_MODEL_FALLBACK: ModelEffortCatalogRow[] = [
   { id: "claude-sonnet-5", aliases: ["sonnet"], defaultEffort: "medium", ultracodeCapable: true },
   { id: "claude-fable-5", aliases: ["fable"], defaultEffort: "high", ultracodeCapable: true },
   { id: "claude-haiku-4-5", aliases: ["haiku"], defaultEffort: "high", ultracodeCapable: true },
+  // Opus 4.7 (D-056 §6): older frontier, default xhigh; dated/[1m] spellings
+  // resolve via longest-match.
+  { id: "claude-opus-4-7", aliases: ["opus-4-7"], defaultEffort: "xhigh", ultracodeCapable: true },
 ];
 
 function normalizeModelId(modelId: string): string {

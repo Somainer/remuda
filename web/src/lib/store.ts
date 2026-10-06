@@ -1052,15 +1052,18 @@ class HubStore {
       return true;
     }
 
-    // A positive switch read-back clears a refusal only with process-local
-    // evidence for the SAME model: a success on model B must not erase model
-    // A's model-scoped refusal (D-056 r2 §5).
+    // A positive switch read-back clears a model-scoped refusal only when the
+    // refusal is bound to a KNOWN model and that model is the current one. A
+    // refusal recorded with modelId null (no effective id existed yet) cannot
+    // be attributed to the current model and must NOT auto-clear (r2 §5).
     if (view.ultracode === true && this.state.effortRefusal[instanceId]) {
       const refusal = this.state.effortRefusal[instanceId];
       const currentModel =
         this.state.modelEffective[instanceId]?.id ?? this.state.models[instanceId] ?? null;
       const sameModel =
-        refusal.scope !== "model" || refusal.modelId == null || refusal.modelId === currentModel;
+        refusal.scope !== "model"
+          ? true
+          : refusal.modelId != null && refusal.modelId === currentModel;
       if (sameModel) {
         patch.effortRefusal = { ...this.state.effortRefusal };
         delete patch.effortRefusal[instanceId];

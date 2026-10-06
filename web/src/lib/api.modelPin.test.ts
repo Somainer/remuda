@@ -51,6 +51,24 @@ describe("mapInstance modelPinMismatches", () => {
     ]);
   });
 
+  it("preserves a durable effortUltracode flag on reload even without an effort event", () => {
+    // Round 2 item 4: the flag rides the instance record; when the journal
+    // tail no longer contains the effort event, the mapped instance must
+    // still carry effortUltracode so the switch survives reload.
+    const mapped = mapInstance(
+      wireRecord({ effortName: "xhigh", effortIndex: 3, effortUltracode: true }),
+    );
+    expect(mapped.effortName).toBe("xhigh");
+    expect(mapped.effortIndex).toBe(3);
+    expect(mapped.effortUltracode).toBe(true);
+    expect(mapped.effortEffective).toBeNull(); // no event in the tail
+  });
+
+  it("maps an absent effortUltracode flag to false (never undefined)", () => {
+    const mapped = mapInstance(wireRecord());
+    expect(mapped.effortUltracode).toBe(false);
+  });
+
   it("maps an absent/null projection to null, and drops malformed rows", () => {
     expect(mapInstance(wireRecord()).modelPinMismatches).toBeNull();
     expect(mapInstance(wireRecord({ modelPinMismatches: null })).modelPinMismatches).toBeNull();

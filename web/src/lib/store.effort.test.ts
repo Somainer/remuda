@@ -441,11 +441,13 @@ it("a failed configure for a replaced request does not clobber the newer one", a
   // A fails slowly; B succeeds.
   let resolveA: () => void = () => {};
   vi.spyOn(api, "instanceConfigure").mockImplementation((_id, _perm, extras) => {
-    if (extras?.effort?.name === "max") {
+    if (extras?.effort?.name === "xhigh") {
+      // A (xhigh) hangs until we reject it late.
       return new Promise((_resolve, reject) => {
         resolveA = () => reject(new Error("A failed late"));
       });
     }
+    // B (max) and anything else resolve immediately.
     return Promise.resolve({} as never);
   });
   // A = xhigh (starts first), then B = max.
@@ -458,33 +460,112 @@ it("a failed configure for a replaced request does not clobber the newer one", a
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });
 
-it("history replay hydrates effective but never touches pending or toasts a refusal", async () => {
-  const ctx = await startFollowing("history-replay");
+it("history replay hydrates effective but never records a refusal, pending or toast", async () => {
+  // A fresh follow whose SEEDED HISTORY contains both an effort observation
+  // (hydrate) and a degraded ultracode lifecycle (must be ignored on replay).
+  const instance: Instance = {
+    ...mockDb.instances[0],
+    id: "ins_effort_store_replay",
+    journalId: "obj_effort_store_replay",
+    kind: "claude",
+    effortName: null,
+    effortIndex: null,
+    effortUltracode: null,
+  };
+  vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
   const configure = vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
   const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
-  // A live refusal marks the switch disabled.
-  ctx.receive(configureLifecycle(2, "effort-degraded:ultracode:ultracode-workflows-disabled"));
-  expect(hubStore.effortRefusalOf(ctx.instance.id)?.reason).toBe("ultracode-workflows-disabled");
-  toast.mockClear();
-
-  // Simulate a history REPLAY of an old positive flag edge (reconnect): it
-  // hydrates effective but must not clear the refusal or settle any pending.
-  hubStore.logout();
-  vi.restoreAllMocks();
-  vi.spyOn(api, "instanceGet").mockResolvedValue(ctx.instance);
+  const seedEvents = [
+    effortEvent(2, "xhigh", true, "remuda"),
+    {
+      eventId: "evt_cfg_replay", instanceId: "x", journalId: "x", seq: "3",
+      kind: "lifecycle", observedAt: "2026-09-16T00:10:00Z",
+      source: { channel: "runtime" },
+      payload: {
+        type: "native", nativeName: "instance.configure",
+        nativeId: { state: "known", value: "not-applicable" },
+        status: { state: "known", value: "effort-degraded:ultracode:ultracode-workflows-disabled" },
+        relatedIds: {},
+      },
+    } as unknown as Observation,
+  ];
   vi.spyOn(api, "eventsRead").mockResolvedValue({
-    events: [effortEvent(3, "xhigh", true, "remuda")],
+    events: seedEvents,
     durableSeq: "3",
     windowFromSeq: "1",
     reachedAfterSeq: true,
     getReadyState: () => 1,
   } as never);
-  vi.spyOn(api, "eventsSubscribe").mockImplementation(async () => subscription(ctx.instance));
-  await hubStore.follow(ctx.instance.id);
+  let deliver!: Observation;
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_j, _a, onBatch) => {
+    deliver = onBatch;
+    return {
+      subscriptionId: "sub_replay",
+      journalId: instance.journalId,
+      durableSeq: "3",
+      windowFromSeq: "1",
+      reachedAfterSeq: true,
+      getReadyState: () => 1,
+      snapshot: {
+        projectionVersion: "v1", projectionEpoch: "e", asOfSeq: "3", instance,
+        runs: [], commands: [], pendingInteractions: [], nodes: [],
+        history: { earliestRetainedSeq: "1", complete: true },
+      },
+    };
+  });
 
-  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.ultracode).toBe(true);
-  // Replay did not touch request-scoped state.
-  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
-  // (logout/relogin drops the in-memory refusal; the point is no toast fired.)
+  await hubStore.follow(instance.id);
+
+  // The observation hydrated effective...
+  expect(hubStore.effortEffectiveOf(instance.id)?.ultracode).toBe(true);
+  // ...but the REPLAYED degraded lifecycle recorded no refusal, no pending,
+  // fired no toast, and triggered no configure.
+  expect(hubStore.effortRefusalOf(instance.id)).toBeNull();
+  expect(hubStore.effortPendingOf(instance.id)).toBeNull();
+  expect(toast).not.toHaveBeenCalled();
   expect(configure).not.toHaveBeenCalled();
+});
+
+const modelRefuse = "effort-degraded:ultracode:ultracode-unavailable-for-model";
+const flagOn = (seq: number, name: string): Observation =>
+  ({
+    eventId: `evt_on_${seq}`, instanceId: "x", journalId: "x", seq: String(seq),
+    kind: "effort", observedAt: `2026-09-17T00:0${seq}:00Z`,
+    source: { channel: "transcript" },
+    payload: {
+      kind: "effort",
+      payload: { effective: { name, ultracode: true, source: "remuda", observedAt: `2026-09-17T00:0${seq}:00Z` }, raw: name },
+    },
+  } as unknown as Observation);
+
+it("success on model B does not erase model A's refusal", async () => {
+  const ctx = await startFollowing("refusal-model-a");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // Establish model A first so the refusal binds to its id.
+  await hubStore.setModel(ctx.instance.id, "model-a");
+  // Refusal on model A.
+  ctx.receive(configureLifecycle(2, ctx.instance.id, modelRefuse));
+  expect(hubStore.effortRefusalOf(ctx.instance.id)?.scope).toBe("model");
+  expect(hubStore.effortRefusalOf(ctx.instance.id)?.modelId).toBe("model-a");
+  // A positive flag read-back still naming model A's environment is gated by
+  // model id; simulate a switch to a DIFFERENT model then positive evidence.
+  await hubStore.setModel(ctx.instance.id, "model-b");
+  ctx.receive(flagOn(3, "xhigh"));
+  // Model A refusal persists because the current model is now B (different
+  // id): positive evidence for B cannot clear A's block.
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
+});
+
+it("a refusal recorded with a null model id never auto-clears", async () => {
+  const ctx = await startFollowing("refusal-null-model");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // Seed a null-modelId refusal directly.
+  hubStore["emit"]({
+    effortRefusal: {
+      [ctx.instance.id]: { reason: "ultracode-unavailable-for-model", scope: "model", modelId: null, at: "2026-09-17T00:00:00Z" },
+    },
+  });
+  // A positive flag read-back must not clear it (model unbound).
+  ctx.receive(flagOn(2, "xhigh"));
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
 });

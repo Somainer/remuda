@@ -142,6 +142,31 @@ describe("WorkflowTimelineCard", () => {
     expect(head()).toHaveAttribute("aria-expanded", "true");
   });
 
+  it("marks an all-done live run 4/4+ provisional, never a final 完成 count", () => {
+    // Dynamic run between spawning iterations: every current member completed
+    // while the run itself is still running. The head count must stay
+    // provisional (4/4+) so it can neither read as finished nor freeze at 100%.
+    renderCard(
+      <WorkflowTimelineCard
+        run={run({ state: "running" })}
+        phases={[phase("p1", "Review", "completed")]}
+        members={[
+          member({ memberId: "a", state: "completed" }),
+          member({ memberId: "b", state: "completed" }),
+          member({ memberId: "c", state: "completed" }),
+          member({ memberId: "d", state: "completed" }),
+        ]}
+      />,
+    );
+    const count = screen.getByTestId("workflow-rail-count");
+    expect(count).toHaveAttribute("data-provisional", "1");
+    expect(count.textContent).toBe("4/4+ agents");
+    expect(count.textContent).not.toContain("完成");
+    expect(screen.getByTestId("workflow-rail")).toHaveAttribute("data-total", "provisional");
+    // The completed-looking phase is provisional on the same rule.
+    expect(screen.getByText("4/4+")).toBeTruthy();
+  });
+
   it("renders per-agent duration, idle, queue and tokens with a live clock", async () => {
     const t = new Date("2026-09-18T12:00:40.000Z").getTime();
     vi.useFakeTimers();
@@ -262,6 +287,105 @@ describe("WorkflowTimelineCard", () => {
     elapsedMs,
   });
 
+  it("reflects the phase disclosure state in aria-expanded and flips on toggle", async () => {
+    const user = userEvent.setup();
+    renderCard(<WorkflowTimelineCard run={run({ state: "completed" })} phases={[phase()]} members={[member({ memberId: "a", state: "completed" })]} />);
+    const phaseHead = screen.getByTestId("workflow-phase").querySelector("button")!;
+    // Completed phases start collapsed; the chevron is drawn right-pointing
+    // (rotation is CSS off aria-expanded — the attribute is the contract).
+    expect(phaseHead).toHaveAttribute("aria-expanded", "false");
+    expect(phaseHead.querySelector("svg")).not.toBeNull();
+    await user.click(phaseHead);
+    expect(phaseHead).toHaveAttribute("aria-expanded", "true");
+    await user.click(phaseHead);
+    expect(phaseHead).toHaveAttribute("aria-expanded", "false");
+  });
+
+  const totalsBlock = (
+    p: Partial<{ done: number; failed: number; killed: number; running: number; total: number; known: boolean }>,
+  ) => ({
+    totalKnown: p.known ?? true,
+    agentsTotal: u(p.total ?? 0),
+    agentsDone: u(p.done ?? 0),
+    agentsFailed: u(p.failed ?? 0),
+    agentsKilled: u(p.killed ?? 0),
+    agentsRunning: u(p.running ?? 0),
+    tokens: u(0),
+    calls: u(0),
+    elapsedMs: u(0),
+  });
+
+  it("advances the header progress from 0/8 to 8/8", () => {
+    const members8 = Array.from({ length: 8 }, (_, i) => member({ memberId: `a${i}`, state: "completed" }));
+    const element = (state: "running" | "completed") => (
+      <WorkflowTimelineCard
+        run={run({ state, totals: totalsBlock(state === "running" ? { done: 0, running: 1, total: 8 } : { done: 8, total: 8 }) })}
+        phases={[phase("p1", "DeepRead", state === "running" ? "running" : "completed")]}
+        members={
+          state === "running"
+            ? [member({ memberId: "a0", state: "running" }), ...Array.from({ length: 7 }, (_, i) => member({ memberId: `q${i}`, state: "queued" }))]
+            : members8
+        }
+      />
+    );
+    const { rerender } = renderCard(element("running"));
+    const count = () => screen.getByTestId("workflow-rail-count").textContent;
+    expect(count()).toContain("0/8");
+    expect(screen.getByTestId("workflow-rail").querySelector("[class*='railFill']")).toBeTruthy();
+
+    rerender(<MemoryRouter initialEntries={["/s/inst_test"]}>{element("completed")}</MemoryRouter>);
+    expect(count()).toContain("8/8");
+  });
+
+  it("marks a failed member in the rail and with a 已失败 count", () => {
+    renderCard(
+      <WorkflowTimelineCard
+        run={run({ state: "failed", totals: totalsBlock({ done: 1, failed: 1, total: 2, known: false }) })}
+        phases={[phase("p1", "Review", "failed")]}
+        members={[
+          member({ memberId: "a", state: "completed" }),
+          member({ memberId: "boom", label: known("review:boom"), state: "failed" }),
+        ]}
+      />,
+    );
+    expect(screen.getByTestId("workflow-rail-count").textContent).toContain("2/2");
+    const failed = screen.getByTestId("workflow-rail-failed");
+    expect(failed.textContent).toContain("1 已失败");
+    // Failed members are finished: full fill with a red slice over half of it.
+    const failSlice = screen.getByTestId("workflow-rail").querySelector("[class*='railFail']") as HTMLElement;
+    expect(failSlice.style.width).toBe("50%");
+  });
+
+  it("marks a dynamic run's total provisional while running and drops the mark at the end", () => {
+    const element = (state: "running" | "completed") => (
+      <WorkflowTimelineCard
+        run={run({ state, totals: totalsBlock(state === "running" ? { done: 2, running: 2, total: 4, known: false } : { done: 4, total: 4, known: false }) })}
+        phases={[phase("p1", "Review", state === "running" ? "running" : "completed")]}
+        members={
+          state === "running"
+            ? [
+                member({ memberId: "a", state: "completed" }),
+                member({ memberId: "b", state: "completed" }),
+                member({ memberId: "c", state: "running" }),
+                member({ memberId: "d", state: "running" }),
+              ]
+            : ["a", "b", "c", "d"].map((id) => member({ memberId: id, state: "completed" }))
+        }
+      />
+    );
+    const { rerender } = renderCard(element("running"));
+    const countEl = () => screen.getByTestId("workflow-rail-count");
+    expect(countEl().textContent).toContain("2/4+");
+    expect(countEl()).toHaveAttribute("title", "运行中，可能还会启动更多 agent");
+    expect(screen.getByTestId("workflow-rail")).toHaveAttribute("data-total", "provisional");
+
+    rerender(<MemoryRouter initialEntries={["/s/inst_test"]}>{element("completed")}</MemoryRouter>);
+    expect(countEl().textContent).toContain("4/4");
+    expect(countEl().textContent).not.toContain("+");
+    expect(countEl().getAttribute("title")).toBeNull();
+    expect(screen.getByTestId("workflow-rail")).toHaveAttribute("data-total", "known");
+  });
+
   it("keeps the header elapsed ticking off totals.elapsedMs when launchedAt is absent", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-18T13:00:00.000Z"));
@@ -306,5 +430,86 @@ describe("WorkflowTimelineCard", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("exposes a labelled progressbar with final now/max on a terminal run", () => {
+    const agents4 = ["a", "b", "c", "d"].map((id) => member({ memberId: id, state: "completed" as const }));
+    renderCard(
+      <WorkflowTimelineCard
+        run={run({
+          state: "completed",
+          totals: totalsBlock({ done: 4, total: 4 }),
+        })}
+        phases={[phase()]}
+        members={agents4}
+      />,
+    );
+    const meter = screen.getByTestId("workflow-progress-meter");
+    expect(meter.getAttribute("role")).toBe("progressbar");
+    expect(meter.getAttribute("aria-label")).toContain("demo-wf");
+    expect(meter.getAttribute("aria-valuemin")).toBe("0");
+    expect(meter.getAttribute("aria-valuemax")).toBe("4");
+    expect(meter.getAttribute("aria-valuenow")).toBe("4");
+    expect(meter.getAttribute("data-provisional")).toBe("0");
+    expect(meter.getAttribute("aria-valuetext")).toBe("4 of 4 agents done");
+  });
+
+  it("exposes a provisional progressbar with valuetext only (no now/min/max) while alive", () => {
+    const agents8 = [
+      ...["a", "b", "c"].map((id) => member({ memberId: id, state: "completed" as const })),
+      member({ memberId: "d", state: "failed" as const }),
+      ...["e", "f", "g"].map((id) => member({ memberId: id, state: "running" as const })),
+      member({ memberId: "h", state: "queued" as const }),
+    ];
+    renderCard(
+      <WorkflowTimelineCard
+        run={run({
+          state: "running",
+          totals: totalsBlock({ done: 4, failed: 1, running: 3, total: 8 }),
+        })}
+        phases={[phase()]}
+        members={agents8}
+      />,
+    );
+    const meter = screen.getByTestId("workflow-progress-meter");
+    // A live run has no valid range at all: omit now/min/max so a count past
+    // any assumed default max (e.g. 101 completions) can't make an invalid
+    // range. Progress is conveyed solely by valuetext.
+    expect(meter.getAttribute("aria-valuemax")).toBeNull();
+    expect(meter.getAttribute("aria-valuemin")).toBeNull();
+    expect(meter.getAttribute("aria-valuenow")).toBeNull();
+    expect(meter.getAttribute("data-provisional")).toBe("1");
+    expect(meter.getAttribute("aria-valuetext")).toBe(
+      "5 of at least 8 agents done, still running; 1 failed",
+    );
+    // The accessible-only node actually carries the hashed sr class.
+    expect(meter.className).toMatch(/_sr[_\s]/);
+  });
+
+  it("a live run with 101 completions exposes no invalid progressbar range", () => {
+    // 101 completed members plus one still running (102 total): the count
+    // exceeds any assumed default max (100), so a live run must carry no
+    // now/max at all — only valuetext.
+    const agents102 = [
+      ...Array.from({ length: 101 }, (_, i) =>
+        member({ memberId: `d${i}`, state: "completed" as const }),
+      ),
+      member({ memberId: "r", state: "running" as const }),
+    ];
+    renderCard(
+      <WorkflowTimelineCard
+        run={run({
+          state: "running",
+          totals: totalsBlock({ done: 101, running: 1, total: 102 }),
+        })}
+        phases={[phase()]}
+        members={agents102}
+      />,
+    );
+    const meter = screen.getByTestId("workflow-progress-meter");
+    expect(meter.getAttribute("aria-valuenow")).toBeNull();
+    expect(meter.getAttribute("aria-valuemin")).toBeNull();
+    expect(meter.getAttribute("aria-valuemax")).toBeNull();
+    expect(meter.getAttribute("aria-valuetext")).toContain("101 of at least 102");
   });
 });

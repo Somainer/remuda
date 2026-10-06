@@ -49,11 +49,11 @@ impl NodeTransport for FakeNode {
             self.calls.lock().unwrap().push(method.clone());
             let reply = match method.as_str() {
                 "host.dirs.list" => {
-                    // Simulate the real Node's authoritative resolution:
-                    //  * an alias directory ("/srv/...") resolves to the
-                    //    registered ROOT;
-                    //  * a real symlink alias ("link-to-e2e") is REFUSED
-                    //    (the Node's no-follow walk never follows it);
+                    // Simulate the REAL Node's no-follow walk:
+                    //  * an exact or lexical ("."/"..") alias of the ROOT
+                    //    resolves to the canonical ROOT (the Node opens the
+                    //    same pinned directory);
+                    //  * a real symlink alias ("link-to-e2e") is REFUSED;
                     //  * a name with a trailing space is a real directory and
                     //    resolves verbatim to the registered root.
                     let requested = params.get("path").and_then(Value::as_str).unwrap_or("");
@@ -62,19 +62,32 @@ impl NodeTransport for FakeNode {
                             "the browsed path is outside the directories this Node allows workspaces in, \
                              or is not an accessible directory"}})
                     } else {
+                        // Lexically collapse "."/".." exactly like the Node's
+                        // pinned walk; the result must be the ROOT or another
+                        // allowed root. This is Node-side filesystem truth,
+                        // not a Hub-side lexical identity.
+                        let collapsed = collapse_alias(requested);
                         let canonical = if requested.is_empty() {
-                            "/home/remuda"
+                            "/home/remuda".to_owned()
+                        } else if collapsed == ROOT
+                            // A real directory whose stored name ends in a
+                            // space: the no-follow walk opens it verbatim and
+                            // reports the same registered ROOT (round 4/5
+                            // item 3/10). Replaced by a real-fs fixture below.
+                            || requested.trim_end() == ROOT
+                        {
+                            ROOT.to_owned()
                         } else {
-                            requested.trim_end()
+                            collapsed
                         };
                         json!({
                             "path": canonical,
                             "parent": null,
                             "home": "/home/remuda",
-                            "roots": ["/home/remuda", canonical],
+                            "roots": ["/home/remuda", ROOT],
                             "workspaces": [],
                             "dirs": [{ "name": "projects" }],
-                            "truncated": false,
+                            "truncated": false
                         })
                     }
                 }
@@ -151,6 +164,22 @@ async fn json_request(
         status,
         String::from_utf8_lossy(&buf[split + 4..]).to_string(),
     ))
+}
+
+/// Lexically collapse "."/".." the way the Node's pinned no-follow walk
+/// reports a canonical path for a non-symlink alias (test fake helper).
+fn collapse_alias(raw: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            name => stack.push(name),
+        }
+    }
+    format!("/{}", stack.join("/"))
 }
 
 fn cookie_from(head: &str) -> Option<String> {

@@ -322,53 +322,42 @@ pub(crate) fn count_workspace_users(
     Ok((sessions, tasks))
 }
 
-/// Map an absolute root path to the workspace id in the host's last observed
-/// snapshot, so the path-bodied DELETE route can run the usage guard.
+/// Resolve an unregister DELETE `path` to the Node-authoritative
+/// `(workspaceId, canonicalRoot)` BEFORE taking the operation lock or
+/// counting occupancy (round 5 item 2).
 ///
-/// Round 3 item 8: a lexical normalization only handles `.`/`..` aliases;
-/// it cannot resolve a symlink or prove that a name with trailing spaces is
-/// the same directory. The Node owns the filesystem, so for any request
-/// path that does not lexically match a canonical snapshot root we ask the
-/// Node to resolve it via a no-side-effects directory browse, then match on
-/// the canonical path the Node reports. Selected paths themselves are never
-/// modified; this is read-only identity resolution.
-async fn workspace_id_for_path(
+/// The exact stored snapshot root matches byte-for-byte (a real trailing
+/// space is a different name; no trimming). Anything else is resolved by the
+/// Node with unregister's own semantics: a no-follow directory browse
+/// returns the canonical path the Node opened, mapped to the snapshot
+/// workspace. A lexical `..` collapse is NEVER identity (`/allowed/link/../A`
+/// can resolve through a symlink elsewhere). A Node refusal (symlink escape,
+/// missing, out-of-policy) returns the error; unregister is not called.
+async fn workspace_identity_for_path(
     state: &AppState,
     host_id: &str,
     path: &str,
-) -> Result<Option<String>, HubError> {
+) -> Result<Option<(String, String)>, HubError> {
     let host = host_id.to_owned();
-    // Passed verbatim: a registered directory name may really end in a space,
-    // and trimming would turn it into a different path (round 4 item 3).
-    let normalized = normalize_absolute(path);
     let (_, workspaces) = state
         .store
-        .run_named("workspace_id_for_path", move |conn| {
+        .run_named("workspace_identity_for_path", move |conn| {
             load_snapshot(conn, &host)
         })
         .await?;
-    let lexical_match = normalized.as_ref().and_then(|normalized| {
-        workspaces
-            .iter()
-            .find(|workspace| {
-                workspace["root"]
-                    .as_str()
-                    .and_then(normalize_absolute)
-                    .as_deref()
-                    == Some(normalized.as_str())
-            })
-            .and_then(|workspace| workspace["workspaceId"].as_str().map(str::to_owned))
-    });
-    if lexical_match.is_some() {
-        return Ok(lexical_match);
+
+    // (1) Exact stored root only: no trim, no lexical `..`.
+    if let Some(workspace) = workspaces
+        .iter()
+        .find(|workspace| workspace["root"].as_str() == Some(path))
+    {
+        let id = workspace["workspaceId"]
+            .as_str()
+            .ok_or_else(|| HubError::BadRequest("snapshot workspaceId missing".into()))?;
+        return Ok(Some((id.to_owned(), path.to_owned())));
     }
-    // Ask the Node for the authoritative canonical identity of this path,
-    // using unregister's own path semantics (path verbatim). This resolves
-    // real names the lexical pass cannot equate (e.g. one ending in a
-    // space). Fail closed (round 4 item 3): if the Node refuses — a symlink
-    // escape, a missing/unreadable directory, an out-of-policy path — the
-    // Hub must not skip the occupancy guard and hope the prepare rejects it,
-    // because that would miss an active task. Surface the Node's refusal.
+
+    // (2) Node-authoritative resolution of the exact path.
     let answer =
         crate::http::call_node(state, host_id, "host.dirs.list", json!({"path": path})).await?;
     let Some(canonical) = answer.get("path").and_then(Value::as_str) else {
@@ -379,13 +368,20 @@ async fn workspace_id_for_path(
     Ok(workspaces
         .iter()
         .find(|workspace| workspace["root"].as_str() == Some(canonical))
-        .and_then(|workspace| workspace["workspaceId"].as_str().map(str::to_owned)))
+        .map(|workspace| {
+            (
+                workspace["workspaceId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                canonical.to_owned(),
+            )
+        }))
 }
 
-/// Lexically normalize an absolute path the way the Node's `canonicalize`
-/// treats non-symlink aliases: empty/`.` segments collapse, `..` pops, with
-/// no filesystem access (symlink components are not resolvable Hub-side).
-/// Returns None for a relative or unrepresentable path.
+/// Lexical normalization helper used only by unit tests now that unregister
+/// identity resolution is exact-match + Node-authoritative (round 5 item 2).
+#[cfg(test)]
 fn normalize_absolute(path: &str) -> Option<String> {
     if !path.starts_with('/') {
         return None;
@@ -429,15 +425,23 @@ async fn mutate(
     // the Node's prepared-workspace create block closes the rest of the
     // window. Unknown paths skip the lock and fall through to the Node's
     // prepare rejection.
-    if let Some(workspace_id) = if method == "workspace.unregister" {
-        workspace_id_for_path(state, &id, &body.path).await?
+    // Round 5 item 1: resolve identity and take the per-workspace guard BEFORE
+    // the occupancy query, then HOLD it in function scope through command
+    // queue, prepare, commit and snapshot observation. A task create that
+    // acquires the same guard (hold_workspace_operation around bind+publish)
+    // therefore cannot interleave with this unregister anywhere.
+    let unbind_identity = if method == "workspace.unregister" {
+        workspace_identity_for_path(state, &id, &body.path).await?
     } else {
         None
-    } {
-        // RAII: held across every exit (success, occupancy refusal, Node
-        // rejection) and marked settled on Drop, so prune never splits a waiter.
-        let _operation_guard = hold_workspace_operation(&id, &workspace_id).await;
-        let (sessions, tasks) = workspace_users(state, &id, &workspace_id).await?;
+    };
+    let _operation_guard = if let Some((workspace_id, _)) = &unbind_identity {
+        Some(hold_workspace_operation(&id, workspace_id).await)
+    } else {
+        None
+    };
+    if let Some((workspace_id, _canonical_root)) = &unbind_identity {
+        let (sessions, tasks) = workspace_users(state, id.as_str(), workspace_id).await?;
         if sessions > 0 || tasks > 0 {
             let mut reasons = Vec::new();
             if sessions > 0 {
@@ -518,12 +522,37 @@ async fn mutate(
         Err(error) => return Err(error),
     };
     require_phase(&settled, &command.command_id, "settled")?;
+    // Round 5 item 2: verify the Node settled the SAME workspace identity we
+    // resolved and locked, so a `..`/alias cannot unregister a different one.
+    if method == "workspace.unregister"
+        && let Some((expected_id, expected_root)) = &unbind_identity
+    {
+        let settled_id = settled.get("workspaceId").and_then(Value::as_str);
+        let settled_root = settled
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row.get("workspaceId").and_then(Value::as_str) == Some(expected_id.as_str())
+                })
+            })
+            .and_then(|row| row.get("root").and_then(Value::as_str));
+        if settled_id != Some(expected_id.as_str())
+            || (settled_root.is_some() && settled_root != Some(expected_root.as_str()))
+        {
+            return Err(HubError::Conflict(format!(
+                "unregister settled a different workspace than resolved ({expected_id}@{expected_root})"
+            )));
+        }
+    }
     observe_snapshot(state, &id, settled.clone(), Some(command.command_id)).await?;
     let mut response = snapshot_view(&state.store, id.clone()).await?;
     if let Some(workspace_id) = settled.get("workspaceId").cloned() {
         response["workspaceId"] = workspace_id;
     }
-    // `_operation_guard` drops here (success) and marks the entry settled.
+    // `_operation_guard` is held to here (after snapshot observation) and
+    // drops across every exit path, blocking task creation for the full
+    // prepare→settle window.
     Ok(Json(response))
 }
 
@@ -733,6 +762,44 @@ mod tests {
         drop(b);
         let _other3 = hold_workspace_operation("hst-prune4", "other3").await;
         assert!(!contains("wsp"), "settled sole-owner entry must be pruned");
+    }
+
+    #[tokio::test]
+    async fn unregister_guard_blocks_task_binding_for_the_whole_prepare_to_settle() {
+        // Round 5 item 1: the unregister guard is held beyond the occupancy
+        // query, through prepare→settle. A task binding that starts after the
+        // occupancy query but before settle must wait, not bind immediately.
+        let unregister = tokio::spawn(hold_workspace_operation("hst-r5", "wsp"));
+        // Let unregister park holding the lock.
+        let held = tokio::time::timeout(std::time::Duration::from_secs(2), unregister)
+            .await
+            .expect("unregister acquires")
+            .expect("unregister task");
+
+        // A binding attempt starts and must be queued (not bound).
+        let bind_started = Arc::new(tokio::sync::Notify::new());
+        let bind_finished = Arc::new(tokio::sync::Notify::new());
+        let bind = {
+            let started = bind_started.clone();
+            let finished = bind_finished.clone();
+            tokio::spawn(async move {
+                let _g = hold_workspace_operation("hst-r5", "wsp").await;
+                let _ = (started, finished);
+            })
+        };
+        bind_started.notify_one();
+        // Give the binding task time to park on the mutex.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // It is still waiting while unregister holds.
+        assert!(!bind.is_finished(), "binding must wait for unregister");
+
+        // Unregister settles; the binding acquires (and then releases).
+        drop(held);
+        bind_finished.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), bind)
+            .await
+            .expect("binding eventually acquires after unregister settles")
+            .expect("bind task");
     }
 
     /// Minimal tables carrying only the columns the usage guard reads.

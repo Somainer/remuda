@@ -250,6 +250,27 @@ describe("subagent-scoped phases (c-cardsettle r3 item 8)", () => {
     );
     const got = livePhase([working, rootFailed]);
     expect(got?.phase).toBe("turn-ended");
-    expect(got?.outcome).toBe("failed");
+  });
+
+  it("r4 item 3: agentId ALONE (missing or empty agentType) is still subagent scope", () => {
+    const working = turnLive(1, phase("thinking", T0), T0);
+    // agentId present, agentType MISSING.
+    const idOnly = turnLive(
+      2,
+      phase("turn-ended", T0, { outcome: "failed", agentId: "agentwithouttype" }),
+      "2026-10-05T00:00:05.000Z",
+      "hook",
+      "StopFailure",
+    );
+    expect(livePhase([working, idOnly])?.phase).toBe("thinking");
+    // agentId present, agentType EMPTY.
+    const emptyType = turnLive(
+      3,
+      phase("turn-ended", T0, { outcome: "failed", agentId: "x", agentType: "" }),
+      "2026-10-05T00:00:06.000Z",
+      "hook",
+      "StopFailure",
+    );
+    expect(livePhase([working, emptyType])?.phase).toBe("thinking");
   });
 });

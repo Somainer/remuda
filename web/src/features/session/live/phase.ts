@@ -91,15 +91,13 @@ function phaseTags(ev: TurnLifecycle): Record<string, string> | null {
   const tags = (payload.relatedIds ?? {}) as Record<string, string>;
   const phase = tags[TAGS.phase];
   if (!phase || !PHASE_SET.has(phase)) return null;
-  // c-cardsettle r3 item 8: a phase tag on a SUBAGENT-scoped observation
-  // (agentId + agentType, e.g. a workflow member's turn-ended/failed) ends
-  // the subagent's turn, never the root turn. Old journals can still carry
-  // this tag from before the Node scoped it, so the browser must ignore it
-  // too — otherwise the main strip shows 回合结束·失败 while the process is
-  // still serving the workflow. Root turn boundaries carry no agentId.
-  const agentId = tags.agentId;
-  const agentType = tags.agentType;
-  if (agentId && agentType) return null;
+  // c-cardsettle r3 item 8 / r4 item 3: a phase tag on a SUBAGENT-scoped
+  // observation (non-empty agentId; agentType is optional) ends the
+  // subagent's turn, never the root turn. Old journals can still carry this
+  // tag from before the Node scoped it, so the browser must ignore it too —
+  // otherwise the main strip shows 回合结束·失败 while the process is still
+  // serving the workflow. Root turn boundaries carry no agentId.
+  if (tags.agentId) return null;
   return tags;
 }
 

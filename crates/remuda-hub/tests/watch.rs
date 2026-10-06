@@ -663,8 +663,10 @@ fn assistant_error_event(message: &str) -> Value {
     })
 }
 
-/// The print driver's turn-result frame: `result` with status `error` (this is
-/// the event that also drives the Hub instance lifecycle to `failed`).
+/// The print driver's turn-result frame: `result` with status `error`. Per
+/// c-cardsettle r4 (OA6) this ends the TURN only — it does NOT mark the
+/// instance lifecycle failed. The driver emits a SEPARATE native session
+/// exit (`session_exit_event`) when the one-shot process actually ends.
 fn turn_error_event() -> Value {
     json!({
         "kind": "lifecycle",
@@ -675,6 +677,24 @@ fn turn_error_event() -> Value {
             "status": { "value": "error" },
             "affectsCompletion": true,
             "relatedIds": { "resultIndex": "1", "numTurns": "1" },
+        },
+    })
+}
+
+/// The real process-end evidence the print/generic driver emits (topic=session,
+/// nativeName=exit) after a one-shot process terminates. THIS — not the turn
+/// result error — is what marks the instance lifecycle failed.
+fn session_exit_event() -> Value {
+    json!({
+        "kind": "lifecycle",
+        "payload": {
+            "type": "native",
+            "topic": "session",
+            "nativeName": "exit",
+            "severity": "error",
+            "affectsCompletion": true,
+            "status": { "value": "failed" },
+            "relatedIds": { "lastError": "pane exited; agent process is gone" },
         },
     })
 }
@@ -699,6 +719,9 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
         &[
             assistant_error_event("API Error: 400 requested model is not available"),
             turn_error_event(),
+            // r4: the turn error alone is not terminal; the one-shot process
+            // then emits a real native session exit.
+            session_exit_event(),
         ],
     );
 

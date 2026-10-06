@@ -213,18 +213,15 @@ impl LiveState {
         let Some(phase) = phase(event, mapped.kind) else {
             return LiveFold::default();
         };
-        // c-cardsettle r3 item 8: a TURN boundary attributed to a SUBAGENT
-        // (raw agent_id + agent_type, e.g. a workflow subagent's StopFailure)
-        // ends the subagent's turn only. It never latches the ROOT phase (no
-        // turn-ended, no idle, no outcome); the member row is owned by the
-        // workflow fold. The subagent's own TOOL events still flow (their
-        // ToolCall/Result extras carry the agent id — see ToolStarted below),
-        // so only the root turn-boundary kinds are gated here. Root turn
-        // boundaries carry no agent id.
-        let subagent_scoped = event.text("agent_id").is_some_and(|id| !id.is_empty())
-            && event
-                .text("agent_type")
-                .is_some_and(|kind| !kind.is_empty());
+        // c-cardsettle r3 item 8 / r4 item 3: a TURN boundary attributed to a
+        // SUBAGENT (raw agent_id; agent_type is optional) ends the subagent's
+        // turn only. It never latches the ROOT phase (no turn-ended, no idle,
+        // no outcome); the member row is owned by the workflow fold. The
+        // subagent's own TOOL events still flow (their ToolCall/Result extras
+        // carry the agent id — see ToolStarted below), so only the root
+        // turn-boundary kinds are gated here. Root turn boundaries carry no
+        // agent id.
+        let subagent_scoped = event.text("agent_id").is_some_and(|id| !id.is_empty());
         if subagent_scoped
             && matches!(
                 mapped.kind,

@@ -1356,13 +1356,13 @@ async fn follow_session(
         if instance_ids.is_empty()
             && let Ok(recent) = state.store.recent_invalidated_interactions().await
         {
-            for (instance_id, interaction_id) in recent {
+            for (instance_id, interaction_id, reason) in recent {
                 let frame = json!({
                     "type": "settlement",
                     "instanceId": instance_id,
                     "interactionId": interaction_id,
                     "state": "invalidated",
-                    "reason": "generation-ended",
+                    "reason": reason,
                 })
                 .to_string();
                 if out_tx.send(FollowMsg::Text(frame)).await.is_err() {
@@ -1483,10 +1483,42 @@ async fn follow_session(
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Settlements are tiny and the bus is generously
-                            // sized; a lag here is effectively impossible, but a
-                            // gap frame still lets the client refresh (its
-                            // durable row is already invalidated).
+                            // c-cardsettle r4 item 6: one or more settlement
+                            // notices were overwritten. A gap frame alone is
+                            // not enough — an older in-flight inbox response
+                            // can resurrect the card because only pinned ids
+                            // are protected. Recover the AUTHORITATIVE
+                            // terminal ids from durable storage (live rows and
+                            // tombstones) and re-send each as a settlement
+                            // notice BEFORE the gap, so the client pins them
+                            // before it reconciles.
+                            let terminal = state
+                                .store
+                                .recent_invalidated_interactions()
+                                .await
+                                .unwrap_or_default();
+                            for (sid, iid, reason) in terminal {
+                                if !instance_ids.is_empty()
+                                    && !instance_ids.iter().any(|id| id == &sid)
+                                {
+                                    continue;
+                                }
+                                let frame = json!({
+                                    "type": "settlement",
+                                    "instanceId": sid,
+                                    "interactionId": iid,
+                                    "state": "invalidated",
+                                    "reason": reason,
+                                })
+                                .to_string();
+                                if out_tx
+                                    .send(FollowMsg::Text(frame))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             let gap = json!({ "type": "gap", "reason": "settlement-backpressure" });
                             if out_tx
                                 .send(FollowMsg::Text(gap.to_string()))

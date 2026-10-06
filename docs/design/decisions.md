@@ -1273,7 +1273,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
    3. **in-memory CAS**：durable 行与墓碑都不存在时才查一次性内存 approval broker（agent 无法 settle 内存卡），内存卡 CAS 在此决出。
    4. **dispatch**：durable 行（含 answer-committed/resolved）只发给该卡记录的**拥有者 host**；真正 live-only（无 durable 拥有者、无墓碑、非内存卡）的 id 才向**全部已连接 Node** fan-out。同 commandId 重放由 Node 去重得 200 `{outcome:'idempotent'}`，竞争 commandId 得 409。
 
-   即 404/410 一律在 Node RPC 之前由 Hub 确定；409 有两个来源——删除墓碑的 409 在 Hub 侧，durable 已答/resolved 与竞争命令的 409 来自 Node（同命令重放为 200 idempotent）。**不存在「未知 id 一律先 404」的承诺**：一个从未出现过的 id（无 durable 行、无墓碑、无内存 grant）仍按 live-only 向 Node fan-out。死世代绝不 500、绝不静默成功。Hub 侧不做 winner 回填/commandId 去重。
+   即 **pre-RPC 的 404/410 只由「已确认终态的 durable 行 / 删除墓碑」产生**；409 有两个来源——删除墓碑的 409 在 Hub 侧，durable 已答/resolved 与竞争命令的 409 来自 Node（同命令重放为 200 idempotent）。**不存在「未知 id 一律先 404」的承诺**：一个从未出现过的 live-only id（无 durable 行、无墓碑、无内存 grant）的 404 来自 Node fan-out **之后**（broker 找不到持有该交互的 Node），不是 pre-RPC。死世代绝不 500、绝不静默成功。Hub 侧不做 winner 回填/commandId 去重。
 
 **明确不做（B 部分，后续独立 ADR）**：answer fence、dispatch 前 claim（pending→dispatching）、ingestion 层 generation fence（终态后重放的 interaction.requested 仍按普通路径入库——但见决策 4/6：r2 item 6 已保证重放不覆写既有终态行）、(nodeEpoch, processGeneration) / link generation fence、Node 侧拒绝、answer winner（commandId）回填与同命令重试幂等（因此已答/resolved 行的 200 idempotent / 409 仍由 Node 判定）、dispatching 在飞行的结清。本 ADR 只保证「已结束 session 的卡不再永远 pending」与「迟到回答得到与实现一致的非 pending 结果」。
 

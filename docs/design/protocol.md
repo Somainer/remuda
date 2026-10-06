@@ -431,7 +431,7 @@ stateDiagram-v2
 > 3. **in-memory CAS**：仅当 durable 行与墓碑都不存在时，查一次性内存 approval broker（agent 永远无法 settle 内存卡）；内存卡的 CAS 在这里决出，过期/被占直接返回相应错误。
 > 4. **dispatch（Node RPC）**：durable 行（含 answer-committed/resolved）只发给该卡记录的**拥有者 host**；真正 live-only（无 durable 拥有者、无墓碑、非内存卡）的 id 才向**全部已连接 Node** fan-out。同 commandId 的重放由 Node 去重得 **200 `{outcome:'idempotent'}`**，竞争 commandId 得 **409（Node 返回）**。
 >
-> 即：**404/410 一律在 Node RPC 之前由 Hub 确定；409 有两个来源——删除墓碑的 409 在 Hub 侧，durable answer-committed/resolved 与竞争命令的 409 来自 Node（同命令重放是 200 idempotent）**。这里没有「未知 → 一律 404 后才转发」的额外承诺：一个从未存在过的 id（无 durable 行、无墓碑、无内存 grant）仍按 live-only 向 Node fan-out。Hub 侧不做 winner 回填/commandId 去重。answer fence、dispatch 前 claim、generation/epoch fence、Node 侧拒绝、winner 回填属于后续独立 ADR（c-deadcards 的 B 部分），本条不含。
+> 即：**pre-RPC（任何 Node `interaction.answer` 转发之前）的 404/410 只由「已确认终态的 durable 行 / 删除墓碑」产生**。409 有两个来源——删除墓碑的 409 在 Hub 侧，durable answer-committed/resolved 与竞争命令的 409 来自 Node（同命令重放是 200 idempotent）。这里没有「未知 → 一律 404 后才转发」的承诺：一个从未存在过的 live-only id（无 durable 行、无墓碑、无内存 grant）的 404 来自 **Node fan-out 之后**（broker 找不到任何持有该交互的 Node），不是 pre-RPC。Hub 侧不做 winner 回填/commandId 去重。answer fence、dispatch 前 claim、generation/epoch fence、Node 侧拒绝、winner 回填属于后续独立 ADR（c-deadcards 的 B 部分），本条不含。
 
 ### 2.7 工作区当前变更（只读 SCM 快照）
 

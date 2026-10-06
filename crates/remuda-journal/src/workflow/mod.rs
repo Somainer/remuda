@@ -300,6 +300,50 @@ impl WorkflowJournalTailer {
         self.emit_snapshots()
     }
 
+    /// c-cardsettle r4 item 5: Tailer-level entry for a subagent StopFailure.
+    /// Resolves/registers the run like `agent_event`, then marks the member
+    /// failed and emits snapshots.
+    pub fn agent_failed(
+        &mut self,
+        agent_id: &str,
+        agent_transcript_path: Option<&Path>,
+    ) -> Result<Vec<Envelope>, Error> {
+        if agent_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let run_id = match agent_transcript_path.and_then(run_id_from_transcript_path) {
+            Some(run_id) => run_id,
+            None => match self.run_for_agent(agent_id) {
+                Some(run_id) => run_id,
+                None => match self.run_for_agent_file(agent_id) {
+                    Some(run_id) => run_id,
+                    None => return Ok(Vec::new()),
+                },
+            },
+        };
+        if self.runs.iter().all(|run| run.native_id != run_id) {
+            let dir = agent_transcript_path
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| {
+                    self.session_dir
+                        .join("subagents")
+                        .join("workflows")
+                        .join(&run_id)
+                });
+            self.register_run(run_id.clone(), dir);
+            self.load_script_for(&run_id);
+        }
+        let index = self
+            .runs
+            .iter()
+            .position(|run| run.native_id == run_id)
+            .expect("run registered above");
+        self.runs[index].agent_failed(agent_id, agent_transcript_path);
+        self.emit_snapshots()
+    }
+
     /// Tail the main session transcript for this run's terminal markers
     /// (`<task-notification>` / TaskStop). Only newly appended bytes are read,
     /// so pass the SessionStart-bound transcript path.
@@ -1276,6 +1320,26 @@ impl RunState {
         self.members.push(member);
         self.refresh_agents()?;
         Ok(())
+    }
+
+    /// c-cardsettle r4 item 5: mark THIS run's member failed from a subagent
+    /// StopFailure. Creates the member if a reordered StopFailure beat its
+    /// SubagentStart. The root instance is untouched; only the member row.
+    fn agent_failed(&mut self, agent_id: &str, transcript_path: Option<&Path>) {
+        if !self.members.iter().any(|m| m.agent_id == agent_id) {
+            let mut member = MemberState::new(agent_id.to_owned(), None, 1);
+            if let Some(path) = transcript_path
+                && let Ok(tail) = FileTail::new(path)
+            {
+                member.jsonl = Some(tail);
+            }
+            self.members.push(member);
+        }
+        if let Some(index) = self.members.iter().position(|m| m.agent_id == agent_id) {
+            self.members[index].state = WorkflowState::Failed;
+            self.members[index].stopped = true;
+        }
+        self.refresh_agents().ok();
     }
 
     fn agent_stopped(&mut self, agent_id: &str, transcript_path: Option<&Path>) {

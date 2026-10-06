@@ -2572,41 +2572,38 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
     let LifecyclePayload::Native(native) = payload.as_ref() else {
         return None;
     };
-    // c-cardsettle r3 item 1 + addendum (owner rule: "even failed must not be
-    // equated with the process exiting; after failed you can retry; only
-    // process exit / tty gone should go to resume"). An instance becomes
-    // terminal ONLY from evidence the PROCESS ENDED. The discriminator is the
-    // driver's `affectsCompletion`:
-    //  - affectsCompletion=false → the process is still alive: a failed live
-    //    configure switch (topic=configuration), a hook StopFailure / a root
-    //    turn failure the PTY survives (topic=turn), a subagent-scoped event
-    //    (relatedIds.agentId + agentType, e.g. workflow-subagent). All are
-    //    turn-level / own-scope and never end the main instance.
-    //  - affectsCompletion=true → this result IS the process completion. A
-    //    one-shot print driver's final `result` error (topic=turn) and a real
-    //    pane/process death (topic=session, name exit/error/gone) then
-    //    terminate. Informational topics (diagnostic/hook/task/plan/configure)
-    //    are never the process lifecycle even with the flag set.
-    if is_subagent_observation(native)
-        || !native.affects_completion
-        || matches!(
-            native.topic,
-            remuda_protocol::LifecycleTopic::Configuration
-                | remuda_protocol::LifecycleTopic::Diagnostic
-                | remuda_protocol::LifecycleTopic::Hook
-                | remuda_protocol::LifecycleTopic::Task
-                | remuda_protocol::LifecycleTopic::Plan
-        )
-    {
+    // c-cardsettle r4 items 1+2 (OA6): terminal ONLY from explicit
+    // process-end evidence. Subagent events (agentId) and ALL non-session
+    // topics — including topic=turn even when affectsCompletion=true — never
+    // end the process. A one-shot print/SDK driver's `result` error is a TURN
+    // failure; the driver emits a SEPARATE topic=session native_exit/EOF when
+    // the child process actually ends. The legacy `shell`/`error`/`gone`
+    // names on topic=session (generic_pty.sh failure_lifecycle, pane exit,
+    // startup failure) remain terminal.
+    if is_subagent_observation(native) || native.topic != remuda_protocol::LifecycleTopic::Session {
         return None;
     }
     let name = native.native_name.to_ascii_lowercase();
-    let failed = native.severity == remuda_protocol::Severity::Error
-        || name.contains("error")
-        || name == "exit"
+    // r4 item 2: only EXPLICIT process-end evidence. A name proving the
+    // process is gone (native_exit/exit/gone/agent_not_ready/shell) or a
+    // launch that never started (reasonCode native-driver-start-failed /
+    // start-fail name). Bare severity=error / generic "error" name is a
+    // transient error the process survives.
+    let reason_code = native
+        .related_ids
+        .get("reasonCode")
+        .map(String::as_str)
+        .unwrap_or("");
+    let explicit_process_exit = name == "exit"
+        || name.contains("exit")
         || name.contains("gone")
         || name.contains("agent_not_ready")
         || name.contains("shell");
+    let startup_failed = reason_code == "native-driver-start-failed"
+        || name == "native-driver-start-failed"
+        || name == "error"
+        || name.contains("start-fail");
+    let failed = explicit_process_exit || startup_failed;
     if !failed {
         return None;
     }
@@ -2621,19 +2618,15 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
     }
 }
 
-/// c-cardsettle r3 item 8: a native lifecycle observation attributed to a
-/// SUBAGENT (a `relatedIds.agentId` paired with an `agentType`, or the
-/// workflow tailer's id field) is the subagent's row, never the main
-/// instance. Main-session observations carry no agentId.
-fn is_subagent_observation(native: &remuda_protocol::NativeLifecycle) -> bool {
+/// c-cardsettle r3 item 8 / r4 item 3: a native lifecycle attributed to a
+/// SUBAGENT (a non-empty `relatedIds.agentId`) is the subagent's row, never
+/// the main instance. `agentType` is OPTIONAL — some producers stamp only the
+/// id. Main-session observations carry no agentId.
+pub(crate) fn is_subagent_observation(native: &remuda_protocol::NativeLifecycle) -> bool {
     native
         .related_ids
         .get("agentId")
         .is_some_and(|id| !id.is_empty())
-        && native
-            .related_ids
-            .get("agentType")
-            .is_some_and(|kind| !kind.is_empty())
 }
 
 /// A PTY process that ended, as reported by the driver's exit waiter (§5.5).
@@ -3616,6 +3609,28 @@ mod tests {
                 &[("agentId", "a1"), ("agentType", "workflow-subagent")],
                 false,
             ),
+            // r4 item 3: agentId ALONE (agentType missing) is still subagent scope.
+            (
+                "subagent-id-only",
+                LifecycleTopic::Session,
+                "exit",
+                Severity::Error,
+                true,
+                &[("agentId", "a1")],
+                false,
+            ),
+            // r4 item 2: a transient topic=session error with a DISTINCT
+            // name (not the exact "error" launch-failure name) is not
+            // terminal even with severity=error.
+            (
+                "transient-session-error",
+                LifecycleTopic::Session,
+                "transient_runtime_error",
+                Severity::Error,
+                false,
+                &[],
+                false,
+            ),
             // Terminal: only real process ends of the MAIN session.
             (
                 "pane-exit",
@@ -3632,7 +3647,10 @@ mod tests {
                 "error",
                 Severity::Error,
                 true,
-                &[("lastError", "agent process exited during startup")],
+                &[
+                    ("lastError", "agent process exited during startup"),
+                    ("reasonCode", "native-driver-start-failed"),
+                ],
                 true,
             ),
             (
@@ -3903,6 +3921,43 @@ mod tests {
                 InstanceLifecycle::Failed | InstanceLifecycle::Exited
             ),
             "a main StopFailure ends the TURN, not the process: {:?}",
+            row.lifecycle
+        );
+
+        // r4 item 2: a failed turn (topic=turn result error, even the final
+        // result) does NOT end a LIVE child — the child accepts another
+        // prompt and cards stay pending until a real topic=session exit.
+        tx.send(native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "not-applicable",
+            &[("resultIndex", "1"), ("outcome", "failed")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        ))
+        .await
+        .unwrap();
+        // The live child is still alive enough to accept another prompt.
+        tx.send(native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "UserPromptSubmit",
+            "not-applicable",
+            &[("phase", "prompt-accepted")],
+            remuda_protocol::Severity::Info,
+            false,
+            "working",
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let row = store.get_instance(&id).unwrap();
+        assert!(
+            !matches!(
+                row.lifecycle,
+                InstanceLifecycle::Failed | InstanceLifecycle::Exited
+            ),
+            "a failed turn keeps the child alive for a retry: {:?}",
             row.lifecycle
         );
 

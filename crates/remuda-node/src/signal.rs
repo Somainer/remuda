@@ -119,20 +119,16 @@ pub fn file_activity(observation: &Observation) -> Option<remuda_protocol::Activ
     }
 }
 
-/// c-cardsettle r3 item 8: a hook/lifecycle observation attributed to a
-/// SUBAGENT (a relatedIds.agentId paired with an agentType, e.g.
-/// workflow-subagent) belongs to that subagent's scope — its start/stop/failure
-/// never moves the ROOT session's turn or activity. Only root observations
-/// (no agentId) drive the main composer.
+/// c-cardsettle r3 item 8 / r4 item 3: a hook/lifecycle observation
+/// attributed to a SUBAGENT (a non-empty relatedIds.agentId) belongs to that
+/// subagent's scope — its start/stop/failure never moves the ROOT session's
+/// turn or activity. `agentType` is OPTIONAL (some producers stamp only the
+/// id). Only root observations (no agentId) drive the main composer.
 pub(crate) fn is_subagent_scoped(native: &NativeLifecycle) -> bool {
     native
         .related_ids
         .get("agentId")
         .is_some_and(|id| !id.is_empty())
-        && native
-            .related_ids
-            .get("agentType")
-            .is_some_and(|kind| !kind.is_empty())
 }
 
 /// The activity a hook observation proves, if it proves one.
@@ -439,6 +435,44 @@ mod tests {
             assert!(!hooks_enabled(Some(value)), "{value}");
         }
         assert!(!hooks_enabled(None), "P1 default must be off");
+    }
+
+    /// r4 item 3: scope is a non-empty agentId ALONE; agentType is optional.
+    #[test]
+    fn subagent_scope_is_agentid_alone() {
+        let mut native = NativeLifecycle {
+            topic: LifecycleTopic::Turn,
+            native_name: "StopFailure".into(),
+            native_id: Knowledge::NotApplicable,
+            status: Knowledge::Known {
+                value: "idle".into(),
+            },
+            related_ids: BTreeMap::new(),
+            data_ref: None,
+            severity: Severity::Warning,
+            affects_completion: false,
+        };
+        assert!(!is_subagent_scoped(&native), "no agentId = root");
+        // agentId + agentType
+        native.related_ids.insert("agentId".into(), "a1".into());
+        native
+            .related_ids
+            .insert("agentType".into(), "workflow-subagent".into());
+        assert!(is_subagent_scoped(&native));
+        // agentType missing
+        native.related_ids.clear();
+        native.related_ids.insert("agentId".into(), "a1".into());
+        assert!(is_subagent_scoped(&native), "agentId alone is subagent");
+        // agentType present but empty
+        native.related_ids.insert("agentType".into(), "".into());
+        assert!(
+            is_subagent_scoped(&native),
+            "empty agentType still subagent"
+        );
+        // empty agentId does not scope
+        native.related_ids.clear();
+        native.related_ids.insert("agentId".into(), "".into());
+        assert!(!is_subagent_scoped(&native), "empty agentId = root");
     }
 
     #[test]

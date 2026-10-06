@@ -96,6 +96,21 @@ impl WorkflowProducer {
                     _ => Vec::new(),
                 }
             }
+            // c-cardsettle r4 item 5: a subagent's StopFailure with
+            // outcome=failed marks THAT workflow member failed. Root is
+            // untouched.
+            "StopFailure"
+                if related
+                    .get("outcome")
+                    .map(String::as_str)
+                    .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"))
+                    && related.get("agentId").is_some() =>
+            {
+                self.agent_failed(
+                    related.get("agentId").map(String::as_str),
+                    related.get("agentTranscriptPath").map(Path::new),
+                )
+            }
             _ => Vec::new(),
         };
         envelopes
@@ -207,6 +222,19 @@ impl WorkflowProducer {
         path: Option<&Path>,
     ) -> Vec<remuda_journal::Envelope> {
         self.agent_event(agent_id.as_deref(), started, path)
+    }
+
+    /// c-cardsettle r4 item 5: mark one workflow member failed from a
+    /// subagent StopFailure.
+    fn agent_failed(
+        &mut self,
+        agent_id: Option<&str>,
+        path: Option<&Path>,
+    ) -> Vec<remuda_journal::Envelope> {
+        let (Some(agent_id), Some(tailer)) = (agent_id, self.tailer.as_mut()) else {
+            return Vec::new();
+        };
+        tailer.agent_failed(agent_id, path).unwrap_or_default()
     }
 
     fn ensure_tailer(

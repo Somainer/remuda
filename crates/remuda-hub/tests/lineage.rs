@@ -194,6 +194,15 @@ impl FakeNode {
             .context("frame")
     }
 
+    /// True when no Hub→Node frame is currently queued (ma-lineage r6 item 1:
+    /// a refused delete must not have sent stop/return/purge side effects).
+    /// Polls for a short grace so an in-flight frame would be caught.
+    async fn has_no_pending_frames(&mut self) -> bool {
+        tokio::time::timeout(Duration::from_millis(150), self.frames.recv())
+            .await
+            .is_err()
+    }
+
     /// Drop the Node connection abruptly; the Hub marks its host offline.
     async fn disconnect(&mut self) {
         if let Some(task) = self.task.take() {
@@ -365,6 +374,17 @@ impl Ctx {
             .json(&json!({"mode":"structured"}))
             .send()
             .await?)
+    }
+
+    async fn instance_is_gone(&self, id: &str) -> Result<bool> {
+        let status = self
+            .http
+            .get(format!("{}/v1/instances/{id}", self.base()))
+            .bearer_auth(&self.human)
+            .send()
+            .await?
+            .status();
+        Ok(status == 404)
     }
 
     async fn get_instance(&self, id: &str, token: &str) -> Result<Value> {
@@ -1143,12 +1163,13 @@ async fn a_resume_addressed_to_an_old_chapter_after_the_current_ended_continues_
     Ok(())
 }
 
-// --- 3. A non-current lineage chapter cannot be deleted (ma-lineage r5) --
+// --- 3. Chapter delete: non-current refused, current deletes the lineage --
 
-/// Deleting a NON-CURRENT (predecessor) chapter is refused — its successors
-/// resolve parent ownership and fan-out through the predecessor's row.
+/// Deleting a NON-CURRENT (predecessor) chapter is refused with NO side
+/// effects; deleting the CURRENT chapter removes the WHOLE lineage (every
+/// chapter + the lineage row) in one transaction, so nothing is stranded.
 #[tokio::test]
-async fn deleting_a_non_current_chapter_is_refused() -> Result<()> {
+async fn deleting_a_non_current_chapter_is_refused_and_current_deletes_lineage() -> Result<()> {
     let ctx = Ctx::boot().await?;
     let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
     let (x, _token) = ctx.seat(&mut node, None).await?;
@@ -1162,7 +1183,8 @@ async fn deleting_a_non_current_chapter_is_refused() -> Result<()> {
         .json()
         .await?;
     let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
-    let (_method, _) = node.next_frame().await?;
+    let (resume_method, _) = node.next_frame().await?;
+    assert_eq!(resume_method, "instance.resume");
 
     // Deleting the predecessor X is refused even though it is terminal.
     let delete_x = ctx
@@ -1176,18 +1198,82 @@ async fn deleting_a_non_current_chapter_is_refused() -> Result<()> {
         409,
         "a closed predecessor chapter cannot be deleted"
     );
+    // ma-lineage r6 item 1: the refusal runs NO side effects.
+    assert!(
+        node.has_no_pending_frames().await,
+        "deleting a non-current chapter must not send stop/return/purge frames"
+    );
+    assert!(
+        ctx.get_instance(&x, &ctx.human).await?.is_object(),
+        "the predecessor chapter row is retained after refusal"
+    );
 
-    // The CURRENT chapter Y can be deleted; X is retained.
+    // Delete the CURRENT chapter Y (it exited via report_session above): the
+    // whole lineage is removed in one transaction — X and Y both gone and no
+    // lineages row left to strand.
     let delete_y = ctx
         .http
         .delete(format!("{}/v1/instances/{y}?force=1", ctx.base()))
         .bearer_auth(&ctx.human)
         .send()
         .await?;
-    assert_eq!(delete_y.status(), 200, "the current chapter is deletable");
+    assert_eq!(
+        delete_y.status(),
+        200,
+        "the current chapter deletes the lineage"
+    );
+
     assert!(
-        ctx.get_instance(&x, &ctx.human).await?.is_object(),
-        "the predecessor chapter row is retained"
+        ctx.instance_is_gone(&x).await?,
+        "predecessor X removed with the lineage"
+    );
+    assert!(ctx.instance_is_gone(&y).await?, "current Y removed");
+    let lineage_status = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .status();
+    assert_eq!(lineage_status, 404, "lineage row removed");
+    Ok(())
+}
+
+/// ma-lineage r6 item 1: a refusal is a pure 409 even for a LIVE predecessor
+/// — `?force=1` must not run stop_before_delete (instance.stop) or purge
+/// before the lineage-current check.
+#[tokio::test]
+async fn deleting_a_non_current_live_chapter_refuses_before_any_stop() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // Continue X → Y while X is still live (do not exit it).
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let _y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    // Delete the now non-current (fenced) X with force: 409, no frames beyond
+    // the continuation's close/resume already drained.
+    let delete_x = ctx
+        .http
+        .delete(format!("{}/v1/instances/{x}?force=1", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?;
+    assert_eq!(delete_x.status(), 409);
+    assert!(
+        node.has_no_pending_frames().await,
+        "force-delete of a non-current chapter must not run side effects"
     );
     Ok(())
 }

@@ -12,7 +12,7 @@
 use crate::config::{new_id, now_rfc3339};
 use crate::provider_models::{self, ProviderModel};
 use remuda_protocol::SettlementOutcome;
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -208,6 +208,61 @@ pub struct Store {
     readers: Arc<ReaderPool>,
     /// Joins the writer thread after the last clone drops its channel sender.
     _join: Arc<StoreJoin>,
+}
+
+/// Delete one chapter's rows and write its interaction tombstones /
+/// deleted-instance marker. Caller owns the transaction and chapter-lifecycle
+/// precondition.
+fn delete_instance_rows(tx: &Transaction, instance_id: &str) -> Result<(), StoreError> {
+    // c-cardsettle r2 item 2: retain the terminal state of this instance's
+    // interactions before their rows are deleted, so a late answer after the
+    // delete gets the state-derived rejection instead of fanning out.
+    tx.execute(
+        "INSERT OR IGNORE INTO interaction_tombstones
+            (id, instance_id, host_id, state, reason, created_at, updated_at)
+         SELECT id, instance_id, host_id, state,
+                COALESCE(
+                    json_extract(payload_json, '$.payload.reasonCode'),
+                    json_extract(payload_json,
+                        '$.payload.entity.resolution.value.reason'),
+                    json_extract(payload_json,
+                        '$.payload.interaction.resolution.value.reason'),
+                    'generation-ended'),
+                created_at, updated_at
+         FROM interactions WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    tx.execute(
+        "DELETE FROM journal WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    tx.execute(
+        "DELETE FROM commands WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    tx.execute(
+        "DELETE FROM interactions WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    tx.execute(
+        "DELETE FROM fleet_members WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    // t-pool: a deleted instance must not keep holding an attach lock.
+    tx.execute(
+        "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
+         WHERE holder_instance_id = ?1",
+        params![instance_id, now_rfc3339()],
+    )?;
+    // Tombstone: a Node command still draining keeps appending for this id;
+    // ensure_instance must not recreate it.
+    tx.execute(
+        "INSERT OR REPLACE INTO deleted_instances (instance_id, deleted_at)
+         VALUES (?1, ?2)",
+        params![instance_id, now_rfc3339()],
+    )?;
+    tx.execute("DELETE FROM instances WHERE id = ?1", params![instance_id])?;
+    Ok(())
 }
 
 /// Result of presenting a Node enroll or host token.
@@ -3007,65 +3062,54 @@ impl Store {
                     .is_some();
             if !is_current {
                 return Err(StoreError::Conflict(format!(
-                    "instance {instance_id} is a closed predecessor chapter; only the lineage's                      current chapter can be deleted (its successors resolve ownership through it)"
+                    "instance {instance_id} is a closed predecessor chapter; only the lineage's \
+                     current chapter can be deleted (its successors resolve ownership through it)"
                 )));
             }
+            // ma-lineage r6 item 2: deleting the CURRENT chapter deletes the
+            // WHOLE lineage (every chapter + the lineage row) in one
+            // transaction. Otherwise the older chapters would be stranded — a
+            // lineages row still naming a deleted current chapter, 409 on
+            // deleting the predecessors forever, and 404 on resume. A plain
+            // instance has no lineage row and is the sole member.
+            let chapter_ids: Vec<String> = if lineage_exists {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM instances
+                      WHERE lineage_id = ?1 ORDER BY generation ASC",
+                )?;
+                let rows =
+                    stmt.query_map(params![&instance.lineage_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                vec![instance_id.clone()]
+            };
+            // Refuse if ANY chapter is still live: the HTTP handler stops the
+            // current one before calling, but predecessors could still be live
+            // in unusual states; require all terminal for a whole-lineage
+            // delete.
+            for chapter_id in &chapter_ids {
+                let lifecycle: String = conn.query_row(
+                    "SELECT lifecycle FROM instances WHERE id = ?1",
+                    params![chapter_id],
+                    |row| row.get(0),
+                )?;
+                if !matches!(lifecycle.as_str(), "exited" | "failed" | "closed") {
+                    return Err(StoreError::Id(format!(
+                        "chapter {chapter_id} is {lifecycle}; stop every chapter before deleting \
+                         the lineage"
+                    )));
+                }
+            }
             let tx = conn.transaction()?;
-            // c-cardsettle r2 item 2: retain the terminal state of this
-            // instance's interactions before their rows are deleted, so a late
-            // answer after the delete gets the state-derived rejection instead
-            // of fanning out to all connected Nodes.
-            tx.execute(
-                "INSERT OR IGNORE INTO interaction_tombstones
-                    (id, instance_id, host_id, state, reason, created_at, updated_at)
-                 SELECT id, instance_id, host_id, state,
-                        COALESCE(
-                            json_extract(payload_json, '$.payload.reasonCode'),
-                            json_extract(payload_json,
-                                '$.payload.entity.resolution.value.reason'),
-                            json_extract(payload_json,
-                                '$.payload.interaction.resolution.value.reason'),
-                            'generation-ended'),
-                        created_at, updated_at
-                 FROM interactions WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute(
-                "DELETE FROM journal WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute(
-                "DELETE FROM commands WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute(
-                "DELETE FROM interactions WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute(
-                "DELETE FROM fleet_members WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
-            // t-pool: a deleted instance must not keep holding an attach lock.
-            // The lease row itself is retained (it tracks the *directory* and
-            // its tasks; worktree reclaim is a separate, lease-aware path), but
-            // holder_instance_id is cleared here so a later lease is not blocked
-            // by a session that no longer exists.
-            tx.execute(
-                "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
-                 WHERE holder_instance_id = ?1",
-                params![&instance_id, now_rfc3339()],
-            )?;
-            // Tombstone: a Node command that is still draining will keep
-            // appending journal events for this id, and `ensure_instance`
-            // would happily recreate the row. A deleted session must stay
-            // deleted, so the id is refused from here on.
-            tx.execute(
-                "INSERT OR REPLACE INTO deleted_instances (instance_id, deleted_at)
-                 VALUES (?1, ?2)",
-                params![&instance_id, now_rfc3339()],
-            )?;
+            for chapter_id in &chapter_ids {
+                delete_instance_rows(&tx, chapter_id)?;
+            }
+            if lineage_exists {
+                tx.execute(
+                    "DELETE FROM lineages WHERE lineage_id = ?1",
+                    params![&instance.lineage_id],
+                )?;
+            }
             tx.commit()?;
             Ok(true)
         })
@@ -4237,6 +4281,40 @@ impl Store {
             last_error.as_deref(),
             ended_at.as_deref(),
         ))
+    }
+
+    /// Whether `instance_id` is its lineage's CURRENT chapter (ma-lineage r6
+    /// item 1): the HTTP delete handler checks this BEFORE any stop/lease/
+    /// purge/audit side effect. A plain instance with no `lineages` row is
+    /// always current.
+    pub async fn is_lineage_current_chapter(&self, instance_id: &str) -> Result<bool, StoreError> {
+        let instance_id = instance_id.to_owned();
+        self.run_named("is_lineage_current_chapter", move |conn| {
+            let instance = load_instance(conn, &instance_id)?
+                .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM lineages WHERE lineage_id = ?1",
+                    params![&instance.lineage_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                return Ok(true);
+            }
+            let current: bool = conn
+                .query_row(
+                    "SELECT 1 FROM lineages WHERE lineage_id = ?2
+                        AND current_instance_id = ?1",
+                    params![&instance_id, &instance.lineage_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            Ok(current)
+        })
+        .await
     }
 
     /// D-057 §5: async edge used by `owns()`, the D-051 route and the

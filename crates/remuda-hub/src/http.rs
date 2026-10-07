@@ -533,6 +533,21 @@ pub async fn delete_instance(
         .get_instance(instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
+    // ma-lineage r6 item 1: refuse BEFORE any side effect (stop, worktree
+    // return, purge, audit) when this is a non-current continuity chapter —
+    // deleting it would orphan its successors. The store re-checks inside the
+    // delete transaction as a backstop.
+    if !state
+        .store
+        .is_lineage_current_chapter(&instance_id)
+        .await
+        .map_err(map_store)?
+    {
+        return Err(HubError::Conflict(format!(
+            "instance {instance_id} is a closed predecessor chapter; only the lineage's current \
+             chapter can be deleted (its successors resolve ownership through it)"
+        )));
+    }
     let force = query.force == Some(1);
     let live = !matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed");
 

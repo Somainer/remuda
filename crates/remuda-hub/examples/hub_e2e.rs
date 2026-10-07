@@ -4685,47 +4685,41 @@ fn fake_hook_question_with_deadline(
 /// r-ux-comment: prompts mentioning code get an assistant reply containing a
 /// fenced ts block, so the browser spec can quote it with the 评论 action.
 fn code_comment_reply(prompt: &str) -> Option<String> {
-    // Font-swap fixture: a COMPACT pre-wrap fenced block with a few lines
-    // tuned to the wrap boundary at each pane width. IBM Plex Mono is the
-    // wider face (~8.0px/char vs ~7.83 system monospace), so a line just
-    // under capacity on the fallback wraps to an extra line on Plex — always
-    // in the same direction. Three lines around the ~340px mobile capacity
-    // (~43-45 chars) move the block height at 390px; three around the ~700px
-    // desktop read measure (~87-90 chars) move it at 1440. The block stays
-    // short enough that the burst anchor below still parks near the top, but
-    // its real HEIGHT changes across faces (unlike a non-wrapping <pre>).
+    // Font-swap fixture: a COMPACT pre-wrap fenced block whose single long
+    // line crosses a wrap boundary between the FALLBACK face and IBM Plex
+    // Mono, in the GROWTH direction (fallback shorter -> Plex taller). Every
+    // latin glyph is narrower in Plex Mono (0.600em) than in the headless
+    // fallback stack's resolved face, so a latin run only ever shrinks on the
+    // swap — which a PINNED transcript survives by browser scroll-clamp alone,
+    // proving nothing. U+2044 FRACTION SLASH inverts the advance ratio: Plex
+    // Mono ships it at the full 0.600em while the fallback face renders it at
+    // ~0.21em, so the block gains two visual lines (~41.6px, measured on the
+    // mounted rows) when the woff2 lands, at BOTH pane widths. A pinned page
+    // can only absorb that growth by size-driven re-pinning (the thing the
+    // pinned e2e arm exists to prove), and the saved-position arms see a block
+    // above the anchor grow, which re-anchoring must counter-scroll.
     if prompt.contains("font wrap probe mobile tail") {
-        // MOBILE PINNED probe: same 120-glyph height-changing block as the
-        // mobile probe (measured 272px fallback -> 230px Plex, ~42px delta),
-        // but selected when the wrap message is sent AFTER the burst rows, so
-        // the block sits in the MOUNTED TAIL and is measurable while the
-        // transcript is pinned without any measurement scroll.
-        let long = "m".repeat(120);
+        // MOBILE PINNED probe (~330px content): 140 fraction slashes fit TWO
+        // visual lines on the fallback (~121/line) and FOUR on Plex (~41/line)
+        // — +2 lines, measured ~210px fallback -> ~251px Plex. Sent AFTER the
+        // burst rows so the block sits in the MOUNTED TAIL and is measurable
+        // while the transcript is pinned, with no measurement scroll.
+        let long = "⁄".repeat(140);
         let mut body = String::from("a tail wrapping line:\n\n```ts src/font_swap_mobile.ts\n");
         body.push_str(&long);
         body.push_str("\n```\n\nask about the wrapped line.");
         return Some(body);
     }
-    if prompt.contains("font wrap probe mobile") {
-        // MOBILE probe (~330px content): the fallback fits ~11 m-glyphs/line
-        // and Plex ~13, so a 12-glyph line is TWO lines on the fallback and
-        // ONE on Plex (~21px delta); the block stays two lines so the pinned
-        // anchor and the block are mounted together.
-        let long = "m".repeat(12);
-        let mut body = String::from("a compact mobile wrapping line:\n\n```ts src/font_swap_mobile.ts\n");
-        body.push_str(&long);
-        body.push_str("\n```\n\nask about the wrapped line.");
-        return Some(body);
-    }
     if prompt.contains("font wrap probe") {
-        // Desktop + bounded-journal probe: a 300-glyph pre-wrap line wraps to
-        // ~12.5 visual lines on the fallback monospace vs ~10.5 on the
-        // narrower Plex at the 692px content width — a solid ~42px (two-line)
-        // HEIGHT delta that re-anchoring has to absorb. The block (~250px)
-        // plus the burst anchor parked at its base stay inside the 613px
-        // scroller on both faces, so the anchor viewport offset is observable.
-        let long = "m".repeat(300);
-        let mut body = String::from("here is a wrapping line whose height differs across monospace faces:\n\n```ts src/font_swap_probe.ts\n");
+        // Desktop + late/mid-swap probe (~684px content): 200 fraction slashes
+        // fit ONE visual line on the fallback (~252/line) and THREE on Plex
+        // (~85/line) — +2 lines, ~41.6px measured on the mounted rows. The
+        // block plus the burst anchor parked at its base stay inside the
+        // desktop scroller on both faces.
+        let long = "⁄".repeat(200);
+        let mut body = String::from(
+            "here is a wrapping line whose height differs across monospace faces:\n\n```ts src/font_swap_probe.ts\n",
+        );
         body.push_str(&long);
         body.push_str("\n```\n\nask about the wrapped line.");
         return Some(body);

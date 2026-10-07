@@ -397,55 +397,6 @@ async function waitAnchorViewport(
   }
 }
 
-/** Snapshot the anchor viewport offset and the restore-active attribute. */
-async function anchorSnapshot(page: Page, scroller: Locator, n: number) {
-  return scroller.evaluate(
-    (el, label) => {
-      const re = new RegExp(`journal_burst_* event ${label}\\b`);
-      const row = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']")).find((c) =>
-        re.test(c.textContent ?? ""),
-      );
-      if (!row) return { top: null as number | null, active: "" };
-      const top = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
-      return { top: top >= 0 && top <= el.clientHeight ? top : null, active: el.getAttribute("data-restore-active") ?? "" };
-    },
-    n,
-  ).then(async (s) => ({ ...s, font: await monoLoaded(page) }));
-}
-
-/**
- * Poll the anchor's VIEWPORT offset until: the row is on screen, it has held
- * the same offset (±1px) across three consecutive measurement frames, and the
- * saved-position restore is no longer active. Bounded by `timeoutMs`; a
- * re-sample that moves or drops the row restarts the streak (item 4).
- */
-async function waitStableAnchorOnScreen(
-  page: Page,
-  scroller: Locator,
-  n: number,
-  timeoutMs = 15_000,
-): Promise<number> {
-  const deadline = Date.now() + timeoutMs;
-  let last: number | null = null;
-  let streak = 0;
-  while (Date.now() < deadline) {
-    await page.waitForTimeout(120);
-    const s = await anchorSnapshot(page, scroller, n);
-    if (s.top === null || s.active === "1") {
-      streak = 0;
-      last = s.top;
-      continue;
-    }
-    if (last !== null && Math.abs(s.top - last) <= 1) {
-      streak += 1;
-      if (streak >= 3) return s.top;
-    } else {
-      streak = 0;
-    }
-    last = s.top;
-  }
-  throw new Error(`anchor viewport offset did not stabilize on screen within ${timeoutMs}ms`);
-}
 
 /**
  * After a font release, poll the wrap block's row HEIGHT until it differs from
@@ -471,16 +422,18 @@ async function waitBlockHeightChange(
 }
 
 /**
- * The restore has quiesced: the anchor row's scroller-relative offset has
- * stayed put across several ResizeObserver MEASUREMENT cycles (two rAFs can
- * elapse with no size commit at all). Any movement or disappearance of the
- * anchor INVALIDATES the run (the counter resets), and the final value is
- * re-validated one frame after the threshold is reached before resolving —
- * so a resize that lands right at the threshold can't be missed. All timers
- * and the observer are torn down together (resolve OR timeout), no leaks.
+ * The restore has quiesced AND stopped being active: the anchor row's
+ * scroller-relative offset has stayed put across several ResizeObserver
+ * MEASUREMENT cycles (two rAFs can elapse with no size commit at all), and the
+ * scroller no longer carries data-restore-active="1". Any movement or
+ * disappearance of the anchor — including one that arrives during the 32 ms
+ * revalidation window — CANCELS that timer and invalidates the run (the
+ * counter resets), so a font swap whose last size commit lands right at the
+ * threshold cannot release early. The final value is then re-read after the
+ * window before resolving. All timers and the observer are torn down together
+ * (resolve OR timeout), no leaks.
  */
 async function waitAnchorStable(
-  page: Page,
   scroller: Locator,
   anchor: number,
   { timeout = 15_000 }: { timeout?: number } = {},
@@ -490,6 +443,9 @@ async function waitAnchorStable(
       new Promise<string>((resolvePromise) => {
         const list = el.firstElementChild;
         const offset = (): number | null => {
+          // The restore must be DONE, not merely visually still: a pending
+          // restore can still correct the scroll on a later commit.
+          if (el.getAttribute("data-restore-active") === "1") return null;
           const re = new RegExp(`journal_burst_* event ${label}\\b`);
           const row = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']")).find(
             (candidate) => re.test(candidate.textContent ?? ""),
@@ -505,7 +461,8 @@ async function waitAnchorStable(
         let last: number | null = offset();
         let stable = 0;
         let settledAt: number | null = null;
-        let revalidating = false;
+        let armedAt: number | null = null;
+        let revalTimer: number | null = null;
         const timers: number[] = [];
         const setTimer = (fn: TimerHandler, ms: number) => {
           const id = window.setTimeout(fn, ms);
@@ -515,42 +472,58 @@ async function waitAnchorStable(
         let ro: ResizeObserver | null = null;
         const finish = (value: string) => {
           timers.forEach((id) => window.clearTimeout(id));
+          if (revalTimer !== null) window.clearTimeout(revalTimer);
           ro?.disconnect();
           resolvePromise(value);
         };
         setTimer(() => {
           finish(settledAt !== null ? `stable:${settledAt}` : last === null ? "missing" : "moving");
         }, deadlineMs);
-        // Movement/disappearance resets the streak; reaching the threshold
-        // arms a ONE-frame revalidation rather than resolving immediately.
+        const cancelRevalidation = () => {
+          if (revalTimer !== null) {
+            window.clearTimeout(revalTimer);
+            revalTimer = null;
+          }
+          armedAt = null;
+          stable = 0;
+        };
+        // Movement/disappearance resets the streak AND cancels a pending
+        // revalidation; reaching the threshold arms a ONE-frame revalidation.
         const sample = () => {
           const next = offset();
           if (next === null) {
-            stable = 0;
+            cancelRevalidation();
             last = null;
             return;
           }
+          if (armedAt !== null) {
+            // A measurement arrived inside the revalidation window: any
+            // movement/removal cancels it immediately instead of waiting.
+            if (Math.abs(next - armedAt) > 1) {
+              cancelRevalidation();
+            } else {
+              return;
+            }
+          }
           if (last !== null && Math.abs(next - last) <= 1) {
-            if (revalidating) return;
             stable += 1;
             if (stable >= REQUIRED) {
-              revalidating = true;
-              setTimer(() => {
+              armedAt = next;
+              revalTimer = setTimer(() => {
                 // Re-read after another frame: any movement/removal here
                 // invalidates and restarts the streak.
                 const check = offset();
-                if (check !== null && Math.abs(check - next) <= 1) {
+                revalTimer = null;
+                if (check !== null && armedAt !== null && Math.abs(check - armedAt) <= 1) {
                   settledAt = check;
                   finish(`stable:${check}`);
                 } else {
-                  revalidating = false;
-                  stable = 0;
+                  cancelRevalidation();
                 }
               }, 32);
             }
           } else {
             stable = 0;
-            revalidating = false;
           }
           last = next;
         };
@@ -561,14 +534,14 @@ async function waitAnchorStable(
         // Quiet fallback: once size commits stop the RO goes silent; poll so
         // a settled window with no further resize still completes.
         const tick = () => {
-          if (!revalidating) sample();
+          if (armedAt === null) sample();
           timers.push(window.setTimeout(tick, 100));
         };
         timers.push(window.setTimeout(tick, 100));
       }),
     { label: anchor, deadlineMs: timeout },
   );
-  expect(result, "the restored anchor never settled across measurement cycles").toMatch(/^stable:/);
+  expect(result, "the restored anchor never settled off-restore across measurement cycles").toMatch(/^stable:/);
   return Number(result.slice("stable:".length));
 }
 
@@ -687,7 +660,7 @@ async function afterSwap(page: Page, scroller: Locator): Promise<void> {
 async function wrapBlockRowHeight(scroller: Locator): Promise<number | null> {
   return scroller.evaluate(() => {
     const block = Array.from(document.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
-      (b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("mmmmmmmmmmmmmmmmmmmm") ?? false),
+      (b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("⁄".repeat(20)) ?? false),
     );
     if (!block) return null;
     const row = block.closest<HTMLElement>("[data-testid='transcript-row']");
@@ -702,7 +675,7 @@ async function wrapBlockRowHeight(scroller: Locator): Promise<number | null> {
  * a measurement-only disturbance.
  */
 function isWrapBlock(b: HTMLElement): boolean {
-  return b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("mmmmmmmmmmmmmmmmmmmm") ?? false;
+  return b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("⁄".repeat(20)) ?? false;
 }
 async function parkBlockHeight(
   scroller: Locator,
@@ -718,7 +691,7 @@ async function parkBlockHeight(
     ({ target, label, needAnchor: need }) => {
       const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']")!;
       const wrapBlock = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
-        b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("mmmmmmmmmmmmmmmmmmmm"),
+        b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("⁄".repeat(20)),
       );
       const re = new RegExp(`journal_burst_* event ${label}\\b`);
       const anchorRow = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']")).find((c) =>
@@ -737,7 +710,7 @@ async function parkBlockHeight(
       () =>
         scroller.evaluate((el, label) => {
           const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
-            b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("mmmmmmmmmmmmmmmmmmmm"),
+            b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("⁄".repeat(20)),
           );
           if (!block) return null;
           if (label < 0) return "ready";
@@ -757,7 +730,7 @@ async function parkBlockHeight(
     .toBe("ready");
   const height = await scroller.evaluate(() => {
     const block = Array.from(document.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
-      b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("mmmmmmmmmmmmmmmmmmmm"),
+      b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("⁄".repeat(20)),
     )!;
     const blockRow = block.closest<HTMLElement>("[data-testid='transcript-row']");
     return (blockRow ?? block).getBoundingClientRect().height;
@@ -907,24 +880,34 @@ async function savedPositionSurvivesSwap(
     leftByControl = await page.evaluate((key) => localStorage.getItem(key), readingKey);
     await reinstate();
     const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
+    // FAIL-PROOF ONLY: FONTSWAP_NO_REANCHOR=1 loads this arm on ?noReanchor=1
+    // (a test-only Transcript seam) and arms the disable exactly at release,
+    // so the restore above runs with the real product; only the post-swap
+    // scroll re-anchoring is off and the anchor must then drift.
+    const noReanchorQuery = process.env.FONTSWAP_NO_REANCHOR === "1" ? "?noReanchor=1" : "";
     try {
-      await page.goto(`/s/${instanceId}`);
+      await page.goto(`/s/${instanceId}${noReanchorQuery}`);
       await waitFontArrival(page, fontGate, "late arm");
       expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
       // Release only AFTER the restore has placed the anchor on screen, its
       // VIEWPORT offset has held across measurement cycles, and the restore is
       // no longer active (item 4) — not on first paint.
-      beforeSwap = await waitStableAnchorOnScreen(page, scroller, anchor);
+      beforeSwap = await waitAnchorStable(scroller, anchor);
       // The two-line wrap block is mounted right above the on-screen anchor;
       // read its height with no measurement scroll.
       blockFallback = wrapProbe ? await wrapBlockRowHeight(scroller) : null;
+      if (process.env.FONTSWAP_NO_REANCHOR === "1") {
+        await page.evaluate(() => {
+          (window as unknown as { __fontSwapNoReanchorArmed?: boolean }).__fontSwapNoReanchorArmed = true;
+        });
+      }
       fontGate.release();
       // Wait until the block height has actually moved and the anchor viewport
       // offset is stable across measurement cycles (item 5), bounded.
       blockSwapped = wrapProbe
         ? await waitBlockHeightChange(page, scroller, blockFallback!)
         : null;
-      settled = await waitStableAnchorOnScreen(page, scroller, anchor);
+      settled = await waitAnchorStable(scroller, anchor);
     } finally {
       await fontGate.dispose();
     }
@@ -959,7 +942,7 @@ async function savedPositionSurvivesSwap(
       // The block height moves with the final face; then the restore settles
       // the anchor on screen. Advance width must prove the face really changed.
       blockSwapped = wrapProbe ? await waitBlockHeightChange(page, scroller, blockFallback!) : null;
-      settled = await waitStableAnchorOnScreen(page, scroller, anchor);
+      settled = await waitAnchorStable(scroller, anchor);
       const advanceSwapped = await monoAdvance(page);
       expect(advanceSwapped, "the held font never swapped to the final face").not.toBe(advanceFallback);
     } finally {
@@ -1072,8 +1055,14 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
   await page.goto("/m");
   await expect(page.getByTestId("home-list")).toBeVisible();
   const finalGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
+  // FAIL-PROOF ONLY: FONTSWAP_NO_SIZE_PIN=1 opens this revisit on ?noSizePin=1
+  // (a test-only Transcript seam) and arms the disable exactly at release, so
+  // the fallback pin below runs with the real product; only post-swap
+  // size-driven re-pinning is off, after which the growing block MUST leave a
+  // gap. No effect when the env var is absent.
+  const noSizePinQuery = process.env.FONTSWAP_NO_SIZE_PIN === "1" ? "?noSizePin=1" : "";
   try {
-    await page.goto(`/s/${instanceId}`);
+    await page.goto(`/s/${instanceId}${noSizePinQuery}`);
     await expect(page.getByTestId("transcript-row")).not.toHaveCount(0, { timeout: 15_000 });
     await finalGate.waitArrival();
     expect(await monoLoaded(page), "the final visit must start with the font unloaded").toBe(false);
@@ -1085,12 +1074,38 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
       scroller.evaluate(() => {
         const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']")!;
         const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
-          b.querySelector("[data-testid='code-code']")?.textContent?.includes("mmmm"),
+          b.querySelector("[data-testid='code-code']")?.textContent?.includes("⁄".repeat(20)),
         );
         if (!block) return null;
         const row = block.closest<HTMLElement>("[data-testid='transcript-row']");
         const height = (row ?? block).getBoundingClientRect().height;
         return height > 0 ? height : null;
+      });
+    // Diagnostic snapshot of the mounted window when the tail block never
+    // appears: row count, code blocks present (with snippet lengths), scroll
+    // geometry, and whether the font has loaded — enough to distinguish
+    // "unmounted by the virtual window" from "reply absent from the journal".
+    const dumpTailWindow = async (): Promise<string> =>
+      scroller.evaluate((el) => {
+        const rows = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']"));
+        const blocks = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).map((b) => {
+          const code = b.querySelector("[data-testid='code-code']")?.textContent?.trim() ?? "";
+          return `code(${code.length}:${code.slice(0, 12)})`;
+        });
+        const anchors = rows.map((r) => r.dataset.anchor?.slice(0, 18) ?? "?");
+        const lastText = rows[rows.length - 1]?.textContent?.slice(0, 60).replace(/\s+/g, " ") ?? "";
+        return JSON.stringify({
+          rows: rows.length,
+          first: anchors[0],
+          last: anchors[anchors.length - 1],
+          lastText,
+          blocks,
+          scrollTop: el.scrollTop,
+          scrollHeight: el.scrollHeight,
+          clientHeight: el.clientHeight,
+          gap: el.scrollHeight - el.scrollTop - el.clientHeight,
+          mono: document.fonts.check('400 13px "IBM Plex Mono"'),
+        });
       });
     const tailBlockHeight = async (): Promise<number> => {
       const deadline = Date.now() + 15_000;
@@ -1099,29 +1114,55 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
         if (h !== null) return h;
         await new Promise((r) => setTimeout(r, 120));
       }
-      throw new Error("tail wrap block not mounted while pinned");
+      throw new Error(`tail wrap block not mounted while pinned (${await dumpTailWindow()})`);
     };
     // Capture the tight baseline gap on the fallback face.
     const fallbackGap = await bottomGap();
     const blockFallback = await tailBlockHeight();
+    // FAIL-PROOF ONLY: arm the re-pin disable exactly at release, so the
+    // fallback pin above was achieved with the real product.
+    if (process.env.FONTSWAP_NO_SIZE_PIN === "1") {
+      await page.evaluate(() => {
+        (window as unknown as { __fontSwapNoSizePinArmed?: boolean }).__fontSwapNoSizePinArmed = true;
+      });
+    }
 
     finalGate.release();
-    // Wait for the block HEIGHT to actually move and the pin to settle,
-    // bounded — no fixed delays.
+    // Wait for the block HEIGHT to actually move (the real metrics change),
+    // THEN for the size-commit re-pin to catch up: the font swap reflows the
+    // DOM a frame before the ResizeObserver reports the new size and the pin
+    // effect runs, so an early sample shows the full growth as a bottom gap.
+    // Require the tight gap AND a stable swapped height across two consecutive
+    // samples. Bounded — no fixed delays.
+    const tightGap = Math.max(8, fallbackGap + 4);
     const blockSwapped = await new Promise<number>((resolve, reject) => {
       const deadline = Date.now() + 15_000;
+      let moved = false;
+      let gapStreak = 0;
+      let heightStreak = 0;
+      let lastH: number | null = null;
       const tick = async () => {
         const gap = await bottomGap();
         const h = await readTailBlockHeight();
-        if (h !== null && Math.abs(h - blockFallback) >= 20 && gap < 64) {
-          resolve(h);
-          return;
+        if (h !== null && Math.abs(h - blockFallback) >= 20) moved = true;
+        if (moved && h !== null) {
+          heightStreak = lastH !== null && Math.abs(h - lastH) <= 0.5 ? heightStreak + 1 : 0;
+          gapStreak = gap <= tightGap ? gapStreak + 1 : 0;
+          if (heightStreak >= 2 && gapStreak >= 2) {
+            resolve(h);
+            return;
+          }
+          lastH = h;
         }
         if (Date.now() > deadline) {
-          reject(new Error(`pin: block height did not move >=20px while pinned (fallback=${blockFallback} last=${h} gap=${gap})`));
+          reject(
+            new Error(
+              `pin: block height did not move >=20px and re-pin tightly while pinned (fallback=${blockFallback} last=${h} gap=${gap} moved=${moved})`,
+            ),
+          );
           return;
         }
-        setTimeout(tick, 120);
+        setTimeout(tick, 100);
       };
       void tick();
     });
@@ -1131,7 +1172,7 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
     expect(
       await bottomGap(),
       `pinned gap moved with the height change (fallbackGap=${fallbackGap})`,
-    ).toBeLessThanOrEqual(Math.max(8, fallbackGap + 4));
+    ).toBeLessThanOrEqual(tightGap);
     expect(
       Math.abs(blockSwapped - blockFallback),
       `390px: the swap did not change the wrap-probe row height (fallback=${blockFallback} swapped=${blockSwapped})`,

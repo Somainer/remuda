@@ -172,6 +172,23 @@ function TranscriptWithRoute(props: Omit<InnerProps, "routeInstanceId">) {
   return <TranscriptInner {...props} routeInstanceId={instanceId} />;
 }
 
+/**
+ * TEST-ONLY seam for the font-swap e2e fail-proof. A document loaded with
+ * ?noReanchor=1 gets NO scroll re-anchoring on measured size changes once the
+ * test arms window.__fontSwapNoReanchorArmed (immediately before releasing the
+ * held woff2 in the late-swap arm): the saved row then rides the block's
+ * font-driven reflow and the viewport-drift assertion MUST fail. Read live
+ * because the call sites are useCallbacks/layout effects that mount once.
+ * No product effect when the query param is absent.
+ */
+function fontSwapReanchorDisabled(): boolean {
+  if (typeof window === "undefined") return false;
+  return (
+    new URLSearchParams(window.location.search).has("noReanchor") &&
+    (window as unknown as { __fontSwapNoReanchorArmed?: boolean }).__fontSwapNoReanchorArmed === true
+  );
+}
+
 function TranscriptInner({
   events,
   bubbles = [],
@@ -209,6 +226,16 @@ function TranscriptInner({
   // pending-restore phase via a scroller attribute. No product effect.
   const restoreProbe =
     typeof window !== "undefined" && new URLSearchParams(window.location.search).has("restoreProbe");
+  // TEST-ONLY seam for the pinned-tail fail-proof. The document is opened with
+  // ?noSizePin=1 and the e2e arms window.__fontSwapNoSizePinArmed immediately
+  // before releasing the held font; from then on BOTH programmatic pin-
+  // maintenance paths (the size-commit re-pin and the scroller-resize re-pin)
+  // are off while the structural nodes.length pin stays. The fallback pin is
+  // therefore achieved with the real product before the seam arms.
+  const noSizePin =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).has("noSizePin") &&
+    (window as unknown as { __fontSwapNoSizePinArmed?: boolean }).__fontSwapNoSizePinArmed === true;
 
   // Bounded-window paging: true while the load-earlier row awaits its page.
   // Declared before the route-switch reset below, which clears it per
@@ -506,6 +533,11 @@ function TranscriptInner({
   // read) for every visible row on every scroll frame.
   const setRowSize = useCallback((id: string, height: number) => {
     if (height <= 0) return;
+    // The fail-proof seam (?noReanchor, armed at release) turns off ALL scroll
+    // re-anchoring on measured size changes; the row heights below are still
+    // recorded so the virtualiser keeps its geometry, but the reader rides the
+    // reflow. No effect without the test query.
+    const reanchor = !fontSwapReanchorDisabled();
     // A web-font swap (or async reflow) changes the HEIGHT of a row above the
     // row the reader restored to. The generic holdReadingAnchor anchors to the
     // topmost on-screen row and cannot compensate when the changing row is a
@@ -517,7 +549,7 @@ function TranscriptInner({
     // mid-restore font-swap arm) — the reflow anchor IS that pending restore's
     // target, and the restore correction alone converges to the wrong (post-
     // reflow) spot without this height-delta compensation.
-    if (el && !pinRef.current && !prependAnchorRef.current) {
+    if (reanchor && el && !pinRef.current && !prependAnchorRef.current) {
       const reflow = reflowAnchorRef.current;
       if (reflow) {
         const prevHeight = rowHeightsRef.current.get(id);
@@ -532,7 +564,7 @@ function TranscriptInner({
         }
       }
     }
-    if (selfDelta !== 0 && el) {
+    if (reanchor && selfDelta !== 0 && el) {
       el.scrollTop += selfDelta;
       scrollTopRef.current = el.scrollTop;
       const held = readingAnchorRef.current;
@@ -554,7 +586,7 @@ function TranscriptInner({
         // (it would undo the hold and converge to the reflowed position).
         reflowCorrectedThisCommitRef.current = true;
       }
-    } else {
+    } else if (reanchor) {
       holdReadingAnchor();
     }
     // Sub-pixel tolerance: measured heights jitter by fractions of a px
@@ -614,6 +646,12 @@ function TranscriptInner({
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el) return;
+    // TEST-ONLY seam read live (this effect mounts once): the pinned fail-
+    // proof disables this re-pin so a font-driven content growth cannot be
+    // masked by an incidental scroller-height re-pin.
+    const pinHoldDisabled = () =>
+      new URLSearchParams(window.location.search).has("noSizePin") &&
+      (window as unknown as { __fontSwapNoSizePinArmed?: boolean }).__fontSwapNoSizePinArmed === true;
     // c-mfix round 4: a height change (the soft keyboard shrinks the band)
     // does not change nodes/sizes, so the pin effect above never reruns and a
     // long transcript pinned to the tail is left scrolled above its newest
@@ -626,7 +664,7 @@ function TranscriptInner({
       const viewport = next < 32 ? 720 : next;
       viewportRef.current = viewport;
       setViewport(viewport);
-      if (wasPinned) {
+      if (wasPinned && !pinHoldDisabled()) {
         el.scrollTop = el.scrollHeight;
         scrollTopRef.current = el.scrollTop;
       }
@@ -742,15 +780,28 @@ function TranscriptInner({
   // inserted above) holds the reader the same way a measured growth does. A
   // range commit after a jump re-acquires the anchor from the rows it mounted.
   useLayoutEffect(() => {
+    if (fontSwapReanchorDisabled()) return;
     holdReadingAnchor();
   }, [sizes, nodes, estimate, range.start, range.end, holdReadingAnchor]);
 
+  // Structural updates (new rows appended) re-pin; size-commit re-pinning is a
+  // separate effect so the test-only ?noSizePin seam can disable it.
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el || !pinRef.current) return;
     el.scrollTop = el.scrollHeight;
+    scrollTopRef.current = el.scrollHeight;
+  }, [nodes.length]);
+
+  // A measured row height change (the web-font swap) re-pins the pinned
+  // transcript so a tail block that grows on the swap cannot leave a gap.
+  useLayoutEffect(() => {
+    const el = scrollerRef.current;
+    if (!el || !pinRef.current || noSizePin) return;
+    el.scrollTop = el.scrollHeight;
     scrollTopRef.current = el.scrollTop;
-  }, [nodes.length, sizes]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sizes]);
 
   const flushPosition = useCallback((top: number) => {
     if (!instanceId) return;

@@ -172,7 +172,11 @@ impl FakeNode {
         creds: &NodeCreds,
         workspace: &str,
     ) -> Result<Self> {
-        Ok(Self::connect_with_bearer(hub, &creds.host, workspace, &creds.token).await?.0)
+        Ok(
+            Self::connect_with_bearer(hub, &creds.host, workspace, &creds.token)
+                .await?
+                .0,
+        )
     }
 
     async fn next(&mut self) -> (String, Value) {

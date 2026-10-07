@@ -260,7 +260,11 @@ async fn create_project(
     let route_doc = route_override_doc(body.api_via.as_deref(), body.api_route.as_deref())?;
     state
         .store
-        .set_project_route_override(created.meta.id.as_id().to_string(), route_doc)
+        .set_project_route_override(
+            created.meta.id.as_id().to_string(),
+            route_doc,
+            crate::agent_scope::CallerAuthority::internal(),
+        )
         .await
         .map_err(map_store)?;
     state
@@ -354,7 +358,11 @@ async fn set_project(
         };
         state
             .store
-            .set_project_route_override(id.clone(), next)
+            .set_project_route_override(
+                id.clone(),
+                next,
+                crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+            )
             .await
             .map_err(map_store)?;
     }
@@ -743,23 +751,28 @@ impl Store {
         &self,
         project_id: String,
         doc: Option<Value>,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<(), StoreError> {
-        self.run_named("set_project_route_override", move |conn| match doc {
-            Some(doc) => {
-                conn.execute(
-                    "INSERT INTO project_route_overrides (project_id, doc_json)
+        self.run_named("set_project_route_override", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
+            match doc {
+                Some(doc) => {
+                    conn.execute(
+                        "INSERT INTO project_route_overrides (project_id, doc_json)
                      VALUES (?1, ?2)
                      ON CONFLICT(project_id) DO UPDATE SET doc_json = excluded.doc_json",
-                    params![project_id, doc.to_string()],
-                )?;
-                Ok(())
-            }
-            None => {
-                conn.execute(
-                    "DELETE FROM project_route_overrides WHERE project_id = ?1",
-                    params![project_id],
-                )?;
-                Ok(())
+                        params![project_id, doc.to_string()],
+                    )?;
+                    Ok(())
+                }
+                None => {
+                    conn.execute(
+                        "DELETE FROM project_route_overrides WHERE project_id = ?1",
+                        params![project_id],
+                    )?;
+                    Ok(())
+                }
             }
         })
         .await

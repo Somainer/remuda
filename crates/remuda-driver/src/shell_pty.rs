@@ -1066,25 +1066,47 @@ impl ShellPtyDriver {
             })??
         };
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
-        // D-056 (4): capture the resume transcript boundary BEFORE the child
-        // spawns, so records it appends between here and the later promotion
-        // hydration are still read as current (and a rotated file can never
-        // replay history). Only for a Remuda-launched agent with `--resume`; a
-        // login shell bounds a hand-typed resume per detected process instead.
-        let pre_resume_boundary = match (spec, &self.options.target) {
-            (
-                Some(spec),
+        // D-056 (r4 items 1 & 3): build the resume mode BEFORE the child
+        // spawns, against the FINAL child config dir (an extra_env
+        // CLAUDE_CONFIG_DIR override wins over the pinned native home, which
+        // wins over the ambient options.native_home) and the effective cwd
+        // (spec.cwd, else options.cwd for a target launched without a spec).
+        // A proven EOF snapshot → Boundary; a resume whose transcript is not
+        // present yet → Unverified (never the fresh byte-0/current path).
+        let launch_cwd = spec
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(&s.cwd))
+            .unwrap_or_else(|| self.options.cwd.clone());
+        let config_dir = self
+            .options
+            .extra_env
+            .iter()
+            .find(|(key, _)| key.as_str() == "CLAUDE_CONFIG_DIR")
+            .map(|(_, value)| std::path::PathBuf::from(value))
+            .or_else(|| {
+                if self.options.pin_native_home {
+                    Some(std::path::PathBuf::from(&recipe.native_home))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| self.options.claude_home.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from(&recipe.native_home));
+        let pre_resume_mode: Option<crate::claude_transcript::ResumeMode> =
+            match &self.options.target {
                 Target::Agent {
                     resume: Some(session_id),
                     ..
-                },
-            ) => crate::claude_transcript::ResumeBoundary::for_resume(
-                std::path::Path::new(&recipe.native_home),
-                std::path::Path::new(&spec.cwd),
-                session_id,
-            ),
-            _ => None,
-        };
+                } => Some(match crate::claude_transcript::ResumeBoundary::for_resume(
+                    &config_dir,
+                    &launch_cwd,
+                    session_id,
+                ) {
+                    Some(boundary) => crate::claude_transcript::ResumeMode::Boundary(boundary),
+                    None => crate::claude_transcript::ResumeMode::Unverified,
+                }),
+                _ => None,
+            };
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
         // `portable-pty` calls `setsid()` before `exec`, so the child leads its
@@ -1414,7 +1436,7 @@ impl ShellPtyDriver {
                 }),
                 Some(Arc::clone(&permission_bridge)),
                 launch_permission,
-                pre_resume_boundary,
+                pre_resume_mode,
                 // c-wfdrill2 B: the pinned path this launch exec'd, so
                 // detection does not depend on the executable's basename
                 // being one the agent table has heard of. Only for an agent

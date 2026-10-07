@@ -2704,35 +2704,24 @@ impl TranscriptMapper {
                 name: request.name,
                 ultracode: request.ultracode,
             });
-        Ok(vec![Observation {
-            schema_version: SchemaVersion,
-            event_id: remuda_protocol::effort_record_event_id(
-                self.mapper.instance_id.as_id().as_str(),
-                "effort-readback-unavailable",
-                cleared.name,
-            ),
-            journal_id: self.mapper.journal_id.clone(),
-            instance_id: self.mapper.instance_id.clone(),
-            run_id: self.mapper.run_id.clone(),
-            observed_at: now()?,
-            native_at: Knowledge::Unknown,
-            source: ObservationSource {
-                driver_kind: self.mapper.driver,
-                channel: remuda_protocol::SourceChannel::Transcript,
-                delivery: SourceDelivery::Live,
-            },
-            body: ObservationPayload::Effort(Box::new(EffortPayload {
+        let obs = self.mapper.observation(
+            Completeness::Structured,
+            remuda_protocol::NativeRequestKey::None,
+            ObservationPayload::Effort(Box::new(EffortPayload {
                 requested,
                 effective: EffortEffective {
                     name: cleared.name,
                     ultracode: cleared.ultracode,
-                    source: cleared.source,
+                    // The provenance loss is not a level observation: source
+                    // unknown, so the UI cannot attribute it to a switch.
+                    source: remuda_protocol::EffortSource::Unknown,
                     observed_at: now()?,
                     readback_available: Some(false),
                 },
                 raw: None,
             })),
-        }])
+        )?;
+        Ok(vec![obs])
     }
 
     /// Whether the effort tracker is accepting current-process records (D-056

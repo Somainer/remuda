@@ -27,9 +27,9 @@ use super::{PROMOTE_POLL, PtyState};
 use crate::claude_print::TranscriptMapper;
 use crate::claude_pty::now_ts;
 use crate::claude_transcript::{
-    ResumeBoundary, SessionStartReport, TailProvenance, TranscriptBinding, TranscriptCandidate,
-    TranscriptTail, bind_by_pid_file, bind_by_session_id, bind_manual, cwd_matches,
-    list_candidates, recorded_cwd, transcript_belongs_to_cwd,
+    ResumeBoundary, ResumeMode, SessionStartReport, TailProvenance, TranscriptBinding,
+    TranscriptCandidate, TranscriptTail, bind_by_pid_file, bind_by_session_id, bind_manual,
+    cwd_matches, list_candidates, recorded_cwd, transcript_belongs_to_cwd,
 };
 use crate::error::{DriverError, DriverResult};
 use crate::promote::{
@@ -790,10 +790,11 @@ pub(super) fn spawn(
     model: Option<ModelSync>,
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
-    // Pre-spawn resume boundary for a Remuda-launched `--resume` agent,
-    // captured before the child spawned. `None` for a login shell (where a
-    // hand-typed resume is bounded per detected process instead).
-    pre_resume_boundary: Option<ResumeBoundary>,
+    // Pre-spawn resume mode for a Remuda-launched `--resume` agent, captured
+    // before the child spawned (Fresh for a new session, Boundary for a proven
+    // resume, Unverified for a known-but-unprovable resume). `None` for a
+    // login shell, where the mode is derived per detected foreground process.
+    pre_resume_mode: Option<ResumeMode>,
     // The exact executable this launch exec'd, when Remuda launched one
     // (c-wfdrill2 B). `None` for a login shell.
     alias: Option<LaunchAlias>,
@@ -841,6 +842,9 @@ pub(super) fn spawn(
         // yet; `Some(None)` = healthy; `Some(Some(r))` = a failed check.
         let mut silence_ticks: u32 = 0;
         let mut last_silence: Option<Option<remuda_signal::hook_silence::HookSilenceReason>> = None;
+        // The (pid, session) the Remuda-launched pre_resume_mode was applied
+        // to, so a SessionStart rebind to another session invalidates it.
+        let mut launch_mode_session: Option<(i32, String)> = None;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1284,11 +1288,24 @@ pub(super) fn spawn(
             match (&promote.kind, &found) {
                 // Claude is the only kind that hydrates a transcript in the MVP.
                 (Some(AgentKind::Claude), Some(found)) if found.hydrates_transcript => {
-                    // Prefer the launch-time boundary; a hand-typed resume in a
-                    // login shell has none, so derive one from the detected
-                    // process's own start time and argv resume provenance.
-                    let epoch_boundary =
-                        pre_resume_boundary.or_else(|| shell_resume_boundary(&ctx, found));
+                    // Item 4: the pre-spawn launch mode belongs to the
+                    // Remuda-launched (pid, session). A rebind to a DIFFERENT
+                    // session invalidates it; that new foreground agent is
+                    // bounded from its own detected provenance instead.
+                    let key = (found.pid, found.session_id.clone().unwrap_or_default());
+                    if let Some((lp, ls)) = &launch_mode_session {
+                        if (*lp, ls.as_str()) != (key.0, key.1.as_str()) {
+                            launch_mode_session = None;
+                        }
+                    }
+                    let epoch_mode = match pre_resume_mode.clone() {
+                        Some(mode) if launch_mode_session.is_none() => {
+                            launch_mode_session = Some(key);
+                            mode
+                        }
+                        Some(mode) => mode,
+                        None => shell_resume_mode(found),
+                    };
                     maintain_binding(
                         &bindings,
                         &ctx,
@@ -1302,7 +1319,7 @@ pub(super) fn spawn(
                         model.as_ref(),
                         permission_bridge.as_ref(),
                         launch_permission,
-                        epoch_boundary,
+                        epoch_mode,
                     )
                     .await;
                 }
@@ -1530,7 +1547,7 @@ async fn maintain_binding(
     model: Option<&ModelSync>,
     permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
-    boundary: Option<ResumeBoundary>,
+    mode: ResumeMode,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -1654,7 +1671,7 @@ async fn maintain_binding(
             model,
             permission_bridge,
             launch_permission,
-            boundary,
+            mode,
         );
     }
     if let Some(active) = hydrator.as_mut() {
@@ -1872,7 +1889,7 @@ impl Hydrator {
             instance_id = %ctx.instance_id.as_id(),
             session = %binding.session_id,
             source = binding.source.as_wire(),
-            resumed = boundary.is_some(),
+            resumed = matches!(mode, ResumeMode::Boundary(_) | ResumeMode::Unverified),
             "hydrating promoted terminal from its bound Claude transcript"
         );
         let mut mapper = TranscriptMapper::new(
@@ -1966,7 +1983,7 @@ async fn pump(
     // Flushing at the end of each poll is what makes a finished turn appear.
     let mut batches: Vec<_> = gate_edges
         .into_iter()
-        .map(Ok)
+        .map(|obs| Ok(vec![obs]))
         .chain(read.lines.iter().map(|line| hydrator.mapper.map_line(line)))
         .collect();
     batches.push(hydrator.mapper.flush());

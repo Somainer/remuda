@@ -53,7 +53,10 @@ fn usage_by_message() -> BTreeMap<String, remuda_protocol::UsagePayload> {
             }
             for obs in mapper.map_line(line).expect("a real 2.1.289 record maps") {
                 if let ObservationPayload::Usage(payload) = obs.body {
-                    let id = payload.scope_id.clone();
+                    // scope_id is "<requestId>:<messageId>" when a requestId
+                    // is present, else the bare message id; key assertions on
+                    // the message id.
+                    let id = payload.scope_id.rsplit(':').next().unwrap().to_owned();
                     assert!(
                         by_id.insert(id, *payload).is_none(),
                         "one usage observation per message id (got a duplicate)"
@@ -103,9 +106,128 @@ fn a_fresh_mapper_replaying_the_transcript_re_emits_but_hub_dedupes() {
     let first = usage_by_message();
     let second = usage_by_message();
     assert_eq!(first.len(), second.len());
+    assert!(!first.is_empty(), "the replay must produce usage payloads");
+    // c-ctxusage r2 item 5: the regression previously passed with zero usage.
+    // Every emitted snapshot must carry a non-empty counter set (this is a
+    // 2.1.289 transcript; the Hub store projection + dedupe of both passes is
+    // asserted in remuda-hub's usage_store tests).
+    for (id, payload) in &first {
+        let has_counter = known_opt(&payload.input_tokens).is_some()
+            || known_opt(&payload.output_tokens).is_some()
+            || known_opt(&payload.cache_read_tokens).is_some()
+            || known_opt(&payload.cache_write_tokens).is_some();
+        assert!(has_counter, "{id} carries at least one known counter");
+    }
     assert_eq!(
         first.keys().collect::<Vec<_>>(),
         second.keys().collect::<Vec<_>>(),
         "re-hydration re-emits one snapshot per identical message id"
+    );
+}
+
+fn known_opt(value: &remuda_protocol::Knowledge<U64>) -> Option<u64> {
+    match value {
+        remuda_protocol::Knowledge::Known { value } => Some(value.0),
+        _ => None,
+    }
+}
+
+/// c-ctxusage r2 item 3: a message split across two poll boundaries must not
+/// emit usage until the group finalises (a stop_reason record). The first
+/// poll (blocks with usage but NO stop_reason) emits content only; the second
+/// poll (stop_reason + final counters) emits the single usage snapshot with
+/// the FINAL numbers — never a frozen partial first snapshot.
+#[test]
+fn usage_finalises_only_when_the_assistant_group_completes() {
+    fn assistant(message_id: &str, usage: serde_json::Value, stop: bool) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": format!("{message_id}-rec"),
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "requestId": "req-1",
+            "message": {
+                "id": message_id,
+                "role": "assistant",
+                "type": "message",
+                "model": "claude-sonnet-5",
+                "stop_reason": if stop {
+                    serde_json::json!("end_turn")
+                } else {
+                    serde_json::Value::Null
+                },
+                "content": [{"type": "text", "text": "part"}],
+                "usage": usage,
+            }
+        })
+        .to_string()
+    }
+    fn usage(input: u64, output: u64, cache_read: u64) -> serde_json::Value {
+        serde_json::json!({
+            "input_tokens": input,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": cache_read,
+            "output_tokens": output,
+        })
+    }
+
+    // Poll 1: first block, provisional counters, NO stop_reason yet.
+    let mut mapper = mapper();
+    let first = mapper
+        .map_line(&assistant("msg-split", usage(100, 5, 5_000), false))
+        .expect("map poll 1");
+    assert!(
+        first
+            .iter()
+            .all(|o| !matches!(o.body, ObservationPayload::Usage(_))),
+        "an in-flight (no stop_reason) block must not emit usage"
+    );
+
+    // A poll-boundary flush (what the 75 ms pump calls) must also NOT emit.
+    let boundary = mapper.flush().expect("poll flush");
+    assert!(
+        boundary
+            .iter()
+            .all(|o| !matches!(o.body, ObservationPayload::Usage(_))),
+        "a poll-boundary flush finalises content but not usage"
+    );
+
+    // Poll 2: continuation block with final counters + stop_reason.
+    let second = mapper
+        .map_line(&assistant("msg-split", usage(200, 9, 9_000), false))
+        .expect("map poll 2 cont");
+    assert!(
+        second
+            .iter()
+            .all(|o| !matches!(o.body, ObservationPayload::Usage(_)))
+    );
+    let done = mapper
+        .map_line(&assistant("msg-split", usage(200, 9, 9_000), true))
+        .expect("map stop");
+    let forced = mapper.flush().expect("final flush");
+    let mut payloads: Vec<_> = done
+        .into_iter()
+        .chain(forced)
+        .filter_map(|o| match o.body {
+            ObservationPayload::Usage(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        payloads.len(),
+        1,
+        "exactly one usage snapshot for the split message"
+    );
+    let p = payloads.pop().unwrap();
+    assert_eq!(
+        known(&p.input_tokens),
+        200,
+        "final input, not the provisional 100"
+    );
+    assert_eq!(known(&p.output_tokens), 9, "final output");
+    assert_eq!(known(&p.cache_read_tokens), 9_000, "final cache read");
+    assert_eq!(
+        p.scope_id, "req-1:msg-split",
+        "scope id namespaces requestId"
     );
 }

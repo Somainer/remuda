@@ -377,7 +377,7 @@ it("a read-back-unavailable edge clears the projection but keeps the pending swi
     eventId: "evt_eff_withdrawn",
     instanceId: "x",
     journalId: "x",
-    seq: "9",
+    seq: "3",
     kind: "effort",
     observedAt: "2026-10-08T12:05:00Z",
     source: { channel: "transcript" },

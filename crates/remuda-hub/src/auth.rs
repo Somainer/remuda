@@ -221,13 +221,15 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
         // restart, and a `cp -r` without -p did so once after a restore.
         if code_changed || file_newer_than_stamp {
             persist_bootstrap(&data_dir, &config.bootstrap_token)?;
-        } else if !stamp_path.is_file() {
-            // Round 4 item 3: backfill a MISSING stamp on an unchanged code.
-            // A crash between persist_bootstrap's two writes, a pre-D-018 data
-            // dir, or a hand-provisioned token leaves the code without one;
-            // bootstrap_within_ttl fails open for a missing stamp, so without
-            // this the code would never expire. First sight is the issue time,
-            // exactly like the no-source adoption branch.
+        } else if bootstrap_issued_at(&data_dir).is_none() {
+            // Backfill a stamp on an unchanged code when there is no USABLE
+            // one: a missing file (crash between writes, pre-D-018 dir,
+            // hand-provisioned token) or an EMPTY file (a kill during
+            // write_private after the truncating open, or `: >
+            // bootstrap-issued-at`). bootstrap_within_ttl fails open for
+            // exactly this condition, so without a backfill the code never
+            // expires. First sight is the issue time. A non-empty but
+            // malformed stamp is left alone — it is treated as expired.
             write_private(&stamp_path, &now_rfc3339())?;
         }
         // Otherwise leave bootstrap-token AND bootstrap-issued-at untouched.
@@ -253,8 +255,8 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
             .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
             .trim()
             .to_string();
-        // Pre-D-018 data dirs have no stamp; treat first sight as issue time.
-        if !stamp_path.is_file() {
+        // Backfill a missing OR EMPTY stamp; treat first sight as issue time.
+        if bootstrap_issued_at(&data_dir).is_none() {
             write_private(&stamp_path, &now_rfc3339())?;
         }
         config.bootstrap_source = crate::config::BootstrapSource::Adopted;
@@ -1063,6 +1065,80 @@ mod tests {
             std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
             expired_bytes,
             "the expired stamp is not revived"
+        );
+        assert!(!bootstrap_within_ttl(dir.path(), 24));
+    }
+
+    /// Round 5 item 2: an EMPTY stamp file (a kill during write_private after
+    /// the truncating open, or `: > bootstrap-issued-at`) is the same fail-open
+    /// condition as a missing stamp. An explicit start with an unchanged code
+    /// must backfill now, and a later expiry still applies.
+    #[test]
+    fn explicit_start_backfills_an_empty_stamp_file() {
+        for empty in ["", "  \n\t "] {
+            let dir = tempfile::tempdir().expect("data dir");
+            write_private(&dir.path().join("bootstrap-token"), "same-code").expect("token");
+            write_private(&dir.path().join("bootstrap-issued-at"), empty).expect("empty stamp");
+            assert!(
+                bootstrap_issued_at(dir.path()).is_none(),
+                "an empty/whitespace stamp reads as absent"
+            );
+
+            let mut config = HubConfig::for_test(dir.path().to_path_buf());
+            config.bootstrap_token = "same-code".to_owned();
+            config.bootstrap_source = BootstrapSource::ExplicitEnv;
+            resolve_bootstrap(&mut config).expect("resolve backfills");
+
+            let stamp = bootstrap_issued_at(dir.path())
+                .expect("an empty stamp is backfilled to a usable now-stamp");
+            let parsed =
+                time::OffsetDateTime::parse(&stamp, &time::format_description::well_known::Rfc3339)
+                    .expect("parseable");
+            assert!(
+                (time::OffsetDateTime::now_utc() - parsed) < time::Duration::seconds(60),
+                "the backfill records the current time"
+            );
+        }
+    }
+
+    /// Round 5 item 2: a no-source start that loads a persisted token next to
+    /// an empty stamp file backfills the stamp rather than failing open forever.
+    #[test]
+    fn no_source_start_backfills_an_empty_stamp_file() {
+        let dir = tempfile::tempdir().expect("data dir");
+        write_private(&dir.path().join("bootstrap-token"), "legacy-code").expect("token");
+        write_private(&dir.path().join("bootstrap-issued-at"), "").expect("empty stamp");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = String::new();
+        config.bootstrap_source = BootstrapSource::Generated;
+        resolve_bootstrap(&mut config).expect("resolve");
+        assert_eq!(config.bootstrap_token, "legacy-code");
+        assert!(
+            bootstrap_issued_at(dir.path()).is_some(),
+            "the no-source adoption path backfills an empty stamp too"
+        );
+    }
+
+    /// Round 5 item 2 negative: a NON-empty malformed stamp is not backfilled
+    /// — it is treated as expired (the empty-file fail-open is what is closed).
+    #[test]
+    fn malformed_nonempty_stamp_is_not_backfilled() {
+        let dir = tempfile::tempdir().expect("data dir");
+        write_private(&dir.path().join("bootstrap-token"), "same-code").expect("token");
+        write_private(&dir.path().join("bootstrap-issued-at"), "not-a-timestamp")
+            .expect("malformed stamp");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitEnv;
+        resolve_bootstrap(&mut config).expect("resolve");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bootstrap-issued-at"))
+                .unwrap()
+                .trim(),
+            "not-a-timestamp",
+            "a non-empty malformed stamp is left as-is"
         );
         assert!(!bootstrap_within_ttl(dir.path(), 24));
     }

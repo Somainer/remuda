@@ -11599,14 +11599,14 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 task_id,
                 usage_rollup,
                 lineage_id: {
-                    let stamped: Option<String> = row.get(24)?;
+                    let stamped: Option<String> = row.get(25)?;
                     stamped.unwrap_or_else(|| row.get::<_, String>(0).unwrap_or_default())
                 },
-                generation: row.get(25)?,
-                chapter_cause: row.get(26)?,
-                fenced_at: row.get(27)?,
+                generation: row.get(26)?,
+                chapter_cause: row.get(27)?,
+                fenced_at: row.get(28)?,
                 restart: row
-                    .get::<_, Option<String>>(28)?
+                    .get::<_, Option<String>>(29)?
                     .and_then(|raw| serde_json::from_str(&raw).ok()),
             })
         },
@@ -12398,8 +12398,10 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
     // relatedIds.settledRootTurn decision (open workflows / queued follow-up
     // turns carry no flag and change nothing) — deliberately separate from
     // the one-shot affectsCompletion heuristic.
-    let settled_root_turn =
-        payload.pointer("/relatedIds/settledRootTurn").and_then(Value::as_str) == Some("true");
+    let settled_root_turn = payload
+        .pointer("/relatedIds/settledRootTurn")
+        .and_then(Value::as_str)
+        == Some("true");
     if payload_type == "native" && topic == "turn" && !subagent_scoped {
         if (native_name, status) == ("turn_started", Some("working")) {
             return (None, Some("working"));
@@ -12419,9 +12421,6 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
             // An intermediate successful result changes neither.
             return (None, None);
         }
-    }
-    {
-        return (Some("running"), Some("idle"));
     }
 
     if kind == "interaction.requested" || kind == "interactionRequested" {

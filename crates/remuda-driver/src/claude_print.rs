@@ -190,6 +190,17 @@ impl TurnBook {
         });
     }
 
+    /// Roll back the most recent [`Self::begin_turn`] when its prompt write
+    /// failed: the prompt never reached the child, so the unstarted turn must
+    /// not make later results look intermediate.
+    fn cancel_latest_turn(&mut self) {
+        if let Some(turn) = self.outstanding.pop_front() {
+            for id in turn.open_workflows {
+                self.implicit_workflows.remove(&id);
+            }
+        }
+    }
+
     /// Track a freshly-opened background workflow against the root turn the
     /// native process is currently emitting for (the FIFO front), or the
     /// implicit bucket when no local turn is known (fixture replay).
@@ -422,6 +433,12 @@ struct Inner {
     /// on the send task never stalls stdout draining, and `close`/`cancel`
     /// stay reachable (neither needs this queue to make progress).
     publish: Mutex<Option<mpsc::UnboundedSender<PublishJob>>>,
+    /// ma-sdk-state r4 item 1: the current prompt write's turn reservation,
+    /// present from before the write blocks until it commits/cancels. A
+    /// mapped result parks on it (see [`TurnReservation`]); it also carries
+    /// the id used to pre-open the mapper book. One at a time under
+    /// [`Inner::write_seq`].
+    pending_turn: Mutex<Option<Arc<TurnReservation>>>,
     /// Serializes prompt sends from enqueue through write completion to
     /// enqueueing the matching `turn_started`, so two concurrent prompts both
     /// write and start in FIFO order. Held across the write await by design;
@@ -509,6 +526,7 @@ impl ClaudePrintDriver {
                     turns: TurnBook::default(),
                 }),
                 publish: Mutex::new(None),
+                pending_turn: Mutex::new(None),
                 write_seq: tokio::sync::Mutex::new(()),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
@@ -832,29 +850,50 @@ impl Driver for ClaudePrintDriver {
                     live.process.writer()
                 };
                 // Concurrent prompts must write AND start in FIFO; write_seq
-                // spans the write and the turn_started enqueue. close/cancel
-                // never take it, so they remain reachable while a prompt is
-                // blocked.
+                // spans the reservation + write + commit. close/cancel never
+                // take it, so they remain reachable while a prompt is blocked.
                 let _seq = self.inner.write_seq.lock().await;
                 let client_message_id = prompt.native_client_message_id.clone();
-                writer
-                    .send_user(prompt_content(&prompt.blocks)?)
-                    .await
-                    .map_err(map_wire)?;
-                // The write reached the child's stdin: enqueue turn_started in
-                // the SAME FIFO the reader enqueues stdout frames into, so this
-                // turn's frames cannot be published before its start. The
-                // enqueue is unbounded (never parks), and a failed write above
-                // means no turn_started is ever recorded for an unwritten
-                // prompt — activity never flips working for a failed write.
-                let publisher = self.inner.publish.lock().await.clone();
-                let Some(publisher) = publisher else {
-                    return Err(DriverError::ControlUnavailable);
-                };
-                publisher
-                    .send(PublishJob::TurnStarted { client_message_id })
-                    .map_err(|_| DriverError::ControlUnavailable)?;
-                Ok(DriverAck::transport_written())
+                // ma-sdk-state r4 item 1: reserve the turn BEFORE awaiting the
+                // write. Open the mapper book synchronously (so a result the
+                // child emits while the write is in flight maps intermediate,
+                // never early-idle) and register the reservation a racing
+                // result batch parks on. The turn_started OBSERVATION is
+                // emitted only after the write acks (commit): by the
+                // TurnStarted job, or prepended by a racing result.
+                let reservation = TurnReservation::shared(client_message_id.clone());
+                {
+                    let mut mapper = self.inner.mapper.lock().await;
+                    mapper.begin_turn_reservation();
+                    *self.inner.pending_turn.lock().await = Some(reservation.clone());
+                }
+                let write = writer.send_user(prompt_content(&prompt.blocks)?).await;
+                match write {
+                    Ok(()) => {
+                        reservation.commit();
+                        *self.inner.pending_turn.lock().await = None;
+                        let publisher = self.inner.publish.lock().await.clone();
+                        if let Some(publisher) = publisher {
+                            // No-op if a racing result already emitted start.
+                            let _ = publisher.send(PublishJob::TurnStarted {
+                                reservation: reservation.clone(),
+                            });
+                        }
+                        Ok(DriverAck::transport_written())
+                    }
+                    Err(error) => {
+                        // Cancel: no turn_started is ever emitted for an
+                        // unwritten prompt; frames queued behind it flow
+                        // unchanged and map against the pre-opened (but
+                        // unstarted) book, which the next successful turn's
+                        // FIFO ordering supersedes.
+                        reservation.cancel();
+                        let mut mapper = self.inner.mapper.lock().await;
+                        mapper.cancel_turn_reservation();
+                        *self.inner.pending_turn.lock().await = None;
+                        Err(map_wire(error))
+                    }
+                }
             }
             DriverInput::Steer(_) => Err(DriverError::CapabilityUnknown("steer".into())),
             DriverInput::ModelSwitch(switch) => {
@@ -1207,26 +1246,145 @@ enum PublishJob {
     /// Boxed: `Outbound` is ~1 KiB while the other jobs are tiny, and this job
     /// already crosses the unbounded queue boundary.
     Frame(Box<Outbound>),
-    /// A user frame finished writing; map/emit its `turn_started` in order.
-    TurnStarted { client_message_id: String },
+    /// Emit the turn_started for a turn whose write committed (a no-op when a
+    /// racing result batch already emitted it through the reservation gate).
+    TurnStarted { reservation: Arc<TurnReservation> },
     /// The child's stdout closed; emit exactly one `exited` (deduped).
     StdoutEof,
+}
+
+/// A prompt write's publication reservation (ma-sdk-state r4 item 1).
+///
+/// Held in [`Inner::pending_turn`] across the write await. The mapper book is
+/// opened (`begin_turn`) BEFORE the write, so a result the child emits while
+/// the write is still in flight maps as an INTERMEDIATE result and can never
+/// project idle before the turn starts. A mapped result batch parks on
+/// [`TurnReservation::committed`] until the write acks; on commit it emits
+/// turn_started ahead of the result. Non-result frames (assistant text,
+/// keepalives, a stdout flood under a blocked write) never park and keep
+/// draining.
+struct TurnReservation {
+    client_message_id: String,
+    committed: tokio::sync::Notify,
+    is_committed: std::sync::atomic::AtomicBool,
+    /// Set once the turn_started observation has been emitted (by the racing
+    /// result batch or by the TurnStarted job — exactly one of them).
+    start_emitted: std::sync::atomic::AtomicBool,
+}
+
+impl TurnReservation {
+    fn new(client_message_id: String) -> Self {
+        Self {
+            client_message_id,
+            committed: tokio::sync::Notify::new(),
+            is_committed: std::sync::atomic::AtomicBool::new(false),
+            start_emitted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Wrap in an [`Arc`] for sharing between the send task and the worker.
+    fn shared(client_message_id: String) -> Arc<Self> {
+        Arc::new(Self::new(client_message_id))
+    }
+
+    /// The write succeeded: unpark a racing result batch.
+    fn commit(&self) {
+        self.is_committed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.committed.notify_waiters();
+    }
+
+    /// The write failed: unpark without a start; queued frames flow as-is.
+    fn cancel(&self) {
+        self.committed.notify_waiters();
+    }
+
+    async fn wait_for_commit(&self) -> bool {
+        if self.is_committed.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        let notified = self.committed.notified();
+        if self.is_committed.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        notified.await;
+        self.is_committed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Claim the right to emit this turn's turn_started observation. Returns
+    /// true exactly once (the racing result batch or the TurnStarted job);
+    /// the caller then builds the observation through the mapper.
+    fn claim_start(&self) -> bool {
+        !self
+            .start_emitted
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+/// Whether a mapped observation batch is a turn `result` that must wait for
+/// the turn's write to commit before it can be published.
+fn batch_has_uncommitted_result(observations: &[Observation]) -> bool {
+    observations.iter().any(|obs| {
+        matches!(&obs.body,
+            ObservationPayload::Lifecycle(p) if matches!(p.as_ref(),
+                LifecyclePayload::Native(n)
+                    if n.topic == LifecycleTopic::Turn && n.native_name == "result"))
+    })
 }
 
 /// Single drainer of [`Inner::publish`]: map + emit strictly in enqueue order.
 async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<PublishJob>) {
     while let Some(job) = rx.recv().await {
         let result = match job {
-            PublishJob::Frame(frame) => publish_frame(&inner, *frame).await,
-            PublishJob::TurnStarted { client_message_id } => {
-                let observation = {
-                    let mut mapper = inner.mapper.lock().await;
-                    mapper.turn_started(&client_message_id)
-                };
-                match observation {
-                    Ok(observation) => emit_all(&inner, vec![observation]).await,
-                    Err(error) => Err(error),
+            PublishJob::Frame(frame) => {
+                async {
+                    if let Outbound::ControlRequest(env) = &*frame
+                        && let ControlRequest::CanUseTool(req) = &env.request
+                    {
+                        return handle_can_use_tool(&inner, env, req).await;
+                    }
+                    let mut observations = {
+                        let mut mapper = inner.mapper.lock().await;
+                        map_outbound(&mut mapper, &frame)?
+                    };
+                    // ma-sdk-state r4 item 1: a result for a turn whose write is
+                    // still in flight parks here until the write acks, then emits
+                    // turn_started FIRST. Everything else (messages, flood
+                    // frames) drains without waiting, so stdout never stalls on a
+                    // blocked write.
+                    if batch_has_uncommitted_result(&observations) {
+                        let reservation = inner.pending_turn.lock().await.clone();
+                        if let Some(reservation) = reservation
+                            && reservation.wait_for_commit().await
+                            && reservation.claim_start()
+                        {
+                            let start = {
+                                let mut mapper = inner.mapper.lock().await;
+                                mapper.turn_started_observation(&reservation.client_message_id)?
+                            };
+                            observations.insert(0, start);
+                        }
+                    }
+                    emit_all(&inner, observations).await
                 }
+                .await
+            }
+            PublishJob::TurnStarted { reservation } => {
+                async {
+                    // Normal (non-racing) path: the write committed before any
+                    // result was mapped. No-op if a racing result already claimed
+                    // the start.
+                    if reservation.claim_start() {
+                        let start = {
+                            let mut mapper = inner.mapper.lock().await;
+                            mapper.turn_started_observation(&reservation.client_message_id)?
+                        };
+                        emit_all(&inner, vec![start]).await
+                    } else {
+                        Ok(())
+                    }
+                }
+                .await
             }
             PublishJob::StdoutEof => emit_exit(&inner, "exited").await,
         };
@@ -1234,20 +1392,6 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
             warn!("ordered publication failed: {error}");
         }
     }
-}
-
-/// Map and emit one prefetched stdout frame, in publication order.
-async fn publish_frame(inner: &Inner, frame: Outbound) -> DriverResult<()> {
-    if let Outbound::ControlRequest(env) = &frame
-        && let ControlRequest::CanUseTool(req) = &env.request
-    {
-        return handle_can_use_tool(inner, env, req).await;
-    }
-    let observations = {
-        let mut mapper = inner.mapper.lock().await;
-        map_outbound(&mut mapper, &frame)?
-    };
-    emit_all(inner, observations).await
 }
 
 /// Whether a user frame carries a tool_result whose content (or mirrored
@@ -2206,8 +2350,21 @@ impl Mapper {
     /// The Remuda command id is owned by the Node and is not known here; the
     /// native client message id (echoed by the harness on its `user` record) is
     /// carried so a later fold can join the two.
-    fn turn_started(&mut self, client_message_id: &str) -> DriverResult<Observation> {
+    /// Open the settlement book for a new root turn BEFORE its prompt write
+    /// blocks (ma-sdk-state r4 item 1), emitting nothing.
+    fn begin_turn_reservation(&mut self) {
         self.turns.begin_turn();
+    }
+
+    /// Roll back the latest turn reservation when its write fails.
+    fn cancel_turn_reservation(&mut self) {
+        self.turns.cancel_latest_turn();
+    }
+
+    /// Build the turn_started observation WITHOUT touching the book — used
+    /// after a write commits when the book was already pre-opened by
+    /// [`Self::begin_turn_reservation`].
+    fn turn_started_observation(&mut self, client_message_id: &str) -> DriverResult<Observation> {
         let mut related = std::collections::BTreeMap::new();
         if !client_message_id.is_empty() {
             related.insert("nativeClientMessageId".into(), client_message_id.into());
@@ -2221,6 +2378,11 @@ impl Mapper {
             related,
             false,
         )
+    }
+
+    fn turn_started(&mut self, client_message_id: &str) -> DriverResult<Observation> {
+        self.turns.begin_turn();
+        self.turn_started_observation(client_message_id)
     }
 
     fn lifecycle_named(
@@ -2945,6 +3107,25 @@ impl StdoutMapper {
     /// Map one decoded stdout frame, exactly as the reader task does.
     pub fn map(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
         map_outbound(&mut self.mapper, &Outbound::from_value(value))
+    }
+
+    /// Open the settlement book for a new root turn BEFORE its prompt write
+    /// blocks (ma-sdk-state r4 item 1), without emitting anything.
+    pub fn begin_turn(&mut self) {
+        self.mapper.begin_turn_reservation();
+    }
+
+    /// Roll back a [`Self::begin_turn`] when the prompt write fails.
+    pub fn cancel_turn(&mut self) {
+        self.mapper.cancel_turn_reservation();
+    }
+
+    /// Build the turn_started observation for an already-reserved turn.
+    pub fn turn_started_observation(
+        &mut self,
+        client_message_id: &str,
+    ) -> DriverResult<Observation> {
+        self.mapper.turn_started_observation(client_message_id)
     }
 
     /// Record a locally-written user frame exactly as the driver send path

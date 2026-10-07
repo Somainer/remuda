@@ -10,13 +10,12 @@ use futures::FutureExt;
 use remuda_protocol::{
     Acceptance, AcceptanceScope, Activity, ActorRef, ActorType, AgentKind, ClaudeRef, Command,
     CommandAuthority, CommandId, CommandOperation, CommandOrigin, CommandResult, CommandState,
-    CommandTarget, Completeness, Connectivity, Digest as WireDigest, DispatchState, DriverKind,
+    CommandTarget, Completeness, Connectivity, Digest as WireDigest, DispatchState,
     EntityLifecycle, EntityMeta, ExpectedState, Host, HostId, HostState, HostTransport,
     HostTransportMode, Id, Instance, InstanceId, InstanceLifecycle, JournalEvent, Knowledge,
     LifecycleEntity, LifecyclePayload, MessagePhase, MessageRole, NativeRef, NodeReceipt,
     ObservationPayload, Ownership, Page, PathStyle, Platform, ProcessRef, ResolutionState,
-    Settlement, SettlementOutcome, SourceChannel, U64, Workspace, WorkspaceId, WorkspaceState,
-    WritePolicy,
+    Settlement, SettlementOutcome, U64, Workspace, WorkspaceId, WorkspaceState, WritePolicy,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -2748,8 +2747,8 @@ fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Opt
     // foreground session, so this channel-agnostic fallback must NOT invent
     // attribution for it. Print/SDK children own the Stdout/Transcript
     // channels outright — those are exactly the events this exists for.
-    if observation.source.channel == SourceChannel::Hook
-        && observation.source.driver_kind == DriverKind::ShellPty
+    if observation.source.channel == remuda_protocol::SourceChannel::Hook
+        && observation.source.driver_kind == remuda_protocol::DriverKind::ShellPty
     {
         return None;
     }

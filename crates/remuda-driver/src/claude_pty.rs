@@ -290,9 +290,7 @@ impl ClaudePtyDriver {
         // child env is assembled (so it uses the effective CLAUDE_CONFIG_DIR,
         // including any extra_env/MCP override) but before the agent runs.
         let resume_id: Option<String> = match &session {
-            crate::materializer::SessionAction::Resume { session_id } => {
-                Some(session_id.clone())
-            }
+            crate::materializer::SessionAction::Resume { session_id } => Some(session_id.clone()),
             crate::materializer::SessionAction::New { .. } => None,
         };
         let request = MaterializeRequest {
@@ -383,13 +381,11 @@ impl ClaudePtyDriver {
         // is not (or which cannot otherwise be bounded) is Unverified — never
         // the fresh byte-0 path.
         let resume_mode = match resume_id.as_deref() {
-            Some(id) => {
-                crate::claude_transcript::ResumeBoundary::mode_for(
-                    &config_dir,
-                    std::path::Path::new(&spec.cwd),
-                    id,
-                )
-            }
+            Some(id) => crate::claude_transcript::ResumeBoundary::mode_for(
+                &config_dir,
+                std::path::Path::new(&spec.cwd),
+                id,
+            ),
             None => crate::claude_transcript::ResumeMode::Fresh,
         };
 
@@ -2698,6 +2694,150 @@ mod tests {
             panic!("effort payload");
         };
         assert_eq!(payload.effective.name, remuda_protocol::EffortName::High);
+    }
+
+    /// c-effortread r4 item 5, claude-pty pump: a VERIFIED resume whose bound
+    /// transcript is replaced emits the explicit read-back-unavailable edge
+    /// (clearing the projected `high`) on the pump's REAL channel, and a
+    /// pending Remuda switch is never settled Applied by a verdict that lands
+    /// after provenance is lost.
+    #[tokio::test]
+    async fn the_transcript_pump_clears_effective_state_when_provenance_is_lost() {
+        use crate::claude_transcript::{ResumeBoundary, ResumeMode};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let transcript = dir.path().join("effort-session.jsonl");
+        let history = "{\"type\":\"user\",\"sessionId\":\"effort-session\"}\n";
+        std::fs::write(&transcript, history).expect("history");
+        let boundary = ResumeBoundary::snapshot(&transcript).expect("pre-spawn EOF");
+
+        let instance = InstanceId::new();
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            session_id: "effort-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let bridge = Arc::new(crate::effort::EffortBridge::new());
+        let (tx, rx) = mpsc::channel(64);
+        let seq = Arc::new(AtomicU64::new(0));
+        let slot: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(Some(
+            transcript.to_string_lossy().into_owned(),
+        )));
+        let task = spawn_transcript_pump(
+            slot,
+            tx,
+            ctx,
+            seq,
+            Some(Arc::clone(&bridge)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            ResumeMode::Boundary(boundary),
+        );
+        let mut rx = rx;
+
+        let append = |line: serde_json::Value| {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("open");
+            writeln!(file, "{line}").expect("append");
+        };
+        let effort_names = |obs: &[Observation]| {
+            obs.iter()
+                .filter_map(|o| match &o.body {
+                    ObservationPayload::Effort(payload) => {
+                        Some((payload.effective.name, payload.effective.readback_available))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A current-process high edge after the verified boundary.
+        append(json!({
+            "type": "assistant",
+            "uuid": "msg-1",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-1",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+            "effort": "high",
+            "perTurnEffort": null,
+        }));
+        let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
+        assert_eq!(
+            effort_names(&obs),
+            vec![(remuda_protocol::EffortName::High, None)]
+        );
+
+        // A Remuda switch is armed; its slash record is a current record.
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        append(json!({
+            "type": "user",
+            "uuid": "cmd-2",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n<command-args>max</command-args>",
+            },
+        }));
+        let _ = drain_for(&mut rx, Duration::from_millis(400)).await;
+        assert!(bridge.has_pending());
+
+        // The transcript is replaced by something shorter: boundary lost.
+        std::fs::write(&transcript, "{\"rotated\":true}\n").expect("rotate");
+        let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
+        assert_eq!(
+            effort_names(&obs),
+            vec![(remuda_protocol::EffortName::High, Some(false))],
+            "the pump publishes one read-back-unavailable edge: {obs:?}"
+        );
+        assert!(bridge.has_pending());
+
+        // The max verdict in the recreated file cannot settle it.
+        append(json!({
+            "type": "user",
+            "uuid": "cmd-3",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": "<local-command-stdout>Set effort level to max</local-command-stdout>",
+            },
+        }));
+        let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
+        assert!(
+            effort_names(&obs).is_empty(),
+            "no edge from an unverified verdict: {obs:?}"
+        );
+        assert!(bridge.has_pending(), "the switch is never resolved Applied");
+        let settled = bridge.wait(generation, Duration::from_millis(150)).await;
+        assert!(settled.is_none());
+
+        task.abort();
+    }
+
+    /// Collect everything the real pump emits within `window`.
+    async fn drain_for(rx: &mut mpsc::Receiver<Observation>, window: Duration) -> Vec<Observation> {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut out = Vec::new();
+        while let Ok(Some(observation)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            out.push(observation);
+        }
+        out
     }
 }
 

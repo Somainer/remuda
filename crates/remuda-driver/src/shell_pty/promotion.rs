@@ -3320,4 +3320,66 @@ mod tests {
         );
         assert!(conversation_hydrated(&observations, "after restore"));
     }
+
+    #[tokio::test]
+    async fn item5_verified_to_unverified_clears_effective_state_without_settling() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Pre-spawn history, then the proven pre-spawn EOF snapshot.
+        let mut fx = pump_fixture(tmp.path(), "{\"before\":true}\n");
+        let boundary = crate::claude_transcript::ResumeBoundary::snapshot(&fx.binding.path)
+            .expect("pre-spawn snapshot");
+        let bridge = Arc::new(crate::effort::EffortBridge::new());
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Boundary(boundary), Some(&bridge));
+        // A current-process record publishes an effective high.
+        append_line(&fx.binding.path, &assistant_line(Some("high"), 1));
+        pump_once(&mut hydrator, &fx).await;
+        let edges = effort_rows(&drain(&mut fx));
+        assert_eq!(
+            edges,
+            vec![(remuda_protocol::EffortName::High, None)],
+            "the verified boundary opens the gate"
+        );
+        // Remuda arms a switch to max; its slash record is a current record.
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        assert!(bridge.has_pending());
+        append_line(&fx.binding.path, &slash_line("max", 2));
+        pump_once(&mut hydrator, &fx).await;
+        drain(&mut fx);
+        assert!(bridge.has_pending());
+
+        // The bound file is replaced (shrink): the boundary is lost.
+        std::fs::write(&fx.binding.path, "{\"rotated\":true}\n").expect("rotate");
+        pump_once(&mut hydrator, &fx).await;
+        let edges = effort_rows(&drain(&mut fx));
+        assert_eq!(
+            edges,
+            vec![(remuda_protocol::EffortName::High, Some(false))],
+            "one explicit read-back-unavailable edge clears the projected state"
+        );
+        assert!(
+            bridge.has_pending(),
+            "the pending switch is not resolved or rejected"
+        );
+
+        // The max verdict then lands in the recreated file: it must not settle
+        // the switch Applied, and it emits no effort edge.
+        append_line(
+            &fx.binding.path,
+            &stdout_verdict("Set effort level to max", 3),
+        );
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(
+            effort_rows(&observations).is_empty(),
+            "an unverified verdict emits nothing: {observations:?}"
+        );
+        assert!(
+            bridge.has_pending(),
+            "read-back loss never resolves a pending switch"
+        );
+        let settled = bridge
+            .wait(generation, std::time::Duration::from_millis(150))
+            .await;
+        assert!(settled.is_none(), "the switch keeps waiting, never Applied");
+    }
 }

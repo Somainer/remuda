@@ -2693,6 +2693,11 @@ impl TranscriptMapper {
             return Ok(Vec::new());
         }
         self.set_effort_current_process(false);
+        // A switch armed for this process must not be settled by a record the
+        // tail can no longer attribute to it. Drop the mapper-side generation
+        // WITHOUT resolving or rejecting: the bridge keeps waiting for its
+        // bounded timeout and degrades, never reporting Applied (item 5).
+        self.effort_generation = None;
         let Some(cleared) = self.effort.read_back_unavailable() else {
             return Ok(Vec::new());
         };
@@ -2967,7 +2972,11 @@ impl TranscriptMapper {
                 .as_ref()
                 .and_then(|bridge| bridge.pending())
                 .is_some_and(|request| request.command_word() == args);
+            // A slash read off an unverified/displaced batch cannot belong to
+            // this process: arm neither the generation nor the level await, so
+            // a verdict that follows provenance loss cannot settle the switch.
             if from_remuda
+                && self.effort.is_current_process()
                 && let Some(bridge) = &self.effort_bridge
                 && let Some((generation, request)) = bridge.pending_with_gen()
             {

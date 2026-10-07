@@ -119,6 +119,8 @@ struct FakeNode {
     live_items: Arc<Mutex<Vec<Value>>>,
     /// Set if the socket dropped: a disconnect is a test failure.
     disconnected: Arc<AtomicBool>,
+    /// Reconnect credential minted by the first `node.hello`.
+    node_token: Arc<Mutex<Option<String>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -135,6 +137,7 @@ impl FakeNode {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let live_items: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let disconnected = Arc::new(AtomicBool::new(false));
+        let node_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let (mut sink, mut stream) = ws.split();
         let calls_task = calls.clone();
         let live_items_task = live_items.clone();
@@ -230,14 +233,31 @@ impl FakeNode {
             calls,
             live_items,
             disconnected,
+            node_token,
             _task: task,
         };
         node.send(json!({
             "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
-            "params": { "hostId": host_id.as_id().as_str(), "nodeVersion": "0.1.0" }
+            "params": {
+                "hostId": host_id.as_id().as_str(),
+                "nodeVersion": "0.1.0",
+                "nodeEpoch": "cs-fake-epoch-1"
+            }
         }))?;
-        node.await_result("hello").await?;
+        let hello = node.await_result("hello").await?;
+        if let Some(token) = hello["result"]["nodeToken"].as_str() {
+            *node.node_token.lock().unwrap() = Some(token.to_string());
+        }
         Ok((node, host_id))
+    }
+
+    /// The reconnect credential the first hello minted.
+    fn node_token(&self) -> String {
+        self.node_token
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("hello result carried a nodeToken")
     }
 
     fn send(&self, frame: Value) -> Result<()> {
@@ -639,6 +659,207 @@ async fn aged_terminal_row_suppresses_the_nodes_pending_copy_from_the_merge() ->
         !ids.contains(&interaction_wire.as_str()),
         "the aged terminal row's stale Node copy must not re-queue: {body}"
     );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// r7 item 1, regression (b): the REAL hello reconcile-then-replay sequence.
+/// A Node loses the Hub, journals an approval and then the exit; on reconnect
+/// the hello reconcile marks the instance exited BEFORE the journal catch-up
+/// replays the request. The late request must never become a pending/blocked
+/// card — it lands invalidated with a settlement notice on the follow bus.
+#[tokio::test]
+async fn hello_reconcile_exits_then_replayed_request_never_reopens_the_card() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+
+    // A running instance on the Node (created over RPC, ready frame appended).
+    let create_body = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "delegation": "none",
+        "permissionMode": "bypass",
+        "prompt": "cardsettle r7 reconnect reconcile",
+    })
+    .to_string();
+    let (status, create_response) =
+        http(addr, "POST", "/v1/instances", &cookie, Some(&create_body)).await?;
+    assert_eq!(status, 200, "create {create_response}");
+    let body: Value = serde_json::from_str(&create_response)?;
+    let instance_id = body["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+    node.append(
+        "jready",
+        &instance_id,
+        json!({ "kind": "lifecycle", "payload": {
+            "type": "entity", "entityType": "instance", "state": "ready"
+        }}),
+    )
+    .await?;
+
+    // An unfiltered follower is the settlement socket; settle it BEFORE the
+    // reconnect so the late card's notice must arrive live (not from the
+    // connect replay).
+    let mut follow_req = format!("ws://{addr}/v1/follow").into_client_request()?;
+    follow_req.headers_mut().insert("Cookie", cookie.parse()?);
+    let (mut follow, _) = tokio_tungstenite::connect_async(follow_req).await?;
+
+    // RECONNECT on a fresh socket (a second hello over the same connection is
+    // refused): a NEW node epoch and an empty, attested inventory — the Node no
+    // longer holds the instance, so the reconcile marks it exited.
+    let mut reconnect_req = format!("ws://{addr}/v1/node").into_client_request()?;
+    reconnect_req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", node.node_token()).parse()?,
+    );
+    let (mut reconnect, _) = tokio_tungstenite::connect_async(reconnect_req).await?;
+    reconnect
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0", "id": "hello2", "method": "node.hello",
+                "params": {
+                    "hostId": host_id.as_id().as_str(),
+                    "nodeVersion": "0.1.0",
+                    "nodeEpoch": "cs-r7-epoch-2",
+                    "instanceStoreFound": true,
+                    "instances": []
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    /// Read frames on a raw Node socket until the result with `want_id`.
+    async fn read_result<S>(socket: &mut S, want_id: &str) -> Result<Value>
+    where
+        S: futures::Stream<
+                Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+            > + Unpin,
+    {
+        loop {
+            let opt = tokio::time::timeout(TIMEOUT, socket.next())
+                .await
+                .with_context(|| format!("timeout waiting for {want_id}"))?
+                .context("node socket closed")?;
+            let Ok(Message::Text(text)) = opt else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&text)?;
+            if frame.get("id").and_then(Value::as_str) == Some(want_id) {
+                anyhow::ensure!(frame.get("result").is_some(), "unexpected frame: {frame}");
+                return Ok(frame);
+            }
+        }
+    }
+
+    read_result(&mut reconnect, "hello2").await?;
+
+    // The owner is exited before any late frame arrives.
+    let (status, instance_response) = http(
+        addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &cookie,
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{instance_response}");
+    let instance: Value = serde_json::from_str(&instance_response)?;
+    assert_eq!(instance["lifecycle"], "exited", "reconcile ended the owner");
+    let activity_after_reconcile = instance["activity"].as_str().unwrap_or("").to_string();
+    assert_ne!(activity_after_reconcile, "blocked");
+
+    // The journal catch-up now replays the approval the Node journaled while
+    // the Hub link was down — over the reconnected link.
+    let late_id = format!("int_{}", uuid::Uuid::now_v7());
+    reconnect
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0", "id": "jlate", "method": "journal.append",
+                "params": {
+                    "instanceId": instance_id,
+                    "event": approval_requested_event(&late_id),
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    read_result(&mut reconnect, "jlate").await?;
+
+    // The settlement notice for the late card rides the dedicated settlement
+    // bus — skip unrelated follow frames (journal events, host updates).
+    let mut got_notice = false;
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(3), follow.next()).await
+    {
+        let Message::Text(text) = msg else { continue };
+        let frame: Value = serde_json::from_str(&text)?;
+        if frame["type"] == "settlement" && frame["interactionId"] == json!(late_id) {
+            assert_eq!(frame["state"], "invalidated");
+            assert_eq!(frame["reason"], "generation-ended");
+            got_notice = true;
+            break;
+        }
+    }
+    assert!(
+        got_notice,
+        "the replayed request produced a live settlement notice"
+    );
+    drop(follow);
+
+    // Durable truth: the card is invalidated, never pending/actionable.
+    let (status, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/interactions?instanceId={instance_id}"),
+        &cookie,
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200);
+    let page: Value = serde_json::from_str(&body)?;
+    let late = page["items"]
+        .as_array()
+        .context("items")?
+        .iter()
+        .find(|item| item["interactionId"] == json!(late_id))
+        .context("late interaction row")?;
+    assert_eq!(late["state"], "invalidated", "{body}");
+    assert_eq!(late["blocking"], json!(false), "the card is not blocking");
+
+    // The owner was never flipped back to blocked.
+    let (status, instance_response) = http(
+        addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &cookie,
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{instance_response}");
+    let instance: Value = serde_json::from_str(&instance_response)?;
+    assert_eq!(instance["lifecycle"], "exited");
+    assert_ne!(
+        instance["activity"].as_str().unwrap_or(""),
+        "blocked",
+        "a replayed request never re-blocks an ended instance"
+    );
+
+    // An answer now gets the existing not-pending rejection and never reaches
+    // the Node.
+    let (status, answer_body) = post_answer(addr, &cookie, &late_id).await?;
+    assert_eq!(status, 404, "late answer rejected: {answer_body}");
+    tokio::time::sleep(NO_FORWARD_WINDOW).await;
+    node.assert_no_answer_forwarded()?;
 
     hub.shutdown().await;
     Ok(())

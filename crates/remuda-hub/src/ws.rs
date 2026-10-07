@@ -662,10 +662,6 @@ pub(crate) async fn handle_node_method(
                 for appended in appended_chunk {
                     if !appended.replayed {
                         publish_journal(&state.bus, &appended.record);
-                        // c-cardsettle: cards this terminal journal event
-                        // invalidated commit with the append; tell followers
-                        // immediately (a seq-less settlement control frame).
-                        state.broadcast_settlement(&appended.settlement);
                         crate::alerts::observe(state, &appended.record);
                         crate::usage_store::observe_journal(state, &appended.record).await;
                         crate::supply::observe_journal_text(state, &appended.record).await;
@@ -673,6 +669,14 @@ pub(crate) async fn handle_node_method(
                             instance_terminated = true;
                         }
                     }
+                    // c-cardsettle: cards a terminal transaction invalidated
+                    // commit with the append; tell followers immediately
+                    // (a seq-less settlement control frame). Broadcast even
+                    // for REPLAYED rows: a request replayed by a Node after
+                    // the hello reconcile ended its owner is invalidated
+                    // during replay (r7 item 1), and that notice has no other
+                    // publication path (no fresh journal event follows it).
+                    state.broadcast_settlement(&appended.settlement);
                     next_seq = Some(appended.record.seq.saturating_add(1));
                     last = Some(appended);
                 }

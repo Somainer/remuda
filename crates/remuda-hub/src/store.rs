@@ -8644,6 +8644,134 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r7 item 1: the hello reconcile can mark an instance exited
+    /// BEFORE the Node's journal catch-up replays an approval it journaled
+    /// while the Hub link was down. The late, unseen `interaction.requested`
+    /// must land directly as invalidated/generation-ended (the exact payload
+    /// the settle path writes), must NOT flip activity back to blocked, and
+    /// returns exactly one settlement notice. The badge (pending-only list)
+    /// never counts it; it appears only in the departed inbox presentation.
+    #[tokio::test]
+    async fn late_request_after_owner_exited_is_invalidated_and_never_pending() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-late-request").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+
+        // The owner ends (real process-end entity event) with no card yet.
+        let end = store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{"type":"entity","entityType":"instance","state":"exited"}}),
+            )
+            .await
+            .expect("append exit");
+        assert!(end.settlement.is_empty(), "nothing was pending yet");
+        let owner = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get owner")
+            .expect("owner row");
+        assert_eq!(owner.lifecycle, "exited");
+        let activity_before = owner.activity.clone();
+
+        // The Node catch-up now replays an approval it journaled before dying.
+        let late_id = new_id("int").expect("late interaction id");
+        let appended = store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": late_id,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "resolution": { "state": "unknown" },
+                            "request": {
+                                "kind": "approval",
+                                "title": "Bash",
+                                "description": "journaled while the hub link was down",
+                                "options": [],
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("replay late request");
+
+        // Exactly one settlement notice, shaped like every other settle.
+        assert_eq!(
+            appended.settlement.interactions.len(),
+            1,
+            "the late request yields one settlement notice: {:?}",
+            appended.settlement.interactions
+        );
+        let notice = &appended.settlement.interactions[0];
+        assert_eq!(notice.instance_id, instance.instance_id);
+        assert_eq!(notice.interaction_id, late_id);
+        assert!(!notice.updated_at.is_empty());
+
+        let (state, reason) = interaction_state_and_reason(&store, &late_id).await;
+        assert_eq!(state, "invalidated", "the card is never pending");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+
+        // Activity is untouched (never flipped back to blocked).
+        let owner_after = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get owner after")
+            .expect("owner row");
+        assert_eq!(
+            owner_after.activity, activity_before,
+            "a late request never re-blocks an ended instance"
+        );
+        assert_ne!(owner_after.activity, "blocked");
+
+        // The badge (actionable, pending-only) never counts it.
+        let pending = store
+            .list_interactions(None, Some(instance.instance_id.clone()), None, true)
+            .await
+            .expect("pending list");
+        assert!(
+            pending.iter().all(|r| r.interaction_id != late_id),
+            "the late card is not actionable: {pending:?}"
+        );
+
+        // It is also idempotent: a second replay settles nothing new.
+        let again = store
+            .append_journal(
+                host,
+                instance.instance_id.clone(),
+                Some(appended.record.seq + 1),
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": { "id": late_id, "kind": "approval", "state": "pending" }
+                    }
+                }),
+            )
+            .await
+            .expect("replay late request twice");
+        assert!(
+            again.settlement.is_empty(),
+            "a replay of an already-invalidated request settles nothing"
+        );
+        let (state, _) = interaction_state_and_reason(&store, &late_id).await;
+        assert_eq!(state, "invalidated");
+        store.close().await;
+    }
+
     /// c-cardsettle r2 item 1: a failed LIVE configure switch
     /// (instance.configure / topic configuration / affectsCompletion=false,
     /// severity=error) on a still-running PTY session must NOT end the session:
@@ -10660,7 +10788,11 @@ fn append_loaded_event(
 ) -> Result<JournalAppend, StoreError> {
     let seq = cursor.next_hint.unwrap_or(cursor.expected_next);
     if let Some(existing) = load_journal_row(conn, instance_id, seq)? {
-        apply_interaction_event(conn, host_id, instance_id, &existing.event)?;
+        // r7 item 1: even a REPLAYED request is checked against the owner's
+        // current lifecycle — the hello reconcile can have ended the instance
+        // before the journal catch-up replayed the request. The settlement
+        // rides the (replayed) append result so the ws layer broadcasts it.
+        let settlement = apply_interaction_event(conn, host_id, instance_id, &existing.event)?;
         // A replay hands the next event this existing row's seq + 1, just as
         // the old per-event loop derived its next hint from the returned
         // record. The durable cursor does not move.
@@ -10669,7 +10801,7 @@ fn append_loaded_event(
             record: existing,
             replayed: true,
             durable_seq: cursor.durable,
-            settlement: Settlement::default(),
+            settlement,
         });
     }
     if seq != cursor.expected_next {
@@ -10704,7 +10836,10 @@ fn append_loaded_event(
     apply_instance_projection(conn, instance_id, &event, seq, &now, &mut settlement)?;
     apply_native_session_projection(conn, instance_id, &event, &now)?;
     apply_command_projection(conn, host_id, instance_id, &event, &now)?;
-    apply_interaction_event(conn, host_id, instance_id, &event)?;
+    // r7 item 1: a fresh request on an already-ended owner is inserted
+    // invalidated and its settlement notice is folded in with any settlement
+    // this event's own terminal transition produced.
+    settlement.merge(apply_interaction_event(conn, host_id, instance_id, &event)?);
     apply_instance_lifecycle(conn, instance_id, &event, &mut settlement)?;
     cursor.expected_next = seq + 1;
     cursor.durable = seq;
@@ -10808,7 +10943,7 @@ fn apply_interaction_event(
     host_id: &str,
     instance_id: &str,
     event: &Value,
-) -> Result<(), StoreError> {
+) -> Result<Settlement, StoreError> {
     let kind = event
         .get("kind")
         .and_then(Value::as_str)
@@ -10865,7 +11000,7 @@ fn apply_interaction_event(
             conn.execute("UPDATE interactions SET state = ?1, blocking = 0, payload_json = ?2, updated_at = ?3 WHERE id = ?4",
                 params![state, payload_json, now_rfc3339(), id])?;
         }
-        return Ok(());
+        return Ok(Settlement::default());
     }
     let id = event
         .get("interactionId")
@@ -10881,9 +11016,10 @@ fn apply_interaction_event(
                 .and_then(Value::as_str)
         });
     let Some(id) = id.filter(|id| !id.is_empty()) else {
-        return Ok(());
+        return Ok(Settlement::default());
     };
     let now = now_rfc3339();
+    let mut settlement = Settlement::default();
     if kind == "interaction.requested" || kind == "interactionRequested" {
         let ikind = event
             .get("interactionKind")
@@ -10895,45 +11031,94 @@ fn apply_interaction_event(
                     .and_then(Value::as_str)
             })
             .unwrap_or("permission");
-        // c-cardsettle r2 item 6: a replayed `interaction.requested` (e.g. a
-        // lost-ack replay) must not overwrite an already-terminal row. The old
-        // upsert rewrote payload_json unconditionally, stripping the
-        // generation-ended/invalidated resolution (and re-stamping a
-        // terminal card's activity), which made the desktop mislabel it as
-        // 已在其它设备处理. Keep the existing payload/state when the row is
-        // already invalidated or expired; only a pending (or non-terminal) row
-        // absorbs the replay.
-        conn.execute(
-            "INSERT INTO interactions
-                (id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?6)
-             ON CONFLICT(id) DO UPDATE SET
-                payload_json = CASE
-                    WHEN interactions.state IN ('invalidated', 'expired')
-                        THEN interactions.payload_json
-                    ELSE excluded.payload_json
-                END,
-                updated_at = CASE
-                    WHEN interactions.state IN ('invalidated', 'expired')
-                        THEN interactions.updated_at
-                    ELSE excluded.updated_at
-                END,
-                state = CASE WHEN interactions.state = 'pending' THEN 'pending' ELSE interactions.state END",
-            params![id, instance_id, host_id, ikind, event.to_string(), now],
-        )?;
-        // A terminal interaction never puts the instance back to blocked.
-        let already_terminal: bool = conn
-            .query_row(
-                "SELECT state IN ('invalidated', 'expired') FROM interactions WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap_or(false);
-        if !already_terminal {
+        // c-cardsettle r7 item 1: a request whose owner is already ended can
+        // never be answered by a live process. Trigger: a Node loses the Hub,
+        // journals an approval and then the exit, and reconnects — the hello
+        // reconcile marks the instance exited BEFORE the journal catch-up
+        // replays the request. In the SAME transaction as the insert, read
+        // the owner's lifecycle (an absent or deleted row also counts as
+        // ended): write the card directly in the settle path's
+        // invalidated / generation-ended shape, do NOT touch activity, and
+        // return a settlement notice so ws broadcasts it exactly like every
+        // other terminal path. A non-terminal owner keeps the pending +
+        // blocked behaviour below.
+        if owner_instance_ended(conn, instance_id)? {
+            let prior_state: Option<String> = conn
+                .query_row(
+                    "SELECT state FROM interactions WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match prior_state.as_deref() {
+                // An already non-pending row (answered/resolved/expired/
+                // invalidated) is settled business: mirror the settle path's
+                // idempotency and leave it untouched.
+                Some(state) if state != "pending" => {}
+                // Unseen request, or a still-pending row on an ended owner.
+                _ => {
+                    let mut stamped = event.clone();
+                    invalidate_interaction_payload(&mut stamped, &now);
+                    conn.execute(
+                        "INSERT INTO interactions
+                            (id, instance_id, host_id, kind, state, blocking,
+                             payload_json, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 'invalidated', 0, ?5, ?6, ?6)
+                         ON CONFLICT(id) DO UPDATE SET
+                            state = 'invalidated',
+                            blocking = 0,
+                            payload_json = excluded.payload_json,
+                            updated_at = excluded.updated_at",
+                        params![id, instance_id, host_id, ikind, stamped.to_string(), now],
+                    )?;
+                    settlement.interactions.push(SettledInteraction {
+                        instance_id: instance_id.to_owned(),
+                        interaction_id: id.to_owned(),
+                        updated_at: now.clone(),
+                    });
+                }
+            }
+        } else {
+            // c-cardsettle r2 item 6: a replayed `interaction.requested` (e.g.
+            // a lost-ack replay) must not overwrite an already-terminal row.
+            // The old upsert rewrote payload_json unconditionally, stripping
+            // the generation-ended/invalidated resolution (and re-stamping a
+            // terminal card's activity), which made the desktop mislabel it as
+            // 已在其它设备处理. Keep the existing payload/state when the row is
+            // already invalidated or expired; only a pending (or non-terminal)
+            // row absorbs the replay.
             conn.execute(
-                "UPDATE instances SET activity = 'blocked', updated_at = ?1 WHERE id = ?2",
-                params![now, instance_id],
+                "INSERT INTO interactions
+                    (id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    payload_json = CASE
+                        WHEN interactions.state IN ('invalidated', 'expired')
+                            THEN interactions.payload_json
+                        ELSE excluded.payload_json
+                    END,
+                    updated_at = CASE
+                        WHEN interactions.state IN ('invalidated', 'expired')
+                            THEN interactions.updated_at
+                        ELSE excluded.updated_at
+                    END,
+                    state = CASE WHEN interactions.state = 'pending' THEN 'pending' ELSE interactions.state END",
+                params![id, instance_id, host_id, ikind, event.to_string(), now],
             )?;
+            // A terminal interaction never puts the instance back to blocked.
+            let already_terminal: bool = conn
+                .query_row(
+                    "SELECT state IN ('invalidated', 'expired') FROM interactions WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false);
+            if !already_terminal {
+                conn.execute(
+                    "UPDATE instances SET activity = 'blocked', updated_at = ?1 WHERE id = ?2",
+                    params![now, instance_id],
+                )?;
+            }
         }
     } else if kind == "interaction.answered"
         || kind == "interactionAnswered"
@@ -10950,7 +11135,7 @@ fn apply_interaction_event(
             params![state, now, id],
         )?;
     }
-    Ok(())
+    Ok(settlement)
 }
 
 fn knowledge_value(value: Option<&Value>) -> Option<&str> {
@@ -10979,6 +11164,25 @@ pub(crate) fn native_payload_is_subagent(payload: &Value) -> bool {
 /// Terminal interaction states that no longer answer and leave the actionable
 /// queue.
 const TERMINAL_INSTANCE_LIFECYCLES: &[&str] = &["exited", "failed", "closed"];
+
+/// c-cardsettle r7 item 1: whether an interaction request's owner is already
+/// ended at insert time. An ABSENT instances row also counts as ended — the
+/// owner is deleted (its row deleted together with the instance) or was never
+/// known to the Hub — so a request replayed by a Node after the hello
+/// reconcile can never be inserted as a live, answerable card.
+fn owner_instance_ended(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
+    let lifecycle: Option<String> = conn
+        .query_row(
+            "SELECT lifecycle FROM instances WHERE id = ?1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match lifecycle {
+        None => true,
+        Some(state) => TERMINAL_INSTANCE_LIFECYCLES.contains(&state.as_str()),
+    })
+}
 
 /// Open a write transaction that takes the RESERVED lock immediately
 /// (`BEGIN IMMEDIATE`). A read-then-write job MUST use this rather than a

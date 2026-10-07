@@ -2272,6 +2272,111 @@ mod tests {
         );
     }
 
+    /// r7 item 7: prepare with the hub-supplied identity must reject an alias
+    /// spelling or a wrong workspaceId without setting a mark, persisting a
+    /// command, or removing membership.
+    #[test]
+    fn prepare_rejects_alias_and_wrong_id_without_a_mark() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+        let members_before = registry.workspaces().len();
+        let revision_before = registry.state.revision;
+
+        // (1) Dot alias: realpaths to the stored root but different bytes.
+        let alias = format!("{}/.", workspace.root_path);
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-alias".into(),
+                    path: alias,
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity does not match"), "{error}");
+        assert!(registry.state.unbinding.is_empty());
+        assert!(!registry.state.commands.contains_key("cmd-r7-alias"));
+        assert_eq!(registry.workspaces().len(), members_before);
+        assert_eq!(registry.state.revision, revision_before);
+
+        // (2) Stored root bytes with a WRONG id.
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-wrongid".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some("wsp_other_identity".into()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity does not match"), "{error}");
+        assert!(registry.state.unbinding.is_empty());
+        assert!(!registry.state.commands.contains_key("cmd-r7-wrongid"));
+        assert_eq!(registry.workspaces().len(), members_before);
+    }
+
+    /// r7 item 7: a commit whose workspaceId differs from the prepared
+    /// command's is refused (and r7 item 1 clears the mark on that refusal).
+    #[test]
+    fn commit_with_an_id_other_than_prepared_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-commitid".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-commitid".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Commit,
+                    workspace_id: Some("wsp_not_prepared".into()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity changed"), "{error}");
+        assert!(
+            !registry.state.unbinding.contains(&workspace.meta.id),
+            "refused commit clears the mark (r7 item 1)"
+        );
+        assert!(
+            registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id)
+        );
+    }
+
     #[test]
     fn expansion_uses_only_node_home_prefixes() {
         let home = Path::new("/home/node");

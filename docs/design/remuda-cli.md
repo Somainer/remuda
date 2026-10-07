@@ -63,7 +63,12 @@ issue timestamp, and a provenance marker
 the file/env. `F` must be a separate operator-managed file: pointing
 `bootstrapToken = "file:…/bootstrap-token"` back at the Hub's own minted file
 marks it explicit and blocks `rotate-bootstrap` on the normal
-stop → rotate → start flow.
+stop → rotate → start flow. It must also live **outside the Hub data
+directory** (a separate read-only secrets mount): a `cp -r`/`scp -r` restore
+of the data dir copies the access file with a fresh mtime newer than the
+restored issued stamp, which would revive an expired code once on the next
+start. In the m1 image the mount is `/data00/remuda/secrets` → `/secrets`,
+so the reference is `bootstrapToken = "file:/secrets/access-code"`.
 
 An explicit code does **not** skip the TTL. The code is trimmed of
 surrounding whitespace/newlines before use; an empty or whitespace-only value

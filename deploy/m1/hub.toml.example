@@ -9,9 +9,13 @@ cookieSecure = true
 # /data/bootstrap-token (0600); `remuda hub rotate-bootstrap` then owns
 # rotation.
 #
-# To pin an OPERATOR-supplied code, point at a SEPARATE file you manage —
-# never at /data/bootstrap-token, which is the Hub's own minted file:
-# feeding it back as a source marks it explicit and blocks rotate-bootstrap
-# on the documented stop -> rotate -> start flow.
-# bootstrapToken = "file:/data/access-code"
+# To pin an OPERATOR-supplied code, point at a file OUTSIDE the Hub data
+# directory — here the separate read-only secrets mount
+# (/data00/remuda/secrets on the host -> /secrets in the container, see
+# compose.hub.yml), never at /data/access-code and never at
+# /data/bootstrap-token. A file inside the data dir would be copied by a
+# `cp -r` restore with a newer mtime than the restored stamp and revive an
+# expired code once; pointing at the Hub's own token file additionally marks
+# it explicit and blocks rotate-bootstrap.
+# bootstrapToken = "file:/secrets/access-code"
 allowedOrigins = ["https://remuda.example.com"]

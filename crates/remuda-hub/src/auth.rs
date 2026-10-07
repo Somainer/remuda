@@ -949,4 +949,35 @@ mod tests {
         );
         assert!(!bootstrap_within_ttl(dir.path(), 24));
     }
+
+    /// Round 4 item 6 (chosen contract): there is NO path-based magic that
+    /// treats an ExplicitFile pointing at the Hub's own minted
+    /// `bootstrap-token` as hub-owned. Feeding that file back through
+    /// `bootstrapToken = "file:…/bootstrap-token"` (the old m1 example) marks
+    /// it explicit like any other operator file, so rotate-bootstrap refuses;
+    /// deploy examples must point at a separate operator file instead.
+    #[test]
+    fn explicit_file_equal_to_the_hubs_own_token_file_is_still_explicit() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let own_token = dir.path().join("bootstrap-token");
+        persist_bootstrap(dir.path(), "hub-minted-code").expect("hub minted first");
+        assert!(
+            rotate_bootstrap(dir.path()).is_ok(),
+            "hub-owned rotates before"
+        );
+
+        // Re-feed the Hub's own token file as the configured source.
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "hub-minted-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(own_token.clone());
+        resolve_bootstrap(&mut config).expect("explicit resolve");
+        assert!(
+            dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file(),
+            "self-referencing file still writes the explicit marker"
+        );
+        assert!(
+            rotate_bootstrap(dir.path()).is_err(),
+            "rotation is now refused: the example must not suggest this path"
+        );
+    }
 }

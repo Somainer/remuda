@@ -60,7 +60,10 @@ When the Hub starts under `remuda dev --access-code-file F` (or with
 Hub data directory (`<data-dir>/dev-hub/bootstrap-token`) together with an
 issue timestamp, and a provenance marker
 (`bootstrap-token-source-explicit`) records that the code's source of truth is
-the file/env.
+the file/env. `F` must be a separate operator-managed file: pointing
+`bootstrapToken = "file:…/bootstrap-token"` back at the Hub's own minted file
+marks it explicit and blocks `rotate-bootstrap` on the normal
+stop → rotate → start flow.
 
 An explicit code does **not** skip the TTL. On a restart the issue timestamp
 is refreshed **only** when the supplied code changed (the file was replaced)
@@ -70,9 +73,12 @@ existing stamp, so that code still expires after `bootstrap_ttl_hours`
 (default **24**; set to `0` to disable expiry entirely).
 
 `remuda hub rotate-bootstrap --data-dir D` detects the dev layout and writes
-to `D/dev-hub/`. It refuses (non-zero exit, token and stamp untouched) when
-that directory has no persisted `bootstrap-token`, or when the explicit-source
-marker is present — in that case the running Hub uses an operator-supplied
+to `D/dev-hub/` unless `--standalone` names `D` directly. If both
+`D/bootstrap-token` and `D/dev-hub/bootstrap-token` exist it refuses without
+`--dev` or `--standalone`, rather than guessing which Hub owns the code. It
+refuses (non-zero exit, token and stamp untouched) when the target directory
+has no persisted `bootstrap-token`, or when the explicit-source marker is
+present — in that case the running Hub uses an operator-supplied
 `--access-code-file` / env and rotation cannot change it: stop the Hub,
 replace the file/env, and restart. A hub-generated token — including a
 restored data dir with a token and no explicit source — rotates normally.

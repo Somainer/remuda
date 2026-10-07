@@ -5,6 +5,13 @@ shutdown_timeout_secs = 15
 [hub]
 listen = "0.0.0.0:8080"
 cookieSecure = true
-# Generated on first start at /data/bootstrap-token (0600) when omitted.
-# bootstrapToken = "file:/data/bootstrap-token"
+# Omit to let the Hub mint the access code on first start at
+# /data/bootstrap-token (0600); `remuda hub rotate-bootstrap` then owns
+# rotation.
+#
+# To pin an OPERATOR-supplied code, point at a SEPARATE file you manage —
+# never at /data/bootstrap-token, which is the Hub's own minted file:
+# feeding it back as a source marks it explicit and blocks rotate-bootstrap
+# on the documented stop -> rotate -> start flow.
+# bootstrapToken = "file:/data/access-code"
 allowedOrigins = ["https://remuda.example.com"]

@@ -778,4 +778,72 @@ async fn drive_aliases(
         status, 400,
         "allowed/proj is unregistered even though link/../proj lexically looks like it: {body}"
     );
+
+    // (6) r7 item 2 REAL-DELETE success: archive the task occupying
+    //     workspace C (archived tasks no longer count), then a
+    //     component-equivalent spelling of its stored root (dot) must resolve
+    //     through the production Node and SETTLE 200.
+    let (status, archived) = {
+        let _ = hub.test_finish_bound_task("tsk_alias_c").await;
+        (200, String::new())
+    };
+    assert_eq!(status, 200, "free workspace C: {archived}");
+    async fn still_listed(
+        addr: std::net::SocketAddr,
+        cookie: &str,
+        host_id: &str,
+        id: &str,
+    ) -> bool {
+        let (status, view) = http(
+            addr,
+            "GET",
+            &format!("/v1/hosts/{host_id}/workspaces"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{view}");
+        let view: Value = serde_json::from_str(view.trim()).unwrap();
+        view["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["workspaceId"].as_str() == Some(id))
+    }
+
+    // Only the first spelling can settle (the membership is gone after it);
+    // the point is that an ALIAS spelling of the stored root reaches a 200
+    // removal at all. Use `/./`-dot form against the real fs.
+    let alias = spaced.join(".");
+    let (status, body) = delete(addr, &cookie, &host_id, &alias).await;
+    assert_eq!(
+        status, 200,
+        "dot alias of the unoccupied stored root must SETTLE (r7 item 2): {body}"
+    );
+    let settled: Value = serde_json::from_str(body.trim()).unwrap();
+    assert!(
+        settled["workspaces"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .all(|row| row["workspaceId"].as_str() != Some(spaced_id.as_str())),
+        "dot-alias DELETE removed workspace C: {settled}"
+    );
+    assert!(
+        !still_listed(addr, &cookie, &host_id, &spaced_id).await,
+        "C gone after dot-alias DELETE"
+    );
+
+    // A repeated-separator spelling of the now-removed C names nothing (400),
+    // proving the alias really resolved to C rather than a stale shortcut.
+    let doubled = format!("{}//", spaced_canonical);
+    let (status, body) = http(
+        addr,
+        "DELETE",
+        &format!("/v1/hosts/{host_id}/workspaces"),
+        Some(&cookie),
+        Some(&json!({"path": doubled}).to_string()),
+    )
+    .await;
+    assert_eq!(status, 400, "removed C no longer resolves: {body}");
 }

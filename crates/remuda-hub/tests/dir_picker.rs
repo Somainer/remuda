@@ -148,13 +148,23 @@ impl NodeTransport for FakeNode {
                     // alias through a symlink resolves to the symlink target's
                     // real sibling, which is the point of round 6 item 1.
                     let requested = params.get("path").and_then(Value::as_str).unwrap_or("");
-                    let resolved = std::fs::canonicalize(requested).ok().and_then(|canonical| {
-                        self.real_roots()
-                            .iter()
-                            .enumerate()
-                            .find(|(_, root)| *root == &canonical)
-                            .map(|(index, root)| (index, root.clone()))
-                    });
+                    // Prefer the REAL realpath (symlink + `..` semantics); fall
+                    // back to the component-normalized spelling so pure
+                    // separators/dot aliases (`/root//`, `/root/.`) that
+                    // std::fs::canonicalize rejects here still resolve to the
+                    // registered row, exactly as the production Node's
+                    // realpath does for them (r7 item 2).
+                    let normalized = lexical_normalize(requested);
+                    let resolved = std::fs::canonicalize(requested)
+                        .ok()
+                        .or_else(|| std::fs::canonicalize(&normalized).ok())
+                        .and_then(|canonical| {
+                            self.real_roots()
+                                .iter()
+                                .enumerate()
+                                .find(|(_, root)| *root == &canonical)
+                                .map(|(index, root)| (index, root.clone()))
+                        });
                     match resolved {
                         Some((0, root)) => json!({
                             "workspaceId": WORKSPACE,
@@ -659,6 +669,60 @@ async fn node_prepare_occupancy_refusal_surfaces_as_409_not_400() -> Result<()> 
     assert_eq!(status, 409, "node occupancy refusal must be 409: {body}");
     assert!(body.contains("3 live session(s)"), "{body}");
     fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dot_and_repeated_separator_aliases_delete_the_real_workspace() -> Result<()> {
+    // r7 item 2: a DELETE whose spelling is component-equivalent but not the
+    // exact stored bytes (`<root>/.`, `<root>//`, trailing slash) must go to
+    // workspace.resolve, get back the stored bytes, and SETTLE as a real
+    // unregister (200, workspace gone) — never the old unfixable "not
+    // observed" 400. The scripted Node's resolve canonicalizes the alias and
+    // its mutation acks.
+    //
+    // Each alias is driven against its OWN fresh fixture: the fake commit
+    // reply empties membership, and every fixture has a distinct temp root.
+    for suffix in ["/.", "//", "/"] {
+        let per = fixture().await?;
+        let alias = format!("{}{suffix}", per.real_root.display());
+        let _ = json_request(
+            per.hub.addr,
+            "GET",
+            &format!("/v1/hosts/{}/workspaces", per.host),
+            &[("Cookie", &per.cookie)],
+            None,
+        )
+        .await?;
+        let (status, body) = json_request(
+            per.hub.addr,
+            "DELETE",
+            &format!("/v1/hosts/{}/workspaces", per.host),
+            &[("Cookie", &per.cookie)],
+            Some(&json!({"path": alias}).to_string()),
+        )
+        .await?;
+        assert_eq!(
+            status, 200,
+            "alias DELETE {alias:?} must settle as a real unregister: {body}"
+        );
+        // The Hub echoes the settled workspaceId on the post-snapshot view.
+        assert!(
+            body.contains(WORKSPACE),
+            "settled response echoes the workspace id for {alias:?}: {body}"
+        );
+        let resolves = per
+            .node
+            .recorded()
+            .iter()
+            .filter(|method| *method == "workspace.resolve")
+            .count();
+        assert_eq!(
+            resolves, 1,
+            "{alias:?} must hit workspace.resolve, not the exact-root shortcut"
+        );
+        per.hub.shutdown().await;
+    }
     Ok(())
 }
 

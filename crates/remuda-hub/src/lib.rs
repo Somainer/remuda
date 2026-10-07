@@ -710,6 +710,31 @@ impl RunningHub {
         Ok(())
     }
 
+    /// Test helper: mark a directly-inserted bound task done and archived so
+    /// the workspace occupancy query no longer counts it.
+    #[doc(hidden)]
+    pub async fn test_finish_bound_task(&self, task_id: &str) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let task_id = task_id.to_owned();
+        store
+            .run_named("test_finish_bound_task", move |conn| {
+                conn.execute(
+                    "UPDATE tasks SET state = 'done',
+                        doc_json = json_set(doc_json, '$.archivedAt', '2026-10-08T00:00:00Z'),
+                        updated_at = '2026-10-08T00:00:00Z'
+                     WHERE id = ?1",
+                    rusqlite::params![task_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
     /// Mint a single-use Node enroll token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/hosts/enroll-token`, used by

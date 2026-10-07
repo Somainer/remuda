@@ -82,15 +82,17 @@ for a single listing, or compact newline-delimited snapshots when watching,
 with `items`, `stream`, and `stale`. Instance rows retain IDs, host link state,
 and separate lifecycle/activity/connectivity fields for automation.
 
-## Planned: seating and dispatch permission flags (D-057)
+## Seating and dispatch permission flags (D-057)
 
-Planned, not yet implemented. The `instance create` flags land with the
-Phase 1 task `ma-seat-cli`; `dispatch --permission-mode` lands with
-`ma-admission`. Until then the CLI rejects them as unknown arguments. The
-design is [main-agent.md §3.2 and §4.2](./main-agent.md#32-seating).
+The `instance create` seating flags landed with the Phase 1 task
+`ma-seat-cli`; `dispatch --permission-mode` still lands with `ma-admission`
+and is rejected as an unknown argument until then. The design is
+[main-agent.md §3.2 and §4.2](./main-agent.md#32-seating).
 
-`remuda instance create` gains flags for fields `CreateInstanceBody` already
-accepts, plus `restart`:
+`remuda instance create` maps these flags one-to-one onto fields
+`CreateInstanceBody` accepts (plus `restart`); an omitted flag is omitted
+from the request, so a create without them is byte-identical to older
+clients:
 
 | Flag | Body field | Meaning |
 | --- | --- | --- |
@@ -102,12 +104,15 @@ accepts, plus `restart`:
 | `--project <prj_…>` | `projectId` | Single-project shortcut when no explicit project scope is given. |
 | `--permission-mode <mode>` | `permissionMode` | A value from the harness's own vocabulary. For an Agent caller, a mode that switches the harness's own permission control off is admitted only if the caller itself runs with it off, and an omitted mode inherits the caller's own mode (D-057). |
 | `--model <id>` | `model` | Model id. |
-| `--restart process-loss:<max-per-hour>` | `restart` | Sets `{onProcessLoss: true, maxPerHour}`. Human devices only; Agent and Bot callers get 403. The suggested cap is 3 per hour. |
+| `--restart <none\|process-loss:N>` | `restart` | `process-loss:N` sets `{onProcessLoss: true, maxPerHour: N}` with N >= 1; `none` omits the field. Parsed client-side, so a bad value is a usage error (exit 2) before any request. Human devices only; Agent and Bot callers get 403 and the CLI prints the Hub's reason. The suggested cap is 3 per hour. |
 
 The existing `--host`, `--workspace-id`, `--kind`, `--driver`, `--name`,
-`--title` and `--prompt-file` flags are unchanged.
+`--title` and `--prompt-file` flags are unchanged. A Hub refusal is rendered
+with the Hub's own reason: for example a second live `address-owner` holder
+gets 409 and the CLI surfaces the conflict text instead of a JSON dump.
 
-`remuda dispatch` gains `--permission-mode <mode>` with the same vocabulary.
+`remuda dispatch` will gain `--permission-mode <mode>` with the same
+vocabulary when `ma-admission` lands.
 A Human-origin dispatch without it keeps today's default byte for byte. An
 Agent-origin dispatch without it inherits the caller's own mode; the
 framework picks no new mode.

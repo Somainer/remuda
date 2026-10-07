@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
+use clap::{Args as ClapArgs, Subcommand};
 use serde_json::{Value, json};
 
 use super::hub_client::{HubClient, HubOpts, block_on, pick_host, print_json};
@@ -41,50 +41,10 @@ impl super::registry::Entrypoint for Args {
 #[derive(Debug, Subcommand)]
 pub(crate) enum InstanceCommand {
     /// Create an instance on a host (`--host`) or matching `--labels`.
-    Create {
-        /// Target host id (`hst_…`).
-        #[arg(long)]
-        host: Option<String>,
-        /// Placement labels (`key=value`, comma-separated or repeated).
-        #[arg(long, value_delimiter = ',')]
-        labels: Vec<String>,
-        /// Agent kind.
-        #[arg(long, default_value = "claude")]
-        kind: String,
-        /// Driver kind (`claude-print`, `generic-pty`; `pty` is an alias).
-        #[arg(long, default_value = "claude-print")]
-        driver: String,
-        /// Optional workspace id.
-        #[arg(long)]
-        workspace_id: Option<String>,
-        /// Working directory recorded on the instance workspace.
-        #[arg(long)]
-        cwd: Option<String>,
-        /// Named worktree (`remuda worktree create` / `git worktree add -b wt/<name>/…`).
-        #[arg(long)]
-        worktree: Option<String>,
-        /// Unique live name (`[a-z][a-z0-9_-]{0,31}`). Stored as the instance title.
-        #[arg(long)]
-        name: Option<String>,
-        /// UI title (defaults to `--name`).
-        #[arg(long)]
-        title: Option<String>,
-        /// Initial prompt (Hub `initialInput`).
-        #[arg(long)]
-        prompt: Option<String>,
-        /// Read the initial prompt from a task-brief file.
-        #[arg(long)]
-        prompt_file: Option<PathBuf>,
-        /// Optional command id for create idempotency.
-        #[arg(long)]
-        command_id: Option<String>,
-        /// Per-launch host capability grant (repeatable). Only
-        /// `computer-use` exists; it requires a macOS host reporting the
-        /// installed capability and is incompatible with bypass permissions
-        /// (D-045).
-        #[arg(long = "capability")]
-        capabilities: Vec<String>,
-    },
+    ///
+    /// Boxed: the argument set is large (the seating flags from D-057 §3.2),
+    /// and a subcommand enum carries every variant on the stack.
+    Create(Box<CreateArgs>),
     /// List instances (`name`, `kind`, `status`, `cwd`, `host`).
     #[command(visible_alias = "ls")]
     List(super::agents::ListArgs),
@@ -179,6 +139,88 @@ pub(crate) enum InstanceCommand {
     },
 }
 
+/// Arguments for `remuda instance create`.
+#[derive(Debug, ClapArgs)]
+pub(crate) struct CreateArgs {
+    /// Target host id (`hst_…`).
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Placement labels (`key=value`, comma-separated or repeated).
+    #[arg(long, value_delimiter = ',')]
+    pub labels: Vec<String>,
+    /// Agent kind.
+    #[arg(long, default_value = "claude")]
+    pub kind: String,
+    /// Driver kind (`claude-print`, `generic-pty`; `pty` is an alias).
+    #[arg(long, default_value = "claude-print")]
+    pub driver: String,
+    /// Optional workspace id.
+    #[arg(long)]
+    pub workspace_id: Option<String>,
+    /// Working directory recorded on the instance workspace.
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// Named worktree (`remuda worktree create` / `git worktree add -b wt/<name>/…`).
+    #[arg(long)]
+    pub worktree: Option<String>,
+    /// Unique live name (`[a-z][a-z0-9_-]{0,31}`). Stored as the instance title.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// UI title (defaults to `--name`).
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Initial prompt (Hub `initialInput`).
+    #[arg(long)]
+    pub prompt: Option<String>,
+    /// Read the initial prompt from a task-brief file.
+    #[arg(long)]
+    pub prompt_file: Option<PathBuf>,
+    /// Optional command id for create idempotency.
+    #[arg(long)]
+    pub command_id: Option<String>,
+    /// Per-launch host capability grant (repeatable). Only
+    /// `computer-use` exists; it requires a macOS host reporting the
+    /// installed capability and is incompatible with bypass permissions
+    /// (D-045).
+    #[arg(long = "capability")]
+    pub capabilities: Vec<String>,
+    /// Delegation preset name (`worker`, `project-coordinator`,
+    /// `top-coordinator`). Display only; the Hub expands it into grants
+    /// once. Enforcement reads grants, never the role (D-057 §3.2).
+    #[arg(long)]
+    pub role: Option<String>,
+    /// Explicit grant verb (repeatable): `address-owner`, `dispatch`,
+    /// `land`, or `spend`. When given, replaces the preset's bundle
+    /// (D-057 §3.2).
+    #[arg(long = "grant")]
+    pub grants: Vec<String>,
+    /// Scope: project id (`prj_…`), repeatable (D-057 §3.2).
+    #[arg(long = "scope-project")]
+    pub scope_project: Vec<String>,
+    /// Scope: host id (`hst_…`), repeatable (D-057 §3.2).
+    #[arg(long = "scope-host")]
+    pub scope_host: Vec<String>,
+    /// Scope: workspace id (`wsp_…`), repeatable (D-057 §3.2).
+    #[arg(long = "scope-workspace")]
+    pub scope_workspace: Vec<String>,
+    /// Single-project scope shortcut (`prj_…`); ignored for scope
+    /// resolution when any `--scope-*` flag is given (D-057 §3.2).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Harness-native permission mode, e.g. Claude `manual` /
+    /// `acceptEdits` / `plan` / `bypassPermissions` (D-057 §3.3).
+    #[arg(long)]
+    pub permission_mode: Option<String>,
+    /// Model id recorded on the create spec.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// C1 restart policy (D-057 §6.1): `none` or `process-loss:<N>` with
+    /// N >= 1 restarts per hour. Only a Human device may set a policy;
+    /// the Hub refuses Agent and Bot callers with 403.
+    #[arg(long, value_parser = parse_restart_flag)]
+    pub restart: Option<RestartFlag>,
+}
+
 /// Inputs for [`create`].
 #[derive(Debug, Clone)]
 pub(crate) struct CreateOpts {
@@ -194,6 +236,54 @@ pub(crate) struct CreateOpts {
     pub prompt: Option<String>,
     pub command_id: Option<String>,
     pub capabilities: Vec<String>,
+    /// Delegation preset name (display only).
+    pub role: Option<String>,
+    /// Explicit grant verbs; empty = omit from the body.
+    pub grants: Vec<String>,
+    /// `scope.projectIds`.
+    pub scope_projects: Vec<String>,
+    /// `scope.hostIds`.
+    pub scope_hosts: Vec<String>,
+    /// `scope.workspaceIds`.
+    pub scope_workspaces: Vec<String>,
+    /// `projectId` single-project shortcut.
+    pub project_id: Option<String>,
+    pub permission_mode: Option<String>,
+    pub model: Option<String>,
+    pub restart: Option<RestartFlag>,
+}
+
+/// Parsed `--restart` value (D-057 §6.1).
+///
+/// Parsed client-side so a bad value fails as a usage error (clap exit 2)
+/// before any request is sent. [`RestartFlag::None`] is an explicit "no
+/// policy" and omits the field just like an omitted flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestartFlag {
+    /// `--restart none` — no `restart` field on the body.
+    None,
+    /// `--restart process-loss:<N>` — `{onProcessLoss:true,maxPerHour:N}`.
+    ProcessLoss(u32),
+}
+
+/// clap value parser for `--restart`: `none` or `process-loss:<N>` (N >= 1).
+fn parse_restart_flag(raw: &str) -> Result<RestartFlag, String> {
+    let value = raw.trim();
+    if value == "none" {
+        return Ok(RestartFlag::None);
+    }
+    let Some(cap_raw) = value.strip_prefix("process-loss:") else {
+        return Err(format!(
+            "expected `none` or `process-loss:<N>` with N >= 1, got {raw:?}"
+        ));
+    };
+    let cap: u32 = cap_raw
+        .parse()
+        .map_err(|_| format!("process-loss cap must be an integer >= 1, got {cap_raw:?}"))?;
+    if cap < 1 {
+        return Err(format!("process-loss cap must be at least 1, got {cap}"));
+    }
+    Ok(RestartFlag::ProcessLoss(cap))
 }
 
 /// Run a `remuda instance` subcommand.
@@ -201,21 +291,31 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
     block_on(async move {
         let client = hub.connect()?;
         match command {
-            InstanceCommand::Create {
-                host,
-                labels,
-                kind,
-                driver,
-                workspace_id,
-                cwd,
-                worktree,
-                name,
-                title,
-                prompt,
-                prompt_file,
-                command_id,
-                capabilities,
-            } => {
+            InstanceCommand::Create(args) => {
+                let CreateArgs {
+                    host,
+                    labels,
+                    kind,
+                    driver,
+                    workspace_id,
+                    cwd,
+                    worktree,
+                    name,
+                    title,
+                    prompt,
+                    prompt_file,
+                    command_id,
+                    capabilities,
+                    role,
+                    grants,
+                    scope_project,
+                    scope_host,
+                    scope_workspace,
+                    project,
+                    permission_mode,
+                    model,
+                    restart,
+                } = *args;
                 let prompt = match (prompt, prompt_file) {
                     (Some(_), Some(_)) => bail!("use --prompt or --prompt-file, not both"),
                     (Some(text), None) => Some(text),
@@ -237,6 +337,15 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                         prompt,
                         command_id,
                         capabilities,
+                        role,
+                        grants,
+                        scope_projects: scope_project,
+                        scope_hosts: scope_host,
+                        scope_workspaces: scope_workspace,
+                        project_id: project,
+                        permission_mode,
+                        model,
+                        restart,
                     },
                 )
                 .await?;
@@ -423,6 +532,43 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
     if !opts.capabilities.is_empty() {
         body["capabilities"] = json!(opts.capabilities);
     }
+    // D-057 §3.2 seating flags. Every field maps one-to-one onto
+    // CreateInstanceBody; omitted flags stay off the body, so a create with
+    // none of these is byte-identical to the pre-seating request.
+    if let Some(role) = &opts.role {
+        body["role"] = json!(role);
+    }
+    if !opts.grants.is_empty() {
+        body["grants"] = json!(opts.grants);
+    }
+    let mut scope = serde_json::Map::new();
+    if !opts.scope_projects.is_empty() {
+        scope.insert("projectIds".into(), json!(opts.scope_projects));
+    }
+    if !opts.scope_hosts.is_empty() {
+        scope.insert("hostIds".into(), json!(opts.scope_hosts));
+    }
+    if !opts.scope_workspaces.is_empty() {
+        scope.insert("workspaceIds".into(), json!(opts.scope_workspaces));
+    }
+    if !scope.is_empty() {
+        body["scope"] = Value::Object(scope);
+    }
+    if let Some(project) = &opts.project_id {
+        body["projectId"] = json!(project);
+    }
+    if let Some(mode) = &opts.permission_mode {
+        body["permissionMode"] = json!(mode);
+    }
+    if let Some(model) = &opts.model {
+        body["model"] = json!(model);
+    }
+    if let Some(RestartFlag::ProcessLoss(cap)) = &opts.restart {
+        body["restart"] = json!({
+            "onProcessLoss": true,
+            "maxPerHour": cap,
+        });
+    }
 
     // Hub placement (proposal.md §4.6) accepts hostId, labels[], or any.
     // Still send hostId when the CLI can resolve it so older Hubs that require
@@ -507,7 +653,10 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
         super::capability::host_supports_computer_use(host)?;
     }
 
-    Ok(client.create_instance(&body).await?)
+    client
+        .create_instance(&body)
+        .await
+        .map_err(super::hub_client::hub_http_error)
 }
 
 pub(crate) async fn list_instances(client: &HubClient, host: Option<&str>) -> Result<Value> {
@@ -1550,6 +1699,38 @@ mod tests {
         assert_eq!(normalize_driver("pty"), "generic-pty");
         assert!(tty_attach_driver("pty"));
         assert!(!tty_attach_driver("claude-print"));
+    }
+
+    #[test]
+    fn restart_flag_parses_none_and_process_loss() {
+        assert_eq!(parse_restart_flag("none").unwrap(), RestartFlag::None);
+        assert_eq!(
+            parse_restart_flag("process-loss:3").unwrap(),
+            RestartFlag::ProcessLoss(3)
+        );
+        // Trimming is accepted; the value itself stays a usage error.
+        assert_eq!(
+            parse_restart_flag("  process-loss:1 ").unwrap(),
+            RestartFlag::ProcessLoss(1)
+        );
+    }
+
+    #[test]
+    fn restart_flag_rejects_garbage_as_a_usage_error() {
+        // A bad value must fail here — clap turns this Err into exit 2 before
+        // the CLI connects to anything.
+        for bad in [
+            "bananas",
+            "process-loss",
+            "process-loss:",
+            "process-loss:0",
+            "process-loss:abc",
+            "process-loss:1.5",
+            "always",
+            "",
+        ] {
+            assert!(parse_restart_flag(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

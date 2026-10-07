@@ -213,10 +213,11 @@ pub(crate) fn print_json(value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Render a Hub refusal (e.g. 409 `PIN_REFUSED`) with its `reasons[]` lines
-/// on stderr instead of an opaque JSON body, so the operator sees both the
-/// rejected pin and the did-you-mean suggestions. Other HTTP errors pass
-/// through unchanged.
+/// Render a Hub refusal with the Hub's own `error` reason on the first line
+/// instead of an opaque JSON body (e.g. 403 `FORBIDDEN` and the 409
+/// `address-owner` conflict text). `PIN_REFUSED` additionally lists its
+/// `reasons[]` lines and did-you-mean suggestions. Bodies without a JSON
+/// `error` string pass through unchanged.
 pub(crate) fn hub_http_error(err: ClientError) -> anyhow::Error {
     if let ClientError::Http { status, body } = &err
         && let Ok(value) = serde_json::from_str::<Value>(body)
@@ -245,6 +246,17 @@ pub(crate) fn hub_http_error(err: ClientError) -> anyhow::Error {
                 .and_then(Value::as_str)
                 .unwrap_or("delivery refused");
             return anyhow::anyhow!("hub HTTP {status}: {code}\n  {headline}");
+        }
+        // Generic rendering of the Hub's reason (D-057 seating refusals:
+        // the Human-only restart 403, the address-owner 409, 400s, …).
+        if let Some(headline) = value.get("error").and_then(Value::as_str) {
+            let mut lines = vec![format!("hub HTTP {status}: {headline}")];
+            if let Some(reasons) = value.get("reasons").and_then(Value::as_array) {
+                for reason in reasons.iter().filter_map(Value::as_str) {
+                    lines.push(format!("  - {reason}"));
+                }
+            }
+            return anyhow::anyhow!(lines.join("\n"));
         }
     }
     anyhow::Error::new(err)

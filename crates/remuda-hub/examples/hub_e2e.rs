@@ -4190,26 +4190,26 @@ fn code_comment_reply(prompt: &str) -> Option<String> {
     // desktop read measure (~87-90 chars) move it at 1440. The block stays
     // short enough that the burst anchor below still parks near the top, but
     // its real HEIGHT changes across faces (unlike a non-wrapping <pre>).
+    if prompt.contains("font wrap probe mobile") {
+        // MOBILE-only compact probe: a ~120-m line is ~3 visual lines on the
+        // fallback face and ~2 on the narrower Plex at the ~330px mobile
+        // content width (block stays <5 lines, so it co-mounts with the burst
+        // anchor inside the 390px virtual window). Used by the pinned-390 test.
+        let long = "m".repeat(120);
+        let mut body = String::from("a compact mobile wrapping line:\n\n```ts src/font_swap_mobile.ts\n");
+        body.push_str(&long);
+        body.push_str("\n```\n\nask about the wrapped line.");
+        return Some(body);
+    }
     if prompt.contains("font wrap probe") {
-        // Lines tuned EXACTLY to the measured wrap boundary against the real
-        // <pre> content width (see the r3 wrap-count probes). The boundary is
-        // the TOTAL line length including the "// x " marker below: 41 chars
-        // at the 330px mobile content width (390 pane), 87 chars at the 692px
-        // desktop content width (1440). IBM Plex Mono is ~2.2% wider than the
-        // system fallback monospace, so a line of exactly boundary length fits
-        // the fallback on one line but wraps to two on Plex — always the same
-        // direction, never cancelling. One line per width: the swap changes
-        // the block/row HEIGHT by ~one line (~21px) at each viewport while
-        // the block stays compact enough for the saved-position restore.
-        let marker_line = |total: usize, tag: char| -> String {
-            let prefix_len = format!("// {tag} ").len();
-            let chars: String = std::iter::repeat('m').take(total.saturating_sub(prefix_len)).collect();
-            format!("// {tag} {chars}\n")
-        };
-        let mut body = String::from("here is a function whose comments wrap across faces:\n\n```ts src/font_swap_probe.ts\n");
-        body.push_str(&marker_line(41, 'm'));
-        body.push_str(&marker_line(87, 'd'));
-        body.push_str("export function fontSwapProbe(): string {\n  return \"font metrics moved the wrap count\";\n}\n```\n\nask about any wrapped line.");
+        // Desktop + bounded-journal probe: an 800-m pre-wrap line is ~21
+        // visual lines on the fallback monospace vs ~16 on the narrower Plex at
+        // the 692px desktop content width — a guaranteed multi-line HEIGHT
+        // delta (~104px) that scroll re-anchoring has to absorb.
+        let long = "m".repeat(300);
+        let mut body = String::from("here is a long wrapping line whose height differs across monospace faces:\n\n```ts src/font_swap_probe.ts\n");
+        body.push_str(&long);
+        body.push_str("\n```\n\nask about the wrapped line.");
         return Some(body);
     }
     if !prompt.contains("show me code") {

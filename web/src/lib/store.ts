@@ -331,6 +331,15 @@ export type HubState = {
   hosts: Host[];
   workspaces: Workspace[];
   interactions: Interaction[];
+  /**
+   * Whether the interaction list has been loaded from at least one
+   * SUCCESSFUL interaction-list response (bootstrap or poll). A failed first
+   * fetch leaves this false even though `ready` is emitted with an empty list
+   * (offline reload), so arrival watchers (question alerts) do not take a
+   * baseline from a failed fetch and toast every already-pending question on
+   * the next successful poll. Empty is a valid success and sets this true.
+   */
+  interactionsHydrated: boolean;
   events: Record<string, Observation[]>;
   journalStatus: Record<string, JournalClient["status"]>;
   bubbles: LocalBubble[];
@@ -382,6 +391,7 @@ const initial: HubState = {
   hosts: [],
   workspaces: [],
   interactions: [],
+  interactionsHydrated: false,
   events: {},
   journalStatus: {},
   bubbles: [],
@@ -1413,6 +1423,12 @@ class HubStore {
     this.connectionStateOverride = state;
   }
 
+  /** Test-only: replace slices and emit, so stores subscribing to hubStore
+   * (e.g. the question-alert watcher) can be driven without a live Hub. */
+  setSlicesForTest(slices: Partial<HubState>): void {
+    this.emit(slices);
+  }
+
   /** Test-only: drive the pagehide/pageshow lifecycle (BFCache, iOS). */
   async pageShowForTest(persisted: boolean): Promise<void> {
     this.onPageHide();
@@ -2118,6 +2134,10 @@ class HubStore {
         hosts: registeredHosts,
         workspaces: registeredHosts.flatMap((host) => (host.workspaces ?? []).map(mapWorkspace)),
         interactions,
+        // The Promise.all above only resolves after a SUCCESSFUL
+        // interaction-list read (an empty page is a valid success): arrival
+        // watchers may take their baseline from this page.
+        interactionsHydrated: true,
       });
       this.hydrateEffortEffective(instances.items);
       this.hydrateUsageRollups(instances.items);
@@ -2301,6 +2321,7 @@ class HubStore {
       hosts: [],
       workspaces: [],
       interactions: [],
+      interactionsHydrated: false,
       events: {},
       connection: "offline",
     });
@@ -2387,6 +2408,10 @@ class HubStore {
           this.listOutstanding,
         ),
         interactions: mergedInteractions,
+        // A successful poll/refresh read settles the baseline even when the
+        // bootstrap fetch failed (offline reload): an empty page here is a
+        // valid success.
+        interactionsHydrated: true,
       });
       // A response newer than a pin proves the server has spoken after the
       // create/answer. Combined with the in-flight sweep below (every older

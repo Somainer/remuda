@@ -401,6 +401,42 @@ async fn failed_no_source_bind_keeps_marker_and_mints_no_token() -> Result<()> {
     Ok(())
 }
 
+/// Round 6 item 2: an empty presented code is refused on a healthy hub even
+/// though an empty string would otherwise compare equal.
+#[tokio::test]
+async fn empty_presented_code_is_always_refused() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(outer.path().join("data"))).await?;
+    assert_eq!(login_status(hub.addr, "").await?, 401);
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// Round 6 item 2: a data dir with an EMPTY token file and a fresh stamp is
+/// recovered on a no-source start — the Hub boots and mints a replacement,
+/// and empty-string login is still refused.
+#[tokio::test]
+async fn empty_token_dir_boots_and_mints_without_accepting_empty_login() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    std::fs::create_dir_all(&hub_data)?;
+    std::fs::write(hub_data.join("bootstrap-token"), b"")?;
+
+    let mut config = HubConfig::for_test(hub_data.clone());
+    config.bootstrap_token = String::new();
+    config.bootstrap_source = BootstrapSource::Generated;
+    let hub = spawn(config).await?;
+    assert_eq!(
+        login_status(hub.addr, "").await?,
+        401,
+        "empty login stays refused"
+    );
+    let stored = std::fs::read_to_string(hub_data.join("bootstrap-token"))?;
+    assert!(!stored.trim().is_empty());
+    hub.shutdown().await;
+    Ok(())
+}
+
 /// rotate-bootstrap writes into a dev-hub/ subdirectory when present.
 #[tokio::test]
 async fn rotate_bootstrap_honours_dev_hub_layout() -> Result<()> {

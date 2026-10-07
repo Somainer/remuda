@@ -70,8 +70,67 @@ pub fn persist_bootstrap(data_dir: &Path, token: &str) -> Result<(), HubError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
     write_private(&data_dir.join("bootstrap-issued-at"), &now_rfc3339())?;
-    write_private(&data_dir.join("bootstrap-token"), token)?;
+    replace_private(&data_dir.join("bootstrap-token"), token)?;
     Ok(())
+}
+
+/// Atomically replace a file: write a fresh 0600 temp file in the SAME
+/// directory, fsync it, rename it over `path`, and fsync the directory.
+///
+/// Round 6 item 2: the bootstrap token must never pass through an observable
+/// truncated/empty state. A truncating open on the live token followed by a
+/// crash (or `: > bootstrap-token`) used to publish an EMPTY code that login
+/// accepted (`secret_eq("", "")`) for the stamp's whole TTL. A rename switches
+/// the token in one step, so a crash leaves either the old file or the new one
+/// — never an empty one.
+fn replace_private(path: &Path, contents: &str) -> Result<(), HubError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("bootstrap");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+
+    let do_write = || -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&tmp, perms)?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    };
+    if let Err(err) = do_write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(HubError::Internal(format!("bootstrap: {err}")));
+    }
+    fsync_dir(dir)
+}
+
+/// Read a persisted token, returning None when the file is absent or empty
+/// after trimming — both are "no usable code" (round 6 item 2).
+fn read_persisted_token(path: &Path) -> Result<Option<String>, HubError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let code = text.trim();
+            Ok((!code.is_empty()).then(|| code.to_owned()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(HubError::Internal(format!("bootstrap: {err}"))),
+    }
 }
 
 /// Sibling marker recording that the persisted `bootstrap-token` is governed
@@ -248,13 +307,13 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
         ));
     }
 
-    // 3) No configured token: load a persisted one or mint. Marker adoption
-    //    (removing a stale explicit marker) is deferred to post-bind.
-    if token_path.is_file() {
-        config.bootstrap_token = std::fs::read_to_string(&token_path)
-            .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
-            .trim()
-            .to_string();
+    // 3) No configured token: load a usable persisted one or mint. A present
+    //    but EMPTY token (a crash during a replace, or a hand-truncated file)
+    //    is "no usable code" too — adopting "" would accept empty-string
+    //    logins — so it falls through to the mint path. Marker adoption is
+    //    deferred to post-bind.
+    if let Some(code) = read_persisted_token(&token_path)? {
+        config.bootstrap_token = code;
         // Backfill a missing OR EMPTY stamp; treat first sight as issue time.
         if bootstrap_issued_at(&data_dir).is_none() {
             write_private(&stamp_path, &now_rfc3339())?;
@@ -269,7 +328,7 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
         });
     }
 
-    // Nothing persisted: mint a hub-generated token IN MEMORY.
+    // No usable token persisted: mint a hub-generated token IN MEMORY.
     config.bootstrap_token = random_token();
     config.bootstrap_source = crate::config::BootstrapSource::Generated;
     if bootstrap_source_is_explicit(&data_dir) {
@@ -330,7 +389,9 @@ fn file_mtime_newer_than_stamp(file: &Path, stamp: &Path) -> Result<bool, HubErr
 ///     token, and the next successful start re-enters the first case and
 ///     finishes the adoption.
 pub fn adopt_bootstrap_after_bind(data_dir: &Path, minted_token: &str) -> Result<(), HubError> {
-    if !data_dir.join("bootstrap-token").is_file() {
+    // An EMPTY token is as good as absent: replace it with the minted code so
+    // an empty code is never adopted (round 6 item 2).
+    if read_persisted_token(&data_dir.join("bootstrap-token"))?.is_none() {
         persist_bootstrap(data_dir, minted_token)?;
     }
     set_bootstrap_explicit_marker(data_dir, false)
@@ -1354,5 +1415,66 @@ mod tests {
             stamp_bytes,
             "a healthy pair is left untouched"
         );
+    }
+
+    /// Round 6 item 2: an EMPTY token file is treated as "no usable code" and
+    /// the Hub MINTS a replacement on a no-source start (never adopts "").
+    #[test]
+    fn empty_token_file_on_no_source_start_is_minted_over() {
+        let dir = tempfile::tempdir().expect("data dir");
+        write_private(&dir.path().join("bootstrap-token"), "").expect("empty token");
+        write_private(&dir.path().join("bootstrap-issued-at"), &now_rfc3339()).expect("stamp");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = String::new();
+        config.bootstrap_source = BootstrapSource::Generated;
+        let resolution = resolve_bootstrap(&mut config).expect("resolve");
+        assert_eq!(resolution, BootstrapResolution::None);
+        assert!(
+            !config.bootstrap_token.is_empty(),
+            "a new code is minted, not \"\""
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bootstrap-token"))
+                .unwrap()
+                .trim(),
+            config.bootstrap_token,
+            "the empty file is replaced by the minted code"
+        );
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+    }
+
+    /// Round 6 item 2: marker present + EMPTY token — the replacement mint is
+    /// committed only after bind, like the missing-token recovery path.
+    #[test]
+    fn empty_token_with_marker_defers_mint_to_after_bind() {
+        let dir = tempfile::tempdir().expect("data dir");
+        write_private(&dir.path().join(BOOTSTRAP_EXPLICIT_MARKER), "").expect("marker");
+        write_private(&dir.path().join("bootstrap-token"), "").expect("empty token");
+        write_private(&dir.path().join("bootstrap-issued-at"), &now_rfc3339()).expect("stamp");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = String::new();
+        config.bootstrap_source = BootstrapSource::Generated;
+        assert_eq!(
+            resolve_bootstrap(&mut config).expect("resolve"),
+            BootstrapResolution::AdoptAfterBind
+        );
+        assert!(!config.bootstrap_token.is_empty());
+        // Before bind the empty token and marker are untouched.
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-token")).unwrap(),
+            b""
+        );
+        assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+
+        adopt_bootstrap_after_bind(dir.path(), &config.bootstrap_token).expect("adopt");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bootstrap-token"))
+                .unwrap()
+                .trim(),
+            config.bootstrap_token
+        );
+        assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
     }
 }

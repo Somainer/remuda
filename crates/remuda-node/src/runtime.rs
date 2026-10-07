@@ -3517,6 +3517,52 @@ mod tests {
             observation
         };
 
+        // Wait until the pump DURABLY commits an observation matching a
+        // native id/status: a sleep could race the pump and assert before (or
+        // long after) the frames landed. r7 item 6 replaces the 120 ms sleep
+        // with this committed-seq readiness marker.
+        let wait_committed =
+            |native_id: &'static str,
+             status: &'static str|
+             -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+                let store = Arc::clone(&store) as Arc<dyn LocalStore>;
+                let id = id.clone();
+                let status = status.to_string();
+                Box::pin(async move {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let committed = store.get_instance(&id).is_ok_and(|instance| {
+                                store
+                                    .read_events(&instance.journal_id, None, 256)
+                                    .is_ok_and(|page| {
+                                        page.events.iter().any(|event| match event {
+                                            JournalEvent::Instance(observation) => {
+                                                matches!(&observation.body,
+                                                    ObservationPayload::Lifecycle(payload)
+                                                        if matches!(payload.as_ref(),
+                                                            LifecyclePayload::Native(native)
+                                                                if matches!(&native.native_id,
+                                                                    Knowledge::Known { value }
+                                                                        if value == native_id)
+                                                                    && matches!(&native.status,
+                                                                        Knowledge::Known { value }
+                                                                            if value == &status)))
+                                            }
+                                            _ => false,
+                                        })
+                                    })
+                            });
+                            if committed {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                    })
+                    .await
+                    .expect("the observation pump commits the frame in time");
+                })
+            };
+
         // 1) The print/SDK init frame (stdout channel).
         tx.send(frame(
             SourceChannel::Stdout,
@@ -3528,6 +3574,17 @@ mod tests {
         ))
         .await
         .unwrap();
+        wait_committed("sess-1", "started").await;
+        // The init frame alone leaves the instance live.
+        let after_init = store.get_instance(&id).unwrap();
+        assert!(
+            !matches!(
+                after_init.lifecycle,
+                InstanceLifecycle::Failed | InstanceLifecycle::Exited
+            ),
+            "the print/SDK init frame never ends the session: {:?}",
+            after_init.lifecycle
+        );
         // 2) The Claude PTY ready frame with each live agent status.
         for status in ["idle", "working", "blocked", "done", "unknown"] {
             tx.send(frame(
@@ -3552,8 +3609,11 @@ mod tests {
         ))
         .await
         .unwrap();
+        wait_committed("pane-8", "working").await;
 
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Lifecycle AND activity asserted only once every startup frame is
+        // durable: still live, with a concrete known activity the folds
+        // produced — never failed/unknown.
         let live = store.get_instance(&id).unwrap();
         assert!(
             !matches!(
@@ -3562,6 +3622,11 @@ mod tests {
             ),
             "startup frames must never end the session: {:?}",
             live.lifecycle
+        );
+        assert!(
+            matches!(live.activity, Knowledge::Known { .. }),
+            "startup frames leave a concrete live activity: {:?}",
+            live.activity
         );
 
         // 3b) A failed first TURN (the print mapper's exact result-error
@@ -3578,7 +3643,9 @@ mod tests {
         ))
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // The failed result commits BEFORE the lifecycle assertion, and ends
+        // the TURN (activity idle) without touching the process lifecycle.
+        wait_committed("sess-1", "error").await;
         let after_turn = store.get_instance(&id).unwrap();
         assert!(
             !matches!(
@@ -3587,6 +3654,13 @@ mod tests {
             ),
             "a failed result is turn-level, not a process end: {:?}",
             after_turn.lifecycle
+        );
+        assert_eq!(
+            after_turn.activity,
+            Knowledge::Known {
+                value: Activity::Idle
+            },
+            "a failed root turn frees the composer (idle)"
         );
 
         // 4) The REAL print driver exit: name=session, status=exited.

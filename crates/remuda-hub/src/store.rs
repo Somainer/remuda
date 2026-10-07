@@ -3655,10 +3655,10 @@ impl Store {
             for id in &stale_ids {
                 tx.execute(
                     "UPDATE instances SET lifecycle = 'failed', activity = 'idle',
-                        last_error = 'create-never-acknowledged', updated_at = ?1,
+                        last_error = ?3, updated_at = ?1,
                         ended_at = COALESCE(ended_at, ?1)
                      WHERE id = ?2 AND lifecycle = 'requested'",
-                    params![&now, id],
+                    params![&now, id, CREATE_NEVER_ACKNOWLEDGED_MARKER],
                 )?;
             }
             // c-cardsettle: a create that never ran owns no answerable card;
@@ -11959,15 +11959,22 @@ fn stamp_ended_at(conn: &Connection, instance_id: &str, at: &str) -> Result<(), 
 /// end (D-019: the process keeps running and is reconciled when the host
 /// returns): such an `exited` row is treated as potentially live until it
 /// carries a real `ended_at`.
+/// The exact `last_error` marker the stale-create sweep stamps when a create
+/// is never acknowledged by the node. Attests the launch never started.
+pub(crate) const CREATE_NEVER_ACKNOWLEDGED_MARKER: &str =
+    "create-never-acknowledged";
+
 pub(crate) const HOST_LOST_MARKER: &str = "host-lost";
 
 /// `last_error` markers that ATTEST a launch never started even when an older
 /// row has no `ended_at` yet (ma-lineage r4 item 1).
 fn is_attested_launch_failure_marker(last_error: &str) -> bool {
+    // Match the Hub's OWN exact markers, not prose: the stale-create sweep
+    // stamps `create-never-acknowledged` (ma-lineage r5 item 4).
     let text = last_error.to_ascii_lowercase();
-    text.contains("start-fail")
+    text == CREATE_NEVER_ACKNOWLEDGED_MARKER
+        || text.contains("start-fail")
         || text.contains("start failed")
-        || text.contains("never acknowledged")
         || text.contains("never started")
 }
 

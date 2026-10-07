@@ -1604,6 +1604,40 @@ async fn a_sessionless_launch_failure_resumes_via_fresh_recovery() -> Result<()>
     Ok(())
 }
 
+
+/// ma-lineage r5 item 4: a sessionless holder the stale-create sweep failed
+/// with the Hub's EXACT `create-never-acknowledged` marker recovers fresh on
+/// resume (not 409). The marker is matched literally, not by the prose
+/// "never acknowledged" string.
+#[tokio::test]
+async fn a_swept_never_acknowledged_create_with_the_real_marker_recovers_fresh() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // Simulate the stale-create sweep exactly: failed, no session ever
+    // reported, last_error is the constant the sweep stamps.
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    db.execute(
+        "UPDATE instances SET lifecycle = 'failed', ended_at = '2026-10-06T01:00:00.000Z',
+            last_error = 'create-never-acknowledged'
+         WHERE id = ?1",
+        rusqlite::params![x],
+    )?;
+    drop(db);
+
+    let recovered = ctx.resume(&x, &ctx.human).await?;
+    assert_eq!(
+        recovered.status(),
+        200,
+        "the exact create-never-acknowledged marker is launch-failure evidence: fresh recovery"
+    );
+    let body: Value = recovered.json().await?;
+    assert_eq!(body["instance"]["generation"], json!(2));
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.create", "fresh relaunch, not resume");
+    Ok(())
+}
+
 /// r3 item 4: an immediate retry of a sessionless fresh recovery returns the
 /// SAME successor (replayed) before the successor reports a session — no new
 /// generation and no extra command.

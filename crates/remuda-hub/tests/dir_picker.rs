@@ -1158,14 +1158,25 @@ mod race {
         let (status, body) = delete_task.await??;
         assert_eq!(status, 200, "DELETE that won the guard must settle: {body}");
 
-        // The waiter then binds and publishes.
+        // The queued task waited on the guard; once it acquires it must
+        // RE-CHECK membership (r7 item 8), find the workspace gone and fail
+        // 409 — a task must never bind a removed directory.
         let (status, created) = create_task.await??;
-        assert_eq!(status, 200, "task create after settle: {created}");
-        let created: Value = serde_json::from_str(created.trim())?;
         assert_eq!(
-            created["workspaceBinding"]["workspaceId"].as_str(),
-            Some(WORKSPACE),
-            "the binding is published only after the DELETE settled"
+            status, 409,
+            "create_task must re-check Hub membership after the guard: {created}"
+        );
+        assert!(
+            created.contains("unregistered"),
+            "409 explains the removed workspace: {created}"
+        );
+        // No task row survives the refused binding.
+        let items = poll_tasks(fixture.hub.addr, &fixture.cookie, &project_id).await?;
+        assert!(
+            items
+                .iter()
+                .all(|item| item["title"].as_str() != Some("racer")),
+            "the refused binding leaves no task row: {items:#?}"
         );
 
         fixture.hub.shutdown().await;

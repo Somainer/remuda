@@ -443,6 +443,35 @@ async fn create_task(
                 workspace_id.as_id().as_str(),
             )
             .await;
+        // c-dirpicker r7 item 8: re-verify Hub membership AFTER acquiring the
+        // guard. The ids were validated before the row was created, but an
+        // unregister that won the guard earlier can have settled and removed
+        // the workspace while this task waited to acquire; binding a task to a
+        // removed directory must 409 with the half-written row rolled back,
+        // same as any other binding refusal.
+        let bound_host = host_id.as_id().as_str().to_owned();
+        let bound_workspace = workspace_id.as_id().as_str().to_owned();
+        let member = state
+            .store
+            .run_named("create_task_recheck_workspace", move |conn| {
+                let (_, workspaces) = crate::workspaces::load_snapshot(conn, &bound_host)?;
+                Ok(workspaces
+                    .iter()
+                    .any(|row| row["workspaceId"].as_str() == Some(bound_workspace.as_str())))
+            })
+            .await
+            .map_err(map_store)?;
+        if !member {
+            let _ = state
+                .store
+                .delete_task_cascade(task.meta.id.as_id().to_string())
+                .await;
+            return Err(HubError::Conflict(format!(
+                "workspace {} unregistered before the task binding settled; choose another \
+                 directory",
+                workspace_id.as_id()
+            )));
+        }
     }
     let sharing = if let Some(request) = binding_request.as_ref() {
         match bind_task_directory(&state, &body.project_id, &task, request).await {

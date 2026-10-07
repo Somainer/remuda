@@ -399,18 +399,17 @@ impl WorkspaceRegistry {
                         // is marked: an alias that realpaths to the root is
                         // rejected here, and an id/root mismatch means the
                         // identity moved.
-                        if let Some(expected) = params.workspace_id.as_deref() {
-                            if expected != workspace_id.as_id().as_str()
-                                || Path::new(&params.path) != canonical
-                            {
-                                return Err(NodeError::Conflict(format!(
-                                    "workspace unregister identity does not match the resolved \
-                                         workspace (expected {}@{}, got {})",
-                                    workspace_id.as_id(),
-                                    canonical.display(),
-                                    params.path
-                                )));
-                            }
+                        if let Some(expected) = params.workspace_id.as_deref()
+                            && (expected != workspace_id.as_id().as_str()
+                                || Path::new(&params.path) != canonical)
+                        {
+                            return Err(NodeError::Conflict(format!(
+                                "workspace unregister identity does not match the resolved \
+                                 workspace (expected {}@{}, got {})",
+                                workspace_id.as_id(),
+                                canonical.display(),
+                                params.path
+                            )));
                         }
                         (canonical, workspace_id, true)
                     };
@@ -513,15 +512,14 @@ impl WorkspaceRegistry {
                         // root and the resolved id at commit; verify both
                         // before removing. Anything that changed between the
                         // phases refuses rather than unbinding.
-                        if let Some(expected) = params.workspace_id.as_deref() {
-                            if expected != command.workspace_id.as_id().as_str()
-                                || Path::new(&params.path) != command.canonical
-                            {
-                                return Err(NodeError::Conflict(
-                                    "workspace unregister identity changed between prepare and commit"
-                                        .into(),
-                                ));
-                            }
+                        if let Some(expected) = params.workspace_id.as_deref()
+                            && (expected != command.workspace_id.as_id().as_str()
+                                || Path::new(&params.path) != command.canonical)
+                        {
+                            return Err(NodeError::Conflict(
+                                "workspace unregister identity changed between prepare and commit"
+                                    .into(),
+                            ));
                         }
                         if next.workspaces.iter().any(|workspace| {
                             Path::new(&workspace.root_path) == command.canonical

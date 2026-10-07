@@ -1481,6 +1481,7 @@ Hub 生成 ownerFence，Node 在本地 durable store 单调保存；旧 fence �
 | `host.get` / `host.list` | Client/Hub | get `{hostId}` → Host；list `{cursor?,limit}` → `{items,nextCursor}` |
 | `driver.list` / `driver.capabilities` | Hub→Node | `{hostId}` / `{driverKind,binaryRef,profileRef}` → descriptor[] / CapabilitySnapshot；不执行模型探针 |
 | `workspace.register` | Hub→Node | `{workspaceId,rootPath,label,writePolicy}` → Command；canonicalRoot 由 Node 解析 |
+| `workspace.resolve` | Hub→Node | 只读：`{path}` → `{workspaceId,canonicalRoot}`；用 unregister prepare 同一个 realpath 解析函数，绝不复用 host.dirs.list（其 `..` 为词法折叠）；未注册/错误时拒绝且不触发 unregister |
 | `workspace.get` / `workspace.list` | Hub→Node | `{workspaceId}` / `{hostId,cursor?,limit}` → Workspace / page |
 | `worktree.create` | Hub→Node | `{worktreeId,parentWorkspaceId,baseOid,branch,path?}` → Command；新 Workspace ID 在接纳前预分配 |
 | `worktree.remove` | Hub→Node | `{worktreeId,expectedHeadOid,expectedDirty:false}` → Command；没有 force 隐式回退 |

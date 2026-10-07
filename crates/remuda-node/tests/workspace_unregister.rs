@@ -17,9 +17,11 @@
 //! 5. DELETE again must settle 200 and remove the workspace from the
 //!    snapshot. A 409 after exit is NOT success.
 //!
-//! Every spawned process is reclaimed: a guard closes the instance and shuts
-//! the runtime down on error and on panic, and the native driver kills the
-//! PTY child while reclaiming (its spawn paths set kill_on_drop).
+//! Every spawned process is reclaimed: the guard closes the instance and
+//! shuts the runtime down on error and on panic; the production native
+//! driver reclaim (the same path `remuda dev` uses) kills the PTY process
+//! group, so no shell outlives the test binary. The happy path additionally
+//! closes the session through the production instance.close route.
 
 use remuda_hub::HubConfig;
 use remuda_node::{
@@ -174,6 +176,7 @@ async fn unregister_refused_by_the_live_native_node_then_settles_after_exit() {
         context.addr,
         context.cookie.clone(),
         context.hub.as_ref().expect("hub"),
+        context.node.as_ref().expect("node"),
         &mut context.instance,
     ))
     .catch_unwind()
@@ -188,7 +191,7 @@ async fn resolve_alias_shapes_against_the_real_runtime_fs() {
     // directory, resolved through the PRODUCTION Node's `workspace.resolve`
     // (reached over the real Hub DELETE route with an active task bound) — no
     // fabricated identity.
-    let mut context = setup().await.expect("setup");
+    let context = setup().await.expect("setup");
     let outcome = std::panic::AssertUnwindSafe(drive_aliases(
         context.addr,
         context.cookie.clone(),
@@ -255,6 +258,7 @@ async fn drive(
     addr: std::net::SocketAddr,
     cookie: String,
     hub: &remuda_hub::RunningHub,
+    node: &remuda_node::DevNode,
     instance_slot: &mut Option<String>,
 ) {
     // The runtime announces its host id itself; discover it from the fleet
@@ -385,8 +389,10 @@ async fn drive(
         "refused unregister must leave the workspace registered: {view}"
     );
 
-    // (4) Kill the real session process through the production close path
-    //     and wait for process-end evidence at the Hub.
+    // (4) Kill the real session process through the production close path.
+    //     The Hub row already says `failed` (stale mark above), so it cannot
+    //     prove process end: wait on the NODE's own live set instead — the
+    //     Node is the liveness authority for exactly this race.
     let (status, closed) = http(
         addr,
         "POST",
@@ -396,13 +402,36 @@ async fn drive(
     )
     .await;
     assert_eq!(status, 200, "instance.close: {closed}");
-    poll_json(
-        addr,
-        &cookie,
-        &format!("/v1/instances/{instance_id}"),
-        |value| matches!(value["lifecycle"].as_str(), Some("exited") | Some("failed")),
-    )
-    .await;
+    let local_id: remuda_protocol::InstanceId = instance_id.parse().expect("instance id");
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        // Absent from the Node's instance list counts as ended: unregister's
+        // own occupancy predicate filters this same list, so a missing row
+        // occupies nothing. A query error keeps waiting until the deadline.
+        let ended = node
+            .list_instances()
+            .map(|page| {
+                page.items
+                    .iter()
+                    .find(|instance| instance.meta.id == local_id)
+                    .is_none_or(|instance| {
+                        matches!(
+                            instance.lifecycle,
+                            remuda_protocol::InstanceLifecycle::Exited
+                                | remuda_protocol::InstanceLifecycle::Failed
+                        )
+                    })
+            })
+            .unwrap_or(false);
+        if ended {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Node kept a live instance {instance_id} after close"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // (5) Second DELETE settles for real: 200 and the workspace is GONE from
     //     the snapshot. A 409 here would mean the process survived the close.
@@ -465,7 +494,8 @@ async fn drive_aliases(
     std::fs::create_dir_all(&allowed_proj).unwrap();
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(dir.join("other"), dir.join("allowed/link")).unwrap();
+        // link must point AT B (other/proj): resolve-symlink-then-`..` lands back in B
+        std::os::unix::fs::symlink(&other_proj, dir.join("allowed/link")).unwrap();
         std::os::unix::fs::symlink(&other_proj, dir.join("link2")).unwrap();
     }
     let spaced = dir.join("space ");

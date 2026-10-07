@@ -47,21 +47,45 @@ async fn workspace_routes_require_settlement_persist_and_forbid_agents() -> Resu
                 "workspace.list" => {
                     json!({"result":{"workspaceRevision":revision,"workspaces":workspaces}})
                 }
+                // c-dirpicker round 6 item 1: read-only identity twin of the
+                // unregister prepare (realpath semantics on the Node).
+                "workspace.resolve" => {
+                    if params["path"] == "/tmp/project" {
+                        json!({"result":{"workspaceId":"wsp_project","canonicalRoot":"/tmp/project"}})
+                    } else {
+                        json!({"error":{"code":-32602,"message":format!(
+                            "workspace {} is not registered", params["path"].as_str().unwrap_or(""))}})
+                    }
+                }
                 "workspace.register" | "workspace.unregister" => {
                     assert!(params["commandId"].as_str().unwrap().starts_with("cmd_"));
                     if params["path"] == "/outside" {
                         json!({"error":{"code":-32602,"message":"workspace /outside is outside workspace_roots; allowed roots: /tmp"}})
                     } else if params["path"] == "/unsettled" || params["phase"] == "prepare" {
-                        json!({"result":{"commandId":params["commandId"],"phase":"prepared","workspaceRevision":revision,"workspaces":workspaces}})
+                        json!({"result":{"commandId":params["commandId"],"phase":"prepared","workspaceRevision":revision,"workspaces":workspaces,
+                            // The Hub sends the resolved id on an unregister; echo it.
+                            "workspaceId": params.get("workspaceId").cloned().unwrap_or(Value::Null)}})
                     } else {
                         assert_eq!(params["phase"], "commit");
                         revision += 1;
+                        let workspace_id = if method == "workspace.register" {
+                            json!("wsp_project")
+                        } else {
+                            // Round 6 item 1: an unregister commit must carry
+                            // the resolved id and remove that exact row.
+                            let id = params
+                                .get("workspaceId")
+                                .and_then(Value::as_str)
+                                .expect("unregister commit carries workspaceId");
+                            assert_eq!(id, "wsp_project");
+                            json!(id)
+                        };
                         workspaces = if method == "workspace.register" {
                             json!([{"workspaceId":"wsp_project","hostId":host_for_node,"root":params["path"]}])
                         } else {
                             json!([])
                         };
-                        json!({"result":{"commandId":params["commandId"],"phase":"settled","workspaceRevision":revision,"workspaces":workspaces}})
+                        json!({"result":{"commandId":params["commandId"],"phase":"settled","workspaceRevision":revision,"workspaces":workspaces,"workspaceId":workspace_id}})
                     }
                 }
                 "instance.create" => {

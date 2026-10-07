@@ -303,11 +303,9 @@ struct Fixture {
     symlink_path: std::path::PathBuf,
     /// The codex/grok tree: a second registered root reached only by
     /// realpath through a symlink plus `..`.
-    alias_root: std::path::PathBuf,
     alias_other: std::path::PathBuf,
-    /// `<tmp>/allowed/link` → `<tmp>/other`; lexical `..` lands on
-    /// `allowed/proj`, realpath lands on `other/proj` (`alias_root`).
-    alias_link: std::path::PathBuf,
+    /// `allowed/link/../proj`: lexical `..` lands on `allowed/proj`,
+    /// realpath lands on `other/proj`.
     alias_dotdot: std::path::PathBuf,
 }
 
@@ -363,9 +361,7 @@ async fn fixture() -> Result<Fixture> {
         host,
         real_root: real_root_canonical,
         symlink_path,
-        alias_root,
         alias_other,
-        alias_link,
         alias_dotdot,
     })
 }

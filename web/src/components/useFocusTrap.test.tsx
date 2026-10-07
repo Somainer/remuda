@@ -226,7 +226,7 @@ describe("portalled DirBrowser inside the New Session sheet form", () => {
           }}
         >
           <input data-testid="new-session-cwd" defaultValue="" />
-          <WorkspaceRegistration hostId="hst_x" />
+          <WorkspaceRegistration hostId="hst_x" onRegistered={() => undefined} />
           <button type="submit" data-testid="new-session-start">
             启动
           </button>
@@ -291,8 +291,10 @@ describe("portalled DirBrowser inside the New Session sheet form", () => {
     screen.getByTestId("dir-browser-filter").focus();
     await user.keyboard("{Enter}");
     expect(create).not.toHaveBeenCalled();
-    // The modal is still open (it did not close or hand the key outward).
-    expect(screen.getByRole("dialog")).toBeTruthy();
+    // The modal is still open (it did not close or hand the key outward). It
+    // and the sheet are both role=dialog (the modal portals out of it), so
+    // assert on the modal subtree itself rather than a unique role query.
+    expect(screen.getByTestId("dir-browser")).toBeTruthy();
   });
 });
 

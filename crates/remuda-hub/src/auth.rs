@@ -199,6 +199,14 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
         };
         if code_changed || file_newer_than_stamp {
             persist_bootstrap(&data_dir, &config.bootstrap_token)?;
+        } else if !stamp_path.is_file() {
+            // Round 4 item 3: backfill a MISSING stamp on an unchanged code.
+            // A crash between persist_bootstrap's two writes, a pre-D-018 data
+            // dir, or a hand-provisioned token leaves the code without one;
+            // bootstrap_within_ttl fails open for a missing stamp, so without
+            // this the code would never expire. First sight is the issue time,
+            // exactly like the no-source adoption branch.
+            write_private(&stamp_path, &now_rfc3339())?;
         }
         // Otherwise leave bootstrap-token AND bootstrap-issued-at untouched.
         return Ok(BootstrapResolution::None);
@@ -893,5 +901,52 @@ mod tests {
         assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
         let new = rotate_bootstrap(dir.path()).expect("hub-owned dir still rotates");
         assert_ne!(new, "real-code");
+    }
+
+    /// Round 4 item 3: an explicit start backfills a MISSING stamp on an
+    /// unchanged code (crash between persist's two writes, pre-D-018 dir, or
+    /// hand-provisioned token), and a later unchanged restart with an expired
+    /// stamp does not revive it — round-3 semantics still hold.
+    #[cfg(unix)]
+    #[test]
+    fn explicit_start_backfills_missing_stamp_then_does_not_restamp() {
+        let dir = tempfile::tempdir().expect("data dir");
+
+        // Simulate the crash window: token present, stamp absent.
+        write_private(&dir.path().join("bootstrap-token"), "same-code").expect("token");
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "same-code").expect("code file");
+        backdate_mtime(&code_file, MTIME_1999);
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file.clone());
+        resolve_bootstrap(&mut config).expect("resolve backfills");
+
+        let stamp = bootstrap_issued_at(dir.path()).expect("a missing stamp is backfilled");
+        let parsed =
+            time::OffsetDateTime::parse(&stamp, &time::format_description::well_known::Rfc3339)
+                .expect("parseable now-stamp");
+        assert!(
+            (time::OffsetDateTime::now_utc() - parsed) < time::Duration::seconds(60),
+            "the backfilled stamp records the current time"
+        );
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+
+        // Expire the backfilled stamp, restart with the same code and a file
+        // older than the stamp: it must not be revived.
+        write_private(&dir.path().join("bootstrap-issued-at"), EXPIRED_STAMP).expect("expired");
+        backdate_mtime(&code_file, MTIME_1999);
+        let expired_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("bytes");
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        resolve_bootstrap(&mut config).expect("resolve unchanged");
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+            expired_bytes,
+            "the expired stamp is not revived"
+        );
+        assert!(!bootstrap_within_ttl(dir.path(), 24));
     }
 }

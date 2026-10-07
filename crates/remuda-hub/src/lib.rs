@@ -609,6 +609,36 @@ impl RunningHub {
         Ok(job.map(|job| serde_json::to_value(job).expect("gate job serializes")))
     }
 
+    /// Test-only: run the §7.5 direct-op admission (check + `admitted` row)
+    /// without a live Node, for worker.provision/remove coverage while the
+    /// worker routes themselves stay Agent-403 (ma-admission opens them).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn test_admit_node_op(
+        &self,
+        op_id: String,
+        host_id: String,
+        method: &'static str,
+        subject: Option<String>,
+        initiator: Option<remuda_protocol::Initiator>,
+        device_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .admit_node_op(
+                op_id,
+                host_id,
+                method,
+                subject,
+                &crate::node_ops::NodeOpAuth {
+                    initiator,
+                    device_id,
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into

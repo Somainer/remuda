@@ -963,29 +963,48 @@ async fn human_requests_remain_unchanged_after_a_fence_and_carry_no_initiator() 
     assert!(params.get("initiator").is_none(), "{params}");
 }
 
-// ── 10. worker.provision admission: no Node effect after fence ────────────
+// ── 10. Worker routes stay 403 for Agents; the node_ops admission boundary ─
+//      still covers worker.provision at the helper/store level (ma-admission
+//      owns the route opening: main-agent.md §15 task 7). ───────────────────
 
 #[tokio::test]
-async fn dispatch_after_fence_refuses_before_worker_provision() {
+async fn agent_worker_routes_are_forbidden_and_provision_admission_is_fence_checked() {
     let (ctx, mut node) = Ctx::boot().await.unwrap();
-    ctx.fence().await;
 
-    // Agent dispatch is now an Agent-admitted route (D-057 §2 decision 2).
+    // Every worker route an Agent could name is refused by the pre-handler
+    // middleware — the dispatch grant widens nothing until ma-admission lands.
     let (status, body) = ctx
         .agent_post(
             "/v1/workers/dispatch",
             json!({"projectId":ctx.project,"brief":BRIEF,"harness":"claude"}),
         )
         .await;
-    assert_eq!(status, 409, "{body}");
-    assert_eq!(body["code"], json!("fenced"), "dispatch body: {body}");
-    node.assert_no_frame("fenced dispatch").await;
-
-    // No roster row written.
+    assert_eq!(status, 403, "agent dispatch must stay 403: {body}");
+    for path in [
+        "/v1/workers",
+        "/v1/workers/wkr_1",
+        "/v1/workers/wkr_1/answer",
+        "/v1/workers/wkr_1/stop",
+        "/v1/workers/wkr_1/retire",
+        "/v1/workers/wkr_1/nudge",
+        "/v1/workers/wkr_1/observe",
+    ] {
+        let method = if path.contains('/') && path != "/v1/workers" {
+            "POST"
+        } else {
+            "GET"
+        };
+        let (status, _) = ctx
+            .send(method, path, &ctx.agent, None, Some(json!({})))
+            .await;
+        assert_eq!(status, 403, "agent {method} {path} must stay 403");
+    }
+    // No roster row, and the Node never saw worker.provision: a Human command
+    // sentinel frame is the first (and only) frame after the refused calls.
     let workers: Value = ctx
         .http
         .get(format!("{}/v1/workers?project={}", ctx.base(), ctx.project))
-        .bearer_auth(&ctx.agent)
+        .bearer_auth(&ctx.human)
         .send()
         .await
         .unwrap()
@@ -993,6 +1012,72 @@ async fn dispatch_after_fence_refuses_before_worker_provision() {
         .await
         .unwrap();
     assert!(workers["items"].as_array().unwrap().is_empty(), "{workers}");
+    let (status, sentinel) = ctx
+        .send(
+            "POST",
+            &format!("/v1/instances/{}/commands", ctx.instance),
+            &ctx.human,
+            None,
+            Some(Ctx::send_body("instance.send")),
+        )
+        .await;
+    assert_eq!(status, 200, "{sentinel}");
+    let (method, _params) = node.next().await;
+    assert_eq!(method, "instance.send", "provision leaked to the Node");
+
+    // The §7.5 admission boundary itself stays: a worker.provision op for a
+    // fenced initiator is refused at the helper/store level with nothing sent.
+    let (lineage_id, generation): (String, i64) = {
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        db.query_row(
+            "SELECT lineage_id, generation FROM instances WHERE id = ?1",
+            rusqlite::params![ctx.instance],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    };
+    let initiator = remuda_protocol::Initiator {
+        instance_id: ctx.instance.clone(),
+        lineage_id,
+        generation,
+    };
+    let device_id = {
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        db.query_row(
+            "SELECT id FROM devices WHERE instance_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            rusqlite::params![ctx.instance],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    ctx.hub
+        .test_admit_node_op(
+            format!("wpr_{}", uuid::Uuid::now_v7()),
+            ctx.host.clone(),
+            "worker.provision",
+            None,
+            Some(initiator.clone()),
+            Some(device_id),
+        )
+        .await
+        .expect("a healthy provision op admits");
+    ctx.fence().await;
+    let err = ctx
+        .hub
+        .test_admit_node_op(
+            format!("wpr_{}", uuid::Uuid::now_v7()),
+            ctx.host.clone(),
+            "worker.provision",
+            None,
+            Some(initiator),
+            None,
+        )
+        .await
+        .expect_err("a fenced provision op must not admit");
+    assert!(
+        format!("{err:#}").to_lowercase().contains("fenced"),
+        "{err:#}"
+    );
 }
 
 // ── 11. Direct store semantics for the stamped-row intent re-check ────────

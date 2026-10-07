@@ -103,6 +103,22 @@ fn explicit_file_config(hub_data: PathBuf, code_file: PathBuf, code: &str) -> Hu
 
 const EXPIRED_STAMP: &str = "2000-01-01T00:00:00.000Z";
 
+/// A current RFC3339 UTC stamp with millisecond precision (what the Hub
+/// writes), for simulating the stamp-first crash window.
+fn now_stamp() -> String {
+    let t = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond()
+    )
+}
+
 /// Same code, but the access-code file was touched (mtime newer than the
 /// backdated stamp): restart re-stamps and login succeeds.
 #[tokio::test]
@@ -168,13 +184,12 @@ async fn unchanged_older_explicit_file_keeps_expired_login_rejected() -> Result<
         hub.shutdown().await;
     }
 
-    // Expire the stamp AND age both the access file and the persisted token
-    // older than it (a genuinely expired code was written long ago; aging the
-    // token too keeps item-8's crash-window repair from firing).
+    // Expire the stamp content and age the access file. The persisted TOKEN
+    // keeps its natural mtime (newer than the year-2000 parsed stamp): round 5
+    // removed the token-mtime trigger, so this must not revive the code.
     let stamp_path = hub_data.join("bootstrap-issued-at");
     std::fs::write(&stamp_path, EXPIRED_STAMP)?;
     backdate_mtime(&code_file);
-    backdate_mtime(&hub_data.join("bootstrap-token"));
     let stamp_bytes_before = std::fs::read(&stamp_path)?;
 
     {
@@ -245,27 +260,31 @@ async fn changed_explicit_file_code_restarts_and_login_succeeds() -> Result<()> 
     Ok(())
 }
 
-/// Round 4 item 8: the previous start persisted a NEW token but was killed
-/// before writing its stamp (stale year-2000 stamp left behind), and the
-/// access file keeps the same code with an OLD mtime (cp -p / rsync -t). The
-/// restart must self-heal via the token file's newer mtime so login with the
-/// new code succeeds.
+/// Round 5 ordering: the previous start wrote the NEW stamp but was killed
+/// before the token write, leaving the OLD token on disk. The access file
+/// carries the new code with an OLD mtime, so the restart must self-heal via
+/// the code-change rule and login with the new code succeeds.
 #[cfg(unix)]
 #[tokio::test]
-async fn restart_after_token_write_crash_restamps_and_login_succeeds() -> Result<()> {
+async fn restart_after_stamp_write_crash_repairs_and_login_succeeds() -> Result<()> {
     let outer = tempfile::tempdir()?;
     let hub_data = outer.path().join("dev-hub");
     std::fs::create_dir_all(&hub_data)?;
     let code_file = outer.path().join("access-code");
+    let old_code = "old-code-before-the-kill-1234567";
     let code = "replaced-after-kill-at-least-sixteen";
 
-    // The crashed state: new token on disk NOW, stale stamp, same code in the
-    // access file whose mtime predates the stamp.
+    // Pre-crash state: the old code + expired stamp existed.
+    std::fs::write(hub_data.join("bootstrap-token"), old_code)?;
+    std::fs::write(hub_data.join("bootstrap-issued-at"), EXPIRED_STAMP)?;
+    backdate_mtime(&hub_data.join("bootstrap-token"));
+    backdate_mtime(&hub_data.join("bootstrap-issued-at"));
+
+    // The killed start landed the NEW stamp (mtime now) but never the token;
+    // the operator file already holds the new code, aged older than the stamp.
+    std::fs::write(hub_data.join("bootstrap-issued-at"), now_stamp())?;
     write_code_file(&code_file, code)?;
     backdate_mtime(&code_file);
-    std::fs::write(hub_data.join("bootstrap-token"), code)?;
-    std::fs::write(hub_data.join("bootstrap-issued-at"), EXPIRED_STAMP)?;
-    backdate_mtime(&hub_data.join("bootstrap-issued-at"));
 
     let hub = spawn(explicit_file_config(
         hub_data.clone(),
@@ -273,12 +292,13 @@ async fn restart_after_token_write_crash_restamps_and_login_succeeds() -> Result
         code,
     ))
     .await?;
+    // Old code is gone (config holds the new one), new code logs in.
+    assert_eq!(login_status(hub.addr, old_code).await?, 401);
     login(hub.addr, code).await?;
-    // The repair wrote a fresh stamp.
-    assert_ne!(
-        std::fs::read_to_string(hub_data.join("bootstrap-issued-at"))?.trim(),
-        EXPIRED_STAMP,
-        "the crash window re-stamped"
+    assert_eq!(
+        std::fs::read_to_string(hub_data.join("bootstrap-token"))?.trim(),
+        code,
+        "the crash window re-persisted the new token"
     );
     hub.shutdown().await;
     Ok(())

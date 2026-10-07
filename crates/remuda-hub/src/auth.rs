@@ -59,11 +59,18 @@ pub fn verify_secret(secret: &str, hash: &str) -> bool {
 /// Writes a sibling `bootstrap-issued-at` stamp so the TTL survives restart
 /// (D-018). The code itself keeps its historical filename so existing tooling
 /// and `remuda dev` keep working.
+///
+/// c-bootstrap-dev round 5: the STAMP is written BEFORE the token. A crash in
+/// between therefore leaves an OLD token paired with a NEW stamp; on the next
+/// start the explicit-code change check (old persisted token ≠ configured
+/// code) re-persists both and self-heals. The reverse order plus a token-mtime
+/// heuristic revived expired codes on every same-millisecond restart, so no
+/// file-mtime comparison against the parsed stamp is allowed for the token.
 pub fn persist_bootstrap(data_dir: &Path, token: &str) -> Result<(), HubError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
-    write_private(&data_dir.join("bootstrap-token"), token)?;
     write_private(&data_dir.join("bootstrap-issued-at"), &now_rfc3339())?;
+    write_private(&data_dir.join("bootstrap-token"), token)?;
     Ok(())
 }
 
@@ -198,23 +205,21 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
         let code_changed = persisted != config.bootstrap_token;
         let file_newer_than_stamp = match &config.bootstrap_source {
             crate::config::BootstrapSource::ExplicitFile(path) => {
-                mtime_newer_than_stamp(path, &stamp_path)?
+                file_mtime_newer_than_stamp(path, &stamp_path)?
             }
             crate::config::BootstrapSource::ExplicitEnv
             | crate::config::BootstrapSource::Generated
             | crate::config::BootstrapSource::Adopted => false,
         };
-        // Round 4 item 8: persist_bootstrap writes the token BEFORE the
-        // stamp. A crash (or kill) after the token write leaves the new code
-        // paired with the previous start's stamp — with an unchanged code and
-        // a `cp -p`/`rsync -t` access file whose mtime predates the stamp, the
-        // two rules above both miss and the new code 401s forever. The token
-        // file's mtime is newer than the parsed stamp exactly in that window,
-        // so re-stamp and self-heal. In a healthy directory the stamp is
-        // always written just after the token, so its parsed time is the later
-        // one and this never fires on a mere restart.
-        let token_newer_than_stamp = mtime_newer_than_stamp(&token_path, &stamp_path)?;
-        if code_changed || file_newer_than_stamp || token_newer_than_stamp {
+        // persist_bootstrap now writes the STAMP first and the TOKEN second:
+        // a crash between the two leaves an old token with a new stamp, and
+        // the `code_changed` rule above re-persists both on retry. There must
+        // be NO token-mtime trigger here — the token file is written after the
+        // stamp on every healthy persist, so its nanosecond mtime is normally
+        // newer than the millisecond-precision parsed stamp; comparing them
+        // re-stamped (and revived expired codes) on every same-millisecond
+        // restart, and a `cp -r` without -p did so once after a restore.
+        if code_changed || file_newer_than_stamp {
             persist_bootstrap(&data_dir, &config.bootstrap_token)?;
         } else if !stamp_path.is_file() {
             // Round 4 item 3: backfill a MISSING stamp on an unchanged code.
@@ -284,13 +289,13 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
     Ok(BootstrapResolution::None)
 }
 
-/// Whether `file`'s mtime is strictly newer than the parsed bootstrap stamp.
-/// Used both for the operator access-code file (round 3: a touched file
-/// re-stamps) and the persisted token itself (round 4 item 8: a crash after
-/// the token write self-heals). An unreadable/absent file or an unparseable
-/// stamp returns false (the conservative choice: do not revive the TTL on
-/// uncertainty).
-fn mtime_newer_than_stamp(file: &Path, stamp: &Path) -> Result<bool, HubError> {
+/// Whether the operator access-code FILE's mtime is strictly newer than the
+/// parsed bootstrap stamp (round 3: a touched/redeployed file re-stamps).
+/// Applies ONLY to that external file — never to the persisted token, which is
+/// written after the stamp by [`persist_bootstrap`] and so is normally newer.
+/// An unreadable/absent file or an unparseable stamp returns false (the
+/// conservative choice: do not revive the TTL on uncertainty).
+fn file_mtime_newer_than_stamp(file: &Path, stamp: &Path) -> Result<bool, HubError> {
     let Ok(meta) = std::fs::metadata(file) else {
         return Ok(false);
     };
@@ -538,11 +543,17 @@ mod tests {
     /// older than the year-2000 test stamp.
     #[cfg(unix)]
     fn backdate_mtime(path: &Path, seconds: i64) {
+        set_mtime(path, seconds, 0);
+    }
+
+    /// Set a path's atime+mtime with nanosecond precision (Unix only).
+    #[cfg(unix)]
+    fn set_mtime(path: &Path, seconds: i64, nanos: i64) {
         use nix::sys::stat::{UtimensatFlags, utimensat};
         use nix::sys::time::TimeSpec;
-        let ts = TimeSpec::new(seconds, 0);
+        let ts = TimeSpec::new(seconds, nanos);
         utimensat(None, path, &ts, &ts, UtimensatFlags::FollowSymlink)
-            .expect("utimensat backdates the access-code file");
+            .expect("utimensat sets the file mtime");
     }
 
     #[test]
@@ -626,16 +637,14 @@ mod tests {
 
     /// Set up a data dir holding `code` with the year-2000 expired stamp, and
     /// return the raw stamp bytes callers compare against after a restart.
-    /// Set up a data dir holding `code` with the year-2000 expired stamp, and
-    /// return the raw stamp bytes callers compare against after a restart.
     ///
-    /// The token file's mtime is backdated too: a genuinely expired code was
-    /// written long ago, so its token cannot look newer than the parsed stamp
-    /// (which is exactly the round-4 item-8 self-heal trigger).
+    /// Round 5: only the STAMP is backdated — the token file keeps its natural
+    /// (now) mtime. Since persist_bootstrap writes the stamp before the token,
+    /// a healthy token is normally NEWER than its parsed stamp; nothing may
+    /// read that as a reason to re-stamp.
     fn expired_token_setup(dir: &Path, code: &str) -> Vec<u8> {
         persist_bootstrap(dir, code).expect("persist");
         write_private(&dir.join("bootstrap-issued-at"), EXPIRED_STAMP).expect("stamp");
-        backdate_mtime(&dir.join("bootstrap-token"), MTIME_1999);
         std::fs::read(dir.join("bootstrap-issued-at")).expect("raw stamp bytes")
     }
 
@@ -690,9 +699,8 @@ mod tests {
             "the persisted token is stored without padding"
         );
 
-        // Age the directory like a genuinely old code (stamp + token).
+        // Expire the stamp content only; the token keeps its natural mtime.
         write_private(&dir.path().join("bootstrap-issued-at"), EXPIRED_STAMP).expect("expired");
-        backdate_mtime(&dir.path().join("bootstrap-token"), MTIME_1999);
         let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap();
 
         // Second start with the SAME padded env value: trimmed to the same
@@ -1042,12 +1050,10 @@ mod tests {
         assert!(bootstrap_within_ttl(dir.path(), 24));
 
         // Expire the backfilled stamp, restart with the same code and a file
-        // older than the stamp: it must not be revived. Age the token file too
-        // so the item-8 crash repair does not fire (a genuinely expired code
-        // was written long ago).
+        // older than the stamp: it must not be revived. The token keeps its
+        // natural mtime — no heuristic may read that as a repair trigger.
         write_private(&dir.path().join("bootstrap-issued-at"), EXPIRED_STAMP).expect("expired");
         backdate_mtime(&code_file, MTIME_1999);
-        backdate_mtime(&dir.path().join("bootstrap-token"), MTIME_1999);
         let expired_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("bytes");
         let mut config = HubConfig::for_test(dir.path().to_path_buf());
         config.bootstrap_token = "same-code".to_owned();
@@ -1159,29 +1165,35 @@ mod tests {
         assert_ne!(new, minted);
     }
 
-    /// Round 4 item 8: persist_bootstrap wrote the new token and was KILLED
-    /// before writing the stamp. The access file carries the same code with an
-    /// OLD mtime (`cp -p`/`rsync -t`), so neither the code-change nor the
-    /// file-mtime rule fires — but the token file's mtime is newer than the
-    /// stale parsed stamp, so the restart re-stamps and the code is usable.
+    /// Round 5 (replaces round-4 item 8): persist_bootstrap now writes the
+    /// STAMP first and the TOKEN second. A kill between the two leaves the OLD
+    /// token paired with a NEW stamp; on restart the configured new code
+    /// differs from the persisted old one (`code_changed`), so the pair is
+    /// re-persisted and the code is usable. This crash shape also covers a
+    /// `cp -r`/`scp -r` restore (mtimes not preserved) because no mtime
+    /// comparison against the token exists anymore.
     #[cfg(unix)]
     #[test]
-    fn crash_between_token_and_stamp_writes_restamps_via_token_mtime() {
+    fn crash_between_stamp_and_token_writes_repairs_via_code_change() {
         let dir = tempfile::tempdir().expect("data dir");
 
-        // The pre-crash state from the previous start: old code + old stamp.
+        // The previous start had the old code + old stamp.
         expired_token_setup(dir.path(), "previous-code");
 
-        // New start wrote the new token (mtime = now) but died before the
-        // stamp write; the operator file holds the new code with an OLD mtime.
-        write_private(&dir.path().join("bootstrap-token"), "replaced-code").expect("new token");
+        // The new start wrote the NEW stamp but was KILLED before the token
+        // write: fresh stamp, still-old token. The operator file holds the new
+        // code with an OLD mtime, so only code_changed can repair.
+        write_private(&dir.path().join("bootstrap-issued-at"), &now_rfc3339())
+            .expect("new stamp landed");
         let code_file = dir.path().join("access-code");
         write_private(&code_file, "replaced-code").expect("code file");
         backdate_mtime(&code_file, MTIME_1999);
-        let stale_stamp = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("stamp");
-        assert!(
-            !bootstrap_within_ttl(dir.path(), 24),
-            "precondition: stamp is old"
+        // Token still says the OLD code.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bootstrap-token"))
+                .unwrap()
+                .trim(),
+            "previous-code"
         );
 
         let mut config = HubConfig::for_test(dir.path().to_path_buf());
@@ -1189,8 +1201,6 @@ mod tests {
         config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
         resolve_bootstrap(&mut config).expect("restart self-heals");
 
-        let repaired = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("stamp");
-        assert_ne!(repaired, stale_stamp, "the crash window re-stamps");
         assert!(
             bootstrap_within_ttl(dir.path(), 24),
             "the new code is usable"
@@ -1203,15 +1213,56 @@ mod tests {
         );
     }
 
-    /// Round 4 item 8 negative: a healthy directory (stamp written just after
-    /// the token) with an unchanged code and an old access file does NOT
-    /// re-stamp — the token-mtime repair must not read a healthy pair as
-    /// crashed.
+    /// Round 5 negative (the round-3 revival regression): a healthy pair has
+    /// the token file mtime NEWER than the parsed millisecond stamp (stamp is
+    /// written first). With an EXPIRED stamp and the token exactly 500 µs
+    /// newer, an unchanged code and an old access file must leave the stamp
+    /// byte-identical — no token-mtime trigger may exist.
+    #[cfg(unix)]
+    #[test]
+    fn token_half_ms_newer_than_expired_stamp_does_not_restamp() {
+        let dir = tempfile::tempdir().expect("data dir");
+        write_private(&dir.path().join("bootstrap-token"), "same-code").expect("token");
+        // Expired stamp with a fractional part: 2000-01-01T00:00:00.123Z.
+        const STAMP_TEXT: &str = "2000-01-01T00:00:00.123Z";
+        write_private(&dir.path().join("bootstrap-issued-at"), STAMP_TEXT).expect("stamp");
+        // Token mtime = parsed stamp + 500 µs (same millisecond, greater).
+        set_mtime(
+            &dir.path().join("bootstrap-token"),
+            946_684_800,
+            123_500_000,
+        );
+
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "same-code").expect("code file");
+        backdate_mtime(&code_file, MTIME_1999);
+
+        let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap();
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        resolve_bootstrap(&mut config).expect("resolve");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+            stamp_bytes,
+            "a token mtime 500 µs newer than the parsed stamp must not re-stamp"
+        );
+        assert!(
+            !bootstrap_within_ttl(dir.path(), 24),
+            "the expired code stays expired"
+        );
+    }
+
+    /// Round 5 negative (fresh variant): a healthy now-pair (stamp written
+    /// first, token fractions later) with an unchanged code and an old access
+    /// file is left untouched on an ordinary restart.
     #[cfg(unix)]
     #[test]
     fn healthy_token_stamp_pair_with_old_file_does_not_trigger_repair() {
         let dir = tempfile::tempdir().expect("data dir");
-        persist_bootstrap(dir.path(), "same-code").expect("persist writes token then stamp");
+        persist_bootstrap(dir.path(), "same-code")
+            .expect("persist writes the stamp first, then the token");
         let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("stamp");
 
         let code_file = dir.path().join("access-code");

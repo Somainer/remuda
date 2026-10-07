@@ -748,10 +748,10 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
     assert_eq!(row["state"]["state"], "working");
     assert!(row["watch"]["observedAt"].is_string(), "{row}");
 
-    // ma-sdk-state / c-cardsettle: a failed TURN is not a process death — the
-    // durable Hub row does NOT converge to failed from the turn error alone,
-    // and the live child still accepts a REAL next prompt through the command
-    // path (the driver emits a separate process-exit event when it ends).
+    // ma-sdk-state / ma-lineage / c-cardsettle: a failed TURN is not a process
+    // death — the durable Hub row does NOT converge to failed from the turn
+    // error alone (the driver emits a separate process-exit event when the
+    // child ends), and the live child still accepts a REAL next prompt.
     let (status, instance) = ctx
         .request("GET", &format!("/v1/instances/{instance_id}"), None)
         .await;

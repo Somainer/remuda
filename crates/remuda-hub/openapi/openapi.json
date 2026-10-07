@@ -1169,6 +1169,17 @@
           "providerProfileId": {
             "type": "string"
           },
+          "restart": {
+            "description": "D-057 §6.1 C1 restart policy: relaunch this instance on Node-attested process loss/start failure, at most `maxPerHour` decisions per hour. Accepted only from a Human origin in Phase 1; an Agent or Bot gets 403. Hub-side policy, never forwarded in the Node spec; makes the instance a continuity lineage. No behaviour follows until the C1 supervisor ships.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RestartPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "role": {
             "description": "Preset name applied at create and stored for display; enforcement reads scope+grants, never this field (design §2.5).",
             "enum": [
@@ -1631,6 +1642,44 @@
               "null"
             ]
           },
+          "chapterCause": {
+            "description": "D-057 §5: why this chapter exists (`owner-resume` now; C1 causes follow). Null on a first chapter or plain instance.",
+            "readOnly": true,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fencedAt": {
+            "description": "D-057 §7.2: when authority moved from this chapter to its successor; null while current.",
+            "readOnly": true,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation": {
+            "description": "D-057 §5: chapter position inside its lineage, 1-based.",
+            "readOnly": true,
+            "type": "integer"
+          },
+          "lineageId": {
+            "description": "D-057 §5: lineage this chapter belongs to; the first chapter's instance id. A plain instance is its own lineage.",
+            "readOnly": true,
+            "type": "string"
+          },
+          "restart": {
+            "description": "D-057 §6.1 C1 restart policy copied to every chapter of a continuity lineage; null on a plain instance.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RestartPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "readOnly": true
+          },
           "signalTier": {
             "description": "Signal tier confirmed by the Node for the current native session. Absent until a tier has been observed.",
             "enum": [
@@ -1682,7 +1731,126 @@
           "activity",
           "connectivity",
           "journalId",
-          "durableSeq"
+          "durableSeq",
+          "lineageId",
+          "generation"
+        ],
+        "type": "object"
+      },
+      "LineageChapter": {
+        "additionalProperties": false,
+        "description": "One chapter of a lineage (D-057 §5).",
+        "properties": {
+          "chapterCause": {
+            "description": "Why this chapter exists; null on the first chapter.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "endedAt": {
+            "description": "Timestamp of the chapter's process-end evidence (the observedAt of the classified end event or a by-construction scheduler end), stamped once and immutable; null while live or when no end evidence is recorded (host loss and ambiguous legacy failures leave it null).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fencedAt": {
+            "description": "When authority moved to the successor; null while current.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation": {
+            "type": "integer"
+          },
+          "instanceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "instanceId",
+          "generation",
+          "createdAt"
+        ],
+        "type": "object"
+      },
+      "LineageRecord": {
+        "additionalProperties": false,
+        "description": "One agent across process lifetimes (D-057 §5). A row exists only for continuity instances: one that holds a grant or carries a restart policy.",
+        "properties": {
+          "chapters": {
+            "description": "Every chapter, oldest generation first.",
+            "items": {
+              "$ref": "#/components/schemas/LineageChapter"
+            },
+            "type": "array"
+          },
+          "generation": {
+            "description": "The current chapter's generation.",
+            "type": "integer"
+          },
+          "lineageId": {
+            "description": "The first chapter's instance id.",
+            "type": "string"
+          },
+          "pausedBy": {
+            "description": "Who paused the lineage (`device`/`self`/`ancestor`/`restart-cap`/`process-exit`); null while unpaused.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "restart": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RestartPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "description": "starting, running, paused, or host-offline (a running current chapter whose host has no live link; derived, not starting).",
+            "enum": [
+              "starting",
+              "running",
+              "paused",
+              "host-offline"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "lineageId",
+          "state",
+          "generation",
+          "chapters"
+        ],
+        "type": "object"
+      },
+      "RestartPolicy": {
+        "additionalProperties": false,
+        "description": "D-057 §6.1 C1 restart policy chosen at create time.",
+        "properties": {
+          "maxPerHour": {
+            "description": "At-most restart decisions per rolling hour; at least 1.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "onProcessLoss": {
+            "description": "Restart on Node-attested process loss or start failure.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "onProcessLoss",
+          "maxPerHour"
         ],
         "type": "object"
       },
@@ -6929,7 +7097,7 @@
     },
     "/v1/instances/{id}/resume": {
       "post": {
-        "description": "Creates a new Instance on the same host and workspace whose driver launches `claude --resume <nativeSessionId>` with the parent's provider, permission and model settings. The exited instance keeps its history and stays exited. Human/Bot only; Agent callers get 403. Idempotent per (instance, mode) inside a short window.",
+        "description": "Creates a new Instance on the same host and workspace whose driver launches `claude --resume <nativeSessionId>` with the parent's provider, permission and model settings. The exited instance keeps its history and stays exited. Human/Bot only; Agent callers get 403. Idempotent per (instance, mode) inside a short window. A `claude-sdk` parent resumes as `claude-sdk` with `--resume`. When the addressed instance belongs to a continuity lineage (D-057 §5), this instead performs a continuation resume: the lineage's current chapter is fenced and a successor chapter is inserted in one generation-CAS transaction; the successor keeps the lineage, role, scope, grants, task and restart policy, and its parent is the predecessor's parent.",
         "operationId": "instanceResume",
         "parameters": [
           {
@@ -7109,6 +7277,45 @@
             "$ref": "#/components/responses/Error"
           }
         },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/lineages/{id}": {
+      "get": {
+        "description": "D-057 §13 lineage projection: state, restart policy, generation and every chapter. Human/Bot devices may read any lineage; an Agent may read only the lineage its instance belongs to (403 otherwise).",
+        "operationId": "getLineage",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "$ref": "#/components/parameters/CallerInstance"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LineageRecord"
+                }
+              }
+            },
+            "description": "Lineage"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read one agent lineage and its chapters (D-057)",
         "tags": [
           "instances"
         ]

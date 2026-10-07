@@ -386,10 +386,25 @@ impl Store {
                     )
                     .map(|previous| matches!(previous.as_str(), "exited" | "failed" | "closed"))
                     .unwrap_or(true);
+                // ma-lineage r5 item 1: a daemon reconcile reporting RUNNING
+                // is authoritative liveness (D-019, same epoch) — it revives a
+                // host-lost/ambiguous terminal row, clearing ended_at (host
+                // loss is contact loss, not a death) and last_error.
+                let reports_running = lifecycle == "running";
                 tx.execute(
                     "UPDATE instances SET lifecycle = ?3, activity = ?4, connectivity = 'connected',
-                     last_error = ?5, updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
-                    params![id, host_id, lifecycle, activity, instance["lastError"].as_str(), &now],
+                     last_error = CASE WHEN ?7 THEN NULL ELSE ?5 END,
+                     ended_at = CASE WHEN ?7 THEN NULL ELSE ended_at END,
+                     updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
+                    params![
+                        id,
+                        &host_id,
+                        lifecycle,
+                        activity,
+                        instance["lastError"].as_str(),
+                        &now,
+                        reports_running
+                    ],
                 )?;
                 if !was_terminal && matches!(lifecycle, "exited" | "failed" | "closed") {
                     ended.push(id.to_string());
@@ -896,6 +911,89 @@ mod tests {
             .unwrap();
         assert_eq!(row.state, "invalidated");
         assert!(!row.blocking);
+        store.close().await;
+    }
+
+    /// ma-lineage r5 item 1(c): a daemon inventory that reports an instance
+    /// RUNNING revives a host-lost/ambiguous terminal row: lifecycle returns
+    /// to running and ended_at / last_error are cleared (D-019 same-epoch
+    /// process is alive).
+    #[tokio::test]
+    async fn daemon_inventory_running_report_revives_a_host_lost_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .insert_managed_host(
+                host.clone(),
+                AddSshHost {
+                    target: "lineage-revive".into(),
+                    label: "lineage-revive".into(),
+                    labels: vec![],
+                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .ssh_status(host.clone(), "online", None)
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "claude".into(),
+                "claude-sdk".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let host_lost_id = instance.instance_id.clone();
+        store
+            .run_named("host-lost", move |conn| {
+                conn.execute(
+                    "UPDATE instances
+                        SET lifecycle = 'exited', activity = 'idle',
+                            connectivity = 'disconnected',
+                            last_error = 'host-lost',
+                            ended_at = NULL
+                      WHERE id = ?1",
+                    [host_lost_id.as_str()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        store
+            .reconcile_daemon_instances(
+                host.clone(),
+                vec![json!({
+                    "id": instance.instance_id,
+                    "hostId": host,
+                    "lifecycle": "running",
+                    "activity": "idle"
+                })],
+            )
+            .await
+            .unwrap();
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.lifecycle, "running",
+            "daemon running report revives the row"
+        );
+        assert_eq!(row.connectivity, "connected");
+        assert!(
+            row.last_error.is_none(),
+            "host-lost marker cleared: {row:?}"
+        );
         store.close().await;
     }
 }

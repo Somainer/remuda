@@ -1878,7 +1878,7 @@ async fn resume_lineage(
     state: &AppState,
     device: &crate::store::Device,
     body: &ResumeBody,
-    addressed: crate::store::InstanceRecord,
+    mut addressed: crate::store::InstanceRecord,
     lineage: crate::store::LineageRecord,
     mode: ResumeMode,
 ) -> Result<Json<Value>, HubError> {
@@ -1898,21 +1898,35 @@ async fn resume_lineage(
         .get_instance_read(lineage.current_instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
-    // ma-lineage round 3 item 4: if the owner addressed an OLDER chapter, the
-    // continuation its successor already represents is the answer — resolve
-    // that idempotent replay HERE, before any launch requirement (host link,
-    // native session) is checked or a new launch is prepared. A repeat resume
-    // of a sessionless predecessor must not hit the fresh-recovery validation
-    // or 409 against the not-yet-sessioned successor. The store re-verifies
-    // addressed-vs-current transactionally, so a chapter superseded between
-    // this read and the fence still converges the same way.
+    // ma-lineage round 3 item 4 + round 5 item 2: the owner may address an
+    // OLDER chapter.
+    //
+    // * If the lineage's CURRENT chapter is still LIVE (requested/starting/
+    //   running), the addressed chapter's continuation already happened —
+    //   resolve that idempotent replay here, before any launch validation, and
+    //   never mint a fourth chapter for a live one.
+    // * If the CURRENT chapter has itself ENDED with process-end evidence, a
+    //   replay would hand back a dead lineage with no new chapter. Instead
+    //   retarget the continuation at the current chapter so the transactional
+    //   flow below fences it and mints the next one (Z from ended Y), no
+    //   matter which older chapter (X) the client happened to address.
     if addressed.instance_id != current.instance_id {
-        return Ok(Json(json!({
-            "instance": current,
-            "hostId": current.host_id,
-            "mode": mode.as_str(),
-            "replayed": true
-        })));
+        if state
+            .store
+            .instance_has_process_end_evidence(&current)
+            .await?
+        {
+            // Retarget at the current chapter; `current` is still needed below
+            // for host id / predecessor bookkeeping.
+            addressed = current.clone();
+        } else {
+            return Ok(Json(json!({
+                "instance": current,
+                "hostId": current.host_id,
+                "mode": mode.as_str(),
+                "replayed": true
+            })));
+        }
     }
     let host = state
         .store

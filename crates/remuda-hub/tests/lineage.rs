@@ -1039,6 +1039,76 @@ async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -
     Ok(())
 }
 
+
+/// ma-lineage r5 item 2: X→Y, then Y itself ends. A resume still addressed to
+/// X must NOT replay the dead Y (`{replayed:true, instance:Y}`); it must
+/// continue the lineage from Y — generation 3, an instance.resume for Z with
+/// resumedFrom Y.
+#[tokio::test]
+async fn a_resume_addressed_to_an_old_chapter_after_the_current_ended_continues_it() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, true).await?;
+
+    // First continuation: X → Y.
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    // Report Y's session and then its real SDK exit.
+    ctx.report_session(&node, &y, false).await?;
+    node.appends.send((y.clone(), sdk_session_exited("2026-10-07T08:00:00.000Z")))?;
+    ctx.wait_until(&y, |v| v["lifecycle"] == json!("exited"))
+        .await?;
+
+    // Resume addressed to the OLDER chapter X now that the current chapter Y
+    // has ended: it must mint generation 3 (Z), not replay dead Y.
+    let response = ctx.resume(&x, &ctx.human).await?.error_for_status()?;
+    assert_eq!(
+        response.status(),
+        200,
+        "an ended current chapter is continued, not refused/replayed"
+    );
+    let third: Value = response.json().await?;
+    assert_ne!(
+        third["replayed"],
+        json!(true),
+        "no idempotent replay of dead Y: {third}"
+    );
+    let z = third["instance"]["instanceId"].as_str().unwrap().to_owned();
+    assert_ne!(z, x);
+    assert_ne!(z, y);
+
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(lineage["generation"], json!(3), "X→Y→Z is generation 3");
+    let chapters = lineage["chapters"].as_array().unwrap();
+    assert_eq!(chapters.len(), 3, "three chapters X,Y,Z");
+    assert_eq!(chapters[2]["instanceId"], json!(z));
+
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume", "params={params}");
+    assert_eq!(
+        params["spec"]["resumedFrom"],
+        json!(y),
+        "Z continues from Y; params={params}"
+    );
+    Ok(())
+}
+
 // --- 2. Ended chapter + host offline ------------------------------------
 
 #[tokio::test]

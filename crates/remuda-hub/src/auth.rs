@@ -140,18 +140,20 @@ pub enum BootstrapResolution {
 
 /// Resolve the bootstrap access code at startup.
 ///
-/// c-bootstrap-dev round 3 crash-safe + correct re-stamp ordering:
+/// c-bootstrap-dev round 3/4 crash-safe and provenance rules:
 ///   * EXPLICIT file/env → write the provenance marker FIRST (fsync'd), then
 ///     re-persist token+stamp ONLY when the code changed or (file) the file's
 ///     mtime is strictly newer than the parsed stamp. An unchanged env, or a
 ///     file older than the stamp, leaves `bootstrap-issued-at` byte-identical —
 ///     an expired code is NOT revived just because the process restarted.
-///   * NON-empty token with no explicit source (programmatic callers) →
-///     hub-generated: write marker removed + persist.
-///   * EMPTY token → load a persisted hub-generated token (or mint one). If an
-///     explicit marker is present the adopt-marker step is deferred until after
-///     a successful bind ([`BootstrapResolution::AdoptAfterBind`]); the token
-///     itself is still loaded.
+///   * EMPTY token with no explicit source → the Hub owns the code: load a
+///     persisted token (or mint one). If an explicit marker is present the
+///     marker removal (and, for a fresh mint, the token write) is deferred
+///     until after a successful bind ([`BootstrapResolution::AdoptAfterBind`]).
+///   * a NON-EMPTY token WITHOUT an explicit source is a configuration error
+///     (round 4): a programmatic caller must not hand in a code and silently
+///     gain rotation authority or wipe an existing explicit marker. Nothing is
+///     written.
 pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, HubError> {
     let data_dir = config.data_dir.clone();
     let token_path = data_dir.join("bootstrap-token");
@@ -190,14 +192,16 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
         return Ok(BootstrapResolution::None);
     }
 
-    // 2) Hub-generated programmatic token (non-empty, no explicit source).
+    // 2) A non-empty token with no explicit provenance is refused: the token
+    //    field is for the operator-supplied code together with a source; the
+    //    Hub mints (empty token) or loads, never adopts a bare caller value.
     if !config.bootstrap_token.is_empty() {
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
-        set_bootstrap_explicit_marker(&data_dir, false)?;
-        persist_bootstrap(&data_dir, &config.bootstrap_token)?;
-        config.bootstrap_source = crate::config::BootstrapSource::Generated;
-        return Ok(BootstrapResolution::None);
+        return Err(HubError::Internal(
+            "bootstrap_token is set without an explicit BootstrapSource; pass \
+             BootstrapSource::ExplicitFile/ExplicitEnv for an operator code, \
+             or leave the token empty for the Hub to mint"
+                .to_owned(),
+        ));
     }
 
     // 3) No configured token: load a persisted one or mint. Marker adoption
@@ -547,6 +551,7 @@ mod tests {
         );
         let mut config = HubConfig::for_test(dir.path().to_path_buf());
         config.bootstrap_token = String::new();
+        config.bootstrap_source = BootstrapSource::Generated;
         resolve_bootstrap(&mut config).expect("resolve");
         assert_eq!(config.bootstrap_token, "legacy-code");
         assert!(
@@ -797,5 +802,39 @@ mod tests {
         let dir = tempfile::tempdir().expect("data dir");
         let err = rotate_bootstrap(dir.path()).expect_err("must refuse without a token");
         assert!(format!("{err}").contains("no bootstrap-token"));
+    }
+
+    /// Round 4 item 1: a non-empty token with the default (Generated) source
+    /// is refused WITHOUT writing anything — in particular an existing
+    /// explicit marker must survive, so rotation keeps refusing.
+    #[test]
+    fn sourceless_token_is_refused_and_leaves_the_marker_intact() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let marker = dir.path().join(BOOTSTRAP_EXPLICIT_MARKER);
+        write_private(&marker, "").expect("marker");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "bare-caller-code".to_owned();
+        config.bootstrap_source = BootstrapSource::Generated;
+        let err = resolve_bootstrap(&mut config).expect_err("sourceless token refused");
+        assert!(
+            format!("{err}").contains("BootstrapSource"),
+            "error explains the provenance requirement: {err}"
+        );
+
+        assert!(marker.is_file(), "the refusal must not remove the marker");
+        assert!(
+            !dir.path().join("bootstrap-token").is_file(),
+            "the refusal must not mint a token"
+        );
+        assert!(rotate_bootstrap(dir.path()).is_err());
+
+        // The same rule applies to the Adopted state (set only by resolution
+        // itself; a caller must not forge it with a value either).
+        let dir2 = tempfile::tempdir().expect("data dir 2");
+        let mut config2 = HubConfig::for_test(dir2.path().to_path_buf());
+        config2.bootstrap_token = "bare-caller-code".to_owned();
+        config2.bootstrap_source = BootstrapSource::Adopted;
+        assert!(resolve_bootstrap(&mut config2).is_err());
     }
 }

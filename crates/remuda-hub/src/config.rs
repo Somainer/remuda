@@ -262,14 +262,22 @@ impl Default for HubConfig {
 }
 
 impl HubConfig {
-    /// Test helper: insecure cookie, generated bootstrap, caller-supplied data dir.
+    /// Test helper: insecure cookie, a FIXED random code with explicit
+    /// operator provenance, caller-supplied data dir.
+    ///
+    /// c-bootstrap-dev round 4: production startup rejects a non-empty
+    /// `bootstrap_token` without an explicit [`BootstrapSource`]; tests and
+    /// the hub_e2e example need a known login code, so they run as an explicit
+    /// source (the provenance marker is written and rotation is refused —
+    /// tests that rotate build their own hub-owned dir via
+    /// [`crate::auth::persist_bootstrap`]).
     pub fn for_test(data_dir: PathBuf) -> Self {
         Self {
             ssh_hosts: crate::ssh_hosts::SshHostOptions::default(),
             data_dir,
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             bootstrap_token: format!("boot-{}", Uuid::new_v4().simple()),
-            bootstrap_source: BootstrapSource::Generated,
+            bootstrap_source: BootstrapSource::ExplicitEnv,
             bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
             enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: false,

@@ -964,7 +964,11 @@ pub async fn create_instance(
     let restart_policy = match &body.restart {
         Some(restart) => {
             if crate::agent_scope::origin(&device) != remuda_protocol::InputOrigin::Human {
-                return Err(HubError::Forbidden);
+                return Err(HubError::ForbiddenReason(
+                    "the restart policy can only be set by a Human creator; \
+                     Agent and Bot origins may not set it (D-057 §6.1)"
+                        .into(),
+                ));
             }
             if restart.max_per_hour < 1 {
                 return Err(HubError::BadRequest(

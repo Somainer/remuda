@@ -279,19 +279,35 @@ pub fn screen_status(screen: &str) -> Option<ScreenStatus> {
     remuda_screen::screen_status(&ScreenGrid::from_raw(&remuda_screen::screen_tail(screen)))
 }
 
-/// `--session-id <uuid>` / `--resume [<uuid>]` from an agent's argv, and
-/// whether a resume flag (`--resume` / `-r`) was present.
+/// `--session-id <uuid>` / `--resume [<uuid>]` / `--continue` (`-c`) from an
+/// agent's argv, and whether a resume flag was present.
 ///
 /// r4: the resume bit is returned even when the value is not a uuid (so
 /// `--resume latest`, `--resume` with no id, or an unparsable id still gate
 /// the transcript as an UNVERIFIABLE resume rather than a fresh session). The
 /// session id is `Some` only for a uuid-shaped value usable to locate the
 /// deterministic transcript.
+///
+/// r5 item 3: `--continue` / `-c` resume the most recent session and take NO
+/// value: they set the resume bit WITHOUT consuming the next argv token (a
+/// leading prompt like `claude -c "fix this"` must keep its prompt).
 fn session_id_from_argv(argv: &[String]) -> (Option<String>, bool) {
     let mut is_resume = false;
     let mut session_id: Option<String> = None;
     let mut iter = argv.iter().skip(1);
     while let Some(arg) = iter.next() {
+        // Boolean resume flags (`--continue`, `-c`): no value ever — including
+        // an inline `=…`, which is ignored — and the next argv token is left
+        // untouched so it stays a prompt.
+        if let Some((flag, _inline)) = arg.split_once('=') {
+            if is_boolean_resume_flag(flag) {
+                is_resume = true;
+                continue;
+            }
+        } else if is_boolean_resume_flag(arg) {
+            is_resume = true;
+            continue;
+        }
         let value = match arg.split_once('=') {
             Some((flag, inline)) if is_session_flag(flag) => {
                 if is_resume_flag(flag) {
@@ -317,11 +333,19 @@ fn session_id_from_argv(argv: &[String]) -> (Option<String>, bool) {
 }
 
 fn is_session_flag(flag: &str) -> bool {
-    matches!(flag, "--session-id" | "--resume" | "-r")
+    matches!(
+        flag,
+        "--session-id" | "--resume" | "-r" | "--continue" | "-c"
+    )
 }
 
 fn is_resume_flag(flag: &str) -> bool {
-    matches!(flag, "--resume" | "-r")
+    matches!(flag, "--resume" | "-r" | "--continue" | "-c")
+}
+
+/// A resume flag that is purely boolean and never followed by a value token.
+fn is_boolean_resume_flag(flag: &str) -> bool {
+    matches!(flag, "--continue" | "-c")
 }
 
 /// Resume provenance parsed from one process's raw `ps args=` line. Returns
@@ -330,43 +354,6 @@ fn is_resume_flag(flag: &str) -> bool {
 #[must_use]
 pub(crate) fn resume_provenance(args: &str) -> (Option<String>, bool) {
     session_id_from_argv(&split_argv(args))
-}
-
-/// Wall-clock instant a local process started (its `starttime` since boot).
-///
-/// Used to derive a verifiable resume boundary for an agent discovered only
-/// after it launched (a `claude --resume` typed into a login shell): transcript
-/// records at/after this instant are the process's own, older ones are history.
-/// Linux reads `/proc/stat` btime and `/proc/<pid>/stat` starttime; returns
-/// `None` where the platform exposes neither, in which case the caller bounds
-/// conservatively at detection-time EOF (no history replay, possibly late).
-#[cfg(target_os = "linux")]
-#[must_use]
-pub fn process_started_at(pid: i32) -> Option<time::OffsetDateTime> {
-    if pid <= 0 {
-        return None;
-    }
-    let boot_secs: i64 = std::fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())?;
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm (field 2) can contain spaces/parens; the remaining fields start
-    // after the final ')'. starttime is field 22 overall → index 19 after comm.
-    let after = stat.rsplit_once(')')?.1.split_whitespace();
-    let starttime_ticks: f64 = after.clone().nth(19)?.parse().ok()?;
-    // USER_HZ is 100 on every Linux platform Remuda targets; sysconf would need
-    // a direct libc link for no real portability gain.
-    const CLK_TCK: f64 = 100.0;
-    let secs = boot_secs as f64 + starttime_ticks / CLK_TCK;
-    time::OffsetDateTime::from_unix_timestamp_nanos((secs * 1_000_000_000.0) as i128).ok()
-}
-
-/// Process start time is not derivable portably off Linux.
-#[cfg(not(target_os = "linux"))]
-#[must_use]
-pub fn process_started_at(_pid: i32) -> Option<time::OffsetDateTime> {
-    None
 }
 
 fn looks_like_uuid(value: &str) -> bool {
@@ -715,6 +702,34 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
                 "{args}"
             );
         }
+    }
+
+    #[test]
+    fn continue_flags_are_resume_without_consuming_the_prompt_token() {
+        // r5 item 3: `--continue` / `-c` resume the most recent session and
+        // take no value, so a leading prompt token is preserved.
+        for args in ["claude --continue", "claude -c"] {
+            let found = detect(&rows(&[(7, args)]), None).expect("detected");
+            assert!(found.resume, "{args} is a resume");
+            assert_eq!(found.session_id, None, "{args} carries no session id");
+        }
+        // The token after the boolean flag is a PROMPT, not a session id, and
+        // is never consumed: a uuid-shaped prompt must not bind a transcript.
+        for args in [
+            "claude -c 04b95a78-e876-4212-aa9c-a6482f30f583",
+            "claude --continue fix the build",
+        ] {
+            let found = detect(&rows(&[(7, args)]), None).expect("detected");
+            assert!(found.resume, "{args}");
+            assert_eq!(
+                found.session_id, None,
+                "the prompt token is not an id: {args}"
+            );
+        }
+        // `--continue=` is treated as the boolean flag (inline value ignored).
+        let found = detect(&rows(&[(7, "claude --continue=true")]), None).expect("detected");
+        assert!(found.resume);
+        assert_eq!(found.session_id, None);
     }
 
     #[test]

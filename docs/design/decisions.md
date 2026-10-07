@@ -36,7 +36,7 @@
 | D-055 | 2026-09-25 | **命令重放按操作分叉：`instance.send` 可重放，`instance.configure` 不可重放。** 同一 commandId 重放 `instance.send` 继续用于恢复丢失响应：返回存储原记录，对仍排队的行恰好转发一次（G1/G2 不变）。`instance.configure` 的 spec merge 只在首次 POST 发生且只发生一次，重放永不再次 merge：终态行（accepted/settled）原样返回存储记录（含首次 merge 失败时持久化的原始 500 与原始 body）；原始结果尚未持久化（转发仍在飞）时返回明确的 409「still in flight」并指引轮询 `GET …/commands/{commandId}`；离线排队（`forwarded=0`）的 configure 重放返回明确 409，要求客户端换用新 commandId 发新命令，绝不代为转发。理由：web 离线 outbox 只重放 send，configure 重放无法闭合「重复 merge / 首次 500 重放成 200 / 并发同 id 双 merge / 排队行重放被转发」四类边角。配套：`GET /v1/instances/{id}/commands/{commandId}` 在转发尝试进行中绑定到**本次尝试**发布的终态行（尝试尚未开始时如实返回 pending 的 `queued`/`forwarded=false`），永不先报 `forwarded=true` 再报回滚后的 `forwarded=false`。 | coordinator（c-configfix） | `protocol.md §2.5`；D-055 任务 B（send 重放） |
 | D-056 | 2026-10-05 | **Claude ultracode 是正交的会话开关（Claude ultracode is an orthogonal session toggle）：effort 档位与 ultracode 端到端是两条独立的轴，按 Claude Code 版本门控。** Claude Code 2.1.284 起 ultracode 不再强制 xhigh，在任意档都保持开启；2.1.203–2.1.283 是耦合基线（开 ultracode = xhigh，选任何档即关）。(1) wire `EffortSelection{name, ultracode}` 不变，但在 ≥2.1.284 上 `ultracode` 不再蕴含 xhigh；旧名 `ultracode` 只作输入别名，读入为 `{xhigh, true}`。(2) launch：≥2.1.284 发 `--effort <level>`，并把 `"ultracode": true` 写进**同一份** per-launch settings overlay（两个 `--settings` 不合并，后出现的整份胜出）；2.1.203–2.1.283 只有 `{xhigh, true}` 可发 `--effort ultracode`，其余组合以 `InvalidLaunchSpec` 拒绝并点名版本；低于 2.1.203 或版本读不出时，任何 `ultracode: true` 都拒绝；版本取 pinned binary 的 `--version`；`--resume` 不恢复 ultracode，resume launch 须再带一次。(3) 会话内：档位走 `/effort <level>`，保留确认框门控（2.1.289 上不弹框）；开关走 `/effort ultracode on\|off`，没有确认框；每次 configure 至多两条命令，档位在前；耦合版本上开 = 单独一条 `/effort ultracode`（仅 `{xhigh, true}`，不先发会保存默认档的 `/effort xhigh`），关 = `/effort <level>`。(4) 回读：档位读 assistant `effort`/`perTurnEffort`；开关只读 verdict 与 `ultra_effort_enter`/`ultra_effort_exit` 附件，且只认本进程产生的记录（resume 重放的旧 verdict 不算），≥2.1.284 上在任意档锁存；版本读 transcript 的 `version`；拒绝映射为稳定 reason（`ultracode-workflows-disabled`、`ultracode-unavailable-for-model`、`env-override`、`dialog-kept`、`invalid-argument`）；被 clamp 的 accept 报 clamp 后的档；切换失败只是这次 configure 的结局，不结束会话，可以重试。(5) UI：Claude 五档滑杆 + 独立的 Ultracode 开关，芯片显示 `<level> · ultracode`；不可用时开关禁用并给出原因，模型拒绝只对那个模型禁用、换模型后重新启用；耦合版本上开关注明以 xhigh 运行。(6) 默认档按模型（官方文档：Opus 5.5 / Sonnet 5.5 为 medium，Opus 4.7 为 xhigh，其余为 high），不得把任何一档标成通用默认。(7) `CLAUDE_CODE_EFFORT_LEVEL` 继续从子进程剥离。取代 D-028a 第 (5) 项中「ultracode ≡ xhigh + dynamic workflow」的口径。per-task / 供给层的 ultracode 请求是所有者的未决问题，本条不定。 | coordinator（c-effortadr，docs-only）；会话级开关为所有者现行口径 | [evidence/effort-sync-4.md](./evidence/effort-sync-4.md)（2.1.289 实测）；Claude Code 官方文档 model-config / cli-reference / settings-reference / workflows 与 2.1.284 changelog；effort-sync-2/3（耦合基线）；D-028、D-028a |
 | D-057 | 2026-10-05 | **main agent = an ordinary claude-sdk instance holding address-owner on the always-on intranet Hub**; lineage continuation (restart only on Node-attested process loss or start failure, any close pauses, Resume only from paused); fence transaction F is the Hub admission boundary, Nodes apply fences eventually and every pre-fence operation gets a truthful outcome; direct RPCs share one initiator-aware boundary; push suppressed only for interactions routed to an effectively running Agent parent, lifted when it stops running; no special permission design (D3). **Owner amendments OA1–OA6 (same day)**: an Agent-created child may turn its harness's permission control off only if its Agent creator runs with it off, and an omitted mode inherits the creator's (the one change to the Agent-origin permission rules, Hub and Node together); the seat's mode and grants are creation-time configuration with no stated default; D-051(b) amended so questions and plan reviews reach the Agent parent even under bypass, approvals stay human-only; failed is not the process exiting (only process-end evidence is terminal; other failures are retryable in place and never restart; only settled root-turn end evidence sets activity idle (a root StopFailure counts only once protocol §5.6 settles it, otherwise the turn stays unknown and held prompts do not flush), while subagent, workflow, configure and diagnostic failures leave it unchanged; C1 restarts only on process loss or start failure) | owner + coordinator | [main-agent.md](./main-agent.md) |
-| D-059 | 2026-10-07 | **回答栅栏（answer fence）proposed——待所有者拍板：让「回答/按键能否到达一个仍在运行的进程」可验证。** 三个从未合并的串行域（SQLite writer、出站 registry/link FIFO、每个进程的内存状态）此前让逐调用点加固失败四轮；本决策把三者收进同一顺序：所有者令牌（host+实例+nodeEpoch+processGeneration，由 Node 盖在 journal 上，客户端提示永不参与授权）、单一 writer 派发口（`Store::dispatch_answer` 无 await、claim 先于入队落盘）、出站写闸（回答帧在交给 socket 前对在飞 attempt 做 CAS，线性化点从入队移到「写出决定」）、Node 每实例 `RunGate`（放行与按键持共享读锁，进程结束分类器的证据取独占锁，按键 `tty.write`/`instance.keys` 同受 AF-K 栅栏）、durable link 身份单一来源 + hello 有序采纳（`hello_seq`，只有当前采纳的 link 能登记）、卡状态机（`invalidated`/`unknown` 是关闭态而非吸收态，可被 Node journal 证据细化为 `answer-committed`/`expired`）、commandId 即身份（无 TTL，对账器重驱）、单 Hub 进程硬前提（`hub.lock` fail-closed）、Hub 无证据自主结束只读本进程单调时钟（Hub 停机不计失联）。只在**进程结束证据**出现时栅栏才收紧（对齐 D-057 OA6：turn/subagent/workflow/configure/diagnostic 失败都不触发，判定交 c-cardsettle 的共享进程结束分类器）。实现切片已列但未排期，c-cardsettle（终态结清、settlement 总线）与 hub.lock 是前置。 | coordinator（c-answerfence，proposed docs-only） | 本 ADR；D-055、D-057 OA6、[hub-topology §3](./hub-topology.md)、[protocol.md §2.5/§2.6/§5.6/§6.1/§7.2/§9.1](./protocol.md)；依赖 c-cardsettle |
+| D-059 | 2026-10-07 | **回答栅栏（answer fence）proposed——待所有者拍板：让「回答/按键能否到达一个仍在运行的进程」可验证。** 三个从未合并的串行域（SQLite writer、出站 registry/link FIFO、每个进程的内存状态）此前让逐调用点加固失败四轮；本决策把三者收进同一顺序：所有者令牌（host+实例+nodeEpoch+processGeneration，由 Node 盖在 journal 上，客户端提示永不参与授权）、单一 writer 派发口（`Store::dispatch_answer` 无 await、claim 先于入队落盘）、出站写闸（回答帧在交给 socket 前对在飞 attempt 做 CAS，线性化点从入队移到「写出决定」）、Node 每实例 `RunGate`（放行与按键持共享读锁，进程结束分类器的证据取独占锁，按键 `tty.write`/`instance.keys` 同受 AF-K 栅栏）、durable link 身份单一来源 + hello 有序采纳（`hello_seq`，只有当前采纳的 link 能登记）、卡状态机（`invalidated`/`unknown` 是关闭态而非吸收态，可被 Node journal 证据细化为 `answer-committed`/`expired`）、commandId 即身份（无 TTL，对账器重驱）、单 Hub 进程硬前提（`hub.lock` fail-closed）、**无 Node 证据时时钟清扫只投影非终态的「联系丢失/未知」、绝不自主结束实例**（Hub 停机不计失联；结束只来自共享进程结束分类器）。只在**进程结束证据**出现时栅栏才收紧（对齐 D-057 OA6：turn/subagent/workflow/configure/diagnostic 失败都不触发，判定交 c-cardsettle 的共享进程结束分类器）。实现切片已列但未排期，c-cardsettle（终态结清、settlement 总线）与 hub.lock 是前置。 | coordinator（c-answerfence，proposed docs-only） | 本 ADR；D-055、D-057 OA6、[hub-topology §3](./hub-topology.md)、[protocol.md §2.5/§2.6/§5.6/§6.1/§7.2/§9.1](./protocol.md)；依赖 c-cardsettle |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -1596,7 +1596,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 
 main 上的回答路径有三段，分别属于三个从未合并的串行域：
 
-1. **SQLite writer**——claim 与终态投影。
+1. **SQLite writer**——今天只做终态投影，没有「发送前 claim」：`answer_interaction` 在到达 owner 之前不提交任何答案（`crates/remuda-hub/src/interactions.rs:592` 的注释明示 "Never commit an answer in the Hub before the owner is reached"），writer 只在 journal 出现 answered/expired 时把 pending 行更新成终态（`crates/remuda-hub/src/store.rs:8565`，`UPDATE ... WHERE state = 'pending'`）。durable 的发送前 claim 是本 ADR 决策 2 引入的**新行为**，不是 main 现状。
 2. **出站 registry + 每个 link 的有界 mpsc FIFO**——回答帧在这里排队、写出。
 3. **每个进程的内存状态**——driver broker、PTY 提示队列。
 
@@ -1610,7 +1610,7 @@ main 上的回答路径有三段，分别属于三个从未合并的串行域：
 
 **2. 一个派发口。** 只有 writer job `Store::dispatch_answer` 能为 `interaction.answer` 建立可送达的尝试（attempt）：从 SQLite 重新校验卡、所有者与当前 link，durable claim 提交后再在**同一个没有 await 的 writer job** 里入队。任何没经这个口登记的 `interaction.answer` 帧，写闸一律丢弃。`instance.respond`/`interaction.respond` 两个直连方法与 commands 端点的回答 op 在机械层就被拒（`ConnectedNodes::call`/`notify` 早报错、HTTP 400），不靠调用点自觉。
 
-**3. 一个出站写闸，线性化点是「写出决定」。** 每个回答帧在交给 socket 字节之前，由写循环对它的 attempt 状态做一次原子 CAS：`Queued → Written` 成功才写字节；结束该卡的事务（终态结清、epoch 退役、link 被取代）在提交前把在排队的 attempt CAS 成 `Revoked`，永不写出。于是只有两种顺序：写出决定早于结束——字节可能在结束之后才到达，卡如实记 `unknown`（可能已送达）；写出决定晚于结束——帧永不写出，卡记 `invalidated`（证明未发）。线性化点不再是入队。
+**3. 一个出站写闸，线性化点是「写出决定」。** 每个回答帧在交给 socket 字节之前，由写循环对它的 attempt 状态做一次原子 CAS：`Queued → Written` 成功才写字节；**结束该卡的事务只有进程结束一类**（c-cardsettle 终态结清、epoch 退役），提交前把在排队的 attempt CAS 成 `Revoked`、永不写出。于是只有两种顺序：写出决定早于结束——字节可能在结束之后才到达，卡如实记 `unknown`（可能已送达）；写出决定晚于结束——帧永不写出，卡记 `invalidated`（证明未发）。**换 link 不属于、也不触发任何结束该卡的事务**（见决策 6）：`adopt_link` 只把旧 link 上仍在排队的 attempt CAS 成 `Revoked`（证据仅为这些字节没有写上旧 socket），卡既不记 `invalidated` 也不记 `unknown`，保持 pending/可答；同一 commandId 在采纳的 link 上由对账器对账或重驱（决策 7），送达之后才可能出现 `unknown`/`answer-committed`。线性化点不再是入队。
 
 **4. Node 是「答案能到达哪个进程」的最终裁决者。** 每个实例一个 `RunGate`：回答放行与 Hub 按键写入持同一把共享读锁；**只有共享进程结束分类器接受的进程结束证据**取独占写锁，先置 `ending`（新请求立即被拒）、排空在飞的放行（有界 30 s），再置 `ended` 并清退该 generation 的 broker 票。令牌不符（实例/epoch/代不对、门已结束）返回 -32029 `INTERACTION_STALE`，放行与按键都不发生。Node 在服务一条 link 的任何请求之前先应用 hello 里的 `endedGenerations`，所以**进程结束证据**（而不是失联）发生时即使还没有新 link 也能立即拦住后续帧。`endedGenerations` 只携带进程结束判定；失联（host-lost/探测失败/link 断开）**绝不**进入它（见决策 10）。
 
@@ -1620,11 +1620,11 @@ main 上的回答路径有三段，分别属于三个从未合并的串行域：
 
 **换 transport link 与结束交互是两件事，必须分开**（对齐 OA6）：`adopt_link` 取代旧 link 时，只把旧 link 上**仍在排队**的 attempt CAS 成 `Revoked`（写闸因此不把这些字节写到旧 socket），但**不结清卡、不退役 epoch、不置 RunGate、不写 `endedGenerations`**；卡与 claim 保持在飞/可对账态，对账器在新 link 上用**同一 commandId** 重驱（决策 7），在新 link 送达后正常记 `unknown`/`answer-committed`。只有进程结束证据才结束交互。终态吸收只作用于**进程结束的终态**：journal/可信 inventory 里由分类器接受的 exited/failed 是吸收态，旧 socket 不能把它改回 running；失联投影（决策 10）不是终态、不吸收、可被重连证据覆盖。
 
-**7. commandId 是回答的身份，没有 TTL。** 同 id 同答案 = 重放/在飞，同 id 异答案 = 409，在飞 = 202；每个响应都带回 commandId（D-055 语义）。「在飞」只看进程内的 `Inflight` 表：Hub 崩溃使 attempt 自然变陈旧，对账器在每次 link 采纳后与周期 tick 上用同一 commandId 重驱，客户端丢了 id 卡也能收敛。
+**7. commandId 是回答的身份，没有 TTL。** 同 id 同答案 = 重放/在飞，同 id 异答案 = 409 `INTERACTION_ANSWER_CONFLICT`，在飞 = 202；每个响应都带回 commandId（D-055 语义）。「在飞」只看进程内的 `Inflight` 表：Hub 崩溃使 attempt 自然变陈旧，对账器在每次 link 采纳后与周期 tick 上用同一 commandId 重驱，客户端丢了 id 卡也能收敛。
 
 **8. 单 Hub 进程是硬前提。** `Store::open` 在打开任何 SQLite 连接、跑 migrate 之前取 `LOCK_EX|LOCK_NB` 的 `hub.lock`，失败即拒绝启动；fd 与 Store 同生命周期。有了它，「库只有一个写者」「Inflight 为空即全部陈旧」「不需要 boot id」这些论证才成立。它是单机锁，不挡多机各持一份数据副本的情形（那由部署流程杜绝）。
 
-**9. 卡关闭态可被 Node 证据细化。** `invalidated` 与 `unknown` 是**关闭态**（不可再答、不回 pending），但不是吸收态：Node 本地回答者与升级前已在途的回答不经过 Hub 的 claim，它们的 `interaction.answered`/`interaction.expired` journal 可以把这两个状态细化为 `answer-committed`/`expired`。Hub 只为自己的派发作保，不替 Node 本地回答者声称「没发」。Node 的 journal 是「回答是否被应用」的权威证据。
+**9. 卡关闭态可被 Node 证据细化。** `invalidated` 与 `unknown` 是**关闭态**（只由决策 3 的进程结束事务产生——换 link 既不产生也不改变它们；不可再答、不回 pending），但不是吸收态：Node 本地回答者与升级前已在途的回答不经过 Hub 的 claim，它们的 `interaction.answered`/`interaction.expired` journal 可以把这两个状态细化为 `answer-committed`/`expired`。Hub 只为自己的派发作保，不替 Node 本地回答者声称「没发」。Node 的 journal 是「回答是否被应用」的权威证据。
 
 **10. Hub 失联只产生非终态的「未知/不可达」投影；栅栏只随进程结束证据收紧（OA6）。** host-lost（link 断开后观测宽限耗尽）与 create-never-acknowledged 两个清扫**不是进程结束证据**：进程可能仍在运行，所以它们绝不关门、绝不写 tombstone、绝不进 `endedGenerations`、绝不吸收章节，对回答与按键都是**非终态**的。它们只依据本 Hub 进程真正观测到的单调时间，把 host/实例投影成一个明确的「联系丢失（contact-lost）/未知（unknown）」状态：非 SSH host 从本进程观测到 link 断开（或进程启动）起算，SSH host 从本进程第一次探测失败起算；持久化的 `offline_since`/`last_seen_at`/`created_at` 降为展示字段；启动时（绑定监听端口之前）不跑这两个清扫；Hub 自己的停机与墙钟跳变都不计入宽限。这个投影的语义是：
 
@@ -1644,13 +1644,13 @@ main 上的回答路径有三段，分别属于三个从未合并的串行域：
 
 - 进程退出（exit/退出码/信号）、PTY 或 tty 消失、启动根本没有开始、Node 报告实例已不存在——这些才结束 run、关门、结清卡、进 `endedGenerations`。
 - 根会话回合失败（含未按 protocol §5.6 结算的 StopFailure）、subagent/workflow 失败、configure 失败、诊断失败，都**不**关门、不退票、不拒后续回答或按键；它们各自记录在自己的范围里，回合可原地重试。
-- **联系丢失不是进程结束**：host-lost（单调时钟宽限耗尽）、SSH 探测失败、link 断开/被取代，都只产生决策 10 的非终态「联系丢失/未知」投影——无 tombstone、无 RunGate 关门、无 `endedGenerations`、无章节吸收；回答与按键保持可对账/可重驱，进程存活则继续、确有进程结束证据才关门（决策 2 换 link 同理：只撤旧 link 的在排队 attempt，不结束卡）。
+- **联系丢失不是进程结束**：host-lost（单调时钟宽限耗尽）、SSH 探测失败、link 断开/被取代，都只产生决策 10 的非终态「联系丢失/未知」投影——无 tombstone、无 RunGate 关门、无 `endedGenerations`、无章节吸收；回答与按键保持可对账/可重驱，进程存活则继续、确有进程结束证据才关门（决策 6 换 link 同理：只撤旧 link 的在排队 attempt，不结束卡）。
 - 「什么算进程结束证据」由 **c-cardsettle 引入的共享进程结束分类器**唯一判定；本 ADR 不另立一套终态口径，失联清扫也不得绕过它。c-cardsettle 落地前本 ADR 不得实现。
 
 ### 不变量
 
 - **End 的定义**：End(I/X) 只在共享进程结束分类器接受进程结束证据时成立。联系丢失（host-lost/探测失败/link 被取代）**不是** End：不关门、不退票、不进 `endedGenerations`、不吸收。
-- **AF（回答）**：对每张卡 I，任何「回答帧的字节在 End(I) 提交之前写出」的决定，都先于 End；End(I) 之后不再有写出决定。写闸先赢卡为 `unknown`，结束先赢卡为 `invalidated`（not-sent）。Node 只在持有令牌所指、尚未结束的 run 的读锁时放行；门在分类器确认该 run 结束后才拒绝。换 link 撤掉的只是旧 link 在排队的 attempt，卡本身不 End。
+- **AF（回答）**：对每张卡 I，任何「回答帧的字节在 End(I) 提交之前写出」的决定，都先于 End；End(I) 之后不再有写出决定。写闸先赢卡为 `unknown`，结束先赢卡为 `invalidated`（not-sent）。Node 只在持有令牌所指、尚未结束的 run 的读锁时放行；门在分类器确认该 run 结束后才拒绝。换 link（决策 6）撤掉的只是旧 link 在排队的 attempt——证据仅是那些字节没写上旧 socket；卡不记 `invalidated`/`unknown`、不 End，保持 pending/可答，凭同一 commandId 在采纳的 link 上对账或重驱。
 - **AF-K（按键）**：对每个实例 X，任何「按键帧的写出决定」都先于 End(X)；End(X) 之后 Node 对 Hub 按键持门拒绝，写闸对缺失/已结束的 `RunFence` 标记一律不写。联系丢失期间 `RunFence` 仍非 `Ended`。
 - 声称未发（`Revoked`/`invalidated`）必须有 CAS 或 fd 证据；不确定一律记 `unknown`，绝不推断为未执行，更不把「联系丢失」当成「进程结束/未执行」。
 - 残余：写出决定先于 End 的字节，可能在 End 之后才到达 Node；Node 的门只在分类器确认该 run 结束后才能拒绝这类帧。
@@ -1667,8 +1667,8 @@ main 上的回答路径有三段，分别属于三个从未合并的串行域：
 
 ### wire 与兼容（增量）
 
-- `InteractionRequestKey.nodeEpoch?`；hello `features:["answer-fence-v1"]` 与回复的 `endedGenerations:[{instanceId,processGeneration}]`（**只含进程结束判定，不含失联**）；`interaction.answer` 参数加 `owner?`、`dispatch?`；-32029 带 `data{reason,persistedState?}`、-32004 带 `data.winner`；迟来的 hello 被拒回**新码 -32047 `SUPERSEDED_HELLO`（`data.reason="superseded-hello"`，非鉴权、可重试用新 hello 重连）**，不再用 -32000 `UNAUTHENTICATED`。
-- HTTP 新增 202 `INTERACTION_IN_PROGRESS`、409 `INTERACTION_NOT_ANSWERABLE`、410 `INTERACTION_ENDED`（关闭态 `invalidated`/`unknown`/`expired`/`answer-committed` 用 410，是**新分支**；**没有行 / 没有 host 的 miss 仍是 404**，两者不混用）、以及一个**非终态可重试**的 503 `INTERACTION_TEMPORARILY_UNAVAILABLE`（联系丢失/宽限耗尽时回答或按键排队失败用；客户端用同一 commandId 稍后重试，绝不当成「进程已结束」）；同 id 异答案仍是 409 `COMMAND_ID_CONFLICT`。commands 端点回答 op 回 400 `ANSWER_VIA_INTERACTIONS`；**进程结束证据**下的终态实例按键回 410 `INSTANCE_ENDED`（失联下按键回非终态、可重试，而不是 410）；follow 回 `tty.diagnostic{reason:"instance-ended"}`（仅进程结束）。
+- `InteractionRequestKey.nodeEpoch?`；hello `features:["answer-fence-v1"]` 与回复的 `endedGenerations:[{instanceId,processGeneration}]`（**只含进程结束判定，不含失联**）；`interaction.answer` 参数加 `owner?`、`dispatch?`；-32029 带 `data{reason,persistedState?}`、-32024 带 `data.winner`；迟来的 hello 被拒回**新码 -32047 `SUPERSEDED_HELLO`（`data.reason="superseded-hello"`，非鉴权、可重试用新 hello 重连）**，不再用 -32000 `UNAUTHENTICATED`。
+- HTTP 新增 202 `INTERACTION_IN_PROGRESS`、409 `INTERACTION_ANSWER_CONFLICT`、410 `INTERACTION_ENDED`（关闭态 `invalidated`/`unknown`/`expired`/`answer-committed` 用 410，是**新分支**；**没有行 / 没有 host 的 miss 仍是 404**，两者不混用）、以及一个**非终态可重试**的 503 `INTERACTION_TEMPORARILY_UNAVAILABLE`（联系丢失/宽限耗尽时回答或按键排队失败用；客户端用同一 commandId 稍后重试，绝不当成「进程已结束」）。**同 id 异答案的 HTTP 回答回新的 409 `INTERACTION_ANSWER_CONFLICT`，绝不复用 `INTERACTION_NOT_ANSWERABLE`**——后者在 [protocol.md §9.1](./protocol.md) 与 `crates/remuda-protocol/src/error.rs:42` 已绑 JSON-RPC -32032（需要原生 TUI 或无支持的 responder，retry never）；Node 面上同 commandId 异 payload 仍是 JSON-RPC -32024 `COMMAND_ID_CONFLICT`（带 `data.winner`），HTTP 名与 Node RPC 名分属两层。commands 端点回答 op 回 400 `ANSWER_VIA_INTERACTIONS`；**进程结束证据**下的终态实例按键回 410 `INSTANCE_ENDED`（失联下按键回非终态、可重试，而不是 410）；follow 回 `tty.diagnostic{reason:"instance-ended"}`（仅进程结束）。
 - 兼容：新 Hub/旧 Node 默认 `legacy_nodes=refuse`，不发帧、回 409（`allow` 仅留一个升级窗口）；旧 Hub/新 Node 时 Node 非严格模式，缺 owner 仍做门的 ended 检查，按键门照常。
 
 ### 否决方案（择要）
@@ -1694,17 +1694,17 @@ registry 锁外加独立 DB claim（跨域，reconcile 先于 slot 切换提交�
 
 | 决策 | 关键测试（实现时） |
 |---|---|
-| 2/3 派发口+写闸 | writer FIFO 在 claim-提交/入队/写出 CAS 各点的竞态（已写出→`unknown`，仍排队→`invalidated` 零帧）；塞入未登记帧被丢弃；commands 回答 op 400。**注：派发口「发送前先 claim」在 main 上是新行为**（main 的 writer 只在收到 pending journal 行后投影），测试须覆盖 claim 先于任何入队字节 |
+| 2/3 派发口+写闸 | writer FIFO 在 claim-提交/入队/写出 CAS 各点的竞态（已写出→`unknown`，仍排队→`invalidated` 零帧；**两态只由进程结束事务产生，`adopt_link` 撤掉旧 link 在排队 attempt 后卡仍 pending、不出现这两个态**，见决策 6 行）；塞入未登记帧被丢弃；commands 回答 op 400。**注：派发口「发送前先 claim」在 main 上是新行为**（main 的 writer 只在收到 pending journal 行后投影），测试须覆盖 claim 先于任何入队字节 |
 | 4 RunGate（仅进程结束） | 错实例/错 epoch/错代/已结束 → -32029；放行停在 driver 内并发 `end_run` 时新回答被拒、排空超时；`endedGenerations`（只含进程结束）到达后首帧即被拒；锁序 debug 断言；**host-lost/探测失败/换 link 不关门、不进 endedGenerations、回答与按键仍可对账** |
 | 5 AF-K 按键 | **进程结束**实例经 worker answer/commands/follow/fleet 全部零帧、410/`tty.diagnostic`；写闸与 End 的两种 CAS 顺序；本地终端输入不受影响；**失联下按键回非终态可重试、RunFence 不 Ended** |
 | 6 link 有序但不结束交互 | 迟来 hello 被 **-32047**（非 -32000）拒并关 socket；迟登记被拒；旧 link journal 被拒；**换 link 只撤旧 link 在排队 attempt、卡保持 pending 且同一 commandId 在新 link 重驱成功**；进程结束证据才结清；终态 inventory 报 running 被吸收；SSH supervise 不退出 |
-| 7 重放 | 崩溃后同 id 自动重驱收敛；**同 id 异答案 409**；超时在飞 202；无 id 由对账器收敛；writer 队列满返回 NODE_BUSY 且 claim 回退 |
+| 7 重放 | 崩溃后同 id 自动重驱收敛；**同 id 异答案 409 `INTERACTION_ANSWER_CONFLICT`**；超时在飞 202；无 id 由对账器收敛；writer 队列满返回 NODE_BUSY 且 claim 回退 |
 | 8 hub.lock | 同 data_dir 第二个 Store 立即失败、未跑 migrate、未碰 link |
 | 9 关闭态细化 | 升级窗口无所有者卡先 `invalidated` 后被重放的 answered 细化；稳态 answered/expired 细化；均不可再答 |
 | 10 失联非终态 | 持久化时间戳改到 1 h 前/墙钟前跳，重建后宽限内不结束、满宽限只投影「联系丢失/未知」（无 tombstone、无 endedGenerations、卡仍 pending、按键不被 410 拒、回可重试暂时不可达）；重连带存活证据则继续、带进程结束证据才关门；SSH 旧 `daemon-unreachable` 不沿用；requested 只在当前 link 计时；断线重连不计时 |
 | 11 settlement | 无 seq 控制帧触发重读、不进 journal、不标 stale；任意 state 都触发刷新 |
-| 12 错误码 | -32047 迟来 hello 走非鉴权路径、客户端重连而非重认证；410 仅关闭态、no-row/no-host miss 仍 404；失联回非终态 503 |
-| 客户端 | 202/410/503/409 文案与 commandId 复用（410=已结束、503=稍后同 id 重试）；settlement 帧驱动列表/离队态刷新（web vitest） |
+| 12 错误码 | -32047 迟来 hello 走非鉴权路径、客户端重连而非重认证；410 仅关闭态、no-row/no-host miss 仍 404；同 id 异答案 HTTP 回 409 `INTERACTION_ANSWER_CONFLICT`、不与 -32032 `INTERACTION_NOT_ANSWERABLE` 混用；失联回非终态 503 |
+| 客户端 | 202/410/503/409 文案与 commandId 复用（410=已结束、503=稍后同 id 重试、409=`INTERACTION_ANSWER_CONFLICT` 同 id 异答案）；settlement 帧驱动列表/离队态刷新（web vitest） |
 
 测试缝（`#[cfg(any(test, feature="test-seams"))]`）：writer 线程阻塞点（claim 校验后、提交后、入队后、结束 CAS 前）、会话任务阻塞点（采纳前、登记前）、写循环 CAS 阻塞点、Node `ParkedDriver`/`ParkedTty`、tokio 暂停时钟、完成类测试必须经真实 waiter 投递回复并断言投递计数（不得预置 journal answered）。
 

@@ -30,6 +30,7 @@ import {
   headerElapsed,
   layoutRows,
   projectWorkflow,
+  PROVISIONAL_HINT,
   runStatus,
   type WfAgent,
   type WfCard,
@@ -360,6 +361,9 @@ function FoldToggle({
         aria-controls={folded.map((a) => `fold-${phaseId}-${a.id}`).join(" ")}
         onClick={onToggle}
       >
+        <span className={css.moreCaret} aria-hidden="true">
+          {open ? "▾" : "▸"}
+        </span>
         {foldedLabel(folded, open)}
       </button>
     </li>
@@ -417,7 +421,13 @@ function PhaseBlock({
       >
         <Chevron />
         <span className={css.phaseTitle}>{phase.title}</span>
-        <span className={css.phaseCount}>{phase.countText}</span>
+        <span
+          className={css.phaseCount}
+          data-provisional={phase.provisional ? "1" : undefined}
+          title={phase.provisional ? PROVISIONAL_HINT : undefined}
+        >
+          {phase.countText}
+        </span>
         <span className={css.phaseMeta}>{phase.metaText}</span>
       </button>
       {open ? (
@@ -515,9 +525,11 @@ function DetailedCard({
     snapshotAnchorMs: snapshotAnchorRef.current.at,
   });
 
-  const agentsWord = card.totals.totalKnown
-    ? `${card.totals.done + card.totals.failed + card.totals.killed}/${card.totals.agentsTotal} agents`
-    : `${card.totals.done + card.totals.failed + card.totals.killed} agents`;
+  const terminal = card.totals.done + card.totals.failed + card.totals.killed;
+  // Run alive: "4/4+ agents" (even with all current members done — another
+  // iteration may spawn), and a dynamic run's denominator can grow so the bar
+  // moves backwards; terminal runs show the final count with no +.
+  const agentsWord = `${terminal}/${card.knownCount}${card.provisional ? "+" : ""} agents`;
 
   const onKey = (event: React.KeyboardEvent) => {
     if (event.key === "Escape" && open) {
@@ -546,10 +558,47 @@ function DetailedCard({
         </span>
         <Chip status={card.status} />
         <span className={css.meta}>
-          <span className={css.rail} aria-hidden="true">
+          {/* Real progress bar: terminal members fill the rail; the failed
+              slice is painted red (killed muted), so a 7/8 + 1 failed run does
+              not read as a plain 100%. While the total is unknown the fill is
+              terminal/known and hatched, never a fabricated denominator. */}
+          <span
+            className={css.rail}
+            data-total={card.provisional ? "provisional" : "known"}
+            data-testid="workflow-rail"
+            aria-hidden="true"
+          >
             <span className={css.railFill} style={{ width: `${card.railPct}%` }} />
+            {card.failedPct > 0 ? (
+              <span
+                className={css.railFail}
+                style={{ left: `${card.donePct}%`, width: `${card.failedPct}%` }}
+              />
+            ) : null}
+            {card.killedPct > 0 ? (
+              <span
+                className={css.railKill}
+                style={{ left: `${card.donePct + card.failedPct}%`, width: `${card.killedPct}%` }}
+              />
+            ) : null}
           </span>
-          <span>{agentsWord}</span>
+          <span
+            data-testid="workflow-rail-count"
+            data-provisional={card.provisional ? "1" : undefined}
+            title={card.provisional ? PROVISIONAL_HINT : undefined}
+          >
+            {agentsWord}
+          </span>
+          {card.totals.failed > 0 ? (
+            <span className={css.railBad} data-testid="workflow-rail-failed">
+              {card.totals.failed} 已失败
+            </span>
+          ) : null}
+          {card.totals.killed > 0 ? (
+            <span className={css.railMute} data-testid="workflow-rail-killed">
+              {card.totals.killed} 已终止
+            </span>
+          ) : null}
           {elapsedMs > 0 ? <span>{fmtDuration(elapsedMs)}</span> : null}
           {card.totals.tokens > 0 ? (
             <span>
@@ -563,6 +612,33 @@ function DetailedCard({
           ) : null}
         </span>
       </button>
+      {/* Accessible progress meter, OUTSIDE the disclosure button (a
+          progressbar must not nest in a button). FINAL runs expose a real
+          now/min/max; a LIVE run has no valid range (the denominator can
+          exceed any assumed max — e.g. 101 completions against a default
+          range of 0..100 would be invalid), so provisional runs omit
+          now/min/max entirely and describe progress in valuetext only. */}
+      <div
+        className={css.sr}
+        role="progressbar"
+        aria-label={`Workflow ${card.name} progress`}
+        {...(card.provisional
+          ? {
+              "aria-valuetext": `${terminal} of at least ${card.knownCount} agents done, still running${
+                card.totals.failed > 0 ? `; ${card.totals.failed} failed` : ""
+              }`,
+            }
+          : {
+              "aria-valuemin": 0,
+              "aria-valuemax": card.knownCount,
+              "aria-valuenow": terminal,
+              "aria-valuetext": `${terminal} of ${card.knownCount} agents done${
+                card.totals.failed > 0 ? `; ${card.totals.failed} failed` : ""
+              }`,
+            })}
+        data-testid="workflow-progress-meter"
+        data-provisional={card.provisional ? "1" : "0"}
+      />
       {open ? (
         <div id={bodyId}>
           {running && card.live ? (

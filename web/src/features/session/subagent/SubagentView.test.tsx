@@ -166,4 +166,73 @@ describe("SubagentView drill-in", () => {
     await userEvent.setup().click(screen.getByTestId("subagent-back"));
     expect(screen.getByTestId("parent-session")).toBeTruthy();
   });
+
+  it("folds the settled process into the collapsible group and paints no duplicate thought caret", async () => {
+    const secondCall = obs(5, "tool_call", {
+      nodeId: "n2" as Id,
+      revision: "1",
+      operation: "open",
+      baseRevision: null,
+      toolCallId: "toolu_read1" as Id,
+      parentToolCallId: null,
+      toolName: known("Read"),
+      displayTitle: known("Read"),
+      category: "fs_read",
+      input: known({ file_path: "auth.rs" }),
+      inputTextDelta: null,
+      state: "running",
+      executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+    });
+    const secondResult = obs(6, "tool_result", {
+      nodeId: "n2" as Id,
+      revision: "1",
+      operation: "close",
+      baseRevision: null,
+      toolCallId: "toolu_read1" as Id,
+      stage: "final",
+      outcome: "succeeded",
+      blocks: [{ type: "text", text: "fn ok()" }],
+      structuredResult: known({}),
+      exitCode: known(0),
+      changes: [],
+    });
+    // Assemble sorts by journal seq, so the turn-closing assistant message
+    // must carry a seq after both tool pairs for the compact group to form.
+    const finalLater = obs(7, "message", {
+      nodeId: "m_final2" as Id,
+      messageId: "m_final2" as Id,
+      revision: "1",
+      operation: "close",
+      baseRevision: null,
+      role: "assistant",
+      phase: "final",
+      blocks: [{ type: "text", text: "auth audit complete: 2 findings" }],
+      targetBlock: null,
+      parentToolCallId: null,
+      nativeOrigin: known("assistant"),
+      status: "complete",
+    });
+    vi.spyOn(api, "fetchSubagentTranscript").mockResolvedValue({
+      available: true,
+      meta: { agentId: "sub123" } as never,
+      events: [promptEvent, toolEvent, resultEvent, secondCall, secondResult, finalLater],
+    });
+    renderAt("/s/ins_1/agents/sub123");
+    await waitFor(() => expect(screen.getByTestId("subagent-view")).toBeTruthy());
+
+    const fold = screen.getByTestId("compact-fold");
+    expect(fold).toHaveAttribute("aria-expanded", "false");
+    expect(fold.textContent).toContain("2 次工具");
+    expect(fold.textContent).toContain("▸");
+    expect(screen.getByTestId("compact-fold-wrap").querySelector("[data-testid='tool-card']")).toBeNull();
+
+    await userEvent.setup().click(fold);
+    expect(fold).toHaveAttribute("aria-expanded", "true");
+    expect(fold.textContent).toContain("▾");
+    expect(screen.getByTestId("compact-fold-wrap").querySelectorAll("[data-testid='tool-card']")).toHaveLength(2);
+
+    await userEvent.setup().click(fold);
+    expect(fold).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("compact-fold-wrap").querySelector("[data-testid='tool-card']")).toBeNull();
+  });
 });

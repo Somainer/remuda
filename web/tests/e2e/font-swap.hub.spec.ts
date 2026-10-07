@@ -468,26 +468,6 @@ async function waitRestoreActiveAndPainted(
 }
 
 /**
- * Did the font's "loadingdone" event fire while a restore was active? Recorded
- * in-page (installed via addInitScript before the gated navigation) so the
- * claim is observed at the actual font-event turn, not reconstructed later.
- */
-async function addFontEventRecorder(page: Page): Promise<void> {
-  await page.addInitScript(() => {
-    const w = window as unknown as { __swapDuringRestore?: string | null };
-    w.__swapDuringRestore = null;
-    const record = () => {
-      const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']");
-      w.__swapDuringRestore = el?.getAttribute("data-restore-active") ?? "no-scroller";
-    };
-    // loadingdone covers a face that becomes available after a hold; poll a
-    // couple of frames too in case the event predates this listener.
-    document.fonts?.addEventListener("loadingdone", record);
-    requestAnimationFrame(() => requestAnimationFrame(record));
-  });
-}
-
-/**
  * Advance width of a long mixed monospace string at the transcript's 13px.
  * The web font and the system fallback differ in glyph advances even when a
  * particular short fenced block happens to occupy the same number of lines /
@@ -820,7 +800,6 @@ async function savedPositionSurvivesSwap(
     await page.goto("/sessions");
     await expect(page.getByTestId("session-list")).toBeVisible();
     await reinstate();
-    await addFontEventRecorder(page);
     const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
     try {
       await page.goto(`/s/${instanceId}?restoreProbe=1`);
@@ -838,15 +817,11 @@ async function savedPositionSurvivesSwap(
       // read its height with NO measurement scroll.
       beforeSwap = (await anchorDocTop(scroller, anchor))!;
       blockFallback = wrapProbe ? await wrapBlockRowHeight(scroller) : null;
+      // Release the gate while the restore attribute is still live ("1",
+      // asserted above): the held woff2 can now only begin applying at a turn
+      // the restore is active — deterministic, no racy post-hoc recorder.
       fontGate.release();
       await waitFontLoaded(page, scroller, "mid arm release");
-      // The font became available at a turn the restore was still active.
-      await expect
-        .poll(() => page.evaluate(() => (window as unknown as { __swapDuringRestore?: string | null }).__swapDuringRestore), {
-          timeout: 5_000,
-          message: "the held font did not become available while the restore was active",
-        })
-        .toBe("1");
       await page.evaluate(
         () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))),
       );

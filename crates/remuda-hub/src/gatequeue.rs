@@ -346,66 +346,62 @@ async fn cancel_project_job(
         },
     )
     .await?;
-    match job.state {
-        GateJobState::Queued => {
-            let updated = state
-                .store
-                .mutate_gate_job(&job_id, |row| {
-                    row.state = GateJobState::Canceled;
-                    row.finished_at = Some(now_ts());
-                    row.error = Some("canceled while queued".into());
-                    Some(())
-                })
-                .await
-                .map_err(map_store)?
-                .ok_or(HubError::NotFound)?;
-            journal(&state, &device.id, "gate.canceled", &updated).await;
-            drop_job_refs(&state, &updated).await;
-            Ok(Json(json!(updated)))
+    // D-057 §7.3: the canceller's authority is checked INSIDE the writer job
+    // that moves the row — before any gate.cancel frame — so a request
+    // authenticated before a fence cannot cancel after it. Scheduler-driven
+    // cancels stay unchecked (a started job's follow-ons are never fenced).
+    let was_queued = job.state == GateJobState::Queued;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
+    let updated = state
+        .store
+        .request_gate_job_cancel(&job_id, authority)
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    if was_queued {
+        // A fenced writer cannot reach here; the queued transition is the
+        // terminal canceled write above.
+        if updated.state != GateJobState::Canceled {
+            return Err(HubError::Conflict(format!(
+                "job already {}",
+                updated.state.as_str()
+            )));
         }
-        GateJobState::Running | GateJobState::Canceling => {
-            let updated = state
-                .store
-                .mutate_gate_job(&job_id, |row| {
-                    row.state = GateJobState::Canceling;
-                    // Stamp the first cancel request; the scheduler finishes
-                    // the job canceled after a bounded grace even if the Node
-                    // never answers.
-                    if row.cancel_requested_at.is_none() {
-                        row.cancel_requested_at = Some(now_ts());
-                    }
-                    Some(())
-                })
-                .await
-                .map_err(map_store)?
-                .ok_or(HubError::NotFound)?;
-            if let (Some(host), Some(lane)) = (&job.host_id, &job.lane_id) {
-                // §7.5: follow-ons are identified by the jobId and carry no
-                // initiator; a Human cancelling an Agent-enqueued job must not
-                // stamp the job's initiator onto the frame.
-                let params = json!({ "jobId": job.id.as_id().as_str(), "laneId": lane });
-                // Best effort: the running tick also fails the job if the
-                // Node is gone.
-                if let Ok(Some(_)) = state
-                    .nodes
-                    .call(
-                        host.as_id().as_str(),
-                        "gate.cancel",
-                        params,
-                        Duration::from_secs(10),
-                    )
-                    .await
-                {
-                    journal(&state, &device.id, "gate.canceling", &updated).await;
-                }
-            }
-            Ok(Json(json!(updated)))
-        }
-        terminal => Err(HubError::Conflict(format!(
-            "job already {terminal}",
-            terminal = terminal.as_str()
-        ))),
+        journal(&state, &device.id, "gate.canceled", &updated).await;
+        drop_job_refs(&state, &updated).await;
+        return Ok(Json(json!(updated)));
     }
+    if !matches!(
+        job.state,
+        GateJobState::Running | GateJobState::Canceling
+    ) {
+        return Err(HubError::Conflict(format!(
+            "job already {}",
+            job.state.as_str()
+        )));
+    }
+    if let (Some(host), Some(lane)) = (&job.host_id, &job.lane_id) {
+        // §7.5: gate.cancel is a follow-on of the admitted (possibly
+        // Node-started) job: the jobId is its opId. The frame carries no
+        // initiator — the Node admits it as a continuation, and the Hub-side
+        // authority of the cancel itself was checked in the writer above.
+        let params = json!({ "jobId": job.id.as_id().as_str(), "laneId": lane });
+        // Best effort: the running tick also fails the job if the
+        // Node is gone.
+        if let Ok(Some(_)) = state
+            .nodes
+            .call(
+                host.as_id().as_str(),
+                "gate.cancel",
+                params,
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            journal(&state, &device.id, "gate.canceling", &updated).await;
+        }
+    }
+    Ok(Json(json!(updated)))
 }
 
 async fn resolve_job(
@@ -1728,6 +1724,62 @@ impl Store {
                         updated_at = ?4
                   WHERE id = ?5",
                 params![doc, job.state.as_str(), job.lane_id, now, id],
+            )?;
+            Ok(Some(job))
+        })
+        .await
+    }
+
+    /// D-057 §7.3: the HTTP cancel route only. `check_initiator` and the row
+    /// transition run in ONE writer job, before any `gate.cancel` frame is
+    /// sent, so a request authenticated before a fence cannot cancel after
+    /// it. The scheduler's own `mutate_gate_job` callers (grace expiry,
+    /// reconcile, a started job's follow-ons) deliberately do not call this.
+    pub(crate) async fn request_gate_job_cancel(
+        &self,
+        id: &str,
+        authority: crate::agent_scope::CallerAuthority,
+    ) -> Result<Option<GateJob>, crate::store::StoreError> {
+        let id = id.to_owned();
+        self.run_named("request_gate_job_cancel", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
+            let Some(mut job) = conn
+                .query_row(
+                    "SELECT doc_json FROM gate_jobs WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|text| serde_json::from_str::<GateJob>(&text).ok())
+            else {
+                return Ok(None);
+            };
+            match job.state {
+                GateJobState::Queued => {
+                    job.state = GateJobState::Canceled;
+                    job.finished_at = Some(now_ts());
+                    job.error = Some("canceled while queued".into());
+                }
+                GateJobState::Running | GateJobState::Canceling => {
+                    job.state = GateJobState::Canceling;
+                    // Stamp the first cancel request; the scheduler finishes
+                    // the job canceled after a bounded grace even if the Node
+                    // never answers.
+                    if job.cancel_requested_at.is_none() {
+                        job.cancel_requested_at = Some(now_ts());
+                    }
+                }
+                // Terminal: leave the row untouched; the handler returns 409.
+                _ => return Ok(Some(job)),
+            }
+            let doc = serde_json::to_string(&job)?;
+            conn.execute(
+                "UPDATE gate_jobs
+                    SET doc_json = ?1, state = ?2, lane_id = ?3, revision = revision + 1,
+                        updated_at = ?4
+                  WHERE id = ?5",
+                params![doc, job.state.as_str(), job.lane_id, now(), id],
             )?;
             Ok(Some(job))
         })

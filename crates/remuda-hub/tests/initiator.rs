@@ -428,6 +428,17 @@ async fn fenced_agent_is_refused_on_every_admitted_write_and_nothing_is_written(
     let task = ctx.create_task("pre-fence task").await;
     let task_id = task["id"].as_str().unwrap().to_owned();
 
+    // A queued gate job for the cancel route (the project configures no
+    // lanes, so the scheduler leaves it queued).
+    let (status, queued_job) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/fenced/cancel","mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{queued_job}");
+    let queued_job_id = queued_job["id"].as_str().unwrap().to_owned();
+
     let commands_before = ctx.command_rows().await.len();
 
     ctx.fence().await;
@@ -455,11 +466,24 @@ async fn fenced_agent_is_refused_on_every_admitted_write_and_nothing_is_written(
         .await;
     assert_fenced(status, &body);
 
-    // gate job insert.
+    // gate job insert after the fence is refused.
     let (status, body) = ctx
         .agent_post(
             &format!("/v1/projects/{}/gate", ctx.project),
             json!({"branch":"wt/fenced/verify","mode":"verify"}),
+        )
+        .await;
+    assert_fenced(status, &body);
+
+    // gate cancel is Agent-admitted: the fenced canceller must not move a
+    // queued job or a running one.
+    let (status, body) = ctx
+        .agent_post(
+            &format!(
+                "/v1/projects/{}/gate/jobs/{queued_job_id}/cancel",
+                ctx.project
+            ),
+            json!({}),
         )
         .await;
     assert_fenced(status, &body);
@@ -582,11 +606,12 @@ async fn fenced_agent_is_refused_on_every_admitted_write_and_nothing_is_written(
         .json()
         .await
         .unwrap();
-    let jobs = gates["jobs"].as_array().cloned().unwrap_or_default();
-    assert!(
-        jobs.is_empty(),
-        "a gate job was queued after fence: {gates}"
-    );
+    let jobs = gates["items"].as_array().cloned().unwrap_or_default();
+    // Only the pre-fence job survives; the post-fence enqueue wrote nothing
+    // and the fenced cancel left the row `queued`.
+    assert_eq!(jobs.len(), 1, "post-fence gate writes leaked: {gates}");
+    assert_eq!(jobs[0]["id"], json!(queued_job_id), "{gates}");
+    assert_eq!(jobs[0]["state"], json!("queued"), "{gates}");
 }
 
 // ── 2. Authenticated before F ─────────────────────────────────────────────
@@ -873,6 +898,82 @@ async fn gate_job_fenced_before_claim_is_canceled_fenced_and_never_dispatched() 
     assert_eq!(doc["state"], json!("canceled"), "{doc}");
     assert_eq!(doc["reason"], json!("fenced"), "{doc}");
     node.assert_no_frame("fenced gate claim").await;
+}
+
+// ── 6b. Gate cancel is checked in the mutating writer (both states) ───────
+
+#[tokio::test]
+async fn fenced_cancel_of_a_queued_or_running_gate_job_is_refused_before_the_node() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+
+    // Enqueue both jobs and pin each row to a running lane before the fence.
+    let mut job_ids = Vec::new();
+    for mode in ["verify", "land"] {
+        let (status, job) = ctx
+            .agent_post(
+                &format!("/v1/projects/{}/gate", ctx.project),
+                json!({"branch": format!("wt/fenced/cancel-{mode}"), "mode": mode}),
+            )
+            .await;
+        assert_eq!(status, 200, "{job}");
+        let job_id = job["id"].as_str().unwrap().to_owned();
+
+        // Claim the row the way the scheduler would: running, pinned to the
+        // connected fake Node's lane. The row never goes through dispatch()
+        // (no gate.run is sent) — only the cancel route under test can emit.
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        db.execute(
+            "UPDATE gate_jobs
+                SET state = 'running', lane_id = 'lane1',
+                    doc_json = json_set(
+                        json_set(json_set(doc_json,
+                            '$.state', 'running'),
+                            '$.laneId', 'lane1'),
+                        '$.hostId', ?2)
+              WHERE id = ?1",
+            rusqlite::params![job_id, ctx.host],
+        )
+        .unwrap();
+        drop(db);
+        job_ids.push(job_id);
+    }
+
+    ctx.fence().await;
+
+    for job_id in &job_ids {
+        let (status, body) = ctx
+            .agent_post(
+                &format!(
+                    "/v1/projects/{}/gate/jobs/{job_id}/cancel",
+                    ctx.project
+                ),
+                json!({}),
+            )
+            .await;
+        assert_fenced(status, &body);
+
+        // The row is untouched and no gate.cancel reached the Node.
+        let doc = ctx.hub.test_get_gate_job(job_id).await.unwrap().unwrap();
+        assert_eq!(doc["state"], json!("running"), "{doc}");
+        assert!(
+            doc["cancelRequestedAt"].is_null(),
+            "cancel stamped despite fence: {doc}"
+        );
+    }
+    // Deterministic no-frame proof: a sentinel Human command is the next
+    // frame the Node receives (twice — no gate.cancel frames queue ahead).
+    let (status, sentinel) = ctx
+        .send(
+            "POST",
+            &format!("/v1/instances/{}/commands", ctx.instance),
+            &ctx.human,
+            None,
+            Some(Ctx::send_body("instance.send")),
+        )
+        .await;
+    assert_eq!(status, 200, "{sentinel}");
+    let (method, _) = node.next().await;
+    assert_eq!(method, "instance.send", "a gate.cancel frame leaked");
 }
 
 // ── 7. Human token narrowed to a fenced chapter ───────────────────────────

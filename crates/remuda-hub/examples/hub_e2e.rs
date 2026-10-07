@@ -1216,6 +1216,41 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
+                    // c-cardsettle: a genuinely live hook approval with an
+                    // UNKNOWN deadline (nothing client-side can retire it),
+                    // enabled only with HUB_E2E_CARDSETTLE=1. The spec ends
+                    // the instance through the existing GHOSTNODE_RESTART
+                    // instance.send sentinel (new epoch omits the instance),
+                    // after which the Hub must have invalidated this card in
+                    // the reconcile transaction — generation-ended, no client
+                    // deadline involved.
+                    if std::env::var("HUB_E2E_CARDSETTLE").as_deref() == Ok("1")
+                        && prompt.contains("cardsettle-live")
+                    {
+                        let iid = InteractionId::new();
+                        let card = fake_approval(&instance_id, host, iid.as_id().as_str());
+                        append_n = append_interaction_requested(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            &card,
+                        )
+                        .await?;
+                        pending
+                            .lock()
+                            .await
+                            .insert(iid.as_id().as_str().to_string(), card);
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
+                            .await?;
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        continue;
+                    }
                     // c-mfix round 2: the full phone-chrome combo fixture
                     // (exited resumable instance + live hook/tool/status strip).
                     if prompt == "mfix-chrome-combo" {

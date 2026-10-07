@@ -42,6 +42,52 @@ fn exited() -> Value {
     })
 }
 
+/// The REAL print/SDK process-exit event the driver's `emit_exit` produces:
+/// topic=session, nativeName=session, status=exited, severity INFO (the
+/// ma-lineage r4 item 2 SDK/print shape — a clean exit, never a failure).
+fn sdk_session_exited(observed_at: &str) -> Value {
+    json!({
+        "kind": "lifecycle",
+        "observedAt": observed_at,
+        "payload": {
+            "type": "native",
+            "topic": "session",
+            "nativeName": "session",
+            "severity": "info",
+            "affectsCompletion": false,
+            "status": { "state": "known", "value": "exited" },
+            "relatedIds": {}
+        }
+    })
+}
+
+/// The REAL shell/generic PTY process-exit event (shell_pty NATIVE_EXIT):
+/// nativeName=native_exit. A zero exit / INFO severity is a clean EXIT;
+/// `exit_code=1` makes it a failure.
+fn pty_native_exit(observed_at: &str, exit_code: u16) -> Value {
+    let (status, severity) = if exit_code == 0 {
+        ("exited", "info")
+    } else {
+        ("failed", "error")
+    };
+    json!({
+        "kind": "lifecycle",
+        "observedAt": observed_at,
+        "payload": {
+            "type": "native",
+            "topic": "session",
+            "nativeName": "native_exit",
+            "severity": severity,
+            "affectsCompletion": false,
+            "status": { "state": "known", "value": status },
+            "relatedIds": {
+                "exitCode": exit_code.to_string(),
+                "reason": format!("native-exit-code-{exit_code}")
+            }
+        }
+    })
+}
+
 struct FakeNode {
     frames: tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
     appends: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
@@ -275,6 +321,18 @@ impl Ctx {
             }
         })
         .await?
+    }
+
+    /// Wait until the durable sequence advances past `before` — a deterministic
+    /// barrier that a journal append has been projected, replacing fixed sleeps
+    /// before NEGATIVE assertions (ma-lineage r5 item 5).
+    async fn wait_seq_advances(&self, id: &str, before: &str) -> Result<String> {
+        let view = self
+            .wait_until(id, |v| {
+                v["durableSeq"].as_str().is_some_and(|seq| seq != before)
+            })
+            .await?;
+        Ok(view["durableSeq"].as_str().unwrap_or("").to_string())
     }
 
     async fn wait_host_offline(&self) -> Result<()> {
@@ -592,6 +650,10 @@ async fn a_live_chapter_after_a_failed_turn_is_closed_when_the_lineage_continues
     // The chapter reports its native session; a failed turn (429) leaves the
     // row RUNNING — the process is still alive.
     ctx.report_session(&node, &x, false).await?;
+    let seq_before = ctx.get_instance(&x, &ctx.human).await?["durableSeq"]
+        .as_str()
+        .unwrap_or("0")
+        .to_string();
     node.appends.send((
         x.clone(),
         json!({
@@ -604,7 +666,9 @@ async fn a_live_chapter_after_a_failed_turn_is_closed_when_the_lineage_continues
             }
         }),
     ))?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Barrier: the result event is applied (durable seq advanced) before the
+    // negative assertion.
+    ctx.wait_seq_advances(&x, &seq_before).await?;
     let before = ctx.get_instance(&x, &ctx.human).await?;
     assert_eq!(
         before["lifecycle"],
@@ -650,6 +714,110 @@ async fn a_live_chapter_after_a_failed_turn_is_closed_when_the_lineage_continues
         .json()
         .await?;
     assert_eq!(lineage["generation"], json!(2));
+    Ok(())
+}
+
+/// ma-lineage r4 item 1: a LEGACY `failed` row (marked failed by a
+/// configure/turn error while the process was alive — no `ended_at`, a
+/// non-attestation `last_error`) is POTENTIALLY LIVE. With a known native
+/// session the continuation still closes the predecessor before resuming (a
+/// genuinely exited row would skip that close); without a session it is
+/// refused with 409.
+#[tokio::test]
+async fn an_ambiguous_legacy_failed_row_with_a_session_is_closed_before_continuation() -> Result<()>
+{
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE instances SET lifecycle = 'failed',
+                last_error = 'api-error: 429', ended_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+    }
+
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = response["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(
+        x, y,
+        "a known session resumes even from an ambiguous failed row"
+    );
+
+    // Potentially live: the predecessor is closed FIRST, then the resume runs.
+    let (method, close_params) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    assert_eq!(close_params["instanceId"], json!(x));
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    // The same ambiguous row WITHOUT a session is refused, not relaunched.
+    let ctx2 = Ctx::boot().await?;
+    let mut node2 = FakeNode::connect(&ctx2.hub, &ctx2.host).await?;
+    let (z, _token2) = ctx2.seat(&mut node2, None).await?;
+    {
+        let db = rusqlite::Connection::open(&ctx2.db_path)?;
+        db.execute(
+            "UPDATE instances SET lifecycle = 'failed',
+                last_error = 'configure failed: model-control-unavailable:x',
+                ended_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![z],
+        )?;
+    }
+    let status = ctx2.resume(&z, &ctx2.human).await?.status();
+    assert_eq!(
+        status, 409,
+        "an ambiguous failed row with no session is potentially live: 409"
+    );
+    Ok(())
+}
+
+/// ma-lineage r4 item 1: a `failed` row WITH recorded end evidence (ended_at
+/// stamped) is treated as ended even without an attested-launch marker — the
+/// close is skipped and continuation proceeds straight to the resume.
+#[tokio::test]
+async fn a_failed_row_with_ended_at_is_ended_for_continuation_and_close() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE instances SET lifecycle = 'failed', ended_at = '2026-09-01T08:30:00.000Z'
+             WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+    }
+
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_ne!(
+        response["instance"]["instanceId"],
+        json!(x),
+        "the ended failed row continues"
+    );
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(
+        method, "instance.resume",
+        "an ended predecessor is not closed"
+    );
     Ok(())
 }
 
@@ -701,6 +869,10 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
     );
 
     // A second end event with a different timestamp does not rewrite it.
+    let seq_before = ctx.get_instance(&x, &ctx.human).await?["durableSeq"]
+        .as_str()
+        .unwrap_or("0")
+        .to_string();
     node.appends.send((
         x.clone(),
         json!({
@@ -709,7 +881,7 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
             "payload": { "type": "entity", "state": "exited", "reasonCode": "duplicate" }
         }),
     ))?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    ctx.wait_seq_advances(&x, &seq_before).await?;
     let lineage: Value = ctx
         .http
         .get(format!("{}/v1/lineages/{x}", ctx.base()))
@@ -721,8 +893,10 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
         .await?;
     assert_eq!(lineage["chapters"][0]["endedAt"], json!(ended_at));
 
-    // Migration backfill: a terminal row from before the column existed keeps
-    // what was its end time then (updated_at at migration).
+    // Migration backfill (ma-lineage r4 item 3): a terminal row from before
+    // the column existed is backfilled from the qualifying process-end EVENT
+    // in its journal (that event's observedAt), NOT from updated_at. A later
+    // diagnostic (non-terminal, non-liveness) must not veto the backfill.
     let data_dir = ctx._dir.path().to_owned();
     let (human, host) = (ctx.human.clone(), ctx.host.clone());
     let Ctx {
@@ -736,9 +910,20 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
     hub.shutdown().await;
     {
         let db = rusqlite::Connection::open(&db_path)?;
+        // Wipe the immutable column and move updated_at to a DIFFERENT time,
+        // so a pass would be obvious if the migration copied it.
         db.execute(
             "UPDATE instances SET ended_at = NULL, updated_at = '2026-09-02T08:30:00.000Z'
              WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+        // Append a later DIAGNOSTIC event (after the exit): it is neither
+        // process end nor return-to-live, so the earlier exit must survive.
+        db.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, 9001, 'evt_diag_mig',
+              '{\"kind\":\"lifecycle\",\"payload\":{\"type\":\"native\",\"topic\":\"diagnostic\",\"nativeName\":\"api_error\",\"status\":{\"state\":\"known\",\"value\":\"rate limited\"},\"severity\":\"error\"}}',
+              '2026-09-01T09:00:00.000Z')",
             rusqlite::params![x],
         )?;
     }
@@ -750,10 +935,439 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
         |row| row.get(0),
     )?;
     assert_eq!(
-        stamped, "2026-09-02T08:30:00.000Z",
-        "the migration stamps existing terminal rows once from updated_at"
+        stamped, ended_at,
+        "the migration backfills from the qualifying end EVENT, not updated_at; a later diagnostic must not veto it"
     );
     let _ = (hub, http, human, host, _dir);
+    Ok(())
+}
+
+/// ma-lineage r4 item 3: the journal backfill respects LATER return-to-live
+/// evidence. A terminal row with ended_at NULL whose journal shows an exit
+/// and then a later `ready` is NOT backfilled (the process came back); a row
+/// with no qualifying end event at all also stays NULL.
+#[tokio::test]
+async fn ended_at_backfill_skips_an_end_followed_by_return_to_live() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // Veto case: a row that is exited now, but its journal shows an exit then
+    // a later ready — the process returned to live, so no end is backfilled.
+    ctx.report_session(&node, &x, false).await?;
+    node.appends
+        .send((x.clone(), sdk_session_exited("2026-10-01T08:00:00.000Z")))?;
+    ctx.wait_until(&x, |v| v["lifecycle"] == json!("exited"))
+        .await?;
+    // Unknown case: a second row with no end event at all in its journal.
+    let (z, _token2) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &z, false).await?;
+
+    let data_dir = ctx._dir.path().to_owned();
+    let (human, host) = (ctx.human.clone(), ctx.host.clone());
+    let Ctx {
+        _dir,
+        hub,
+        http: _http,
+        human: _human,
+        host: _host,
+        db_path,
+    } = ctx;
+    hub.shutdown().await;
+    {
+        let db = rusqlite::Connection::open(&db_path)?;
+        // Wipe both ended_at and append a LATER ready to x's journal.
+        db.execute("UPDATE instances SET ended_at = NULL", rusqlite::params![])?;
+        db.execute(
+            r#"INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, 9100, 'evt_ready_after_exit',
+              '{"kind":"lifecycle","payload":{"type":"entity","entityType":"instance","state":"ready","reasonCode":"driver-started"}}',
+              '2026-10-01T09:00:00.000Z')"#,
+            rusqlite::params![x],
+        )?;
+        // z carries only session lifecycle frames (started), no end event.
+    }
+    let _hub = spawn(HubConfig::for_test(data_dir.join("data"))).await?;
+    let db = rusqlite::Connection::open(&db_path)?;
+    let ended_x: Option<String> = db.query_row(
+        "SELECT ended_at FROM instances WHERE id = ?1",
+        rusqlite::params![x],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        ended_x, None,
+        "a later return-to-live vetoes the ended_at backfill"
+    );
+    let ended_z: Option<String> = db.query_row(
+        "SELECT ended_at FROM instances WHERE id = ?1",
+        rusqlite::params![z],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        ended_z, None,
+        "no qualifying end event leaves ended_at NULL"
+    );
+    let _ = (human, host, _dir);
+    Ok(())
+}
+
+// --- 1a. Host loss is contact loss, never process end (ma-lineage r5 item 1)
+
+/// A seat whose HOST link is lost past grace is marked exited+host-lost but
+/// keeps no ended_at (D-019: the process may still be running). When the same
+/// host reconnects with the node alive, continuing the seat closes the
+/// predecessor before resuming, and the chapter's endedAt stays null
+/// throughout.
+#[tokio::test]
+async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // Mark the host offline (as the WS-disconnect / boot sweep would), then
+    // run the host-lost sweep at grace 0 directly (the periodic sweeper uses
+    // the same path with a real grace window).
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE hosts SET state = 'unreachable', offline_since = '2000-01-01T00:00:00.000Z'
+             WHERE id = ?1",
+            rusqlite::params![ctx.host],
+        )?;
+    }
+    let (changed, _settlement) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
+    assert_eq!(changed, 1, "the seat's row is host-lost");
+    let row = ctx.get_instance(&x, &ctx.human).await?;
+    assert_eq!(row["lifecycle"], json!("exited"), "{row}");
+    assert_eq!(row["lastError"], json!("host-lost"), "{row}");
+    assert_eq!(
+        first_chapter_ended_at(&ctx, &x).await?,
+        None,
+        "host loss stamps no endedAt: the process may still be running"
+    );
+
+    // The node is still connected (same epoch). Continuation closes the
+    // possibly-alive predecessor BEFORE the successor resume.
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = response["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(x, y, "host-lost continues into a new chapter");
+
+    let (method, close_params) = node.next_frame().await?;
+    assert_eq!(
+        method, "instance.close",
+        "the potentially live predecessor is closed"
+    );
+    assert_eq!(close_params["instanceId"], json!(x));
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    assert_eq!(first_chapter_ended_at(&ctx, &x).await?, None);
+    Ok(())
+}
+
+/// ma-lineage r5 item 2: X→Y, then Y itself ends. A resume still addressed to
+/// X must NOT replay the dead Y (`{replayed:true, instance:Y}`); it must
+/// continue the lineage from Y — generation 3, an instance.resume for Z with
+/// resumedFrom Y.
+#[tokio::test]
+async fn a_resume_addressed_to_an_old_chapter_after_the_current_ended_continues_it() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, true).await?;
+
+    // First continuation: X → Y.
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    // Report Y's session and then its real SDK exit.
+    ctx.report_session(&node, &y, false).await?;
+    node.appends
+        .send((y.clone(), sdk_session_exited("2026-10-07T08:00:00.000Z")))?;
+    ctx.wait_until(&y, |v| v["lifecycle"] == json!("exited"))
+        .await?;
+
+    // Resume addressed to the OLDER chapter X now that the current chapter Y
+    // has ended: it must mint generation 3 (Z), not replay dead Y.
+    let response = ctx.resume(&x, &ctx.human).await?.error_for_status()?;
+    assert_eq!(
+        response.status(),
+        200,
+        "an ended current chapter is continued, not refused/replayed"
+    );
+    let third: Value = response.json().await?;
+    assert_ne!(
+        third["replayed"],
+        json!(true),
+        "no idempotent replay of dead Y: {third}"
+    );
+    let z = third["instance"]["instanceId"].as_str().unwrap().to_owned();
+    assert_ne!(z, x);
+    assert_ne!(z, y);
+
+    let lineage: Value = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(lineage["generation"], json!(3), "X→Y→Z is generation 3");
+    let chapters = lineage["chapters"].as_array().unwrap();
+    assert_eq!(chapters.len(), 3, "three chapters X,Y,Z");
+    assert_eq!(chapters[2]["instanceId"], json!(z));
+
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume", "params={params}");
+    assert_eq!(
+        params["spec"]["resumedFrom"],
+        json!(y),
+        "Z continues from Y; params={params}"
+    );
+    Ok(())
+}
+
+// --- 3. A non-current lineage chapter cannot be deleted (ma-lineage r5) --
+
+/// Deleting a NON-CURRENT (predecessor) chapter is refused — its successors
+/// resolve parent ownership and fan-out through the predecessor's row.
+#[tokio::test]
+async fn deleting_a_non_current_chapter_is_refused() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, true).await?;
+
+    // Continue X → Y (X becomes a closed predecessor chapter).
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (_method, _) = node.next_frame().await?;
+
+    // Deleting the predecessor X is refused even though it is terminal.
+    let delete_x = ctx
+        .http
+        .delete(format!("{}/v1/instances/{x}?force=1", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?;
+    assert_eq!(
+        delete_x.status(),
+        409,
+        "a closed predecessor chapter cannot be deleted"
+    );
+
+    // The CURRENT chapter Y can be deleted; X is retained.
+    let delete_y = ctx
+        .http
+        .delete(format!("{}/v1/instances/{y}?force=1", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?;
+    assert_eq!(delete_y.status(), 200, "the current chapter is deletable");
+    assert!(
+        ctx.get_instance(&x, &ctx.human).await?.is_object(),
+        "the predecessor chapter row is retained"
+    );
+    Ok(())
+}
+
+// --- 7. Ambiguous failed rows keep occupying seat/fan-out (ma-lineage r5) -
+
+/// Mark `id` failed with no ended_at and a plain turn/configure error — the
+/// ambiguous failed-but-potentially-live state.
+fn mark_ambiguous_failed(db_path: &std::path::Path, id: &str, last_error: &str) -> Result<()> {
+    let db = rusqlite::Connection::open(db_path)?;
+    db.execute(
+        "UPDATE instances SET lifecycle = 'failed', ended_at = NULL,
+            fenced_at = NULL, last_error = ?2 WHERE id = ?1",
+        rusqlite::params![id, last_error],
+    )?;
+    Ok(())
+}
+
+/// An ambiguous failed address-owner holder (no ended_at, turn-error marker)
+/// STILL occupies its seat: a second address-owner create is refused 409. A
+/// genuinely-ended failed holder (ended_at stamped) frees the seat.
+#[tokio::test]
+async fn an_ambiguous_failed_address_owner_holder_still_occupies_the_seat() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+
+    mark_ambiguous_failed(&ctx.db_path, &x, "api-error: 429")?;
+
+    let second = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-pty",
+            "grants": ["address-owner"], "prompt": "second seat"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        second.status(),
+        409,
+        "an ambiguous failed holder is potentially live and keeps the seat"
+    );
+
+    // Once real end evidence exists the seat is free.
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    db.execute(
+        "UPDATE instances SET ended_at = '2026-10-01T08:30:00.000Z' WHERE id = ?1",
+        rusqlite::params![x],
+    )?;
+    drop(db);
+    let second = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-pty",
+            "grants": ["address-owner"], "prompt": "second seat"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        second.status(),
+        200,
+        "an evidenced-ended holder frees the seat"
+    );
+    Ok(())
+}
+
+/// Resuming an ambiguous failed holder closes it FIRST (the continuation
+/// transaction commits) — it is not dropped by the seat-uniqueness guard
+/// before reaching the predecessor close.
+#[tokio::test]
+async fn resuming_an_ambiguous_failed_holder_closes_it_and_commits() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+    mark_ambiguous_failed(
+        &ctx.db_path,
+        &x,
+        "configure failed: model-control-unavailable:x",
+    )?;
+
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let _y = response["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (method, close_params) = node.next_frame().await?;
+    assert_eq!(
+        method, "instance.close",
+        "the potentially live failed holder is closed"
+    );
+    assert_eq!(close_params["instanceId"], json!(x));
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    let view = ctx.get_instance(&x, &ctx.human).await?;
+    assert!(view["fencedAt"].is_string(), "fence committed: {view}");
+    Ok(())
+}
+
+/// An ambiguous failed CHILD (no ended_at, a turn error while alive) still
+/// occupies its parent's fan-out slot; real end evidence frees it.
+#[tokio::test]
+async fn an_ambiguous_failed_child_still_counts_toward_fan_out() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+
+    let project: Value = ctx
+        .http
+        .post(format!("{}/v1/projects", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "name": "fanout-ambiguous",
+            "policy": { "configurable": { "coordinatorFanOut": 1, "maxDelegationDepth": 2 } }
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let project_id = project["id"].as_str().context("project id")?.to_owned();
+    let scope = json!({ "projectIds": [project_id] });
+    let (x, x_token) = ctx.seat(&mut node, Some(scope)).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    let w1 = ctx.agent_child(&x_token, &mut node).await?;
+    mark_ambiguous_failed(&ctx.db_path, &w1, "api-error: 429")?;
+
+    let refused = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&x_token)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-print",
+            "permissionMode": "manual",
+            "scope": { "projectIds": [project_id] },
+            "prompt": "would be the second child"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        refused.status(),
+        409,
+        "ambiguous failed child still holds the slot"
+    );
+    assert!(refused.text().await?.contains("fan-out"));
+
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    db.execute(
+        "UPDATE instances SET ended_at = '2026-10-01T08:30:00.000Z' WHERE id = ?1",
+        rusqlite::params![w1],
+    )?;
+    drop(db);
+    let allowed = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&x_token)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-print",
+            "permissionMode": "manual",
+            "scope": { "projectIds": [project_id] },
+            "prompt": "now a valid second child"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        allowed.status(),
+        200,
+        "an evidenced-ended child frees the slot"
+    );
     Ok(())
 }
 
@@ -1037,20 +1651,64 @@ async fn a_failed_turn_sets_no_ended_at_until_the_real_process_exit() -> Result<
     );
 
     // The real process exits later: only now is endedAt set.
-    node.appends.send((
-        x.clone(),
-        json!({
-            "kind": "lifecycle",
-            "observedAt": "2026-10-06T02:00:00.000Z",
-            "payload": { "type": "entity", "state": "exited", "reasonCode": "native-exit" }
-        }),
-    ))?;
+    // The REAL print/SDK exit shape via the shared helper.
+    node.appends
+        .send((x.clone(), sdk_session_exited("2026-10-06T02:00:00.000Z")))?;
     ctx.wait_until(&x, |v| v["lifecycle"] == json!("exited"))
         .await?;
     assert_eq!(
         first_chapter_ended_at(&ctx, &x).await?,
         Some(json!("2026-10-06T02:00:00.000Z")),
-        "endedAt comes from the real exit, not the turn error"
+        "endedAt comes from the real SDK/print exit, not the turn error"
+    );
+    Ok(())
+}
+
+/// ma-lineage r4 item 2: a clean PTY exit (native_exit / status exited /
+/// severity info) is lifecycle EXITED — not failed — and stamps endedAt; a
+/// non-zero exit is failed. Both come from the shared classifier's REAL
+/// driver shapes.
+#[tokio::test]
+async fn real_native_exit_shapes_classify_and_stamp_ended_at() -> Result<()> {
+    // Clean PTY exit → exited.
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+    node.appends
+        .send((x.clone(), pty_native_exit("2026-10-06T03:00:00.000Z", 0)))?;
+    let view = ctx
+        .wait_until(&x, |v| v["lifecycle"] == json!("exited"))
+        .await?;
+    assert_eq!(
+        view["lifecycle"],
+        json!("exited"),
+        "a clean native_exit (info) is exited, not failed"
+    );
+    assert_eq!(
+        first_chapter_ended_at(&ctx, &x).await?,
+        Some(json!("2026-10-06T03:00:00.000Z"))
+    );
+
+    // Non-zero PTY exit → failed.
+    let ctx2 = Ctx::boot().await?;
+    let mut node2 = FakeNode::connect(&ctx2.hub, &ctx2.host).await?;
+    let (z, _token2) = ctx2.seat(&mut node2, None).await?;
+    ctx2.report_session(&node2, &z, false).await?;
+    node2
+        .appends
+        .send((z.clone(), pty_native_exit("2026-10-06T03:30:00.000Z", 1)))?;
+    let view2 = ctx2
+        .wait_until(&z, |v| v["lifecycle"] == json!("failed"))
+        .await?;
+    assert_eq!(
+        view2["lifecycle"],
+        json!("failed"),
+        "exit 1 is a failed end"
+    );
+    assert_eq!(
+        first_chapter_ended_at(&ctx2, &z).await?,
+        Some(json!("2026-10-06T03:30:00.000Z"))
     );
     Ok(())
 }
@@ -1064,6 +1722,10 @@ async fn an_error_severity_event_then_ready_leaves_ended_at_null() -> Result<()>
     let (x, _token) = ctx.seat(&mut node, None).await?;
     ctx.report_session(&node, &x, false).await?;
 
+    let seq_before = ctx.get_instance(&x, &ctx.human).await?["durableSeq"]
+        .as_str()
+        .unwrap_or("0")
+        .to_string();
     node.appends.send((
         x.clone(),
         json!({
@@ -1077,7 +1739,7 @@ async fn an_error_severity_event_then_ready_leaves_ended_at_null() -> Result<()>
             }
         }),
     ))?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    ctx.wait_seq_advances(&x, &seq_before).await?;
     let view = ctx.get_instance(&x, &ctx.human).await?;
     assert_ne!(
         view["lifecycle"],
@@ -1157,6 +1819,39 @@ async fn a_sessionless_launch_failure_resumes_via_fresh_recovery() -> Result<()>
             .is_none_or(|v| v.is_null()),
         "fresh recovery must not carry a resume session id"
     );
+    Ok(())
+}
+
+/// ma-lineage r5 item 4: a sessionless holder the stale-create sweep failed
+/// with the Hub's EXACT `create-never-acknowledged` marker recovers fresh on
+/// resume (not 409). The marker is matched literally, not by the prose
+/// "never acknowledged" string.
+#[tokio::test]
+async fn a_swept_never_acknowledged_create_with_the_real_marker_recovers_fresh() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // Simulate the stale-create sweep exactly: failed, no session ever
+    // reported, last_error is the constant the sweep stamps.
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    db.execute(
+        "UPDATE instances SET lifecycle = 'failed', ended_at = '2026-10-06T01:00:00.000Z',
+            last_error = 'create-never-acknowledged'
+         WHERE id = ?1",
+        rusqlite::params![x],
+    )?;
+    drop(db);
+
+    let recovered = ctx.resume(&x, &ctx.human).await?;
+    assert_eq!(
+        recovered.status(),
+        200,
+        "the exact create-never-acknowledged marker is launch-failure evidence: fresh recovery"
+    );
+    let body: Value = recovered.json().await?;
+    assert_eq!(body["instance"]["generation"], json!(2));
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.create", "fresh relaunch, not resume");
     Ok(())
 }
 

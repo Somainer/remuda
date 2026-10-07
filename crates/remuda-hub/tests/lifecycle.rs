@@ -252,7 +252,7 @@ async fn a_late_create_ack_converges_from_the_journal_without_a_resend() -> Resu
         &ins,
         json!({
             "kind": "lifecycle",
-            "payload": { "type": "entity", "state": "starting", "reasonCode": "driver-spawn" }
+            "payload": { "type": "entity", "entityType": "instance", "state": "starting", "reasonCode": "driver-spawn" }
         }),
     )
     .await?;
@@ -262,7 +262,7 @@ async fn a_late_create_ack_converges_from_the_journal_without_a_resend() -> Resu
         &ins,
         json!({
             "kind": "lifecycle",
-            "payload": { "type": "entity", "state": "ready", "reasonCode": "driver-started" }
+            "payload": { "type": "entity", "entityType": "instance", "state": "ready", "reasonCode": "driver-started" }
         }),
     )
     .await?;
@@ -330,7 +330,7 @@ async fn journal_replay_derives_lifecycle_and_herdr_idle() -> Result<()> {
         ins,
         json!({
             "kind": "lifecycle",
-            "payload": { "type": "entity", "state": "starting", "reasonCode": "driver-start" }
+            "payload": { "type": "entity", "entityType": "instance", "state": "starting", "reasonCode": "driver-start" }
         }),
     )
     .await?;
@@ -348,7 +348,7 @@ async fn journal_replay_derives_lifecycle_and_herdr_idle() -> Result<()> {
         ins,
         json!({
             "kind": "lifecycle",
-            "payload": { "type": "entity", "state": "ready", "reasonCode": "driver-started" }
+            "payload": { "type": "entity", "entityType": "instance", "state": "ready", "reasonCode": "driver-started" }
         }),
     )
     .await?;
@@ -434,7 +434,7 @@ async fn journal_replay_derives_lifecycle_and_herdr_idle() -> Result<()> {
         ins,
         json!({
             "kind": "lifecycle",
-            "payload": { "type": "entity", "state": "exited", "reasonCode": "explicit-close" }
+            "payload": { "type": "entity", "entityType": "instance", "state": "exited", "reasonCode": "explicit-close" }
         }),
     )
     .await?;
@@ -452,6 +452,7 @@ async fn journal_replay_derives_lifecycle_and_herdr_idle() -> Result<()> {
             "kind": "lifecycle",
             "payload": {
                 "type": "entity",
+                "entityType": "instance",
                 "state": "failed",
                 "reasonCode": "native-driver-start-failed"
             }
@@ -537,7 +538,7 @@ async fn pty_create_stays_accepted_with_a_queued_prompt_and_native_dialog() -> R
         (
             "ready",
             json!({ "kind": "lifecycle", "payload": {
-                "type": "entity", "state": "ready", "reasonCode": "driver-started"
+                "type": "entity", "entityType": "instance", "state": "ready", "reasonCode": "driver-started"
             }}),
         ),
         (
@@ -672,7 +673,7 @@ async fn journal_replay_promotes_and_demotes_a_terminal_instance() -> Result<()>
         ins,
         json!({
             "kind": "lifecycle",
-            "payload": { "type": "entity", "state": "ready", "reasonCode": "driver-started" }
+            "payload": { "type": "entity", "entityType": "instance", "state": "ready", "reasonCode": "driver-started" }
         }),
     )
     .await?;

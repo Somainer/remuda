@@ -299,6 +299,38 @@ fn stop_and_stop_failure_report_their_outcomes_but_never_a_tool_phase() {
 }
 
 #[test]
+fn subagent_scoped_stop_failure_never_opens_the_root_turn_phase() {
+    // c-cardsettle r3 item 8: a workflow subagent's StopFailure carries
+    // agent_id/agent_type. It ends the subagent's own turn — it must not latch
+    // the ROOT turn-ended phase (so the main strip never shows 回合结束·失败
+    // and the composer stays live while the workflow finishes).
+    let tags = fold_one(
+        &event(
+            "StopFailure",
+            1,
+            serde_json::json!({
+                "agent_id": "agent0sub0agent000",
+                "agent_type": "workflow-subagent",
+            }),
+        ),
+        true,
+    );
+    assert!(
+        !tags.contains_key("phase"),
+        "a subagent StopFailure must not open the root phase: {tags:?}"
+    );
+    assert!(
+        !tags.contains_key("outcome"),
+        "no root outcome either: {tags:?}"
+    );
+
+    // The ROOT StopFailure (no agent id) still ends the root turn failed.
+    let root = fold_one(&event("StopFailure", 1, serde_json::json!({})), true);
+    assert_eq!(root["phase"], "turn-ended");
+    assert_eq!(root["outcome"], "failed");
+}
+
+#[test]
 fn subagent_stop_session_events_and_unknown_hooks_have_no_phase() {
     // Rule 7: SubagentStop fires with no subagent at all.
     for name in [

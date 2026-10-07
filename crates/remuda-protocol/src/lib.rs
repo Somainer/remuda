@@ -21,6 +21,8 @@ mod native;
 mod observation;
 pub mod path_guard;
 mod permission;
+/// c-cardsettle r5 addendum: the single shared process-end classifier (OA6).
+pub mod process_end;
 mod project;
 mod rpc;
 mod scalar;

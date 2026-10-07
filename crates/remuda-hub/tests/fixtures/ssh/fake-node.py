@@ -25,7 +25,7 @@ if 'complete' in sys.argv:
     instance_file.write_text(json.dumps(instance))
     with journal_file.open('a') as journal:
         journal.write(json.dumps({'instanceId': instance['id'], 'seq': '2', 'event': {
-            'kind': 'lifecycle', 'payload': {'type': 'entity', 'state': 'exited', 'reasonCode': 'fixture-completed'}
+            'kind': 'lifecycle', 'payload': {'type': 'entity', 'entityType': 'instance', 'state': 'exited', 'reasonCode': 'fixture-completed'}
         }}) + '\n')
     (data / 'fixture-DONE').write_text('DONE\n')
     sys.exit(0)
@@ -69,7 +69,7 @@ for line in sys.stdin:
     if method == 'instance.create':
         instance_id = frame['params']['instanceId']
         instance_file.write_text(json.dumps({'id': instance_id, 'hostId': host, 'lifecycle': 'ready', 'activity': 'working', 'durableSeq': '1'}))
-        entry = {'instanceId': instance_id, 'seq': '1', 'event': {'kind': 'lifecycle', 'payload': {'type': 'entity', 'state': 'ready'}}}
+        entry = {'instanceId': instance_id, 'seq': '1', 'event': {'kind': 'lifecycle', 'payload': {'type': 'entity', 'entityType': 'instance', 'state': 'ready'}}}
         journal_file.write_text(json.dumps(entry) + '\n')
         emit({'jsonrpc': '2.0', 'id': 'start-1', 'method': 'journal.append', 'params': entry})
         if os.environ.get('REMUDA_FAKE_API_OPEN') == '1':

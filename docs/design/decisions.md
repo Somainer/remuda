@@ -1618,3 +1618,33 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 **由谁**：c-dirpicker。Hub 端点、Node RPC、前端与文档在同一分支落地。
 
 **测试**：Node 单测（containment、symlink 不导航、隐藏目录开关、4096 上限、默认起点）；Hub 集成测试（Human 200、Bot/Agent 403、404/409、占用 409 不到达 Node、结束后两阶段解绑成功）；Hub SQL 单测（live/ended 会话与各种 task state/归档组合）；web 单测（浏览、过滤、手动输入、确认、拒绝理由）；HUB_E2E_DIR_PICKER=1 的 hub playwright（浏览器添加 + 占用拒绝/结束后移除，截图仅在 REMUDA_EVIDENCE 下）。
+
+**修订（2026-10-08，c-dirpicker round 7）**：
+
+1. **移除标识一律用存储的根字节，DELETE 别名走 Node 解析。** round 6 的
+   `workspace.resolve` 在路径按 `Path` 分量相等时（`<root>/`、`<root>/.`、
+   `//root`）直接返回调用方拼写，而 Hub 快照快捷路径按字符串精确比对，导致
+   分量等价但字节不同的 DELETE 通过 Hub 快捷路径、却在 Node prepare 被拒，
+   呈现为刷新也修不好的「not observed」400。现规定：存储根的快捷匹配必须是
+   `OsStr` 字节相等；其余一切拼写（含 `.`/重复分隔符/尾斜杠）都经只读
+   `workspace.resolve` 做 realpath，RPC 始终返回**命中注册表行的存储根字节**，
+   prepare 与 commit 都按字节复核调用方 `path` 与 `workspaceId`。
+2. **新增第三阶段 `abort`（workspace.unregister）。** round 6 只有 prepare/commit：
+   一旦 prepare 置下持久 unbinding 标记，只有成功 commit 会清除它；commit 拒绝
+   （身份不符、身份被替换、prepare 后新增加占用）、WSS 断开、Hub/Node 重启或 RPC
+   超时都会让标记永久卡住，工作区列出但无法新建/恢复/注册。abort 幂等，只清该
+   命令的 unbinding 标记、不动成员关系，未知或已终结命令同样确认；Node 自己的
+   commit 拒绝在返回前清除本命令的标记（即使后续 abort 帧丢失也不会卡），注册表
+   打开时丢弃全部持久标记（在途状态只在内存中，重启后没有命令可能在途）；Hub 在
+   prepare/commit 任何失败与身份不一致时发送 abort，并在 `node.hello` 对该 host
+   仍处 `queued`/`accepted` 的 `workspace.unregister` 命令逐一 abort 后把命令结算为
+   rejected（queued 与 accepted 均可）。
+3. **绑定任务在拿到占用锁后复查 Hub 成员身份。** create_task 此前拿到
+   hold_workspace_operation 后不再复查，排队等在 settle 后面的任务会在工作区已被
+   移除后仍绑定成功；现规定获取锁后查观测快照，工作区已不在则 409 并回滚半成品任务行。
+
+**本轮线协议变化**：`WorkspaceMutationPhase` 增加 `abort`（`crates/remuda-protocol`
+hubnode），Node `workspace.unregister` 接受第三阶段；`workspace.resolve` 既有
+（round 6）入参 `{path}`、出参 `{workspaceId,canonicalRoot}` 不变，但语义收紧为
+「返回命中行的存储根字节」，unregister prepare/commit 的入参继续携带
+`workspaceId` 与精确 `path` 供 Node 双重核验。

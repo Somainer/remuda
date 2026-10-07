@@ -169,10 +169,11 @@ describe("native wire vocabulary is closed", () => {
       },
     })!;
     expect(observed.requested?.name).toBe(name);
-    expect(observed.effective.name).toBe(name);
-    expect(effectiveFromRecord(observed.effective)).toEqual(observed.effective);
-    expect(effortMismatch(requestedWord, false, observed.effective)).toBeNull();
-    expect(effortFromRecord("codex", observed.effective.name)).toEqual(selection);
+    const effective = observed.effective!;
+    expect(effective.name).toBe(name);
+    expect(effectiveFromRecord(effective)).toEqual(effective);
+    expect(effortMismatch(requestedWord, false, effective)).toBeNull();
+    expect(effortFromRecord("codex", effective.name)).toEqual(selection);
   });
 
   it("returns current tier words and throws a typed error on anything else", () => {

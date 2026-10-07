@@ -962,7 +962,7 @@ class HubStore {
     // "Ours" = a live push-down still pending, OR one the durable projection
     // already settled whose live frame is only now arriving (same read-back,
     // observedAt no newer than the one the poll folded).
-    const ours = Boolean(pending) || (hydratedAt != null && parsed.effective.observedAt <= hydratedAt);
+    const ours = Boolean(pending) || (hydratedAt != null && view.observedAt <= hydratedAt);
     if (ours) {
       // Our own push-down settled: leave the slider where the user put it (the
       // mismatch line renders if the native side clamped it).
@@ -973,7 +973,7 @@ class HubStore {
       // Consume the marker once the matching (or an even newer) live edge for
       // our push-down arrives; a genuinely newer terminal switch (observedAt
       // past the marker) is handled in the else branch instead.
-      if (hydratedAt != null && parsed.effective.observedAt >= hydratedAt) {
+      if (hydratedAt != null && view.observedAt >= hydratedAt) {
         this.settledEffortPushdown.delete(instanceId);
       }
     } else {

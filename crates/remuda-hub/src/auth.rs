@@ -161,6 +161,18 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
 
     // 1) Explicit operator source.
     if config.bootstrap_source.is_explicit() {
+        // Round 4 item 2: an empty (or whitespace-only) explicit code must be
+        // refused BEFORE writing anything — accepting it would let an empty
+        // string log in (secret_eq("", "") passes) or overwrite a previously
+        // persisted real code, and writing the marker first would additionally
+        // lock rotation onto the empty value.
+        if config.bootstrap_token.trim().is_empty() {
+            return Err(HubError::Internal(
+                "explicit bootstrap access code is empty; provide a non-empty \
+                 --access-code-file / REMUDA_BOOTSTRAP_TOKEN value"
+                    .to_owned(),
+            ));
+        }
         // Marker FIRST, durable, before any token/stamp write — on crash the
         // marker still correctly says "explicit; do not rotate".
         std::fs::create_dir_all(&data_dir)
@@ -836,5 +848,50 @@ mod tests {
         config2.bootstrap_token = "bare-caller-code".to_owned();
         config2.bootstrap_source = BootstrapSource::Adopted;
         assert!(resolve_bootstrap(&mut config2).is_err());
+    }
+
+    /// Round 4 item 2: empty or whitespace-only explicit codes are refused
+    /// before anything is written (no marker, no token, no stamp).
+    #[test]
+    fn empty_explicit_code_is_rejected_before_writes() {
+        for code in ["", "   ", "\n\t "] {
+            let dir = tempfile::tempdir().expect("data dir");
+            let mut config = HubConfig::for_test(dir.path().to_path_buf());
+            config.bootstrap_token = code.to_owned();
+            config.bootstrap_source = BootstrapSource::ExplicitEnv;
+            let err = resolve_bootstrap(&mut config).expect_err("empty explicit refused");
+            assert!(format!("{err}").contains("empty"), "got: {err}");
+            assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+            assert!(!dir.path().join("bootstrap-token").is_file());
+            assert!(!dir.path().join("bootstrap-issued-at").is_file());
+        }
+    }
+
+    /// Round 4 item 2: an empty explicit code on an EXISTING hub-owned dir
+    /// must not overwrite the real token or stamp and must not write the
+    /// marker (so rotation stays available).
+    #[test]
+    fn empty_explicit_code_does_not_overwrite_existing_token() {
+        let dir = tempfile::tempdir().expect("data dir");
+        persist_bootstrap(dir.path(), "real-code").expect("persist");
+        let token_bytes = std::fs::read(dir.path().join("bootstrap-token")).expect("token");
+        let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("stamp");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = String::new();
+        config.bootstrap_source = BootstrapSource::ExplicitEnv;
+        assert!(resolve_bootstrap(&mut config).is_err());
+
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-token")).unwrap(),
+            token_bytes
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+            stamp_bytes
+        );
+        assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+        let new = rotate_bootstrap(dir.path()).expect("hub-owned dir still rotates");
+        assert_ne!(new, "real-code");
     }
 }

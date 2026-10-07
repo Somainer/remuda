@@ -512,7 +512,7 @@ export function Shell() {
   return (
     <CommitProbe name="Shell">
     <AnnotationProvider>
-    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layout}data-collapsed={collapsed}>
+    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layout} data-phone-nav={chrome.phoneNav ? "1" : undefined} data-collapsed={collapsed}>
       <BoardScopeSync />
       <div className={css.install}>
         <InstallBar />

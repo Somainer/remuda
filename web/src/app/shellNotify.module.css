@@ -147,16 +147,18 @@
 }
 
 /*
- * Compact phones render the PhoneNav home bar on HOME-level routes
- * (Shell.chrome: phoneNav = mobile && !session). There the stack must clear
- * the 56px bar + safe area or it covers the bottom nav buttons; keep the
- * legacy --phone-nav-h offset under the same compact query as the layout
- * (COMPACT_WORKBENCH_QUERY). On /s/* no bar renders, and on desktop the
- * offset stays dropped (c-composerpop item 8).
+ * The --phone-nav-h offset applies ONLY while the 56px PhoneNav bar is
+ * actually mounted (r3 item 2): Shell stamps data-phone-nav="1" on home-level
+ * compact routes (chrome.phoneNav = mobile && !session), and PhoneShell
+ * always stamps it. A media query alone cannot know the route — on /s/:id at
+ * 390 PhoneNav is not mounted and the extra 56px parked a blocking notice on
+ * top of the composer dock. CSS cannot express that condition either, so the
+ * shell element carries the fact. The base `.stack` rule
+ * (safe-bottom + space-3) therefore holds on /s/* and on desktop.
  */
 @media (max-width: 767px),
   (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
-  .stack {
+  :global([data-phone-nav="1"]) .stack {
     bottom: calc(var(--phone-nav-h) + var(--safe-bottom) + var(--space-3));
   }
 }

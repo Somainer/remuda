@@ -325,7 +325,20 @@ test.describe("overlay z tiers keep the annotation dock under real scrims (r3 it
 });
 
 
-test.describe("notification stack clears the phone home bar at 390 (r2 item 2)", () => {
+test.describe("notification stack clears the phone home bar at 390 (r2/r3 item 2)", () => {
+  const raiseOne = (page: Page) =>
+    page.evaluate(() => {
+      (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab?.notify({
+        severity: "blocking",
+        subject: "standing one",
+        stage: "standing error",
+      });
+    });
+  const clear = (page: Page) =>
+    page.evaluate(() => {
+      (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab?.dismissAllBlocking();
+    });
+
   test("a blocking notice never covers the bottom PhoneNav buttons on a home route", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     // login() lands a compact viewport on /m where PhoneNav renders (home
@@ -355,9 +368,66 @@ test.describe("notification stack clears the phone home bar at 390 (r2 item 2)",
     await page.getByTestId("phone-nav-more").click();
     await expect(page.getByTestId("phone-nav-more")).toHaveAttribute("aria-expanded", "true");
 
-    await page.evaluate(() => {
-      (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab?.dismissAllBlocking();
+    // /m mounts PhoneNav, so the shell stamps data-phone-nav and the stack is
+    // lifted by 56px (--phone-nav-h) + safe-bottom + space-3.
+    const shell = page.locator("[data-compact]");
+    await expect(shell).toHaveAttribute("data-phone-nav", "1");
+    const bottomOffset = await page.evaluate(() => {
+      const stack = document.querySelector<HTMLElement>("[data-testid='blocking-errors']")?.parentElement;
+      return stack ? window.innerHeight - stack.getBoundingClientRect().bottom : NaN;
     });
+    expect(bottomOffset).toBeCloseTo(68, 0);
+
+    await clear(page);
+  });
+
+  test("on /s/:id the notice stays at safe-bottom + space-3 and never lifts over the composer dock", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await createSession(page, "composer popover notify session");
+    // PhoneNav is not mounted on /s/*; the shell must not carry the lift
+    // attribute (r3 item 2: a viewport-only media query raised the notice
+    // 56px even on this route). waitForURL resolves on the history update,
+    // before React commits the new route, so wait on the auto-retrying
+    // locator assertion, not a one-shot element read.
+    const shell = page.locator("[data-compact]");
+    await expect(shell).not.toHaveAttribute("data-phone-nav", "1");
+    await expect(page.getByTestId("composer-input")).toBeVisible();
+
+    await raiseOne(page);
+    await expect(page.getByText("standing error")).toBeVisible();
+
+    // The stack's bottom edge is exactly safe-bottom (0 in headless) +
+    // space-3 (12px) — NOT 56+12.
+    const bottomOffset = await page.evaluate(() => {
+      const stack = document.querySelector<HTMLElement>("[data-testid='blocking-errors']")?.parentElement;
+      return stack ? window.innerHeight - stack.getBoundingClientRect().bottom : NaN;
+    });
+    expect(bottomOffset).toBeCloseTo(12, 0);
+
+    // Hit-test the input's TOP strip: the route-aware anchor leaves the
+    // notice one card-height + 12px from the bottom, which clears the upper
+    // input row; the extra 56px lift on the buggy build raised the card over
+    // exactly that strip (and the input center), parking on the dock.
+    const input = page.getByTestId("composer-input");
+    const box = (await input.boundingBox())!;
+    const point = { x: box.x + box.width / 2, y: box.y + 6 };
+    const probe = await page.evaluate((p) => {
+      const el = document.elementFromPoint(p.x, p.y);
+      const stackEl = document.querySelector<HTMLElement>("[data-testid='blocking-errors']")?.parentElement;
+      const sr = stackEl?.getBoundingClientRect();
+      return {
+        hit: el?.closest("[data-testid='composer-input']") != null,
+        hitTag: (el as HTMLElement | null)?.dataset.testid ?? el?.tagName,
+        stackTop: sr ? Math.round(sr.top) : null,
+        vh: window.innerHeight,
+      };
+    }, point);
+    expect(probe.hit, `top strip hit ${probe.hitTag}; stack top ${probe.stackTop}/${probe.vh}`).toBe(true);
+
+    if (process.env.REMUDA_EVIDENCE === "1") {
+      await page.screenshot({ path: "test-results/composerpop-r3-notify-session-390.png", animations: "disabled" });
+    }
+    await clear(page);
   });
 });
 

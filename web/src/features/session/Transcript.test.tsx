@@ -1656,6 +1656,13 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
       top = Math.max(0, Math.min(value, maxScroll()));
       fireEvent.scroll(scroller());
     };
+    // A real WHEEL gesture: the browser scrolls ~delta then fires wheel (and
+    // later a coalesced scroll). Clamp like the browser; tiny deltas still
+    // move within rounding.
+    const wheel = (deltaY: number) => {
+      top = Math.max(0, Math.min(top + deltaY, maxScroll()));
+      fireEvent.wheel(scroller(), { deltaY });
+    };
     /** Flush the setter's coalesced next-frame scroll event(s). */
     const nextFrame = () =>
       new Promise<void>((resolve) => {
@@ -1668,7 +1675,7 @@ describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
       observerCbs.get(el)?.();
     };
     const scrollTopNow = () => top;
-    return { scroller, defineScroll, scrollTo, growMountedRow, scrollTopNow, nextFrame };
+    return { scroller, defineScroll, scrollTo, wheel, growMountedRow, scrollTopNow, nextFrame };
   }
 
   function gate<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -2240,6 +2247,12 @@ describe("load-earlier anchor lifecycle round 5", () => {
       top = Math.max(0, Math.min(value, max));
       fireEvent.scroll(scroller());
     };
+    // A real wheel gesture: scroll ~delta (clamped) then fire wheel.
+    const wheel = (deltaY: number) => {
+      const max = Math.max(0, (opts.clampHeight?.() ?? dynamicTotal * ROW) - VIEW);
+      top = Math.max(0, Math.min(top + deltaY, max));
+      fireEvent.wheel(scroller(), { deltaY });
+    };
     /** Flush the setter's coalesced next-frame scroll event(s). */
     const nextFrame = () =>
       new Promise<void>((resolve) => {
@@ -2254,7 +2267,7 @@ describe("load-earlier anchor lifecycle round 5", () => {
     const setTotal = (n: number) => {
       dynamicTotal = n;
     };
-    return { scroller: () => scroller(), defineScroll, scrollTo, growRow, top: () => top, setTotal, nextFrame };
+    return { scroller: () => scroller(), defineScroll, scrollTo, wheel, growRow, top: () => top, setTotal, nextFrame };
   }
 
   /**
@@ -3017,6 +3030,57 @@ describe("load-earlier anchor lifecycle round 5", () => {
       const before = geo.top();
       geo.growRow(4, ROW + 40);
       expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+    });
+
+    // UO-6a round 7 item 3: a tiny WHEEL gesture (1.5px) cancels an armed
+    // restore even though a scroll event that small can fall inside the
+    // restore's ±2px echo window. Without an explicit gesture listener the
+    // settle correction would treat the move as its own echo (or reverse it).
+    it("a 1.5px wheel gesture while a restore is armed retires it", async () => {
+      const user = userEvent.setup();
+      const geo = installGeo(50);
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const { tail, older } = fixture("insWheel");
+      const g = gate<Page>();
+      makeClient(reg, "insWheel", tail, () => g.promise, "31", "50");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        return result;
+      });
+      render(
+        <MemoryRouter initialEntries={["/s/insWheel"]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+      await act(async () => {
+        g.resolve(pageOf(older, true));
+        await Promise.resolve();
+      });
+      await act(async () => {});
+      // Restore is armed (page landed but stable passes incomplete). A tiny
+      // 1.5px wheel BEFORE any scroll event retires it.
+      act(() => {
+        geo.wheel(1.5);
+      });
+      await act(async () => {});
+      // The reader now owns ~the post-wheel position. Pump a settle correction
+      // frame and more size commits: a still-armed restore would re-run its
+      // correction loop and pull the position back to the click-time anchor;
+      // retired, the position stays at the reader's wheel spot (within the
+      // 1.5px gesture).
+      const afterWheel = geo.top();
+      geo.growRow(4, ROW + 40);
+      await act(async () => {});
+      geo.growRow(5, ROW + 40);
+      await act(async () => {});
+      await geo.nextFrame();
+      expect(Math.abs(geo.top() - afterWheel)).toBeLessThanOrEqual(8);
     });
   });
 

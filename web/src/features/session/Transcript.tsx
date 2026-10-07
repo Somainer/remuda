@@ -549,6 +549,65 @@ function TranscriptInner({
   useEffect(() => {
     cancelLoadRestoreRef.current = cancelLoadRestore;
   }, [cancelLoadRestore]);
+  // Latest sampleReadingAnchor, for the gesture cancellation effect (which is
+  // mounted before the callback is defined).
+  const sampleAnchorOnGestureRef = useRef<() => void>(() => {});
+
+  // A genuine GESTURE (wheel, touch drag, a scroll keypress, or a scrollbar
+  // pointer drag) must cancel an armed load-earlier restore independently of
+  // how far it scrolls — even a 1-2px move. The onScroll echo classifier runs
+  // only on the coalesced scroll event, where a tiny move can land inside the
+  // restore's ±2px echo window and be mistaken for the restore's own write
+  // (then reversed by the next correction). These input events fire BEFORE
+  // that scroll event and are unambiguous, so retire the restore on them.
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const SCROLL_KEYS = new Set([
+      "ArrowUp",
+      "ArrowDown",
+      "PageUp",
+      "PageDown",
+      "Home",
+      "End",
+      " ",
+    ]);
+    const gesture = () => {
+      cancelLoadRestoreRef.current();
+      // Re-sample the reader anchor at the current position so subsequent
+      // growth holds the post-gesture row (cancelLoadRestore nulls the stale
+      // pre-restore anchor; a tiny wheel scrolls ~0 so onScroll won't run).
+      sampleAnchorOnGestureRef.current();
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaY !== 0 || event.deltaX !== 0) gesture();
+    };
+    const onTouchMove = () => gesture();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (SCROLL_KEYS.has(event.key) && !event.defaultPrevented) gesture();
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      // A primary-button press on the vertical scrollbar gutter cancels. The
+      // gutter is the scroller itself (event.target === el) within
+      // scrollbarWidth of the right edge; content presses land on a child row.
+      if (event.button !== 0) return;
+      const target = event.target as Node;
+      if (target !== el) return;
+      const rect = el.getBoundingClientRect();
+      const scrollbarWidth = el.offsetWidth - el.clientWidth;
+      if (event.clientX >= rect.right - Math.max(scrollbarWidth, 12)) gesture();
+    };
+    el.addEventListener("wheel", onWheel, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    el.addEventListener("keydown", onKeyDown);
+    el.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("touchmove", onTouchMove);
+      el.removeEventListener("keydown", onKeyDown);
+      el.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, []);
   /**
    * Arm (or re-arm) the quiet-window release: when measurement/size commits
    * stop for PREPEND_SETTLE_QUIET_MS the anchor is retired even though the
@@ -788,6 +847,9 @@ function TranscriptInner({
       }
     }
   }, []);
+  useEffect(() => {
+    sampleAnchorOnGestureRef.current = sampleReadingAnchor;
+  }, [sampleReadingAnchor]);
   const holdReadingAnchor = useCallback(() => {
     const el = scrollerRef.current;
     const held = readingAnchorRef.current;

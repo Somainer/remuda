@@ -953,6 +953,52 @@ describe("nested tool rows share the transcript expansion set", () => {
   });
 });
 
+function thoughtEvent(seq: number, text = "thinking it over"): Observation {
+  return obs(seq, "thought", {
+    nodeId: `nt-${seq}` as Id,
+    thoughtId: `th-${seq}` as Id,
+    revision: "1",
+    baseRevision: null,
+    operation: "append",
+    partIndex: 0,
+    representation: "summary",
+    status: "complete",
+    text,
+  });
+}
+
+describe("c-uifold compact process fold", () => {
+  it("expands and collapses again; the caret flips and aria-expanded matches", async () => {
+    const user = userEvent.setup();
+    renderRouted([
+      userMessage(1, "跑一下"),
+      ...settledBash(2, 3),
+      thoughtEvent(4),
+      assistantMessage(5, "好了"),
+    ]);
+    const fold = () => screen.getByTestId("compact-fold");
+    const wrap = () => screen.getByTestId("compact-fold-wrap");
+    // Collapsed: right caret, count summary, no mounted body.
+    expect(fold()).toHaveAttribute("aria-expanded", "false");
+    expect(fold().textContent).toContain("▸");
+    expect(fold().textContent).toContain("1 次工具 · 1 段思考");
+    expect(wrap().querySelector("[data-testid='tool-card']")).toBeNull();
+
+    // Open: down caret, 收起过程 label, body mounted.
+    await user.click(fold());
+    expect(fold()).toHaveAttribute("aria-expanded", "true");
+    expect(fold().textContent).toContain("▾");
+    expect(fold().textContent).toContain("收起过程");
+    expect(wrap().querySelector("[data-testid='tool-card']")).not.toBeNull();
+
+    // Clicking the SAME summary row collapses it again.
+    await user.click(fold());
+    expect(fold()).toHaveAttribute("aria-expanded", "false");
+    expect(fold().textContent).toContain("▸");
+    expect(wrap().querySelector("[data-testid='tool-card']")).toBeNull();
+  });
+});
+
 const nestedExecutor = known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null });
 
 /** A tool call, optionally stamped as a subagent's own (source agent id). */

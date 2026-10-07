@@ -1109,6 +1109,56 @@ async fn a_resume_addressed_to_an_old_chapter_after_the_current_ended_continues_
     Ok(())
 }
 
+
+// --- 3. A non-current lineage chapter cannot be deleted (ma-lineage r5) --
+
+/// Deleting a NON-CURRENT (predecessor) chapter is refused — its successors
+/// resolve parent ownership and fan-out through the predecessor's row.
+#[tokio::test]
+async fn deleting_a_non_current_chapter_is_refused() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, true).await?;
+
+    // Continue X → Y (X becomes a closed predecessor chapter).
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (_method, _) = node.next_frame().await?;
+
+    // Deleting the predecessor X is refused even though it is terminal.
+    let delete_x = ctx
+        .http
+        .delete(format!("{}/v1/instances/{x}?force=1", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?;
+    assert_eq!(
+        delete_x.status(),
+        409,
+        "a closed predecessor chapter cannot be deleted"
+    );
+
+    // The CURRENT chapter Y can be deleted; X is retained.
+    let delete_y = ctx
+        .http
+        .delete(format!("{}/v1/instances/{y}?force=1", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?;
+    assert_eq!(delete_y.status(), 200, "the current chapter is deletable");
+    assert!(
+        ctx.get_instance(&x, &ctx.human).await?.is_object(),
+        "the predecessor chapter row is retained"
+    );
+    Ok(())
+}
+
 // --- 2. Ended chapter + host offline ------------------------------------
 
 #[tokio::test]

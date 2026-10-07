@@ -2935,6 +2935,39 @@ impl Store {
                     instance.lifecycle
                 )));
             }
+            // ma-lineage r5 item 3: a NON-CURRENT CONTINUITY chapter is the
+            // immutable lineage link its successors resolve parent ownership
+            // through (parent_lineage_of reads the predecessor's row, and
+            // fan-out/question routing count its descendants). Deleting it
+            // silently orphans those successors (403s, broken routing, a freed
+            // fan-out slot). Only the lineage's CURRENT chapter may be deleted;
+            // older ended chapters must be retained.
+            //
+            // A plain (non-continuity) instance has NO lineages row; it is
+            // always its own current chapter and is deletable.
+            let lineage_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM lineages WHERE lineage_id = ?1",
+                    params![&instance.lineage_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let is_current = !lineage_exists
+                || conn
+                    .query_row(
+                        "SELECT 1 FROM lineages WHERE lineage_id = ?2
+                            AND current_instance_id = ?1",
+                        params![&instance_id, &instance.lineage_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+            if !is_current {
+                return Err(StoreError::Conflict(format!(
+                    "instance {instance_id} is a closed predecessor chapter; only the lineage's                      current chapter can be deleted (its successors resolve ownership through it)"
+                )));
+            }
             let tx = conn.transaction()?;
             // c-cardsettle r2 item 2: retain the terminal state of this
             // instance's interactions before their rows are deleted, so a late

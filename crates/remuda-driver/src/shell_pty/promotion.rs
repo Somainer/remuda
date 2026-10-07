@@ -939,7 +939,13 @@ pub(super) fn spawn(
             // binding. Without this bridge only Claude's separate pid file
             // could hydrate, leaving a spurious manual picker over a hooked
             // session. begin_epoch must happen first so it cannot erase it.
-            let mut session_rebound = false;
+            // Item 2: when an authenticated SessionStart rebinds the
+            // foreground to another session, bound the NEW session from its
+            // OWN transcript snapshot at this instant (Fresh for an
+            // absent/empty file — a `/clear`; Unverified at current EOF
+            // otherwise — an in-TUI `/resume`). Never the launch argv, never
+            // byte 0.
+            let mut rebound_mode: Option<ResumeMode> = None;
             if let Some(hooks) = hooks.as_ref()
                 && let Some(binding) = hooks.binding()
                 && found.as_ref().is_some_and(|found| found.pid == binding.pid)
@@ -967,7 +973,9 @@ pub(super) fn spawn(
                         found.as_ref().expect("matched foreground"),
                         &report,
                     ) {
-                        session_rebound = true;
+                        rebound_mode = Some(crate::claude_transcript::ResumeMode::rebound_mode(
+                            std::path::Path::new(&report.transcript_path),
+                        ));
                         hydrator = None;
                         announced = None;
                     }
@@ -1298,8 +1306,7 @@ pub(super) fn spawn(
                     // a DIFFERENT session, or a pid change, kills it for the
                     // rest of the epoch; that new foreground agent is bounded
                     // from its own detected provenance instead.
-                    let epoch_mode =
-                        epoch_mode(&mut launch_mode, pre_resume_mode, session_rebound, found);
+                    let mode = epoch_mode(&mut launch_mode, pre_resume_mode, rebound_mode, found);
                     maintain_binding(
                         &bindings,
                         &ctx,
@@ -1313,7 +1320,7 @@ pub(super) fn spawn(
                         model.as_ref(),
                         permission_bridge.as_ref(),
                         launch_permission,
-                        epoch_mode,
+                        mode,
                     )
                     .await;
                 }
@@ -1515,37 +1522,41 @@ enum LaunchModeBinding {
     /// The pre-spawn mode belongs to this `(pid, session)`. An empty session
     /// means detection had not learned the id on that sample.
     Bound(i32, String),
-    /// The foreground rebound to another session (or changed pid): the
-    /// pre-spawn mode is dead for the rest of the promoted epoch.
-    Dead,
+    /// The foreground left the launched (pid, session): the pre-spawn mode is
+    /// dead for the rest of the promoted epoch. The carried mode is the
+    /// REBOUND session's own boundary (item 2: an authenticated rebind is
+    /// bounded from its own transcript snapshot, not the launch argv); for a
+    /// pid/argv-only change it is the detected provenance.
+    Dead(ResumeMode),
 }
 
 /// Decide one tick's epoch [`ResumeMode`] and advance the sticky
 /// [`LaunchModeBinding`].
 ///
-/// `rebound` says THIS tick's authenticated SessionStart replaced the bound
-/// session with another one. The pre-spawn mode applies only to the process
-/// it was captured for: it survives a session id simply becoming known for the
-/// same pid, dies on a rebind or a pid change, and never revives afterwards.
-/// A login shell (no pre-spawn mode) is always bounded per detected
-/// provenance via [`shell_resume_mode`].
+/// `rebound` carries the mode computed from the rebound session's OWN
+/// transcript when an authenticated SessionStart rebind happened this tick
+/// (see [`ResumeBoundary::rebound_mode`]); it is `None` on ordinary ticks.
+/// The pre-spawn mode applies only to the process it was captured for: it
+/// survives a session id simply becoming known for the same pid, dies on a
+/// rebind or pid change, and never revives. A login shell (no pre-spawn mode)
+/// is always bounded per detected provenance via [`shell_resume_mode`].
 fn epoch_mode(
     binding: &mut LaunchModeBinding,
     pre_resume_mode: Option<ResumeMode>,
-    rebound: bool,
+    rebound: Option<ResumeMode>,
     found: &Detected,
 ) -> ResumeMode {
     let Some(mode) = pre_resume_mode else {
-        return shell_resume_mode(found);
+        // A login shell rebind is bounded from the rebound transcript too.
+        return rebound.unwrap_or_else(|| shell_resume_mode(found));
     };
     let (pid, session) = (found.pid, found.session_id.clone().unwrap_or_default());
+    // An authenticated rebind this tick always wins over the current slot.
+    if let Some(rebind_mode) = rebound {
+        *binding = LaunchModeBinding::Dead(rebind_mode);
+        return rebind_mode;
+    }
     match *binding {
-        LaunchModeBinding::Unbound if rebound => {
-            // The first sighting was already an authenticated rebind: the
-            // launched boundary belongs to the prior session, never this one.
-            *binding = LaunchModeBinding::Dead;
-            shell_resume_mode(found)
-        }
         LaunchModeBinding::Unbound => {
             *binding = LaunchModeBinding::Bound(pid, session);
             mode
@@ -1554,8 +1565,7 @@ fn epoch_mode(
         // unchanged): the pre-spawn boundary still proves this foreground.
         // Refine a remembered empty id once the hook reports it.
         LaunchModeBinding::Bound(bound_pid, ref bound_session)
-            if !rebound
-                && bound_pid == pid
+            if bound_pid == pid
                 && (bound_session.is_empty()
                     || session.is_empty()
                     || bound_session == &session) =>
@@ -1565,12 +1575,14 @@ fn epoch_mode(
             }
             mode
         }
-        // An authenticated rebind, a session id changing to a different known
-        // id, or a different pid: establish the new session's own boundary.
-        // Dead is sticky.
-        LaunchModeBinding::Bound(..) | LaunchModeBinding::Dead => {
-            *binding = LaunchModeBinding::Dead;
-            shell_resume_mode(found)
+        // The rebound session's stored mode stays in force on later ticks.
+        LaunchModeBinding::Dead(dead_mode) => dead_mode,
+        // A pid change or a known session id flipping without an authenticated
+        // rebind: fall back to detected provenance and hold it.
+        LaunchModeBinding::Bound(..) => {
+            let detected = shell_resume_mode(found);
+            *binding = LaunchModeBinding::Dead(detected);
+            detected
         }
     }
 }
@@ -1921,7 +1933,15 @@ struct Hydrator {
     mapper: TranscriptMapper,
     /// Launch-time observations (model snapshot) emitted on the first pump.
     pending: Vec<Observation>,
+    /// Consecutive polls whose bound file could not be opened (live tail
+    /// NotFound). A resume tail survives a one-poll ENOENT internally; a LIVE
+    /// tail's file never legitimately vanishes, so after this many missing
+    /// polls the binding degrades instead of waiting forever.
+    missing_polls: u32,
 }
+
+/// Consecutive live-tail NotFound polls that mark the binding degraded.
+const LIVE_MISSING_POLL_DEGRADE: u32 = 3;
 
 impl Hydrator {
     /// Open the bound transcript for one detected foreground process /
@@ -1987,6 +2007,7 @@ impl Hydrator {
             mapper,
             tail,
             pending,
+            missing_polls: 0,
         })
     }
 }
@@ -2020,12 +2041,22 @@ async fn pump(
             }
         }
     }
-    // r4 item 6: a one-poll ENOENT (the bound file is being rotated/recreated)
-    // keeps the hydrator alive at its unverified anchor; the next tick retries.
-    // Only a persistent/other open error degrades the binding.
+    // A resume tail survives a one-poll ENOENT internally (it returns an
+    // empty Unverified read); a LIVE tail's file never legitimately vanishes.
+    // Tolerate a few consecutive missing polls (a transient rename/save),
+    // then degrade the binding rather than swallowing NotFound forever.
     let read = match hydrator.tail.poll() {
-        Ok(read) => read,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(read) => {
+            hydrator.missing_polls = 0;
+            read
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hydrator.missing_polls = hydrator.missing_polls.saturating_add(1);
+            if hydrator.missing_polls >= LIVE_MISSING_POLL_DEGRADE {
+                return Err(());
+            }
+            return Ok(());
+        }
         Err(_) => return Err(()),
     };
     // Apply provenance on EVERY poll, even with no lines: an unverified resume
@@ -2839,7 +2870,7 @@ mod tests {
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            false,
+            None,
             &detected_claude(7, None),
         );
         assert_eq!(mode, boundary_mode());
@@ -2849,7 +2880,7 @@ mod tests {
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            false,
+            None,
             &detected_claude(7, Some(CORRECT)),
         );
         assert_eq!(mode, boundary_mode());
@@ -2858,95 +2889,102 @@ mod tests {
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            false,
+            None,
             &detected_claude(7, Some(CORRECT)),
         );
         assert_eq!(mode, boundary_mode());
     }
 
     #[test]
-    fn a_session_start_rebind_kills_the_launch_mode_stickily() {
+    fn an_authenticated_rebind_binds_the_new_session_to_its_own_mode_stickily() {
+        // r5 item 2: the rebound session is bounded by the mode computed from
+        // ITS OWN transcript snapshot (passed in by the caller), never by the
+        // launch argv. A fresh `/clear` rebound is Fresh; a `/resume` rebound
+        // is its own unverified-EOF mode — and it sticks on later ticks.
+        let rebound_fresh = ResumeMode::Fresh;
+        let rebound_unverified = ResumeMode::Unverified;
         let mut binding = LaunchModeBinding::Bound(7, CORRECT.to_owned());
-        // Same pid, DIFFERENT session via an authenticated rebind: the new
-        // session is bounded from its own detected provenance (fresh here)...
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            true,
+            Some(rebound_fresh),
             &detected_claude(7, Some(LATE_STARTER)),
         );
-        assert_eq!(mode, ResumeMode::Fresh, "the stale launch mode is dead");
-        assert_eq!(binding, LaunchModeBinding::Dead);
-        // ...and it never revives, not even back on the original key.
+        assert_eq!(mode, ResumeMode::Fresh);
+        assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Fresh));
+        // Sticks on later ticks even though the argv Detected says resume.
+        let mut found = detected_claude(7, Some(LATE_STARTER));
+        found.resume = true;
+        let mode = epoch_mode(&mut binding, Some(boundary_mode()), None, &found);
+        assert_eq!(mode, ResumeMode::Fresh, "the rebound mode is sticky");
+        // A second rebind (e.g. then /resume again) replaces it with that
+        // session's own mode.
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            false,
-            &detected_claude(7, Some(CORRECT)),
+            Some(rebound_unverified),
+            &found,
         );
-        assert_eq!(mode, ResumeMode::Fresh);
-        assert_eq!(binding, LaunchModeBinding::Dead);
-        // A resumed rebound session is Unverified on its own merits, never the
-        // launch boundary.
-        let mut binding = LaunchModeBinding::Bound(7, CORRECT.to_owned());
-        let mut rebound = detected_claude(7, Some(LATE_STARTER));
-        rebound.resume = true;
-        let mode = epoch_mode(&mut binding, Some(boundary_mode()), true, &rebound);
         assert_eq!(mode, ResumeMode::Unverified);
-        assert_eq!(binding, LaunchModeBinding::Dead);
+        assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Unverified));
     }
 
     #[test]
-    fn a_pid_change_or_a_session_id_flip_kills_the_launch_mode() {
+    fn a_pid_change_or_a_session_id_flip_uses_detected_provenance_and_holds_it() {
         let mut binding = LaunchModeBinding::Bound(7, CORRECT.to_owned());
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            false,
+            None,
             &detected_claude(8, Some(CORRECT)),
         );
         assert_eq!(mode, ResumeMode::Fresh, "a new pid is a new process");
-        assert_eq!(binding, LaunchModeBinding::Dead);
+        assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Fresh));
         // A known session id silently changing to another known id at the same
         // pid (without an authenticated rebind) is also not the launch.
         let mut binding = LaunchModeBinding::Bound(7, CORRECT.to_owned());
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            false,
+            None,
             &detected_claude(7, Some(BUSY_OTHER)),
         );
         assert_eq!(mode, ResumeMode::Fresh);
-        assert_eq!(binding, LaunchModeBinding::Dead);
+        assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Fresh));
     }
 
     #[test]
-    fn a_rebound_on_the_very_first_sighting_is_dead_too() {
+    fn a_rebound_on_the_very_first_sighting_uses_the_rebound_mode() {
         let mut binding = LaunchModeBinding::Unbound;
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            true,
+            Some(ResumeMode::Unverified),
             &detected_claude(7, Some(LATE_STARTER)),
         );
-        assert_eq!(mode, ResumeMode::Fresh);
-        assert_eq!(binding, LaunchModeBinding::Dead);
+        assert_eq!(mode, ResumeMode::Unverified);
+        assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Unverified));
     }
 
     #[test]
-    fn a_login_shell_always_uses_detected_provenance_and_never_binds() {
+    fn a_login_shell_uses_detected_provenance_or_the_rebound_mode_without_binding() {
         let mut binding = LaunchModeBinding::Unbound;
         let mut found = detected_claude(7, Some(CORRECT));
         found.resume = true;
         assert_eq!(
-            epoch_mode(&mut binding, None, false, &found),
+            epoch_mode(&mut binding, None, None, &found),
             ResumeMode::Unverified
         );
         assert_eq!(binding, LaunchModeBinding::Unbound);
         found.resume = false;
         assert_eq!(
-            epoch_mode(&mut binding, None, false, &found),
+            epoch_mode(&mut binding, None, None, &found),
             ResumeMode::Fresh
+        );
+        // A login-shell rebind is bounded from the rebound transcript too.
+        assert_eq!(
+            epoch_mode(&mut binding, None, Some(ResumeMode::Unverified), &found),
+            ResumeMode::Unverified
         );
     }
     // ----- items 1/2/5/6/7: the production promotion pump ------------------
@@ -3006,9 +3044,10 @@ mod tests {
     }
 
     /// `(level, readback_available)` for every emitted effort observation.
+    /// Level is None on the read-back-unavailable edge.
     fn effort_rows(
         observations: &[Observation],
-    ) -> Vec<(remuda_protocol::EffortName, Option<bool>)> {
+    ) -> Vec<(Option<remuda_protocol::EffortName>, Option<bool>)> {
         observations
             .iter()
             .filter_map(|observation| match &observation.body {
@@ -3164,18 +3203,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn item1_without_process_start_evidence_a_resume_is_unverified() {
-        // macOS (and a pid the table cannot time on Linux) give no start
-        // instant, so a time-based boundary is impossible.
-        assert_eq!(crate::promote::process_started_at(99_999_999), None);
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(
-            crate::promote::process_started_at(std::process::id() as i32),
-            None
-        );
+    async fn item1_no_start_time_evidence_a_resume_is_still_unverified() {
+        // r5 item 6: process time is never a verifier. The mode derives only
+        // from the production argv detector via shell_resume_mode: any resume
+        // flag with no pre-exec snapshot is Unverified, regardless of pid.
+        let argv = "claude --resume";
+        let (session_id, is_resume) = crate::promote::resume_provenance(argv);
+        assert_eq!(session_id, None);
+        assert!(is_resume);
         let found = Detected {
-            resume: true,
-            ..detected_claude(7, None)
+            resume: is_resume,
+            ..detected_claude(7, session_id.as_deref())
         };
         assert_eq!(shell_resume_mode(&found), ResumeMode::Unverified);
         assert_unverified_pump_gates_history(
@@ -3187,46 +3225,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn item1_a_partial_trailing_line_still_gates_the_resume_at_the_pump() {
-        use crate::claude_transcript::{ResumeBoundary, TranscriptTail};
-        // The resumed process is mid-write on an effort record (no newline).
-        // at_process_start ends its scan at the partial line instead of
-        // failing; the line is held back until its newline arrives.
+    async fn item1_a_partial_trailing_line_does_not_error_the_unverified_pump() {
+        // The resumed process is mid-write on a record (no newline). The
+        // unverified EOF anchor tolerates the half-written record: completing
+        // it with a newline neither errors nor reopens the gate; only a
+        // genuinely new record hydrates (conversation, not effort).
         let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("t.jsonl");
-        let history_line = "{\"timestamp\":\"1970-01-01T00:00:10Z\",\"body\":\"history\"}\n";
-        let partial = "{\"timestamp\":\"1970-01-01T00:00:20Z\",\"body\":\"partial\"}";
-        std::fs::write(&path, format!("{history_line}{partial}")).expect("write");
-        let started = time::OffsetDateTime::from_unix_timestamp(15).expect("start");
-        let boundary = ResumeBoundary::at_process_start(&path, started)
-            .expect("a partial trailing line ends the scan at that offset instead of failing");
-        assert_eq!(boundary.start as usize, history_line.len());
-        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
-        assert!(tail.poll().expect("poll").lines.is_empty());
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("open")
-            .write_all(b"\n")
-            .expect("finish the line");
-        let read = tail.poll().expect("poll");
-        assert_eq!(read.provenance, TailProvenance::Current);
-        assert_eq!(read.lines, vec![partial]);
-
-        // Through the production promotion pump the same shape is an
-        // Unverified anchor: EOF sits mid-record, completing it with a newline
-        // neither errors nor reopens the gate (the half-written bytes were
-        // before the anchor; only a genuinely new record hydrates).
+        let history_line = "{\"body\":\"history\"}\n";
+        let partial = "{\"body\":\"partial\"}";
         let mut fx = pump_fixture(tmp.path(), &format!("{history_line}{partial}"));
         let mut hydrator = open_hydrator(&fx, ResumeMode::Unverified, None);
         pump_once(&mut hydrator, &fx).await;
         assert!(drain(&mut fx).is_empty());
         append_line(&fx.binding.path, "\n");
         pump_once(&mut hydrator, &fx).await;
-        let observations = drain(&mut fx);
         assert!(
-            effort_rows(&observations).is_empty(),
-            "completing the partial line never opens the gate: {observations:?}"
+            drain(&mut fx).is_empty(),
+            "completing the partial emits nothing"
         );
         append_line(&fx.binding.path, &user_line(1, "real next question"));
         pump_once(&mut hydrator, &fx).await;
@@ -3308,17 +3323,45 @@ mod tests {
         std::fs::remove_file(&fx.binding.path).expect("vanish");
         pump_once(&mut hydrator, &fx).await;
         assert!(drain(&mut fx).is_empty(), "no observations while absent");
-        // It returns under a new identity: appended conversation hydrates,
-        // still Unverified, so an effort record on it cannot open the gate.
+        // It returns with DIFFERENT content (a recreate): that poll anchors
+        // at the restored EOF and replays nothing.
         append_line(&fx.binding.path, &user_line(1, "after restore"));
         append_line(&fx.binding.path, &assistant_line(Some("high"), 2));
+        pump_once(&mut hydrator, &fx).await;
+        assert!(drain(&mut fx).is_empty(), "restored bytes never replay");
+        // Only bytes appended AFTER the anchor hydrate, still Unverified, so
+        // an effort record on them cannot open the gate.
+        append_line(&fx.binding.path, &user_line(3, "later question"));
         pump_once(&mut hydrator, &fx).await;
         let observations = drain(&mut fx);
         assert!(
             effort_rows(&observations).is_empty(),
             "post-restore bytes stay gated: {observations:?}"
         );
-        assert!(conversation_hydrated(&observations, "after restore"));
+        assert!(conversation_hydrated(&observations, "later question"));
+        // An identical-content recreate continues at the stored offset: the
+        // later append hydrates and nothing already seen is re-emitted.
+        std::fs::remove_file(&fx.binding.path).expect("vanish again");
+        pump_once(&mut hydrator, &fx).await;
+        let _ = drain(&mut fx);
+        let restored = format!(
+            "{}{}{}",
+            user_line(1, "after restore"),
+            assistant_line(Some("high"), 2),
+            user_line(3, "later question"),
+        );
+        std::fs::write(&fx.binding.path, restored).expect("identical restore");
+        pump_once(&mut hydrator, &fx).await;
+        assert!(
+            drain(&mut fx).is_empty(),
+            "identical restore replays nothing"
+        );
+        append_line(&fx.binding.path, &user_line(4, "after identical restore"));
+        pump_once(&mut hydrator, &fx).await;
+        assert!(conversation_hydrated(
+            &drain(&mut fx),
+            "after identical restore"
+        ));
     }
 
     #[tokio::test]
@@ -3336,7 +3379,7 @@ mod tests {
         let edges = effort_rows(&drain(&mut fx));
         assert_eq!(
             edges,
-            vec![(remuda_protocol::EffortName::High, None)],
+            vec![(Some(remuda_protocol::EffortName::High), None)],
             "the verified boundary opens the gate"
         );
         // Remuda arms a switch to max; its slash record is a current record.
@@ -3353,8 +3396,8 @@ mod tests {
         let edges = effort_rows(&drain(&mut fx));
         assert_eq!(
             edges,
-            vec![(remuda_protocol::EffortName::High, Some(false))],
-            "one explicit read-back-unavailable edge clears the projected state"
+            vec![(None, Some(false))],
+            "one explicit read-back-unavailable edge withdraws the projected state"
         );
         assert!(
             bridge.has_pending(),
@@ -3381,5 +3424,212 @@ mod tests {
             .wait(generation, std::time::Duration::from_millis(150))
             .await;
         assert!(settled.is_none(), "the switch keeps waiting, never Applied");
+    }
+
+    /// r5 item 3: `claude -c` / `--continue` parses as a value-less resume,
+    /// so the continued transcript is tailed from current EOF unverified, not
+    /// byte 0 as current. The mode derives through the production argv parser.
+    /// r5 item 5: a LIVE tail whose bound file vanishes is tolerated only for a
+    /// few consecutive polls; after that the pump errors so the binding is
+    /// marked degraded (TRANSCRIPT_DEGRADED) instead of waiting forever.
+    #[tokio::test]
+    async fn item5_a_persistently_vanished_live_tail_degrades_after_the_threshold() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fx = pump_fixture(tmp.path(), "{}\n");
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Fresh, None);
+        // The file is genuinely gone (not a resume-tail one-poll ENOENT).
+        std::fs::remove_file(&fx.binding.path).expect("vanish");
+        for expected in 1..LIVE_MISSING_POLL_DEGRADE {
+            assert_eq!(hydrator.missing_polls, expected - 1);
+            pump(&mut hydrator, &fx.tx, &fx.seq, &fx.ctx)
+                .await
+                .expect("transient missing polls are tolerated");
+        }
+        pump(&mut hydrator, &fx.tx, &fx.seq, &fx.ctx)
+            .await
+            .expect_err("the threshold poll degrades the binding");
+        // The file returning resets the counter: the next vanish again gets
+        // the full tolerance window instead of degrading immediately.
+        let mut live = open_hydrator(&fx, ResumeMode::Fresh, None);
+        std::fs::write(&fx.binding.path, "{}\n").expect("restored");
+        pump_once(&mut live, &fx).await;
+        assert_eq!(
+            live.missing_polls, 0,
+            "a successful poll resets the counter"
+        );
+        std::fs::remove_file(&fx.binding.path).expect("vanish again");
+        for _ in 1..LIVE_MISSING_POLL_DEGRADE {
+            pump(&mut live, &fx.tx, &fx.seq, &fx.ctx)
+                .await
+                .expect("the new window tolerates transient misses again");
+        }
+        pump(&mut live, &fx.tx, &fx.seq, &fx.ctx)
+            .await
+            .expect_err("the repeated vanish degrades again");
+    }
+
+    #[tokio::test]
+    async fn item3_continue_flag_tails_history_from_eof_unverified() {
+        let history = assistant_line(Some("high"), 1);
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &history);
+        // The real detector on `claude -c "fix the build"` sees a resume with
+        // no session id and keeps the prompt token.
+        let (session_id, is_resume) = crate::promote::resume_provenance("claude -c fix the build");
+        assert!(is_resume, "-c is a resume flag");
+        assert_eq!(session_id, None, "the prompt is not consumed as an id");
+        let mut found = detected_claude(7, session_id.as_deref());
+        found.resume = is_resume;
+        let mode = shell_resume_mode(&found);
+        assert_eq!(mode, ResumeMode::Unverified);
+        let mut hydrator = open_hydrator(&fx, mode, None);
+        pump_once(&mut hydrator, &fx).await;
+        assert!(
+            drain(&mut fx).is_empty(),
+            "history must not replay as current"
+        );
+        append_line(&fx.binding.path, &user_line(2, "continued session work"));
+        pump_once(&mut hydrator, &fx).await;
+        assert!(conversation_hydrated(
+            &drain(&mut fx),
+            "continued session work"
+        ));
+        // A high record appended after the anchor still does NOT open the gate
+        // (value-less continue is unverifiable).
+        append_line(&fx.binding.path, &assistant_line(Some("max"), 3));
+        pump_once(&mut hydrator, &fx).await;
+        assert!(effort_rows(&drain(&mut fx)).is_empty());
+    }
+
+    #[test]
+    fn rebound_mode_is_fresh_for_absent_or_empty_and_unverified_eof_otherwise() {
+        use crate::claude_transcript::ResumeMode;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("resumed.jsonl");
+        // Absent: Fresh (the new session's file does not exist yet).
+        assert_eq!(ResumeMode::rebound_mode(&path), ResumeMode::Fresh);
+        // Empty: Fresh (`/clear` created a zero-length file).
+        write(&path, "");
+        assert_eq!(ResumeMode::rebound_mode(&path), ResumeMode::Fresh);
+        // Non-empty: an unverified boundary anchored at the CURRENT EOF.
+        write(&path, "{\"history\":true}\n");
+        match ResumeMode::rebound_mode(&path) {
+            ResumeMode::Boundary(boundary) => {
+                assert!(!boundary.verified, "a rebound is never time-verified");
+                assert_eq!(boundary.start as usize, "{\"history\":true}\n".len());
+            }
+            other => panic!("expected an unverified boundary, got {other:?}"),
+        }
+    }
+
+    /// r5 item 2(a): a FRESH launch argv that in-TUI `/resume <older-id>`
+    /// rebounds onto a transcript full of history. The rebound mode is taken
+    /// from the rebound session's OWN snapshot (Unverified at EOF), never from
+    /// the launch argv (Fresh/byte 0). The old records do not publish, and a
+    /// switch whose word matches a replayed slash+verdict never settles.
+    #[tokio::test]
+    async fn item2a_fresh_argv_rebound_onto_history_is_unverified_not_byte_zero() {
+        // The rebound transcript already carries the older session's effort
+        // history: a high assistant record and a complete slash→verdict max.
+        let history = format!(
+            "{}{}{}",
+            assistant_line(Some("high"), 1),
+            slash_line("max", 2),
+            stdout_verdict("Set effort level to max", 3),
+        );
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &history);
+        // Simulate the authenticated rebind: the mode derives from the bound
+        // transcript at the rebind instant, not from the (fresh) launch argv.
+        let mode = crate::claude_transcript::ResumeMode::rebound_mode(&fx.binding.path);
+        assert!(
+            matches!(mode, crate::claude_transcript::ResumeMode::Boundary(b) if !b.verified),
+            "a history-bearing rebound is unverified-EOF, got {mode:?}"
+        );
+        let bridge = std::sync::Arc::new(crate::effort::EffortBridge::new());
+        let mut hydrator = open_hydrator(&fx, mode, Some(&bridge));
+        // First poll: zero history replays (it would publish high/applied as
+        // current under the old Fresh/byte-0 behaviour).
+        pump_once(&mut hydrator, &fx).await;
+        assert!(drain(&mut fx).is_empty(), "no history replays on rebind");
+
+        // A Remuda-armed switch must not be settled by the rebound session's
+        // old (already-on-disk, but here simply not in-window) verdict nor by
+        // anything appended while the epoch is unverified.
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        append_line(
+            &fx.binding.path,
+            &format!(
+                "{}{}",
+                slash_line("max", 4),
+                stdout_verdict("Set effort level to max", 5),
+            ),
+        );
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(
+            effort_rows(&observations).is_empty(),
+            "the rebound epoch never opens the gate: {observations:?}"
+        );
+        assert!(bridge.has_pending());
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_millis(150))
+                .await
+                .is_none(),
+            "a replayed/rebound verdict must not resolve Applied"
+        );
+        // Conversation after the anchor still hydrates.
+        append_line(&fx.binding.path, &user_line(6, "question after rebind"));
+        pump_once(&mut hydrator, &fx).await;
+        assert!(conversation_hydrated(
+            &drain(&mut fx),
+            "question after rebind"
+        ));
+    }
+
+    /// r5 item 2(b): a `--resume` launch followed by `/clear` rebounds onto a
+    /// brand-new (empty/absent) transcript. That new session is FRESH from its
+    /// own snapshot, not permanently Unverified from the launch — its own
+    /// later records are current and switch read-backs can settle.
+    #[tokio::test]
+    async fn item2b_clear_rebound_is_fresh_and_its_new_records_are_current() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), "{}\n");
+        // `/clear` lands on an EMPTY new transcript: Fresh regardless of the
+        // original --resume launch mode.
+        std::fs::write(&fx.binding.path, "").expect("empty new session file");
+        let mode = crate::claude_transcript::ResumeMode::rebound_mode(&fx.binding.path);
+        assert_eq!(mode, crate::claude_transcript::ResumeMode::Fresh);
+        let bridge = std::sync::Arc::new(crate::effort::EffortBridge::new());
+        let mut hydrator = open_hydrator(&fx, mode, Some(&bridge));
+        pump_once(&mut hydrator, &fx).await;
+        assert!(drain(&mut fx).is_empty());
+        // The NEW session arms max and its own verdict lands: Fresh/Current,
+        // so the read-back opens the gate and settles the switch.
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        append_line(
+            &fx.binding.path,
+            &format!(
+                "{}{}{}",
+                slash_line("max", 1),
+                stdout_verdict("Set effort level to max", 2),
+                assistant_line(Some("max"), 3),
+            ),
+        );
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert_eq!(
+            effort_rows(&observations),
+            vec![(Some(remuda_protocol::EffortName::Max), None)],
+            "the new session's own records are current: {observations:?}"
+        );
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_millis(150))
+                .await
+                .is_some(),
+            "the new session's verdict settles the switch"
+        );
     }
 }

@@ -662,66 +662,6 @@ impl ResumeBoundary {
             head: hash_head(path, start),
         })
     }
-
-    /// Boundary for a resume discovered only after its process started (a
-    /// `claude --resume <id>` typed into a login shell): the first whole record
-    /// whose top-level `timestamp` is at/after `started_at`, measured as a byte
-    /// offset so the tail can seek straight to it. Records the resumed process
-    /// wrote before it was promoted are current (timestamp ≥ process start) and
-    /// are NOT lost; older records are history. `None` when the file cannot be
-    /// read or its identity established.
-    #[must_use]
-    pub fn at_process_start(path: &Path, started_at: time::OffsetDateTime) -> Option<Self> {
-        use serde_json::Value;
-        let identity = FileIdentity::of(path)?;
-        let bytes = std::fs::read(path).ok()?;
-        // Offset just past the last history line; equals EOF when every record
-        // seen so far predates the process (the common "promote before any
-        // record" case).
-        let mut start = 0usize;
-        let mut cursor = 0usize;
-        while cursor < bytes.len() {
-            // A partial trailing line (no newline yet) is exactly what a
-            // running process is currently writing: treat it as the boundary
-            // instead of failing the scan (which previously made the resume
-            // unprovable and tailed byte 0 as current).
-            let Some(nl_rel) = bytes[cursor..].iter().position(|b| *b == b'\n') else {
-                start = cursor;
-                break;
-            };
-            let nl = cursor + nl_rel;
-            let line_end = nl + 1;
-            let line = &bytes[cursor..nl];
-            let at = serde_json::from_slice::<Value>(line)
-                .ok()
-                .and_then(|v| {
-                    v.get("timestamp")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .and_then(|ts| record_timestamp(&ts));
-            if at.is_some_and(|at| at >= started_at) {
-                // This line is the first the running process wrote.
-                start = cursor;
-                break;
-            }
-            start = line_end;
-            cursor = line_end;
-        }
-        let total = bytes.len() as u64;
-        Some(Self {
-            identity,
-            start: start as u64,
-            verified: true,
-            head: Some(fingerprint_bytes(&bytes, total)),
-        })
-    }
-}
-
-/// Parse a transcript record's RFC3339 `timestamp` to an instant.
-fn record_timestamp(value: &str) -> Option<time::OffsetDateTime> {
-    use time::format_description::well_known::Rfc3339;
-    time::OffsetDateTime::parse(value, &Rfc3339).ok()
 }
 
 /// Incremental reader over one transcript file.
@@ -763,9 +703,10 @@ struct ResumeState {
     verified: bool,
     /// Set once the tracked file shrank, was replaced, or vanished.
     displaced: bool,
-    /// The most recent displacement was a vanish (ENOENT): when the file
-    /// returns under a new identity, everything it then contains is new to
-    /// this tail and is hydrated (Unverified) rather than anchored over.
+    /// The previous poll was an ENOENT: on the next poll an identity change is
+    /// EXPECTED (a delete-and-recreate gets a new inode), so an intact head
+    /// fingerprint means "same content restored" and the tail continues at the
+    /// old offset instead of anchoring (r5 item 4).
     absent: bool,
 }
 
@@ -809,6 +750,29 @@ impl ResumeMode {
     #[must_use]
     pub fn is_resume(&self) -> bool {
         !matches!(self, ResumeMode::Fresh)
+    }
+
+    /// Mode for a session that arrived through an AUTHENTICATED in-TUI
+    /// SessionStart rebind (a `/resume <older-id>` or `/clear` in a live
+    /// Claude): the new foreground must be bounded from ITS OWN transcript as
+    /// it exists at the rebind, never from the launch argv and never byte 0.
+    ///
+    /// - absent or EMPTY (`len == 0`) → [`ResumeMode::Fresh`]: it is a brand
+    ///   new session (`/clear`), every record it will write is current;
+    /// - otherwise → an unverified EOF anchor: the existing bytes are another
+    ///   session's history and must not replay as current, while bytes
+    ///   appended after the rebind hydrate conversation only (the effort gate
+    ///   stays closed for the epoch).
+    #[must_use]
+    pub fn rebound_mode(path: &Path) -> ResumeMode {
+        let non_empty = std::fs::metadata(path)
+            .map(|metadata| metadata.is_file() && metadata.len() > 0)
+            .unwrap_or(false);
+        if non_empty && let Some(boundary) = ResumeBoundary::unverified_eof(path) {
+            ResumeMode::Boundary(boundary)
+        } else {
+            ResumeMode::Fresh
+        }
     }
 
     /// Open the tail for a bound transcript `path`. For an [`ResumeMode::Unverified`]
@@ -982,34 +946,35 @@ impl TranscriptTail {
                     }
                     None => true,
                 };
-                if identity_now != state.identity || !head_matches {
-                    if state.absent {
-                        // The file came back after an ENOENT. Every byte on the
-                        // restored file is new to THIS tail: hydrate the whole
-                        // thing (still Unverified — the gate is closed), then
-                        // follow appends on the restored identity.
-                        self.offset = 0;
-                        self.partial.clear();
-                    } else {
-                        // A replacement seen while the file stayed present may
-                        // carry replayed history: anchor at the new EOF.
-                        self.offset = len;
-                        self.partial.clear();
-                    }
+                // After a vanish the inode may legitimately differ for an
+                // identical restore; elsewhere an identity change is itself a
+                // replacement signal.
+                let replaced = !head_matches || (!state.absent && identity_now != state.identity);
+                if replaced {
+                    // A replacement — whether the file stayed present or
+                    // returned after an ENOENT with DIFFERENT content — may
+                    // carry replayed or already-published bytes. Anchor at the
+                    // new file's EOF so nothing is re-emitted; only bytes
+                    // appended AFTER this poll hydrate (Unverified).
+                    self.offset = len;
+                    self.partial.clear();
                     state.identity = identity_now;
                     state.head = hash_head(&self.path, len);
-                    state.absent = false;
                 } else {
-                    // The same file continued (or reappeared on its identity
-                    // with an intact head): ordinary tailing resumes; the
-                    // absent-restore rule no longer applies to a later
-                    // replacement.
-                    state.absent = false;
+                    // Same head — an identical restore after a vanish, or a
+                    // plain append: continue at the stored offset so a
+                    // delete-and-recreate with identical content re-emits zero
+                    // messages. Adopt the restored inode (it legitimately
+                    // differs after a recreate) or the next append would be
+                    // misread as yet another replacement. A shrink still
+                    // cannot seek backwards.
+                    state.identity = identity_now;
                     if len < self.offset {
                         self.offset = len;
                         self.partial.clear();
                     }
                 }
+                state.absent = false;
                 let lines = Self::read_lines(&mut file, len, &mut self.offset, &mut self.partial)?;
                 return Ok(TailRead {
                     lines,
@@ -1337,42 +1302,6 @@ mod tests {
         assert!(!tail.displaced());
     }
 
-    /// Build a record line with an RFC3339 timestamp `secs` seconds past epoch.
-    fn ts_record(secs: i64, body: &str) -> String {
-        use time::format_description::well_known::Rfc3339;
-        let at = time::OffsetDateTime::from_unix_timestamp(secs).expect("ts");
-        format!(
-            "{{\"timestamp\":\"{}\",\"body\":{}}}\n",
-            at.format(&Rfc3339).expect("fmt"),
-            serde_json::to_string(body).expect("json")
-        )
-    }
-
-    #[test]
-    fn a_process_start_boundary_keeps_records_the_resumed_process_already_wrote() {
-        // Discovered-later resume (a `claude --resume` typed into a login
-        // shell): records the process wrote before promotion are current.
-        let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("t.jsonl");
-        write(&path, "");
-        append(&path, &ts_record(100, "history-a"));
-        append(&path, &ts_record(200, "history-b"));
-        // The foreground process started at t=150 and already appended one
-        // current record before the poller bound the transcript.
-        let started = time::OffsetDateTime::from_unix_timestamp(150).expect("start");
-        let boundary = ResumeBoundary::at_process_start(&path, started).expect("boundary");
-        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
-        let read = tail.poll().expect("poll");
-        assert_eq!(read.lines, vec![ts_record(200, "history-b").trim_end()]);
-        assert_eq!(read.provenance, TailProvenance::Current);
-        // A later current record is read too.
-        append(&path, &ts_record(250, "current-c"));
-        assert_eq!(
-            tail.poll().expect("poll").lines,
-            vec![ts_record(250, "current-c").trim_end()]
-        );
-    }
-
     #[test]
     fn a_shorter_replacement_does_not_replay_history_as_current() {
         // Item 2: the file is replaced by something SHORTER (rotation/truncation).
@@ -1447,8 +1376,8 @@ mod tests {
     fn a_one_poll_enoent_keeps_the_resume_tail_and_comes_back_unverified() {
         // Item 6: a one-poll ENOENT (the bound file is being rotated/recreated)
         // does NOT end the tail: the hydrator keeps its anchor, the missing poll
-        // returns no lines as Unverified, and appends after the restore hydrate
-        // conversation — never as Current.
+        // returns no lines as Unverified, and only bytes appended AFTER the
+        // restore hydrate conversation — never as Current.
         let tmp = tempfile::tempdir().expect("tmp");
         let path = tmp.path().join("t.jsonl");
         write(&path, "{\"old\":1}\n");
@@ -1460,56 +1389,64 @@ mod tests {
         assert!(missing.lines.is_empty());
         assert_eq!(missing.provenance, TailProvenance::Unverified);
         assert!(tail.displaced(), "the anchor is now unprovable");
-        // The file returns under a new identity (tmpfs may even reuse the
-        // inode; the head fingerprint makes the replacement detectable):
-        // every byte on the restored file is new to this tail and hydrates,
-        // but the gate stays closed.
-        append(&path, "{\"new\":1}\n{\"new\":2}\n");
-        let read = tail.poll().expect("poll after restore");
-        assert_eq!(read.provenance, TailProvenance::Unverified);
-        assert_eq!(read.lines, vec!["{\"new\":1}", "{\"new\":2}"]);
-        // A second transient ENOENT is still survivable, and its restore also
-        // hydrates.
-        std::fs::remove_file(&path).expect("remove again");
-        let missing = tail.poll().expect("second ENOENT still keeps the tail");
-        assert_eq!(missing.provenance, TailProvenance::Unverified);
+        // The file returns with DIFFERENT content (a recreate/restore): anchor
+        // at the restored EOF — its bytes are replayed/foreign and emit
+        // nothing; only later appends hydrate, still Unverified. tmpfs may even
+        // reuse the inode; the head fingerprint makes the replacement visible.
+        write(&path, "{\"new\":1}\n{\"new\":2}\n");
+        assert!(
+            tail.poll().expect("poll after restore").lines.is_empty(),
+            "restored bytes never replay"
+        );
         append(&path, "{\"new\":3}\n");
         let read = tail.poll().expect("poll");
         assert_eq!(read.provenance, TailProvenance::Unverified);
         assert_eq!(read.lines, vec!["{\"new\":3}"]);
-        // A present-file replacement afterwards anchors at EOF (replayed
-        // bytes suppressed), then appends hydrate.
+        // A present-file replacement anchors at its EOF too, then appends
+        // hydrate.
         write(&path, "{\"rotated\":1}\n");
         assert!(tail.poll().expect("poll").lines.is_empty());
         append(&path, "{\"new\":4}\n");
         assert_eq!(tail.poll().expect("poll").lines, vec!["{\"new\":4}"]);
     }
+
     #[test]
-    fn a_partial_trailing_line_ends_the_process_start_scan_at_that_offset() {
-        // Item 1 (Linux): a record the resumed process is mid-write (no trailing
-        // newline yet) used to make at_process_start fail entirely, which sent
-        // the pump down the fresh byte-0/current path. The scan now ends at the
-        // partial line's offset: it is treated as the first current record.
+    fn an_identical_restore_after_enoent_continues_at_the_old_offset_with_zero_dupes() {
+        // r5 item 4: a delete-and-recreate (sync tool / copy-back / editor
+        // save) that restores the SAME bytes must continue at the stored
+        // offset — already-published records are never re-emitted. Only the
+        // genuinely new suffix is read.
         let tmp = tempfile::tempdir().expect("tmp");
         let path = tmp.path().join("t.jsonl");
-        write(&path, "");
-        append(&path, &ts_record(100, "history-a"));
-        let partial = "{\"timestamp\":\"1970-01-01T00:00:20Z\",\"body\":\"partial\"}";
-        append(&path, partial);
-        let started = time::OffsetDateTime::from_unix_timestamp(150).expect("start");
-        let boundary = ResumeBoundary::at_process_start(&path, started).expect("boundary");
-        assert_eq!(
-            boundary.start as usize,
-            ts_record(100, "history-a").len(),
-            "the boundary starts at the un-newline-terminated record"
-        );
+        let history = "{\"old\":1}\n";
+        let current = "{\"current\":2}\n";
+        write(&path, &format!("{history}{current}"));
+        // Boundary after the history line: the current line was already read.
+        // The head probe spans the file's current length (history + current).
+        let snapshot = ResumeBoundary::snapshot(&path).expect("boundary");
+        let boundary = ResumeBoundary {
+            start: history.len() as u64,
+            ..snapshot
+        };
         let mut tail = TranscriptTail::resumed(path.clone(), boundary);
-        let read = tail.poll().expect("poll holds the partial line back");
-        assert!(read.lines.is_empty());
-        // The writer finishes the line: it now reads whole, as current.
-        append(&path, "\n");
         let read = tail.poll().expect("poll");
+        assert_eq!(read.lines, vec!["{\"current\":2}"]);
         assert_eq!(read.provenance, TailProvenance::Current);
-        assert_eq!(read.lines, vec![partial]);
+        let eof = (history.len() + current.len()) as u64;
+        // Vanish, then restore the identical content plus a new line.
+        std::fs::remove_file(&path).expect("remove");
+        assert!(tail.poll().expect("enotent").lines.is_empty());
+        let fresh = "{\"current\":3}\n";
+        write(&path, &format!("{history}{current}{fresh}"));
+        let read = tail.poll().expect("poll after identical restore");
+        // Exactly ONE line — neither the history nor the already-published
+        // current record is re-emitted.
+        assert_eq!(
+            read.lines,
+            vec!["{\"current\":3}"],
+            "zero duplicated messages"
+        );
+        assert_eq!(read.provenance, TailProvenance::Unverified);
+        let _ = eof;
     }
 }

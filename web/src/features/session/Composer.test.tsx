@@ -528,21 +528,27 @@ describe("Composer context usage chip", () => {
   }
 
   it("a no-rollup context-chip leave does not close the effort menu (RC2)", async () => {
+    // Time is driven explicitly (r3 item 4): fake timers, never wall-clock.
+    // Fake only setTimeout/setInterval: the beforeEach rAF stub (noop) must
+    // survive, and user-event's pointer choreography waits on the faked
+    // clock, so the gestures go through plain fireEvent.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     stubFinePointer();
-    const user = userEvent.setup();
     render(<Composer instanceId="ins_rc2_e" mobile={false} onSend={vi.fn()} kind="claude" />);
-    await user.click(screen.getByTestId("model-effort-chip"));
+    fireEvent.click(screen.getByTestId("model-effort-chip"));
     expect(screen.getByTestId("effort-slider-panel")).toBeInTheDocument();
-    // Cross/leave the context chip and wait beyond HOVER_CLOSE_DELAY_MS: the
-    // scoped leave timer must not dismiss the effort menu.
+    // Cross/leave the context chip and advance beyond HOVER_CLOSE_DELAY_MS:
+    // the scoped leave timer must not dismiss the effort menu.
     fireEvent.mouseLeave(screen.getByTestId("context-chip"));
-    await new Promise((r) => setTimeout(r, HOVER_CLOSE_DELAY_MS + 60));
+    act(() => {
+      vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 60);
+    });
     expect(screen.getByTestId("effort-slider-panel")).toBeInTheDocument();
   });
 
   it("a no-rollup context-chip leave does not close the permission menu (RC2)", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     stubFinePointer();
-    const user = userEvent.setup();
     render(
       <Composer
         instanceId="ins_rc2_p"
@@ -552,10 +558,12 @@ describe("Composer context usage chip", () => {
         permissionMode="manual"
       />,
     );
-    await user.click(screen.getByTestId("permission-chip"));
+    fireEvent.click(screen.getByTestId("permission-chip"));
     expect(screen.getByTestId("permission-menu")).toBeInTheDocument();
     fireEvent.mouseLeave(screen.getByTestId("context-chip"));
-    await new Promise((r) => setTimeout(r, HOVER_CLOSE_DELAY_MS + 60));
+    act(() => {
+      vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 60);
+    });
     expect(screen.getByTestId("permission-menu")).toBeInTheDocument();
   });
 

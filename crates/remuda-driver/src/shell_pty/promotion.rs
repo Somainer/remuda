@@ -1901,16 +1901,12 @@ async fn pump(
             }
         };
         for observation in mapped {
-            if emit(
-                events,
-                seq,
-                ctx,
-                SourceChannel::Transcript,
-                observation.completeness,
-                observation.body,
-            )
-            .await
-            .is_err()
+            // c-ctxusage r3 item 5: preserve the mapper-provided native time
+            // (historical usage timestamps) instead of rebuilding the envelope
+            // with native_at: Unknown.
+            if emit_native(events, seq, ctx, SourceChannel::Transcript, &observation)
+                .await
+                .is_err()
             {
                 return Err(());
             }
@@ -1951,7 +1947,36 @@ async fn emit(
         channel,
         completeness,
         body,
+        Knowledge::Unknown {
+            reason: "not-emitted".into(),
+            evidence_event_ids: Vec::new(),
+        },
     )?;
+    events
+        .send(observation)
+        .await
+        .map_err(|_| DriverError::ControlUnavailable)
+}
+
+/// Send an observation the mapper already stamped, preserving its envelope's
+/// `native_at` (c-ctxusage r3 item 5 — historical usage must keep its time).
+async fn emit_native(
+    events: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &PromoteCtx,
+    channel: SourceChannel,
+    stamped: &Observation,
+) -> DriverResult<()> {
+    let mut observation = build(
+        ctx,
+        seq.fetch_add(1, Ordering::SeqCst) + 1,
+        channel,
+        stamped.completeness,
+        stamped.body.clone(),
+        stamped.native_at.clone(),
+    )?;
+    // The replay completeness/evidence the mapper computed rides along.
+    observation.evidence_event_ids = stamped.evidence_event_ids.clone();
     events
         .send(observation)
         .await
@@ -1964,6 +1989,7 @@ fn build(
     channel: SourceChannel,
     completeness: Completeness,
     body: ObservationPayload,
+    native_at: Knowledge<Timestamp>,
 ) -> DriverResult<Observation> {
     Ok(Observation {
         schema_version: SchemaVersion,
@@ -1976,10 +2002,7 @@ fn build(
         run_generation: Some(U64(1)),
         seq: U64(seq),
         observed_at: now_ts()?,
-        native_at: Knowledge::Unknown {
-            reason: "not-emitted".into(),
-            evidence_event_ids: Vec::new(),
-        },
+        native_at,
         source: ObservationSource {
             driver_kind: remuda_protocol::DriverKind::ShellPty,
             driver_version: "shell-pty".into(),

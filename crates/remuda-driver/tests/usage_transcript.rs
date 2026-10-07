@@ -53,10 +53,10 @@ fn usage_by_message() -> BTreeMap<String, remuda_protocol::UsagePayload> {
             }
             for obs in mapper.map_line(line).expect("a real 2.1.289 record maps") {
                 if let ObservationPayload::Usage(payload) = obs.body {
-                    // scope_id is "<requestId>:<messageId>" when a requestId
-                    // is present, else the bare message id; key assertions on
-                    // the message id.
-                    let id = payload.scope_id.rsplit(':').next().unwrap().to_owned();
+                    // The durable key is the bare assistant message id (r3
+                    // item 4 drops requestId namespacing so round-one rows
+                    // merge on re-hydration).
+                    let id = payload.scope_id.clone();
                     assert!(
                         by_id.insert(id, *payload).is_none(),
                         "one usage observation per message id (got a duplicate)"
@@ -227,7 +227,238 @@ fn usage_finalises_only_when_the_assistant_group_completes() {
     assert_eq!(known(&p.output_tokens), 9, "final output");
     assert_eq!(known(&p.cache_read_tokens), 9_000, "final cache read");
     assert_eq!(
-        p.scope_id, "req-1:msg-split",
-        "scope id namespaces requestId"
+        p.scope_id, "msg-split",
+        "the durable key is the bare message id (requestId is not namespaced)"
     );
+}
+
+/// c-ctxusage r3 item 1: a record carrying a stop_reason, followed on a LATER
+/// poll by another record for the SAME message id with different counters, must
+/// finalise on the LATER counters — the poll drains content but retains the
+/// group, and the second snapshot is a higher revision, not a frozen first row.
+#[test]
+fn a_later_same_id_record_revises_the_usage_to_the_final_counters() {
+    fn assistant(message_id: &str, ts: &str, input: u64, stop: bool) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": format!("{message_id}-{ts}"),
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "requestId": "req-1",
+            "timestamp": ts,
+            "message": {
+                "id": message_id,
+                "role": "assistant",
+                "type": "message",
+                "model": "claude-sonnet-5",
+                "stop_reason": if stop { serde_json::json!("end_turn") } else { serde_json::Value::Null },
+                "content": [{"type": "text", "text": "x"}],
+                "usage": {
+                    "input_tokens": input,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": input,
+                },
+            }
+        })
+        .to_string()
+    }
+    // One poll = map the batch lines then a flush().
+    let poll = |mapper: &mut TranscriptMapper, lines: &[String]| {
+        let mut out = Vec::new();
+        for line in lines {
+            out.extend(mapper.map_line(line).expect("map"));
+        }
+        out.extend(mapper.flush().expect("flush"));
+        out.into_iter()
+            .filter_map(|o| match o.body {
+                ObservationPayload::Usage(p) => Some(*p),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut mapper = mapper();
+    // Poll 1: stop_reason + provisional counters.
+    let first = poll(
+        &mut mapper,
+        &[assistant("msg-rev", "2026-09-01T00:00:00.000Z", 100, true)],
+    );
+    assert_eq!(first.len(), 1, "the completed turn publishes a snapshot");
+    assert_eq!(first[0].metric_revision, U64(1));
+    assert_eq!(known(&first[0].input_tokens), 100);
+
+    // Poll 2: a later same-id record with different counters revises it.
+    let second = poll(
+        &mut mapper,
+        &[assistant("msg-rev", "2026-09-01T00:00:05.000Z", 250, true)],
+    );
+    assert_eq!(second.len(), 1, "the later record revises the same turn");
+    assert_eq!(second[0].scope_id, "msg-rev");
+    assert_eq!(second[0].metric_revision, U64(2), "revision bumps");
+    assert_eq!(known(&second[0].input_tokens), 250, "FINAL counters win");
+}
+
+/// c-ctxusage r3 item 1: usage with NO stop_reason survives a poll and is
+/// finalised when a user record supersedes the group (an interrupt must not
+/// lose the tokens).
+#[test]
+fn usage_without_stop_reason_is_finalised_by_a_superseding_user_record() {
+    fn assistant(ts: &str, input: u64) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": "msg-int-rec",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "timestamp": ts,
+            "message": {
+                "id": "msg-int",
+                "role": "assistant",
+                "type": "message",
+                "model": "m",
+                "stop_reason": serde_json::Value::Null,
+                "content": [{"type": "text", "text": "partial"}],
+                "usage": {
+                    "input_tokens": input,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 7,
+                },
+            }
+        })
+        .to_string()
+    }
+    let user = serde_json::json!({
+        "type": "user",
+        "uuid": "user-1",
+        "timestamp": "2026-09-01T00:00:10.000Z",
+        "message": {"role": "user", "content": [{"type": "text", "text": "go"}]}
+    })
+    .to_string();
+
+    let mut mapper = mapper();
+    for obs in mapper
+        .map_line(&assistant("2026-09-01T00:00:00.000Z", 333))
+        .expect("map")
+    {
+        assert!(!matches!(obs.body, ObservationPayload::Usage(_)));
+    }
+    // The poll boundary drains content but cannot finalise (no stop_reason).
+    assert!(
+        mapper
+            .flush()
+            .expect("poll")
+            .iter()
+            .all(|o| !matches!(o.body, ObservationPayload::Usage(_))),
+        "no usage before supersede"
+    );
+    // A superseding user record finalises the retained counters.
+    let finalised: Vec<_> = mapper
+        .map_line(&user)
+        .expect("user")
+        .into_iter()
+        .filter_map(|o| match o.body {
+            ObservationPayload::Usage(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finalised.len(), 1, "the interrupt still reports usage");
+    assert_eq!(known(&finalised[0].input_tokens), 333, "tokens not lost");
+    assert_eq!(finalised[0].scope_id, "msg-int");
+}
+
+/// c-ctxusage r3 item 1: a different message id finalises the previous group
+/// even without a stop_reason.
+#[test]
+fn a_different_message_finalises_the_pending_group_without_stop_reason() {
+    fn assistant(id: &str, input: u64) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": format!("{id}-rec"),
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "timestamp": "2026-09-01T00:00:00.000Z",
+            "message": {
+                "id": id,
+                "role": "assistant",
+                "type": "message",
+                "model": "m",
+                "stop_reason": serde_json::Value::Null,
+                "content": [{"type": "text", "text": "t"}],
+                "usage": {
+                    "input_tokens": input,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": input,
+                },
+            }
+        })
+        .to_string()
+    }
+    let mut mapper = mapper();
+    mapper.map_line(&assistant("msg-a", 111)).expect("a");
+    // Poll with no stop: nothing finalises yet.
+    assert!(
+        mapper
+            .flush()
+            .expect("poll")
+            .iter()
+            .all(|o| !matches!(o.body, ObservationPayload::Usage(_)))
+    );
+    // The next assistant message supersedes and finalises msg-a.
+    let usages: Vec<_> = mapper
+        .map_line(&assistant("msg-b", 222))
+        .expect("b")
+        .into_iter()
+        .filter_map(|o| match o.body {
+            ObservationPayload::Usage(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usages.len(), 1, "msg-a finalised once");
+    assert_eq!(usages[0].scope_id, "msg-a");
+    assert_eq!(known(&usages[0].input_tokens), 111);
+}
+
+/// c-ctxusage r3 item 5: the usage observation carries the transcript record's
+/// own timestamp as `native_at`, so a historical replay is excluded from the
+/// rate windows by the Hub.
+#[test]
+fn usage_observation_carries_the_record_timestamp_as_native_at() {
+    let line = serde_json::json!({
+        "type": "assistant",
+        "uuid": "msg-ts-rec",
+        "sessionId": "effort-session",
+        "version": "2.1.289",
+        "timestamp": "2020-01-01T00:00:00.000Z",
+        "message": {
+            "id": "msg-ts",
+            "role": "assistant",
+            "type": "message",
+            "model": "m",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "t"}],
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 5,
+            },
+        }
+    })
+    .to_string();
+    let mut mapper = mapper();
+    mapper.map_line(&line).expect("map");
+    let obs = mapper
+        .flush()
+        .expect("flush")
+        .into_iter()
+        .find(|o| matches!(o.body, ObservationPayload::Usage(_)))
+        .expect("usage observation");
+    match &obs.native_at {
+        remuda_protocol::Knowledge::Known { value } => {
+            assert!(String::from(value.clone()).starts_with("2020-01-01T00:00:00"));
+        }
+        other => panic!("native_at must be Known from the record, got {other:?}"),
+    }
 }

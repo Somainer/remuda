@@ -1477,16 +1477,11 @@ fn spawn_transcript_pump(
                         }
                     };
                     for observation in mapped {
-                        if emit_obs(
-                            &tx,
-                            &seq,
-                            &ctx,
-                            SourceChannel::Transcript,
-                            observation.completeness,
-                            observation.body,
-                        )
-                        .await
-                        .is_err()
+                        // Preserve the mapper's native_at (historical usage
+                        // timestamps) — c-ctxusage r3 item 5.
+                        if emit_native_obs(&tx, &seq, &ctx, SourceChannel::Transcript, &observation)
+                            .await
+                            .is_err()
                         {
                             return;
                         }
@@ -1621,7 +1616,43 @@ async fn emit_obs(
     payload: ObservationPayload,
 ) -> DriverResult<()> {
     let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
-    tx.send(build_observation(ctx, n, channel, completeness, payload)?)
+    tx.send(build_observation(
+        ctx,
+        n,
+        channel,
+        completeness,
+        payload,
+        Knowledge::Unknown {
+            reason: "herdr-clock".into(),
+            evidence_event_ids: vec![],
+        },
+    )?)
+    .await
+    .map_err(|_| DriverError::ControlUnavailable)?;
+    Ok(())
+}
+
+/// Send a transcript observation the mapper stamped, preserving its envelope's
+/// `native_at` (c-ctxusage r3 item 5 — a historical usage record keeps its own
+/// timestamp so the Hub rate windows exclude the replay).
+async fn emit_native_obs(
+    tx: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &ObsCtx,
+    channel: SourceChannel,
+    stamped: &Observation,
+) -> DriverResult<()> {
+    let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut observation = build_observation(
+        ctx,
+        n,
+        channel,
+        stamped.completeness,
+        stamped.body.clone(),
+        stamped.native_at.clone(),
+    )?;
+    observation.evidence_event_ids = stamped.evidence_event_ids.clone();
+    tx.send(observation)
         .await
         .map_err(|_| DriverError::ControlUnavailable)?;
     Ok(())
@@ -1633,6 +1664,7 @@ pub(crate) fn build_observation(
     channel: SourceChannel,
     completeness: Completeness,
     payload: ObservationPayload,
+    native_at: Knowledge<Timestamp>,
 ) -> DriverResult<Observation> {
     Ok(Observation {
         schema_version: SchemaVersion,
@@ -1645,10 +1677,7 @@ pub(crate) fn build_observation(
         run_generation: Some(U64(1)),
         seq: U64(seq),
         observed_at: now_ts()?,
-        native_at: Knowledge::Unknown {
-            reason: "herdr-clock".into(),
-            evidence_event_ids: vec![],
-        },
+        native_at,
         source: ObservationSource {
             driver_kind: ctx.driver,
             driver_version: ctx.pin_version.clone(),

@@ -595,7 +595,11 @@ pub async fn spawn_on_host(
 /// gateway credential through; an auto route against a host with a
 /// relayBind keeps sub-mode auto so the Node can probe direct-net and fall
 /// back, and a direct-net route still egresses through H.
-async fn install_route_egress(state: &AppState, instance: &InstanceRecord, spec: &Value) {
+pub(crate) async fn install_route_egress(
+    state: &AppState,
+    instance: &InstanceRecord,
+    spec: &Value,
+) {
     // The observed api_route column is only populated after the Node create
     // echo; at this point the requested route on the spec is authoritative.
     let requested: remuda_protocol::RequestedApiRoute =

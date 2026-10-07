@@ -663,6 +663,92 @@ fn assistant_error_event(message: &str) -> Value {
     })
 }
 
+/// The print driver's turn-result frame: `result` with status `error` (this is
+/// the event that also drives the Hub instance lifecycle to `failed`).
+fn turn_error_event() -> Value {
+    json!({
+        "kind": "lifecycle",
+        "payload": {
+            "type": "native",
+            "topic": "turn",
+            "nativeName": "result",
+            "status": { "value": "error" },
+            "affectsCompletion": true,
+            "relatedIds": { "resultIndex": "1", "numTurns": "1" },
+        },
+    })
+}
+
+#[tokio::test]
+async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-failed", "58960-58989").await;
+    ctx.dispatch(&project, "c-failed", "58960-58989").await;
+
+    // The print worker has no screen; the node even reports a stale "ready".
+    ctx.node.set_print("ready");
+    let instance_id = {
+        let observed = ctx.observe().await;
+        observed["items"][0]["instanceId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    ctx.node.append_journal(
+        &instance_id,
+        &[
+            assistant_error_event("API Error: 400 requested model is not available"),
+            turn_error_event(),
+        ],
+    );
+
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_eq!(
+        row["watch"]["status"], "failed",
+        "a failed first turn must not read as working: {row}"
+    );
+    assert_eq!(
+        row["watch"]["reason"],
+        "API Error: 400 requested model is not available"
+    );
+    let detail = row["watch"]["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("screen-unavailable"),
+        "detail must disclose the missing screen: {detail}"
+    );
+    // Failed is a watch-only state: the durable lifecycle is untouched.
+    assert_eq!(row["state"]["state"], "working");
+    assert!(row["watch"]["observedAt"].is_string(), "{row}");
+
+    // D-057 OA6 (ma-lineage round 3): a turn result error is turn-level, never
+    // process termination — the durable Hub row does NOT converge to failed
+    // from the turn error alone (the print/sdk driver emits a separate process
+    // exit event when the child actually ends). The watch-layer failed state
+    // above still classifies the turn.
+    let (status, instance) = ctx
+        .request("GET", &format!("/v1/instances/{instance_id}"), None)
+        .await;
+    assert_eq!(status, 200, "{instance}");
+    assert_ne!(
+        instance["lifecycle"], "failed",
+        "a turn result error must not fail the durable instance: {instance}"
+    );
+
+    // Persisted on the roster, sticky on the next observation, with timestamp.
+    let (_, roster) = ctx.request("GET", "/v1/workers", None).await;
+    let persisted = roster["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == json!("c-failed"))
+        .expect("roster row");
+    assert_eq!(persisted["watch"]["status"], "failed");
+    assert!(persisted["watch"]["observedAt"].is_string());
+    let observed = ctx.observe().await;
+    assert_eq!(observed["items"][0]["watch"]["status"], "failed");
+}
+
 /// A `model` observation. `source` distinguishes the launch read-back
 /// (`"launch"`) from a later human `/model` (`"slash"`) or a Remuda
 /// `instance.configure` (`"remuda"`).

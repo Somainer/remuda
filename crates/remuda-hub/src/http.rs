@@ -138,6 +138,19 @@ pub struct CreateInstanceBody {
     /// D-047 route sub-mode for `apiVia`: `auto` | `hub-relay` | `direct-net`.
     #[serde(default, rename = "apiRoute")]
     api_route: Option<String>,
+    /// D-057 §6.1 C1 restart policy. In Phase 1 only a Human creator may set
+    /// it; an Agent or Bot gets 403. It is Hub-side state, never part of the
+    /// Node-facing spec; no restart behaviour follows until `ma-restart`.
+    #[serde(default)]
+    restart: Option<RestartPolicyBody>,
+}
+
+/// `restart: {onProcessLoss, maxPerHour}` on the create body (D-057 §6.1).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartPolicyBody {
+    on_process_loss: bool,
+    max_per_hour: u32,
 }
 
 fn default_kind() -> String {
@@ -915,6 +928,7 @@ pub(crate) fn resolve_delegation(
         grants,
         task_id,
         enforce_tree: true,
+        restart: None,
     })
 }
 
@@ -944,6 +958,30 @@ pub async fn create_instance(
                 .into(),
         ));
     }
+    // D-057 §6.1: the C1 restart policy is a standing relaunch grant only a
+    // Human can give at seating. Agent or Bot origins get 403 before any
+    // resource is touched; the bound is validated at the boundary too.
+    let restart_policy = match &body.restart {
+        Some(restart) => {
+            if crate::agent_scope::origin(&device) != remuda_protocol::InputOrigin::Human {
+                return Err(HubError::ForbiddenReason(
+                    "the restart policy can only be set by a Human creator; \
+                     Agent and Bot origins may not set it (D-057 §6.1)"
+                        .into(),
+                ));
+            }
+            if restart.max_per_hour < 1 {
+                return Err(HubError::BadRequest(
+                    "restart.maxPerHour must be at least 1".into(),
+                ));
+            }
+            Some(crate::store::RestartPolicy {
+                on_process_loss: restart.on_process_loss,
+                max_per_hour: restart.max_per_hour,
+            })
+        }
+        None => None,
+    };
     // Validate the D-047 overrides before any resource lookup.
     let route_overrides =
         parse_route_overrides(body.api_via.as_deref(), body.api_route.as_deref())?;
@@ -1140,11 +1178,13 @@ pub async fn create_instance(
         ),
         None => None,
     };
-    let delegation = resolve_delegation(
+    let mut delegation = resolve_delegation(
         &body,
         parent_scope.as_ref(),
         placement_project_id.as_deref(),
     )?;
+    // D-057 §6.1: Hub-side only; never stamped into the Node-facing spec.
+    delegation.restart = restart_policy;
     let project_provider = project.as_ref().map(|project| project.provider.clone());
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);
     let placement_outcome = crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
@@ -1613,9 +1653,12 @@ pub async fn resume_instance(
     // human/bot action; an Agent asking to resume its own parent would escape
     // the scope its instance credential was issued for (D-017).
     crate::agent_scope::require_operator(&state, &headers).await?;
+    // Read on the reader pool: a continuation resume racing another one may
+    // hold the writer thread open inside its fence transaction, and the
+    // lineage branch must keep observing committed state meanwhile.
     let parent = state
         .store
-        .get_instance(instance_id.clone())
+        .get_instance_read(instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
     let mode = match body.mode.as_str() {
@@ -1632,6 +1675,13 @@ pub async fn resume_instance(
             "resume supports Claude sessions; this one is {}",
             parent.kind
         )));
+    }
+    // D-057 §5: a chapter of a continuity lineage performs a continuation
+    // resume (fence + successor in one generation-CAS transaction), not the
+    // D-026 child insert. Plain sessions keep the byte-identical path below.
+    if let Some(lineage) = state.store.get_lineage(parent.lineage_id.clone()).await? {
+        let device = crate::agent_scope::caller(&state, &headers).await?;
+        return resume_lineage(&state, &device, &body, parent, lineage, mode).await;
     }
     let session_id = parent.native_session_id.clone().ok_or_else(|| {
         HubError::Conflict(
@@ -1821,6 +1871,369 @@ pub async fn resume_instance(
     })))
 }
 
+/// D-057 §5/§7.2 (ma-lineage): continuation resume of a continuity lineage.
+///
+/// Resolving any chapter addresses the lineage's current chapter. The fence,
+/// credential deletion, generation bump and successor insert land in one
+/// store transaction with a generation CAS; only a host-offline current
+/// chapter refuses beforehand. `ma-fence` replaces the store half with the
+/// full fence transaction and adds the pause-first rules.
+async fn resume_lineage(
+    state: &AppState,
+    device: &crate::store::Device,
+    body: &ResumeBody,
+    addressed: crate::store::InstanceRecord,
+    lineage: crate::store::LineageRecord,
+    mode: ResumeMode,
+) -> Result<Json<Value>, HubError> {
+    // The addressed chapter may itself be superseded: always act on the
+    // lineage's current chapter.
+    let lineage = state
+        .store
+        .get_lineage(lineage.lineage_id)
+        .await?
+        .ok_or(HubError::NotFound)?;
+    // Deterministic race hook: after the generation read, before any
+    // writer-thread job is queued. Two resumes observing the same generation
+    // then serialize on the in-transaction CAS.
+    crate::store::run_continuation_hook("read", &lineage.lineage_id);
+    let current = state
+        .store
+        .get_instance_read(lineage.current_instance_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    // ma-lineage round 3 item 4: if the owner addressed an OLDER chapter, the
+    // continuation its successor already represents is the answer — resolve
+    // that idempotent replay HERE, before any launch requirement (host link,
+    // native session) is checked or a new launch is prepared. A repeat resume
+    // of a sessionless predecessor must not hit the fresh-recovery validation
+    // or 409 against the not-yet-sessioned successor. The store re-verifies
+    // addressed-vs-current transactionally, so a chapter superseded between
+    // this read and the fence still converges the same way.
+    if addressed.instance_id != current.instance_id {
+        return Ok(Json(json!({
+            "instance": current,
+            "hostId": current.host_id,
+            "mode": mode.as_str(),
+            "replayed": true
+        })));
+    }
+    let host = state
+        .store
+        .get_host(current.host_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    // The only refusal this task adds: the existing host-offline shape.
+    if state.nodes.kind_of(&host.host_id).await.is_none() {
+        return Err(HubError::HostOffline {
+            host_id: host.host_id.clone(),
+        });
+    }
+    // Recovery source (§6.3.1): the current chapter's native session id, else
+    // the most recent earlier chapter that reported one, else a fresh launch
+    // from the lineage's original create spec.
+    let mut recovery_session = current.native_session_id.clone();
+    if recovery_session.is_none() {
+        let chapters = state
+            .store
+            .list_lineage_chapters(lineage.lineage_id.clone())
+            .await?;
+        for chapter in chapters.iter().rev() {
+            if chapter.generation >= lineage.generation {
+                continue;
+            }
+            if let Some(earlier) = state
+                .store
+                .get_instance_read(chapter.instance_id.clone())
+                .await?
+                && earlier.native_session_id.is_some()
+            {
+                recovery_session = earlier.native_session_id;
+                break;
+            }
+        }
+    }
+    // ma-lineage round 2 item 9 + round 3 item 3 (OA6): a chapter with no
+    // native session is continued only when there is explicit process-end
+    // evidence. A LIVE chapter (no session yet) is refused with a clear 409 —
+    // relaunching blank would discard the conversation the running process
+    // holds. But an ATTESTED LAUNCH FAILURE (the Node rejected create, or the
+    // create was never acknowledged, so the process never started) IS
+    // process-end evidence ("a launch that never started"), exactly like an
+    // exited/closed chapter; it must take the fresh-recovery path, not 409.
+    if recovery_session.is_none() && !crate::store::instance_row_has_process_end_evidence(&current)
+    {
+        return Err(HubError::Conflict(
+            "the current chapter has not reported a native session to continue; \
+             retry once it has, or close it first"
+                .into(),
+        ));
+    }
+    let (mut spec, operation) = match recovery_session {
+        Some(session_id) => {
+            let mut spec = current.spec_for_resume();
+            if let Some(object) = spec.as_object_mut() {
+                // A continuation keeps the same carrier (claude-sdk resumes as
+                // claude-sdk; ResumeMode no longer downgrades it).
+                object.insert("driver".into(), json!(current.driver));
+                object.insert("resumeSessionId".into(), json!(session_id));
+                object.insert("resumedFrom".into(), json!(current.instance_id));
+                object.insert("parentInstanceId".into(), json!(current.parent_instance_id));
+                object.insert("hostId".into(), json!(current.host_id));
+                object.insert("prompt".into(), json!(body.prompt));
+                object.remove("nativeSessionId");
+                object.remove("nativeTranscriptPath");
+            }
+            (spec, "instance.resume")
+        }
+        None => {
+            // No chapter ever reported a session: relaunch the original create
+            // spec fresh, as the supervisor will on a first-chapter start
+            // failure.
+            let mut spec = lineage
+                .origin_spec_ref
+                .as_ref()
+                .and_then(|reference| reference.get("spec").cloned())
+                .unwrap_or_else(|| current.spec_for_resume());
+            if let Some(object) = spec.as_object_mut() {
+                object.insert("driver".into(), json!(current.driver));
+                object.insert("resumedFrom".into(), json!(current.instance_id));
+                object.insert("parentInstanceId".into(), json!(current.parent_instance_id));
+                object.insert("hostId".into(), json!(current.host_id));
+                if body.prompt.is_some() {
+                    object.insert("prompt".into(), json!(body.prompt));
+                }
+                object.remove("resumeSessionId");
+                object.remove("nativeSessionId");
+                object.remove("nativeTranscriptPath");
+            }
+            (spec, "instance.create")
+        }
+    };
+    let host = crate::store::Store::with_live_link(host, true);
+    // D-047 observed-route resolution, mirroring the D-026 path: the
+    // successor inherits the predecessor's *observed* route and gets a fresh
+    // host-scoped secret.
+    let parent_observed_via = current
+        .api_route
+        .as_ref()
+        .filter(|route| route.is_via())
+        .cloned();
+    let resume_overrides = if parent_observed_via.is_none() {
+        crate::providers::RouteOverrides {
+            via: Some(remuda_protocol::ApiViaOverride::Direct),
+            ..Default::default()
+        }
+    } else {
+        crate::providers::RouteOverrides::default()
+    };
+    crate::providers::resolve_and_attach(state, &host, &mut spec, resume_overrides).await?;
+    if let Some(observed) = parent_observed_via.as_ref() {
+        let target = match observed.via_host_id.as_ref() {
+            Some(id) => crate::provider_resolve::ViaTarget::Host(id.as_id().to_string()),
+            None => crate::provider_resolve::ViaTarget::HubHost,
+        };
+        let mode = match observed.route {
+            Some(remuda_protocol::ApiRouteKind::HubRelay) => {
+                remuda_protocol::ApiRouteMode::HubRelay
+            }
+            Some(remuda_protocol::ApiRouteKind::DirectNet) => {
+                remuda_protocol::ApiRouteMode::DirectNet
+            }
+            None => remuda_protocol::ApiRouteMode::HubRelay,
+        };
+        let choice = crate::provider_resolve::ApiRouteChoice {
+            target,
+            route: mode,
+            source: "resume",
+        };
+        let profile_id = spec
+            .get("providerProfileId")
+            .and_then(Value::as_str)
+            .filter(|id| crate::provider_resolve::is_real_profile_id(id))
+            .ok_or_else(|| {
+                HubError::BadRequest(
+                    "the resumed via session has no gateway profile on its spec".into(),
+                )
+            })?;
+        let profile = state
+            .store
+            .get_provider(profile_id.to_string())
+            .await?
+            .ok_or_else(|| {
+                HubError::BadRequest("the resumed via session's gateway profile vanished".into())
+            })?;
+        crate::providers::validate_via_target(state, &host, &choice, &profile).await?;
+        crate::providers::write_requested_route(&mut spec, &choice)?;
+    }
+    let title = current
+        .title
+        .clone()
+        .map(|title| format!("{title} (resumed)"))
+        .or_else(|| Some("resumed session".to_string()));
+    let origin = serde_json::to_value(crate::agent_scope::origin(device))
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "human".into());
+    let result = state
+        .store
+        .continuation_resume(crate::store::ContinuationResumeRequest {
+            addressed_instance_id: addressed.instance_id.clone(),
+            expected_generation: lineage.generation,
+            host_id: current.host_id.clone(),
+            spec: spec.clone(),
+            operation: operation.to_string(),
+            prompt: body.prompt.clone(),
+            origin,
+            title,
+        })
+        .await
+        .map_err(map_store)?;
+    let (fenced, successor, command) = match result {
+        crate::store::ContinuationResumeResult::Superseded { current } => {
+            // The generation CAS lost to a concurrent resume: present its
+            // successor as an idempotent replay.
+            let current = *current;
+            return Ok(Json(json!({
+                "instance": current,
+                "hostId": current.host_id,
+                "mode": mode.as_str(),
+                "replayed": true,
+            })));
+        }
+        crate::store::ContinuationResumeResult::Resumed(resumed) => {
+            (resumed.fenced, resumed.successor, resumed.command)
+        }
+    };
+    // D-057 OA6 (ma-lineage): close the fenced predecessor's process only when
+    // it could still be running. Terminal lifecycle is explicit process-end
+    // evidence — an exited/closed process has nothing to stop, and a `failed`
+    // chapter is an attested launch failure (the process never started,
+    // round 3 item 3), also nothing to close. A still-live chapter
+    // (ready/running/requested/starting) on a host with a live link MUST be
+    // closed so two chapters never run at once.
+    let host_live = state.nodes.kind_of(&fenced.host_id).await.is_some();
+    let predecessor_process_ended = crate::store::instance_row_has_process_end_evidence(&fenced);
+    if host_live && !predecessor_process_ended {
+        // Until ma-fence lands, the old process loses Hub authority through
+        // its deleted launch credential; the Hub still forwards the existing
+        // instance.close so the live process stops.
+        let (close, _) = state
+            .store
+            .queue_command(
+                None,
+                Some(fenced.instance_id.clone()),
+                fenced.host_id.clone(),
+                "instance.close".into(),
+                json!({ "instanceId": fenced.instance_id, "origin": "human" }),
+                None,
+            )
+            .await?;
+        let _ = forward_if_online(state, close, true).await;
+    }
+    let command = forward_if_online(state, command, true).await?;
+    // Re-install the via egress credential for the successor id (the analog
+    // of the post-spawn install in `placement::spawn_on_host`).
+    crate::placement::install_route_egress(state, &successor, &spec).await;
+    let now = crate::config::now_rfc3339();
+    // The resume links describe native-transcript continuity; a successor
+    // relaunched fresh from the origin spec (no chapter ever reported a
+    // session) has no transcript id to link.
+    if let Some(session_id) = spec
+        .get("resumeSessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        journal_resume_link(
+            state,
+            &fenced.host_id,
+            &fenced.instance_id,
+            "resumed-into",
+            &successor.instance_id,
+            session_id,
+            &now,
+        )
+        .await;
+        journal_resume_link(
+            state,
+            &successor.host_id,
+            &successor.instance_id,
+            "resumed-from",
+            &fenced.instance_id,
+            session_id,
+            &now,
+        )
+        .await;
+    }
+    Ok(Json(json!({
+        "instance": successor,
+        "command": command,
+        "hostId": successor.host_id,
+        "mode": mode.as_str(),
+        "replayed": false,
+    })))
+}
+
+/// `GET /v1/lineages/{lineageId}` — D-057 §13 lineage projection.
+pub async fn get_lineage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(lineage_id): Path<String>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = crate::agent_scope::caller(&state, &headers).await?;
+    let lineage = state
+        .store
+        .get_lineage(lineage_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    // Human/Bot devices may read any lineage; an Agent may read only its own.
+    if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+        let bound = device.instance_id.as_deref().ok_or(HubError::Forbidden)?;
+        let own = state
+            .store
+            .lineage_id_for_instance(bound.to_string())
+            .await?
+            .ok_or(HubError::Forbidden)?;
+        if own != lineage_id {
+            return Err(HubError::Forbidden);
+        }
+    }
+    let chapters = state
+        .store
+        .list_lineage_chapters(lineage_id.clone())
+        .await?;
+    let current = state
+        .store
+        .get_instance_read(lineage.current_instance_id.clone())
+        .await?;
+    let mut lineage_state = lineage.state.clone();
+    if lineage.paused_by.is_some() {
+        lineage_state = "paused".into();
+    } else if let Some(current) = &current {
+        let host_live = state.nodes.kind_of(&current.host_id).await.is_some();
+        let chapter_running = matches!(current.lifecycle.as_str(), "ready" | "running");
+        lineage_state = if chapter_running && host_live {
+            "running".into()
+        } else if chapter_running {
+            // D-057 §5 derived state: the chapter was running but its host
+            // link is gone. It is not `starting` — the process may be alive
+            // (D-019); report it truthfully as running with an offline host.
+            "host-offline".into()
+        } else {
+            "starting".into()
+        };
+    }
+    Ok(Json(json!({
+        "lineageId": lineage.lineage_id,
+        "state": lineage_state,
+        "pausedBy": lineage.paused_by,
+        "restart": lineage.restart,
+        "generation": lineage.generation,
+        "chapters": chapters,
+    })))
+}
+
 /// Which driver a resume target launches.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResumeMode {
@@ -1856,6 +2269,10 @@ impl ResumeMode {
         match self {
             Self::Terminal => "claude-pty",
             Self::Structured if parent_driver == "claude-pty" => "claude-pty",
+            // D-057 §5: resuming a claude-sdk session relaunches claude-sdk
+            // with `--resume`, on every claude-sdk session. The old mapping to
+            // claude-print ended the conversation after one response (D-035).
+            Self::Structured if parent_driver == "claude-sdk" => "claude-sdk",
             Self::Structured => "claude-print",
         }
     }

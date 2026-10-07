@@ -551,10 +551,6 @@ pub struct GateThenParams {
     /// Wall-clock budget (seconds); default enforced by the Node.
     #[serde(default)]
     pub timeout_secs: u64,
-    /// D-057 §7.5: follow-on step carrying the admission record's initiator
-    /// (the jobId is the opId). Absent for Human/Bot jobs and older Hubs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initiator: Option<crate::Initiator>,
 }
 
 /// `gate.then` result.
@@ -606,10 +602,6 @@ pub struct GateLandParams {
     /// Wall-clock budget (seconds); 0 uses the Node default.
     #[serde(default)]
     pub timeout_secs: u64,
-    /// D-057 §7.5: the land step carries the admission record's initiator
-    /// (the jobId is the opId). Absent for Human/Bot jobs and older Hubs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initiator: Option<crate::Initiator>,
 }
 
 fn default_push_remote() -> String {
@@ -652,10 +644,6 @@ pub struct GateUnpinParams {
     pub job_id: String,
     /// Lane checkout holding the refs.
     pub repo_path: String,
-    /// D-057 §7.5: follow-on steps carry the admission record's initiator
-    /// (the jobId is the opId). Absent for Human/Bot jobs and older Hubs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initiator: Option<crate::Initiator>,
 }
 
 /// `gate.unpin` result.

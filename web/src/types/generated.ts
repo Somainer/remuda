@@ -1076,7 +1076,6 @@ export type GateLandParams = ({
   "baseSha": (string);
   "branch": (string);
   "fetchRemote": (string);
-  "initiator"?: (Initiator | (null));
   "jobId": (string);
   "mergeRef": (string);
   "mergeSha": (string);
@@ -1181,7 +1180,6 @@ export type GateThenParams = ({
   "env": ({
   [key: string]: (string);
 });
-  "initiator"?: (Initiator | (null));
   "jobId": (string);
   "timeoutSecs": (number);
   [key: string]: unknown;
@@ -1197,7 +1195,6 @@ export type GateThenResult = ({
 
 /** `gate.unpin` params: drop a job's persisted merge refs on the lane host. */
 export type GateUnpinParams = ({
-  "initiator"?: (Initiator | (null));
   "jobId": (string);
   "repoPath": (string);
   [key: string]: unknown;

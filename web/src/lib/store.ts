@@ -3562,6 +3562,14 @@ class HubStore {
     );
   }
 
+  /** c-composerpop e2e seam: inject a Hub-computed usage rollup exactly as a
+   *  poll hydration would have folded it in (fake-node sessions never report
+   *  usage, so the mobile stacked-sheet cases inject one). Mirrors the
+   *  window.__notifyLab / window.__ttyLab seams; no production call site. */
+  setUsageRollupForTest(instanceId: Id, rollup: UsageRollup) {
+    this.emit({ usageRollup: { ...this.state.usageRollup, [instanceId]: rollup } });
+  }
+
   /** The word the slider last requested for this instance (wire spelling). */
   effortRequestedWordOf(instanceId: Id): { word: string; ultracode: boolean } {
     const selected = this.state.effort[instanceId];

@@ -1475,7 +1475,13 @@ export function Composer({
         <ContextUsagePopover
           rollup={displayRollup}
           mobile={mobile}
-          onClose={dismissUsage}
+          onClose={() => {
+            // Explicit × (or the popover's own close path): unpin and return
+            // focus to the chip that opened it — on mobile the options sheet
+            // stays open and the context chip is the return target (RC4).
+            dismissUsage();
+            triggerRefs.usage.current?.focus();
+          }}
           placement={usageAnchor.placement}
           anchorStyle={usageAnchor.style}
           panelRef={menuRefs.usage}
@@ -1509,13 +1515,10 @@ export function Composer({
       <ComposerOptionsSheet
         open={mobile && optionsOpen}
         onClose={() => {
-          // RC4: a stacked usage sheet is the TOPMOST layer — the first
-          // Escape/scrim dismiss closes ONLY it; the second closes the
-          // options sheet. When usage is not stacked, close the sheet.
-          if (menu === "usage") {
-            dismissUsage();
-            return;
-          }
+          // RC4: the stacked usage sheet closes WITH ITS PARENT — one scrim
+          // tap or Escape dismisses usage and the options sheet together, so
+          // the composer trigger is hit-testable again after a single
+          // dismissal. (The usage panel's own × closes only usage.)
           dismissUsage();
           setOptionsOpen(false);
         }}

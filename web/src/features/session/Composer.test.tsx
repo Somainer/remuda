@@ -602,7 +602,7 @@ describe("Composer context usage chip", () => {
     expect(screen.getByTestId("context-usage-popover")).toHaveAttribute("data-mobile", "1");
   });
 
-  it("dismissing the options sheet also closes a stacked usage sheet (RC4)", async () => {
+  it("scrim mousedown on the options sheet closes the stacked usage sheet with its parent (RC4)", async () => {
     const user = userEvent.setup();
     render(
       <Composer instanceId="ins_sheet_usage" mobile onSend={vi.fn()} usageRollup={rollup} />,
@@ -613,14 +613,38 @@ describe("Composer context usage chip", () => {
     // Stack the usage sheet inside.
     await user.click(within(screen.getByTestId("composer-options-sheet")).getByTestId("context-chip"));
     expect(screen.getByTestId("context-usage-popover")).toHaveAttribute("data-mobile", "1");
-    // First Escape closes the TOPMOST layer (usage); the Sheet onClose now
-    // dismisses usage only when it is stacked.
+    // One scrim mousedown dismisses usage WITH ITS PARENT: no orphaned usage
+    // popover is left floating after the options sheet closes.
+    fireEvent.mouseDown(document.querySelector("[data-variant='sheet']")!);
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+    expect(screen.queryByTestId("composer-options-sheet")).toBeNull();
+  });
+
+  it("a single Escape closes the stacked usage sheet with the options sheet (RC4)", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_sheet_usage_esc" mobile onSend={vi.fn()} usageRollup={rollup} />,
+    );
+    await user.click(screen.getByTestId("model-effort-chip"));
+    await user.click(within(screen.getByTestId("composer-options-sheet")).getByTestId("context-chip"));
+    expect(screen.getByTestId("context-usage-popover")).toBeInTheDocument();
     await user.keyboard("{Escape}");
     expect(screen.queryByTestId("context-usage-popover")).toBeNull();
-    expect(screen.getByTestId("composer-options-sheet")).toBeVisible();
-    // Second Escape closes the options sheet.
-    await user.keyboard("{Escape}");
     expect(screen.queryByTestId("composer-options-sheet")).toBeNull();
+  });
+
+  it("the usage panel's own close button returns focus to the context chip and leaves the sheet open (RC4)", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_sheet_usage_x" mobile onSend={vi.fn()} usageRollup={rollup} />,
+    );
+    await user.click(screen.getByTestId("model-effort-chip"));
+    const chip = within(screen.getByTestId("composer-options-sheet")).getByTestId("context-chip");
+    await user.click(chip);
+    await user.click(screen.getByTestId("context-usage-close"));
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+    expect(screen.getByTestId("composer-options-sheet")).toBeVisible();
+    expect(chip).toHaveFocus();
   });
 });
 

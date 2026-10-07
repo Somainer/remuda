@@ -48,6 +48,16 @@ import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
 import { FilesView } from "../features/files/FilesView";
 import session from "../chrome/sessionPage.module.css";
+import type { UsageRollup } from "../features/session/contextUsage";
+
+declare global {
+  interface Window {
+    /** c-composerpop e2e seam; installed by SessionPage. */
+    __usageLab?: {
+      setRollup: (rollup: UsageRollup) => void;
+    };
+  }
+}
 
 export function SessionPage({
   view = "auto",
@@ -108,6 +118,19 @@ export function SessionPage({
 
   useEffect(() => {
     if (instanceId && !isTtyLabFixtureId(instanceId)) void hubStore.follow(instanceId);
+  }, [instanceId]);
+
+  // c-composerpop e2e seam: inject a Hub-computed usage rollup as if a poll
+  // had delivered it (fake-node sessions never report usage). Same shape as
+  // the window.__notifyLab seam in app/Shell.tsx; e2e-only.
+  useEffect(() => {
+    if (!instanceId || isTtyLabFixtureId(instanceId)) return;
+    window.__usageLab = {
+      setRollup: (rollup: UsageRollup) => hubStore.setUsageRollupForTest(instanceId, rollup),
+    };
+    return () => {
+      delete window.__usageLab;
+    };
   }, [instanceId]);
 
   useEffect(() => {

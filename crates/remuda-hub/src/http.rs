@@ -725,12 +725,15 @@ async fn stop_before_delete(
             );
         }
     }
-    if state
+    let (changed, settlement) = state
         .store
         .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
         .await
-        .map_err(map_store)?
-    {
+        .map_err(map_store)?;
+    // c-cardsettle: cards invalidated by the delete leave open inboxes
+    // immediately.
+    state.broadcast_settlement(&settlement);
+    if changed {
         state
             .api_relay
             .revoke_instance_egress(state, &instance.instance_id)
@@ -1946,15 +1949,26 @@ async fn resume_lineage(
             }
         }
     }
-    // ma-lineage round 2 item 9 + round 3 item 3 (OA6): a chapter with no
-    // native session is continued only when there is explicit process-end
-    // evidence. A LIVE chapter (no session yet) is refused with a clear 409 —
-    // relaunching blank would discard the conversation the running process
-    // holds. But an ATTESTED LAUNCH FAILURE (the Node rejected create, or the
-    // create was never acknowledged, so the process never started) IS
-    // process-end evidence ("a launch that never started"), exactly like an
-    // exited/closed chapter; it must take the fresh-recovery path, not 409.
-    if recovery_session.is_none() && !crate::store::instance_row_has_process_end_evidence(&current)
+    // ma-lineage rounds 2/3/4 item 1 (OA6): a chapter with no native session
+    // is continued only when there is definite process-end evidence. A LIVE
+    // chapter (no session yet) is refused with a clear 409 — relaunching blank
+    // would discard the conversation the running process holds. An ATTESTED
+    // LAUNCH FAILURE (the Node rejected create, or the create was never
+    // acknowledged, so the process never started) IS process-end evidence,
+    // exactly like an exited/closed chapter; it takes the fresh-recovery
+    // path, not 409.
+    //
+    // r4: a `failed` row only counts with RECORDED evidence (ended_at stamped
+    // from a classified end event, or an attested launch-failure marker). An
+    // ambiguous legacy `failed` row (a configure/turn error marked failed
+    // while the process was alive) is treated as potentially live, so without
+    // a session the 409 stands; with a known session the successor closes the
+    // predecessor below instead.
+    if recovery_session.is_none()
+        && !state
+            .store
+            .instance_has_process_end_evidence(&current)
+            .await?
     {
         return Err(HubError::Conflict(
             "the current chapter has not reported a native session to continue; \
@@ -2099,14 +2113,17 @@ async fn resume_lineage(
         }
     };
     // D-057 OA6 (ma-lineage): close the fenced predecessor's process only when
-    // it could still be running. Terminal lifecycle is explicit process-end
-    // evidence — an exited/closed process has nothing to stop, and a `failed`
-    // chapter is an attested launch failure (the process never started,
-    // round 3 item 3), also nothing to close. A still-live chapter
-    // (ready/running/requested/starting) on a host with a live link MUST be
-    // closed so two chapters never run at once.
+    // it could still be running. A cleanly exited/closed process has nothing
+    // to stop, and a `failed` chapter with recorded process-end evidence (a
+    // classified end or an attested launch failure) also never started / is
+    // already gone. An AMBIGUOUS failed row is treated as potentially live:
+    // on a host with a live link it is still closed here so two chapters can
+    // never run at once.
     let host_live = state.nodes.kind_of(&fenced.host_id).await.is_some();
-    let predecessor_process_ended = crate::store::instance_row_has_process_end_evidence(&fenced);
+    let predecessor_process_ended = state
+        .store
+        .instance_has_process_end_evidence(&fenced)
+        .await?;
     if host_live && !predecessor_process_ended {
         // Until ma-fence lands, the old process loses Hub authority through
         // its deleted launch credential; the Hub still forwards the existing
@@ -4002,10 +4019,11 @@ pub(crate) async fn forward_if_online(
                     "instance.create" | "instance.resume"
                 ) && let Some(instance_id) = command.instance_id.clone()
                 {
-                    state
+                    let settlement = state
                         .store
                         .fail_instance(instance_id, err.to_string())
                         .await?;
+                    state.broadcast_settlement(&settlement);
                 } else if command.operation == "instance.configure" {
                     // Persist the 503 (and its body) WITH the terminal row: a
                     // configure is non-replayable, so a same-id retry must
@@ -4081,12 +4099,15 @@ async fn settle_stop_for_unknown_instance(
         operation = %command.operation,
         "node does not know this instance; settling the stop as exited"
     );
-    if state
+    let (changed, settlement) = state
         .store
         .settle_instance_exited(instance_id.clone(), "node-lost-instance".into())
         .await
-        .map_err(map_store)?
-    {
+        .map_err(map_store)?;
+    // c-cardsettle: the Node already forgot this generation; invalidate its
+    // cards for followers in the same breath.
+    state.broadcast_settlement(&settlement);
+    if changed {
         state
             .api_relay
             .revoke_instance_egress(state, &instance_id)
@@ -4129,10 +4150,11 @@ async fn fail_unaccepted_create(
     if command.operation == "instance.create"
         && let Some(instance_id) = command.instance_id.clone()
     {
-        state
+        let settlement = state
             .store
             .fail_instance(instance_id, message.clone())
             .await?;
+        state.broadcast_settlement(&settlement);
         return Err(HubError::BadRequest(message));
     }
     // An explicit Node error reply is positive evidence the command did not

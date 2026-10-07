@@ -18,6 +18,7 @@ import {
   type TranscriptNode,
 } from "../assemble";
 import { ToolCard } from "../ToolCard";
+import { CompactToolFold } from "../CompactToolFold";
 import sessionCss from "../transcript.module.css";
 import { fmtDuration, fmtTokens } from "../workflow/workflowProgress";
 import {
@@ -67,11 +68,24 @@ function NodeRow({ node }: { node: TranscriptNode }) {
     );
   }
   if (node.type === "thought") {
+    // Caret painted/flipped by .thought summary::before — a literal 「▸」
+    // here would double-paint and stay right-pointing while open.
     return (
       <details className={sessionCss.thought}>
-        <summary>▸ thinking</summary>
+        <summary>thinking</summary>
         <p>{node.text}</p>
       </details>
+    );
+  }
+  if (node.type === "compact") {
+    // Same collapsible process fold as the main transcript; without it the
+    // drill-in view used to drop compacted tool rows entirely.
+    return (
+      <CompactToolFold key={node.id} toolCount={node.toolCount} thoughtCount={node.thoughtCount}>
+        {node.children.map((child) => (
+          <NodeRow key={child.id} node={child} />
+        ))}
+      </CompactToolFold>
     );
   }
   if (node.type === "tool") {

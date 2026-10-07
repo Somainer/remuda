@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { WorkflowMemberPayload, WorkflowPhasePayload, WorkflowRunPayload } from "../../types/generated";
 import { knowledgeValue } from "../../types/command";
@@ -28,22 +29,13 @@ export function WorkflowTree({
         <span className={css.stat}>只画身份与状态，log 进原始事件</span>
       </summary>
       <div className={css.wfMembers}>
-        {phases.map((phase) => {
-          const phaseMembers = members.filter((m) => m.phaseId === phase.phaseId);
-          return (
-            <div key={phase.phaseId} data-testid="workflow-phase">
-              <div className={css.wfPhase}>
-                <span>▾</span>
-                <span>{knowledgeValue(phase.label) ?? phase.phaseId}</span>
-              </div>
-              <ul className={css.wfMembers}>
-                {phaseMembers.map((m) => (
-                  <MemberRow key={m.memberId} member={m} />
-                ))}
-              </ul>
-            </div>
-          );
-        })}
+        {phases.map((phase) => (
+          <PhaseGroup
+            key={phase.phaseId}
+            phase={phase}
+            members={members.filter((m) => m.phaseId === phase.phaseId)}
+          />
+        ))}
         {unphasedMembers(phases, members).length ? (
           <ul className={css.wfMembers}>
             {unphasedMembers(phases, members).map((m) => (
@@ -52,6 +44,52 @@ export function WorkflowTree({
           </ul>
         ) : null}
       </div>
+    </details>
+  );
+}
+
+/**
+ * One collapsible phase. The disclosure state is owned here (rather than an
+ * always-`open` native details) so the chevron is bound to THIS phase's own
+ * open state (`details.wfPhaseDetails[open] > summary`), never to an open
+ * ancestor run <details>: a collapsed phase inside an open run must show ▸.
+ */
+function PhaseGroup({ phase, members }: { phase: WorkflowPhasePayload; members: WorkflowMemberPayload[] }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <details
+      className={css.wfPhaseDetails}
+      data-testid="workflow-phase"
+      open={open}
+      data-open={open ? "1" : "0"}
+      // Re-sync when something OTHER than our summary click changes the native
+      // open state: browser find-in-page / form-restore / an accessibility
+      // action can expand a collapsed <details> natively. onToggle tracks the
+      // DOM state so React state and aria-expanded follow it; our summary
+      // handler still preventDefaults and drives the toggle for
+      // pointer/keyboard, so the two paths agree instead of fighting.
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary
+        className={css.wfPhase}
+        aria-expanded={open}
+        // React owns the disclosure state. Without preventDefault the native
+        // <summary> activation toggles details.open ITSELF on the first click
+        // and then React flips state on the second, so after two clicks the
+        // real details.open / body visibility / chevron / aria-expanded
+        // desync. Suppress the native toggle and drive `open` solely from here.
+        onClick={(event) => {
+          event.preventDefault();
+          setOpen((value) => !value);
+        }}
+      >
+        <span>{knowledgeValue(phase.label) ?? phase.phaseId}</span>
+      </summary>
+      <ul className={css.wfMembers}>
+        {members.map((m) => (
+          <MemberRow key={m.memberId} member={m} />
+        ))}
+      </ul>
     </details>
   );
 }

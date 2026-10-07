@@ -721,8 +721,10 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
         .await?;
     assert_eq!(lineage["chapters"][0]["endedAt"], json!(ended_at));
 
-    // Migration backfill: a terminal row from before the column existed keeps
-    // what was its end time then (updated_at at migration).
+    // Migration backfill (ma-lineage r4 item 3): a terminal row from before
+    // the column existed is backfilled from the qualifying process-end EVENT
+    // in its journal (that event's observedAt), NOT from updated_at. A later
+    // diagnostic (non-terminal, non-liveness) must not veto the backfill.
     let data_dir = ctx._dir.path().to_owned();
     let (human, host) = (ctx.human.clone(), ctx.host.clone());
     let Ctx {
@@ -736,9 +738,20 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
     hub.shutdown().await;
     {
         let db = rusqlite::Connection::open(&db_path)?;
+        // Wipe the immutable column and move updated_at to a DIFFERENT time,
+        // so a pass would be obvious if the migration copied it.
         db.execute(
             "UPDATE instances SET ended_at = NULL, updated_at = '2026-09-02T08:30:00.000Z'
              WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+        // Append a later DIAGNOSTIC event (after the exit): it is neither
+        // process end nor return-to-live, so the earlier exit must survive.
+        db.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, 9001, 'evt_diag_mig',
+              '{\"kind\":\"lifecycle\",\"payload\":{\"type\":\"native\",\"topic\":\"diagnostic\",\"nativeName\":\"api_error\",\"status\":{\"state\":\"known\",\"value\":\"rate limited\"},\"severity\":\"error\"}}',
+              '2026-09-01T09:00:00.000Z')",
             rusqlite::params![x],
         )?;
     }
@@ -750,8 +763,8 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
         |row| row.get(0),
     )?;
     assert_eq!(
-        stamped, "2026-09-02T08:30:00.000Z",
-        "the migration stamps existing terminal rows once from updated_at"
+        stamped, ended_at,
+        "the migration backfills from the qualifying end EVENT, not updated_at; a later diagnostic must not veto it"
     );
     let _ = (hub, http, human, host, _dir);
     Ok(())
@@ -1037,12 +1050,19 @@ async fn a_failed_turn_sets_no_ended_at_until_the_real_process_exit() -> Result<
     );
 
     // The real process exits later: only now is endedAt set.
+    // The real print/SDK exit shape (topic=session, nativeName=session,
+    // status exited) — not a synthetic entity event.
     node.appends.send((
         x.clone(),
         json!({
             "kind": "lifecycle",
             "observedAt": "2026-10-06T02:00:00.000Z",
-            "payload": { "type": "entity", "state": "exited", "reasonCode": "native-exit" }
+            "payload": {
+                "type": "native", "topic": "session", "nativeName": "session",
+                "severity": "info", "affectsCompletion": false,
+                "status": { "state": "known", "value": "exited" },
+                "relatedIds": {}
+            }
         }),
     ))?;
     ctx.wait_until(&x, |v| v["lifecycle"] == json!("exited"))
@@ -1050,7 +1070,7 @@ async fn a_failed_turn_sets_no_ended_at_until_the_real_process_exit() -> Result<
     assert_eq!(
         first_chapter_ended_at(&ctx, &x).await?,
         Some(json!("2026-10-06T02:00:00.000Z")),
-        "endedAt comes from the real exit, not the turn error"
+        "endedAt comes from the real SDK/print exit, not the turn error"
     );
     Ok(())
 }

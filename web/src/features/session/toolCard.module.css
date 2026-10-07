@@ -206,7 +206,16 @@
   font-size: var(--text-meta);
   color: var(--fg-body);
   padding: 0 var(--space-3);
+  cursor: pointer;
+  list-style: none;
 }
+.wfPhase::-webkit-details-marker { display: none; }
+.wfPhase::before { content: "▸"; }
+/* The chevron is bound to the phase's OWN <details> via a direct-child
+   selector. The previous `details[open] .wfPhase` matched any open ancestor
+   (the run <details open>), so a collapsed phase inside an open run kept the
+   down chevron. */
+details.wfPhaseDetails[open] > summary.wfPhase::before { content: "▾"; }
 
 .wfMembers {
   padding: var(--space-2) var(--space-3) 10px;
@@ -308,4 +317,18 @@
 
 .heldRowActions {
   composes: heldRowActions from "./composer.module.css";
+}
+
+/* Accessible-only node (e.g. the workflow progress meter): removed from the
+   visual flow but exposed to assistive tech. */
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }

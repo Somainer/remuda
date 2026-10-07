@@ -4292,16 +4292,23 @@ mod tests {
         pump.await.unwrap();
     }
 
-    /// c-cardsettle r5 item 3 — the owner replay driven through the REAL Node
-    /// pump: a shell-pty hook StopFailure for a workflow subagent (agentId +
-    /// agentType, outcome=failed, remudaActivity=idle, NO
-    /// agentTranscriptPath, StopFailure before SubagentStart) must (a) leave
-    /// the root instance exactly as it was — no failed/exited lifecycle and
-    /// no idle — while (b) journaling a workflow.member Failed for THAT
-    /// agent, resolved from agentId via its on-disk transcript.
+    /// c-cardsettle r7 item 5 (was r5 item 3, strengthened): the owner's
+    /// recorded RAW hook is mapped through the REAL `map_event` mapper and
+    /// driven through the REAL Node pump — not a hand-built observation — with
+    /// the root explicitly seeded WORKING (the old fixture defaulted to Idle,
+    /// so an idle-stamping regression compared Idle to Idle and passed).
+    ///
+    /// 1. Root stays Working (lifecycle and activity literally unchanged)
+    ///    after the subagent StopFailure carrying the recorded
+    ///    remudaActivity=idle.
+    /// 2. The workflow member is journaled Failed.
+    /// 3. The Node's COMMITTED output is then fed into the HUB projection:
+    ///    the pending approval stays pending and the member row is failed
+    ///    there too.
     #[tokio::test]
-    async fn owner_subagent_stopfailure_pump_keeps_root_and_fails_the_member() {
-        use remuda_protocol::{DriverKind, Knowledge, ObservationPayload, SourceChannel};
+    async fn owner_subagent_stopfailure_pump_keeps_working_root_fails_member_and_hub_keeps_card() {
+        use remuda_protocol::{DriverKind, ObservationPayload, SourceChannel};
+        use remuda_signal::{HookEvent, map_event};
 
         // On-disk session tree the tailer resolves runs from.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4323,8 +4330,18 @@ mod tests {
         )
         .unwrap();
         let id = instance.meta.id.clone();
+        let journal_id = instance.journal_id.clone();
         store.insert_instance(instance).unwrap();
-        let instance = store.get_instance(&id).unwrap();
+        // Explicitly WORKING root — this is what made the old test vacuous.
+        store
+            .set_instance_state(
+                &id,
+                None,
+                Some(remuda_protocol::Knowledge::Known {
+                    value: Activity::Working,
+                }),
+            )
+            .unwrap();
         let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
         let (tx, rx) = mpsc::channel(16);
         let pump = spawn_observation_pump(
@@ -4336,63 +4353,115 @@ mod tests {
             Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
         );
 
-        // A shell-pty HOOK observation (the mapped shape the hook shim commits).
-        let hook = |topic: remuda_protocol::LifecycleTopic,
-                    name: &str,
-                    related: &[(&str, &str)],
-                    status: &str,
-                    severity: remuda_protocol::Severity| {
-            let mut observation = native_lifecycle_full(
-                topic,
-                name,
-                "not-applicable",
-                related,
-                severity,
-                false,
-                status,
-            );
+        const PPID: i32 = 4242;
+        let transcript = enc.join("sid.jsonl").to_string_lossy().into_owned();
+
+        /// Map a recorded raw hook through the REAL mapper, then stamp the
+        /// envelope the production bus stamps (Hook / shell-pty).
+        fn map_raw_hook(name: &str, payload: serde_json::Value) -> remuda_protocol::Observation {
+            let mapped = map_event(&HookEvent {
+                name: name.into(),
+                ppid: PPID,
+                payload,
+            });
+            let mut observation = remuda_protocol::Observation {
+                schema_version: remuda_protocol::SchemaVersion,
+                event_id: remuda_protocol::EventId::new(),
+                journal_id: Id::new("obj").unwrap(),
+                instance_id: InstanceId::new(),
+                run_id: None,
+                host_id: HostId::new(),
+                process_generation: U64(1),
+                run_generation: None,
+                seq: U64(1),
+                observed_at: timestamp_now().unwrap(),
+                native_at: unknown("test"),
+                source: crate::driver::runtime_source(
+                    &fixture_instance(
+                        InstanceId::new(),
+                        HostId::new(),
+                        WorkspaceId::new(),
+                        DriverKind::ShellPty,
+                    )
+                    .unwrap(),
+                    U64(1),
+                ),
+                completeness: mapped.completeness,
+                raw_ref: None,
+                evidence_event_ids: Vec::new(),
+                body: mapped.payload,
+            };
             observation.source.channel = SourceChannel::Hook;
             observation.source.driver_kind = DriverKind::ShellPty;
             observation
-        };
+        }
 
-        // SessionStart binds the session directory.
-        tx.send(hook(
-            remuda_protocol::LifecycleTopic::Session,
+        /// Merge a live-fold tag into a mapped native observation.
+        fn tag(
+            observation: &mut remuda_protocol::Observation,
+            key: &'static str,
+            value: &'static str,
+        ) {
+            let ObservationPayload::Lifecycle(payload) = &mut observation.body else {
+                panic!("the mapper produced a lifecycle payload");
+            };
+            let remuda_protocol::LifecyclePayload::Native(native) = payload.as_mut() else {
+                panic!("a native lifecycle payload");
+            };
+            native.related_ids.insert(key.into(), value.into());
+        }
+
+        // SessionStart arrives first; with no foreground reading yet it is
+        // held PENDING (the honest "unverified binding" rule).
+        let mut session_start = map_raw_hook(
             "SessionStart",
-            &[(
-                "transcriptPath",
-                enc.join("sid.jsonl").to_string_lossy().as_ref(),
-            )],
-            "observed",
+            serde_json::json!({
+                "session_id": "sid",
+                "transcript_path": transcript,
+            }),
+        );
+        tag(&mut session_start, "remudaActivity", "working");
+        tx.send(session_start).await.unwrap();
+
+        // The promotion poll then identifies the foreground pid: the pending
+        // SessionStart binds to it (the real production order). Without this,
+        // owns_hook is false and the subagent activity guard is never
+        // exercised.
+        let mut promoted = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Session,
+            "agent_promoted",
+            "not-applicable",
+            &[("kind", "claude"), ("pid", "4242")],
             remuda_protocol::Severity::Info,
-        ))
-        .await
-        .unwrap();
-        // The owner's first event: subagent StopFailure, remudaActivity=idle.
-        let before = store.get_instance(&id).unwrap();
-        let before_lifecycle = before.lifecycle;
-        let before_activity = before.activity.clone();
-        tx.send(hook(
-            remuda_protocol::LifecycleTopic::Turn,
+            false,
+            "observed",
+        );
+        promoted.source.channel = SourceChannel::Runtime;
+        promoted.source.driver_kind = DriverKind::ShellPty;
+        tx.send(promoted).await.unwrap();
+
+        // The owner's first event: subagent StopFailure. Raw payload fields
+        // are the harness's snake_case wire keys; the live fold's turn-ended
+        // phase and the (old-shim) remudaActivity=idle tag are merged onto the
+        // raw observation exactly like the recorded event.
+        let mut stop_failure = map_raw_hook(
             "StopFailure",
-            &[
-                ("agentId", "agent0sub0agent000"),
-                ("agentType", "workflow-subagent"),
-                ("outcome", "failed"),
-                ("phase", "turn-ended"),
-                ("remudaActivity", "idle"),
-            ],
-            "idle",
-            remuda_protocol::Severity::Warning,
-        ))
-        .await
-        .unwrap();
+            serde_json::json!({
+                "session_id": "sid",
+                "transcript_path": transcript,
+                "agent_id": "agent0sub0agent000",
+                "agent_type": "workflow-subagent",
+                "outcome": "failed",
+            }),
+        );
+        tag(&mut stop_failure, "phase", "turn-ended");
+        tag(&mut stop_failure, "remudaActivity", "idle");
+        tx.send(stop_failure).await.unwrap();
 
         // Poll until the member-failed observation lands (or time out).
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let page = store.read_events(&instance.journal_id, None, 256).unwrap();
+                let page = store.read_events(&journal_id, None, 256).unwrap();
                 let failed = page.events.iter().any(|event| {
                     let remuda_protocol::JournalEvent::Instance(event) = event else {
                         return false;
@@ -4400,7 +4469,7 @@ mod tests {
                     matches!(&event.body,
                         ObservationPayload::WorkflowMember(member)
                             if matches!(&member.native_agent_id,
-                                Knowledge::Known { value }
+                                remuda_protocol::Knowledge::Known { value }
                                     if value == "agent0sub0agent000")
                                 && member.state == remuda_protocol::WorkflowState::Failed)
                 });
@@ -4413,20 +4482,143 @@ mod tests {
         .await
         .expect("the failed workflow member is journaled");
 
-        // The root turn is unchanged: lifecycle and activity equal what they
-        // were BEFORE the subagent StopFailure (no end, no idle).
+        // The root turn is unchanged: lifecycle still Ready and, decisively,
+        // activity still WORKING — a subagent remudaActivity=idle cannot idle
+        // a working root (the pre-r7 fixture asserted Idle against Idle).
         let root = store.get_instance(&id).unwrap();
         assert_eq!(
-            root.lifecycle, before_lifecycle,
+            root.lifecycle,
+            InstanceLifecycle::Ready,
             "a subagent StopFailure never ends the root"
         );
         assert_eq!(
-            root.activity, before_activity,
-            "the subagent's remudaActivity=idle never moves the root activity"
+            root.activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Working
+            },
+            "the subagent's remudaActivity=idle never moves a WORKING root"
+        );
+
+        // Collect the Node's COMMITTED output (every observation the pump
+        // actually journaled, including the synthesized member-failed).
+        let committed: Vec<remuda_protocol::Observation> = store
+            .read_events(&journal_id, None, 256)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter_map(|event| match event {
+                remuda_protocol::JournalEvent::Instance(observation) => Some(*observation),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            committed.iter().any(|o| matches!(&o.body,
+                ObservationPayload::WorkflowMember(m)
+                    if m.state == remuda_protocol::WorkflowState::Failed)),
+            "the committed output carries the failed member"
         );
 
         drop(tx);
         pump.await.unwrap();
+
+        // ── Hub projection half ────────────────────────────────────────────
+        // Feed the Node's committed output (the exact uplink conversion:
+        // serde_json::to_value(JournalEvent::Instance)) into a real Hub Store
+        // with a running, card-holding instance.
+        let hub_dir = tempfile::tempdir().unwrap();
+        let hub_store =
+            remuda_hub::store_test_support::Store::open(hub_dir.path()).expect("hub store");
+        let hub_host = remuda_protocol::HostId::new().as_id().to_string();
+        let hub_instance = remuda_protocol::InstanceId::new().as_id().to_string();
+        hub_store
+            .ensure_instance(hub_host.clone(), hub_instance.clone())
+            .await
+            .unwrap();
+        let hub_append = |event: serde_json::Value| {
+            let hub_store = &hub_store;
+            let host = hub_host.clone();
+            let instance = hub_instance.clone();
+            async move {
+                hub_store
+                    .append_journal(host, instance, None, event)
+                    .await
+                    .expect("hub append")
+            }
+        };
+        hub_append(serde_json::json!({"kind":"lifecycle","payload":{
+            "type":"entity","entityType":"instance","state":"ready"}}))
+        .await;
+        hub_append(serde_json::json!({"kind":"lifecycle","payload":{
+            "type":"native","topic":"turn","nativeName":"agent_status",
+            "status":{"state":"known","value":"working"}}}))
+        .await;
+        let hub_card = format!("int_{}", uuid::Uuid::now_v7());
+        hub_append(
+            serde_json::json!({"kind":"interaction.requested","payload":{
+            "interactionKind":"approval",
+            "interaction":{
+                "id": hub_card, "kind":"approval", "state":"pending",
+                "blocking": true, "answerable": true,
+                "resolution": {"state":"unknown"},
+                "request": {"kind":"approval","title":"Bash","description":"x","options":[]}}}}),
+        )
+        .await;
+
+        // Re-stamp each Node observation onto the Hub instance and append in
+        // journal order, exactly as the WSS uplink serializes it.
+        for mut observation in committed {
+            observation.instance_id =
+                remuda_protocol::InstanceId::try_from(hub_instance.clone()).unwrap();
+            let value = serde_json::to_value(remuda_protocol::JournalEvent::Instance(Box::new(
+                observation,
+            )))
+            .expect("node journal event serializes to hub wire JSON");
+            hub_append(value).await;
+        }
+
+        let hub_row = hub_store
+            .get_instance(hub_instance.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            hub_row.lifecycle, "running",
+            "the hub projection keeps the root running"
+        );
+        assert_ne!(
+            hub_row.activity, "idle",
+            "the subagent StopFailure never idles the working root at the hub either"
+        );
+        let pending = hub_store
+            .list_interactions(None, Some(hub_instance.clone()), None, true)
+            .await
+            .unwrap();
+        assert!(
+            pending.iter().any(|r| r.interaction_id == hub_card),
+            "the pending approval is still pending after the subagent failure"
+        );
+        // The member row is failed in the Hub journal projection (the wire
+        // shape the uplink serializes: kind=workflow.member, state=failed,
+        // nativeAgentId carrying the owner's subagent id).
+        let hub_page = hub_store
+            .read_journal(hub_instance.clone(), 0, None)
+            .await
+            .unwrap();
+        let member_failed = hub_page.events.iter().any(|record| {
+            let event = &record.event;
+            event.get("kind").and_then(|v| v.as_str()) == Some("workflow.member")
+                && event.pointer("/payload/state").and_then(|v| v.as_str()) == Some("failed")
+                && event
+                    .pointer("/payload/nativeAgentId/value")
+                    .and_then(|v| v.as_str())
+                    == Some("agent0sub0agent000")
+        });
+        assert!(
+            member_failed,
+            "the hub projection records the workflow member failed: {}",
+            serde_json::to_value(&hub_page.events).unwrap_or_default()
+        );
+        hub_store.close().await;
     }
 
     #[tokio::test]

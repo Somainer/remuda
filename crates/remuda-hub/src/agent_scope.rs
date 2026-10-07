@@ -64,10 +64,13 @@ pub async fn owns(state: &AppState, device: &Device, target: &str) -> Result<boo
     let Some(caller) = device.instance_id.as_deref() else {
         return Ok(false);
     };
-    let Some(instance) = state.store.get_instance(target.into()).await? else {
-        return Ok(false);
-    };
-    Ok(caller == target || instance.parent_instance_id.as_deref() == Some(caller))
+    // D-057 §5: the target is a chapter in the caller's lineage, or its parent
+    // is. Plain instances keep the old self-or-direct-parent edge.
+    state
+        .store
+        .lineage_owns(caller.to_string(), target.to_string())
+        .await
+        .map_err(crate::http::map_store)
 }
 
 /// Fleet-wide metadata is available only to operator devices.
@@ -161,6 +164,32 @@ fn attachment_read(path: &str) -> bool {
             .strip_prefix("/v1/attachments/")
             .and_then(|rest| rest.strip_suffix("/content"))
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// `GET /v1/lineages/{id}` — D-057 §13. An Agent may read only its own
+/// lineage; the middleware pins the path id to the caller's stamped lineage,
+/// and the handler re-checks.
+fn lineage_read_target(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/v1/lineages/")?;
+    (!rest.is_empty() && !rest.contains('/')).then_some(rest)
+}
+
+/// Whether an Agent device's bound instance belongs to `lineage_id`.
+async fn agent_owns_lineage(
+    state: &AppState,
+    device: &Device,
+    lineage_id: &str,
+) -> Result<bool, HubError> {
+    let Some(bound) = device.instance_id.as_deref() else {
+        return Ok(false);
+    };
+    Ok(state
+        .store
+        .lineage_id_for_instance(bound.to_string())
+        .await
+        .map_err(crate::http::map_store)?
+        .as_deref()
+        == Some(lineage_id))
 }
 
 /// `GET /v1/hosts/{id}/hostcap` — the coordinator's pre-dispatch host read.
@@ -696,6 +725,10 @@ pub async fn restrict_agent_routes(
                     // and the feature switch; admitting the path loosens
                     // nothing by itself.
                     || path == "/v1/interactions"
+                    || match lineage_read_target(path) {
+                        Some(id) => agent_owns_lineage(&state, &device, id).await?,
+                        None => false,
+                    }
                     || match read_target(path) {
                         Some(id) => owns(&state, &device, id).await?,
                         None => false,

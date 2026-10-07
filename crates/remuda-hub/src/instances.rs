@@ -26,6 +26,7 @@ pub fn routes() -> Router<AppState> {
             get(http::get_instance_command),
         )
         .route("/v1/instances/{id}/resume", post(http::resume_instance))
+        .route("/v1/lineages/{id}", get(http::get_lineage))
         .route("/v1/instances/{id}/journal", get(http::get_journal))
         .route("/v1/instances/{id}/screen", get(http::get_screen))
         .route(

@@ -40,7 +40,17 @@ pub(crate) enum HubCommand {
     /// Replace the device pairing access code and print the new one.
     ///
     /// Paired devices keep their tokens; only future pairing is affected.
-    RotateBootstrap,
+    RotateBootstrap(RotateBootstrapArgs),
+}
+
+#[derive(ClapArgs)]
+pub(crate) struct RotateBootstrapArgs {
+    /// Rotate in `<data-dir>/dev-hub`, the layout `remuda dev` writes.
+    #[arg(long, conflicts_with = "standalone")]
+    dev: bool,
+    /// Rotate directly in `<data-dir>` (standalone Hub).
+    #[arg(long)]
+    standalone: bool,
 }
 
 impl Args {
@@ -61,9 +71,32 @@ impl Args {
 /// root. Refuse when the target directory has no persisted bootstrap-token
 /// (the running hub relies on an explicit `--access-code-file`, which
 /// rotation cannot change).
-fn rotate_bootstrap(config: &Config) -> anyhow::Result<()> {
+///
+/// Round 4 item 5: when BOTH `<data-dir>/bootstrap-token` and
+/// `<data-dir>/dev-hub/bootstrap-token` exist the layout is ambiguous —
+/// silently picking dev-hub would rotate the wrong Hub for an operator
+/// revoking a leaked standalone code. Require an explicit `--dev` or
+/// `--standalone` in that case.
+fn rotate_bootstrap(config: &Config, args: &RotateBootstrapArgs) -> anyhow::Result<()> {
+    let outer_token = config.data_dir.join("bootstrap-token");
     let dev_hub = config.data_dir.join("dev-hub");
-    let target_dir = if dev_hub.is_dir() {
+    let dev_token = dev_hub.join("bootstrap-token");
+    let both_present = outer_token.is_file() && dev_token.is_file();
+    let target_dir = if args.dev {
+        dev_hub
+    } else if args.standalone {
+        config.data_dir.clone()
+    } else if both_present {
+        anyhow::bail!(
+            "both {} and {} exist; refusing to guess which Hub owns the code \
+             to rotate — pass --dev for the remuda dev Hub or --standalone for \
+             the Hub rooted at the data directory",
+            outer_token.display(),
+            dev_token.display()
+        );
+    } else if dev_token.is_file() {
+        // Auto-detect the remuda dev layout only when the standalone code is
+        // absent, so the choice is never ambiguous.
         tracing::debug!(
             path = %dev_hub.display(),
             "rotating in remuda dev hub data directory"
@@ -148,9 +181,9 @@ pub(crate) async fn run(
     args: Args,
     mut shutdown: Shutdown,
 ) -> anyhow::Result<()> {
-    if let Some(HubCommand::RotateBootstrap) = args.command {
+    if let Some(HubCommand::RotateBootstrap(rotate_args)) = args.command {
         config.validate()?;
-        return rotate_bootstrap(&config);
+        return rotate_bootstrap(&config, &rotate_args);
     }
     let with_dispatcher = args.with_dispatcher;
     let healthcheck = args.healthcheck;

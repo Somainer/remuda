@@ -125,3 +125,97 @@ fn rotate_bootstrap_cli_refuses_without_persisted_token() {
         "expected missing-token refusal"
     );
 }
+
+/// Round 4 item 5: when BOTH a standalone and a dev-hub token exist, an
+/// unqualified rotation must refuse rather than silently rotating dev-hub
+/// (an operator revoking a leaked standalone code would rotate the wrong Hub).
+#[test]
+fn rotate_bootstrap_cli_refuses_when_both_layouts_exist() {
+    let outer = tempfile::tempdir().unwrap();
+    let dev_hub = outer.path().join("dev-hub");
+    let outer_token = outer.path().join("bootstrap-token");
+    let dev_token = dev_hub.join("bootstrap-token");
+    write(&outer_token, "standalone-code-aaaaaaaaaaaaaa");
+    write(&dev_token, "dev-hub-code-bbbbbbbbbbbbbbbb");
+    let outer_before = fs::read(&outer_token).unwrap();
+    let dev_before = fs::read(&dev_token).unwrap();
+
+    let output = Command::new(bin())
+        .args(["hub", "rotate-bootstrap", "--data-dir"])
+        .arg(outer.path())
+        .output()
+        .expect("run rotate-bootstrap");
+    assert!(!output.status.success(), "ambiguous layout must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--dev") && stderr.contains("--standalone"),
+        "stderr names both disambiguation flags: {stderr}"
+    );
+    // Neither token is touched.
+    assert_eq!(fs::read(&outer_token).unwrap(), outer_before);
+    assert_eq!(fs::read(&dev_token).unwrap(), dev_before);
+}
+
+/// `--dev` selects the dev-hub token even when both layouts are present; the
+/// standalone token is byte-identical afterwards.
+#[test]
+fn rotate_bootstrap_cli_dev_flag_selects_dev_hub_when_ambiguous() {
+    let outer = tempfile::tempdir().unwrap();
+    let dev_hub = outer.path().join("dev-hub");
+    let outer_token = outer.path().join("bootstrap-token");
+    let dev_token = dev_hub.join("bootstrap-token");
+    write(&outer_token, "standalone-code-aaaaaaaaaaaaaa");
+    write(&dev_token, "dev-hub-code-bbbbbbbbbbbbbbbb");
+    let outer_before = fs::read(&outer_token).unwrap();
+
+    let output = Command::new(bin())
+        .args(["hub", "rotate-bootstrap", "--dev", "--data-dir"])
+        .arg(outer.path())
+        .output()
+        .expect("run rotate-bootstrap --dev");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let new_code = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    assert_ne!(new_code, "dev-hub-code-bbbbbbbbbbbbbbbb");
+    assert_eq!(read(&dev_token), new_code);
+    assert_eq!(
+        fs::read(&outer_token).unwrap(),
+        outer_before,
+        "the standalone token must be untouched"
+    );
+}
+
+/// `--standalone` selects the outer token even when both layouts are present;
+/// the dev-hub token is byte-identical afterwards.
+#[test]
+fn rotate_bootstrap_cli_standalone_flag_selects_outer_when_ambiguous() {
+    let outer = tempfile::tempdir().unwrap();
+    let dev_hub = outer.path().join("dev-hub");
+    let outer_token = outer.path().join("bootstrap-token");
+    let dev_token = dev_hub.join("bootstrap-token");
+    write(&outer_token, "standalone-code-aaaaaaaaaaaaaa");
+    write(&dev_token, "dev-hub-code-bbbbbbbbbbbbbbbb");
+    let dev_before = fs::read(&dev_token).unwrap();
+
+    let output = Command::new(bin())
+        .args(["hub", "rotate-bootstrap", "--standalone", "--data-dir"])
+        .arg(outer.path())
+        .output()
+        .expect("run rotate-bootstrap --standalone");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let new_code = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    assert_ne!(new_code, "standalone-code-aaaaaaaaaaaaaa");
+    assert_eq!(read(&outer_token), new_code);
+    assert_eq!(
+        fs::read(&dev_token).unwrap(),
+        dev_before,
+        "the dev-hub token must be untouched"
+    );
+}

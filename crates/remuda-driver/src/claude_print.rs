@@ -2772,11 +2772,6 @@ impl TranscriptMapper {
         self.map_record(value)
     }
 
-    /// Flush whatever assistant run is still buffered.
-    ///
-    /// A run is normally closed by the record that supersedes it, so the last
-    /// message of a transcript would otherwise sit in the buffer forever. The
-    /// tailer calls this when it reaches the end of the available input.
     /// Poll-boundary drain (called at the end of every pump batch): publish
     /// any new content blocks, and — only for a run that has seen its
     /// stop_reason and carries fresh counters — a provisional, replaceable

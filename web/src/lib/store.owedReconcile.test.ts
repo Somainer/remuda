@@ -57,6 +57,7 @@ async function mountTwo() {
     .spyOn(api, "eventsSubscribe")
     .mockImplementation(
       (async (_jid, _after, _onBatch, _onGap, hooks) => {
+        console.error("PROBE subscribe call", subscribe.mock.calls.length + 1, "jid", _jid);
         if (hooks?.onClose && !onClose) onClose = hooks.onClose;
         const n = subscribe.mock.calls.length;
         return {
@@ -130,6 +131,7 @@ it("a delivered row whose follow owner is rebound to another session still gets 
   // runs (the Hub REST path works; only the follow socket is down).
   closeA();
   await vi.waitFor(() => expect(hubStore.connectionState).toBe("offline"));
+  console.error("PROBE after close A", hubStore.connectionState, "bound", (hubStore as unknown as { connectionBoundTo: string }).connectionBoundTo);
 
   // send() persists even offline; an explicit flush delivers it. The drain
   // job runs on A's free chain, sees A's bound follow own recovery, records
@@ -137,7 +139,9 @@ it("a delivered row whose follow owner is rebound to another session still gets 
   await hubStore.send(A, "owed rebind");
   void internals.flushAllOutbox();
   await vi.waitFor(() => expect(api.instanceSend).toHaveBeenCalledTimes(1));
-  await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(true));
+  console.error("PROBE send delivered; state", hubStore.connectionState);
+  await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(true), { timeout: 2000 });
+  console.error("PROBE debt recorded");
   const cid = ((api.instanceSend as unknown as { mock: { calls: unknown[][] } }).mock.calls[0]?.[4] as string) ?? "";
   expect(cid).toBeTruthy();
 

@@ -786,6 +786,73 @@ async fn close_returns_when_stdin_is_not_drained_and_the_writer_is_saturated() {
     );
 }
 
+/// r3 item 5: a blocked SEND cannot gate close, and stdout must keep draining
+/// under bidirectional pipe pressure.
+///
+/// The fake stops reading stdin AND floods stdout forever. A prompt bigger
+/// than a pipe buffer blocks in the writer task. Pre-r3 `send` held the
+/// `live` (and turn-order) lock across that write, so a concurrent `close`
+/// could not start its ladder and the process hung. Here we:
+///  1. start a large send and prove it is parked on the blocked pipe;
+///  2. prove stdout frames keep arriving (the reader is not starved by the
+///     blocked write);
+///  3. close concurrently — it must reach the ladder, reap the child within
+///     its bound, and release the parked send (with an error, not a success).
+#[tokio::test]
+async fn a_blocked_send_cannot_gate_close_and_stdout_keeps_draining() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STOP_READING".into(), "1".into());
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = driver.start(spec).await.expect("start");
+
+    // 1. A large prompt parks on the blocked pipe (write never completes).
+    let big = "x".repeat(256 * 1024);
+    let mut send_fut = Box::pin(driver.send(prompt(&big)));
+    let parked = tokio::time::timeout(Duration::from_millis(800), &mut send_fut).await;
+    assert!(
+        parked.is_err(),
+        "the send must stay parked while the child does not drain stdin"
+    );
+
+    // 2. Bidirectional pressure: stdout frames keep being mapped and delivered
+    // while the write is blocked. The flood emits assistant frames every
+    // ~500us; collect a handful from the RunHandle channel.
+    let mut drained = 0usize;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while drained < 5 && tokio::time::Instant::now() < drain_deadline {
+        match tokio::time::timeout(Duration::from_millis(500), handle.recv()).await {
+            Ok(Some(_)) => drained += 1,
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        drained >= 5,
+        "stdout must keep draining behind a blocked write; got {drained} observations"
+    );
+
+    // 3. close must start immediately (no `live` held by the blocked send),
+    // bound the unresponsive child away, and unblock the send.
+    let started = std::time::Instant::now();
+    let close_fut = tokio::time::timeout(Duration::from_secs(20), driver.close());
+    let (send_result, closed) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(20), &mut send_fut),
+        close_fut
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "close took {:?}: a blocked send gated the close ladder",
+        started.elapsed()
+    );
+    closed.expect("close timed out").expect("close ack");
+    let send_result = send_result.expect("the parked send never resolved after close");
+    assert!(
+        send_result.is_err(),
+        "a write the dead child never drained must surface an error, not success: {send_result:?}"
+    );
+}
+
 /// Item 4: a reader from a previous launch must never emit into the next one.
 ///
 /// `close` joins or aborts the reader before it returns, and `start` re-arms

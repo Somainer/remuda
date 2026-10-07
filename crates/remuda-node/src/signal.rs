@@ -157,10 +157,12 @@ pub fn hook_activity(observation: &Observation) -> Option<remuda_protocol::Activ
 /// - `turn/turn_started` status `working` is emitted when the user frame is
 ///   written to the native process, so activity flips to `working` even before
 ///   the harness echoes anything;
-/// - `turn/result` status `turn_done` ends the root turn only when it is the
-///   process's terminal result (`affects_completion`, i.e. `result_index > 0`
-///   with nothing queued): a Workflow's intermediate result does not prove the
-///   root has no more work;
+/// - `turn/result` status `turn_done` ends the root turn only when the driver
+///   has settled it from PER-ROOT-TURN evidence (`relatedIds.settledRootTurn`):
+///   every workflow the owning turn opened has sent its own terminal
+///   task_notification, nothing newer is queued/outstanding, regardless of the
+///   process-global `result_index` — a Workflow's intermediate result does not
+///   prove the root has no more work;
 /// - `turn/result` status `error` is still a *settled turn end*: a 429 frees
 ///   the composer and never fails the instance. It applies whenever no further
 ///   prompt is queued, matching the driver's own error-result shape

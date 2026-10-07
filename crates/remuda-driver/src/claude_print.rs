@@ -246,7 +246,10 @@ impl TurnBook {
             return false;
         }
         if self.outstanding.pop_front().is_some() {
-            queued == 0 && self.outstanding.is_empty()
+            // Defense in depth: workflows observed before any locally-written
+            // turn (pure replay/hydration) live in the implicit bucket; they
+            // still gate settlement even when a synthetic turn is popped.
+            queued == 0 && self.outstanding.is_empty() && self.implicit_workflows.is_empty()
         } else {
             // No locally-known turn (pure replay): native queue evidence plus
             // the implicit workflow bucket.
@@ -983,11 +986,18 @@ impl Driver for ClaudePrintDriver {
             publisher.abort();
         }
 
-        // Whichever path got there first — the worker draining StdoutEof, or
-        // this call covering an aborted one — emits exactly once
-        // (`exit_emitted`), and only while `events` is still live.
-        let _ = emit_exit(&self.inner, "exited").await;
+        // Seal the events channel BEFORE covering the exit. Under output
+        // pressure (a child that floods stdout while stdin is wedged) the
+        // events channel is full and the worker was aborted above; emitting
+        // the exit into that full channel would block forever and hang close.
+        // On the normal path the worker already drained StdoutEof and emitted
+        // `exited` into the receiver before it was joined, so dropping the
+        // sender loses nothing; here the once-guard below is then a no-op.
         *self.inner.events.lock().await = None;
+        // Whichever path got there first — the worker draining StdoutEof, or
+        // this call covering an aborted one — records exactly once
+        // (`exit_emitted`); emission is skipped once events is sealed.
+        let _ = emit_exit(&self.inner, "exited").await;
         // S5: the child has exited, so the launch overlays can go. The label is
         // the carrier's wire name, matching the kebab-case the sibling drivers
         // pass (`claude-pty`, `claude-bg`, `generic-pty`).
@@ -1181,7 +1191,7 @@ async fn map_loop(
         };
         // Unbounded: enqueue never parks on the writer/sender, so stdout keeps
         // draining even while a prompt write is blocked and close is running.
-        if publisher.send(PublishJob::Frame(frame)).is_err() {
+        if publisher.send(PublishJob::Frame(Box::new(frame))).is_err() {
             break;
         }
     }
@@ -1194,7 +1204,9 @@ async fn map_loop(
 /// One ordered unit of publication work. See [`Inner::publish`].
 enum PublishJob {
     /// Map one already-prefolded stdout frame and emit its observations.
-    Frame(Outbound),
+    /// Boxed: `Outbound` is ~1 KiB while the other jobs are tiny, and this job
+    /// already crosses the unbounded queue boundary.
+    Frame(Box<Outbound>),
     /// A user frame finished writing; map/emit its `turn_started` in order.
     TurnStarted { client_message_id: String },
     /// The child's stdout closed; emit exactly one `exited` (deduped).
@@ -1205,7 +1217,7 @@ enum PublishJob {
 async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<PublishJob>) {
     while let Some(job) = rx.recv().await {
         let result = match job {
-            PublishJob::Frame(frame) => publish_frame(&inner, frame).await,
+            PublishJob::Frame(frame) => publish_frame(&inner, *frame).await,
             PublishJob::TurnStarted { client_message_id } => {
                 let observation = {
                     let mut mapper = inner.mapper.lock().await;
@@ -2933,6 +2945,15 @@ impl StdoutMapper {
     /// Map one decoded stdout frame, exactly as the reader task does.
     pub fn map(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
         map_outbound(&mut self.mapper, &Outbound::from_value(value))
+    }
+
+    /// Record a locally-written user frame exactly as the driver send path
+    /// does (write-completed → turn_started), opening a new root turn in the
+    /// settlement book. Returns the same lifecycle observation the live send
+    /// publishes. Replay tests use it to correlate results with turns without
+    /// spawning a process (r3 item 4).
+    pub fn turn_started(&mut self) -> DriverResult<Observation> {
+        self.mapper.turn_started("")
     }
 
     /// Attach the tool-media stager so image result blocks become object

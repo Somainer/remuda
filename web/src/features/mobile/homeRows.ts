@@ -237,12 +237,16 @@ export function buildHomeRows(
       // comes from the durable lastTurnError marker (cleared by the next turn
       // start). It is shown verbatim but is NOT a red process failure; a
       // genuine process error (homeError) keeps the error treatment.
-      const turnError = ended ? null : homeTurnError(instance);
-      const processError = ended
+      //
+      // c-question-alert r3 item 8: UNKNOWN connectivity/lifecycle takes
+      // precedence over BOTH error channels — a disconnect (or a reconcile
+      // after reconnect) on an instance that still carries lastTurnError must
+      // read 状态待确认, never present the stale turn text as the live state.
+      const statusUnknown = status === "unknown";
+      const turnError = ended || statusUnknown ? null : homeTurnError(instance);
+      const processError = ended || statusUnknown || turnError
         ? null
-        : turnError
-          ? null
-          : homeError(instance, input.eventsOf?.(instance.id));
+        : homeError(instance, input.eventsOf?.(instance.id));
       const body = ended
         ? { text: canResume ? `${ended.label} · 可恢复` : ended.label, isError: false }
         : turnError

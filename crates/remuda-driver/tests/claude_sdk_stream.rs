@@ -413,3 +413,133 @@ fn a_workflow_intermediate_result_does_not_settle_until_its_final() {
         "the workflow's final result settles"
     );
 }
+
+fn result_lines(source: &str, driver: DriverKind) -> Vec<remuda_protocol::NativeLifecycle> {
+    result_natives(source, driver)
+}
+
+/// r3 item 2: the REAL stopped-workflow capture. The workflow's terminal
+/// task_notification (status=stopped, after a task_updated killed patch)
+/// arrives BEFORE the only result, which carries the process-global
+/// result_index 0 and queued 0. The terminal notification — not the index —
+/// is what closes the workflow, so that single result settles the root turn.
+/// Pre-r3 the counter-based bookkeeping kept the root "working" forever.
+#[test]
+fn the_stopped_workflow_canary_settles_on_its_terminal_notification() {
+    let results = result_lines(
+        include_str!("../../remuda-testing/fixtures/claude/claude-workflow-canary-1.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(results.len(), 1, "the canary has exactly one result");
+    assert!(
+        settles_root_turn(&results[0]),
+        "the post-notification result (index 0) settles the root turn"
+    );
+}
+
+/// r3 item 3: with TWO workflows owned by one turn, closing the first one
+/// does not settle: an intervening result stays intermediate until the SECOND
+/// workflow's terminal notification; only the last result settles.
+#[test]
+fn two_open_workflows_settle_only_after_both_terminate() {
+    let results = result_lines(
+        include_str!("../../remuda-testing/fixtures/scripts/workflow-two.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(results.len(), 3);
+    assert!(!settles_root_turn(&results[0]), "both workflows open");
+    assert!(
+        !settles_root_turn(&results[1]),
+        "A terminated but B still open: the first close must not settle"
+    );
+    assert!(settles_root_turn(&results[2]), "both terminated");
+}
+
+/// r3 item 1: result_index is process-global and grows across turns, so a
+/// workflow intermediate in a LATER root turn can carry a NONZERO index. The
+/// index must not settle it; the owning turn's open workflow does.
+#[test]
+fn a_later_turn_workflow_intermediate_with_nonzero_index_does_not_settle() {
+    let results = result_lines(
+        include_str!("../../remuda-testing/fixtures/scripts/workflow-later-turn.jsonl"),
+        DriverKind::ClaudeSdk,
+    );
+    assert_eq!(results.len(), 3);
+    // Turn 1 (index 0) settles normally.
+    assert!(settles_root_turn(&results[0]));
+    // Turn 2's workflow intermediate has index 1 (nonzero) but must NOT settle.
+    assert!(
+        !settles_root_turn(&results[1]),
+        "a nonzero result_index is not evidence of settlement while the workflow is open"
+    );
+    // After the terminal notification (status=stopped), index 2 settles.
+    assert!(settles_root_turn(&results[2]));
+}
+
+/// r3 item 4: an older buffered result mapped AFTER a newer turn_started was
+/// published must settle the OLDER outstanding turn, not the newer input.
+///
+/// The mapper tracks locally-written turns as a FIFO: the first result pops
+/// the front turn and settles the root only when NO newer turn remains
+/// outstanding. Here two prompts are written (A then B), the result for A is
+/// mapped after B's turn_started: it cannot idle B; B's own result then
+/// settles.
+#[test]
+fn an_older_buffered_result_cannot_settle_a_newer_outstanding_input() {
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
+    let _started_a = mapper.turn_started().expect("turn A started");
+    let _started_b = mapper.turn_started().expect("turn B started");
+
+    // A result line for turn A mapped from the reader NOW — after B's start
+    // was published (the buffer/reorder race).
+    let result_a = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": "A done",
+        "stop_reason": "end_turn",
+        "session_id": SESSION,
+        "result_index": 0,
+    });
+    let obs_a = mapper.map(result_a).expect("map result A");
+    let native_a = obs_a
+        .iter()
+        .find_map(|o| match &o.body {
+            ObservationPayload::Lifecycle(p) => match p.as_ref() {
+                LifecyclePayload::Native(n) if n.native_name == "result" => Some(n),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("result lifecycle A");
+    assert!(
+        !settles_root_turn(native_a),
+        "turn B is still outstanding: A's result must not idle the root"
+    );
+
+    // B's own result settles.
+    let result_b = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": "B done",
+        "stop_reason": "end_turn",
+        "session_id": SESSION,
+        "result_index": 1,
+    });
+    let obs_b = mapper.map(result_b).expect("map result B");
+    let settles_b = obs_b.iter().any(|o| match &o.body {
+        ObservationPayload::Lifecycle(p) => match p.as_ref() {
+            LifecyclePayload::Native(n) => {
+                n.native_name == "result"
+                    && n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true")
+            }
+            _ => false,
+        },
+        _ => false,
+    });
+    assert!(
+        settles_b,
+        "the last outstanding turn's result settles the root"
+    );
+}

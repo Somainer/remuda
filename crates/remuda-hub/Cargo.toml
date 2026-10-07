@@ -54,6 +54,10 @@ webauthn-rs-core = "=0.5.5"
 [dev-dependencies]
 anyhow.workspace = true
 base64 = "0.22"
+# D-057 OA6 ma-sdk-state r3: the claude-sdk state tests replay the real
+# recorded fixtures through the driver's stdout mapper (test-stub only) and
+# fold the serialized observations via journal.append.
+remuda-driver = { workspace = true, features = ["test-stub"] }
 ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
 # Software ES256 authenticator for the passkey ceremony tests (D-029).
 openssl = "0.10"

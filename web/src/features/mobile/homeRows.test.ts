@@ -249,7 +249,7 @@ describe("buildHomeGroups body text", () => {
     const row = groups[0].rows[0];
     expect(row.status).toBe("idle");
     expect(row.body).toBe("API Error: 429");
-    expect(row.bodyIsError).toBe(false, "a retryable turn error is not a red process failure");
+    expect(row.bodyIsError, "a retryable turn error is not a red process failure").toBe(false);
 
     // A severity-info topic=turn result with a lastError related id is NOT a
     // process error in the homeError fallback.
@@ -296,6 +296,45 @@ describe("buildHomeGroups body text", () => {
       expect(body).toBe("状态待确认 · 不推断成功或结束");
       expect(body).not.toMatch(/运行中|API Error/);
     }
+  });
+
+  it("(r3 item 8) unknown connectivity wins over a durable lastTurnError: disconnect and reconcile", () => {
+    // An instance that carries a settled turn error disconnects: the row must
+    // show the unknown-connectivity sentence, not the turn error text.
+    const disconnected = session("ins-turn-disconnected", {
+      lifecycle: "running",
+      connectivity: "disconnected",
+      activity: known("idle"),
+      lastTurnError: { at: "2026-10-06T00:00:00Z", text: "API Error: 429" },
+    });
+    // The reconnect reconcile state projects to the same unknown status.
+    // During reconcile connectivity is "reconciling" (projectStatus unknown).
+    const reconciling = session("ins-turn-reconciling", {
+      lifecycle: "reconciling",
+      connectivity: "reconciling",
+      activity: known("idle"),
+      lastTurnError: { at: "2026-10-06T00:00:00Z", text: "API Error: 500" },
+    });
+    const groups = build(named([disconnected, reconciling]));
+    for (const row of groups[0].rows) {
+      expect(row.status).toBe("unknown");
+      expect(row.body).toBe("状态待确认 · 不推断成功或结束");
+      expect(row.body).not.toContain("API Error");
+      expect(row.bodyIsError).toBe(false);
+    }
+
+    // After reconnect reconciles (connected again), the marker shows again.
+    const reconnected = build(
+      named([
+        session("ins-turn-reconciling", {
+          lifecycle: "running",
+          connectivity: "connected",
+          activity: known("idle"),
+          lastTurnError: { at: "2026-10-06T00:00:00Z", text: "API Error: 500" },
+        }),
+      ]),
+    );
+    expect(reconnected[0].rows[0].body).toBe("API Error: 500");
   });
 
   it("advertises 恢复 only on exited rows whose resume capability is supported", () => {

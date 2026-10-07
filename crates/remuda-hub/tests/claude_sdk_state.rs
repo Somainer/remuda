@@ -706,3 +706,126 @@ async fn scoped_and_nonterminal_failures_never_fail_the_root_instance() -> Resul
     assert_eq!(node.task_error().await, None, "fake-node task panicked");
     Ok(())
 }
+
+/// r3 (items 1-3): replay the REAL recorded fixtures through the shared
+/// driver mapper and fold each serialized observation through the Hub's
+/// journal state machine (`derive_instance_state` under the store fold). The
+/// durable activity after each `result` must match the per-root-turn
+/// settlement evidence: an intermediate workflow result leaves the row
+/// non-idle, the settled one idles it — regardless of the process-global
+/// result_index and including the real stopped-workflow canary whose only
+/// result is index 0 AFTER the terminal notification.
+#[tokio::test]
+async fn recorded_fixtures_fold_to_the_right_activity_per_result() -> Result<()> {
+    use remuda_driver::StdoutMapper;
+    use remuda_protocol::DriverKind;
+    use remuda_testing::fixtures_dir;
+
+    /// Map one fixture into its per-result activity expectations ("idle" when
+    /// the mapper stamped settledRootTurn on that result, "working" when it
+    /// did not — the row stays non-idle, here asserted as NOT "idle").
+    fn mapped_results(relative: &str) -> Vec<Value> {
+        let path = fixtures_dir().join(relative);
+        let source = std::fs::read_to_string(&path).expect("fixture");
+        let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
+        let mut results = Vec::new();
+        for line in source.lines().filter(|line| !line.trim().is_empty()) {
+            let value: Value = serde_json::from_str(line).expect("fixture line");
+            for observation in mapper.map(value).expect("map frame") {
+                let value = serde_json::to_value(&observation).expect("serialize");
+                if value.pointer("/payload/nativeName") == Some(&json!("result")) {
+                    results.push(value);
+                }
+            }
+        }
+        results
+    }
+
+    // (fixture, result indices that START a new root turn, expected activity
+    // after EACH result). The live driver emits turn_started(working) at every
+    // send; replay only carries results, so the boundaries are inserted here
+    // exactly as they would occur on the wire.
+    let cases: [(&str, &[usize], &[&str]); 5] = [
+        ("scripts/ok.jsonl", &[0], &["idle"]),
+        ("scripts/twoturn.jsonl", &[0, 1], &["idle", "idle"]),
+        (
+            "claude/claude-workflow-canary-1.jsonl",
+            // The single post-notification result at process-global index 0.
+            &[0],
+            &["idle"],
+        ),
+        (
+            "scripts/workflow-two.jsonl",
+            // One turn: both workflows open; first closed; both terminated.
+            &[0],
+            &["working", "working", "idle"],
+        ),
+        (
+            "scripts/workflow-later-turn.jsonl",
+            // Two turns; the intermediate (nonzero index) belongs to turn 2.
+            &[0, 1],
+            &["idle", "working", "idle"],
+        ),
+    ];
+
+    let ctx = Ctx::boot().await;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await;
+
+    for (fixture, turn_starts, expected) in cases {
+        // Plain instances (no address-owner grant: that grant is one-per-Hub
+        // and create_holder is reserved for the seat test).
+        let body = json!({
+            "hostId": ctx.host,
+            "kind": "claude",
+            "driver": "claude-sdk",
+            "permissionMode": "manual",
+            "prompt": "fixture replay"
+        })
+        .to_string();
+        let (status, text) = ctx.raw_http("POST", "/v1/instances", Some(&body)).await;
+        assert_eq!(status, 200, "{text}");
+        let id = serde_json::from_str::<Value>(text.trim()).unwrap()["instance"]["instanceId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        node.next_frame().await; // drain the instance.create forwarded frame
+        node.append(&id, session_started(SESSION));
+        ctx.wait_until(&id, |v| v["lifecycle"] == json!("running"))
+            .await;
+
+        for (result_index, (result_event, expected_activity)) in mapped_results(fixture)
+            .into_iter()
+            .zip(expected.iter())
+            .enumerate()
+        {
+            // Reproduce the live turn_started(working) at each turn boundary.
+            if turn_starts.contains(&result_index) {
+                let seq = ctx.durable_seq(&id).await;
+                node.append(&id, turn_started());
+                ctx.after_append(&id, seq).await;
+                ctx.wait_until(&id, |v| v["activity"] == json!("working"))
+                    .await;
+            }
+            let seq = ctx.durable_seq(&id).await;
+            node.append(&id, result_event);
+            let view = ctx.after_append(&id, seq).await;
+            if *expected_activity == "idle" {
+                assert_eq!(
+                    view["activity"],
+                    json!("idle"),
+                    "{fixture} result should idle: {view}"
+                );
+            } else {
+                assert_ne!(
+                    view["activity"],
+                    json!("idle"),
+                    "{fixture} intermediate result must keep the root non-idle: {view}"
+                );
+            }
+            // Workflow intermediates never fail the instance.
+            assert_ne!(view["lifecycle"], json!("failed"), "{fixture}");
+        }
+    }
+    assert_eq!(node.task_error().await, None, "fake-node task panicked");
+    Ok(())
+}

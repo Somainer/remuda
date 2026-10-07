@@ -441,10 +441,14 @@ fn flood_stdout() -> ! {
     let mut n: u64 = 0;
     loop {
         let _ = writeln!(stdout, "{}", json!({ "type": "keep_alive" }));
+        // A UNIQUE message id per frame: a repeated id with the same block is
+        // deduped/coalesced by the driver's stream assembler, which would make
+        // this flood look like one observation instead of continuous stdout
+        // pressure.
         let frame = json!({
             "type": "assistant",
             "message": {
-                "id": "msg_flood",
+                "id": format!("msg_flood_{n}"),
                 "type": "message",
                 "role": "assistant",
                 "content": [{ "type": "text", "text": format!("flood {n}") }]

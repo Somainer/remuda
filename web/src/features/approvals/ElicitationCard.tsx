@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
+import { InteractionDeadline } from "./InteractionDeadline";
 import css from "./decision.module.css";
 
 type ElicitationAction = "accept" | "decline" | "cancel";
@@ -88,6 +89,7 @@ export function ElicitationCard({
           Cancel
         </button>
       </div>
+      <InteractionDeadline interaction={interaction} />
     </section>
   );
 }

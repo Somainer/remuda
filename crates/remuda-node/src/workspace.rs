@@ -205,7 +205,10 @@ impl WorkspaceRegistry {
     ///
     /// Identity semantics an unregister accepts:
     /// * an absolute path;
-    /// * the exact stored canonical root, matched component-wise (r6);
+    /// * the exact stored canonical root BYTES, matched as an `OsStr` (a
+    ///   trailing `/`, a `.` component or a repeated separator is a DIFFERENT
+    ///   spelling and never takes this shortcut — r7 item 2; `Path == Path`
+    ///   compares components, so it cannot be used here);
     /// * anything else goes through [`canonical_directory`] — a real `realpath`
     ///   with the access probe, never a lexical `..` collapse
     ///   (`/allowed/link/../p` resolves where the symlink actually points);
@@ -221,16 +224,16 @@ impl WorkspaceRegistry {
             ));
         }
         // A deleted project remains removable using its stored canonical
-        // absolute path; for that exact string the root is trusted verbatim.
-        let canonical = if self
-            .state
-            .workspaces
-            .iter()
-            .any(|workspace| Path::new(&workspace.root_path) == candidate)
-        {
-            candidate.to_path_buf()
-        } else {
-            canonical_directory(candidate)?
+        // absolute path; for that EXACT string the root is trusted verbatim.
+        // Component-equivalent spellings (`/root/`, `/root/.`, `//root`) do
+        // NOT match: they fall through to realpath like any other alias.
+        let stored =
+            self.state.workspaces.iter().find(|workspace| {
+                Path::new(&workspace.root_path).as_os_str() == candidate.as_os_str()
+            });
+        let canonical = match stored {
+            Some(workspace) => PathBuf::from(&workspace.root_path),
+            None => canonical_directory(candidate)?,
         };
         let workspace = self
             .state
@@ -243,17 +246,27 @@ impl WorkspaceRegistry {
                     candidate.display()
                 ))
             })?;
-        Ok((workspace.meta.id.clone(), canonical))
+        // Always the matched row's stored bytes, never the caller's spelling.
+        Ok((
+            workspace.meta.id.clone(),
+            PathBuf::from(&workspace.root_path),
+        ))
     }
 
     /// Short locked read for the stored-root shortcut; runs NO filesystem
-    /// probe.
+    /// probe. Byte-exact (`OsStr`) match, so `/root/` and `/root/.` fall
+    /// through to realpath; returns the STORED root bytes (r7 item 2).
     pub(crate) fn stored_root_shortcut(&self, candidate: &Path) -> Option<(WorkspaceId, PathBuf)> {
         self.state
             .workspaces
             .iter()
-            .find(|workspace| Path::new(&workspace.root_path) == candidate)
-            .map(|workspace| (workspace.meta.id.clone(), candidate.to_path_buf()))
+            .find(|workspace| Path::new(&workspace.root_path).as_os_str() == candidate.as_os_str())
+            .map(|workspace| {
+                (
+                    workspace.meta.id.clone(),
+                    PathBuf::from(&workspace.root_path),
+                )
+            })
     }
 
     /// Short locked membership match for a `realpath` result; runs NO probe.
@@ -436,10 +449,12 @@ impl WorkspaceRegistry {
                             // plus the resolved id. Verify both before anything
                             // is marked: an alias that realpaths to the root is
                             // rejected here, and an id/root mismatch means the
-                            // identity moved.
+                            // identity moved. r7 item 2: byte-level OsStr
+                            // comparison — `Path == Path` is component-based
+                            // and treats `/root` and `/root/.` as equal.
                             if let Some(expected) = params.workspace_id.as_deref()
                                 && (expected != workspace_id.as_id().as_str()
-                                    || Path::new(&params.path) != canonical)
+                                    || Path::new(&params.path).as_os_str() != canonical.as_os_str())
                             {
                                 return Err(NodeError::Conflict(format!(
                                     "workspace unregister identity does not match the resolved \
@@ -549,10 +564,12 @@ impl WorkspaceRegistry {
                         // Round 6 item 1: the Hub re-sends the exact stored
                         // root and the resolved id at commit; verify both
                         // before removing. Anything that changed between the
-                        // phases refuses rather than unbinding.
+                        // phases refuses rather than unbinding. r7 item 2:
+                        // byte-level OsStr comparison (Path eq is component).
                         if let Some(expected) = params.workspace_id.as_deref()
                             && (expected != command.workspace_id.as_id().as_str()
-                                || Path::new(&params.path) != command.canonical)
+                                || Path::new(&params.path).as_os_str()
+                                    != command.canonical.as_os_str())
                         {
                             return Err(NodeError::Conflict(
                                 "workspace unregister identity changed between prepare and commit"
@@ -1983,6 +2000,64 @@ mod tests {
              membership+reservation step, got: {error}"
         );
         node.shutdown().await.unwrap();
+    }
+
+    /// r7 item 2: dot, repeated-separator and trailing-slash spellings are not
+    /// the stored-root shortcut — they realpath to the workspace but resolve
+    /// returns the MATCHED ROW's stored bytes, never the caller's alias.
+    #[test]
+    fn resolve_returns_stored_root_bytes_for_component_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let stored = registry.workspaces()[0].root_path.clone();
+        let (id_shortcut, root_shortcut) = registry
+            .resolve_unregister_locked(Path::new(&stored))
+            .unwrap();
+        assert_eq!(root_shortcut.as_os_str(), stored.as_str());
+
+        for alias in [
+            format!("{stored}/."),
+            format!("{stored}//"),
+            format!("{stored}/./"),
+        ] {
+            let (id, resolved) = registry
+                .resolve_unregister_locked(Path::new(&alias))
+                .unwrap_or_else(|error| panic!("alias {alias:?} realpaths: {error}"));
+            assert_eq!(
+                id.as_id(),
+                id_shortcut.as_id(),
+                "alias {alias:?} resolves to the same workspace"
+            );
+            assert_eq!(
+                resolved.as_os_str(),
+                stored.as_str(),
+                "resolver returns the stored root bytes, not the alias {alias:?}"
+            );
+        }
+    }
+
+    /// r7 item 2: the stored-root shortcut itself is byte-exact; nothing
+    /// trims or component-matches it.
+    #[test]
+    fn stored_root_shortcut_is_byte_exact() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let stored = registry.workspaces()[0].root_path.clone();
+        assert!(registry.stored_root_shortcut(Path::new(&stored)).is_some());
+        for alias in [
+            format!("{stored}/"),
+            format!("{stored}/."),
+            format!("{stored}//"),
+        ] {
+            assert!(
+                registry.stored_root_shortcut(Path::new(&alias)).is_none(),
+                "{alias:?} must not take the byte-exact shortcut"
+            );
+        }
     }
 
     #[test]

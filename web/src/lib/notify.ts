@@ -218,6 +218,31 @@ export class NotifyStore {
     });
   };
 
+  /**
+   * Update an existing notification IN PLACE, keeping its id (so focused
+   * controls and the DOM node survive) and recomputing the one-line text.
+   * Unlike a fresh {@link notify} with the same key, this never allocates a
+   * new id and never restacks the entry. Returns false when no live
+   * notification has that id — the caller must then treat it as dismissed
+   * rather than re-posting it (a countdown tick must not resurrect a
+   * notification the owner explicitly closed).
+   */
+  update = (id: string, patch: Partial<NotifyInput>): boolean => {
+    let found = false;
+    const apply = (notification: Notification): Notification => {
+      if (notification.id !== id) return notification;
+      found = true;
+      const next: Notification = { ...notification, ...patch };
+      next.text = line(next);
+      return next;
+    };
+    this.emit({
+      info: this.state.info.map(apply),
+      blocking: this.state.blocking.map(apply),
+    });
+    return found;
+  };
+
   /** Clear every standing error. Only ever a user action. */
   dismissAllBlocking = (): void => {
     this.emit({ ...this.state, blocking: [] });

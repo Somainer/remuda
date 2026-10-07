@@ -1,5 +1,5 @@
-//! c-dirpicker round 6 item 4: unregister against the PRODUCTION Node
-//! runtime.
+//! c-dirpicker round 6 item 4 / round 7 items 4-5: unregister against the
+//! PRODUCTION Node runtime.
 //!
 //! Unlike the scripted-node route tests, every frame here is handled by real
 //! code: the in-process Hub (`remuda_hub::spawn`), a real outbound-WSS
@@ -9,19 +9,25 @@
 //! `workspace.resolve` identity RPC.
 //!
 //! Sequence:
-//! 1. create a session through real admission;
+//! 1. create a session through real admission and positively await the
+//!    NODE-side Ready state (the process exists), not just the Hub's
+//!    pre-spawn `preparing` row (r7 item 4);
 //! 2. mark ONLY the Hub row `failed` — the Node still runs the shell;
-//! 3. DELETE must surface the production Node refusal (409, live session(s))
-//!    and leave the workspace registered;
+//! 3. DELETE must surface the production Node refusal verbatim (409,
+//!    `state conflict:` / `(session history is kept)`, never the Hub's own
+//!    "end or archive them" guard text) and leave the workspace registered;
 //! 4. close the session for real and wait for the process to end;
 //! 5. DELETE again must settle 200 and remove the workspace from the
 //!    snapshot. A 409 after exit is NOT success.
 //!
-//! Every spawned process is reclaimed: the guard closes the instance and
-//! shuts the runtime down on error and on panic; the production native
-//! driver reclaim (the same path `remuda dev` uses) kills the PTY process
-//! group, so no shell outlives the test binary. The happy path additionally
-//! closes the session through the production instance.close route.
+//! Every spawned process is reclaimed unconditionally: `Context` owns an
+//! implicit Drop guard that runs on EVERY exit path (setup `?` failure,
+//! panic, normal return). Its teardown HTTP requests are fallible and
+//! bounded (no expect/panic before node.shutdown), and the native
+//! driver-reclaim path (`node.shutdown`, which kills the PTY process group)
+//! always runs before the hub stops, so no shell outlives the test binary.
+
+use std::sync::Mutex;
 
 use remuda_hub::HubConfig;
 use remuda_node::{
@@ -35,6 +41,53 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Bounded, infallible single HTTP exchange for cleanup: unlike the
+/// assertion-based `http` helper it never panics or blocks teardown when the
+/// hub is already gone (r7 item 5).
+async fn http_best_effort(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    body: Option<&str>,
+) -> Option<(u16, String)> {
+    let fut = async {
+        let mut stream = TcpStream::connect(addr).await.ok()?;
+        let content_length = body.map(str::len).unwrap_or(0);
+        let mut head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {content_length}\r\n"
+        );
+        if let Some(cookie) = cookie {
+            head.push_str(&format!("Cookie: {cookie}\r\n"));
+        }
+        if body.is_some() {
+            head.push_str("Content-Type: application/json\r\n");
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes()).await.ok()?;
+        if let Some(body) = body {
+            stream.write_all(body.as_bytes()).await.ok()?;
+        }
+        let mut buf = Vec::new();
+        AsyncReadExt::read_to_end(&mut stream, &mut buf)
+            .await
+            .ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        let (head, rest) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        Some((status, rest.to_string()))
+    };
+    tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .ok()
+        .flatten()
+}
 
 async fn http(
     addr: std::net::SocketAddr,
@@ -130,54 +183,103 @@ async fn poll_json(
     }
 }
 
-/// All owned handles, so the spawned login shell is reclaimed on every exit
-/// path (assertion panic included): close the instance, drop the link, shut
-/// the runtime (native reclaim kills the PTY child), stop the hub.
+struct Handles {
+    hub: remuda_hub::RunningHub,
+    link: WssLink,
+    node: remuda_node::DevNode,
+}
+
+/// All owned handles, so the spawned login shell is reclaimed on EVERY exit
+/// path (assertion panic, setup `?` failure and normal return): `Drop`
+/// performs the same bounded teardown as the explicit `cleanup`. The close
+/// HTTP request is fallible/bounded, the WSS link and native runtime are shut
+/// with timeouts, and the native reclaim (`node.shutdown` — kills the PTY
+/// child process group) ALWAYS runs before the hub stops. The temp tree
+/// outlives the runtime and is deleted last.
 struct Context {
     addr: std::net::SocketAddr,
     cookie: String,
-    hub: Option<remuda_hub::RunningHub>,
-    link: Option<WssLink>,
-    node: Option<remuda_node::DevNode>,
-    instance: Option<String>,
+    handles: Option<Handles>,
+    instance: Mutex<Option<String>>,
+    handle: tokio::runtime::Handle,
     /// Kept until cleanup so the real temp tree outlives the runtime.
     #[allow(dead_code)]
     dir: tempfile::TempDir,
 }
 
+/// Shared teardown body. `handles` is taken exactly once; the instance close
+/// is best-effort and bounded and runs only when the hub is still alive.
+async fn run_teardown(
+    handles: Handles,
+    addr: std::net::SocketAddr,
+    cookie: String,
+    instance: Option<String>,
+) {
+    if let Some(instance) = instance {
+        let _ = http_best_effort(
+            addr,
+            "POST",
+            &format!("/v1/instances/{instance}/commands"),
+            Some(&cookie),
+            Some(&json!({"operation":"instance.close","payload":{}}).to_string()),
+        )
+        .await;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(5), handles.link.shutdown()).await;
+    // NATIVE reclamation, unconditionally: abort workers and close every
+    // retained driver (kills the login shell's PTY group).
+    if let Err(error) = tokio::time::timeout(Duration::from_secs(8), handles.node.shutdown()).await
+    {
+        eprintln!("node shutdown bounded after {error:?}");
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(5), handles.hub.shutdown()).await;
+}
+
 impl Context {
+    fn set_instance(&self, id: String) {
+        *self.instance.lock().unwrap() = Some(id);
+    }
+
     async fn cleanup(mut self) {
-        if let (Some(hub), Some(instance)) = (self.hub.as_ref(), self.instance.take()) {
-            let _ = http(
-                hub.addr,
-                "POST",
-                &format!("/v1/instances/{instance}/commands"),
-                Some(&self.cookie),
-                Some(&json!({"operation":"instance.close","payload":{}}).to_string()),
-            )
-            .await;
+        if let Some(handles) = self.handles.take() {
+            let instance = self.instance.lock().ok().and_then(|mut slot| slot.take());
+            run_teardown(handles, self.addr, self.cookie.clone(), instance).await;
         }
-        if let Some(link) = self.link.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), link.shutdown()).await;
-        }
-        if let Some(node) = self.node.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(8), node.shutdown()).await;
-        }
-        if let Some(hub) = self.hub.take() {
-            let _ = hub.shutdown().await;
-        }
+        // Dropping now only removes the temp dir.
+        drop(self);
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        // An early return/panic skipped the explicit cleanup: run the FULL
+        // bounded teardown from a real OS thread, because block_on from one
+        // of the multi_thread runtime's worker threads is rejected. This is
+        // what guarantees the native login shell never outlives the binary.
+        let Some(handles) = self.handles.take() else {
+            return;
+        };
+        let instance = self.instance.lock().ok().and_then(|mut slot| slot.take());
+        let addr = self.addr;
+        let cookie = self.cookie.clone();
+        let handle = self.handle.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                handle.block_on(run_teardown(handles, addr, cookie, instance));
+            });
+        });
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unregister_refused_by_the_live_native_node_then_settles_after_exit() {
-    let mut context = setup().await.expect("setup");
+    let context = setup().await.expect("setup");
     let outcome = std::panic::AssertUnwindSafe(drive(
         context.addr,
         context.cookie.clone(),
-        context.hub.as_ref().expect("hub"),
-        context.node.as_ref().expect("node"),
-        &mut context.instance,
+        &context.handles.as_ref().expect("handles").hub,
+        &context.handles.as_ref().expect("handles").node,
+        &context,
     ))
     .catch_unwind()
     .await;
@@ -195,7 +297,7 @@ async fn resolve_alias_shapes_against_the_real_runtime_fs() {
     let outcome = std::panic::AssertUnwindSafe(drive_aliases(
         context.addr,
         context.cookie.clone(),
-        context.hub.as_ref().expect("hub"),
+        &context.handles.as_ref().expect("handles").hub,
         context.dir.path(),
     ))
     .catch_unwind()
@@ -208,24 +310,36 @@ use futures::FutureExt;
 
 async fn setup() -> anyhow::Result<Context> {
     let dir = tempfile::tempdir()?;
-    let workspace = dir.path().join("workspace");
-    std::fs::create_dir_all(&workspace)?;
-    let node_data = dir.path().join("node-data");
-    std::fs::create_dir_all(&node_data)?;
 
     let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub-data"))).await?;
     let addr = hub.addr;
     let cookie = login(addr, &hub.bootstrap_token).await;
 
+    // Build the owning context BEFORE any later fallible step so a setup `?`
+    // failure drops it and reclaims what already exists (r7 item 5). Handles
+    // are filled in as they come up.
+    let mut context = Context {
+        addr,
+        cookie,
+        handles: None,
+        instance: Mutex::new(None),
+        handle: tokio::runtime::Handle::current(),
+        dir,
+    };
+
     // PRODUCTION Node runtime: native shell-pty driver; the temp workspace is
     // the startup root and dir.path is the existing allowlist root.
+    let workspace = context.dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    let node_data = context.dir.path().join("node-data");
+    std::fs::create_dir_all(&node_data)?;
     let http_config = DevServerConfig::loopback(0)
-        .with_workspace_root(workspace.clone())
-        .with_workspace_roots(vec![dir.path().to_path_buf()]);
+        .with_workspace_root(workspace)
+        .with_workspace_roots(vec![context.dir.path().to_path_buf()]);
     let node = compose(&ServeConfig {
         http: http_config,
         data_dir: node_data,
-        drivers: LocalDrivers::Native(NativeDriverConfig::new(dir.path().to_path_buf())),
+        drivers: LocalDrivers::Native(NativeDriverConfig::new(context.dir.path().to_path_buf())),
     })?;
     let host_id = HostId::new();
     let mut config = WssConfig::loopback(
@@ -242,16 +356,8 @@ async fn setup() -> anyhow::Result<Context> {
     };
     let link =
         tokio::time::timeout(TIMEOUT, WssLink::connect_runtime(config, node.clone())).await??;
-
-    Ok(Context {
-        addr,
-        cookie,
-        hub: Some(hub),
-        link: Some(link),
-        node: Some(node),
-        instance: None,
-        dir,
-    })
+    context.handles = Some(Handles { hub, link, node });
+    Ok(context)
 }
 
 async fn drive(
@@ -259,7 +365,7 @@ async fn drive(
     cookie: String,
     hub: &remuda_hub::RunningHub,
     node: &remuda_node::DevNode,
-    instance_slot: &mut Option<String>,
+    context: &Context,
 ) {
     // The runtime announces its host id itself; discover it from the fleet
     // view rather than reusing the pre-connect HostId (both are the same
@@ -320,9 +426,45 @@ async fn drive(
         .or_else(|| created["instance"]["id"].as_str())
         .expect("instanceId")
         .to_owned();
-    *instance_slot = Some(instance_id.clone());
+    context.set_instance(instance_id.clone());
 
-    // The Hub observes the live session before we falsify only its row.
+    // r7 item 4: wait for POSITIVE Node-side evidence the process exists —
+    // the production runtime only journals Ready AFTER driver.start() spawned
+    // the PTY (runtime.rs publishes `preparing` BEFORE the worker exists, so
+    // accepting that would let the test flip the Hub row before any process
+    // was running). The NODE's own instance list is the liveness authority;
+    // terminal shell-pty session reports Ready on the NODE while the Hub
+    // projection can additionally surface `running`; Ready is the positive
+    // post-spawn evidence (never preparing/starting/requested).
+    let local_id: remuda_protocol::InstanceId = instance_id.parse().expect("instance id");
+    let node_ready = || {
+        node.list_instances().map(|page| {
+            page.items
+                .iter()
+                .find(|instance| instance.meta.id == local_id)
+                .is_some_and(|instance| {
+                    matches!(
+                        instance.lifecycle,
+                        remuda_protocol::InstanceLifecycle::Ready
+                    )
+                })
+        })
+    };
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        if node_ready().unwrap_or(false) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Node never reported a post-spawn live state for {instance_id}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The Hub projection must have observed the spawned session too. A
+    // terminal session normally shows `running`; exclude every pre-spawn
+    // state INCLUDING `preparing` (which the old predicate accepted even
+    // though it is published before the worker/process exists).
     poll_json(
         addr,
         &cookie,
@@ -330,7 +472,7 @@ async fn drive(
         |value| {
             value["lifecycle"]
                 .as_str()
-                .is_some_and(|state| !["requested", "starting"].contains(&state))
+                .is_some_and(|state| matches!(state, "ready" | "running"))
         },
     )
     .await;
@@ -369,9 +511,27 @@ async fn drive(
         status, 409,
         "production Node must refuse unregister while the shell is alive: {body}"
     );
+    // r7 item 4: this MUST be the NODE's refusal (its local occupancy count),
+    // proven by the NodeError::Conflict prefix and the Node-only suffix — and
+    // it must NOT be the Hub's own occupancy guard (whose wording ends with
+    // "end or archive them"). The Hub row was stale-failed, so its guard
+    // passed; only the live Node could refuse.
+    assert!(
+        body.contains("state conflict:"),
+        "refusal must be the Node's state conflict, not a generic channel error: {body}"
+    );
+    assert!(
+        body.contains("(session history is kept)"),
+        "Node refusal carries its history-kept suffix: {body}"
+    );
     assert!(
         body.contains("live session(s)"),
         "production refusal text: {body}"
+    );
+    assert!(
+        !body.contains("end or archive them"),
+        "the Hub's own guard must not have fired (its row was failed); \
+         this 409 must be the Node's live count: {body}"
     );
     let view = poll_json(
         addr,

@@ -43,7 +43,7 @@ vi.mock("../../lib/store", () => ({
     summaryOf: (id: string) => summaries[id] ?? "",
     hostName: (id: string) => hostNames[id] ?? id,
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
-    effortEffectiveOf: () => null,
+    effortEffectiveOf: (id: string) => effortEffectiveState[id] ?? null,
     modelOf: () => "acme_hub/model_x_o50[1m]",
     // Running model for the chip: a read-back effective id wins; otherwise an
     // explicit fixture entry (pin or null); otherwise the fixture launch pin.
@@ -75,6 +75,11 @@ const modelEffective: Record<
 /// Per-instance running model the chip shows when no read-back exists yet
 /// (the durable launch spec). null means no launch model: chip is empty.
 const runningModel: Record<string, string | null> = {};
+/// Per-instance effective effort read-back (suffix r2 item 9).
+const effortEffectiveState: Record<
+  string,
+  { name: string | null; ultracode: boolean | null; source: string; observedAt: string }
+> = {};
 
 function host(id: string, label: string) {
   return { id, label, state: "online" };
@@ -125,6 +130,7 @@ beforeEach(() => {
   titles.ins_b = "等待批准";
   for (const key of Object.keys(summaries)) delete summaries[key];
   for (const key of Object.keys(runningModel)) delete runningModel[key];
+  for (const key of Object.keys(effortEffectiveState)) delete effortEffectiveState[key];
 });
 
 describe("SessionList empty states", () => {
@@ -649,5 +655,45 @@ describe("SessionList hold-modifier badges (⌘1–9)", () => {
     renderKeyList();
     expect(screen.queryByTestId("session-switch-hint")).toBeNull();
     expect(screen.queryByText(/⌘ /)).toBeNull();
+  });
+});
+
+describe("SessionList effort suffix (c-effortui r2 item 9)", () => {
+  afterEach(() => {
+    for (const key of Object.keys(effortEffectiveState)) delete effortEffectiveState[key];
+  });
+
+  it("shows an explicit unknown marker when the tier is unread", () => {
+    for (const id of ["ins_a", "ins_b"]) {
+    effortEffectiveState[id] = { name: null, ultracode: null, source: "launch", observedAt: "2026-10-06T00:00:00Z" };
+  }
+    renderList();
+    for (const node of screen.getAllByTestId("session-effort")) {
+      expect(node).toHaveAttribute("data-ultracode-effective", "unknown");
+      expect(node.textContent).toContain("?");
+      expect(node.textContent).not.toContain("ultracode");
+    }
+  });
+
+  it("shows the · ultracode suffix on a positive flag read-back", () => {
+    for (const id of ["ins_a", "ins_b"]) {
+    effortEffectiveState[id] = { name: "xhigh", ultracode: true, source: "remuda", observedAt: "2026-10-06T00:00:00Z" };
+  }
+    renderList();
+    for (const node of screen.getAllByTestId("session-effort")) {
+      expect(node.textContent).toBe("xhigh · ultracode");
+      expect(node).toHaveAttribute("data-ultracode-effective", "on");
+    }
+  });
+
+  it("names the tier without the suffix when the flag is explicitly off", () => {
+    for (const id of ["ins_a", "ins_b"]) {
+    effortEffectiveState[id] = { name: "high", ultracode: false, source: "remuda", observedAt: "2026-10-06T00:00:00Z" };
+  }
+    renderList();
+    for (const node of screen.getAllByTestId("session-effort")) {
+      expect(node.textContent).toBe("high");
+      expect(node).toHaveAttribute("data-ultracode-effective", "off");
+    }
   });
 });

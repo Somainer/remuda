@@ -1302,7 +1302,22 @@ async fn fake_node(
                     // card instead: harness-hook carrier, the real tool input as
                     // its description, and an always-allow option built from the
                     // permission_suggestion the harness offered.
-                    let card = if prompt.contains("ask-question") {
+                    let card = if prompt.contains("ask-question-deadline") {
+                        // c-question-alert: a question with a short known
+                        // deadline (~60 s). The e2e installs page.clock at
+                        // roughly the same real instant and fast-forwards past
+                        // it (~30 store polls, no year-long timer flood).
+                        let deadline = (time::OffsetDateTime::now_utc()
+                            + time::Duration::seconds(60))
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default();
+                        fake_hook_question_with_deadline(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                            &deadline,
+                        )
+                    } else if prompt.contains("ask-question") {
                         fake_hook_question(
                             &instance_id,
                             host_id.as_id().as_str(),
@@ -4650,6 +4665,20 @@ fn fake_hook_question(instance_id: &str, host_id: &str, interaction_id: &str) ->
         "delivery": "not-sent",
         "resolution": { "state": "not-applicable" }
     })
+}
+
+/// c-question-alert: like [`fake_hook_question`] but with a KNOWN deadline
+/// (RFC3339, ~15 min out) so the web countdown can be asserted and advanced
+/// with `page.clock`. The card is otherwise the ask-question sentinel.
+fn fake_hook_question_with_deadline(
+    instance_id: &str,
+    host_id: &str,
+    interaction_id: &str,
+    deadline: &str,
+) -> Value {
+    let mut card = fake_hook_question(instance_id, host_id, interaction_id);
+    card["deadline"] = json!({ "state": "known", "value": deadline });
+    card
 }
 
 /// r-ux-w: select a synthetic workflow scenario by prompt prefix.

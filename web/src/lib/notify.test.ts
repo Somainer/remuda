@@ -51,6 +51,20 @@ describe("notify — severities have different lifetimes", () => {
     store.dismiss(id);
     expect(store.getState().blocking).toHaveLength(0);
   });
+
+  it("update keeps the same id/order and rewrites the line; an unknown id returns false", () => {
+    const id = blocking("会话 alpha", "删除");
+    expect(store.update(id, { reason: "主机离线" })).toBe(true);
+    const next = store.getState().blocking[0]!;
+    expect(next.id, "focused controls must keep the same node").toBe(id);
+    expect(next.text).toContain("主机离线");
+
+    // No re-stack: still one entry, still first.
+    expect(store.getState().blocking).toHaveLength(1);
+
+    expect(store.update("ntf_nonexistent", { reason: "x" })).toBe(false);
+    expect(store.getState().blocking).toHaveLength(1);
+  });
 });
 
 describe("notify — a later success never covers a blocking error", () => {

@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
-use remuda_hub::{HubConfig, spawn};
+use remuda_hub::{BootstrapSource, HubConfig, spawn};
 use remuda_protocol::HostId;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -34,10 +34,16 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| std::env::temp_dir().join("remuda-mcp-demo-hub"));
     std::fs::create_dir_all(&data_dir).context("data dir")?;
     let mut config = HubConfig::for_test(data_dir);
-    if let Ok(token) = std::env::var("REMUDA_BOOTSTRAP_TOKEN")
-        && !token.is_empty()
-    {
-        config.bootstrap_token = token;
+    if let Ok(token) = std::env::var("REMUDA_BOOTSTRAP_TOKEN") {
+        // Operator-supplied provenance: the demo Hub treats it as explicit,
+        // never as a code it may rotate. Trim like SecretRef::resolve so a
+        // trailing newline cannot re-stamp the code on every restart; a
+        // whitespace-only value falls back to the generated demo code.
+        let token = token.trim();
+        if !token.is_empty() {
+            config.bootstrap_token = token.to_owned();
+            config.bootstrap_source = BootstrapSource::ExplicitEnv;
+        }
     }
     if let Ok(listen) = std::env::var("REMUDA_LISTEN")
         && !listen.is_empty()

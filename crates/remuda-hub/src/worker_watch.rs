@@ -1494,6 +1494,7 @@ async fn relaunch_instance(
         grants: Vec::new(),
         task_id: worker.task_id.as_ref().map(|id| id.as_id().to_string()),
         enforce_tree: true,
+        restart: None,
     };
     let (instance, _command) = crate::placement::spawn_on_host(
         state,

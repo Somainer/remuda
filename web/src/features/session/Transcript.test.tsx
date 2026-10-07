@@ -2996,6 +2996,59 @@ describe("load-earlier anchor lifecycle round 5", () => {
       expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
     });
 
+    // UO-6a round 7 item 4: the quiet-timer release must be observable on its
+    // own, BEFORE any reader scroll. The earlier test only checked behaviour
+    // AFTER geo.scrollTo, which releases the hold by itself — so it passed
+    // even with the quiet release removed. Assert the hold is armed shortly
+    // after the prepend and retired purely by crossing the 800ms quiet window.
+    it("the quiet timer retires the hold with no reader scroll (data-prepend-hold)", async () => {
+      const user = userEvent.setup();
+      const geo = installGeo(50);
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const { tail, older } = fixture("insQuietObservable");
+      const g = gate<Page>();
+      makeClient(reg, "insQuietObservable", tail, () => g.promise, "31", "50");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        return result;
+      });
+      render(
+        <MemoryRouter initialEntries={["/s/insQuietObservable"]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-prepend-hold");
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+
+      vi.useFakeTimers();
+      await act(async () => {
+        g.resolve(pageOf(older, true));
+        await Promise.resolve();
+      });
+      // Measurement corrections have stopped but the quiet window (800ms) has
+      // not elapsed: the hold must still be ARMED. (The hold is what the
+      // release is about to retire.)
+      act(() => {
+        vi.advanceTimersByTime(100);
+      });
+      expect(hold(), "the load-earlier hold is armed before the quiet window").toBe("1");
+
+      // Cross the quiet window with NO reader scroll and no further size
+      // commit: the timer alone must retire the hold and reflect it at once.
+      act(() => {
+        vi.advanceTimersByTime(750);
+      });
+      expect(hold(), "the quiet window retires the hold before any scroll").toBe("0");
+      vi.useRealTimers();
+      await act(async () => {});
+      expect(hold(), "the retired hold stays retired").toBe("0");
+    });
+
     it("a genuine reader scroll releases the settling restore immediately", async () => {
       const user = userEvent.setup();
       const geo = installGeo(50);

@@ -667,6 +667,11 @@ function TranscriptInner({
       prependSettleTimerRef.current = window.setTimeout(() => {
         prependSettleTimerRef.current = null;
         releasePrependAnchor(held);
+        // The quiet window ends on a timer with no size or scroll commit to
+        // re-render, so bump the tick: the anchor effects re-run (and no-op on
+        // the retired hold) and data-prepend-hold flips to "0" without needing
+        // a later reader scroll.
+        setLoadTick((n) => n + 1);
       }, PREPEND_SETTLE_QUIET_MS);
     },
     [releasePrependAnchor],
@@ -1589,6 +1594,11 @@ function TranscriptInner({
         data-restore-active={
           restoreProbe ? (pendingScroll.current?.kind === "restore" ? "1" : "0") : undefined
         }
+        // Inert observability for the load-earlier hold: "1" while its anchor
+        // is armed, "0" once retired (quiet window, gesture, navigation, route
+        // switch). Read from the ref at render; the quiet timer bumps loadTick
+        // so the "0" is reflected without a later scroll.
+        data-prepend-hold={prependAnchorRef.current ? "1" : "0"}
         onScroll={(event) => {
           const el = event.currentTarget;
           setScrollTop(el.scrollTop);

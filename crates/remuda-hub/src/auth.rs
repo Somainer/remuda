@@ -120,6 +120,24 @@ fn replace_private(path: &Path, contents: &str) -> Result<(), HubError> {
     fsync_dir(dir)
 }
 
+/// Whether two paths name the SAME on-disk file (device + inode on Unix).
+/// Used to detect an ExplicitFile pointing at the Hub's own persisted token.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        #[cfg(unix)]
+        (Ok(ma), Ok(mb)) => {
+            use std::os::unix::fs::MetadataExt;
+            ma.dev() == mb.dev() && ma.ino() == mb.ino()
+        }
+        #[cfg(not(unix))]
+        (Ok(_), Ok(_)) => match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(ca), Ok(cb)) => ca == cb,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Read a persisted token, returning None when the file is absent or empty
 /// after trimming — both are "no usable code" (round 6 item 2).
 fn read_persisted_token(path: &Path) -> Result<Option<String>, HubError> {
@@ -253,42 +271,33 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
         write_private(&data_dir.join(BOOTSTRAP_EXPLICIT_MARKER), "")?;
         fsync_dir(&data_dir)?;
 
-        let persisted = if token_path.is_file() {
-            std::fs::read_to_string(&token_path)
-                .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
-                .trim()
-                .to_string()
-        } else {
-            String::new()
-        };
+        let persisted = read_persisted_token(&token_path)?.unwrap_or_default();
         let code_changed = persisted != config.bootstrap_token;
+        // Round 6 item 1: if the configured ExplicitFile IS the Hub's own
+        // persisted token (a misconfiguration the docs forbid), its mtime is
+        // ALWAYS newer than the parsed stamp (the token is renamed into place
+        // after the stamp). Applying the file rule would re-stamp it on every
+        // restart. Detect that inode and skip the mtime rule for it (we accept
+        // the self-reference rather than failing, so an existing deployment
+        // keeps starting — it then behaves like an env source).
+        let self_token_file = match &config.bootstrap_source {
+            crate::config::BootstrapSource::ExplicitFile(path) => same_file(path, &token_path),
+            _ => false,
+        };
         let file_newer_than_stamp = match &config.bootstrap_source {
-            crate::config::BootstrapSource::ExplicitFile(path) => {
+            crate::config::BootstrapSource::ExplicitFile(path) if !self_token_file => {
                 file_mtime_newer_than_stamp(path, &stamp_path)?
             }
-            crate::config::BootstrapSource::ExplicitEnv
-            | crate::config::BootstrapSource::Generated
-            | crate::config::BootstrapSource::Adopted => false,
+            _ => false,
         };
-        // persist_bootstrap now writes the STAMP first and the TOKEN second:
-        // a crash between the two leaves an old token with a new stamp, and
-        // the `code_changed` rule above re-persists both on retry. There must
-        // be NO token-mtime trigger here — the token file is written after the
-        // stamp on every healthy persist, so its nanosecond mtime is normally
-        // newer than the millisecond-precision parsed stamp; comparing them
-        // re-stamped (and revived expired codes) on every same-millisecond
-        // restart, and a `cp -r` without -p did so once after a restore.
-        if code_changed || file_newer_than_stamp {
+        if code_changed {
+            // Only a genuine code change rewrites the token (stamp first, then
+            // the atomic token), which self-heals a crash between the two.
             persist_bootstrap(&data_dir, &config.bootstrap_token)?;
-        } else if bootstrap_issued_at(&data_dir).is_none() {
-            // Backfill a stamp on an unchanged code when there is no USABLE
-            // one: a missing file (crash between writes, pre-D-018 dir,
-            // hand-provisioned token) or an EMPTY file (a kill during
-            // write_private after the truncating open, or `: >
-            // bootstrap-issued-at`). bootstrap_within_ttl fails open for
-            // exactly this condition, so without a backfill the code never
-            // expires. First sight is the issue time. A non-empty but
-            // malformed stamp is left alone — it is treated as expired.
+        } else if file_newer_than_stamp || bootstrap_issued_at(&data_dir).is_none() {
+            // A touched access file, or a missing/empty stamp, reissues ONLY
+            // the stamp. Never rewrite an unchanged token: doing so gave it a
+            // newer mtime and revived the code on the next start.
             write_private(&stamp_path, &now_rfc3339())?;
         }
         // Otherwise leave bootstrap-token AND bootstrap-issued-at untouched.
@@ -1476,5 +1485,79 @@ mod tests {
             config.bootstrap_token
         );
         assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+    }
+
+    /// Round 6 item 1: an ExplicitFile that IS the Hub's own token file does
+    /// NOT re-stamp on a second restart, even though the token's mtime is
+    /// always newer than the parsed millisecond stamp. After the code expires,
+    /// re-resolving leaves the stamp byte-identical (the TTL stays expired).
+    #[test]
+    fn self_token_file_does_not_restamp_on_restart_when_expired() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let own_token = dir.path().join("bootstrap-token");
+        let code = "self-referencing-code";
+
+        let mut cfg1 = HubConfig::for_test(dir.path().to_path_buf());
+        cfg1.bootstrap_token = code.to_owned();
+        cfg1.bootstrap_source = BootstrapSource::ExplicitFile(own_token.clone());
+        resolve_bootstrap(&mut cfg1).expect("first resolve");
+
+        // Expire the stamp; the token keeps its natural (newer) mtime.
+        write_private(&dir.path().join("bootstrap-issued-at"), EXPIRED_STAMP).expect("expired");
+        let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap();
+        let token_bytes = std::fs::read(&own_token).unwrap();
+
+        let mut cfg2 = HubConfig::for_test(dir.path().to_path_buf());
+        cfg2.bootstrap_token = code.to_owned();
+        cfg2.bootstrap_source = BootstrapSource::ExplicitFile(own_token);
+        resolve_bootstrap(&mut cfg2).expect("second resolve");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+            stamp_bytes,
+            "the self token file must not re-stamp"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-token")).unwrap(),
+            token_bytes
+        );
+        assert!(
+            !bootstrap_within_ttl(dir.path(), 24),
+            "the expired code stays expired"
+        );
+    }
+
+    /// Round 6 item 1: after a touch reissues the stamp for a normal EXTERNAL
+    /// file, a second unchanged restart leaves that stamp (and the token)
+    /// alone — the touch rule writes only the stamp.
+    #[cfg(unix)]
+    #[test]
+    fn external_file_second_unchanged_restart_keeps_the_reissued_stamp() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "same-code").expect("code file");
+
+        let mut cfg = HubConfig::for_test(dir.path().to_path_buf());
+        cfg.bootstrap_token = "same-code".to_owned();
+        cfg.bootstrap_source = BootstrapSource::ExplicitFile(code_file.clone());
+        resolve_bootstrap(&mut cfg).expect("first resolve persists the fresh code");
+
+        backdate_mtime(&code_file, MTIME_1999);
+        let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap();
+        let token_bytes = std::fs::read(dir.path().join("bootstrap-token")).unwrap();
+
+        let mut cfg2 = HubConfig::for_test(dir.path().to_path_buf());
+        cfg2.bootstrap_token = "same-code".to_owned();
+        cfg2.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        resolve_bootstrap(&mut cfg2).expect("second resolve");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+            stamp_bytes
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-token")).unwrap(),
+            token_bytes
+        );
     }
 }

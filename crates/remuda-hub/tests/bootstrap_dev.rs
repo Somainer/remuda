@@ -401,6 +401,45 @@ async fn failed_no_source_bind_keeps_marker_and_mints_no_token() -> Result<()> {
     Ok(())
 }
 
+/// Round 6 item 1: an ExplicitFile that is literally the Hub's own
+/// `<data>/bootstrap-token` must not re-stamp on restart (the token rename
+/// always lands after the stamp). After expiry a second start keeps the old
+/// stamp and the code is refused.
+#[tokio::test]
+async fn self_token_file_keeps_expired_login_rejected_after_restart() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    std::fs::create_dir_all(&hub_data)?;
+    let own_token = hub_data.join("bootstrap-token");
+    let code = "self-referencing-code-at-least-16-x";
+    let config = || HubConfig {
+        bootstrap_token: code.to_owned(),
+        bootstrap_source: BootstrapSource::ExplicitFile(own_token.clone()),
+        ..HubConfig::for_test(hub_data.clone())
+    };
+
+    // First start on a fresh dir persists the code and works.
+    {
+        let hub = spawn(config()).await?;
+        login(hub.addr, code).await?;
+        hub.shutdown().await;
+    }
+
+    // Expire the stamp; the token keeps its natural (newer) mtime.
+    let stamp_path = hub_data.join("bootstrap-issued-at");
+    std::fs::write(&stamp_path, EXPIRED_STAMP)?;
+    let stamp_before = std::fs::read(&stamp_path)?;
+
+    // Second start pointing at the same file, same code: no re-stamp, 401.
+    {
+        let hub = spawn(config()).await?;
+        assert_eq!(login_status(hub.addr, code).await?, 401);
+        assert_eq!(std::fs::read(&stamp_path)?, stamp_before);
+        hub.shutdown().await;
+    }
+    Ok(())
+}
+
 /// Round 6 item 2: an empty presented code is refused on a healthy hub even
 /// though an empty string would otherwise compare equal.
 #[tokio::test]

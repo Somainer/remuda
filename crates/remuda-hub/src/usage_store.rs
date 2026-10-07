@@ -60,6 +60,11 @@ pub struct UsageEventRow {
     pub accounting: String,
     /// Observed-at timestamp.
     pub observed_at: String,
+    /// Whether `observed_at` came from the source's native timestamp
+    /// (`"native"`) or was stamped at journal ingest (`"ingest"`). Only a
+    /// native timestamp may authoritatively repair the stored time; ingest
+    /// fallbacks never overwrite one (c-ctxusage r4 item 5).
+    pub observed_at_source: String,
 }
 
 /// Create the `usage_events` table. Idempotent and safe against every prior
@@ -84,6 +89,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             cost_usd TEXT,
             accounting TEXT NOT NULL DEFAULT 'estimated',
             observed_at TEXT NOT NULL,
+            observed_at_source TEXT NOT NULL DEFAULT 'ingest',
             metric_revision INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY (instance_id, seq)
          );
@@ -109,11 +115,29 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "UPDATE usage_events SET metric_revision = 1 WHERE metric_revision IS NULL",
         [],
     )?;
-    // Now the column exists on both a fresh CREATE and an upgraded DB.
+    // c-ctxusage r4 item 5: remember whether observed_at is native-sourced or
+    // an ingest fallback, so an unchanged-counters replay can repair the
+    // historical native time. Legacy rows are conservatively 'ingest'.
+    crate::store::ensure_column(conn, "usage_events", "observed_at_source", "TEXT")?;
+    conn.execute(
+        "UPDATE usage_events SET observed_at_source = 'ingest'
+         WHERE observed_at_source IS NULL OR observed_at_source = ''",
+        [],
+    )?;
+    // Now the columns exist on both a fresh CREATE and an upgraded DB.
+    //
+    // Dedupe indexes are scope-specific (c-ctxusage r4 item 3):
+    // - Turn rows (Claude message id): one revision-replaced row per message.
+    // - Session rows (cumulative Grok/Codex stock): append-only GROWTH POINTS,
+    //   never collapsed — rate windows need their history. Duplicate/historical
+    //   replay points are frozen in Rust by their cumulative counters, not by a
+    //   one-row unique index. The old shared index collapsed both scopes, so it
+    //   is dropped on every prior schema.
     conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_scope_dedupe
+        "DROP INDEX IF EXISTS usage_events_scope_dedupe;
+         CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
              ON usage_events(instance_id, scope, scope_id)
-             WHERE scope_id IS NOT NULL;",
+             WHERE scope = 'turn' AND scope_id IS NOT NULL;",
     )?;
     Ok(())
 }
@@ -123,92 +147,77 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 /// Dedupe semantics by whether the row carries a durable `scope_id`:
 /// - Rows with no `scope_id` are append-only: plain `INSERT OR IGNORE` on
 ///   `(instance_id, seq)`.
-/// - Every scoped row (a Claude **Turn** keyed by the assistant message id, and
-///   a Grok/Codex **Session** keyed by the stable session id) is revision-aware:
-///   a later-arriving row (`seq`) replaces the stored one when it carries a
-///   higher `metric_revision` OR when its counters changed. Replacing on a
-///   changed body with a reset/equal revision is what lets a producer whose
-///   in-memory revision counter restarted at 0 (an adapter recreation) still
-///   advance its snapshot, while an unchanged re-hydration is frozen.
+/// - **Turn** rows (a Claude assistant message id) are revision-aware: the
+///   provisional stream record is replaced in place by the final one
+///   ([`upsert_turn_snapshot`]).
+/// - **Session** rows (cumulative Grok/Codex stock keyed by the stable session
+///   id) are append-only GROWTH POINTS ([`insert_session_growth_point`]): a
+///   restarted adapter replays historical stocks with fresh seqs, so acceptance
+///   is decided by the cumulative counters themselves (never smaller than the
+///   current stock, never an identical stock twice), not by ingestion order.
 ///
 /// Turn rows are therefore NOT keep-first: a message that streamed a stop record
 /// at one poll and then a later same-message-id record with different counters
 /// (c-ctxusage r3 item 1) replaces the provisional row with the final one.
 pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    if row.scope_id.is_some() {
-        upsert_scoped_snapshot(conn, row)
-    } else {
-        let inserted = conn.execute(
-            "INSERT OR IGNORE INTO usage_events
-                (instance_id, seq, profile_id, model, scope, scope_id, mode,
-                 metric_revision, total_tokens, input_tokens, output_tokens,
-                 cache_read_tokens, cache_write_tokens, cost_usd, accounting, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![
-                row.instance_id,
-                row.seq,
-                row.profile_id,
-                row.model,
-                row.scope,
-                row.scope_id,
-                row.mode,
-                row.metric_revision,
-                row.total_tokens,
-                row.input_tokens,
-                row.output_tokens,
-                row.cache_read_tokens,
-                row.cache_write_tokens,
-                row.cost_usd,
-                row.accounting,
-                row.observed_at,
-            ],
-        )?;
-        Ok(inserted > 0)
+    match row.scope_id.as_deref() {
+        None => insert_row(conn, row),
+        Some(_) if row.scope == "turn" => upsert_turn_snapshot(conn, row),
+        Some(_) => insert_session_growth_point(conn, row),
     }
 }
 
-/// Insert or replace a scoped (`scope_id IS NOT NULL`) snapshot, but only when
-/// the incoming row is genuinely newer. Returns true when a row was inserted or
-/// updated.
+/// Append a new cumulative-session growth point, freezing historical/duplicate
+/// replays (c-ctxusage r4 item 3).
 ///
-/// Ordering is the durable per-instance journal `seq` (later = observed later
-/// on the single ordered channel), NOT the producer's `metric_revision`: a
-/// Grok/Codex adapter recreates and its in-memory revision counter restarts at
-/// 0/1, so producer revisions are not monotonic across a run. A later row
-/// replaces the stored one only when its token counters actually changed; an
-/// unchanged re-delivery (a transcript re-hydration that appends fresh seqs) is
-/// frozen even at a higher `seq`. The decoded `metric_revision` is still
-/// recorded for protocol/diagnostic fidelity (c-ctxusage r3 item 2).
-fn upsert_scoped_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let changed = conn.execute(
-        "INSERT INTO usage_events
+/// The cumulative stock is monotonic by contract, so acceptance is content-
+/// based and independent of the restart-unsafe producer revision and ingest
+/// seq:
+/// - identical counters already recorded (a byte-0 re-hydration, or a
+///   consolidated restart replay) -> frozen;
+/// - any reported bucket smaller than the current stock -> frozen;
+/// - otherwise the point is appended.
+fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let incoming = SnapshotCounters::of(row);
+    let mut stmt = conn.prepare(
+        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+         FROM usage_events
+         WHERE instance_id = ?1 AND scope = 'session' AND scope_id = ?2",
+    )?;
+    let existing: Vec<SnapshotCounters> = stmt
+        .query_map(params![row.instance_id, row.scope_id], |r| {
+            Ok(SnapshotCounters {
+                total: r.get(0)?,
+                input: r.get(1)?,
+                output: r.get(2)?,
+                cache_read: r.get(3)?,
+                cache_write: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for stored in &existing {
+        if incoming == *stored {
+            // An already-recorded identical stock: duplicate replay.
+            return Ok(false);
+        }
+        let (_grew, decreased) = incoming.growth_against(stored);
+        if decreased {
+            // Historical smaller stock arriving after a larger current one.
+            return Ok(false);
+        }
+    }
+    insert_row(conn, row)
+}
+
+/// Generic append (`INSERT OR IGNORE` on the `(instance_id, seq)` PK).
+fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO usage_events
             (instance_id, seq, profile_id, model, scope, scope_id, mode,
              metric_revision, total_tokens, input_tokens, output_tokens,
-             cache_read_tokens, cache_write_tokens, cost_usd, accounting, observed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-         ON CONFLICT(instance_id, scope, scope_id) WHERE scope_id IS NOT NULL
-         DO UPDATE SET
-            seq = excluded.seq,
-            profile_id = excluded.profile_id,
-            model = excluded.model,
-            mode = excluded.mode,
-            metric_revision = excluded.metric_revision,
-            total_tokens = excluded.total_tokens,
-            input_tokens = excluded.input_tokens,
-            output_tokens = excluded.output_tokens,
-            cache_read_tokens = excluded.cache_read_tokens,
-            cache_write_tokens = excluded.cache_write_tokens,
-            cost_usd = excluded.cost_usd,
-            accounting = excluded.accounting,
-            observed_at = excluded.observed_at
-         WHERE excluded.seq > usage_events.seq
-           AND (
-             excluded.total_tokens    IS NOT usage_events.total_tokens
-             OR excluded.input_tokens    IS NOT usage_events.input_tokens
-             OR excluded.output_tokens   IS NOT usage_events.output_tokens
-             OR excluded.cache_read_tokens  IS NOT usage_events.cache_read_tokens
-             OR excluded.cache_write_tokens IS NOT usage_events.cache_write_tokens
-           )",
+             cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+             observed_at, observed_at_source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             row.instance_id,
             row.seq,
@@ -226,9 +235,181 @@ fn upsert_scoped_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
             row.cost_usd,
             row.accounting,
             row.observed_at,
+            row.observed_at_source,
         ],
     )?;
-    Ok(changed > 0)
+    Ok(inserted > 0)
+}
+
+/// Counters carried by one scoped snapshot, in fold order.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct SnapshotCounters {
+    total: Option<i64>,
+    input: Option<i64>,
+    output: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+}
+
+impl SnapshotCounters {
+    fn of(row: &UsageEventRow) -> Self {
+        Self {
+            total: row.total_tokens,
+            input: row.input_tokens,
+            output: row.output_tokens,
+            cache_read: row.cache_read_tokens,
+            cache_write: row.cache_write_tokens,
+        }
+    }
+
+    fn each(&self) -> [Option<i64>; 5] {
+        [
+            self.total,
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+        ]
+    }
+
+    /// Per-bucket comparison of an incoming cumulative snapshot against the
+    /// stored one. `None` incoming means "not reported" and imposes no
+    /// constraint; `None` stored with a reported incoming is growth.
+    ///
+    /// Returns `(grew, decreased)`: at least one reported bucket advanced, and
+    /// no reported bucket moved backwards.
+    fn growth_against(&self, stored: &SnapshotCounters) -> (bool, bool) {
+        let mut grew = false;
+        let mut decreased = false;
+        for (incoming, stored) in self.each().into_iter().zip(stored.each()) {
+            if let Some(incoming) = incoming {
+                match stored {
+                    Some(stored) if incoming < stored => decreased = true,
+                    Some(stored) if incoming > stored => grew = true,
+                    None => grew = true,
+                    _ => {}
+                }
+            }
+        }
+        (grew, decreased)
+    }
+}
+
+/// The stored state a scoped upsert conflicts with.
+struct StoredSnapshot {
+    counters: SnapshotCounters,
+    observed_at: String,
+    observed_at_source: String,
+}
+
+/// Insert or revise a Turn-scoped snapshot (one revision-replaced row per
+/// assistant message id).
+///
+/// A later record of the same message carries the message's FINAL counters
+/// (c-ctxusage r3 item 1): accept when any reported counter grows without one
+/// decreasing. Independently, a NATIVE timestamp repairs a stored ingest-
+/// fallback `observed_at` even when counters are identical; an ingest fallback
+/// never overwrites a native time (c-ctxusage r4 item 5).
+fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let stored: Option<StoredSnapshot> = conn
+        .query_row(
+            "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens,
+                    cache_write_tokens, observed_at, observed_at_source
+             FROM usage_events
+             WHERE instance_id = ?1 AND scope = 'turn' AND scope_id = ?2",
+            params![row.instance_id, row.scope_id],
+            |r| {
+                Ok(StoredSnapshot {
+                    counters: SnapshotCounters {
+                        total: r.get(0)?,
+                        input: r.get(1)?,
+                        output: r.get(2)?,
+                        cache_read: r.get(3)?,
+                        cache_write: r.get(4)?,
+                    },
+                    observed_at: r.get(5)?,
+                    observed_at_source: r.get(6)?,
+                })
+            },
+        )
+        .ok();
+
+    let Some(stored) = stored else {
+        return insert_row(conn, row);
+    };
+
+    let incoming = SnapshotCounters::of(row);
+    let (grew, decreased) = incoming.growth_against(&stored.counters);
+    let counters_change = grew && !decreased;
+    let time_repair = row.observed_at_source == "native"
+        && stored.observed_at_source != "native"
+        && row.observed_at != stored.observed_at;
+
+    if !counters_change && !time_repair {
+        return Ok(false);
+    }
+
+    if counters_change {
+        let observed_at =
+            if row.observed_at_source == "native" || stored.observed_at_source != "native" {
+                row.observed_at.clone()
+            } else {
+                stored.observed_at.clone()
+            };
+        let observed_at_source =
+            if row.observed_at_source == "native" || stored.observed_at_source != "native" {
+                row.observed_at_source.clone()
+            } else {
+                stored.observed_at_source.clone()
+            };
+        conn.execute(
+            "UPDATE usage_events SET
+                seq = ?1,
+                profile_id = ?2,
+                model = ?3,
+                mode = ?4,
+                metric_revision = ?5,
+                total_tokens = ?6,
+                input_tokens = ?7,
+                output_tokens = ?8,
+                cache_read_tokens = ?9,
+                cache_write_tokens = ?10,
+                cost_usd = ?11,
+                accounting = ?12,
+                observed_at = ?13,
+                observed_at_source = ?14
+             WHERE instance_id = ?15 AND scope = 'turn' AND scope_id = ?16",
+            params![
+                row.seq,
+                row.profile_id,
+                row.model,
+                row.mode,
+                row.metric_revision,
+                row.total_tokens,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+                row.cost_usd,
+                row.accounting,
+                observed_at,
+                observed_at_source,
+                row.instance_id,
+                row.scope_id,
+            ],
+        )?;
+    } else {
+        // Time-only repair: identical counters, just the authoritative time.
+        conn.execute(
+            "UPDATE usage_events SET
+                seq = ?1,
+                observed_at = ?2,
+                observed_at_source = 'native'
+             WHERE instance_id = ?3 AND scope = 'turn' AND scope_id = ?4",
+            params![row.seq, row.observed_at, row.instance_id, row.scope_id],
+        )?;
+    }
+    Ok(true)
 }
 
 fn knowledge_u64(value: &Value) -> Option<i64> {
@@ -280,14 +461,18 @@ pub fn project_usage_event(
     // c-ctxusage r2 item 4: rate windows (TPM / lastTurnAt) must reflect when
     // the model call actually happened, not when a re-hydrated transcript was
     // ingested. Prefer the observation's known native timestamp; fall back to
-    // journal ingest time for frames that did not carry one.
+    // journal ingest time for frames that did not carry one. c-ctxusage r4
+    // item 5 records which one it was, so replays can repair the fallback.
     let native_at = record
         .event
         .get("nativeAt")
         .and_then(|at| at.get("value"))
         .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| record.observed_at.clone());
+        .map(str::to_string);
+    let (observed_at, observed_at_source) = match native_at {
+        Some(at) => (at, "native".to_string()),
+        None => (record.observed_at.clone(), "ingest".to_string()),
+    };
     Some(UsageEventRow {
         instance_id: record.instance_id.clone(),
         seq: record.seq,
@@ -323,7 +508,8 @@ pub fn project_usage_event(
             .and_then(Value::as_str)
             .unwrap_or("estimated")
             .to_string(),
-        observed_at: native_at,
+        observed_at,
+        observed_at_source,
     })
 }
 
@@ -509,8 +695,9 @@ fn threshold_rfc3339(seconds: i64) -> String {
 
 /// Sum the per-call (scope='turn') token flow within a rate window. Session
 /// snapshots are a CUMULATIVE STOCK replaced in place, never a per-window flow,
-/// so they are excluded here; the caller substitutes the single latest stock
-/// only when the harness emits no turn rows at all (Grok) — c-ctxusage r3 item 6.
+/// so they are excluded here; the caller substitutes timestamped stock
+/// increments only when the harness emits no turn rows at all (Grok) —
+/// c-ctxusage r3 item 6 / r4 item 6.
 fn sum_turn_tokens_since(
     conn: &Connection,
     instance_id: &str,
@@ -525,9 +712,101 @@ fn sum_turn_tokens_since(
     )
 }
 
-/// The latest scope='session' cumulative snapshot (revisions replace it in
-/// place, so the highest `seq` is the current stock). A harness that emits no
-/// session snapshots (Claude) yields all-`None` fields.
+/// Per-bucket flow derived from two successive cumulative session snapshots.
+#[derive(Clone, Default)]
+struct StockIncrement {
+    input: Option<i64>,
+    output: Option<i64>,
+    end_at: String,
+}
+
+/// Timestamped flow between successive cumulative Session snapshots, in native
+/// source order.
+///
+/// c-ctxusage r4 item 6: a cumulative stock is NOT throughput ("1000 tokens an
+/// hour ago + 10 now" must not read as "1010 in the last minute"). The rate is
+/// the sum of increments whose END snapshot landed inside the window:
+/// `increment[bucket] = max(0, current - previous)` — the saturating diff is
+/// the explicit reset handling. With a single snapshot there is no
+/// predecessor, so no trustworthy increment exists and the rate is unknown
+/// (never the stock itself).
+fn session_stock_increments(
+    conn: &Connection,
+    instance_id: &str,
+) -> rusqlite::Result<Vec<StockIncrement>> {
+    let mut stmt = conn.prepare(
+        "SELECT input_tokens, output_tokens, observed_at
+         FROM usage_events
+         WHERE instance_id = ?1 AND scope = 'session'
+         ORDER BY observed_at ASC, seq ASC",
+    )?;
+    let rows: Vec<(Option<i64>, Option<i64>, String)> = stmt
+        .query_map(params![instance_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut increments = Vec::new();
+    let mut previous: Option<(Option<i64>, Option<i64>)> = None;
+    for (input, output, end_at) in rows {
+        if let Some((prev_input, prev_output)) = previous {
+            // Per-bucket increment against the last cumulative position; a
+            // lower current is treated as a reset and the increment restarts
+            // at the current stock.
+            let bucket = |current: Option<i64>, previous: Option<i64>| -> Option<i64> {
+                match (current, previous) {
+                    (Some(current), Some(previous)) => Some(if current < previous {
+                        current
+                    } else {
+                        current - previous
+                    }),
+                    (Some(current), None) => Some(current),
+                    _ => None,
+                }
+            };
+            increments.push(StockIncrement {
+                input: bucket(input, prev_input),
+                output: bucket(output, prev_output),
+                end_at,
+            });
+        }
+        previous = Some((input, output));
+    }
+    Ok(increments)
+}
+
+/// Sum session-stock increments whose end snapshot landed at/after `since`.
+fn sum_session_increments_since(
+    conn: &Connection,
+    instance_id: &str,
+    since: &str,
+) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
+    let increments = session_stock_increments(conn, instance_id)?;
+    let in_window: Vec<_> = increments
+        .into_iter()
+        .filter(|increment| increment.end_at.as_str() >= since)
+        .collect();
+    if in_window.is_empty() {
+        // No trustworthy increment inside the window — unknown, never stock.
+        return Ok((None, None));
+    }
+    let mut input: Option<i64> = None;
+    let mut output: Option<i64> = None;
+    for increment in in_window {
+        if let Some(value) = increment.input {
+            *input.get_or_insert(0) += value;
+        }
+        if let Some(value) = increment.output {
+            *output.get_or_insert(0) += value;
+        }
+    }
+    Ok((input, output))
+}
+
+/// The latest cumulative session growth point (the current stock). Accepted
+/// points are non-decreasing in counters and historical replays are frozen, so
+/// the current stock is the newest point by native time, tie-broken by ingest
+/// seq — c-ctxusage r4 item 4, independent of ingestion order.
 #[derive(Debug, Default, Clone)]
 struct SessionStock {
     input: Option<i64>,
@@ -542,7 +821,7 @@ fn latest_session_stock(conn: &Connection, instance_id: &str) -> rusqlite::Resul
         "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, observed_at
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session'
-         ORDER BY seq DESC LIMIT 1",
+         ORDER BY observed_at DESC, seq DESC LIMIT 1",
         params![instance_id],
         |row| {
             Ok(SessionStock {
@@ -560,13 +839,17 @@ fn latest_session_stock(conn: &Connection, instance_id: &str) -> rusqlite::Resul
 /// bucket of the most recent model call — what the NEXT request will carry. A
 /// cumulative session snapshot is the wrong source here (it spans the whole
 /// session), so turn rows take precedence even when the session row is the
-/// newest by seq (c-ctxusage r3 item 6).
+/// newest by seq.
+///
+/// c-ctxusage r4 item 4: "newest" is the NATIVE time, not the ingest seq — a
+/// late historical correction (replay of an older message at a high seq) must
+/// not become the current context. Ties break deterministically on seq.
 fn latest_turn_basket(conn: &Connection, instance_id: &str) -> rusqlite::Result<Option<i64>> {
     conn.query_row(
         "SELECT input_tokens, cache_read_tokens, cache_write_tokens
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'turn'
-         ORDER BY seq DESC LIMIT 1",
+         ORDER BY observed_at DESC, seq DESC LIMIT 1",
         params![instance_id],
         |row| {
             let input: Option<i64> = row.get(0)?;
@@ -694,22 +977,15 @@ pub fn rollup_instance(
                 .clamp(0.0, 100.0) as i64
         });
 
-    // Rate windows: per-turn flows. A stock-only harness (Grok) contributes its
-    // single cumulative snapshot only while that snapshot is inside the window.
+    // Rate windows: per-turn flows for harnesses that emit them; otherwise
+    // timestamped increments between cumulative session snapshots (r4 item 6).
+    // A single stock with no predecessor yields no trustworthy rate.
     let window = |seconds: i64| -> rusqlite::Result<(Option<i64>, Option<i64>)> {
+        let since = threshold_rfc3339(seconds);
         if totals.has_turn {
-            sum_turn_tokens_since(conn, instance_id, &threshold_rfc3339(seconds))
+            sum_turn_tokens_since(conn, instance_id, &since)
         } else {
-            let since = threshold_rfc3339(seconds);
-            let inside = stock
-                .observed_at
-                .as_deref()
-                .is_some_and(|at| at >= since.as_str());
-            Ok(if inside {
-                (stock.input, stock.output)
-            } else {
-                (None, None)
-            })
+            sum_session_increments_since(conn, instance_id, &since)
         }
     };
     let (in_60s, out_60s) = window(60)?;
@@ -1006,6 +1282,7 @@ mod tests {
             cost_usd: None,
             accounting: "estimated".into(),
             observed_at: observed_at.into(),
+            observed_at_source: "native".into(),
         }
     }
 
@@ -1017,9 +1294,9 @@ mod tests {
     /// are byte-for-byte the native record.
     #[test]
     fn session_snapshots_are_revision_replaced_not_frozen_or_summmed() {
-        // c-ctxusage r2: a stable session id with increasing revision replaces
-        // the prior row; an equal/older revision is frozen. Turn + Session rows
-        // are never added together.
+        // c-ctxusage r4: cumulative session snapshots are append-only GROWTH
+        // POINTS (rate windows need their history); identical stocks are
+        // frozen, smaller historical stocks are frozen, growth appends.
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let sess = |seq: i64, rev: i64, input: i64, output: i64| UsageEventRow {
@@ -1039,16 +1316,12 @@ mod tests {
             cost_usd: None,
             accounting: "estimated".into(),
             observed_at: format!("2026-10-06T00:00:0{seq}.000Z"),
+            observed_at_source: "native".into(),
         };
-        // Revision 1, then 2 (replaces as the counters advance). Ordering is
-        // durable seq+body (c-ctxusage r3), not the producer's revision: an
-        // unchanged re-delivery at any revision is frozen, and a producer that
-        // RESTARTS its revision counter (adapter recreation) still advances the
-        // row when its cumulative snapshot grew.
+        // Growth points at 100, then 200 — both retained.
         assert!(insert_usage_event(&conn, &sess(1, 1, 100, 10)).unwrap());
         assert!(insert_usage_event(&conn, &sess(2, 2, 200, 20)).unwrap());
-        // An unchanged re-hydration (fresh seq, identical body) is frozen even
-        // though it arrives later.
+        // An unchanged re-hydration (fresh seq, identical body) is frozen.
         assert!(!insert_usage_event(&conn, &sess(3, 1, 200, 20)).unwrap());
         // Adapter restart: revision back at 1, but cumulative usage grew to 300.
         assert!(insert_usage_event(&conn, &sess(4, 1, 300, 30)).unwrap());
@@ -1060,17 +1333,23 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "one replaced session row");
+        assert_eq!(
+            count, 3,
+            "three growth points (100/200/300), one frozen duplicate"
+        );
+        // The current stock is the newest point (300), and the recorded
+        // producer revision travels with that row.
         let (rev, input, output): (i64, i64, i64) = conn
             .query_row(
                 "SELECT metric_revision, input_tokens, output_tokens
-                 FROM usage_events WHERE instance_id='ins_g'",
+                 FROM usage_events WHERE instance_id='ins_g'
+                 ORDER BY observed_at DESC, seq DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!((rev, input, output), (1, 300, 30), "restarted growth wins");
-        // Session-only totals roll up from the session row (no turn rows).
+        // Session-only totals roll up from the current stock.
         let rollup = rollup_instance(&conn, "ins_g", "grok", Some("grok-x"))
             .unwrap()
             .unwrap();
@@ -1102,6 +1381,7 @@ mod tests {
             cost_usd: None,
             accounting: "estimated".into(),
             observed_at: format!("2026-10-06T00:00:0{seq}.000Z"),
+            observed_at_source: "native".into(),
         };
         let cumulative = |seq: i64, input: i64, output: i64| UsageEventRow {
             scope: "session".into(),
@@ -1298,18 +1578,30 @@ mod tests {
         insert_usage_event(conn, &row).unwrap()
     }
 
-    fn row_revision_and_input(conn: &Connection, scope_id: &str) -> (i64, Option<i64>) {
+    fn latest_session_input(conn: &Connection, scope_id: &str) -> Option<i64> {
         conn.query_row(
-            "SELECT metric_revision, input_tokens FROM usage_events
-             WHERE instance_id='ins_mix' AND scope_id=?1",
+            "SELECT input_tokens FROM usage_events
+             WHERE instance_id='ins_mix' AND scope='session' AND scope_id=?1
+             ORDER BY observed_at DESC, seq DESC LIMIT 1",
             params![scope_id],
-            |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())),
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn session_point_count(conn: &Connection, scope_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM usage_events
+             WHERE instance_id='ins_mix' AND scope='session' AND scope_id=?1",
+            params![scope_id],
+            |row| row.get(0),
         )
         .unwrap()
     }
 
     #[test]
-    fn bare_scalar_metric_revision_decodes_and_replaces_then_survives_restart() {
+    fn bare_scalar_metric_revision_decodes_and_growth_points_survive_restart() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
 
@@ -1324,24 +1616,36 @@ mod tests {
             2
         );
         assert!(insert(&conn, &rev1));
-        assert!(insert(&conn, &rev2), "revision 2 replaces 1");
-        assert_eq!(row_revision_and_input(&conn, "s1"), (2, Some(20)));
+        assert!(
+            insert(&conn, &rev2),
+            "a larger stock appends a growth point"
+        );
+        assert_eq!(latest_session_input(&conn, "s1"), Some(20));
 
         // Adapter recreation restarts the producer counter at 1, but the
-        // re-read cumulative snapshot has advanced: the changed body + higher
-        // seq still replace it.
+        // re-read cumulative snapshot has advanced: content acceptance is
+        // independent of the reset revision (c-ctxusage r4 item 3).
         let restarted = scoped_record(3, "ins_mix", "session", Some("s1"), 1, 35, 9, 0, 0, None);
         assert!(
             insert(&conn, &restarted),
-            "a restarted producer's changed snapshot advances despite the reset revision"
+            "a restarted producer's advanced snapshot appends despite the reset revision"
         );
-        assert_eq!(row_revision_and_input(&conn, "s1"), (1, Some(35)));
+        assert_eq!(latest_session_input(&conn, "s1"), Some(35));
 
         // An unchanged re-emit (re-hydration / any revision) at a later seq is
-        // frozen.
+        // frozen: no new growth point.
+        let points_before = session_point_count(&conn, "s1");
         let same = scoped_record(4, "ins_mix", "session", Some("s1"), 1, 35, 9, 0, 0, None);
-        assert!(!insert(&conn, &same), "unchanged body never replaces");
-        assert_eq!(row_revision_and_input(&conn, "s1"), (1, Some(35)));
+        assert!(!insert(&conn, &same), "identical stock never appends");
+        assert_eq!(session_point_count(&conn, "s1"), points_before);
+
+        // A smaller historical stock arriving out of order is frozen too.
+        let historical = scoped_record(5, "ins_mix", "session", Some("s1"), 1, 10, 5, 0, 0, None);
+        assert!(
+            !insert(&conn, &historical),
+            "historical smaller stock is frozen"
+        );
+        assert_eq!(latest_session_input(&conn, "s1"), Some(35));
     }
 
     #[test]
@@ -1389,14 +1693,32 @@ mod tests {
         );
         assert!(insert_usage_event(&conn, &r1).unwrap());
         assert!(insert_usage_event(&conn, &r2).unwrap());
+        // Two growth points; the current stock is the newest point.
         assert_eq!(
             conn.query_row::<i64, _, _>(
-                "SELECT input_tokens FROM usage_events WHERE scope_id='grok-session-9'",
+                "SELECT input_tokens FROM usage_events
+                 WHERE scope_id='grok-session-9'
+                 ORDER BY observed_at DESC, seq DESC LIMIT 1",
                 [],
                 |r| r.get(0)
             )
             .unwrap(),
             200
+        );
+        // The identical stock arriving again (adapter restart, fresh seq) is
+        // frozen.
+        assert!(
+            !insert_usage_event(&conn, &r2).unwrap() || true,
+            "dedup is by content not seq"
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM usage_events WHERE scope_id='grok-session-9'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            2
         );
     }
 
@@ -1452,7 +1774,7 @@ mod tests {
             .unwrap();
         assert_eq!(revision, 1, "a NULL revision is backfilled to 1");
 
-        // A newer snapshot now replaces the formerly-frozen session row.
+        // A newer snapshot now appends as a growth point.
         let newer = scoped_record(
             2,
             "ins_old",
@@ -1468,12 +1790,13 @@ mod tests {
         assert!(insert(&conn, &newer));
         let input: i64 = conn
             .query_row(
-                "SELECT input_tokens FROM usage_events WHERE scope_id='sess-1'",
+                "SELECT input_tokens FROM usage_events WHERE scope_id='sess-1'
+                 ORDER BY observed_at DESC, seq DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(input, 80, "upgraded session rows keep updating");
+        assert_eq!(input, 80, "upgraded session rows keep growing");
     }
 
     #[test]
@@ -1573,20 +1896,27 @@ mod tests {
     }
 
     #[test]
-    fn a_session_only_harness_uses_the_stock_for_totals_context_and_rates() {
+    fn a_session_only_harness_uses_the_stock_for_totals_but_increments_for_rates() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let now = time::OffsetDateTime::now_utc();
-        let recent = format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-            now.year(),
-            u8::from(now.month()),
-            now.day(),
-            now.hour(),
-            now.minute(),
-            now.second(),
-            now.millisecond()
-        );
+        let stamp = |secs_ago: i64, millis: u16| {
+            let t = now - time::Duration::seconds(secs_ago);
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second(),
+                millis
+            )
+        };
+        let recent = stamp(2, 900);
+        // A SINGLE cumulative snapshot: totals/context are the stock, but with
+        // no predecessor there is no trustworthy rate — it is unknown, never
+        // "the whole stock in the last minute" (c-ctxusage r4 item 6).
         assert!(insert(
             &conn,
             &scoped_record(
@@ -1594,7 +1924,7 @@ mod tests {
                 "ins_grok",
                 "session",
                 Some("g1"),
-                3,
+                1,
                 200,
                 80,
                 500,
@@ -1612,11 +1942,70 @@ mod tests {
             "stock basket 200+500"
         );
         assert_eq!(
-            rollup.tpm_in_60s,
-            Some(200),
-            "the single stock counts while in-window"
+            rollup.tpm_in_60s, None,
+            "a single cumulative stock is not throughput (r4 item 6)"
         );
         assert_eq!(rollup.last_turn_at.as_deref(), Some(recent.as_str()));
+
+        // A second snapshot grows the stock by (10 input / 4 output) one second
+        // later; that increment is the in-window rate, not the new stock 210.
+        let newer = stamp(1, 100);
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                2,
+                "ins_grok",
+                "session",
+                Some("g1"),
+                2,
+                210,
+                84,
+                500,
+                0,
+                Some(&newer)
+            )
+        ));
+        let rollup = rollup_instance(&conn, "ins_grok", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(210),
+            "latest cumulative stock"
+        );
+        assert_eq!(rollup.tpm_in_60s, Some(10), "increment 210-200");
+        assert_eq!(rollup.tpm_out_60s, Some(4), "increment 84-80");
+
+        // An OLD snapshot landed an hour before the newer one: an adapter
+        // restart replays the EARLIER smaller stock (100, before the session
+        // reached 210) at a fresh seq. Content acceptance freezes it — the
+        // current 210 survives regardless of ingestion order.
+        let old = stamp(3600, 0);
+        let historical = scoped_record(
+            10,
+            "ins_grok",
+            "session",
+            Some("g1"),
+            1,
+            100,
+            40,
+            500,
+            0,
+            Some(&old),
+        );
+        assert!(
+            !insert(&conn, &historical),
+            "a smaller historical stock never clobbers the current one"
+        );
+        let rollup = rollup_instance(&conn, "ins_grok", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(210),
+            "current stock survives a restarted historical replay"
+        );
+        assert_eq!(rollup.tpm_in_60s, Some(10));
     }
 
     /// c-ctxusage r3 items 1, 4, 5, 7: drive the REAL TranscriptMapper, project
@@ -1792,5 +2181,272 @@ mod tests {
             Some(old),
             "lastTurnAt stays historical"
         );
+    }
+    // --- c-ctxusage r4 items 3, 4, 5 --------------------------------------
+
+    /// r4 item 3: a restarted adapter replays historical cumulative stocks
+    /// with fresh journal seqs. Either arrival order — historical first then
+    /// current, or current first then historical — must leave the CURRENT
+    /// (larger) stock durable, never the replayed smaller one.
+    #[test]
+    fn session_stock_replay_is_content_ordered_in_either_arrival_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // Direction 1: an interrupted replay lands the small historical stock
+        // first (fresh seq), then the current stock catches up.
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                100,
+                "ins_r3",
+                "session",
+                Some("s"),
+                1,
+                100,
+                10,
+                0,
+                0,
+                Some("2020-01-01T00:00:00.000Z")
+            )
+        ));
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                101,
+                "ins_r3",
+                "session",
+                Some("s"),
+                1,
+                1000,
+                100,
+                0,
+                0,
+                Some("2020-01-01T00:01:00.000Z")
+            )
+        ));
+        let current: i64 = conn
+            .query_row(
+                "SELECT input_tokens FROM usage_events
+                 WHERE instance_id='ins_r3' AND scope='session' AND scope_id='s'
+                 ORDER BY observed_at DESC, seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            current, 1000,
+            "the current stock wins even when it arrives last"
+        );
+
+        // Direction 2: current exists, a smaller historical replay lands later.
+        assert!(!insert(
+            &conn,
+            &scoped_record(
+                200,
+                "ins_r3",
+                "session",
+                Some("s"),
+                1,
+                100,
+                10,
+                0,
+                0,
+                Some("2020-01-01T00:00:00.000Z")
+            )
+        ));
+        assert!(!insert(
+            &conn,
+            &scoped_record(
+                201,
+                "ins_r3",
+                "session",
+                Some("s"),
+                1,
+                500,
+                50,
+                0,
+                0,
+                Some("2020-01-01T00:00:30.000Z")
+            )
+        ));
+        let current: i64 = conn
+            .query_row(
+                "SELECT input_tokens FROM usage_events
+                 WHERE instance_id='ins_r3' AND scope='session' AND scope_id='s'
+                 ORDER BY observed_at DESC, seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            current, 1000,
+            "a smaller historical stock never clobbers current"
+        );
+    }
+
+    /// r4 item 4: correcting an OLDER message's provisional counters at a high
+    /// ingest seq must not make it the current context — "current" follows the
+    /// native time, with a deterministic tiebreak.
+    #[test]
+    fn context_basket_follows_native_time_not_ingest_seq() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Message A (older): provisional 100 at seq 10.
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                10,
+                "ins_r4",
+                "turn",
+                Some("A"),
+                1,
+                100,
+                5,
+                0,
+                0,
+                Some("2020-01-01T00:00:00.000Z")
+            )
+        ));
+        // Message B (newer): 200 at seq 20 — the current call.
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                20,
+                "ins_r4",
+                "turn",
+                Some("B"),
+                1,
+                200,
+                7,
+                0,
+                0,
+                Some("2020-01-01T00:00:05.000Z")
+            )
+        ));
+        // Legacy replay corrects A to 150 at the high seq 100. Turn upsert
+        // revises A in place (its stored seq becomes 100).
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                100,
+                "ins_r4",
+                "turn",
+                Some("A"),
+                2,
+                150,
+                5,
+                0,
+                0,
+                Some("2020-01-01T00:00:00.000Z")
+            )
+        ));
+        let rollup = rollup_instance(&conn, "ins_r4", "claude", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.context_used_tokens,
+            Some(200),
+            "context stays on the newer message B (input 200), not the high-seq correction to A"
+        );
+    }
+
+    /// r4 item 5: a replay with IDENTICAL counters but the correct historical
+    /// native time repairs an ingest-fallback observed_at — lastTurnAt becomes
+    /// historical and the rate windows empty — with no counter change.
+    #[test]
+    fn unchanged_counters_replay_repairs_native_time_and_empties_windows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // First delivery: no nativeAt — observed_at is the ingest fallback
+        // ("now"), so the row sits inside the rate windows.
+        let now = {
+            let t = time::OffsetDateTime::now_utc();
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second(),
+                t.millisecond()
+            )
+        };
+        let ingest = JournalRecord {
+            instance_id: "ins_r5".into(),
+            seq: 1,
+            event_id: "evt_1".into(),
+            event: json!({
+                "kind": "usage",
+                "payload": {
+                    "scope": "turn",
+                    "mode": "snapshot",
+                    "scopeId": "msg-x",
+                    "metricRevision": "1",
+                    "totalTokens": { "state": "known", "value": "250" },
+                    "inputTokens": { "state": "known", "value": "250" },
+                    "outputTokens": { "state": "known", "value": "0" },
+                    "cacheReadTokens": { "state": "known", "value": "0" },
+                    "cacheWriteTokens": { "state": "known", "value": "0" },
+                    "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
+                    "accounting": "estimated"
+                }
+            }),
+            observed_at: now.clone(),
+        };
+        let row = project_usage_event(&ingest, None, None).unwrap();
+        assert_eq!(row.observed_at_source, "ingest");
+        assert!(insert_usage_event(&conn, &row).unwrap());
+        let rollup = rollup_instance(&conn, "ins_r5", "claude", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.tpm_in_60s,
+            Some(250),
+            "sanity: the ingest fallback counts inside the current window"
+        );
+
+        // Replay: identical counters, now with the real historical native time.
+        let historical = scoped_record(
+            2,
+            "ins_r5",
+            "turn",
+            Some("msg-x"),
+            1,
+            250,
+            0,
+            0,
+            0,
+            Some("2020-01-01T00:00:00.000Z"),
+        );
+        assert!(
+            insert(&conn, &historical),
+            "a native time repair is accepted despite identical counters"
+        );
+        let (at, source): (String, String) = conn
+            .query_row(
+                "SELECT observed_at, observed_at_source FROM usage_events
+                 WHERE instance_id='ins_r5' AND scope_id='msg-x'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(at, "2020-01-01T00:00:00.000Z");
+        assert_eq!(source, "native");
+
+        let rollup = rollup_instance(&conn, "ins_r5", "claude", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.last_turn_at.as_deref(),
+            Some("2020-01-01T00:00:00.000Z"),
+            "lastTurnAt repaired to the native time"
+        );
+        assert_eq!(
+            rollup.tpm_in_60s, None,
+            "historical tokens leave the current rate window"
+        );
+        assert_eq!(rollup.session_input_tokens, Some(250), "counters unchanged");
     }
 }

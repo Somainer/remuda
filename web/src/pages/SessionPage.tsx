@@ -11,6 +11,7 @@ import { Composer } from "../features/session/Composer";
 import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
 import { allModelPinMismatches } from "../features/session/modelEffective";
+import { skippedSidecarEntries } from "../features/session/skippedSidecars";
 import { RunDetails } from "../features/session/RunDetails";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
@@ -454,6 +455,23 @@ export function SessionPage({
         data-observed={mismatch.observed}
       >
         请求模型 {mismatch.requested}，实际运行 {mismatch.observed}
+      </span>,
+    );
+  }
+  // c-resumehome round 6 item 8: sidecars the resume staging skipped
+  // (symlink/FIFO/socket/device) are a non-fatal NOTICE, not a failure: the
+  // conversation completed normally. One neutral chip; the raw entries live in
+  // its title and data attribute.
+  const skippedSidecars = skippedSidecarEntries(events);
+  if (skippedSidecars.length > 0) {
+    diagnostics.push(
+      <span
+        key={`skipped-sidecars-${diagnostics.length}`}
+        data-testid="run-details-skipped-sidecars"
+        data-entries={skippedSidecars.join(",")}
+        title={`恢复时跳过了 ${skippedSidecars.length} 个非普通文件侧车（未复制）：\n${skippedSidecars.join("\n")}`}
+      >
+        {`跳过 ${skippedSidecars.length} 个侧车文件（不影响本次会话）`}
       </span>,
     );
   }

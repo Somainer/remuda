@@ -586,3 +586,45 @@ describe("buildHomeRows / arrangeHomeGroups split (commit:HomeList caching seam)
     );
   });
 });
+
+describe("skipped-sidecar home row notice (c-resumehome round 6 item 8)", () => {
+  function groupsWithEvents(events: Observation[]) {
+    const instances = named([session("ins-skip")]);
+    const spaces = buildSpaces(workspaces, instances, defaultSpacePrefs());
+    return buildHomeGroups({
+      spaces,
+      interactions: [],
+      order: "clock",
+      query: "",
+      titleOf: (instanceId) => titles[instanceId] ?? instanceId,
+      hostNameOf: (hostId) => hostNames[hostId ?? ""] ?? hostId ?? "",
+      branchOf: () => "main",
+      rollupOf: () => null,
+      eventsOf: (instanceId) => (instanceId === "ins-skip" ? events : undefined),
+    });
+  }
+
+  const skippedEvent = {
+    kind: "lifecycle",
+    payload: {
+      type: "native",
+      topic: "diagnostic",
+      nativeName: "resume_staging",
+      severity: "warning",
+      status: { state: "known", value: "skipped-sidecars" },
+      relatedIds: { severity: "warning", skippedSidecars: "symlink:S/a,non-regular:S/sock" },
+    },
+  } as unknown as Observation;
+
+  it("carries the entries as a neutral notice, never as the error body", () => {
+    const row = groupsWithEvents([skippedEvent])[0].rows[0];
+    expect(row.noticeEntries).toEqual(["symlink:S/a", "non-regular:S/sock"]);
+    expect(row.bodyIsError).toBe(false);
+    expect(row.body).not.toContain("symlink");
+  });
+
+  it("has no notice without the diagnostic", () => {
+    const row = groupsWithEvents([])[0].rows[0];
+    expect(row.noticeEntries).toBeNull();
+  });
+});

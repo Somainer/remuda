@@ -250,6 +250,16 @@
   color: var(--fg-muted);
 }
 
+/* c-resumehome r6 item 8: skipped sidecars are a neutral, non-error notice. */
+.rowNotice {
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .rowTime {
   flex: none;
   color: var(--fg-faint);

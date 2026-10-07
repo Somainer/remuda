@@ -57,6 +57,8 @@ pub struct FakeClaudeProcess {
     lines: mpsc::Receiver<std::io::Result<String>>,
     /// `--session-id` value.
     pub session_id: String,
+    /// Collector thread for the child's piped stderr (joined on wait).
+    stderr_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
 
 impl FakeClaudeProcess {
@@ -149,6 +151,26 @@ impl FakeClaudeProcess {
             .ok_or_else(|| anyhow!("fake-claude child already reaped"))?;
         Ok(child.wait()?)
     }
+
+    /// Close stdin, wait for exit and return the status together with every
+    /// stderr byte the child emitted (the collector is joined, so the buffer
+    /// is complete). Startup-failure tests assert the specific refusal here
+    /// instead of accepting any non-zero exit.
+    pub fn wait_with_stderr(mut self) -> Result<(std::process::ExitStatus, String)> {
+        self.stdin.take();
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| anyhow!("fake-claude child already reaped"))?;
+        let status = child.wait()?;
+        let stderr = self
+            .stderr_thread
+            .take()
+            .and_then(|handle| handle.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        Ok((status, stderr))
+    }
 }
 
 impl Drop for FakeClaudeProcess {
@@ -156,6 +178,10 @@ impl Drop for FakeClaudeProcess {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        // Reap the stderr collector so its pipe does not outlive the child.
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -215,7 +241,7 @@ fn spawn_fake_claude_mode(options: SpawnOptions, print: bool) -> Result<FakeClau
         .env("FAKE_CLAUDE_SCRIPT", &options.script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     if let Some(dir) = &options.transcript_dir {
         command.env("FAKE_CLAUDE_TRANSCRIPT_DIR", dir);
     }
@@ -230,6 +256,22 @@ fn spawn_fake_claude_mode(options: SpawnOptions, print: bool) -> Result<FakeClau
         .with_context(|| format!("spawn {}", bin.display()))?;
     let stdin = child.stdin.take().context("fake-claude stdin")?;
     let stdout = child.stdout.take().context("fake-claude stdout")?;
+    let stderr = child.stderr.take().context("fake-claude stderr")?;
+    // Drain piped stderr into an owned buffer so a refusal before init can be
+    // asserted verbatim (an undrained pipe could stall the child instead).
+    let stderr_thread = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut captured = Vec::new();
+        let mut buf = [0_u8; 1024];
+        use std::io::Read;
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => captured.extend_from_slice(&buf[..read]),
+            }
+        }
+        captured
+    });
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -255,6 +297,7 @@ fn spawn_fake_claude_mode(options: SpawnOptions, print: bool) -> Result<FakeClau
         stdin: Some(stdin),
         lines: rx,
         session_id: options.session_id,
+        stderr_thread: Some(stderr_thread),
     })
 }
 

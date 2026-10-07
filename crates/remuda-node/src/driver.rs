@@ -208,6 +208,16 @@ pub trait Driver: Send + Sync {
     fn startup_error(&self) -> Option<String> {
         None
     }
+
+    /// Drain resume-staging notices attached to this driver, exactly once.
+    ///
+    /// Returns the `"kind:path"` names of non-regular/symlinked sidecars the
+    /// safe staging walk skipped. The runtime drains and journals these as
+    /// warnings BEFORE [`Driver::start`], so a notice is never lost on the
+    /// start-fails path (c-resumehome round 6 item 7).
+    fn take_skipped_sidecars(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// What this *session* can do, as opposed to what its driver kind can
     /// (D-028 §4.3, §6).
     ///

@@ -438,10 +438,10 @@ fn transcript_file(session_id: &str, flags: &ClaudeFlags) -> Result<Option<File>
         // A DIRECTORY target: adopt the directory itself, never its (possibly
         // shared) mount parent.
         crate::sandbox::ensure_dir_in_temp(&dir, ALLOW_HOME_WRITE_ENV)?;
-        // Same descriptor walk as the projects layout: no symlinked parent
-        // can redirect the create.
-        let dir_fd = remuda_fdsafe::DirFd::anchor_or_create(&crate::sandbox::normalize(&dir))
-            .map_err(std::io::Error::from)?;
+        // Round 6 item 1: pin the allocated ROOT and walk to the directory
+        // below it — anchoring `dir` itself would follow an intermediate
+        // symlink and write outside the allocated home.
+        let dir_fd = crate::sandbox::rooted_ensure_subdir(&dir)?;
         let file_name = format!("{session_id}.jsonl");
         let name = file_name.as_bytes();
         return Ok(Some(

@@ -63,6 +63,57 @@ fn system_temp_bases() -> Vec<PathBuf> {
     bases
 }
 
+/// The fixed temp bases in their PHYSICAL form, deduped. On macOS `/tmp` is a
+/// symlink to `/private/tmp` (and `/var/tmp` to `/private/var/tmp`): round 6
+/// item A pins the allocation BASE, and a trailing symlink is not pinnable, so
+/// allocation must canonicalise the deliberately trusted base ONCE and then
+/// walk everything below it O_NOFOLLOW. Nonexistent bases are dropped (only
+/// real directories anchor).
+fn canonical_temp_bases() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for base in system_temp_bases() {
+        let Ok(canonical) = base.canonicalize() else {
+            continue;
+        };
+        if seen.insert(canonical.clone()) {
+            out.push(canonical);
+        }
+    }
+    out
+}
+
+/// Every lexical AND physical form of the fixed temp bases. Membership tests
+/// use this so a path presented logically (`/tmp/…` on macOS) or physically
+/// (`/private/tmp/…`, the form allocations return) is classified identically.
+fn temp_base_forms() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for base in system_temp_bases()
+        .into_iter()
+        .map(|base| normalize(&base))
+        .chain(canonical_temp_bases())
+    {
+        if seen.insert(base.clone()) {
+            out.push(base);
+        }
+    }
+    out
+}
+
+/// Canonicalise the deliberately trusted allocation base once: the
+/// env-overridden base must already exist, and (like the fixed bases) it may
+/// be reached through a system mount symlink (`/tmp` on macOS). Everything
+/// BELOW the returned path is walked O_NOFOLLOW by the caller.
+fn trusted_base(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize().map_err(|error| {
+        std::io::Error::other(format!(
+            "fake home base {} is not accessible: {error}",
+            path.display()
+        ))
+    })
+}
+
 /// Lexically normalize `path` (`.`/`..` resolved, no symlink following),
 /// making it absolute.
 pub fn normalize(path: &Path) -> PathBuf {
@@ -107,8 +158,8 @@ impl TempHome {
     /// attempt is removed by this function only.
     pub fn allocate(label: &str) -> std::io::Result<Self> {
         let base = match std::env::var_os(HOME_BASE_ENV) {
-            Some(value) if !value.is_empty() => PathBuf::from(value),
-            _ => system_temp_bases()
+            Some(value) if !value.is_empty() => trusted_base(&PathBuf::from(value))?,
+            _ => canonical_temp_bases()
                 .into_iter()
                 .find(|base| base.is_dir())
                 .ok_or_else(|| {
@@ -240,7 +291,7 @@ impl Drop for TempHome {
 /// `TMPDIR=$HOME`.
 #[must_use]
 pub fn private_temp_home(label: &str) -> PathBuf {
-    for base in system_temp_bases() {
+    for base in canonical_temp_bases() {
         let Ok(base_fd) = DirFd::anchor_existing(&base) else {
             continue;
         };
@@ -341,11 +392,13 @@ fn root_fd_and_relative(path: &Path) -> Option<(DirFd, PathBuf)> {
 
 /// Walk from a pinned root fd to a regular leaf for appending. `relative` may
 /// include parent directories; each is walked O_NOFOLLOW (missing returns
-/// NotFound), the leaf fstatat'd and opened with O_NONBLOCK.
+/// NotFound). With `create`, missing parents are mkdir'd O_NOFOLLOW and a
+/// missing leaf is O_EXCL-created (0600); an existing symlink or special leaf
+/// is refused either way.
 fn append_via_root(
     root_fd: &DirFd,
     relative: &Path,
-    create_missing_parents: bool,
+    create: bool,
 ) -> std::io::Result<std::fs::File> {
     let Some(name) = relative.file_name() else {
         return Err(std::io::Error::new(
@@ -361,14 +414,25 @@ fn append_via_root(
         .collect();
     let mut dir = root_fd.self_clone();
     for component in parents {
-        dir = if create_missing_parents {
+        dir = if create {
             dir.ensure_subdir(std::os::unix::ffi::OsStrExt::as_bytes(component))?
         } else {
             dir.subdir(std::os::unix::ffi::OsStrExt::as_bytes(component))?
         };
     }
-    dir.open_append_leaf(name.as_encoded_bytes())
-        .map_err(std::io::Error::from)
+    let name = name.as_encoded_bytes();
+    match dir.classify_leaf(name)? {
+        Some(entry) if entry.kind == LeafKind::Regular => Ok(dir.open_append_leaf(name)?),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "test fake refuses to write through a symlink or non-regular file",
+        )),
+        None if create => Ok(dir.create_leaf_excl(name)?),
+        None => Err(std::io::Error::from(remuda_fdsafe::FdError::new(
+            String::from_utf8_lossy(name),
+            remuda_fdsafe::FdErrorKind::Missing,
+        ))),
+    }
 }
 
 /// A sentinel marks a real root only when its directory is owned by this
@@ -379,19 +443,16 @@ fn sentinel_dir_is_trustworthy(dir: &DirFd, path: &Path) -> bool {
         return false;
     }
     let normalized = normalize(path);
-    !system_temp_bases()
-        .iter()
-        .any(|base| normalize(base) == normalized)
+    !temp_base_forms().contains(&normalized)
 }
 
-/// Whether `path` (lexically) lies below a FIXED kernel temp mount. Unlike
+/// Whether `path` (lexically) lies below a FIXED kernel temp mount, in either
+/// its logical (`/tmp/…`) or physical (`/private/tmp/…` on macOS) form. Unlike
 /// round 2 this deliberately does NOT consult `$TMPDIR`: an inherited
 /// `TMPDIR=$HOME` must not authorize the operator's real home.
 fn under_fixed_temp(path: &Path) -> bool {
     let path = normalize(path);
-    system_temp_bases()
-        .iter()
-        .any(|base| path.starts_with(base))
+    temp_base_forms().iter().any(|base| path.starts_with(base))
 }
 
 /// Mark `dir` itself as an allocated root (fd walk + sentinel). Idempotent:
@@ -401,10 +462,7 @@ fn under_fixed_temp(path: &Path) -> bool {
 /// dedicated test directory, never every descendant of the temp mount.
 fn mark_root(dir: &Path) -> std::io::Result<()> {
     let normalized_dir = normalize(dir);
-    if system_temp_bases()
-        .iter()
-        .any(|base| normalize(base) == normalized_dir)
-    {
+    if temp_base_forms().contains(&normalized_dir) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "refusing to mark a shared temp mount as a fake root",
@@ -655,14 +713,38 @@ pub fn open_existing_transcript_append(
         .map_err(std::io::Error::from)
 }
 
+/// Pin the allocated ROOT governing `path` and walk/create `path` BELOW it
+/// with O_NOFOLLOW — never anchor `path` itself. Anchoring a descendant is the
+/// round 6 item 1 hole: `fstatat(NOFOLLOW)` follows intermediate symlinks, so
+/// an anchor of `H/projects/<slug>` resolves through a symlinked `projects`.
+/// The caller must already have authorized `path` ([`ensure_dir_in_temp`] /
+/// [`ensure_home_allocated`]); an ungoverned path is a [`PermissionDenied`].
+pub fn rooted_ensure_subdir(path: &Path) -> std::io::Result<DirFd> {
+    let absolute = normalize(path);
+    let Some((root_fd, relative)) = root_fd_and_relative(&absolute) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "test fake refuses to anchor {}: it is not below an allocated fake root",
+                absolute.display()
+            ),
+        ));
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(root_fd);
+    }
+    root_fd.ensure_subpath(&relative).map_err(Into::into)
+}
+
 /// Pin the Claude config home with the correct trust semantics.
 ///
-/// - An EXPLICIT `<explicit_env>` path is the configured home: it is the
-///   trusted anchor, realpath'd once (crossing system mount symlinks).
-/// - Otherwise an IMPLICIT `$<home_env>/<fallback>` is resolved by anchoring
-///   `$<home_env>` and WALKING `<fallback>` with `O_NOFOLLOW`; a symlinked
-///   fallback directory (e.g. a planted `~/.claude`) inside an allocated home
-///   is refused rather than canonicalized through.
+/// - An EXPLICIT `<explicit_env>` path is the configured home: accepted ONLY
+///   inside an allocated root, then reached by pinning that ROOT and walking
+///   the remainder link-free — never by anchoring the path itself.
+/// - Otherwise an IMPLICIT `$<home_env>/<fallback>` is resolved the same way;
+///   a symlinked fallback/intermediate directory (e.g. a planted `~/.claude`
+///   or `projects` inside an allocated home) is refused rather than
+///   canonicalized through.
 /// - With neither, the private per-process home is minted and the fallback
 ///   walked link-free.
 pub fn claude_config_home_fd(
@@ -674,18 +756,18 @@ pub fn claude_config_home_fd(
     if let Some(explicit) = std::env::var_os(explicit_env).filter(|v| !v.is_empty()) {
         let path = PathBuf::from(explicit);
         ensure_home_allocated(&path, allow_env)?;
-        return Ok(Some(DirFd::anchor_or_create(&path)?));
+        return Ok(Some(rooted_ensure_subdir(&path)?));
     }
     if let Some(home) = std::env::var_os(home_env).filter(|v| !v.is_empty()) {
         let home = PathBuf::from(home);
         // An implicit `$HOME/<fallback>` that is not under an allocated root:
         // silently skip persistence (None) — the turn still runs, but no
         // `~/.claude` tree is created. The EXPLICIT env case above fails loud.
-        if find_allowed_root(&home.join(fallback)).is_none() {
+        let configured = home.join(fallback);
+        if find_allowed_root(&configured).is_none() {
             return Ok(None);
         }
-        let home_fd = DirFd::anchor_or_create(&home)?;
-        return Ok(Some(home_fd.ensure_subdir(fallback.as_bytes())?));
+        return Ok(Some(rooted_ensure_subdir(&configured)?));
     }
     Ok(None)
 }
@@ -781,30 +863,37 @@ pub fn is_in_allocated_root(path: &Path) -> bool {
 /// Open an absolute `path` for appending, creating parent directories and the
 /// leaf (0600) entirely through the descriptor walk. `path` must be inside an
 /// allocated root; a symlink at any level, including the leaf, is refused.
+///
+/// Round 6 item 1: the allocated ROOT is pinned once and every descendant is
+/// walked/created from THAT fd with O_NOFOLLOW. This must never anchor the
+/// leaf's parent as a "trusted root": `fstatat(AT_SYMLINK_NOFOLLOW)` follows
+/// INTERMEDIATE symlinks, so an `anchor_or_create(H/projects/slug)` would pin
+/// the target of a symlinked `H/projects` and append outside the home.
 pub fn append_or_create(path: &Path, allow_env: &str) -> std::io::Result<std::fs::File> {
     let absolute = normalize(path);
-    ensure_allowed(&absolute, allow_env)?;
-    let parent = absolute
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| std::io::Error::other("write target has no parent directory"))?;
-    let Some(name) = absolute.file_name() else {
-        return Err(std::io::Error::other("write target has no file name"));
-    };
-    let parent_fd = DirFd::anchor_or_create(parent)?;
-    match parent_fd.classify_leaf(name.as_encoded_bytes())? {
-        Some(entry) if entry.kind == LeafKind::Regular => {
-            Ok(parent_fd.open_append_leaf(name.as_encoded_bytes())?)
+    if outside_writes_allowed(allow_env) {
+        // Deliberate manual run: legacy behavior.
+        if let Some(parent) = absolute.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        Some(_) => Err(std::io::Error::new(
+        return std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(absolute);
+    }
+    // Pin the allocated root and walk the descendants O_NOFOLLOW; never anchor
+    // a descendant itself.
+    let Some((root_fd, relative)) = root_fd_and_relative(&absolute) else {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "test fake refuses to write through a symlink/non-regular file: {}",
+                "test fake refuses to write {}: it is not under an allocated fake root (set \
+                 {allow_env}=1 only for a deliberate manual run)",
                 absolute.display()
             ),
-        )),
-        None => Ok(parent_fd.create_leaf_excl(name.as_encoded_bytes())?),
-    }
+        ));
+    };
+    append_via_root(&root_fd, &relative, true)
 }
 
 #[cfg(test)]
@@ -868,5 +957,86 @@ mod tests {
         let root = TempHome::allocate("unit-components").expect("allocate");
         assert!(append_project_transcript(root.path(), "slug", "../escape.jsonl").is_err());
         assert!(append_project_transcript(root.path(), "slug/../../x", "y").is_err());
+    }
+
+    /// Round 6 item A: with no `REMUDA_FAKE_HOME_BASE` override, allocation
+    /// picks a FIXED system base and must canonicalise it ONCE before pinning.
+    /// On macOS the first candidate is `/tmp` itself — a symlink to
+    /// `/private/tmp`; anchoring it uncanonicalised made every default
+    /// allocation fail there.
+    #[test]
+    fn allocate_against_the_default_base_pins_a_physical_dir() {
+        let root = TempHome::allocate("unit-default-base").expect("default-base allocate");
+        let canonical = root.path().canonicalize().expect("root canonicalizes");
+        assert_eq!(
+            normalize(root.path()),
+            normalize(&canonical),
+            "the allocated root is reported in its physical form already"
+        );
+        assert!(
+            canonical_temp_bases()
+                .iter()
+                .any(|base| canonical.starts_with(base)),
+            "allocation stays under a canonical fixed temp base: {}",
+            canonical.display()
+        );
+        // A child is reachable by an O_NOFOLLOW walk straight from the pinned
+        // base descriptor (no system-mount symlink in the returned path).
+        let fd = DirFd::anchor_existing(root.path()).expect("root pinnable");
+        fd.ensure_subdir(b"projects")
+            .expect("projects walked below the pinned base");
+    }
+
+    /// Round 6 item 1 (unit): `append_or_create` must not re-anchor a descendant.
+    /// `H/projects -> outside` redirects a path-anchoring writer; the pinned
+    /// root walk refuses the intermediate link instead.
+    #[test]
+    fn append_or_create_refuses_a_symlinked_intermediate_dir() {
+        use std::os::unix::fs::symlink;
+        let root = TempHome::allocate("unit-append-link").expect("allocate");
+        let home = root.child("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let target = root.child("elsewhere");
+        std::fs::create_dir_all(&target).expect("target");
+        symlink(&target, home.join("projects")).expect("projects link");
+        let escaped = target.join("slug/s.jsonl");
+        let error = append_or_create(
+            &home.join("projects/slug/s.jsonl"),
+            "FAKE_TEST_NO_SUCH_KNOB_Z",
+        )
+        .expect_err("the intermediate symlink is refused, never anchored");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        assert!(
+            !escaped.exists(),
+            "no bytes created outside through the link"
+        );
+    }
+
+    /// Round 6 item 1 (unit): the rooted config-home resolution walks the
+    /// configured home BELOW the pinned allocated root even when the config
+    /// dir itself is a descendant (`H/sub/claude-home`).
+    #[test]
+    fn rooted_ensure_subdir_walks_a_descendant_home_without_anchoring_it() {
+        use std::os::unix::fs::symlink;
+        let root = TempHome::allocate("unit-rooted-home").expect("allocate");
+        let configured = root.child("sub/claude-home");
+        std::fs::create_dir_all(&configured).expect("configured home");
+        let fd = rooted_ensure_subdir(&configured).expect("rooted walk");
+        fd.ensure_subdir(b"projects")
+            .expect("projects below the descendant anchor");
+        // A symlink BELOW the configured home is refused by the walk.
+        symlink(root.child("outside"), configured.join("projects-link")).expect("link");
+        assert!(rooted_ensure_subdir(&configured.join("projects-link")).is_err());
+        // An ungoverned path is refused outright.
+        let foreign = root
+            .path()
+            .parent()
+            .unwrap()
+            .join("definitely-not-a-root-anywhere");
+        assert!(rooted_ensure_subdir(&foreign).is_err());
     }
 }

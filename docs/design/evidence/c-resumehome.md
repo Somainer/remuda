@@ -380,3 +380,101 @@ resume with only `H/projects` replaced by a symlink into a valid external
 fmt + four-crate clippy `-D warnings` and the gated `nice cargo test
 --workspace` green; the coordinator re-runs fdsafe/testing/driver
 claude_transcript on the Mac.
+
+## Round 6 — canonical allocation base, root-fd writers, proven inode + prefix, per-dest locking (2026-10-07)
+
+Review of `6edbc93a` (codex REJECT, grok REJECT) plus the coordinator's macOS
+run. The rule is unchanged: pin the trusted root, walk everything below with
+`O_NOFOLLOW`, never adopt an inode or path you did not prove.
+
+### macOS (coordinator)
+
+- **A — `/tmp` is a symlink.** Three sandbox tests failed at allocate because
+  `/tmp -> /private/tmp` and a trailing symlink is not pinnable.
+  `TempHome::allocate`/`private_temp_home` now canonicalise the deliberately
+  trusted BASE once (`canonical_temp_bases`; `/private/tmp` on macOS, `/tmp` on
+  Linux) and anchor THAT; everything below is walked O_NOFOLLOW. Membership
+  tests use both logical and physical forms (`temp_base_forms`). A direct
+  default-base allocation regression (`allocate_against_the_default_base_pins_a_physical_dir`)
+  runs on every platform.
+- **B — socket `sun_path`.** The short-tmp leaf appeared twice in the staged
+  path plus the 36-char session id. The sidecar socket is now bound at
+  `/tmp/<fhex>/s` (one leaf, asserted ≤100 bytes) and the bound socket node is
+  `rename(2)`d into the sidecar tree on the same filesystem; the long final
+  path is never passed to `bind(2)`.
+
+### Findings
+
+1. **Re-anchoring fake writers (codex, high).** `append_or_create` anchored
+   the leaf's PARENT, and the events-log/config-home writers re-anchored
+   descendants — `fstatat(NOFOLLOW)` follows INTERMEDIATE links (only the
+   final component is protected), so a configured home reached THROUGH a link
+   (`H/home-link -> R/sink`, with the real final component beyond the link)
+   pinned the sink and created `.claude/projects/...` there. Every writer now
+   takes the allocated-root fd + relative path: `append_or_create` walks from
+   `root_fd_and_relative` (parent creation included), `claude_config_home_fd`
+   and the explicit transcript-dir resolution pin the root and
+   `ensure_subpath` below it (`rooted_ensure_subdir`). Process regressions: a
+   FRESH session and an EXPLICIT `CLAUDE_CONFIG_DIR`, each reached through an
+   intermediate symlink with a real component beyond it — non-zero exit, the
+   specific "is a symlink" refusal, sink bytes byte-identical. Both FAIL when
+   run against the pre-fix `sandbox.rs`/`fake.rs` (verified in an isolated
+   target) and pass after; a unit regression covers the rooted walk directly.
+2. **Marker is not proof (codex, high).** The provenance marker now records
+   the `(st_dev, st_ino)` of the inode the publishing launch renamed into
+   place (marker v2; a v1 marker fails closed). A kept destination must prove,
+   against the OPENED fd, BOTH the staged PREFIX (size+sha256; child-appended
+   suffix allowed) AND the recorded inode with nlink==1. Changed bytes with a
+   matching marker are refused; a replaced single-link inode with the exact
+   staged bytes is replaced by the staged copy; unproven appended bytes on a
+   foreign inode are refused. The marker is written only after the FINAL fd
+   passes the same checks. Regressions: changed-bytes matching marker;
+   swapped single-link inode matching marker; child append survives against
+   the proven inode.
+3. **Inherited no-op walks the whole trees (both).**
+   `validate_inherited_sidecar_trees` + the new fdsafe
+   `reject_symlink_descendants` recurse the complete `<S>/` and `memory/`
+   trees from the pinned project fd (depth-bounded) and refuse ANY symlink or
+   special-file descendant before the same-file no-op. Regressions for
+   `memory/MEMORY.md -> outside` (nested leaf) and `<S>/subagents -> outside`
+   (nested dir); fdsafe covers both at the primitive level too.
+4. **Harness regression race (both, medium).** The symlinked-`projects`
+   resume test now canonicalises the workspace before seeding AND spawning
+   (`HarnessBuilder::cwd`, child `cmd.cwd` + physical `--cwd`), waits for
+   startup exit WITHOUT sending input, and asserts the captured
+   "is a symlink" refusal (the PTY drain now captures stdout+stderr into
+   `captured_text`), non-zero status, and unchanged external bytes.
+5. **Concurrent resumes (codex, medium).** A new fdsafe RAII
+   `DirFd::lock_exclusive` (`flock` on a dup'd independent open description,
+   released on drop; contention proven by a two-pin test) is held for the
+   whole staging sequence on the destination project dir — the per-attempt
+   `.stage-*` sweep, copy and publish. One attempt can no longer delete
+   another's live tree; stale trees are removed only under the lock. A
+   deterministic two-attempt barrier regression repeats the race 6×.
+6. **FIFO test specificity (grok, medium).** `FakeClaudeProcess` now pipes and
+   drains stderr (`wait_with_stderr`); the FIFO resume regression asserts the
+   exact "not a regular file" refusal, so an unrelated startup failure can't
+   satisfy it.
+7. **Warning dropped when the pump never starts (grok, medium).** The staging
+   result rides on the built driver (`Driver::take_skipped_sidecars`) instead
+   of a process-global map; `materialize_instance` drains and journals the
+   `skippedSidecars` warning BEFORE `driver.start()`, so it is durable on the
+   start-fails path and the per-instance entry is consumed on every path. Node
+   e2e: staging with a symlinked sidecar, a "claude" that exits 7 — the
+   warning is in the journal even though the process never started.
+8. **Web shows skipped sidecars (grok, low).** New pure
+   `skippedSidecars` extractor (`features/session/skippedSidecars.ts`); the
+   session view renders a neutral `run-details-skipped-sidecars` notice
+   (non-error, entries in `data-entries`/title) and the mobile home row
+   carries `noticeEntries` rendered by `home-row-skipped-sidecars` alongside,
+   never replacing, the body. Unit tests cover the extractor, the session
+   chip and the home-row derivation.
+
+Tests: fdsafe 13 (dir lock contention, recursive link rejection); driver
+`claude_transcript` 54 (items 2/3/B/5 regressions above); testing lib+bin
+49/28, `fake_home_guard` 8 (fresh+explicit symlinked projects, specific FIFO
+refusal), `fake_harness` 25; node `resume_home` 12 (item 7 start-fails
+journaling); web 2140 unit tests (3 new files, skipped-sidecar cases).
+fmt + workspace clippy `--all-targets -D warnings` clean; the fdsafe/driver/
+node/testing suites green under `TMPDIR=/tmp`. The coordinator re-runs the
+three Mac groups.

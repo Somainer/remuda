@@ -41,7 +41,7 @@
 
 use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag};
+use nix::fcntl::{AtFlags, Flock, FlockArg, OFlag};
 use nix::sys::stat::{FileStat, Mode};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -133,6 +133,51 @@ impl DirFd {
 impl AsRawFd for DirFd {
     fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+}
+
+/// RAII exclusive advisory lock (`flock(2)`) held on a pinned directory fd.
+///
+/// `flock` locks are tied to the open file description: two independent
+/// `openat` pins of the SAME directory (in two threads or two processes)
+/// contend, while a [`DirFd::self_clone`] shares one lock. The held nix
+/// [`Flock`] releases the lock on drop; a process that dies holding it
+/// releases the kernel lock automatically, which is exactly what lets a later
+/// attempt prove an earlier one is gone before removing its private temp tree.
+#[must_use]
+pub struct DirLock<'a> {
+    // Exists for its Drop (LOCK_UN); never read.
+    #[allow(dead_code)]
+    held: Flock<File>,
+    _pin: std::marker::PhantomData<&'a DirFd>,
+}
+
+impl DirFd {
+    /// Acquire an EXCLUSIVE advisory lock on this directory, blocking until no
+    /// other pin holds one. A caller staging into a shared destination tree
+    /// holds this for the whole enumerate/cleanup/copy/publish sequence, so a
+    /// concurrent attempt can neither remove the first attempt's live temp
+    /// tree nor interleave its publishes. Works on Linux and macOS (flock on a
+    /// directory fd); stale temp-tree cleanup is safe only once this lock is
+    /// held — a free lock proves the creating process is gone.
+    pub fn lock_exclusive(&self) -> Result<DirLock<'_>, FdError> {
+        // A dup is an independent open description: it CONTENDS with another
+        // process's pin (unlike a borrowed raw fd, which would describe the
+        // same lock owner).
+        let pin = self
+            .file
+            .try_clone()
+            .map_err(|error| FdError::new("<flock>", FdErrorKind::Other(error.to_string())))?;
+        match Flock::lock(pin, FlockArg::LockExclusive) {
+            Ok(held) => Ok(DirLock {
+                held,
+                _pin: std::marker::PhantomData,
+            }),
+            Err((_pin, error)) => Err(FdError::new(
+                "<flock>",
+                FdErrorKind::Other(error.to_string()),
+            )),
+        }
     }
 }
 
@@ -772,6 +817,55 @@ impl DirFd {
         Ok(out)
     }
 
+    /// Recursively verify that NO symlink (or other non-directory/non-regular
+    /// entry) exists anywhere below this directory: every descendant must be a
+    /// real directory or regular file, reached link-free. Unlike a check of
+    /// just the immediate children, this catches a NESTED link such as
+    /// `<S>/subagents -> /outside` or `memory/MEMORY.md -> /outside`, which is
+    /// invisible to a root-only check but would redirect a later relative walk.
+    /// Depth-bounded like every other walk here; the first offending entry is
+    /// returned as a [`FdErrorKind::Symlink`] (other special files as
+    /// [`FdErrorKind::Other`]).
+    pub fn reject_symlink_descendants(&self, max_depth: u32) -> Result<(), FdError> {
+        self.reject_links_below("", max_depth)
+    }
+
+    fn reject_links_below(&self, rel: &str, depth_left: u32) -> Result<(), FdError> {
+        for entry in self.entries()? {
+            match entry.kind {
+                LeafKind::Directory => {
+                    if depth_left == 0 {
+                        return Err(FdError::new(
+                            format!("{rel}/{}", String::from_utf8_lossy(&entry.name)),
+                            FdErrorKind::Other("sidecar tree deeper than the staging limit".into()),
+                        ));
+                    }
+                    let sub = self.subdir(&entry.name)?;
+                    let child_rel = if rel.is_empty() {
+                        String::from_utf8_lossy(&entry.name).into_owned()
+                    } else {
+                        format!("{rel}/{}", String::from_utf8_lossy(&entry.name))
+                    };
+                    sub.reject_links_below(&child_rel, depth_left - 1)?;
+                }
+                LeafKind::Regular => {}
+                LeafKind::Symlink => {
+                    return Err(FdError::new(
+                        format!("{rel}/{}", String::from_utf8_lossy(&entry.name)),
+                        FdErrorKind::Symlink,
+                    ));
+                }
+                LeafKind::Other => {
+                    return Err(FdError::new(
+                        format!("{rel}/{}", String::from_utf8_lossy(&entry.name)),
+                        FdErrorKind::Other("not a regular file or directory".into()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Recursively remove a subtree directly below this fd. Used ONLY on
     /// private temp trees the caller created with [`Self::ensure_subdir`], so
     /// every removal stays descriptor-relative and symlink-safe (a symlink
@@ -1139,5 +1233,61 @@ mod tests {
         assert!(target.join("x").is_file());
         // Re-open is idempotent.
         DirFd::anchor_or_create(target).expect("re-anchor");
+    }
+
+    #[test]
+    fn an_exclusive_dir_lock_blocks_a_second_pin_until_released() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let tmp = tempdir();
+        let path = tmp.path().to_path_buf();
+        // A second, INDEPENDENT open description of the same directory: a dup
+        // would share the flock, a fresh pin must contend like another process.
+        let (tx, rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let dir = DirFd::anchor_existing(&path).expect("anchor");
+            let _guard = dir.lock_exclusive().expect("first lock");
+            tx.send(()).expect("ready");
+            std::thread::sleep(Duration::from_millis(800));
+        });
+        rx.recv().expect("holder armed");
+        let other = anchor(&tmp);
+        let started = std::time::Instant::now();
+        let _guard2 = other
+            .lock_exclusive()
+            .expect("second lock blocks then wins");
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "the second pin waited for the holder, not just re-entered the lock"
+        );
+        holder.join().expect("holder thread");
+    }
+
+    #[test]
+    fn reject_symlink_descendants_catches_nested_links_and_accepts_a_real_tree() {
+        let tmp = tempdir();
+        let root = anchor(&tmp);
+        // A real tree: dirs and regular files at several levels.
+        let a = root.ensure_subdir(b"a").expect("a");
+        let b = a.ensure_subdir(b"b").expect("b");
+        b.create_leaf_excl(b"f").expect("f");
+        a.create_leaf_excl(b"g").expect("g");
+        root.reject_symlink_descendants(8)
+            .expect("real tree accepted");
+        // A nested DIRECTORY symlink must be rejected.
+        std::os::unix::fs::symlink("/etc", tmp.path().join("a/b/evil")).expect("nested dir link");
+        let error = root
+            .reject_symlink_descendants(8)
+            .expect_err("nested dir link rejected");
+        assert_eq!(error.kind, FdErrorKind::Symlink);
+        std::fs::remove_file(tmp.path().join("a/b/evil")).expect("unlink nested dir link");
+        // A nested LEAF symlink too (replace the regular leaf with a link).
+        std::fs::remove_file(tmp.path().join("a/g")).expect("remove real leaf");
+        std::os::unix::fs::symlink("/etc/passwd", tmp.path().join("a/g"))
+            .expect("nested leaf link");
+        let error = root
+            .reject_symlink_descendants(8)
+            .expect_err("nested leaf link rejected");
+        assert_eq!(error.kind, FdErrorKind::Symlink);
     }
 }

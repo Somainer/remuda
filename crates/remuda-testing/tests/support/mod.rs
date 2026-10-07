@@ -29,6 +29,10 @@ pub struct Harness {
     seen: usize,
     closed: bool,
     owns_home: bool,
+    /// Every byte the binary emitted (stdout AND stderr share the PTY slave),
+    /// captured by the drainer so a startup refusal can be asserted on
+    /// verbatim instead of racing a guessed exit reason.
+    captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 /// Builder for [`Harness`].
@@ -39,6 +43,7 @@ pub struct HarnessBuilder {
     settings: Option<PathBuf>,
     envs: HashMap<String, String>,
     extra_args: Vec<String>,
+    cwd: Option<PathBuf>,
     cols: u16,
     rows: u16,
 }
@@ -53,6 +58,7 @@ impl HarnessBuilder {
             settings: None,
             envs: HashMap::new(),
             extra_args: Vec::new(),
+            cwd: None,
             cols: 80,
             rows: 24,
         }
@@ -85,6 +91,15 @@ impl HarnessBuilder {
     /// Extra CLI argument.
     pub fn arg(mut self, arg: &str) -> Self {
         self.extra_args.push(arg.to_owned());
+        self
+    }
+
+    /// Working directory the binary is spawned in. Callers must canonicalise
+    /// it BEFORE seeding artifacts and spawning: the child canonicalises its
+    /// own `--cwd` at startup, so a logical path that crosses a symlink would
+    /// derive a different slug than the one the test seeded.
+    pub fn cwd(mut self, cwd: PathBuf) -> Self {
+        self.cwd = Some(cwd);
         self
     }
 
@@ -123,6 +138,9 @@ impl HarnessBuilder {
         for (key, value) in &self.envs {
             cmd.env(key, value);
         }
+        if let Some(cwd) = &self.cwd {
+            cmd.cwd(cwd);
+        }
         cmd.arg("--kind");
         cmd.arg(self.kind);
         cmd.arg("--home");
@@ -145,15 +163,24 @@ impl HarnessBuilder {
         let master = pair.master;
         let writer = master.take_writer().expect("pty writer");
         // Drain screen bytes for the whole run so a filled PTY buffer can never
-        // stall the binary's repaints; tests assert on artifacts/events.
+        // stall the binary's repaints; tests assert on artifacts/events. The
+        // same bytes are captured verbatim (stderr and stdout share the slave)
+        // for startup-failure assertions.
         let drain_reader = master.try_clone_reader().expect("clone reader");
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain_captured = std::sync::Arc::clone(&captured);
         std::thread::spawn(move || {
             let mut reader = drain_reader;
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(read) => {
+                        if let Ok(mut sink) = drain_captured.lock() {
+                            sink.extend_from_slice(&buf[..read]);
+                        }
+                    }
                 }
             }
         });
@@ -167,6 +194,7 @@ impl HarnessBuilder {
             seen: 0,
             closed: false,
             owns_home,
+            captured,
         }
     }
 }
@@ -379,6 +407,17 @@ impl Harness {
     /// Home directory.
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// All captured PTY bytes (stdout + stderr), lossily decoded. A startup
+    /// refusal prints here before any event is written.
+    pub fn captured_text(&self) -> String {
+        let bytes = self
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// Locate the dialect's main artifact by walking the home tree.

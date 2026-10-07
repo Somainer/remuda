@@ -7,6 +7,7 @@ import type { Observation } from "../../types/observation";
 import type { Task } from "../../types/generated";
 import type { UsageRollup } from "../session/contextUsage";
 import { nextStep, type RowScreen } from "../session/nextStep";
+import { skippedSidecarEntries } from "../session/skippedSidecars";
 import { OTHER_SPACE, type Space } from "../spaces/store";
 import { rankQuickFind } from "../search/quickFindSearch";
 import { buildTaskGroups, type TaskListGroup } from "../tasks/taskRows";
@@ -72,6 +73,12 @@ export type HomeRow = {
    * never visible text. Null for a live row or a clean exit.
    */
   bodyDetail: string | null;
+  /**
+   * Non-fatal notice entries for this row (c-resumehome round 6 item 8):
+   * sidecars resume staging skipped. Rendered as a neutral annotation, never
+   * as the error body; null when the window carried no such diagnostic.
+   */
+  noticeEntries: string[] | null;
   /** 0..100 used-context share; null = unknown, and the ring must not render. */
   contextPct: number | null;
   blocked: boolean;
@@ -232,6 +239,10 @@ export function buildHomeRows(
         bodyIsError: body.isError,
         bodyTone: ended?.tone ?? null,
         bodyDetail: ended?.detail ?? null,
+        noticeEntries: (() => {
+          const entries = skippedSidecarEntries(input.eventsOf?.(instance.id) ?? []);
+          return entries.length > 0 ? entries : null;
+        })(),
         contextPct: input.rollupOf(instance.id)?.contextPct ?? null,
         blocked: status === "blocked",
         canResume,

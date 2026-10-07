@@ -96,19 +96,42 @@ fn invalid_input(message: impl Into<String>) -> std::io::Error {
 /// the staging walk requires a real file/directory). Same kind the
 /// descriptor-relative walk itself returns, so callers cannot distinguish a
 /// walk-level refusal from an explicit one.
-/// Validate the sidecar roots (`<session>/` and `memory/`) under an inherited
-/// destination slug dir: each present root must be a real directory reached
-/// through pinned fds (a symlink is refused). Guards the inherited-home
-/// no-op's two known sidecar entry points.
-fn validate_inherited_sidecar_roots(dest_dir_fd: &DirFd, session_id: &str) -> std::io::Result<()> {
+/// Validate the COMPLETE sidecar trees (`<session>/` and `memory/`) under an
+/// inherited destination slug dir: every descendant, at every nesting level,
+/// must be a real directory or regular file reached through pinned fds. Round
+/// 6 item 3: checking only the two roots let a NESTED link through
+/// (`<S>/subagents -> /outside`, `memory/MEMORY.md -> /outside`); a child that
+/// later walks those sidecars relative to the pinned project dir would escape.
+fn validate_inherited_sidecar_trees(
+    dest_dir_fd: &DirFd,
+    session_id: &str,
+    max_depth: u32,
+) -> std::io::Result<()> {
     for root in [session_id, "memory"] {
-        if let Some(entry) = dest_dir_fd.classify_leaf(root.as_bytes())?
-            && entry.kind != LeafKind::Directory
-        {
-            return Err(symlink_refused(format!(
-                "inherited resume sidecar root {root} is a symlink or non-directory; refusing the \
-                 no-op"
-            )));
+        if let Some(entry) = dest_dir_fd.classify_leaf(root.as_bytes())? {
+            match entry.kind {
+                LeafKind::Directory => {
+                    let root_fd = dest_dir_fd.subdir(root.as_bytes())?;
+                    root_fd.reject_symlink_descendants(max_depth).map_err(|error| {
+                        symlink_refused(format!(
+                            "inherited resume sidecar tree {root}/{} contains a symlink or special \
+                             file; refusing the no-op: {error}",
+                            error.at
+                        ))
+                    })?;
+                }
+                LeafKind::Regular => {
+                    // A regular file wearing a sidecar-directory name is not an
+                    // escape, but the child expects a directory there; leave
+                    // the no-op decision untouched.
+                }
+                LeafKind::Symlink | LeafKind::Other => {
+                    return Err(symlink_refused(format!(
+                        "inherited resume sidecar root {root} is a symlink or non-directory; \
+                         refusing the no-op"
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -655,35 +678,66 @@ fn crash_after_stage_seam() -> bool {
 /// Provenance recorded next to a staged transcript (review item 4). The sha is
 /// computed over the bytes actually streamed into the child home (round 3
 /// item 3), never re-read from the source path.
+///
+/// Round 6 item 2: a matching marker is no longer proof by itself — an
+/// attacker can copy both the file and its marker. The marker additionally
+/// records the `(dev, ino)` of the inode THIS launch PUBLISHED, and every later
+/// resume re-verifies that identity (plus the staged prefix's size/hash)
+/// against the OPENED destination fd before keeping anything. The child's own
+/// appended turns survive: only the staged prefix is content-checked.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StagingProvenance {
     /// Marker format version.
     version: u32,
     /// Absolute path of the predecessor transcript this copy came from.
     source: String,
-    /// Source size in bytes at staging time.
+    /// Size of the staged PREFIX at publish time (== the streamed source size).
     source_size: u64,
-    /// Lower-hex SHA-256 of the streamed source bytes.
+    /// Lower-hex SHA-256 of the staged prefix.
     source_sha256: String,
+    /// `st_dev` of the inode the publishing launch renamed into place.
+    inode_dev: u64,
+    /// `st_ino` of that published inode.
+    inode_ino: u64,
 }
 
 impl StagingProvenance {
-    fn new(source: &Path, source_size: u64, source_sha256: &str) -> Self {
+    fn new(
+        source: &Path,
+        source_size: u64,
+        source_sha256: &str,
+        published_identity: (u64, u64),
+    ) -> Self {
         Self {
-            version: 1,
+            version: MARKER_VERSION,
             source: source.display().to_string(),
             source_size,
             source_sha256: source_sha256.to_owned(),
+            inode_dev: published_identity.0,
+            inode_ino: published_identity.1,
         }
     }
 
+    /// Whether this marker was written for exactly `(source, prefix size,
+    /// prefix sha)` — the predecessor the current launch just streamed. Inode
+    /// identity is verified SEPARATELY against the opened destination fd.
     fn covers(&self, source: &Path, source_size: u64, source_sha256: &str) -> bool {
-        self.version == 1
+        self.version == MARKER_VERSION
             && self.source == source.display().to_string()
             && self.source_size == source_size
             && self.source_sha256 == source_sha256
     }
+
+    /// The inode identity recorded at publish time.
+    fn published_identity(&self) -> (u64, u64) {
+        (self.inode_dev, self.inode_ino)
+    }
 }
+
+/// Marker version round 6: the v1 marker carried no published-inode identity,
+/// so a v1 file reads as absent (fail closed) and goes through markerless
+/// full-byte verification.
+const MARKER_VERSION: u32 = 2;
 
 /// One verified file in the private temp tree. `rel` is relative to the slug
 /// directory, `/`-separated, e.g. `<S>/subagents/side.jsonl` or `<S>.jsonl`.
@@ -777,6 +831,13 @@ fn stage_for_resume_with_limits(
     let dest_home_fd = DirFd::anchor_or_create(&absolutize(target_home))?;
     let projects_fd = dest_home_fd.ensure_subdir(b"projects")?;
     let dest_dir_fd = projects_fd.ensure_subdir(slug.as_bytes())?;
+    // Round 6 item 5: serialise staging per destination project directory.
+    // Without this, two concurrent resumes into the same project each sweep
+    // `.stage-*` trees and one can remove the other's LIVE attempt (its prefix
+    // cleanup was keyed only on the shared prefix). The flock is held for the
+    // whole enumerate/sweep/copy/publish sequence; stale trees are removed only
+    // while holding it — a free lock also proves a crashed attempt is gone.
+    let _stage_lock = dest_dir_fd.lock_exclusive().map_err(std::io::Error::from)?;
     let dest_dir_identity = dest_dir_fd.dir_identity()?;
     let dest_dir = project_dir(target_home, &resolved_cwd);
     let transcript_name = format!("{session_id}.jsonl");
@@ -805,13 +866,14 @@ fn stage_for_resume_with_limits(
             if dest_leaf.identity()? == src_identity
                 && Some(dest_dir_identity) == src_dir_fd.dir_identity().ok()
             {
-                // Same file in the SAME inherited project directory. Round 5
-                // part 2 item 5: even the inherited-home no-op must not return
-                // before validating that the `<S>/` and `memory/` sidecar
-                // roots present under the destination are real directories
-                // (never symlinks). The transcript itself is already proven a
-                // real regular leaf above.
-                validate_inherited_sidecar_roots(&dest_dir_fd, session_id)?;
+                // Same file in the SAME inherited project directory. Round 6
+                // item 3: even the inherited-home no-op must not return before
+                // walking the COMPLETE `<S>/` and `memory/` trees: a nested
+                // symlink descendant (`<S>/subagents -> /outside`,
+                // `memory/MEMORY.md -> /outside`) under a real root must refuse
+                // the no-op. The transcript itself is already proven a real
+                // regular leaf above.
+                validate_inherited_sidecar_trees(&dest_dir_fd, session_id, limits.max_depth)?;
                 return Ok(StagedResume {
                     transcript: dest_transcript,
                     sidecar_dirs: Vec::new(),
@@ -1031,16 +1093,17 @@ fn build_verify_and_publish(
         ));
     }
 
-    // (4) A retained destination transcript now has to prove provenance
-    // against the source bytes we actually streamed. Round 4 item 9: a
-    // transcript published in an earlier attempt whose marker never landed
-    // (a crash in the publish window) is RECOVERABLE — re-hash the bytes at
-    // the destination and accept them only if they are exactly the bytes the
-    // current source streamed.
-    // Decide whether to publish the fresh staged transcript over an existing
-    // destination. Markerless recovery MUST replace the foreign inode (it may
-    // be a hardlink to an unrelated outside file with identical bytes); a
-    // marker-matched independent file is kept.
+    // (4) A retained destination transcript has to prove provenance against
+    // the source bytes we actually streamed.
+    //
+    // Round 6 item 2: a matching marker proves nothing by itself — a planted
+    // replacement can carry a copied marker. The OPENED destination fd must
+    // prove BOTH (a) its staged prefix has the recorded size+sha256, and
+    // (b) its inode is the one a Remuda launch actually published. A
+    // child-appended turn survives: only the prefix is content-checked, and a
+    // prefix match on the authorised inode keeps the file. Anything unproven
+    // is refused (foreign bytes) or replaced by the staged copy (foreign inode
+    // carrying exactly the staged bytes).
     #[derive(PartialEq, Eq)]
     enum TranscriptPublish {
         RenameOver,
@@ -1054,17 +1117,44 @@ fn build_verify_and_publish(
             .find(|seed| seed.rel == transcript_name)
             .map_or(source_size, |seed| seed.size);
         match read_staging_provenance(dest_dir_fd, transcript_name)? {
-            // A marker covering the predecessor we just streamed. Keep the
-            // existing inode only if it is independent (nlink == 1) and its
-            // inode did not change to the source's inode; otherwise replace it
-            // so the published inode is ours (round 5 part 2 item 3).
             Some(marker) if marker.covers(source_transcript, published_size, &transcript_sha) => {
                 let dest_leaf = dest_dir_fd.open_regular_leaf(transcript_name.as_bytes())?;
-                let same_as_source = dest_leaf.identity()? == transcript_leaf_identity;
-                if same_as_source || dest_leaf.nlink()? > 1 {
+                // (a) Verify the staged PREFIX on the OPENED fd — a replacement
+                // transcript with a matching marker fails here.
+                if !destination_prefix_matches(
+                    &mut &dest_leaf.file,
+                    published_size,
+                    &transcript_sha,
+                )? {
+                    return Err(invalid_input(format!(
+                        "resume destination {} carries a matching staging marker but its staged \
+                         prefix no longer has the recorded size/sha256 (size {}); the file was \
+                         changed after staging — refusing to keep it",
+                        dest_dir.join(transcript_name).display(),
+                        published_size
+                    )));
+                }
+                let identity = dest_leaf.identity()?;
+                let nlink = dest_leaf.nlink()?;
+                let inode_authorised = identity == marker.published_identity() && nlink == 1;
+                if inode_authorised {
+                    // (b) The published inode, independently linked, prefix
+                    // intact: any bytes past the prefix are this child's own
+                    // appended turns — keep them.
+                    TranscriptPublish::KeepExisting
+                } else if dest_leaf.len == published_size {
+                    // Foreign inode (replaced file, hardlink to the source or
+                    // to an outside file) but EXACTLY the staged bytes and
+                    // nothing after them: nothing to lose, publish our copy.
                     TranscriptPublish::RenameOver
                 } else {
-                    TranscriptPublish::KeepExisting
+                    return Err(invalid_input(format!(
+                        "resume destination {} has a matching marker but its inode is not the one \
+                         Remuda published (or it is hard-linked), yet it carries {} bytes beyond \
+                         the staged prefix — refusing to overwrite unproven appended bytes",
+                        dest_dir.join(transcript_name).display(),
+                        dest_leaf.len.saturating_sub(published_size)
+                    )));
                 }
             }
             Some(_) => {
@@ -1164,13 +1254,54 @@ fn build_verify_and_publish(
         .iter()
         .find(|seed| seed.rel == transcript_name)
         .map_or(source_size, |seed| seed.size);
+    // Re-open the FINAL destination and verify the staged prefix on that fd
+    // before recording its identity in the marker. Never write a marker over
+    // an inode we did not just prove: it must be a single-link regular file
+    // whose staged prefix hashes to the streamed bytes.
+    let final_leaf = dest_dir_fd.open_regular_leaf(transcript_name.as_bytes())?;
+    if final_leaf.nlink()? != 1 {
+        return Err(invalid_input(format!(
+            "resume destination {} is hard-linked after publish; refusing to record provenance for \
+             a shared inode",
+            dest_dir.join(transcript_name).display()
+        )));
+    }
+    if !destination_prefix_matches(&mut &final_leaf.file, published_size, &transcript_sha)? {
+        return Err(invalid_input(format!(
+            "resume destination {} failed final staged-prefix verification; refusing to record \
+             provenance",
+            dest_dir.join(transcript_name).display()
+        )));
+    }
+    let final_identity = final_leaf.identity()?;
     write_staging_provenance(
         dest_dir_fd,
         transcript_name,
-        &StagingProvenance::new(source_transcript, published_size, &transcript_sha),
+        &StagingProvenance::new(
+            source_transcript,
+            published_size,
+            &transcript_sha,
+            final_identity,
+        ),
     )?;
 
     Ok(published_roots)
+}
+
+/// Whether the first `prefix_size` bytes of the OPENED destination file hash
+/// to `expected_sha`. Unlike [`destination_bytes_match`], trailing bytes are
+/// allowed: they are the resumed child's own appended turns. A truncated file
+/// (fewer than `prefix_size` bytes) fails.
+fn destination_prefix_matches<R: std::io::Read>(
+    reader: &mut R,
+    prefix_size: u64,
+    expected_sha: &str,
+) -> std::io::Result<bool> {
+    let mut limited = std::io::Read::take(reader, prefix_size);
+    let sha = hash_reader(&mut limited)?;
+    // The Take must be fully consumed: an EOF before `prefix_size` means the
+    // prefix is truncated.
+    Ok(limited.limit() == 0 && sha == expected_sha)
 }
 
 /// Whether the existing destination transcript is byte-identical to the copy
@@ -1611,7 +1742,7 @@ fn read_staging_provenance(
     };
     let marker = serde_json::from_str::<StagingProvenance>(&body)
         .ok()
-        .filter(|marker| marker.version == 1);
+        .filter(|marker| marker.version == MARKER_VERSION);
     Ok(marker)
 }
 
@@ -3334,14 +3465,27 @@ mod tests {
         );
     }
 
-    /// Round 4 item 5: a unix socket sidecar is classified Other, skipped and
-    /// reported, and staging still succeeds. Uses a SHORT scratch dir and short
-    /// cwd so the socket bind fits in macOS `sun_path` (104 bytes).
+    /// Round 4 item 5 + round 6 item B: a unix socket sidecar is classified
+    /// Other, skipped and reported, and staging still succeeds. The socket is
+    /// BOUND at a guaranteed-short scratch address (`<tmp>/s`, asserted under
+    /// 100 bytes for macOS `sun_path` = 104) and the bound node is then
+    /// `rename(2)`d into the long sidecar tree (same filesystem): only the
+    /// bind address counts against `sun_path`, never the long staged path.
     #[cfg(unix)]
     #[test]
     fn round4_socket_and_device_sidecars_are_skipped_and_reported() {
         use std::os::unix::net::UnixListener;
         let tmp = ShortTmp::new();
+        // The bind address: `<short tmp>/s` — no repeated ShortTmp leaf, no
+        // session id, provably under 100 bytes on every platform.
+        let bind_path = tmp.path.join("s");
+        assert!(
+            bind_path.as_os_str().len() <= 100,
+            "bind address must fit macOS sun_path: {}",
+            bind_path.display()
+        );
+        // Homes/workspace live under the SAME scratch so the socket rename(2)
+        // into the sidecar tree never crosses a filesystem.
         let old_home = tmp.path.join("o");
         let new_home = tmp.path.join("n");
         let cwd = tmp.path.join("w");
@@ -3351,13 +3495,12 @@ mod tests {
         write_file(&source, "{}\n");
         let side = source.parent().unwrap().join(session);
         std::fs::create_dir_all(&side).expect("side dir");
-        let socket_path = side.join("sock");
-        assert!(
-            socket_path.as_os_str().len() <= 100,
-            "socket path must fit macOS sun_path: {}",
-            socket_path.display()
-        );
-        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let socket_final = side.join("sock");
+        // Bind at the SHORT address, then rename(2) the bound socket node into
+        // the sidecar tree. A bound unix socket keeps its inode at the new
+        // name; the long final path is never passed to bind(2).
+        let _listener = UnixListener::bind(&bind_path).expect("bind socket at short path");
+        std::fs::rename(&bind_path, &socket_final).expect("rename bound socket into sidecar tree");
         let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
         assert!(staged.transcript.is_file());
         assert!(
@@ -3739,5 +3882,243 @@ mod tests {
             );
             assert!(error.to_string().contains("symlink"), "{error}");
         }
+    }
+
+    /// Round 6 item 2: changing the staged PREFIX bytes while leaving the
+    /// (matching) marker in place must be refused on re-staging. The marker
+    /// matches the predecessor, but the OPENED destination fd fails the
+    /// recorded size/hash check.
+    #[cfg(unix)]
+    #[test]
+    fn round6_a_matching_marker_does_not_cover_changed_bytes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000d1";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "unchanged-prefix-bytes\n");
+        stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
+        let dest = transcript_layout(&new_home, &cwd, session);
+        // Rewrite the destination with same-LENGTH different bytes; the marker
+        // stays in place and still "matches" the predecessor.
+        write_file(&dest, "CHANGED-PREFIX-BYTES!\n");
+        let error = stage_for_resume(&source, &new_home, &cwd, session)
+            .expect_err("changed bytes under a matching marker are refused");
+        assert!(
+            error.to_string().contains("changed after staging"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            "unchanged-prefix-bytes\n"
+        );
+    }
+
+    /// Round 6 item 2: a replaced SINGLE-LINK inode carrying EXACTLY the
+    /// staged bytes, with the marker copied alongside it, is detected by the
+    /// recorded inode identity and replaced by our own copy (the marker alone
+    /// is not proof).
+    ///
+    /// Determinism: `unlink + create` lets the kernel RECYCLE the old inode
+    /// number, which would accidentally equal the marker identity. The attack
+    /// instead creates the planted file while the published one still exists
+    /// (a necessarily different inode), `rename`s it over the destination, and
+    /// Holds it open so its number cannot be reused by the staging temp file.
+    #[cfg(unix)]
+    #[test]
+    fn round6_a_matching_marker_does_not_adopt_a_swapped_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000d2";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "swap-me-prefix-bytes\n");
+        stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
+        let dest = transcript_layout(&new_home, &cwd, session);
+        // Create the planted replacement WHILE the published inode is alive,
+        // so its number is necessarily different; rename it over the
+        // destination and keep it open so its number cannot be recycled while
+        // staging creates the replacement copy.
+        let plant = dest.parent().unwrap().join("planted-replacement.jsonl");
+        write_file(&plant, "swap-me-prefix-bytes\n");
+        let planted = std::fs::File::open(&plant).expect("hold the planted inode open");
+        let planted_id = {
+            let stat = planted.metadata().expect("planted metadata");
+            (stat.dev(), stat.ino())
+        };
+        std::fs::rename(&plant, &dest).expect("rename the planted file over the dest");
+        stage_for_resume(&source, &new_home, &cwd, session).expect("swap replaced, not adopted");
+        let final_meta = std::fs::symlink_metadata(&dest).expect("final metadata");
+        let final_id = (final_meta.dev(), final_meta.ino());
+        // The live name identifies a fresh inode — never the still-open
+        // planted one, regardless of inode-number recycling.
+        assert_ne!(
+            final_id, planted_id,
+            "the planted foreign inode is replaced by the freshly staged copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "swap-me-prefix-bytes\n"
+        );
+        drop(planted);
+    }
+
+    /// Round 6 item 2 positive case: the child's own appended turns survive a
+    /// re-stage because the OPENED fd proves the published inode (single link,
+    /// recorded identity) AND the staged prefix hash; only the suffix is new.
+    #[cfg(unix)]
+    #[test]
+    fn round6_appended_turns_survive_against_the_proven_inode() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000d3";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "staged-prefix\n");
+        stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
+        let dest = transcript_layout(&new_home, &cwd, session);
+        let before_ino = inode_of(&dest);
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&dest)
+            .expect("open append")
+            .write_all(b"child appended turn\n")
+            .expect("child append");
+        let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("append kept");
+        assert_eq!(inode_of(&staged.transcript), before_ino, "inode kept");
+        assert_eq!(
+            std::fs::read_to_string(&staged.transcript).unwrap(),
+            "staged-prefix\nchild appended turn\n"
+        );
+    }
+
+    /// Round 6 item 3: a NESTED leaf symlink `memory/MEMORY.md -> outside`
+    /// under an otherwise real inherited sidecar root rejects the no-op.
+    #[cfg(unix)]
+    #[test]
+    fn round6_inherited_noop_rejects_a_nested_memory_leaf_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("ws");
+        let sink = tmp.path().join("sink.md");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        write_file(&sink, "sink\n");
+        let session = "01993ab0-0000-7000-8000-0000000000d4";
+        let source = transcript_layout(&home, &cwd, session);
+        write_file(&source, "inherited\n");
+        let memory = source.parent().unwrap().join("memory");
+        std::fs::create_dir_all(&memory).expect("real memory root");
+        symlink(&sink, memory.join("MEMORY.md")).expect("nested memory link");
+        let error = stage_for_resume(&source, &home, &cwd, session)
+            .expect_err("nested memory symlink rejects the inherited no-op");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&sink).unwrap(),
+            "sink\n",
+            "the link target is untouched"
+        );
+    }
+
+    /// Round 6 item 3: a NESTED directory symlink `<S>/subagents -> outside`
+    /// rejects the inherited-home no-op even though the `<S>` root is real.
+    #[cfg(unix)]
+    #[test]
+    fn round6_inherited_noop_rejects_a_nested_sidecar_dir_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("ws");
+        let sink = tmp.path().join("subagents-sink");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&sink).expect("sink dir");
+        let session = "01993ab0-0000-7000-8000-0000000000d5";
+        let source = transcript_layout(&home, &cwd, session);
+        write_file(&source, "inherited\n");
+        let side = source.parent().unwrap().join(session);
+        std::fs::create_dir_all(&side).expect("real session sidecar root");
+        symlink(&sink, side.join("subagents")).expect("nested subagents link");
+        let error = stage_for_resume(&source, &home, &cwd, session)
+            .expect_err("nested sidecar-dir symlink rejects the no-op");
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    /// Round 6 item 5: concurrent resumes into the SAME project directory must
+    /// never let one attempt delete another's live `.stage` tree. The per-dest
+    /// flock serialises staging; both attempts succeed and the published tree
+    /// is complete with no private leftovers.
+    #[cfg(unix)]
+    #[test]
+    fn round6_concurrent_resumes_into_one_project_never_clobber_each_other() {
+        use std::sync::{Arc, Barrier};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000d6";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "concurrent transcript\n");
+        write_file(
+            &source.parent().unwrap().join("memory/MEMORY.md"),
+            "project memory\n",
+        );
+        // Repeat the two-attempt race several times: the first round publishes,
+        // later rounds contend over the already-provenanced destination.
+        for round in 0..6 {
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let barrier = Arc::clone(&barrier);
+                let (old, new, ws, sid) = (
+                    old_home.clone(),
+                    new_home.clone(),
+                    cwd.clone(),
+                    session.to_owned(),
+                );
+                handles.push(std::thread::spawn(move || {
+                    let source = transcript_layout(&old, &ws, &sid);
+                    barrier.wait();
+                    stage_for_resume(&source, &new, &ws, &sid)
+                        .expect("every serialised attempt succeeds");
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("race thread");
+            }
+            let slug_dir = new_home.join("projects").join(slug_for(&cwd));
+            let leftovers: Vec<_> = std::fs::read_dir(&slug_dir)
+                .expect("slug dir")
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(STAGING_TMP_PREFIX)
+                })
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "round {round}: no live .stage tree is left behind (or swept by another attempt)"
+            );
+        }
+        let dest = transcript_layout(&new_home, &cwd, session);
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "concurrent transcript\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.parent().unwrap().join("memory").join("MEMORY.md"))
+                .unwrap(),
+            "project memory\n"
+        );
     }
 }

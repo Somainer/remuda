@@ -195,6 +195,101 @@ fn a_symlinked_projects_inside_the_home_is_refused_not_followed() {
     );
 }
 
+/// Round 6 item 1: a FRESH session whose IMPLICIT home is reached THROUGH an
+/// intermediate symlink (`$HOME = H/home-link/real-home`, where
+/// `home-link -> R/fresh-sink` and `real-home` exists under the sink) must not
+/// write into the sink. `fstatat(NOFOLLOW)` only protects the FINAL component,
+/// so the round-5 code anchored the real home THROUGH the link and pinned the
+/// sink; the pinned-root relative walk refuses the link component instead.
+/// The sink tree stays byte-identical.
+#[test]
+fn a_fresh_session_cannot_write_through_an_intermediate_home_symlink() {
+    use std::os::unix::fs::symlink;
+    let root = TempHome::allocate("guard-fresh-link").expect("allocated root");
+    // The sink and the REAL final home component BEYOND the link.
+    let sink = root.child("fresh-sink");
+    let real_home = sink.join("real-home");
+    std::fs::create_dir_all(&real_home).expect("real home beyond the link");
+    let sentinel = real_home.join("sentinel.txt");
+    std::fs::write(&sentinel, b"EXT-BYTES\n").expect("seed external bytes");
+    // `$HOME` goes: H/home-link (link) / real-home (real).
+    let home_dir = root.child("home");
+    std::fs::create_dir_all(&home_dir).expect("parent home dir");
+    symlink(&sink, home_dir.join("home-link")).expect("intermediate home link");
+    let home = home_dir.join("home-link/real-home");
+
+    let mut opts = SpawnOptions::bundled(ScriptKind::Ok);
+    opts.extra_envs = vec![("HOME".to_owned(), home.to_string_lossy().into_owned())];
+    let child = spawn_fake_claude(opts).expect("spawn fake-claude");
+    let init = child.recv_until(Duration::from_secs(2), |v| is_system_subtype(v, "init"));
+    assert!(
+        init.is_err(),
+        "the fresh-session transcript open must fail before init"
+    );
+    let (status, stderr) = child.wait_with_stderr().expect("wait");
+    assert!(!status.success(), "the symlink refusal is a non-zero exit");
+    assert!(
+        stderr.contains("is a symlink"),
+        "stderr names the fd-walk symlink refusal, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).expect("sentinel readable"),
+        b"EXT-BYTES\n",
+        "the sink tree stays byte-identical"
+    );
+    assert!(
+        first_jsonl(&sink).is_none(),
+        "no transcript is created through the linked home"
+    );
+}
+
+/// Round 6 item 1, explicit-config variant: an explicit `CLAUDE_CONFIG_DIR`
+/// reached through an intermediate symlink (`H/cfg-link/claude`,
+/// `cfg-link -> R/cfg-sink`, `claude/` real under the sink) is pinned at the
+/// allocated ROOT and walked link-free; round 5 anchored the real final dir
+/// THROUGH the link and created files in the sink. Sink bytes stay identical.
+#[test]
+fn an_explicit_config_dir_cannot_write_through_an_intermediate_symlink() {
+    use std::os::unix::fs::symlink;
+    let root = TempHome::allocate("guard-explicit-link").expect("allocated root");
+    let sink = root.child("cfg-sink");
+    let real_config = sink.join("claude");
+    std::fs::create_dir_all(&real_config).expect("real config beyond the link");
+    let sentinel = real_config.join("sentinel.txt");
+    std::fs::write(&sentinel, b"CFG-EXT\n").expect("seed sink bytes");
+    let home = root.child("cfg-home");
+    std::fs::create_dir_all(&home).expect("parent dir");
+    symlink(&sink, home.join("cfg-link")).expect("intermediate config link");
+    let config = home.join("cfg-link/claude");
+
+    let mut opts = SpawnOptions::bundled(ScriptKind::Ok);
+    opts.extra_envs = vec![(
+        "CLAUDE_CONFIG_DIR".to_owned(),
+        config.to_string_lossy().into_owned(),
+    )];
+    let child = spawn_fake_claude(opts).expect("spawn fake-claude");
+    let init = child.recv_until(Duration::from_secs(2), |v| is_system_subtype(v, "init"));
+    assert!(
+        init.is_err(),
+        "the explicit config home must fail before init"
+    );
+    let (status, stderr) = child.wait_with_stderr().expect("wait");
+    assert!(!status.success(), "non-zero exit");
+    assert!(
+        stderr.contains("is a symlink"),
+        "stderr names the symlink refusal, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).expect("sentinel readable"),
+        b"CFG-EXT\n",
+        "the sink tree stays byte-identical"
+    );
+    assert!(
+        first_jsonl(&sink).is_none(),
+        "no transcript through the linked config dir"
+    );
+}
+
 /// Round 4 item 6: a REAL fake-process `--resume` whose target transcript is a
 /// FIFO must fail promptly (never block opening it), not hang the process.
 #[test]
@@ -243,10 +338,18 @@ fn resume_of_a_fifo_transcript_fails_without_blocking() {
         started.elapsed() < Duration::from_secs(3),
         "the fake must not block opening the FIFO"
     );
-    let status = child.wait().expect("wait");
+    // Round 6 item 6: any startup failure could make the assertions above
+    // pass. Capture stderr and require the SPECIFIC open_append_leaf refusal,
+    // so a different breakage can never masquerade as the FIFO guard.
+    let (status, stderr) = child.wait_with_stderr().expect("wait and capture stderr");
     assert!(
         !status.success(),
         "a FIFO transcript is a non-zero-exit refusal"
+    );
+    assert!(
+        stderr.contains("fake-claude") && stderr.contains("not a regular file"),
+        "stderr must carry the specific non-regular-file refusal from open_append_leaf, got: \
+         {stderr}"
     );
     // The FIFO itself remains a FIFO (never opened/written).
     let mode = std::fs::symlink_metadata(&fifo)

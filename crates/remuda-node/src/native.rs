@@ -15,39 +15,19 @@ use remuda_driver::{
 use remuda_protocol::{
     AgentKind, ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode,
     ClaudePermission, ClaudePermissionMode, CompletionScope, ContentBlock, DriverInput, DriverKind,
-    HerdrRepresentation, HerdrServer, HostId, Id, InputOrigin, InstanceId, InstanceSpec,
-    InteractionAnswer, NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput,
-    PromptMode, PtyBackend, PtyCarrier, SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock,
-    U64,
+    HerdrRepresentation, HerdrServer, HostId, Id, InputOrigin, InstanceSpec, InteractionAnswer,
+    NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput, PromptMode, PtyBackend,
+    PtyCarrier, SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock, U64,
 };
 use sha2::{Digest as _, Sha256};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::OnceLock;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-
-/// Per-instance resume-staging skipped-sidecar names, produced inside the
-/// native driver factory (which has no observation channel) and drained by the
-/// runtime observation pump (which does) right after the run starts, so each
-/// omission becomes a warning lifecycle diagnostic (affects_completion=false).
-fn staging_skipped_store() -> &'static std::sync::Mutex<BTreeMap<InstanceId, Vec<String>>> {
-    static STORE: OnceLock<std::sync::Mutex<BTreeMap<InstanceId, Vec<String>>>> = OnceLock::new();
-    STORE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
-}
-
-/// Drain and return any skipped-sidecar names recorded for `instance` during
-/// its resume materialization. Called once by the observation pump.
-pub(crate) fn take_staging_skipped_sidecars(instance: &InstanceId) -> Vec<String> {
-    staging_skipped_store()
-        .lock()
-        .map(|mut m| m.remove(instance).unwrap_or_default())
-        .unwrap_or_default()
-}
 
 /// Build the warning lifecycle payload for resume staging skipped sidecars
 /// (`affects_completion=false`): the conversation completed normally, but one
@@ -401,6 +381,10 @@ impl DriverFactory for NativeClaudeFactory {
         // runtime already refused a transcript it could not locate, so a `None`
         // here or a vanished file is a hard, explicit failure — never a silent
         // process that dies a second later with "No conversation found".
+        // Round 6 item 7: the staging result rides on the built driver and is
+        // drained/journaled by the runtime BEFORE driver.start() — a
+        // process-global side table could be dropped on the start-fails path
+        // and the notice would never appear.
         let staging_skipped: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         if let Some(session_id) = resume_session_id.as_deref() {
             let Some(source) = launch.resume_transcript.as_ref() else {
@@ -693,19 +677,13 @@ impl DriverFactory for NativeClaudeFactory {
                 )));
             }
         };
-        // Publish the collected skipped sidecars to the per-instance report
-        // the runtime observation pump drains.
-        let skipped = staging_skipped
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !skipped.is_empty()
-            && let Ok(mut store) = staging_skipped_store().lock()
-        {
-            store
-                .entry(launch.instance.meta.id.clone())
-                .or_default()
-                .extend(skipped.iter().cloned());
-        }
+        // The collected skipped sidecars ride on the adapter; the runtime
+        // drains and journals them before start() (round 6 item 7).
+        let skipped_sidecars = std::mem::take(
+            &mut *staging_skipped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         Ok(Arc::new(NativeAdapter {
             kind: self.kind,
             native,
@@ -713,6 +691,7 @@ impl DriverFactory for NativeClaudeFactory {
             resume_session_id,
             recipe: std::sync::Mutex::new(None),
             startup_error: std::sync::Mutex::new(None),
+            skipped_sidecars: std::sync::Mutex::new(skipped_sidecars),
         }))
     }
 }
@@ -910,6 +889,9 @@ struct NativeAdapter {
     resume_session_id: Option<String>,
     recipe: std::sync::Mutex<Option<remuda_driver::LaunchRecipe>>,
     startup_error: std::sync::Mutex<Option<String>>,
+    /// Skipped resume-staging sidecars, drained exactly once by the runtime
+    /// before `start()` so the warning is journaled even when start fails.
+    skipped_sidecars: std::sync::Mutex<Vec<String>>,
 }
 
 impl Driver for NativeAdapter {
@@ -957,6 +939,13 @@ impl Driver for NativeAdapter {
 
     fn startup_error(&self) -> Option<String> {
         self.startup_error.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn take_skipped_sidecars(&self) -> Vec<String> {
+        self.skipped_sidecars
+            .lock()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .unwrap_or_default()
     }
 
     /// Ask the live driver what this session can do (§4.3, §6).

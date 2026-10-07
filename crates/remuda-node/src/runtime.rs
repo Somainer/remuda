@@ -1637,22 +1637,6 @@ fn spawn_observation_pump(
     prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Round 5 part 2 item 8: emit a warning lifecycle diagnostic for any
-        // sidecars resume staging skipped (symlink/FIFO/socket/device), before
-        // the run's own observations. affects_completion=false — staging and
-        // the turn still succeed.
-        let skipped = crate::native::take_staging_skipped_sidecars(&instance_id);
-        if !skipped.is_empty() {
-            let payload = crate::native::skipped_sidecars_diagnostic(&skipped);
-            if let Err(error) = store.append_observation(
-                &instance_id,
-                None,
-                remuda_protocol::Completeness::Structured,
-                payload,
-            ) {
-                tracing::warn!(%error, "resume skipped-sidecar diagnostic not journaled");
-            }
-        }
         // D-028 §7: `MessageDisplay` deltas are the only live text an
         // agent-in-PTY session has. Folding them here — beside the journal
         // append, not in a path of their own — is what makes the 结构 view
@@ -1923,6 +1907,22 @@ async fn materialize_instance(
         "preparing",
         "driver-spawn",
     )?;
+    // Round 6 item 7: journal resume-staging skipped sidecars from the
+    // STAGING RESULT (attached to the driver at build) BEFORE start, not from
+    // the observation pump. A notice drained here is already durable when a
+    // later start fails; draining also removes it from the driver on every
+    // path (no process-global table to leak).
+    let skipped_sidecars = driver.take_skipped_sidecars();
+    if !skipped_sidecars.is_empty()
+        && let Err(error) = store.append_observation(
+            &instance_id,
+            None,
+            Completeness::Structured,
+            crate::native::skipped_sidecars_diagnostic(&skipped_sidecars),
+        )
+    {
+        tracing::warn!(%error, "resume skipped-sidecar diagnostic not journaled");
+    }
     let start_span = tracing::info_span!("driver.start");
     let start_result = {
         use tracing::Instrument;

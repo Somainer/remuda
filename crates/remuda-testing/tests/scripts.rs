@@ -202,8 +202,12 @@ fn interrupt_ends_turn_while_waiting_for_approval() {
 
 #[test]
 fn transcript_dir_appends_user_assistant_result() {
-    let dir = std::env::temp_dir().join(format!("remuda-fake-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    // Allocate a sentinel root: the fake authorises FAKE_CLAUDE_TRANSCRIPT_DIR
+    // only under an allocated root (or a fixed system temp mount), so this must
+    // not depend on the ambient `$TMPDIR` landing on `/tmp`.
+    let root = remuda_testing::sandbox::TempHome::allocate("scripts-transcript-dir")
+        .expect("allocated root");
+    let dir = root.child("transcripts");
     std::fs::create_dir_all(&dir).unwrap();
     let mut opts = SpawnOptions::bundled(ScriptKind::Ok);
     opts.transcript_dir = Some(dir.clone());
@@ -225,7 +229,6 @@ fn transcript_dir_appends_user_assistant_result() {
     assert!(body.contains("\"type\":\"assistant\""));
     assert!(body.contains("\"type\":\"result\""));
     assert!(body.contains(FIXED_SESSION_ID));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

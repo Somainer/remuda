@@ -774,11 +774,17 @@ fn codex_resume_appends_to_the_same_rollout_with_one_session_meta() {
 // Flags
 // ===========================================================================
 
-/// Round 5 part 2 item 3: a Claude resume must NOT append through a symlinked
-/// `H/projects`. A valid `<slug>/<S>.jsonl` transcript is placed in the
-/// EXTERNAL target; only the home's `projects` entry (not the whole home) is
-/// replaced by a symlink. The resume must fail with the specific symlink
-/// refusal and a non-zero exit, and the external file must stay byte-identical.
+/// Round 5 part 2 item 3 + round 6 item 4: a Claude resume must NOT append
+/// through a symlinked `H/projects`. A valid `<slug>/<S>.jsonl` transcript is
+/// placed in the EXTERNAL target; only the home's `projects` entry (not the
+/// whole home) is replaced by a symlink.
+///
+/// Round 6 hardening: the workspace is canonicalised ONCE before seeding and
+/// spawning (the child canonicalises `--cwd` at startup, so a lexical slug
+/// derived here could miss); the resume is a pure STARTUP-FAILURE case — the
+/// process exits without a single byte of input, and the test waits on exit
+/// only, asserts the specific symlink refusal in the captured stderr, a
+/// non-zero status, and byte-identical external contents.
 #[test]
 #[cfg(unix)]
 fn resume_refuses_to_append_through_a_symlinked_home_projects() {
@@ -786,26 +792,31 @@ fn resume_refuses_to_append_through_a_symlinked_home_projects() {
     let home = support::temp_home();
     let sink = support::temp_home();
 
-    // Short workspace so the external slug path stays short.
-    let workspace = std::env::temp_dir().join(format!(
-        "r5prj-{}-{}",
+    // Short workspace so the external slug path stays short; canonicalise it
+    // BEFORE anything is seeded or spawned (physical slug, like the child
+    // derives itself).
+    let workspace_raw = std::env::temp_dir().join(format!(
+        "r6prj-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0)
     ));
-    std::fs::create_dir_all(&workspace).expect("workspace");
-    let _workspace_guard = RemoveOnDrop(workspace.clone());
+    std::fs::create_dir_all(&workspace_raw).expect("workspace");
+    let workspace = std::fs::canonicalize(&workspace_raw).expect("physical workspace");
+    let _workspace_guard = RemoveOnDrop(workspace_raw.clone());
     let slug = remuda_driver::claude_transcript::encode_project_dir(&workspace);
     let session = "00000000-0000-4000-8000-000000000007";
 
     // First normal Claude run under the real home, so a valid transcript with
-    // the session exists.
+    // the session exists. Spawned IN the physical workspace with the physical
+    // `--cwd` — no lexical/physical divergence anywhere.
     {
         let mut h = HarnessBuilder::new("claude")
             .home(home.clone())
             .scenario("ok.json")
+            .cwd(workspace.clone())
             .arg("--cwd")
             .arg(workspace.to_str().unwrap())
             .arg("--session-id")
@@ -831,20 +842,26 @@ fn resume_refuses_to_append_through_a_symlinked_home_projects() {
     std::os::unix::fs::symlink(sink.join("projects"), &home_projects)
         .expect("link projects into external sink");
 
+    // The resume fails at STARTUP (open_resume happens before any input is
+    // read): send NOTHING and wait purely on exit.
     let mut h = HarnessBuilder::new("claude")
         .home(home.clone())
         .scenario("ok.json")
+        .cwd(workspace.clone())
         .arg("--cwd")
         .arg(workspace.to_str().unwrap())
         .arg("--resume")
         .arg(session)
         .spawn();
-    h.submit("second prompt");
-    // The resume must terminate promptly; it cannot complete through the link.
     let status = h.wait_status(WAIT);
     assert!(
         !status.success(),
         "resume through a symlinked H/projects must exit non-zero"
+    );
+    let output = h.captured_text();
+    assert!(
+        output.contains("fake-harness") && output.contains("is a symlink"),
+        "the specific fd-walk symlink refusal must be printed before exit, got: {output}"
     );
     let after = std::fs::read_to_string(&external_transcript).expect("transcript still readable");
     assert_eq!(

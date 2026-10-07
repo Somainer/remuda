@@ -1036,3 +1036,117 @@ async fn resume_is_accepted_while_the_predecessor_still_records_the_ins_placehol
         "the predecessor transcript was staged despite the placeholder recording"
     );
 }
+
+/// Round 6 item 7: skipped sidecars are journaled from the STAGING RESULT,
+/// before `driver.start()` — so the warning survives a launch whose process
+/// then fails to start. The old process-global map drained by the observation
+/// pump dropped the entry on exactly this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skipped_sidecars_warning_is_journaled_even_when_the_process_fails_to_start() {
+    let root_dir = tempfile::tempdir().expect("tempdir");
+    let root = root_dir.path().to_path_buf();
+    let data = root.join("data");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let binary = install_fake_claude(&root);
+    let node = compose(&serve_config(&workspace, &data, &binary)).expect("compose");
+
+    // 1) A normal predecessor run with a real transcript.
+    let parent_home = root.join("homes/gen-0");
+    std::fs::create_dir_all(&parent_home).expect("home0");
+    let parent = node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "first turn",
+            None,
+            &binary,
+            &parent_home,
+        ))
+        .await
+        .expect("parent create");
+    wait_settled(&node, &parent.command.command_id).await;
+    let parent_id = parent.instance.meta.id.clone();
+    let session = recorded_session(&node, &parent_id).await;
+    let slug_dir = transcript_in(&parent_home, &workspace, &session)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    // 2) Plant a symlinked sidecar entry the safe staging walk must skip.
+    let side_dir = slug_dir.join(&session);
+    std::fs::create_dir_all(&side_dir).expect("sidecar dir");
+    let outside = root.join("outside-side.txt");
+    std::fs::write(&outside, b"outside\n").expect("outside file");
+    std::os::unix::fs::symlink(&outside, side_dir.join("evil.jsonl")).expect("sidecar link");
+
+    // 3) A "claude" that exits immediately: staging succeeds, start() fails.
+    let broken_dir = root.join("opt/broken");
+    std::fs::create_dir_all(&broken_dir).expect("broken dir");
+    let broken = broken_dir.join("claude");
+    std::fs::write(&broken, "#!/bin/sh\nexec sh -c 'echo nothing; exit 7'\n")
+        .expect("write broken claude");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    // 4) Resume: the command settles (the launch could not start), but the
+    //    skipped-sidecar warning must already be durable.
+    let child_home = root.join("homes/gen-1");
+    std::fs::create_dir_all(&child_home).expect("home1");
+    let child = node
+        .create_instance(request(
+            DriverKind::ClaudePrint,
+            "continue",
+            Some((&parent_id, session.as_str())),
+            &broken,
+            &child_home,
+        ))
+        .await
+        .expect("the resume is accepted (staging succeeds before start)");
+    wait_settled(&node, &child.command.command_id).await;
+
+    // 5) The warning diagnostic is in the journal regardless of start failure.
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let page = node
+                .read_journal(&child.instance.journal_id, None, 4096)
+                .expect("read journal");
+            let hit = page.events.iter().any(|event| {
+                let remuda_protocol::JournalEvent::Instance(observation) = event else {
+                    return false;
+                };
+                let remuda_protocol::ObservationPayload::Lifecycle(payload) = &observation.body
+                else {
+                    return false;
+                };
+                let remuda_protocol::LifecyclePayload::Native(native) = payload.as_ref() else {
+                    return false;
+                };
+                native.native_name == "resume_staging"
+                    && native
+                        .related_ids
+                        .get("skippedSidecars")
+                        .is_some_and(|value| {
+                            value.contains("symlink") && value.contains("evil.jsonl")
+                        })
+            });
+            if hit {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    found.expect("the skipped-sidecars warning is journaled before the failed start");
+    // Staging itself did its real job, including the skip report.
+    assert!(
+        transcript_in(&child_home, &workspace, &session).is_file(),
+        "the transcript was staged even though the process failed to start"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "outside\n",
+        "the skipped symlink target is never touched"
+    );
+}

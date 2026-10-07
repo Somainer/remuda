@@ -426,6 +426,17 @@ export const HomeList = memo(function HomeList() {
                           >
                             {row.body}
                           </span>
+                          {row.noticeEntries ? (
+                            <span
+                              className={css.rowNotice}
+                              data-testid="home-row-skipped-sidecars"
+                              data-error="0"
+                              data-entries={row.noticeEntries.join(",")}
+                              title={`恢复时跳过了 ${row.noticeEntries.length} 个非普通文件侧车（未复制）：\n${row.noticeEntries.join("\n")}`}
+                            >
+                              {`跳过 ${row.noticeEntries.length} 个侧车文件（不影响本次会话）`}
+                            </span>
+                          ) : null}
                         </span>
                         <span className={css.rowTime} title={row.updatedAt}>
                           {row.timeLabel}

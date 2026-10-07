@@ -2031,3 +2031,375 @@ async fn subagent_drill_in_reaches_the_node_over_the_wss_carrier() {
     link.shutdown().await;
     hub.shutdown().await;
 }
+
+/// c-cardsettle r7 item 4 — the REAL failed-first-turn lifecycle, no hand-built
+/// JSON anywhere: a fake SDK child (fake-claude speaking the print/SDK
+/// stream-json stdout protocol) driven through the REAL claude-sdk driver,
+/// Node runtime, WSS uplink and Hub projection.
+///
+///  1. The driver's init frame leaves the instance running.
+///  2. Turn one raises a `can_use_tool` pending approval visible in the Hub.
+///  3. The turn ends with a FAILED result: the root turn idles, the process
+///     stays ALIVE, and the card is STILL pending.
+///  4. A second prompt is delivered — receipt is verified IN THE CHILD via the
+///     transcript the fake appends.
+///  5. Only the driver's OWN exit (stdin close → child exits → print
+///     emit_exit("exited")) marks the instance Exited and invalidates the
+///     card, on that transition only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sdk_failed_first_turn_keeps_child_and_card_until_the_driver_exit() {
+    use remuda_node::{DevServerConfig, LocalDrivers, NativeDriverConfig, ServeConfig, compose};
+    use remuda_testing::ensure_workspace_bin;
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let transcript_dir = dir.path().join("transcripts");
+    std::fs::create_dir_all(&transcript_dir).expect("transcript dir");
+
+    // The fake child's two-turn script. Turn 1: pending approval, then a
+    // FAILED result and a turn barrier (the child keeps reading stdin — this
+    // is the SDK carrier, it never exits on a result). Turn 2: one more turn
+    // after the retry prompt. No `expect`: the approval stays unanswered,
+    // exactly like an owner who never clicked.
+    let script_path = dir.path().join("failed-first-turn.jsonl");
+    std::fs::write(
+        &script_path,
+        r#"{"type":"assistant","message":{"id":"msg_r7_turn1","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"tool_use","id":"toolu_r7_bash","name":"Bash","input":{"command":"rm -rf /none"}}],"session_id":"__SESSION__","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"}}
+{"type":"control_request","request_id":"perm-r7-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"rm -rf /none"},"tool_use_id":"toolu_r7_bash"}}
+{"type":"result","subtype":"success","is_error":true,"duration_ms":1,"duration_api_ms":1,"num_turns":1,"result":"model returned an error","stop_reason":"error","total_cost_usd":0,"usage":{"input_tokens":1,"output_tokens":1},"modelUsage":{},"permission_denials":[],"session_id":"__SESSION__","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2","result_index":0}
+{"turn":"end"}
+{"type":"assistant","message":{"id":"msg_r7_turn2","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Retried OK."}],"session_id":"__SESSION__","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3"}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1,"duration_api_ms":1,"num_turns":2,"result":"Retried OK.","stop_reason":"end_turn","total_cost_usd":0,"usage":{"input_tokens":2,"output_tokens":2},"modelUsage":{},"permission_denials":[],"session_id":"__SESSION__","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4","result_index":1}
+{"turn":"end"}
+"#,
+    )
+    .expect("write script");
+
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub")))
+        .await
+        .expect("hub");
+
+    let mut node_http = DevServerConfig::loopback(0);
+    node_http.workspace_root = workspace;
+    node_http.workspace_roots = Some(remuda_testing::test_workspace_roots!());
+    let mut native = NativeDriverConfig::new(dir.path().join("node"))
+        .with_claude_binary(ensure_workspace_bin("fake-claude"));
+    native.extra_env.insert(
+        "FAKE_CLAUDE_SCRIPT".into(),
+        script_path.to_string_lossy().into_owned(),
+    );
+    // The fake appends every user frame it receives here: receipt is verified
+    // inside the child, not inferred from the command ledger.
+    native.extra_env.insert(
+        "FAKE_CLAUDE_TRANSCRIPT_DIR".into(),
+        transcript_dir.to_string_lossy().into_owned(),
+    );
+    let node = compose(&ServeConfig {
+        http: node_http,
+        data_dir: dir.path().join("node"),
+        drivers: LocalDrivers::Native(native),
+    })
+    .expect("compose native node");
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let mut config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone());
+    config.backoff = Backoff {
+        initial: Duration::from_millis(5),
+        max: Duration::from_millis(20),
+        jitter_ppt: 0,
+    };
+    let query = node.clone();
+    let _link = tokio::time::timeout(SLOW_TIMEOUT, WssLink::connect_runtime(config, node))
+        .await
+        .expect("connect timeout")
+        .expect("wss runtime connect");
+
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+
+    // Native-login profile the real materializer needs.
+    let provider = json!({
+        "name": "dummy-gateway",
+        "kind": "gateway",
+        "baseUrl": "http://127.0.0.1:1",
+        "authToken": "sk-fake-test-gateway-token",
+        "defaultGateway": true
+    })
+    .to_string();
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers",
+        &[("Cookie", cookie.as_str())],
+        Some(&provider),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let profile_id = serde_json::from_str::<Value>(body.trim()).expect("provider json")["id"]
+        .as_str()
+        .expect("provider id")
+        .to_owned();
+
+    let create = json!({
+        "hostId": host_id,
+        "kind": "claude",
+        "driver": "claude-sdk",
+        "model": "fake",
+        "providerProfileId": profile_id,
+        "permissionMode": "bypassPermissions",
+        "prompt": "r7 initial prompt"
+    })
+    .to_string();
+    let (status, body) = tokio::time::timeout(
+        SLOW_TIMEOUT,
+        http(
+            hub.addr,
+            "POST",
+            "/v1/instances",
+            &[("Cookie", cookie.as_str())],
+            Some(&create),
+        ),
+    )
+    .await
+    .expect("create timeout");
+    assert_eq!(status, 200, "{body}");
+    let instance_id = serde_json::from_str::<Value>(body.trim()).expect("create json")["instance"]
+        ["instanceId"]
+        .as_str()
+        .expect("instanceId")
+        .to_owned();
+    let instance_path = format!("/v1/instances/{instance_id}");
+    let interactions_path = format!("/v1/interactions?instanceId={instance_id}");
+
+    let get_json = |path: String| {
+        let cookie = cookie.clone();
+        async move {
+            let (status, body) =
+                http(hub.addr, "GET", &path, &[("Cookie", cookie.as_str())], None).await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str::<Value>(body.trim()).expect("json")
+        }
+    };
+
+    // Poll helper until `pred` holds on the instance JSON.
+    async fn wait_for_instance<F>(
+        addr: std::net::SocketAddr,
+        cookie: &str,
+        path: &str,
+        what: &str,
+        mut pred: F,
+    ) -> Value
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
+        loop {
+            let (status, body) = http(addr, "GET", path, &[("Cookie", cookie)], None).await;
+            assert_eq!(status, 200, "{body}");
+            let value = serde_json::from_str::<Value>(body.trim()).expect("instance json");
+            if pred(&value) {
+                return value;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}; last={value}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // 1) The SDK child starts and stays live.
+    let live = wait_for_instance(
+        hub.addr,
+        &cookie,
+        &instance_path,
+        "a live sdk instance",
+        |v| matches!(v["lifecycle"].as_str(), Some("ready") | Some("running")),
+    )
+    .await;
+    assert!(
+        !matches!(live["lifecycle"].as_str(), Some("exited") | Some("failed")),
+        "the init frame never ends the instance: {live}"
+    );
+
+    // 2) The pending approval card becomes visible in the Hub.
+    let deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
+    let approval_id = loop {
+        let page = get_json(interactions_path.clone()).await;
+        let found = page["items"].as_array().into_iter().flatten().find(|item| {
+            // The Hub mints the public interaction id; the child's request id
+            // rides the raw event's nativeEventId (perm-r7-bash).
+            item["state"].as_str() == Some("pending")
+                && item["blocking"].as_bool() == Some(true)
+                && item["event"]["source"]["nativeRequestId"]["value"].as_str()
+                    == Some("perm-r7-bash")
+        });
+        if let Some(item) = found {
+            break item["interactionId"].as_str().unwrap().to_owned();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "approval never appeared: {page}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // 3) The FAILED first turn: root turn idles, process alive, card pending.
+    let after_fail = wait_for_instance(
+        hub.addr,
+        &cookie,
+        &instance_path,
+        "the failed turn to idle",
+        |v| v["activity"].as_str() == Some("idle"),
+    )
+    .await;
+    assert!(
+        matches!(
+            after_fail["lifecycle"].as_str(),
+            Some("ready") | Some("running")
+        ),
+        "a failed result is turn-level, not a process end: {after_fail}"
+    );
+    // The process is alive on the Node side too (not failed/exited there).
+    let node_instance = query
+        .get_instance(&instance_id.parse().expect("id"))
+        .expect("node still lists the instance");
+    assert!(
+        !matches!(
+            node_instance.lifecycle,
+            remuda_protocol::InstanceLifecycle::Exited | remuda_protocol::InstanceLifecycle::Failed
+        ),
+        "the node child is alive after the failed turn: {:?}",
+        node_instance.lifecycle
+    );
+    let page = get_json(interactions_path.clone()).await;
+    assert!(
+        page["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|item| item["interactionId"].as_str() == Some(&approval_id)
+                && item["state"].as_str() == Some("pending")),
+        "the approval is STILL pending after the failed turn: {page}"
+    );
+
+    // 4) The next prompt really reaches the child: the fake appends the
+    // incoming user frame to its transcript file.
+    let retry_prompt = format!("r7 retry prompt {}", uuid::Uuid::now_v7());
+    let send = json!({
+        "operation": "instance.send",
+        "payload": {
+            "input": { "type": "prompt", "mode": "new-turn", "text": retry_prompt }
+        }
+    })
+    .to_string();
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        &format!("{instance_path}/commands"),
+        &[("Cookie", cookie.as_str())],
+        Some(&send),
+    )
+    .await;
+    assert_eq!(status, 200, "the live child accepts the retry: {body}");
+
+    let transcript_deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
+    loop {
+        let mut seen = String::new();
+        if let Ok(readdir) = std::fs::read_dir(&transcript_dir) {
+            for entry in readdir.flatten() {
+                if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                    seen.push_str(&text);
+                }
+            }
+        }
+        if seen.contains(&retry_prompt) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < transcript_deadline,
+            "the child never received the retry prompt in its transcript"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The second turn completes; the instance is still live and the card is
+    // STILL pending (a successful turn does not settle an unanswered approval).
+    let _still_live = wait_for_instance(
+        hub.addr,
+        &cookie,
+        &instance_path,
+        "turn two to settle the prompt",
+        |v| v["lifecycle"].as_str() == Some("running") || v["lifecycle"].as_str() == Some("ready"),
+    )
+    .await;
+    // Give the second result a moment to land, then re-assert the invariants.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let page = get_json(interactions_path.clone()).await;
+    assert!(
+        page["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|item| item["interactionId"].as_str() == Some(&approval_id)
+                && item["state"].as_str() == Some("pending")),
+        "the card stays pending through the successful retry: {page}"
+    );
+    let before_exit = wait_for_instance(
+        hub.addr,
+        &cookie,
+        &instance_path,
+        "the pre-exit read",
+        |_| true,
+    )
+    .await;
+    assert!(
+        matches!(
+            before_exit["lifecycle"].as_str(),
+            Some("ready") | Some("running")
+        ),
+        "the instance is still alive before its own exit: {before_exit}"
+    );
+
+    // 5) The driver's OWN exit: close releases stdin; the fake child exits and
+    // print emit_exit("exited") is the only thing that ends the instance and
+    // invalidates the card.
+    let close = json!({ "operation": "instance.close", "payload": {} }).to_string();
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        &format!("{instance_path}/commands"),
+        &[("Cookie", cookie.as_str())],
+        Some(&close),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let exited = wait_for_instance(
+        hub.addr,
+        &cookie,
+        &instance_path,
+        "the driver exit to reach Exited",
+        |v| v["lifecycle"].as_str() == Some("exited"),
+    )
+    .await;
+    assert_eq!(exited["lifecycle"], "exited");
+
+    let deadline = tokio::time::Instant::now() + SLOW_TIMEOUT;
+    loop {
+        let page = get_json(interactions_path.clone()).await;
+        let invalidated = page["items"].as_array().into_iter().flatten().any(|item| {
+            item["interactionId"].as_str() == Some(&approval_id)
+                && item["state"].as_str() == Some("invalidated")
+        });
+        if invalidated {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "card never invalidated: {page}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = hub.shutdown().await;
+}

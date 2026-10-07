@@ -206,6 +206,18 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   await chip.click();
   const popover = page.getByTestId("context-usage-popover");
   await expect(popover).toBeVisible();
+  // The card (not the chip beneath) is the topmost thing at its own centre:
+  // the element at the point must be the popover or one of its descendants.
+  const box = await popover.boundingBox();
+  expect(box).not.toBeNull();
+  const inside = await page.evaluate(
+    ({ x, y }) => {
+      const el = document.elementFromPoint(x, y);
+      return !!el?.closest('[data-testid="context-usage-popover"]');
+    },
+    { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 },
+  );
+  expect(inside, "panel centre must hit the popover, not the chip beneath").toBe(true);
   await expect(page.getByTestId("context-usage-headline")).toHaveText(
     "上下文 34.3k/200.0k (17%)",
   );
@@ -284,6 +296,18 @@ test("context chip popover becomes a sheet at 390 px touch width", async ({ brow
     const sheet = narrow.getByTestId("context-usage-popover");
     await expect(sheet).toBeVisible();
     await expect(sheet).toHaveAttribute("data-mobile", "1");
+    // The sheet (not composer/chip beneath) is topmost near its top: the hit
+    // element must be the sheet or a descendant.
+    const sheetBox = await sheet.boundingBox();
+    expect(sheetBox).not.toBeNull();
+    const sheetInside = await narrow.evaluate(
+      ({ x, y }) => {
+        const el = document.elementFromPoint(x, y);
+        return !!el?.closest('[data-testid="context-usage-popover"]');
+      },
+      { x: sheetBox!.x + sheetBox!.width / 2, y: sheetBox!.y + 24 },
+    );
+    expect(sheetInside, "sheet must be topmost over composer").toBe(true);
     // Close affordance exists and dismisses the sheet.
     await narrow.getByTestId("context-usage-close").click();
     await expect(sheet).toHaveCount(0);

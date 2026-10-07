@@ -167,6 +167,15 @@ export function DirBrowser({ hostId, open, disabled, onClose, onRegistered }: Pr
           if (event.key !== "Enter") return;
           const target = event.target as HTMLElement | null;
           if (target?.tagName !== "INPUT") return;
+          // IME composition (confirming a Chinese/Japanese candidate) also
+          // fires keyDown Enter with isComposing / keyCode 229; that Enter
+          // belongs to the input method, not the form — swallowing it would
+          // submit an unfinished path or flash a premature error (r7 item 3).
+          // The replaced registration input excluded composing Enter for
+          // exactly this reason.
+          if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) {
+            return;
+          }
           event.preventDefault();
           event.stopPropagation();
           if (

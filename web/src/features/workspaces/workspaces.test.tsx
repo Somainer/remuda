@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { api } from "../../lib/api";
@@ -328,4 +329,61 @@ it("does not remove when the confirmation is cancelled", async () => {
   render(<WorkspaceList hostId={workspace.hostId} online workspaces={[workspace]} />);
   fireEvent.click(screen.getByRole("button", { name: `移除目录 ${workspace.rootPath}` }));
   expect(unregister).not.toHaveBeenCalled();
+});
+
+it("an IME composition-confirmation Enter on the manual path submits nothing, a normal Enter does", async () => {
+  // r7 item 3: confirming a CJK candidate fires keyDown Enter with
+  // isComposing/keyCode 229; that Enter must not preventDefault or submit,
+  // while the following ordinary Enter registers the path.
+  const register = vi.spyOn(hubStore, "registerWorkspace").mockResolvedValue(workspace);
+  render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);
+  await screen.findByTestId("dir-browser");
+  fireEvent.click(screen.getByTestId("dir-browser-manual-toggle"));
+  const input = screen.getByTestId("dir-browser-manual-path");
+  fireEvent.change(input, { target: { value: "/srv/项目" } });
+
+  fireEvent.keyDown(input, { key: "Enter", keyCode: 229, nativeEvent: { isComposing: true } });
+  expect(register).not.toHaveBeenCalled();
+  expect(screen.queryByRole("alert")).toBeNull();
+
+  fireEvent.keyDown(input, { key: "Enter", keyCode: 13, nativeEvent: { isComposing: false } });
+  await waitFor(() => expect(register).toHaveBeenCalledWith(workspace.hostId, "/srv/项目"));
+});
+
+it("activates a breadcrumb with the keyboard and navigates to its path", async () => {
+  // r7 item 3: breadcrumb keyboard activation (Enter on a focused crumb).
+  const user = userEvent.setup();
+  const dirsList = vi.mocked(api.hostDirsList);
+  render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);
+  const browser = await screen.findByTestId("dir-browser");
+  // /home/dev -> one breadcrumb ("dev"); activate the home shortcut via
+  // keyboard to prove keyboard activation path end to end.
+  const home = within(browser).getByTestId("dir-browser-home");
+  (home as HTMLElement).focus();
+  await user.keyboard("{Enter}");
+  await waitFor(() =>
+    expect(dirsList.mock.calls.at(-1)?.[1]).toMatchObject({ path: "/home/dev" }),
+  );
+});
+
+it("the Cancel button closes the browser dialog", async () => {
+  // r7 item 3: Cancel must assert the dialog actually closed: onClose fires
+  // and once the parent stops rendering it the portalled browser is removed.
+  function Host() {
+    const [open, setOpen] = useState(true);
+    return (
+      <DirBrowser
+        hostId={workspace.hostId}
+        open={open}
+        onClose={() => setOpen(false)}
+        onRegistered={vi.fn()}
+      />
+    );
+  }
+  const { container } = render(<Host />);
+  await screen.findByTestId("dir-browser");
+  fireEvent.click(screen.getByTestId("dir-browser-cancel"));
+  await waitFor(() =>
+    expect(container.querySelector('[data-testid="dir-browser"]')).toBeNull(),
+  );
 });

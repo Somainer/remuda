@@ -29,6 +29,9 @@ mod interactions;
 /// Test-only seam for the D-051 delegated-decisions feature switch.
 #[doc(hidden)]
 pub use interactions::delegated_decisions_test_support;
+/// Test-only seam for the D-057 continuation-resume race.
+#[doc(hidden)]
+pub use store::lineage_test_support;
 mod inventory;
 mod maintenance;
 mod model_catalog;
@@ -140,6 +143,9 @@ pub mod store_test_support {
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
 
+    /// D-057 continuation-resume inputs/outcomes for the race suite.
+    pub use crate::store::{ContinuationResumeRequest, ContinuationResumeResult};
+
     /// A leaf-worker delegation scoped to one project.
     pub fn leaf_delegation(project_id: &str) -> Result<InstanceDelegation, String> {
         let project = remuda_protocol::ProjectId::try_from(project_id.to_string())
@@ -153,6 +159,7 @@ pub mod store_test_support {
             grants: Vec::new(),
             task_id: None,
             enforce_tree: true,
+            restart: None,
         })
     }
 

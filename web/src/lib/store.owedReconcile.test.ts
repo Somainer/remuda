@@ -138,17 +138,14 @@ it("a delivered row whose follow owner is rebound to another session still gets 
   await vi.waitFor(() =>
     expect(["offline", "recovering"]).toContain(hubStore.connectionState),
   );
-  console.error("P1 state", hubStore.connectionState, "bound", (hubStore as unknown as { connectionBoundTo: string | null }).connectionBoundTo);
 
   // send() persists even offline; an explicit flush delivers it. The drain
   // job runs on A's free chain, sees A's bound follow own recovery, records
   // the debt, and skips its own REST read.
   await hubStore.send(A, "owed rebind");
   void internals.flushAllOutbox();
-  await vi.waitFor(() => expect(api.instanceSend).toHaveBeenCalledTimes(1), { timeout: 2000 });
-  console.error("P2 posted; state", hubStore.connectionState);
+  await vi.waitFor(() => expect(api.instanceSend).toHaveBeenCalledTimes(1), { timeout: 2_000 });
   await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(true), { timeout: 3_000 });
-  console.error("P3 debt");
   const cid = ((api.instanceSend as unknown as { mock: { calls: unknown[][] } }).mock.calls[0]?.[4] as string) ?? "";
   expect(cid).toBeTruthy();
 
@@ -198,11 +195,8 @@ it("a delivered row whose follow owner is rebound to another session still gets 
   // Open B live → bind A→B → the abandoned A instance gets its coalesced REST
   // fallback now, independent of the machine now bound to B.
   await hubStore.follow(B);
-  console.error("P4 after follow B call; state", hubStore.connectionState);
-  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"), { timeout: 3000 });
-  console.error("P5 B live; bound", (hubStore as unknown as { connectionBoundTo: string | null }).connectionBoundTo);
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"), { timeout: 3_000 });
   await vi.waitFor(() => expect(aFallback).toHaveBeenCalled(), { timeout: 5_000 });
-  console.error("P6 fallback called");
   await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(false), { timeout: 5_000 });
   await vi.waitFor(() => expect(internals.outbox.get(cid)?.state).toBe("done"), { timeout: 5_000 });
 

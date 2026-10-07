@@ -15,6 +15,9 @@ import { login } from "./hub-auth";
  */
 
 test.describe.configure({ mode: "serial" });
+// The usage sentinel is served by the in-process fake Node; an external hub
+// cannot reproduce it (same gate as api-route.hub.spec.ts).
+test.skip(process.env.HUB_E2E_EXTERNAL === "1", "needs the in-process fake Nodes");
 
 const evidence =
   process.env.REMUDA_EVIDENCE === "1"
@@ -77,6 +80,9 @@ async function createReadySession(page: Page): Promise<string> {
   const res = await creating;
   expect(res.ok(), `instance create failed: ${res.status()}`).toBe(true);
   const instanceId = (await res.json()).instance.instanceId as string;
+  // Register for guaranteed cleanup BEFORE any further step that could fail
+  // (navigation/approval waits). The DELETE is idempotent.
+  created.push(instanceId);
   await expect(page).toHaveURL(new RegExp(`/s/${instanceId}`), { timeout: 20_000 });
 
   // The create-time approval keeps the composer disabled until answered.
@@ -181,8 +187,10 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   page,
 }, testInfo) => {
   test.setTimeout(180_000);
+  // Pin the desktop geometry explicitly — the chip's popover anchor and
+  // hit-testing are geometry-dependent; never rely on the config default.
+  await page.setViewportSize({ width: 1440, height: 900 });
   const instanceId = await createReadySession(page);
-  created.push(instanceId);
 
   // Before any usage observation the chip is an empty ring with a dash and
   // cannot open a popover.
@@ -282,7 +290,6 @@ test("context chip popover becomes a sheet at 390 px touch width", async ({ brow
   try {
     await login(narrow);
     const instanceId = await createReadySession(narrow);
-    created.push(instanceId);
     await sendUsageTurn(narrow, "4794,260,29496,0", false, true);
     // D-042 (c-composer): at compact widths the context chip rides inside the
     // composer options sheet, not the collapsed bar. Open the sheet first.

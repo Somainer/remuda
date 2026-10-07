@@ -15,19 +15,69 @@ use remuda_driver::{
 use remuda_protocol::{
     AgentKind, ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode,
     ClaudePermission, ClaudePermissionMode, CompletionScope, ContentBlock, DriverInput, DriverKind,
-    HerdrRepresentation, HerdrServer, HostId, Id, InputOrigin, InstanceSpec, InteractionAnswer,
-    NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput, PromptMode, PtyBackend,
-    PtyCarrier, SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock, U64,
+    HerdrRepresentation, HerdrServer, HostId, Id, InputOrigin, InstanceId, InstanceSpec,
+    InteractionAnswer, NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput,
+    PromptMode, PtyBackend, PtyCarrier, SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock,
+    U64,
 };
 use sha2::{Digest as _, Sha256};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
+
+/// Per-instance resume-staging skipped-sidecar names, produced inside the
+/// native driver factory (which has no observation channel) and drained by the
+/// runtime observation pump (which does) right after the run starts, so each
+/// omission becomes a warning lifecycle diagnostic (affects_completion=false).
+fn staging_skipped_store() -> &'static std::sync::Mutex<BTreeMap<InstanceId, Vec<String>>> {
+    static STORE: OnceLock<std::sync::Mutex<BTreeMap<InstanceId, Vec<String>>>> = OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Drain and return any skipped-sidecar names recorded for `instance` during
+/// its resume materialization. Called once by the observation pump.
+pub(crate) fn take_staging_skipped_sidecars(instance: &InstanceId) -> Vec<String> {
+    staging_skipped_store()
+        .lock()
+        .map(|mut m| m.remove(instance).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// Build the warning lifecycle payload for resume staging skipped sidecars
+/// (`affects_completion=false`): the conversation completed normally, but one
+/// or more non-regular/symlinked sidecars were not copied into the new home.
+pub(crate) fn skipped_sidecars_diagnostic(
+    skipped: &[String],
+) -> remuda_protocol::ObservationPayload {
+    use remuda_protocol::{
+        Knowledge, LifecyclePayload, LifecycleTopic, NativeLifecycle, ObservationPayload, Severity,
+    };
+    ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+        NativeLifecycle {
+            topic: LifecycleTopic::Diagnostic,
+            native_name: "resume_staging".to_owned(),
+            native_id: Knowledge::NotApplicable,
+            status: Knowledge::Known {
+                value: "skipped-sidecars".to_owned(),
+            },
+            related_ids: [
+                ("severity".to_owned(), "warning".to_owned()),
+                ("skippedSidecars".to_owned(), skipped.join(",")),
+            ]
+            .into_iter()
+            .collect(),
+            data_ref: None,
+            severity: Severity::Warning,
+            affects_completion: false,
+        },
+    ))))
+}
 
 /// Filesystem and binary settings shared by native Claude driver factories.
 #[derive(Debug, Clone)]
@@ -351,6 +401,7 @@ impl DriverFactory for NativeClaudeFactory {
         // runtime already refused a transcript it could not locate, so a `None`
         // here or a vanished file is a hard, explicit failure — never a silent
         // process that dies a second later with "No conversation found".
+        let staging_skipped: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         if let Some(session_id) = resume_session_id.as_deref() {
             let Some(source) = launch.resume_transcript.as_ref() else {
                 return Err(DriverError::Failed(format!(
@@ -367,17 +418,22 @@ impl DriverFactory for NativeClaudeFactory {
                 DriverError::Failed(format!("cannot resume session {session_id}: {error}"))
             })?;
             // Surface every skipped sidecar (a symlink/FIFO/socket/device the
-            // safe staging walk refused to copy) as a production launch
-            // diagnostic — staging still succeeds, but the omission must never
-            // be silent.
-            for entry in &staged.skipped {
+            // safe staging walk refused to copy) as a production native
+            // lifecycle diagnostic with affects_completion=false: staging
+            // succeeds, the turn completes, but the omission is reported on the
+            // instance's event stream (and mirrored to the log).
+            if !staged.skipped.is_empty() {
                 tracing::warn!(
                     instance_id = %launch.instance.meta.id.as_id(),
                     %session_id,
-                    skipped_sidecar = %entry,
-                    "resume staging skipped a non-regular or symlinked sidecar; it was not copied \
+                    skipped = ?staged.skipped,
+                    "resume staging skipped non-regular/symlinked sidecars; they were not copied \
                      into the new native home"
                 );
+                staging_skipped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(staged.skipped.iter().cloned());
             }
         }
         let spec = instance_spec(&launch, &self.config, &profile)?;
@@ -637,6 +693,19 @@ impl DriverFactory for NativeClaudeFactory {
                 )));
             }
         };
+        // Publish the collected skipped sidecars to the per-instance report
+        // the runtime observation pump drains.
+        let skipped = staging_skipped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !skipped.is_empty()
+            && let Ok(mut store) = staging_skipped_store().lock()
+        {
+            store
+                .entry(launch.instance.meta.id.clone())
+                .or_default()
+                .extend(skipped.iter().cloned());
+        }
         Ok(Arc::new(NativeAdapter {
             kind: self.kind,
             native,

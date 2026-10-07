@@ -96,6 +96,24 @@ fn invalid_input(message: impl Into<String>) -> std::io::Error {
 /// the staging walk requires a real file/directory). Same kind the
 /// descriptor-relative walk itself returns, so callers cannot distinguish a
 /// walk-level refusal from an explicit one.
+/// Validate the sidecar roots (`<session>/` and `memory/`) under an inherited
+/// destination slug dir: each present root must be a real directory reached
+/// through pinned fds (a symlink is refused). Guards the inherited-home
+/// no-op's two known sidecar entry points.
+fn validate_inherited_sidecar_roots(dest_dir_fd: &DirFd, session_id: &str) -> std::io::Result<()> {
+    for root in [session_id, "memory"] {
+        if let Some(entry) = dest_dir_fd.classify_leaf(root.as_bytes())?
+            && entry.kind != LeafKind::Directory
+        {
+            return Err(symlink_refused(format!(
+                "inherited resume sidecar root {root} is a symlink or non-directory; refusing the \
+                 no-op"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn symlink_refused(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::PermissionDenied, message.into())
 }
@@ -669,11 +687,21 @@ impl StagingProvenance {
 
 /// One verified file in the private temp tree. `rel` is relative to the slug
 /// directory, `/`-separated, e.g. `<S>/subagents/side.jsonl` or `<S>.jsonl`.
+///
+/// `src_identity` is the `(dev,ino)` of the SOURCE leaf this entry was
+/// streamed from. It is `#[serde(skip)]` (not persisted to the manifest) and
+/// used only at publish time to detect a destination that is a hardlink to
+/// the predecessor: such a destination shares bytes but is a foreign inode and
+/// must be replaced by the independent staged copy.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ManifestEntry {
     rel: String,
     size: u64,
     sha256: String,
+    /// `(dev, ino)` of the source leaf; `None` when reconstructed from the
+    /// serialized manifest (verification then relies on size+sha only).
+    #[serde(skip)]
+    src_identity: Option<(u64, u64)>,
 }
 
 /// The complete temp-tree manifest, verified before anything is published.
@@ -698,19 +726,14 @@ fn stage_for_resume_with_limits(
         )));
     }
 
-    // ---- Source: pin the predecessor project dir, component by component
-    // from `/`, and open the transcript as a real regular leaf. No symlink
-    // component anywhere on the path is followed.
+    // ---- Source: pin the predecessor HOME as the trusted root and WALK the
+    // `projects/<slug>` descendants with O_NOFOLLOW, then open the transcript
+    // as a real regular leaf. A symlinked `projects`/`<slug>` component — e.g.
+    // `predecessor-home/projects -> /outside` — fails the walk instead of
+    // letting staging copy an outside tree (round 5 part 2 item 1).
     let source_abs = absolutize(source_transcript);
-    let source_dir_path = source_abs
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| {
-            invalid_input(format!(
-                "resume transcript path has no parent directory: {}",
-                source_abs.display()
-            ))
-        })?;
+    let source_parts: Vec<std::ffi::OsString> =
+        source_abs.iter().map(std::ffi::OsString::from).collect();
     let source_name = source_abs
         .file_name()
         .map(std::ffi::OsString::from)
@@ -720,19 +743,7 @@ fn stage_for_resume_with_limits(
                 source_abs.display()
             ))
         })?;
-    let src_dir_fd = DirFd::anchor_existing(source_dir_path).map_err(|error| {
-        if error.kind == FdErrorKind::Missing {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "resume transcript not found at {}: the predecessor directory does not exist",
-                    source_abs.display()
-                ),
-            )
-        } else {
-            error.into()
-        }
-    })?;
+    let src_dir_fd = source_project_dir_fd(&source_abs, &source_parts)?;
     let src_leaf = src_dir_fd.open_regular_leaf(source_name.as_bytes()).map_err(|error| {
         if error.kind == FdErrorKind::Missing {
             std::io::Error::new(
@@ -794,10 +805,13 @@ fn stage_for_resume_with_limits(
             if dest_leaf.identity()? == src_identity
                 && Some(dest_dir_identity) == src_dir_fd.dir_identity().ok()
             {
-                // Same file in the SAME inherited project directory: the
-                // conversation already lives exactly where the new process
-                // looks. A cross-home hardlink (different directory fd) is
-                // NOT a no-op and falls through to be copied fresh.
+                // Same file in the SAME inherited project directory. Round 5
+                // part 2 item 5: even the inherited-home no-op must not return
+                // before validating that the `<S>/` and `memory/` sidecar
+                // roots present under the destination are real directories
+                // (never symlinks). The transcript itself is already proven a
+                // real regular leaf above.
+                validate_inherited_sidecar_roots(&dest_dir_fd, session_id)?;
                 return Ok(StagedResume {
                     transcript: dest_transcript,
                     sidecar_dirs: Vec::new(),
@@ -930,6 +944,7 @@ fn build_verify_and_publish(
         rel: transcript_name.to_owned(),
         size: streamed.bytes,
         sha256: transcript_sha.clone(),
+        src_identity: Some(transcript_leaf_identity),
     });
 
     // (2) Sidecar roots. `<dir>/<S>/` first (a renamed transcript keeps the
@@ -1022,18 +1037,36 @@ fn build_verify_and_publish(
     // (a crash in the publish window) is RECOVERABLE — re-hash the bytes at
     // the destination and accept them only if they are exactly the bytes the
     // current source streamed.
-    if retained {
-        // The marker binds the PUBLISHED transcript, whose size is the number
-        // of bytes actually streamed.
+    // Decide whether to publish the fresh staged transcript over an existing
+    // destination. Markerless recovery MUST replace the foreign inode (it may
+    // be a hardlink to an unrelated outside file with identical bytes); a
+    // marker-matched independent file is kept.
+    #[derive(PartialEq, Eq)]
+    enum TranscriptPublish {
+        RenameOver,
+        KeepExisting,
+    }
+    let transcript_publish = if !retained {
+        TranscriptPublish::RenameOver
+    } else {
         let published_size = seeds
             .iter()
             .find(|seed| seed.rel == transcript_name)
             .map_or(source_size, |seed| seed.size);
         match read_staging_provenance(dest_dir_fd, transcript_name)? {
-            // A marker that covers the predecessor we just streamed: keep it.
-            Some(marker) if marker.covers(source_transcript, published_size, &transcript_sha) => {}
-            // A marker that names different bytes/source is a definitive
-            // conflict; do NOT byte-recover over an existing marker.
+            // A marker covering the predecessor we just streamed. Keep the
+            // existing inode only if it is independent (nlink == 1) and its
+            // inode did not change to the source's inode; otherwise replace it
+            // so the published inode is ours (round 5 part 2 item 3).
+            Some(marker) if marker.covers(source_transcript, published_size, &transcript_sha) => {
+                let dest_leaf = dest_dir_fd.open_regular_leaf(transcript_name.as_bytes())?;
+                let same_as_source = dest_leaf.identity()? == transcript_leaf_identity;
+                if same_as_source || dest_leaf.nlink()? > 1 {
+                    TranscriptPublish::RenameOver
+                } else {
+                    TranscriptPublish::KeepExisting
+                }
+            }
             Some(_) => {
                 return Err(invalid_input(format!(
                     "resume destination {} exists but its staging provenance does not match \
@@ -1043,18 +1076,19 @@ fn build_verify_and_publish(
                     source_transcript.display()
                 )));
             }
-            // No marker at all: an interrupted publish (crash between the
-            // transcript rename and the marker write). Recover ONLY when the
-            // bytes already at the destination are exactly the bytes the
-            // current source streamed; a fresh marker is written below.
             None => {
-                let recovered = destination_bytes_match(
+                // No marker: an interrupted publish OR a markerless foreign
+                // file. In BOTH cases replace the inode with the freshly
+                // written O_EXCL temp copy, but only accept doing so when the
+                // bytes already at the destination match what we streamed
+                // (otherwise a foreign conversation is at risk → refuse).
+                let bytes_match = destination_bytes_match(
                     dest_dir_fd,
                     transcript_name,
                     published_size,
                     &transcript_sha,
                 )?;
-                if !recovered {
+                if !bytes_match {
                     return Err(invalid_input(format!(
                         "resume destination {dest_transcript} already exists without Remuda staging \
                          provenance for predecessor {source} (and its bytes do not match the staged \
@@ -1064,9 +1098,10 @@ fn build_verify_and_publish(
                         source = source_transcript.display()
                     )));
                 }
+                TranscriptPublish::RenameOver
             }
         }
-    }
+    };
 
     // (5) Publish: empty root dirs first, then sidecars (identical files are
     // kept, foreign/diverging files are a conflict), transcript last.
@@ -1084,42 +1119,30 @@ fn build_verify_and_publish(
         }
         publish_one_seed(temp_fd, dest_dir_fd, seed)?;
     }
-    // Publish the transcript. Two retained cases:
-    // - the destination is the SAME INODE as the open source but in a
-    //   DIFFERENT directory (a cross-home hardlink, round 4 item 2): replace it
-    //   with the fresh independent temp copy, breaking the link;
-    // - the destination is a different inode (an independent prior stage,
-    //   possibly carrying this child's appended turns): keep its bytes and drop
-    //   the temp copy, never overwriting the child's turns.
-    // The inherited-home no-op (same directory AND same inode) returned before
-    // this function.
-    let replace_retained = if retained {
-        let dest_leaf = dest_dir_fd.open_regular_leaf(transcript_name.as_bytes())?;
-        dest_leaf.identity()? == transcript_leaf_identity
-    } else {
-        // Re-check right before the rename: a fresh destination must still be
-        // absent, otherwise fail closed instead of replacing it.
-        if dest_dir_fd
+    // Publish the transcript. A fresh destination is renamed over; the
+    // absence re-check below refuses to replace a file that raced in. A
+    // retained independent file (valid marker, nlink==1, not the source inode)
+    // keeps its bytes (it may carry this child's appended turns) and drops the
+    // staged copy.
+    if transcript_publish == TranscriptPublish::RenameOver
+        && !retained
+        && dest_dir_fd
             .classify_leaf(transcript_name.as_bytes())?
             .is_some()
-        {
-            return Err(invalid_input(format!(
-                "resume destination {} appeared during staging without provenance; refusing to \
-                 overwrite",
-                dest_dir.join(transcript_name).display()
-            )));
-        }
-        true
-    };
-    if replace_retained {
+    {
+        return Err(invalid_input(format!(
+            "resume destination {} appeared during staging without provenance; refusing to \
+             overwrite",
+            dest_dir.join(transcript_name).display()
+        )));
+    }
+    if transcript_publish == TranscriptPublish::RenameOver {
         temp_fd.rename(
             transcript_name.as_bytes(),
             dest_dir_fd,
             transcript_name.as_bytes(),
         )?;
     } else {
-        // Keep the independent destination (its provenance was validated above
-        // and it may carry this child's appended turns); discard the temp copy.
         let _ = temp_fd.unlink_file(transcript_name.as_bytes());
     }
 
@@ -1275,6 +1298,7 @@ fn copy_sidecar_seed(
     // Stream at most the REMAINING aggregate byte budget (+1 byte is probed
     // inside copy_capped to detect an over-cap stream); charge the actual
     // byte count afterwards.
+    let source_identity = leaf.identity()?;
     let remaining_bytes = account
         .limits
         .max_bytes
@@ -1287,6 +1311,7 @@ fn copy_sidecar_seed(
         rel: format!("{root_label}/{rel}"),
         size: streamed.bytes,
         sha256: streamed.sha256,
+        src_identity: Some(source_identity),
     });
     Ok(())
 }
@@ -1485,25 +1510,29 @@ fn publish_one_seed(
             Some(entry) if entry.kind == LeafKind::Regular => {
                 // Verify identity of the bytes already at the destination.
                 let leaf = dest_parent.open_regular_leaf(last)?;
-                if leaf.len != seed.size {
-                    return Err(invalid_input(format!(
-                        "resume sidecar {} already exists with a different size; refusing to \
-                         overwrite an unverified file",
-                        seed.rel
-                    )));
-                }
                 let mut file = &leaf.file;
-                let sha = hash_reader(&mut file)?;
-                if sha != seed.sha256 {
+                let bytes_match = leaf.len == seed.size && hash_reader(&mut file)? == seed.sha256;
+                let dest_identity = leaf.identity()?;
+                let dest_nlink = leaf.nlink()?;
+                let is_hardlink_to_source =
+                    seed.src_identity.is_some_and(|src| src == dest_identity) || dest_nlink > 1;
+                if !bytes_match {
                     return Err(invalid_input(format!(
                         "resume sidecar {} already exists with different content; refusing to \
                          overwrite an unverified file",
                         seed.rel
                     )));
                 }
-                // Identical: drop the temp copy, keep the destination.
-                unlink_temp_relative(temp_fd, &components)?;
-                return Ok(());
+                if is_hardlink_to_source {
+                    // Byte-identical but a FOREIGN inode still shared with the
+                    // predecessor (hardlink): fall through to replace it with
+                    // the independent staged copy (drop the temp after rename).
+                } else {
+                    // Independent file with identical bytes: keep it, drop the
+                    // staged copy.
+                    unlink_temp_relative(temp_fd, &components)?;
+                    return Ok(());
+                }
             }
             Some(_) => {
                 return Err(invalid_input(format!(
@@ -1629,6 +1658,63 @@ fn marker_filename(transcript_name: &str) -> String {
     transcript_name
         .strip_suffix('l')
         .map_or_else(|| transcript_name.to_owned(), str::to_owned)
+}
+
+/// Pin the predecessor home (everything up to `projects`) as the trusted
+/// anchor and walk `projects/<slug>` below it link-free; fall back to anchoring
+/// the immediate parent for a transcript not under a `projects/` layout. This
+/// refuses a symlinked `projects` or `<slug>` component instead of following
+/// it into an outside tree.
+fn source_project_dir_fd(
+    source_abs: &Path,
+    parts: &[std::ffi::OsString],
+) -> std::io::Result<DirFd> {
+    if let Some(projects_idx) = parts.iter().position(|p| p == "projects")
+        && projects_idx > 0
+    {
+        let home: PathBuf = parts[..projects_idx].iter().collect();
+        let below: PathBuf = parts[projects_idx..parts.len() - 1].iter().collect();
+        let home_fd = DirFd::anchor_existing(&home).map_err(|error| {
+            if error.kind == FdErrorKind::Missing {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "resume transcript not found at {}: the predecessor home does not exist",
+                        source_abs.display()
+                    ),
+                )
+            } else {
+                error.into()
+            }
+        })?;
+        return if below.as_os_str().is_empty() {
+            Ok(home_fd)
+        } else {
+            home_fd.subpath(&below).map_err(std::io::Error::from)
+        };
+    }
+    let parent = source_abs
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            invalid_input(format!(
+                "resume transcript path has no parent directory: {}",
+                source_abs.display()
+            ))
+        })?;
+    DirFd::anchor_existing(parent).map_err(|error| {
+        if error.kind == FdErrorKind::Missing {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "resume transcript not found at {}: the predecessor directory does not exist",
+                    source_abs.display()
+                ),
+            )
+        } else {
+            error.into()
+        }
+    })
 }
 
 /// Make a path absolute against the process cwd without following symlinks
@@ -2060,6 +2146,51 @@ mod tests {
         project_dir(home, cwd).join(format!("{session}.jsonl"))
     }
 
+    /// A SHORT, randomised, exclusive 0700 scratch dir under `/tmp` with Drop
+    /// cleanup. Needed so a unix socket bound below it stays within macOS
+    /// `sun_path` (104 bytes); the long std `tempfile()` path does not.
+    struct ShortTmp {
+        path: PathBuf,
+    }
+    impl ShortTmp {
+        fn new() -> ShortTmp {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            use std::os::unix::fs::DirBuilderExt;
+            for _ in 0..16 {
+                let name = format!(
+                    "rt{:x}{:x}",
+                    std::process::id() ^ SEQ.fetch_add(1, Ordering::Relaxed),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(0)
+                );
+                let path = PathBuf::from("/tmp").join(name);
+                if std::fs::DirBuilder::new().mode(0o700).create(&path).is_ok() {
+                    return ShortTmp { path };
+                }
+            }
+            panic!("no short scratch dir");
+        }
+    }
+    impl Drop for ShortTmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// The project slug Claude itself uses: it derives the directory from the
+    /// PHYSICAL cwd (`getcwd()` returns `/private/var/...` when the shell is in
+    /// a `/var/...` symlink on macOS). Every test that builds a Claude-shaped
+    /// source/destination tree must use THIS, not `encode_project_dir(&cwd)` on
+    /// a possibly-logical temp path, or source-side and destination-side slugs
+    /// disagree on macOS.
+    fn slug_for(cwd: &std::path::Path) -> String {
+        let physical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        encode_project_dir(&physical)
+    }
+
     #[test]
     fn resume_staging_copies_transcript_session_dir_and_memory() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -2074,7 +2205,7 @@ mod tests {
         write_file(
             &old_home
                 .join("projects")
-                .join(encode_project_dir(&cwd))
+                .join(slug_for(&cwd))
                 .join(session)
                 .join("subagents")
                 .join("side.jsonl"),
@@ -2083,7 +2214,7 @@ mod tests {
         write_file(
             &old_home
                 .join("projects")
-                .join(encode_project_dir(&cwd))
+                .join(slug_for(&cwd))
                 .join("memory")
                 .join("MEMORY.md"),
             "project memory\n",
@@ -2327,7 +2458,7 @@ mod tests {
         write_file(
             &deep_home
                 .join("projects")
-                .join(encode_project_dir(&cwd))
+                .join(slug_for(&cwd))
                 .join(session)
                 .join("a/b/c/deep.jsonl"),
             "deep\n",
@@ -2805,7 +2936,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            !project_target.join(encode_project_dir(&cwd)).exists(),
+            !project_target.join(slug_for(&cwd)).exists(),
             "the slug dir must not be created through the symlinked projects"
         );
 
@@ -3007,7 +3138,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("already exists with a different size"),
+                .contains("already exists with different content"),
             "{error}"
         );
         // (b) A leftover private temp tree from a killed attempt is discarded,
@@ -3204,22 +3335,29 @@ mod tests {
     }
 
     /// Round 4 item 5: a unix socket sidecar is classified Other, skipped and
-    /// reported, and staging still succeeds.
+    /// reported, and staging still succeeds. Uses a SHORT scratch dir and short
+    /// cwd so the socket bind fits in macOS `sun_path` (104 bytes).
     #[cfg(unix)]
     #[test]
     fn round4_socket_and_device_sidecars_are_skipped_and_reported() {
         use std::os::unix::net::UnixListener;
-        let tmp = tempfile::tempdir().expect("tmp");
-        let old_home = tmp.path().join("old");
-        let new_home = tmp.path().join("new");
-        let cwd = tmp.path().join("ws");
+        let tmp = ShortTmp::new();
+        let old_home = tmp.path.join("o");
+        let new_home = tmp.path.join("n");
+        let cwd = tmp.path.join("w");
         std::fs::create_dir_all(&cwd).expect("cwd");
         let session = "01993ab0-0000-7000-8000-0000000000b9";
         let source = transcript_layout(&old_home, &cwd, session);
         write_file(&source, "{}\n");
         let side = source.parent().unwrap().join(session);
         std::fs::create_dir_all(&side).expect("side dir");
-        let _listener = UnixListener::bind(side.join("sock")).expect("bind socket");
+        let socket_path = side.join("sock");
+        assert!(
+            socket_path.as_os_str().len() <= 100,
+            "socket path must fit macOS sun_path: {}",
+            socket_path.display()
+        );
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
         let staged = stage_for_resume(&source, &new_home, &cwd, session).expect("stage");
         assert!(staged.transcript.is_file());
         assert!(
@@ -3259,7 +3397,7 @@ mod tests {
         PUBLISH_NO_MARKER_SEAM.with(|seam| seam.set(false));
         assert!(first.is_err(), "seam forces a failure");
         // The transcript landed, the marker did not.
-        let dest_project = new_home.join("projects").join(encode_project_dir(&cwd));
+        let dest_project = new_home.join("projects").join(slug_for(&cwd));
         let dest = dest_project.join(format!("{session}.jsonl"));
         assert!(dest.is_file(), "transcript published before the crash seam");
         assert!(
@@ -3331,7 +3469,7 @@ mod tests {
         let error = stage_for_resume(&source, &new_home, &cwd, session);
         CRASH_AFTER_STAGE_SEAM.with(|seam| seam.set(false));
         assert!(error.is_err(), "seam forces a failure");
-        let slug_dir = new_home.join("projects").join(encode_project_dir(&cwd));
+        let slug_dir = new_home.join("projects").join(slug_for(&cwd));
         let leftover: Vec<_> = std::fs::read_dir(&slug_dir)
             .expect("slug dir exists")
             .flatten()
@@ -3360,6 +3498,219 @@ mod tests {
     fn inode_of(path: &Path) -> u64 {
         use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// Round 5 part 2 item 3: a markerless byte-identical destination that is
+    /// a HARDLINK to an unrelated outside file must be REPLACED by the staged
+    /// O_EXCL copy (the published inode is ours), not kept just because the
+    /// bytes match.
+    #[cfg(unix)]
+    #[test]
+    fn round5_markerless_identical_hardlink_is_replaced_with_our_inode() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let outside = tmp.path().join("outside.jsonl");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000c1";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "identical-bytes\n");
+        write_file(&outside, "identical-bytes\n");
+        // Stage once, then replace the staged transcript with a hardlink to
+        // the outside file and remove the marker (a markerless foreign link).
+        stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
+        let dest = transcript_layout(&new_home, &cwd, session);
+        let marker = dest
+            .parent()
+            .unwrap()
+            .join(".remuda-staging")
+            .join(format!("{}.json", session));
+        std::fs::remove_file(&dest).expect("remove staged transcript");
+        std::fs::remove_file(&marker).expect("remove marker");
+        std::fs::hard_link(&outside, &dest).expect("plant hardlink");
+        assert_eq!(inode_of(&dest), inode_of(&outside), "setup: shared inode");
+
+        stage_for_resume(&source, &new_home, &cwd, session).expect("recovered by replacement");
+        assert_ne!(
+            inode_of(&dest),
+            inode_of(&outside),
+            "the destination is now an independent inode, not the outside hardlink"
+        );
+        // The outside file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "identical-bytes\n"
+        );
+    }
+
+    /// Round 5 part 2 item 4: a cross-home SIDECAR hardlink with identical
+    /// bytes is replaced by the independent staged copy on retry.
+    #[cfg(unix)]
+    #[test]
+    fn round5_cross_home_sidecar_hardlink_is_replaced() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let outside = tmp.path().join("side-outside.jsonl");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = "01993ab0-0000-7000-8000-0000000000c2";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "{}\n");
+        write_file(
+            &source.parent().unwrap().join("memory/MEMORY.md"),
+            "shared sidecar\n",
+        );
+        write_file(&outside, "shared sidecar\n");
+        // First stage establishes the sidecar.
+        stage_for_resume(&source, &new_home, &cwd, session).expect("first stage");
+        let side_dest = transcript_layout(&new_home, &cwd, session)
+            .parent()
+            .unwrap()
+            .join("memory/MEMORY.md");
+        // Replace the staged sidecar with a hardlink to the outside file.
+        std::fs::remove_file(&side_dest).expect("remove staged sidecar");
+        std::fs::hard_link(&outside, &side_dest).expect("sidecar hardlink");
+        assert_eq!(inode_of(&side_dest), inode_of(&outside));
+
+        stage_for_resume(&source, &new_home, &cwd, session).expect("retry replaces hardlink");
+        assert_ne!(
+            inode_of(&side_dest),
+            inode_of(&outside),
+            "cross-home sidecar hardlink replaced by an independent copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&side_dest).unwrap(),
+            "shared sidecar\n"
+        );
+    }
+
+    /// Round 5 part 2 item 5: the inherited-home same-file no-op refuses when
+    /// an inherited sidecar root (`<S>/`) is a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn round5_inherited_noop_validates_sidecar_roots() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("ws");
+        let sink = tmp.path().join("sink");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&sink).expect("sink");
+        let session = "01993ab0-0000-7000-8000-0000000000c3";
+        let source = transcript_layout(&home, &cwd, session);
+        write_file(&source, "inherited\n");
+        // A symlinked session sidecar root under the same inherited home.
+        let side = source.parent().unwrap().join(session);
+        symlink(&sink, &side).expect("side root link");
+        let error = stage_for_resume(&source, &home, &cwd, session)
+            .expect_err("inherited no-op must validate sidecar roots");
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    /// Round 5 part 1 (macOS slug): staging under a cwd reached through a
+    /// symlinked ancestor uses the PHYSICAL slug on both source and
+    /// destination, so sidecars and the transcript line up.
+    /// Round 5 part 2 item 1 (source): a predecessor home whose `projects` is a
+    /// symlink to /outside is never followed — staging refuses rather than
+    /// copying an outside tree, and the outside bytes are untouched.
+    #[cfg(unix)]
+    #[test]
+    fn round5_source_symlinked_projects_dir_is_refused() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let outside = tmp.path().join("outside");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&old_home).expect("home");
+        std::fs::create_dir_all(&outside).expect("outside");
+        let session = "01993ab0-0000-7000-8000-0000000000c5";
+        // The transcript lives THROUGH the symlinked projects.
+        let stolen = outside
+            .join(slug_for(&cwd))
+            .join(format!("{session}.jsonl"));
+        write_file(&stolen, "outside bytes\n");
+        std::os::unix::fs::symlink(&outside, old_home.join("projects")).expect("projects link");
+        let recorded = transcript_layout(&old_home, &cwd, session);
+        let error = stage_for_resume(&recorded, &new_home, &cwd, session)
+            .expect_err("staging must refuse a symlinked predecessor projects");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&stolen).unwrap(),
+            "outside bytes\n",
+            "the outside transcript is never opened for copying"
+        );
+    }
+
+    /// Round 5 part 2 item 1 (destination): a symlinked native-home target is
+    /// refused; mkdir/create never descends into it.
+    #[cfg(unix)]
+    #[test]
+    fn round5_destination_symlinked_native_home_is_refused() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let old_home = tmp.path().join("old");
+        let new_home = tmp.path().join("new");
+        let elsewhere = tmp.path().join("elsewhere");
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        let session = "01993ab0-0000-7000-8000-0000000000c6";
+        let source = transcript_layout(&old_home, &cwd, session);
+        write_file(&source, "x\n");
+        // The configured native home is itself a symlink.
+        std::os::unix::fs::symlink(&elsewhere, &new_home).expect("native-home link");
+        let error = stage_for_resume(&source, &new_home, &cwd, session)
+            .expect_err("a symlinked native home is not created through");
+        assert!(
+            error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.to_string().contains("symlink"),
+            "{error}"
+        );
+        // Nothing created in the symlink target.
+        assert!(!elsewhere.join("projects").exists(), "elsewhere untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round5_staging_uses_the_physical_cwd_slug_under_a_symlinked_ancestor() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("cwd ancestor link");
+        // The LOGICAL cwd goes through the symlink; Claude/getcwd sees the
+        // physical path.
+        let logical_cwd = link.join("ws");
+        let physical_cwd = real.join("ws");
+        std::fs::create_dir_all(&physical_cwd).expect("physical cwd");
+        let old_home = real.join("old");
+        let new_home = real.join("new");
+        let session = "01993ab0-0000-7000-8000-0000000000c4";
+        // Build the source using the PHYSICAL slug (as Claude writes it).
+        let source = transcript_layout(&old_home, &physical_cwd, session);
+        write_file(&source, "physical-slug\n");
+        // Stage passing the LOGICAL cwd (as a spawn request does).
+        let staged =
+            stage_for_resume(&source, &new_home, logical_cwd.as_path(), session).expect("stage");
+        let physical_slug = slug_for(&logical_cwd);
+        assert!(
+            staged.transcript.to_string_lossy().contains(&physical_slug),
+            "destination uses the physical slug: {}",
+            staged.transcript.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&staged.transcript).unwrap(),
+            "physical-slug\n"
+        );
+        // Nothing was created under the LOGICAL slug.
+        assert!(
+            !new_home
+                .join("projects")
+                .join(encode_project_dir(&logical_cwd))
+                .exists(),
+            "no logical-slug tree is created"
+        );
     }
 
     #[cfg(unix)]

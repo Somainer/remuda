@@ -333,10 +333,16 @@ impl Harness {
 
     /// Wait for the process to exit (scenarios with `quit_after_turns`).
     pub fn wait_exit(&mut self, timeout: Duration) {
+        let _ = self.wait_status(timeout);
+    }
+
+    /// Wait for the process to exit and return its status (for tests that must
+    /// assert a non-zero exit, e.g. a resume the sandbox refused).
+    pub fn wait_status(&mut self, timeout: Duration) -> portable_pty::ExitStatus {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.child.try_wait().expect("wait").is_some() {
-                return;
+            if let Some(status) = self.child.try_wait().expect("wait") {
+                return status;
             }
             if Instant::now() >= deadline {
                 panic!("fake-harness ({}) did not exit", self.kind);

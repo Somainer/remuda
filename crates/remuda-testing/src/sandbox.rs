@@ -233,31 +233,56 @@ impl Drop for TempHome {
 }
 
 /// Create a private per-process home under a FIXED system temp (never
-/// `$TMPDIR`), marked as an allocated root. A fake uses this when it was
-/// spawned with no configured home, so it persists nowhere near the
-/// operator's real home even when `TMPDIR=$HOME`.
+/// `$TMPDIR`), marked as an allocated root. The name is RANDOMIZED and
+/// created exclusively (never a predictable `label-<pid>` a planted dir could
+/// pre-create). A fake uses this when it was spawned with no configured home,
+/// so it persists nowhere near the operator's real home even when
+/// `TMPDIR=$HOME`.
 #[must_use]
 pub fn private_temp_home(label: &str) -> PathBuf {
-    let name = format!("{label}-{}", std::process::id());
     for base in system_temp_bases() {
-        let candidate = normalize(&base.join(&name));
-        // Anchor the fixed mount, then ensure the per-process subtree and
-        // verify it is ours and private before accepting any sentinel.
         let Ok(base_fd) = DirFd::anchor_existing(&base) else {
             continue;
         };
-        let Ok(dir) = base_fd.ensure_subdir(name.as_bytes()) else {
-            continue;
-        };
-        // The private per-process home created by the FAKE itself is private;
-        // this path also tolerates an adopted test dir with group access.
-        if !dir_is_ours_and_not_world_writable(&dir).unwrap_or(false) {
-            continue;
-        }
-        if dir.create_leaf_excl(ROOT_SENTINEL.as_bytes()).is_ok()
-            || matches!(dir.classify_leaf(ROOT_SENTINEL.as_bytes()), Ok(Some(entry)) if entry.kind == LeafKind::Regular)
-        {
-            return candidate;
+        // A few random exclusive names; reuse an existing sentinel-marked
+        // private dir of ours only as a fallback (same fake, restarted).
+        for _ in 0..8 {
+            let name = format!(
+                "{}-{:x}{:x}",
+                label,
+                std::process::id() ^ ALLOC_SEQ.fetch_add(1, Ordering::Relaxed) as u32,
+                simple_random_suffix()
+            );
+            let candidate = normalize(&base.join(&name));
+            let dir = match base_fd.create_subdir_excl(name.as_bytes()) {
+                Ok(dir) => dir,
+                Err(error) if error.is_already_exists() => {
+                    // Possibly our own earlier private home; accept only if it
+                    // already carries a regular sentinel and is ours/private.
+                    match base_fd.subdir(name.as_bytes()) {
+                        Ok(existing)
+                            if dir_is_ours_and_private(&existing).unwrap_or(false)
+                                && matches!(
+                                    existing
+                                        .classify_leaf(ROOT_SENTINEL.as_bytes()),
+                                    Ok(Some(entry)) if entry.kind == LeafKind::Regular
+                                ) =>
+                        {
+                            return candidate;
+                        }
+                        _ => continue,
+                    }
+                }
+                Err(_) => continue,
+            };
+            if !dir_is_ours_and_private(&dir).unwrap_or(false) {
+                let _ = base_fd.remove_private_tree(name.as_bytes());
+                continue;
+            }
+            if dir.create_leaf_excl(ROOT_SENTINEL.as_bytes()).is_ok() {
+                return candidate;
+            }
+            let _ = base_fd.remove_private_tree(name.as_bytes());
         }
     }
     // Last resort: do not persist anywhere.
@@ -297,6 +322,53 @@ fn find_allowed_root(path: &Path) -> Option<PathBuf> {
             .map(Path::to_path_buf);
     }
     None
+}
+
+/// Resolve `path` to (pinned allocated-root fd, relative path below the root).
+///
+/// The ROOT (the sentinel directory) is the only thing anchored/realpath'd;
+/// every descendant is then walked from that fd with
+/// `O_NOFOLLOW|O_DIRECTORY`. This never re-anchors a descendant — so a
+/// symlinked `H/projects` below an allocated home cannot redirect the write.
+/// Returns `None` when no allocated root governs `path`.
+fn root_fd_and_relative(path: &Path) -> Option<(DirFd, PathBuf)> {
+    let root = find_allowed_root(path)?;
+    let absolute = normalize(path);
+    let relative = absolute.strip_prefix(&root).ok()?;
+    let root_fd = DirFd::anchor_existing(&root).ok()?;
+    Some((root_fd, relative.to_path_buf()))
+}
+
+/// Walk from a pinned root fd to a regular leaf for appending. `relative` may
+/// include parent directories; each is walked O_NOFOLLOW (missing returns
+/// NotFound), the leaf fstatat'd and opened with O_NONBLOCK.
+fn append_via_root(
+    root_fd: &DirFd,
+    relative: &Path,
+    create_missing_parents: bool,
+) -> std::io::Result<std::fs::File> {
+    let Some(name) = relative.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("write target has no file name: {}", relative.display()),
+        ));
+    };
+    let parents: Vec<&std::ffi::OsStr> = relative
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .iter()
+        .flat_map(|p| p.iter())
+        .collect();
+    let mut dir = root_fd.self_clone();
+    for component in parents {
+        dir = if create_missing_parents {
+            dir.ensure_subdir(std::os::unix::ffi::OsStrExt::as_bytes(component))?
+        } else {
+            dir.subdir(std::os::unix::ffi::OsStrExt::as_bytes(component))?
+        };
+    }
+    dir.open_append_leaf(name.as_encoded_bytes())
+        .map_err(std::io::Error::from)
 }
 
 /// A sentinel marks a real root only when its directory is owned by this
@@ -441,31 +513,24 @@ pub fn ensure_dir_in_temp(dir: &Path, allow_env: &str) -> std::io::Result<()> {
 /// must go through this so a symlinked `H/projects/…` cannot redirect a
 /// write outside the allocated home.
 pub fn open_append_file(path: &Path, allow_env: &str) -> std::io::Result<std::fs::File> {
-    let absolute = normalize(path);
-    let parent = absolute
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "write target has no parent directory: {}",
-                    absolute.display()
-                ),
-            )
-        })?;
-    // Authorization governs the DIRECTORY the file lives in.
-    adopt_or_refuse(parent, allow_env)?;
-    let Some(name) = absolute.file_name() else {
+    // Escape hatch (deliberate manual run): legacy behavior.
+    if outside_writes_allowed(allow_env) {
+        return std::fs::OpenOptions::new()
+            .append(true)
+            .open(normalize(path));
+    }
+    // Walk from the PINNED allocated root, never re-anchoring a descendant.
+    let Some((root_fd, relative)) = root_fd_and_relative(path) else {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("write target has no file name: {}", absolute.display()),
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "test fake refuses to append {}: it is not under an allocated fake root (set \
+                 {allow_env}=1 only for a deliberate manual run)",
+                normalize(path).display()
+            ),
         ));
     };
-    let dir_fd = DirFd::anchor_existing(parent)?;
-    dir_fd
-        .open_append_leaf(name.as_encoded_bytes())
-        .map_err(std::io::Error::from)
+    append_via_root(&root_fd, &relative, false)
 }
 
 /// See [`ensure_path_in_temp`] — current name kept for callers that think of
@@ -646,15 +711,39 @@ pub fn private_claude_home_fd(label: &str, fallback: &str) -> std::io::Result<Di
 /// allocated root.
 pub fn write_allowed_file(path: &Path, body: &[u8], allow_env: &str) -> std::io::Result<()> {
     let absolute = normalize(path);
-    ensure_allowed(&absolute, allow_env)?;
-    let parent = absolute
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| std::io::Error::other("write target has no parent directory"))?;
-    let Some(name) = absolute.file_name() else {
+    if outside_writes_allowed(allow_env) {
+        // Deliberate manual run.
+        if let Some(parent) = absolute.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        return std::fs::write(&absolute, body);
+    }
+    // Pin the allocated root and walk the descendants O_NOFOLLOW; never anchor
+    // the descendant itself.
+    let Some((root_fd, relative)) = root_fd_and_relative(&absolute) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "test fake refuses to write {}: it is not under an allocated fake root (set \
+                 {allow_env}=1 only for a deliberate manual run)",
+                absolute.display()
+            ),
+        ));
+    };
+    let Some(name) = relative.file_name() else {
         return Err(std::io::Error::other("write target has no file name"));
     };
-    let parent_fd = DirFd::anchor_or_create(parent)?;
+    // Walk/create parent dirs from the pinned root (no descendant anchoring).
+    let parents: Vec<&std::ffi::OsStr> = relative
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .iter()
+        .flat_map(|p| p.iter())
+        .collect();
+    let mut parent_fd = root_fd.self_clone();
+    for component in parents {
+        parent_fd = parent_fd.ensure_subdir(std::os::unix::ffi::OsStrExt::as_bytes(component))?;
+    }
     // Refuse a symlink or special file at the destination up front; the final
     // rename also never replaces a directory or link.
     if let Some(entry) = parent_fd.classify_leaf(name.as_encoded_bytes())?

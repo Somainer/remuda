@@ -208,7 +208,12 @@ fn resume_of_a_fifo_transcript_fails_without_blocking() {
     std::fs::create_dir_all(&home).expect("home");
     let workspace = root.child("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
-    let slug = remuda_driver::claude_transcript::encode_project_dir(&workspace);
+    // Round 5 part 2 item 7 (macOS): build the slug from the PHYSICAL cwd the
+    // child process will see (getcwd under a symlinked TMPDIR resolves to
+    // /private/tmp/...), so the FIFO is actually found (and then refused as a
+    // non-regular file) rather than missed under a differently named slug.
+    let physical_workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace.clone());
+    let slug = remuda_driver::claude_transcript::encode_project_dir(&physical_workspace);
     let slug_dir = home.join(".claude/projects").join(slug);
     std::fs::create_dir_all(&slug_dir).expect("slug dir");
     let session = "01993ab0-0000-7000-8000-0000000000f0";
@@ -220,6 +225,7 @@ fn resume_of_a_fifo_transcript_fails_without_blocking() {
     let mut opts = SpawnOptions::bundled(ScriptKind::Ok);
     opts.session_id = session.to_owned();
     opts.extra_args = vec!["--resume".to_owned(), session.to_owned()];
+    // Spawn with the LOGICAL workspace; the child derives the physical slug.
     opts.cwd = Some(workspace.clone());
     opts.extra_envs = vec![(
         "CLAUDE_CONFIG_DIR".to_owned(),

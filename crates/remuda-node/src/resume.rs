@@ -202,21 +202,57 @@ fn readable_regular_file(path: &Path) -> std::io::Result<bool> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    let Some(parent) = absolute.parent() else {
-        return Ok(false);
-    };
     let Some(name) = absolute.file_name() else {
         return Ok(false);
     };
-    // Pin the parent as a trusted anchor (realpath resolved once; the fd walk
-    // stays symlink-free below it) rather than walking every system path from
-    // `/`, which breaks on macOS `/tmp → /private/tmp` mount symlinks.
-    let dir = match DirFd::anchor_existing(parent) {
-        Ok(dir) => dir,
-        Err(error) if error.kind == FdErrorKind::Missing => return Ok(false),
-        Err(error) => return Err(error.into()),
+    // Pin the predecessor HOME (the configured trusted root, realpath'd once)
+    // and walk EVERY descendant with O_NOFOLLOW. The transcript always lives at
+    // `<home>/projects/<slug>/<S>.jsonl`; pinning the home (not the slug dir)
+    // means a symlinked `projects` or `<slug>` component — e.g.
+    // `home/projects -> /outside` — is refused instead of being followed into
+    // an outside tree. Fall back to the parent anchor only for a path that is
+    // not under a `projects/` layout.
+    let components: Vec<std::ffi::OsString> =
+        absolute.iter().map(std::ffi::OsString::from).collect();
+    let pinned = if let Some(projects_idx) = components
+        .iter()
+        .position(|part| part == "projects")
+        .filter(|idx| *idx > 0)
+    {
+        let home: std::path::PathBuf = components[..projects_idx].iter().collect();
+        let below: std::path::PathBuf = components[projects_idx..components.len() - 1]
+            .iter()
+            .collect();
+        match DirFd::anchor_existing(&home).and_then(|home_fd| {
+            if below.as_os_str().is_empty() {
+                Ok(home_fd)
+            } else {
+                home_fd.subpath(&below)
+            }
+        }) {
+            Ok(dir) => dir,
+            Err(error) if error.kind == FdErrorKind::Missing => return Ok(false),
+            Err(error)
+                if matches!(
+                    error.kind,
+                    FdErrorKind::Symlink | FdErrorKind::NotDirectory | FdErrorKind::BadComponent
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        let Some(parent) = absolute.parent() else {
+            return Ok(false);
+        };
+        match DirFd::anchor_existing(parent) {
+            Ok(dir) => dir,
+            Err(error) if error.kind == FdErrorKind::Missing => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
     };
-    match dir.open_regular_leaf(name.as_encoded_bytes()) {
+    match pinned.open_regular_leaf(name.as_encoded_bytes()) {
         Ok(_leaf) => Ok(true),
         Err(error) if matches!(error.kind, FdErrorKind::Missing | FdErrorKind::Symlink) => {
             Ok(false)

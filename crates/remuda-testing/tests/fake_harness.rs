@@ -774,49 +774,92 @@ fn codex_resume_appends_to_the_same_rollout_with_one_session_meta() {
 // Flags
 // ===========================================================================
 
-/// Round 4 item 3: a fake-harness resume must NOT append through a symlinked
-/// home directory entry. The external target stays byte-identical; the resume
-/// exits non-zero.
+/// Round 5 part 2 item 3: a Claude resume must NOT append through a symlinked
+/// `H/projects`. A valid `<slug>/<S>.jsonl` transcript is placed in the
+/// EXTERNAL target; only the home's `projects` entry (not the whole home) is
+/// replaced by a symlink. The resume must fail with the specific symlink
+/// refusal and a non-zero exit, and the external file must stay byte-identical.
 #[test]
 #[cfg(unix)]
 fn resume_refuses_to_append_through_a_symlinked_home_projects() {
     let _serial = support::serial();
     let home = support::temp_home();
     let sink = support::temp_home();
-    let external = sink.join("external-rollout.jsonl");
-    std::fs::write(&external, "SEED\n").expect("seed target");
 
+    // Short workspace so the external slug path stays short.
+    let workspace = std::env::temp_dir().join(format!(
+        "r5prj-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let _workspace_guard = RemoveOnDrop(workspace.clone());
+    let slug = remuda_driver::claude_transcript::encode_project_dir(&workspace);
     let session = "00000000-0000-4000-8000-000000000007";
-    // First, a normal run that creates the codex artifacts and records the
-    // session, so the resume has a valid session id to name.
+
+    // First normal Claude run under the real home, so a valid transcript with
+    // the session exists.
     {
-        let mut h = HarnessBuilder::new("codex")
+        let mut h = HarnessBuilder::new("claude")
             .home(home.clone())
             .scenario("ok.json")
+            .arg("--cwd")
+            .arg(workspace.to_str().unwrap())
             .arg("--session-id")
             .arg(session)
             .spawn();
         h.submit("first prompt");
         h.wait_exit(WAIT);
     }
-    // Replace the whole home with a symlink to the external sink directory.
-    std::fs::remove_dir_all(&home).expect("remove the real home after it was adopted");
-    std::os::unix::fs::symlink(&sink, &home).expect("link home to external sink");
 
-    let mut h = HarnessBuilder::new("codex")
+    // Build a valid external Claude project layout holding a transcript with
+    // the right <slug>/<S>.jsonl name.
+    let external_slug = sink.join("projects").join(&slug);
+    std::fs::create_dir_all(&external_slug).expect("external slug dir");
+    let external_transcript = external_slug.join(format!("{session}.jsonl"));
+    std::fs::write(&external_transcript, "SEED\n").expect("seed transcript");
+
+    // Replace ONLY H/projects with a symlink into the external sink (keeping
+    // the allocated home, its sentinel and .claude settings in place).
+    let home_projects = home.join("projects");
+    if home_projects.exists() {
+        std::fs::remove_dir_all(&home_projects).expect("remove real projects");
+    }
+    std::os::unix::fs::symlink(sink.join("projects"), &home_projects)
+        .expect("link projects into external sink");
+
+    let mut h = HarnessBuilder::new("claude")
         .home(home.clone())
         .scenario("ok.json")
+        .arg("--cwd")
+        .arg(workspace.to_str().unwrap())
         .arg("--resume")
         .arg(session)
         .spawn();
     h.submit("second prompt");
-    // The resume must terminate promptly rather than completing the turn.
-    h.wait_exit(WAIT);
-    let after = std::fs::read_to_string(&external).expect("target still readable");
+    // The resume must terminate promptly; it cannot complete through the link.
+    let status = h.wait_status(WAIT);
+    assert!(
+        !status.success(),
+        "resume through a symlinked H/projects must exit non-zero"
+    );
+    let after = std::fs::read_to_string(&external_transcript).expect("transcript still readable");
     assert_eq!(
         after, "SEED\n",
-        "no append byte reaches the external target through the symlinked home"
+        "no append byte reaches the external transcript through the symlinked projects"
     );
+}
+
+#[cfg(unix)]
+struct RemoveOnDrop(std::path::PathBuf);
+#[cfg(unix)]
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]

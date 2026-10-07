@@ -95,12 +95,21 @@ pub struct OpenedLeaf {
 }
 
 impl OpenedLeaf {
-    /// The `(st_dev, st_ino)` pair of the opened file description. Two leaves
-    /// are the same on-disk file iff their pairs match — read from the opened
-    /// fds, so a symlink swap after opening cannot change the verdict.
+    /// The `(st_dev, st_ino, st_nlink)` triple of the opened file description.
+    /// Two leaves are the same on-disk file iff dev+ino match — read from the
+    /// opened fds, so a symlink swap after opening cannot change the verdict.
+    /// `nlink` lets a caller reject a leaf that is still a hardlink to a file
+    /// it did not itself write.
     pub fn identity(&self) -> Result<(u64, u64), FdError> {
         let stat = fstat_fd(self.file.as_raw_fd())?;
         Ok((dev_of(&stat), ino_of(&stat)))
+    }
+
+    /// Hard-link count on the opened fd (`st_nlink`).
+    pub fn nlink(&self) -> Result<u64, FdError> {
+        let stat = fstat_fd(self.file.as_raw_fd())?;
+        #[allow(clippy::unnecessary_cast)]
+        Ok(stat.st_nlink as u64)
     }
 }
 
@@ -108,6 +117,17 @@ impl OpenedLeaf {
 #[derive(Debug)]
 pub struct DirFd {
     file: File,
+}
+
+impl DirFd {
+    /// Duplicate the directory descriptor (an independent `dup` of the same
+    /// open directory description), so a caller can walk a chain without
+    /// borrowing `self` mutably.
+    pub fn self_clone(&self) -> DirFd {
+        DirFd {
+            file: self.file.try_clone().expect("dup directory fd"),
+        }
+    }
 }
 
 impl AsRawFd for DirFd {
@@ -158,6 +178,20 @@ impl FdError {
             other => FdErrorKind::Other(other.to_string()),
         };
         Self { at, kind }
+    }
+
+    /// Map a nix `Errno` (from an openat on a canonicalized path) to a kind.
+    fn from_errno(at: impl Into<String>, error: Errno) -> Self {
+        let kind = match error {
+            Errno::ELOOP => FdErrorKind::Symlink,
+            Errno::ENOTDIR => FdErrorKind::NotDirectory,
+            Errno::ENOENT => FdErrorKind::Missing,
+            other => FdErrorKind::Other(other.to_string()),
+        };
+        Self {
+            at: at.into(),
+            kind,
+        }
     }
 
     /// Whether the walk hit a symlink component.
@@ -289,46 +323,83 @@ const DIR_MODE: Mode = Mode::from_bits_truncate(0o700);
 const FILE_MODE: Mode = Mode::from_bits_truncate(0o600);
 
 impl DirFd {
-    /// Pin a TRUSTED ANCHOR directory.
+    /// Pin a TRUSTED ROOT that already exists.
     ///
-    /// Unlike every other entry in the module, symlinks IN the anchor path
-    /// itself are resolved once with `realpath`/`canonicalize`: the anchor is
-    /// configured by trusted setup (a managed native home, a test allocation
-    /// base), and on macOS system paths like `/tmp → /private/tmp` and
-    /// `/var → /private/var` are mount symlinks an O_NOFOLLOW walk from `/`
-    /// cannot cross. The canonical path is then opened with
-    /// `O_NOFOLLOW|O_DIRECTORY`; everything BELOW it is walked link-free.
+    /// The whole path must resolve to a REAL DIRECTORY. The final component is
+    /// checked with `fstatat(AT_SYMLINK_NOFOLLOW)`: a symlink-to-directory is
+    /// REFUSED (it climbs to its parent, sees the path is not itself a real
+    /// dir, and returns an error) — so this never pins a descendant symlink
+    /// like `home/projects -> /outside`. Intermediate SYSTEM mount symlinks
+    /// above the root (macOS `/tmp → /private/tmp`, `/var → /private/var`) are
+    /// the one thing resolved: the deepest real-directory ancestor is
+    /// realpath'd once and opened `O_NOFOLLOW|O_DIRECTORY`. Callers pin only a
+    /// configured base/home and then walk every descendant with
+    /// [`Self::subpath`] / [`Self::ensure_subpath`].
     pub fn anchor_existing(path: &Path) -> Result<Self, FdError> {
-        let canonical = std::fs::canonicalize(path)
-            .map_err(|error| FdError::new(path.display().to_string(), errno_kind(error)))?;
+        if !path.is_absolute() {
+            return Err(FdError::new(
+                path.display().to_string(),
+                FdErrorKind::BadComponent,
+            ));
+        }
+        let mut leaf_error: Option<FdErrorKind> = None;
+        // Climb to the deepest ancestor whose FINAL component is a real
+        // directory under lstat (no trailing symlink).
+        let mut current = path.to_path_buf();
+        let root = loop {
+            match nix::sys::stat::fstatat(
+                Some(nix::libc::AT_FDCWD),
+                &current,
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat) if (stat.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFDIR => {
+                    break current;
+                }
+                Ok(stat) if (stat.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFLNK => {
+                    leaf_error = Some(FdErrorKind::Symlink);
+                }
+                Ok(_) => leaf_error = Some(FdErrorKind::NotDirectory),
+                Err(Errno::ENOENT) => leaf_error = Some(FdErrorKind::Missing),
+                Err(error) => leaf_error = Some(FdErrorKind::Other(error.to_string())),
+            }
+            let Some(parent) = current.parent().filter(|p| *p != current) else {
+                return Err(FdError::new(
+                    path.display().to_string(),
+                    FdErrorKind::BadComponent,
+                ));
+            };
+            current = parent.to_path_buf();
+        };
+        if root != path {
+            // The requested path itself was not a real directory (a trailing
+            // symlink, special file, or missing entry). Refuse rather than
+            // pinning its parent: callers use subpath() to reach descendants.
+            return Err(FdError::new(
+                path.display().to_string(),
+                leaf_error.unwrap_or(FdErrorKind::NotDirectory),
+            ));
+        }
+        let canonical = std::fs::canonicalize(&root)
+            .map_err(|error| FdError::new(root.display().to_string(), errno_kind(error)))?;
         let fd = nix::fcntl::openat(
             Some(nix::libc::AT_FDCWD),
             &canonical,
             DIR_FLAGS,
             Mode::empty(),
         )
-        .map_err(|error| match error {
-            Errno::ELOOP => FdError::new(canonical.display().to_string(), FdErrorKind::Symlink),
-            Errno::ENOTDIR => {
-                FdError::new(canonical.display().to_string(), FdErrorKind::NotDirectory)
-            }
-            Errno::ENOENT => FdError::new(canonical.display().to_string(), FdErrorKind::Missing),
-            other => FdError::new(
-                canonical.display().to_string(),
-                FdErrorKind::Other(other.to_string()),
-            ),
-        })?;
+        .map_err(|error| FdError::from_errno(canonical.display().to_string(), error))?;
         Ok(Self {
             file: unsafe { own_fd(fd) },
         })
     }
 
-    /// Pin an anchor, creating it 0700 if absent.
+    /// Pin a trusted root, creating its 0700 tail if absent.
     ///
-    /// The deepest EXISTING ancestor is realpath'd once (crossing its system
-    /// mount symlinks); every component below that ancestor is created
-    /// `mkdirat` + `O_NOFOLLOW`, so a symlink under the anchor cannot be
-    /// created through even when the anchor path did not previously exist.
+    /// The deepest EXISTING ancestor whose final component is a REAL DIRECTORY
+    /// (lstat, a trailing symlink refused) is realpath'd once (crossing only
+    /// system mount symlinks); every component of the remaining tail is
+    /// created `mkdirat` + re-opened `O_NOFOLLOW`. A trailing symlink is not
+    /// created through.
     pub fn anchor_or_create(path: &Path) -> Result<Self, FdError> {
         if !path.is_absolute() {
             return Err(FdError::new(
@@ -336,11 +407,20 @@ impl DirFd {
                 FdErrorKind::BadComponent,
             ));
         }
-        // Find the deepest existing ancestor.
+        // Deepest existing REAL directory (lstat), collecting the tail.
         let mut existing = path.to_path_buf();
         let mut tail: Vec<std::ffi::OsString> = Vec::new();
         loop {
-            if existing.is_dir() {
+            let is_real_dir = match nix::sys::stat::fstatat(
+                Some(nix::libc::AT_FDCWD),
+                &existing,
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat) => (stat.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFDIR,
+                Err(Errno::ENOENT) => false,
+                Err(_) => false,
+            };
+            if is_real_dir {
                 break;
             }
             let name = match existing.file_name().map(std::ffi::OsStr::to_owned) {
@@ -353,18 +433,29 @@ impl DirFd {
                 }
             };
             tail.push(name);
-            let parent = match existing.parent() {
-                Some(parent) if parent != existing => parent.to_path_buf(),
-                _ => {
-                    return Err(FdError::new(
-                        path.display().to_string(),
-                        FdErrorKind::BadComponent,
-                    ));
-                }
+            let Some(parent) = existing.parent().filter(|p| *p != existing) else {
+                return Err(FdError::new(
+                    path.display().to_string(),
+                    FdErrorKind::BadComponent,
+                ));
             };
-            existing = parent;
+            existing = parent.to_path_buf();
         }
-        let mut current = Self::anchor_existing(&existing)?;
+        let canonical = std::fs::canonicalize(&existing)
+            .map_err(|error| FdError::new(existing.display().to_string(), errno_kind(error)))?;
+        let mut current = Self {
+            file: unsafe {
+                own_fd(
+                    nix::fcntl::openat(
+                        Some(nix::libc::AT_FDCWD),
+                        &canonical,
+                        DIR_FLAGS,
+                        Mode::empty(),
+                    )
+                    .map_err(|error| FdError::from_errno(canonical.display().to_string(), error))?,
+                )
+            },
+        };
         for part in tail.into_iter().rev() {
             current = current.ensure_subdir(part.as_bytes())?;
         }
@@ -407,6 +498,13 @@ impl DirFd {
         let stat = fstat_fd(self.as_raw_fd())?;
         #[allow(clippy::unnecessary_cast)]
         Ok(stat.st_mode as u32)
+    }
+
+    /// Hard-link count of the opened directory.
+    pub fn nlink(&self) -> Result<u64, FdError> {
+        let stat = fstat_fd(self.as_raw_fd())?;
+        #[allow(clippy::unnecessary_cast)]
+        Ok(stat.st_nlink as u64)
     }
 
     /// The `(st_dev, st_ino)` pair of this directory fd.
@@ -800,20 +898,81 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn tempdir() -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::path::PathBuf::from(format!(
-            "/tmp/remuda-fdsafe-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+    /// Randomised, exclusive, short-lived 0700 scratch dir with a SHORT path
+    /// (so a unix socket bound under it stays inside `sun_path` on macOS) and
+    /// Drop cleanup. Never a predictable `mkdir -p` name: an existing entry is
+    /// never adopted or deleted.
+    struct Tmp {
+        path: std::path::PathBuf,
+    }
+    impl Tmp {
+        fn new() -> Tmp {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            for _ in 0..16 {
+                let name = format!(
+                    "f{:x}{:x}",
+                    std::process::id() ^ SEQ.fetch_add(1, Ordering::Relaxed) as u32,
+                    nanos
+                );
+                let path = std::path::PathBuf::from("/tmp").join(&name);
+                use std::os::unix::fs::DirBuilderExt;
+                if std::fs::DirBuilder::new()
+                    .recursive(false)
+                    .mode(0o700)
+                    .create(&path)
+                    .is_ok()
+                {
+                    return Tmp { path };
+                }
+            }
+            panic!("could not allocate a unique short scratch dir under /tmp");
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
-    fn anchor(tmp: &std::path::Path) -> DirFd {
-        DirFd::anchor_existing(tmp).expect("anchor")
+    fn tempdir() -> Tmp {
+        Tmp::new()
+    }
+
+    fn anchor(tmp: &Tmp) -> DirFd {
+        DirFd::anchor_existing(tmp.path()).expect("anchor")
+    }
+
+    #[test]
+    fn anchor_refuses_a_trailing_symlink_to_directory() {
+        // Round 5 part 2: even though the symlink target is a real directory,
+        // anchoring the LINK path must fail (never resolve into it) —
+        // `home/projects -> /outside` is the production attack.
+        let tmp = tempdir();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let projects = tmp.path().join("projects");
+        std::os::unix::fs::symlink(&outside, &projects).expect("projects link");
+        let error = DirFd::anchor_existing(&projects).expect_err("symlink anchor refused");
+        assert_eq!(error.kind, FdErrorKind::Symlink);
+        // anchor_or_create on the same link must not create through it.
+        let error2 = DirFd::anchor_or_create(&projects).expect_err("symlink anchor-create refused");
+        assert_eq!(error2.kind, FdErrorKind::Symlink);
+        // And nothing was written into the outside target.
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        // The parent remains pinnable and reaches the link only as an error.
+        let home = anchor(&tmp);
+        assert!(matches!(
+            home.subdir(b"projects").err().map(|e| e.kind),
+            Some(FdErrorKind::Symlink)
+        ));
     }
 
     #[test]
@@ -832,10 +991,10 @@ mod tests {
         // /tmp is a symlink to /private/tmp on macOS and real on Linux; the
         // anchor resolves it either way.
         let tmp = tempdir();
-        let project = &tmp.join("real-dir");
+        let project = &tmp.path().join("real-dir");
         std::fs::create_dir_all(project).expect("mkdir");
         use std::os::unix::fs::symlink;
-        symlink(project, tmp.join("linkdir")).expect("symlink dir");
+        symlink(project.as_path(), tmp.path().join("linkdir")).expect("symlink dir");
         assert!(anchor(&tmp).subdir(b"linkdir").is_err());
         // A multi-component walk refuses parent/root components.
         assert!(matches!(
@@ -858,7 +1017,7 @@ mod tests {
     fn a_fifo_is_classified_other_and_never_opened() {
         let tmp = tempdir();
         let root = anchor(&tmp);
-        let fifo = &tmp.join("pipe");
+        let fifo = &tmp.path().join("pipe");
         nix::unistd::mkfifo(fifo.as_os_str(), Mode::from_bits_truncate(0o600)).expect("mkfifo");
         let entry = root.classify_leaf(b"pipe").expect("stat").expect("entry");
         assert_eq!(entry.kind, LeafKind::Other);
@@ -873,7 +1032,7 @@ mod tests {
         let tmp = tempdir();
         let root = anchor(&tmp);
         nix::unistd::mkfifo(
-            tmp.join("hose").as_os_str(),
+            tmp.path().join("hose").as_os_str(),
             Mode::from_bits_truncate(0o600),
         )
         .expect("mkfifo");
@@ -892,7 +1051,7 @@ mod tests {
         use std::os::unix::net::UnixListener;
         let tmp = tempdir();
         let root = anchor(&tmp);
-        let _listener = UnixListener::bind(tmp.join("sock")).expect("bind");
+        let _listener = UnixListener::bind(tmp.path().join("sock")).expect("bind");
         let entry = root.classify_leaf(b"sock").expect("stat").expect("entry");
         assert_eq!(entry.kind, LeafKind::Other);
         assert!(root.open_regular_leaf(b"sock").is_err());
@@ -945,9 +1104,9 @@ mod tests {
         let root = anchor(&tmp);
         let temp = root.ensure_subdir(b"tmp-1").expect("temp");
         temp.create_leaf_excl(b"a").expect("a");
-        std::os::unix::fs::symlink("/etc/passwd", tmp.join("tmp-1/link")).expect("link");
+        std::os::unix::fs::symlink("/etc/passwd", tmp.path().join("tmp-1/link")).expect("link");
         root.remove_private_tree(b"tmp-1").expect("rmtree");
-        assert!(!&tmp.join("tmp-1").exists());
+        assert!(!&tmp.path().join("tmp-1").exists());
         assert!(
             std::path::Path::new("/etc/passwd").exists(),
             "target untouched"
@@ -968,13 +1127,13 @@ mod tests {
             .expect("subdir")
             .create_leaf_excl(b"keep")
             .expect("leaf");
-        assert!(tmp.join("planted/keep").is_file());
+        assert!(tmp.path().join("planted/keep").is_file());
     }
 
     #[test]
     fn open_or_create_anchor_handles_missing_leaf_components() {
         let tmp = tempdir();
-        let target = &tmp.join("a/b/c");
+        let target = &tmp.path().join("a/b/c");
         let dir = DirFd::anchor_or_create(target).expect("anchor create");
         dir.create_leaf_excl(b"x").expect("leaf");
         assert!(target.join("x").is_file());

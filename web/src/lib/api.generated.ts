@@ -829,7 +829,7 @@ export interface paths {
         put?: never;
         /**
          * Continue an exited Claude session on a new instance (D-026)
-         * @description Creates a new Instance on the same host and workspace whose driver launches `claude --resume <nativeSessionId>` with the parent's provider, permission and model settings. The exited instance keeps its history and stays exited. Human/Bot only; Agent callers get 403. Idempotent per (instance, mode) inside a short window.
+         * @description Creates a new Instance on the same host and workspace whose driver launches `claude --resume <nativeSessionId>` with the parent's provider, permission and model settings. The exited instance keeps its history and stays exited. Human/Bot only; Agent callers get 403. Idempotent per (instance, mode) inside a short window. A `claude-sdk` parent resumes as `claude-sdk` with `--resume`. When the addressed instance belongs to a continuity lineage (D-057 §5), this instead performs a continuation resume: the lineage's current chapter is fenced and a successor chapter is inserted in one generation-CAS transaction; the successor keeps the lineage, role, scope, grants, task and restart policy, and its parent is the predecessor's parent.
          */
         post: operations["instanceResume"];
         delete?: never;
@@ -916,6 +916,26 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["interactionAnswer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lineages/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one agent lineage and its chapters (D-057)
+         * @description D-057 §13 lineage projection: state, restart policy, generation and every chapter. Human/Bot devices may read any lineage; an Agent may read only the lineage its instance belongs to (403 otherwise).
+         */
+        get: operations["getLineage"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2156,6 +2176,8 @@ export interface components {
             projectId?: string;
             prompt?: string;
             providerProfileId?: string;
+            /** @description D-057 §6.1 C1 restart policy: relaunch this instance on Node-attested process loss/start failure, at most `maxPerHour` decisions per hour. Accepted only from a Human origin in Phase 1; an Agent or Bot gets 403. Hub-side policy, never forwarded in the Node spec; makes the instance a continuity lineage. No behaviour follows until the C1 supervisor ships. */
+            restart?: components["schemas"]["RestartPolicy"] | null;
             /**
              * @description Preset name applied at create and stored for display; enforcement reads scope+grants, never this field (design §2.5).
              * @enum {string}
@@ -2206,6 +2228,8 @@ export interface components {
             activity: "unknown" | "idle" | "working" | "blocked" | "draining";
             /** @description Model-API route this instance actually uses (D-047); absent on a direct session. */
             readonly apiRoute?: components["schemas"]["ApiRoute"];
+            /** @description D-057 §5: why this chapter exists (`owner-resume` now; C1 causes follow). Null on a first chapter or plain instance. */
+            readonly chapterCause?: string | null;
             connectivity: string;
             createdAt?: string;
             cwd?: string | null;
@@ -2233,6 +2257,10 @@ export interface components {
             effortName?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
             /** @description Dynamic-workflow flag (`--effort ultracode`). Session-only; it is xhigh plus dynamic workflow, not a sixth level. */
             effortUltracode?: boolean | null;
+            /** @description D-057 §7.2: when authority moved from this chapter to its successor; null while current. */
+            readonly fencedAt?: string | null;
+            /** @description D-057 §5: chapter position inside its lineage, 1-based. */
+            readonly generation: number;
             hostId: string;
             instanceId: string;
             journalId: string;
@@ -2247,6 +2275,8 @@ export interface components {
              * @enum {string}
              */
             lifecycle: "requested" | "starting" | "running" | "closing" | "exited" | "failed";
+            /** @description D-057 §5: lineage this chapter belongs to; the first chapter's instance id. A plain instance is its own lineage. */
+            readonly lineageId: string;
             /**
              * @description How this instance reached its kind. "promoted" means a terminal instance had a known agent CLI take over its PTY foreground (D-025); the driver stays shell-pty.
              * @enum {string|null}
@@ -2286,11 +2316,15 @@ export interface components {
             readonly nativeTranscriptPath?: string | null;
             /** @description Immutable creator instance, recorded by the Hub from authenticated identity. */
             readonly parentInstanceId?: string | null;
+            /** @description Requested harness permission mode from the create/configure spec; the transcript-observed effective mode is permissionEffective (D-057 §3.3). */
+            permissionMode?: string | null;
             /** @description When the terminal was promoted. Absent unless mode is "promoted". */
             promotedAt?: string | null;
             providerProfileId?: string | null;
             providerSource?: string | null;
             providerSourceHint?: string | null;
+            /** @description D-057 §6.1 C1 restart policy copied to every chapter of a continuity lineage; null on a plain instance. */
+            readonly restart?: components["schemas"]["RestartPolicy"] | null;
             /** @description Exited instance whose conversation this instance continues (D-026). */
             readonly resumedFrom?: string | null;
             /**
@@ -2369,6 +2403,35 @@ export interface components {
             instanceId: string;
             /** @description False when rows below the window floor were cut; descend with beforeSeq=fromSeq-1. */
             reachedAfterSeq: boolean;
+        };
+        /** @description One chapter of a lineage (D-057 §5). */
+        LineageChapter: {
+            /** @description Why this chapter exists; null on the first chapter. */
+            chapterCause?: string | null;
+            createdAt: string;
+            /** @description Last update once the chapter reached an ended lifecycle (exited/failed/closed); null while live. */
+            endedAt?: string | null;
+            /** @description When authority moved to the successor; null while current. */
+            fencedAt?: string | null;
+            generation: number;
+            instanceId: string;
+        };
+        /** @description One agent across process lifetimes (D-057 §5). A row exists only for continuity instances: one that holds a grant or carries a restart policy. */
+        LineageRecord: {
+            /** @description Every chapter, oldest generation first. */
+            chapters: components["schemas"]["LineageChapter"][];
+            /** @description The current chapter's generation. */
+            generation: number;
+            /** @description The first chapter's instance id. */
+            lineageId: string;
+            /** @description Who paused the lineage (`device`/`self`/`ancestor`/`restart-cap`/`process-exit`); null while unpaused. */
+            pausedBy?: Record<string, never> | null;
+            restart?: components["schemas"]["RestartPolicy"] | null;
+            /**
+             * @description starting, running, paused, or host-offline (a running current chapter whose host has no live link; derived, not starting).
+             * @enum {string}
+             */
+            state: "starting" | "running" | "paused" | "host-offline";
         };
         LoginRequest: {
             bootstrapToken: string;
@@ -2835,6 +2898,13 @@ export interface components {
                 auth: string;
                 p256dh: string;
             };
+        };
+        /** @description D-057 §6.1 C1 restart policy chosen at create time. */
+        RestartPolicy: {
+            /** @description At-most restart decisions per rolling hour; at least 1. */
+            maxPerHour: number;
+            /** @description Restart on Node-attested process loss or start failure. */
+            onProcessLoss: boolean;
         };
         ResumeRequest: {
             /**
@@ -5059,6 +5129,34 @@ export interface operations {
                 };
             };
             401: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    getLineage: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Lineage */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LineageRecord"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
             404: components["responses"]["Error"];
         };
     };

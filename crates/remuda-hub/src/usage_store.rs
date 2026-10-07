@@ -37,6 +37,11 @@ pub struct UsageEventRow {
     /// rebind re-emits the same `(scope, scope_id)`, and INSERT OR IGNORE on
     /// the partial unique index drops the duplicate projection.
     pub scope_id: Option<String>,
+    /// Snapshot revision for a given `(scope, scope_id)`. Turn observations
+    /// are immutable (always 1); Grok/Codex Session snapshots keep a stable
+    /// session id and re-emit with an increasing revision, so a newer
+    /// revision replaces the older row instead of being frozen.
+    pub metric_revision: i64,
     /// Snapshot vs delta.
     pub mode: String,
     /// Total tokens when known.
@@ -57,7 +62,10 @@ pub struct UsageEventRow {
     pub observed_at: String,
 }
 
-/// Create the `usage_events` table. Idempotent.
+/// Create the `usage_events` table. Idempotent and safe against every prior
+/// schema: the `scope_id` partial unique index is created only AFTER the
+/// column is guaranteed to exist, so a pre-delivery database (no scope_id
+/// column) upgrades instead of failing to open.
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS usage_events (
@@ -76,32 +84,100 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             cost_usd TEXT,
             accounting TEXT NOT NULL DEFAULT 'estimated',
             observed_at TEXT NOT NULL,
+            metric_revision INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY (instance_id, seq)
          );
-         CREATE UNIQUE INDEX IF NOT EXISTS usage_events_scope_dedupe
-             ON usage_events(instance_id, scope, scope_id)
-             WHERE scope_id IS NOT NULL;
          CREATE INDEX IF NOT EXISTS usage_events_profile_model
              ON usage_events(profile_id, model);
-         CREATE INDEX IF NOT EXISTS usage_events_instance ON usage_events(instance_id);",
+         CREATE INDEX IF NOT EXISTS usage_events_instance
+             ON usage_events(instance_id);",
     )?;
     // Rows created before the context rollup carried no cache counters.
     crate::store::ensure_column(conn, "usage_events", "cache_read_tokens", "INTEGER")?;
     crate::store::ensure_column(conn, "usage_events", "cache_write_tokens", "INTEGER")?;
     // Context-window rollup (c-ctxusage RC1): durable per-turn dedupe key.
+    // MUST be added before the partial unique index that references it.
     crate::store::ensure_column(conn, "usage_events", "scope_id", "TEXT")?;
+    // r2: snapshot revision for revision-aware Session upserts (default 1).
+    crate::store::ensure_column(conn, "usage_events", "metric_revision", "INTEGER")?;
+    // Now the column exists on both a fresh CREATE and an upgraded DB.
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_scope_dedupe
+             ON usage_events(instance_id, scope, scope_id)
+             WHERE scope_id IS NOT NULL;",
+    )?;
     Ok(())
 }
 
-/// Inserts a usage projection from a journal event. Idempotent on
-/// `(instance_id, seq)` — replays are ignored.
+/// Inserts a usage projection.
+///
+/// Dedupe semantics by scope:
+/// - **Turn** observations (Claude message id) and rows with no scope_id are
+///   immutable: `INSERT OR IGNORE` on `(instance_id, seq)` / the partial
+///   `(instance_id, scope, scope_id)` index, so re-hydration never changes a
+///   completed turn.
+/// - **Session** snapshots (Grok/Codex keep a stable session id and re-emit as
+///   `usage.json` changes) are revision-aware: an equal-or-older
+///   `metric_revision` is frozen, a newer one replaces the row in place.
 pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let inserted = conn.execute(
-        "INSERT OR IGNORE INTO usage_events
-            (instance_id, seq, profile_id, model, scope, scope_id, mode, total_tokens,
-             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-             cost_usd, accounting, observed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+    if row.scope == "session" && row.scope_id.is_some() {
+        upsert_session_snapshot(conn, row)
+    } else {
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO usage_events
+                (instance_id, seq, profile_id, model, scope, scope_id, mode,
+                 metric_revision, total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd, accounting, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                row.instance_id,
+                row.seq,
+                row.profile_id,
+                row.model,
+                row.scope,
+                row.scope_id,
+                row.mode,
+                row.metric_revision,
+                row.total_tokens,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+                row.cost_usd,
+                row.accounting,
+                row.observed_at,
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+}
+
+/// Insert or replace a `scope='session'` snapshot keyed on the stable session
+/// id, but only when the incoming revision is newer. Returns true when a row
+/// was inserted or updated.
+fn upsert_session_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "INSERT INTO usage_events
+            (instance_id, seq, profile_id, model, scope, scope_id, mode,
+             metric_revision, total_tokens, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, cost_usd, accounting, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+         ON CONFLICT(instance_id, scope, scope_id) WHERE scope_id IS NOT NULL
+         DO UPDATE SET
+            seq = excluded.seq,
+            profile_id = excluded.profile_id,
+            model = excluded.model,
+            mode = excluded.mode,
+            metric_revision = excluded.metric_revision,
+            total_tokens = excluded.total_tokens,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            cache_read_tokens = excluded.cache_read_tokens,
+            cache_write_tokens = excluded.cache_write_tokens,
+            cost_usd = excluded.cost_usd,
+            accounting = excluded.accounting,
+            observed_at = excluded.observed_at
+         WHERE excluded.metric_revision > usage_events.metric_revision",
         params![
             row.instance_id,
             row.seq,
@@ -110,6 +186,7 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
             row.scope,
             row.scope_id,
             row.mode,
+            row.metric_revision,
             row.total_tokens,
             row.input_tokens,
             row.output_tokens,
@@ -120,7 +197,7 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
             row.observed_at,
         ],
     )?;
-    Ok(inserted > 0)
+    Ok(changed > 0)
 }
 
 fn knowledge_u64(value: &Value) -> Option<i64> {
@@ -157,6 +234,17 @@ pub fn project_usage_event(
         .and_then(|value| value.get("amount"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    // c-ctxusage r2 item 4: rate windows (TPM / lastTurnAt) must reflect when
+    // the model call actually happened, not when a re-hydrated transcript was
+    // ingested. Prefer the observation's known native timestamp; fall back to
+    // journal ingest time for frames that did not carry one.
+    let native_at = record
+        .event
+        .get("nativeAt")
+        .and_then(|at| at.get("value"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| record.observed_at.clone());
     Some(UsageEventRow {
         instance_id: record.instance_id.clone(),
         seq: record.seq,
@@ -171,6 +259,12 @@ pub fn project_usage_event(
             .get("scopeId")
             .and_then(Value::as_str)
             .map(str::to_string),
+        metric_revision: payload
+            .get("metricRevision")
+            .and_then(knowledge_u64)
+            .map(i64::try_from)
+            .and_then(Result::ok)
+            .unwrap_or(1),
         mode: payload
             .get("mode")
             .and_then(Value::as_str)
@@ -187,7 +281,7 @@ pub fn project_usage_event(
             .and_then(Value::as_str)
             .unwrap_or("estimated")
             .to_string(),
-        observed_at: record.observed_at.clone(),
+        observed_at: native_at,
     })
 }
 
@@ -388,16 +482,30 @@ fn sum_tokens_since(
 /// stays below the type-complexity lint).
 struct RollupTotals {
     turns: i64,
-    session_input: Option<i64>,
-    session_output: Option<i64>,
-    cache_read: Option<i64>,
-    cache_creation: Option<i64>,
+    /// Additive sums over scope='turn' rows.
+    turn_input: Option<i64>,
+    turn_output: Option<i64>,
+    turn_cache_read: Option<i64>,
+    turn_cache_write: Option<i64>,
+    /// Totals over scope='session' rows (harnesses that emit only session
+    /// snapshots, e.g. Grok). Used only when there are no turn rows.
+    sess_input: Option<i64>,
+    sess_output: Option<i64>,
+    sess_cache_read: Option<i64>,
+    sess_cache_write: Option<i64>,
+    has_any: bool,
     last_turn_at: Option<String>,
 }
 
 /// Fold every persisted usage event of one instance into
 /// [`InstanceUsageRollup`]. Returns `None` when the session has no usage
 /// observations yet, so the field stays off the instance record entirely.
+///
+/// Turn and Session scopes are kept separate (c-ctxusage r2): Codex emits both
+/// per-turn additive rows and a cumulative session snapshot, so summing both
+/// double-counts. Additive totals come from turn rows when any exist,
+/// otherwise from session-snapshot rows (the Grok shape, which emits session
+/// snapshots that are replaced in place by revision).
 pub fn rollup_instance(
     conn: &Connection,
     instance_id: &str,
@@ -405,28 +513,60 @@ pub fn rollup_instance(
     model: Option<&str>,
 ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
     let totals = conn.query_row(
-        "SELECT COUNT(*),
-                SUM(input_tokens),
-                SUM(output_tokens),
-                SUM(cache_read_tokens),
-                SUM(cache_write_tokens),
-                MAX(observed_at)
+        "SELECT
+            COUNT(CASE WHEN scope='turn' THEN 1 END) AS turns,
+            SUM(CASE WHEN scope='turn' THEN input_tokens END),
+            SUM(CASE WHEN scope='turn' THEN output_tokens END),
+            SUM(CASE WHEN scope='turn' THEN cache_read_tokens END),
+            SUM(CASE WHEN scope='turn' THEN cache_write_tokens END),
+            SUM(CASE WHEN scope='session' THEN input_tokens END),
+            SUM(CASE WHEN scope='session' THEN output_tokens END),
+            SUM(CASE WHEN scope='session' THEN cache_read_tokens END),
+            SUM(CASE WHEN scope='session' THEN cache_write_tokens END),
+            COUNT(*),
+            MAX(CASE WHEN scope='turn' THEN observed_at END)
          FROM usage_events WHERE instance_id = ?1",
         params![instance_id],
         |row| {
             Ok(RollupTotals {
                 turns: row.get(0)?,
-                session_input: row.get(1)?,
-                session_output: row.get(2)?,
-                cache_read: row.get(3)?,
-                cache_creation: row.get(4)?,
-                last_turn_at: row.get(5)?,
+                turn_input: row.get(1)?,
+                turn_output: row.get(2)?,
+                turn_cache_read: row.get(3)?,
+                turn_cache_write: row.get(4)?,
+                sess_input: row.get(5)?,
+                sess_output: row.get(6)?,
+                sess_cache_read: row.get(7)?,
+                sess_cache_write: row.get(8)?,
+                has_any: row.get::<_, i64>(9)? > 0,
+                last_turn_at: row.get(10)?,
             })
         },
     )?;
-    if totals.turns == 0 {
+    if !totals.has_any {
         return Ok(None);
     }
+    let use_turn = totals.turns > 0;
+    let session_input = if use_turn {
+        totals.turn_input
+    } else {
+        totals.sess_input
+    };
+    let session_output = if use_turn {
+        totals.turn_output
+    } else {
+        totals.sess_output
+    };
+    let cache_read = if use_turn {
+        totals.turn_cache_read
+    } else {
+        totals.sess_cache_read
+    };
+    let cache_creation = if use_turn {
+        totals.turn_cache_write
+    } else {
+        totals.sess_cache_write
+    };
 
     // What the next request carries comes from the newest observation:
     // fresh input plus every cached bucket, summed over whichever buckets
@@ -467,10 +607,10 @@ pub fn rollup_instance(
         context_used_tokens,
         context_window_tokens,
         context_pct,
-        session_input_tokens: totals.session_input,
-        session_output_tokens: totals.session_output,
-        cache_read_tokens: totals.cache_read,
-        cache_creation_tokens: totals.cache_creation,
+        session_input_tokens: session_input,
+        session_output_tokens: session_output,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
         turns: totals.turns,
         tpm_in_60s: in_60s,
         tpm_out_60s: out_60s,
@@ -542,6 +682,74 @@ mod tests {
             }),
             observed_at: "2026-09-15T00:00:00.000Z".into(),
         }
+    }
+
+    #[test]
+    fn migration_upgrades_a_pre_delivery_database_preserving_rows() {
+        // c-ctxusage r2: a database created at the 3bd07311 schema (no
+        // cache_* / scope_id columns, and no dedupe index) must open and
+        // migrate without losing its existing rows.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, mode, total_tokens, input_tokens,
+                 output_tokens, accounting, observed_at)
+             VALUES ('ins_old', 1, 'turn', 'snapshot', 1000, 500, 500,
+                     'estimated', '2026-09-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        // Runs the full current migration against the old table.
+        migrate(&conn).unwrap();
+
+        // New columns exist and the dedupe index is in place.
+        let mut stmt = conn.prepare("PRAGMA table_info(usage_events)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for col in ["cache_read_tokens", "cache_write_tokens", "scope_id"] {
+            assert!(cols.iter().any(|c| c == col), "column {col} migrated");
+        }
+        // Old row is preserved (new columns NULL).
+        let (total, scope_id): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT total_tokens, scope_id FROM usage_events WHERE instance_id='ins_old'",
+                [],
+                |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(total, Some(1000));
+        assert!(
+            scope_id.is_none(),
+            "old row has no scope_id, so is not deduped"
+        );
+        // Rollup still works after upgrade.
+        assert!(
+            rollup_instance(&conn, "ins_old", "claude", Some("fake"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -672,6 +880,7 @@ mod tests {
             scope: "turn".into(),
             scope_id: None,
             mode: "snapshot".into(),
+            metric_revision: 1,
             total_tokens: None,
             input_tokens: input,
             output_tokens: output,
@@ -689,6 +898,109 @@ mod tests {
     /// = (4794, 0, 29496, 260), (1839, 0, 33592, 185), (1223, 0, 34616, 144).
     /// Timestamps are re-anchored to exercise the TPM windows; the counters
     /// are byte-for-byte the native record.
+    #[test]
+    fn session_snapshots_are_revision_replaced_not_frozen_or_summmed() {
+        // c-ctxusage r2: a stable session id with increasing revision replaces
+        // the prior row; an equal/older revision is frozen. Turn + Session rows
+        // are never added together.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let sess = |seq: i64, rev: i64, input: i64, output: i64| UsageEventRow {
+            instance_id: "ins_g".into(),
+            seq,
+            profile_id: None,
+            model: Some("grok-x".into()),
+            scope: "session".into(),
+            scope_id: Some("grok-session".into()),
+            mode: "snapshot".into(),
+            metric_revision: rev,
+            total_tokens: Some(input + output),
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: format!("2026-10-06T00:00:0{seq}.000Z"),
+        };
+        // Revision 1, then 2 (replaces), then a stale 1 re-delivery (frozen).
+        assert!(insert_usage_event(&conn, &sess(1, 1, 100, 10)).unwrap());
+        assert!(insert_usage_event(&conn, &sess(2, 2, 200, 20)).unwrap());
+        assert!(!insert_usage_event(&conn, &sess(3, 1, 999, 999)).unwrap());
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE instance_id='ins_g'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "one replaced session row, not three");
+        let (rev, input, output): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens, output_tokens
+                 FROM usage_events WHERE instance_id='ins_g'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((rev, input, output), (2, 200, 20), "newest revision wins");
+        // Session-only totals roll up from the session row (no turn rows).
+        let rollup = rollup_instance(&conn, "ins_g", "grok", Some("grok-x"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.turns, 0, "session snapshots are not turns");
+        assert_eq!(rollup.session_input_tokens, Some(200));
+        assert_eq!(rollup.session_output_tokens, Some(20));
+    }
+
+    #[test]
+    fn turn_and_session_rows_do_not_double_count() {
+        // Codex emits an additive Turn row AND a cumulative Session snapshot
+        // each turn; the rollup must take the turn sums and ignore session.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let turn = |seq: i64, input: i64, output: i64| UsageEventRow {
+            instance_id: "ins_c".into(),
+            seq,
+            profile_id: None,
+            model: Some("codex".to_string()),
+            scope: "turn".into(),
+            scope_id: Some(format!("turn-{seq}")),
+            mode: "snapshot".into(),
+            metric_revision: seq,
+            total_tokens: Some(input + output),
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: format!("2026-10-06T00:00:0{seq}.000Z"),
+        };
+        let cumulative = |seq: i64, input: i64, output: i64| UsageEventRow {
+            scope: "session".into(),
+            scope_id: Some("codex-session".into()),
+            metric_revision: seq,
+            ..turn(seq + 10, input, output)
+        };
+        insert_usage_event(&conn, &turn(1, 100, 10)).unwrap();
+        insert_usage_event(&conn, &cumulative(1, 100, 10)).unwrap();
+        insert_usage_event(&conn, &turn(2, 50, 5)).unwrap();
+        insert_usage_event(&conn, &cumulative(2, 150, 15)).unwrap();
+
+        let rollup = rollup_instance(&conn, "ins_c", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.turns, 2);
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(150),
+            "turns only, no session"
+        );
+        assert_eq!(rollup.session_output_tokens, Some(15));
+    }
+
     #[test]
     fn rollup_folds_recorded_usage_sequence() {
         let conn = Connection::open_in_memory().unwrap();

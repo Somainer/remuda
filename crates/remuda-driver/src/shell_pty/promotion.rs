@@ -1595,7 +1595,13 @@ async fn maintain_binding(
     // collision once records carrying a cwd have actually been written.
     if !bindings.content_cwd_check() {
         bindings.mark_degraded("transcript cwd does not match the promoted terminal");
-        finalize_hydrator(hydrator, events, seq, ctx).await;
+        // c-ctxusage r5 item 1: DISCARD, do not finalise. A final tail read here
+        // would journal exactly the mismatched-cwd records — messages, tool
+        // calls and usage of a transcript the driver just declared foreign — so
+        // the chip would show another session's context. Demote/promote/
+        // rebind/vanish/close keep their reading finalise; only the
+        // cwd-mismatch degrade drops the hydrator unread.
+        hydrator.take();
         let mut related = BTreeMap::from([
             ("sessionId".to_owned(), binding.session_id.clone()),
             ("source".to_owned(), binding.source.as_wire().to_owned()),
@@ -2388,6 +2394,176 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_cwd_mismatch_degrade_discards_the_foreign_transcript_unread() {
+        // c-ctxusage r5 item 1: after a bind is established, the transcript
+        // grows a record whose top-level cwd is a DIFFERENT directory. The
+        // degrade must DISCARD the hydrator without a final read — the
+        // foreign record's Message/Usage must never reach this instance.
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("repo");
+        let foreign = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let session = "ffffffff-1111-4222-8333-ffffffffffff";
+
+        // Phase 1 record: assistant text+usage, NO stop_reason, no top-level cwd
+        // — the content check is still indeterminate, so the bind hydrates.
+        let first = serde_json::json!({
+            "type": "assistant",
+            "uuid": "msg-foreign-rec",
+            "timestamp": "2020-01-01T00:00:00.000Z",
+            "isSidechain": false,
+            "message": {
+                "id": "msg-own",
+                "role": "assistant",
+                "type": "message",
+                "model": "m",
+                "stop_reason": null,
+                "content": [{"type": "text", "text": "OWN"}],
+                "usage": {
+                    "input_tokens": 1,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 1
+                }
+            }
+        });
+        let path = slug_session(&home, &cwd, session, &format!("{}\n", first));
+
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&cwd, &home);
+        // Force the deterministic claim directly (the transcript slug is under
+        // the real cwd, so identity channels accept it; only its later content
+        // disagrees).
+        {
+            let mut slot = bindings
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.binding = Some(crate::claude_transcript::TranscriptBinding {
+                session_id: session.into(),
+                path: path.clone(),
+                cwd: cwd.clone(),
+                source: crate::claude_transcript::BindingSource::Hook,
+            });
+        }
+
+        let ctx = ctx_in(&cwd);
+        let found = detected_claude(42, Some(session));
+        let (tx, mut rx) = mpsc::channel::<Observation>(128);
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        maintain_binding(
+            &bindings,
+            &ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &tx,
+            &std::sync::atomic::AtomicU64::new(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !bindings.degraded(),
+            "still indeterminate: no cwd record yet"
+        );
+        assert!(hydrator.is_some(), "the hydrator opened against the claim");
+        // Phase 1 drains only content (no stop_reason -> no usage).
+        while let Ok(_obs) = rx.try_recv() {}
+
+        // Phase 2: a foreign-cwd user record, then a finalised assistant turn.
+        // Under r4 the reading finalise polled these exact records and
+        // journaled them; the fix must not.
+        use std::io::Write;
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open transcript");
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "user-foreign",
+                    "timestamp": "2020-01-01T00:00:01.000Z",
+                    "cwd": foreign.to_string_lossy(),
+                    "message": {"role": "user", "content": "go"}
+                })
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type": "assistant",
+                    "uuid": "msg-evil-rec",
+                    "timestamp": "2020-01-01T00:00:02.000Z",
+                    "isSidechain": false,
+                    "message": {
+                        "id": "msg-evil",
+                        "role": "assistant",
+                        "type": "message",
+                        "model": "m",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "EVIL_FOREIGN_CONTENT"}],
+                        "usage": {
+                            "input_tokens": 999,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                            "output_tokens": 999
+                        }
+                    }
+                })
+            )
+            .unwrap();
+        }
+
+        maintain_binding(
+            &bindings,
+            &ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &tx,
+            &std::sync::atomic::AtomicU64::new(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(bindings.degraded(), "the foreign cwd degrades the claim");
+        assert!(hydrator.is_none(), "the hydrator is discarded");
+
+        let mut saw_usage = false;
+        let mut saw_foreign_message = false;
+        while let Ok(obs) = rx.try_recv() {
+            match &obs.body {
+                ObservationPayload::Usage(_) => saw_usage = true,
+                ObservationPayload::Message(message) => {
+                    let rendered = serde_json::to_string(message).unwrap_or_default();
+                    if rendered.contains("EVIL_FOREIGN_CONTENT") || rendered.contains("msg-evil") {
+                        saw_foreign_message = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !saw_foreign_message,
+            "foreign content must never be journaled"
+        );
+        assert!(!saw_usage, "foreign usage must never reach usage_events");
     }
 
     // ----- deterministic binding, per epoch --------------------------------

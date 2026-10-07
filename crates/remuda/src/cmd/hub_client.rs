@@ -256,6 +256,28 @@ pub(crate) fn hub_http_error(err: ClientError) -> anyhow::Error {
                     lines.push(format!("  - {reason}"));
                 }
             }
+            // Preserve EVERY other body field. A 429 SUPPLY_DEFERRED merges
+            // the full supply decision into this body (`rejected[]`
+            // per-candidate reasons, `ranked`, `deferredUntil`, `retryable`,
+            // `code`-bearing pins, …); rendering only the headline hid the
+            // actionable detail from `remuda dispatch` / `remuda profile`.
+            let details: serde_json::Map<_, _> = value
+                .as_object()
+                .map(|object| {
+                    object
+                        .iter()
+                        .filter(|(key, _)| !matches!(key.as_str(), "error" | "code" | "reasons"))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !details.is_empty()
+                && let Ok(rendered) = serde_json::to_string_pretty(&Value::Object(details))
+            {
+                for line in rendered.lines() {
+                    lines.push(format!("  {line}"));
+                }
+            }
             return anyhow::anyhow!(lines.join("\n"));
         }
     }

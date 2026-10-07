@@ -109,7 +109,10 @@ clients:
 The existing `--host`, `--workspace-id`, `--kind`, `--driver`, `--name`,
 `--title` and `--prompt-file` flags are unchanged. A Hub refusal is rendered
 with the Hub's own reason: for example a second live `address-owner` holder
-gets 409 and the CLI surfaces the conflict text instead of a JSON dump.
+gets 409 and the CLI surfaces the conflict text instead of a JSON dump. A
+429 `SUPPLY_DEFERRED` keeps the full decision on stderr — every
+`rejected[].reasons`, `ranked`, `deferredUntil` and `retryable` field is
+printed, not only the top-level headline.
 
 `remuda dispatch` will gain `--permission-mode <mode>` with the same
 vocabulary when `ma-admission` lands.

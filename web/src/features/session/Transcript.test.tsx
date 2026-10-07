@@ -1325,3 +1325,223 @@ describe("streaming row (D-053)", () => {
     expect((screen.getByTestId("held-queue-steer") as HTMLButtonElement).disabled).toBe(false);
   });
 });
+
+// c-fontswap round 5 items 1/2/8: the saved-position height-delta compensator.
+// A browser-like geometry harness (clamping scrollTop, coalesced own-write
+// scroll events, real per-row rects) drives a saved restore so the reflow
+// anchor arms, then grows rows above / at the saved row.
+describe("font reflow compensator", () => {
+  const ROW = 96;
+  const VIEW = 720;
+  type ScrollModel = {
+    total: () => number;
+    getTop: () => number;
+    setTop: (v: number) => void;
+  };
+  let activeScroll: ScrollModel | null = null;
+  let protoInstalled = false;
+  const nativeOwner = (() => {
+    const onH = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop");
+    return onH ? { desc: onH, on: HTMLElement.prototype } : null;
+  })();
+  const restoreNative = () => {
+    if (!protoInstalled || !nativeOwner) return;
+    if (nativeOwner.on === HTMLElement.prototype) Object.defineProperty(HTMLElement.prototype, "scrollTop", nativeOwner.desc);
+    else delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollTop;
+    protoInstalled = false;
+  };
+
+  function installGeo(rowCount: number) {
+    let dynamicTotal = rowCount;
+    const heights = new WeakMap<Element, number>();
+    const observerCbs = new Map<Element, () => void>();
+    const isScroller = (el: unknown) => el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    let top = 0;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? VIEW : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? dynamicTotal * ROW : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      const h = heights.get(el) ?? ROW;
+      if (el.dataset?.testid === "transcript-scroller") {
+        return { top: 0, left: 0, right: 500, bottom: VIEW, width: 500, height: VIEW, x: 0, y: 0, toJSON() {} } as DOMRect;
+      }
+      if (el.dataset?.anchor && el.parentElement) {
+        const list = el.parentElement;
+        const spacer = Array.from(list.children).find((c) => c.getAttribute("aria-hidden") === "true") as HTMLElement | undefined;
+        const pad = Number.parseFloat(spacer?.style.height ?? "0") || 0;
+        let preceding = 0;
+        for (const sib of Array.from(list.querySelectorAll("[data-anchor]"))) {
+          if (sib === el) break;
+          preceding += heights.get(sib) ?? ROW;
+        }
+        const rowTop = pad + preceding - top;
+        return { top: rowTop, left: 0, right: 500, bottom: rowTop + h, width: 500, height: h, x: 0, y: rowTop, toJSON() {} } as DOMRect;
+      }
+      return { top: 0, left: 0, right: 0, bottom: h, width: 0, height: h, x: 0, y: 0, toJSON() {} } as DOMRect;
+    });
+    class GeoRO {
+      constructor(private readonly cb: () => void) {}
+      observe(el: Element) {
+        observerCbs.set(el, this.cb);
+      }
+      unobserve(el: Element) {
+        if (observerCbs.get(el) === this.cb) observerCbs.delete(el);
+      }
+      disconnect() {
+        for (const [el, cb] of observerCbs) if (cb === this.cb) observerCbs.delete(el);
+      }
+    }
+    vi.stubGlobal("ResizeObserver", GeoRO);
+    activeScroll = { total: () => dynamicTotal, getTop: () => top, setTop: (v) => (top = v) };
+    if (!protoInstalled) {
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+        configurable: true,
+        get(this: HTMLElement) {
+          if (isScroller(this) && activeScroll) return activeScroll.getTop();
+          return nativeOwner?.desc.get?.call(this) as number;
+        },
+        set(this: HTMLElement, v: number) {
+          const m = activeScroll;
+          if (!isScroller(this) || !m) {
+            nativeOwner?.desc.set?.call(this, v);
+            return;
+          }
+          // Browser model: clamp, no event when unchanged; a programmatic
+          // write's scroll event is delivered next frame (coalesced).
+          const max = Math.max(0, m.total() * ROW - VIEW);
+          const clamped = Math.max(0, Math.min(v, max));
+          if (clamped === m.getTop()) return;
+          m.setTop(clamped);
+          const el = this;
+          requestAnimationFrame(() => fireEvent.scroll(el));
+        },
+      });
+      protoInstalled = true;
+    }
+    const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
+    const readerScroll = (value: number) => {
+      const max = Math.max(0, dynamicTotal * ROW - VIEW);
+      top = Math.max(0, Math.min(value, max));
+      fireEvent.scroll(scroller());
+    };
+    const growById = (nodeId: string, height: number) => {
+      const el = scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!el) throw new Error(`row ${nodeId} not mounted`);
+      heights.set(el, height);
+      observerCbs.get(el)?.();
+    };
+    const nextFrame = () =>
+      new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    return { scroller, readerScroll, growById, top: () => top, nextFrame, setTotal: (n: number) => (dynamicTotal = n) };
+  }
+
+  /** Render a non-follow transcript restored to anchor node N (1-based) at 0 offset. */
+  function renderRestored(instanceId: string, anchorN: number, count = 40) {
+    localStorage.clear();
+    const events = buildLongObservations({
+      instanceId: instanceId as Id,
+      journalId: `obj_${instanceId}` as Id,
+      hostId: "hst_1" as Id,
+      count,
+    });
+    localStorage.setItem(
+      `runtime.reading.v1.${instanceId}`,
+      JSON.stringify({ anchorId: `obj_long_n_${anchorN}`, offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    return renderRouted(events, `/s/${instanceId}`, false);
+  }
+
+  /** Flush until the saved restore has settled (attribute flips to 0). */
+  async function settle(geo: ReturnType<typeof installGeo>, instanceId: string) {
+    for (let i = 0; i < 30; i += 1) {
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        await Promise.resolve();
+      });
+      const active = screen.getByTestId("transcript-scroller").getAttribute("data-restore-active");
+      if (active === "0") return;
+    }
+    throw new Error(`restore never settled for ${instanceId} (top=${geo.top()})`);
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    activeScroll = null;
+    restoreNative();
+    localStorage.clear();
+  });
+
+  it("item 8: a row above the restored anchor grows -> scrollTop += delta", async () => {
+    const geo = installGeo(40);
+    renderRestored("insAbove", 5);
+    await settle(geo, "insAbove");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    expect(geo.top(), "compensates for an above-row growth").toBe(before + 40);
+  });
+
+  it("item 1: the restored row ITSELF grows -> its own top is held, no scroll jump", async () => {
+    const geo = installGeo(40);
+    renderRestored("insSelf", 5);
+    await settle(geo, "insSelf");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_5", ROW + 40);
+    });
+    expect(geo.top(), "the saved row's own growth must not scroll by its delta").toBe(before);
+  });
+
+  it("item 2: after the reader scrolls up, a row between the new and old anchor does not jump", async () => {
+    const geo = installGeo(40);
+    renderRestored("insScroll", 5);
+    await settle(geo, "insScroll");
+    const restoredTop = geo.top();
+    // Reader scrolls UP: the new reading anchor is a row near the viewport top
+    // (n_2), while the saved row (n_5) is lower. Row n_3 sits BETWEEN them.
+    act(() => geo.readerScroll(restoredTop - 200));
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    const afterReader = geo.top();
+    expect(afterReader).toBe(restoredTop - 200);
+    // n_3 is BELOW the new reading anchor, so generic anchoring ignores its
+    // growth. The sticky-reflow bug kept n_5 as the reflow anchor; n_3 is
+    // strictly above it, so selfDelta jumped by the whole growth and rewrote
+    // the reading anchor back to the saved row.
+    await act(async () => {
+      geo.growById("obj_long_n_3", ROW + 40);
+    });
+    expect(geo.top(), "a reader who navigated owns the position; no reflow jump").toBe(afterReader);
+  });
+
+  it("item 8: a sub-pixel measurement is a no-op", async () => {
+    const geo = installGeo(40);
+    renderRestored("insSub", 5);
+    await settle(geo, "insSub");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 0.5);
+    });
+    expect(geo.top()).toBe(before);
+  });
+
+  it("item 8: repeated same-height reports do not re-apply the delta", async () => {
+    const geo = installGeo(40);
+    renderRestored("insRepeat", 5);
+    await settle(geo, "insRepeat");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+      geo.growById("obj_long_n_2", ROW + 40);
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    expect(geo.top(), "the committed delta is applied once").toBe(before + 40);
+  });
+});

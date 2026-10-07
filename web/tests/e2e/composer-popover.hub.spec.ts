@@ -76,8 +76,12 @@ async function createSession(page: Page, prompt: string): Promise<string> {
   await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
   const host = await hostPicker.locator("option").filter({ hasText: "e2e-fake-node" }).getAttribute("value");
   expect(host).toBeTruthy();
-  hostPicker.selectOption(host!);
+  // r3 item 5: await the selection change (the old fire-and-forget let start
+  // run against the previous host, so cleanup deleted the wrong id) and wait
+  // until start is enabled FOR THIS HOST before filling/starting.
+  await hostPicker.selectOption(host!);
   await page.getByTestId("new-session-prompt").fill(prompt);
+  await expect(page.getByTestId("new-session-start")).toBeEnabled();
   await page.getByTestId("new-session-start").click();
   await page.waitForURL(/\/s\//, { timeout: 20_000 });
   const id = new URL(page.url()).pathname.split("/").pop()!;

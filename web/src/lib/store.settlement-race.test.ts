@@ -224,3 +224,94 @@ it("the immediate settlement projection keeps generation-ended when its refresh 
     vi.useRealTimers();
   }
 });
+
+/**
+ * c-cardsettle r6 item 5: a settlement frame carries its resolution REASON
+ * through the subscription API into the immediate pin. A non-process-end
+ * settlement (transcript-picker demotion = agent-demoted) must keep that label
+ * even when the follow-up refresh rejects — never overwritten as
+ * generation-ended.
+ */
+it("an agent-demoted settlement keeps its reason through the pin and a rejecting refresh", async () => {
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    let settlementCallback:
+      | ((interactionId: string, reason?: string) => void)
+      | null = null;
+    vi.spyOn(api, "settlementSubscribe").mockImplementation((callback) => {
+      settlementCallback = callback;
+      return () => undefined;
+    });
+    vi.spyOn(api, "hello").mockResolvedValue({} as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null });
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null });
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] });
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    let listCalls = 0;
+    vi.spyOn(api, "interactionList").mockImplementation(async () => {
+      const n = ++listCalls;
+      if (n === 1) return [card("pending")];
+      // The follow-up refresh rejects: the immediate pin must hold the reason.
+      throw new Error("list down");
+    });
+    await hubStore.bootstrap();
+    expect(
+      hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+    ).toBe("pending");
+
+    settlementCallback!(INTERACTION, "agent-demoted");
+    await vi.advanceTimersByTimeAsync(500);
+
+    const row = hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION);
+    expect(row?.state).toBe("invalidated");
+    expect(
+      row?.resolution.state === "known" ? row.resolution.value.reason : "missing",
+    ).toBe("agent-demoted");
+    expect(row?.answerable).toBe(false);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+/** r6 item 5: a frame with no/empty reason still defaults to generation-ended. */
+it("a settlement frame without a reason defaults the pin to generation-ended", async () => {
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    let settlementCallback:
+      | ((interactionId: string, reason?: string) => void)
+      | null = null;
+    vi.spyOn(api, "settlementSubscribe").mockImplementation((callback) => {
+      settlementCallback = callback;
+      return () => undefined;
+    });
+    vi.spyOn(api, "hello").mockResolvedValue({} as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null });
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null });
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] });
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] });
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "interactionList").mockResolvedValue([card("pending")]);
+    await hubStore.bootstrap();
+
+    settlementCallback!(INTERACTION);
+    await vi.advanceTimersByTimeAsync(500);
+
+    const row = hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION);
+    expect(
+      row?.resolution.state === "known" ? row.resolution.value.reason : "missing",
+    ).toBe("generation-ended");
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});

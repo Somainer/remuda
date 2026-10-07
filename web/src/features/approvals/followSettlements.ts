@@ -16,7 +16,7 @@
  */
 export function followSettlements(
   url: string,
-  onSettlement: (interactionId: string) => void,
+  onSettlement: (interactionId: string, reason?: string) => void,
 ) {
   let stopped = false;
   let socket: WebSocket;
@@ -31,9 +31,14 @@ export function followSettlements(
           type?: string;
           state?: string;
           interactionId?: string;
+          reason?: string;
         };
         if (frame.type === "settlement" && frame.state === "invalidated" && frame.interactionId) {
-          onSettlement(frame.interactionId);
+          // Carry the Hub's resolution reason through verbatim: a
+          // non-process-end settlement (e.g. transcript-picker demotion =
+          // agent-demoted) must not be relabelled generation-ended (r6 item 5).
+          const reason = typeof frame.reason === "string" && frame.reason ? frame.reason : undefined;
+          onSettlement(frame.interactionId, reason);
         }
       } catch {
         /* ignore unrelated or malformed follow frames */

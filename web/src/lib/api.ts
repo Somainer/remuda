@@ -669,7 +669,12 @@ export type HubApi = {
    * the settled interaction id so the store can pin it before refreshing;
    * callers trailing-coalesce their own refresh. Returns a stop function.
    */
-  settlementSubscribe(onSettlement: (interactionId: Id) => void): () => void;
+  /**
+   * Subscribe to global settlement notices. `reason` carries the Hub's
+   * resolution reason verbatim (generation-ended for a process end, or a
+   * non-process-end reason such as agent-demoted — r6 item 5).
+   */
+  settlementSubscribe(onSettlement: (interactionId: Id, reason?: string) => void): () => void;
   providerList(q?: { hostId?: string }): Promise<{ items: HubProviderRow[]; nextCursor?: string | null }>;
   providerGet(id: string): Promise<HubProviderRow>;
   providerCreate(body: ProviderCreate): Promise<HubProviderRow>;

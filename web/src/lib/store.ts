@@ -6,6 +6,7 @@ import type { Command, CommandSettlementOutcome } from "../types/command";
 import type { components } from "./api.generated";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
+import type { InteractionResolutionReason } from "../types/generated";
 import type { Observation } from "../types/observation";
 import type { Id, U64 } from "../types/wire";
 import type { PromptMode } from "../types/generated";
@@ -1843,12 +1844,12 @@ class HubStore {
       // mounted inbox/badge drop the card immediately via one trailing-coalesced
       // interaction refresh; missed notices converge on the next 2 s poll.
       this.stopSettlementFollow?.();
-      this.stopSettlementFollow = api.settlementSubscribe((interactionId) => {
+      this.stopSettlementFollow = api.settlementSubscribe((interactionId, reason) => {
         this.settlementCount += 1;
         // Install the terminal pin against the CURRENT list seq BEFORE
         // refreshing, so an older in-flight poll resolving last cannot
         // resurrect the settled card (r2 item 4).
-        this.pinHubSettlement(interactionId);
+        this.pinHubSettlement(interactionId, reason);
         if (this.settlementRefreshTimer) clearTimeout(this.settlementRefreshTimer);
         this.settlementRefreshTimer = setTimeout(() => {
           this.settlementRefreshTimer = null;
@@ -3590,7 +3591,7 @@ class HubStore {
    * until a newer page confirms. The local row is flipped immediately so the
    * card drops even before the refresh resolves.
    */
-  private pinHubSettlement(interactionId: Id) {
+  private pinHubSettlement(interactionId: Id, reason?: string) {
     this.settledInteractions.set(interactionId, {
       seq: this.listReqSeq,
       confirmedByNewer: false,
@@ -3599,12 +3600,15 @@ class HubStore {
       this.emit({
         interactions: this.state.interactions.map((row) => {
           if (row.id !== interactionId) return row;
-          // c-cardsettle r3 item 7: stamp generation-ended on the immediate
-          // projection too, not just state=invalidated. Keeping the old
-          // resolution made the desktop label the row 已在其它设备处理 if the
-          // follow-up refresh rejected/lagged. The frame's reason is the
-          // generation-ended settle; the authoritative list confirms later.
+          // c-cardsettle r3 item 7: stamp the terminal resolution on the
+          // immediate projection too. r6 item 5: carry the Hub's reason
+          // verbatim — a non-process-end settlement (e.g. transcript-picker
+          // demotion = agent-demoted) must not be overwritten with
+          // generation-ended; absent/unknown reasons default to generation-
+          // ended (the only settlement the process-end paths publish).
           const now = new Date().toISOString();
+          const settlementReason: InteractionResolutionReason =
+            reason === "agent-demoted" ? "agent-demoted" : "generation-ended";
           return {
             ...row,
             state: "invalidated" as const,
@@ -3613,7 +3617,7 @@ class HubStore {
             updatedAt: now,
             resolution: {
               state: "known" as const,
-              value: { reason: "generation-ended" as const, eventIds: [] },
+              value: { reason: settlementReason, eventIds: [] },
             },
           };
         }),

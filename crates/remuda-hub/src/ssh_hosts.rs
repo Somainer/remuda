@@ -885,10 +885,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            settlement.interactions,
-            vec![(instance.instance_id.clone(), interaction_id.clone())]
-        );
+        assert_eq!(settlement.interactions.len(), 1);
+        assert_eq!(settlement.interactions[0].instance_id, instance.instance_id);
+        assert_eq!(settlement.interactions[0].interaction_id, interaction_id);
+        assert!(!settlement.interactions[0].updated_at.is_empty());
         let row = store
             .get_interaction(interaction_id)
             .await

@@ -137,16 +137,17 @@ impl AppState {
     /// follower converges against the durable (already-invalidated) rows
     /// regardless, so a missed notice is self-healing.
     pub(crate) fn broadcast_settlement(&self, settlement: &Settlement) {
-        for (instance_id, interaction_id) in &settlement.interactions {
+        for settled in &settlement.interactions {
             // Publish on the DEDICATED settlement bus (not the journal bus): a
             // follower lagging on a journal burst during page load must not
             // miss the one-shot terminal notice. Recent settlements are also
             // replayed to unfiltered followers on connect (see follow_session).
             let _ = self.settlement_bus.send(crate::ws::SettlementNotice {
-                instance_id: instance_id.clone(),
-                interaction_id: interaction_id.clone(),
+                instance_id: settled.instance_id.clone(),
+                interaction_id: settled.interaction_id.clone(),
                 state: "invalidated".to_string(),
                 reason: "generation-ended".to_string(),
+                updated_at: settled.updated_at.clone(),
             });
         }
     }

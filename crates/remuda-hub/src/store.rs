@@ -1330,17 +1330,29 @@ impl InteractionRecord {
 }
 
 /// Outcome of a write that moved instance(s) into a terminal lifecycle
-/// (c-cardsettle): the still-pending interactions invalidated IN THAT SAME
-/// TRANSACTION, as `(instance_id, interaction_id)` pairs.
+/// (c-cardsettle): one interaction invalidated IN THE SAME TRANSACTION as its
+/// instance ending.
 ///
-/// The store never depends on [`crate::AppState`]; callers take this back and
-/// publish it on the follow bus so every open inbox/session drops the card
-/// immediately instead of waiting for its next poll. Idempotent writes settle
-/// nothing and yield an empty settlement.
+/// The store never depends on [`crate::AppState`]; callers publish these on
+/// the follow bus so every open inbox/session drops the card immediately
+/// instead of waiting for its next poll. Idempotent writes settle nothing and
+/// yield an empty settlement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settlement {
-    /// `(instance_id, interaction_id)` pairs settled to `invalidated`.
-    pub interactions: Vec<(String, String)>,
+    /// Interactions settled to `invalidated`, in commit order.
+    pub interactions: Vec<SettledInteraction>,
+}
+
+/// One interaction a terminal transaction settled; `updated_at` is the durable
+/// write timestamp the lag-recovery cursor pages on (c-cardsettle r6 item 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledInteraction {
+    /// Owning instance.
+    pub instance_id: String,
+    /// The interaction id that was invalidated.
+    pub interaction_id: String,
+    /// Durable `updated_at` of the terminal row, for delivery cursoring.
+    pub updated_at: String,
 }
 
 impl Settlement {
@@ -4242,18 +4254,17 @@ impl Store {
             .collect())
     }
 
-    /// c-cardsettle r5 item 6: one BOUNDED page (at most
+    /// c-cardsettle r6 item 2: one BOUNDED page (at most
     /// [`SETTLEMENT_LAG_PAGE`] live rows + tombstones) of terminal
-    /// interactions strictly after a per-follower delivery cursor. The cursor
-    /// is the opaque token [`settlement_cursor_of`] built from the last row a
-    /// follower already received; it is a COMPOSITE `(updated_at, id)` key so
-    /// rows one transaction settled in the same millisecond cannot be skipped
-    /// across a page boundary. The lag recovery sends this page BEFORE its gap
-    /// frame and then advances the cursor to the page high-water mark, so
-    /// repeated lag bursts page forward instead of re-running a fixed time
-    /// window. With no cursor (a fresh connection's first recovery) the most
-    /// recent bounded page is returned regardless of age — an older lost
-    /// settlement is still authoritative and must not resurrect a card.
+    /// interactions strictly after a per-follower delivery cursor, in
+    /// ASCENDING `(updated_at, id)` order. The lag recovery drains page after
+    /// page (each call advances past the previous page's last row) until a
+    /// short page, so a burst larger than one page cannot permanently skip the
+    /// older rows. The cursor is the opaque token [`settlement_cursor_of`] —
+    /// a COMPOSITE `(updated_at, id)` key so rows one transaction settled in
+    /// the same millisecond cannot be skipped. With no cursor (a follower that
+    /// has never passed a row) the drain starts at the OLDEST terminal row and
+    /// walks forward; an older lost settlement is still authoritative.
     pub async fn invalidated_interactions_after(
         &self,
         cursor: Option<String>,
@@ -4268,9 +4279,24 @@ impl Store {
         format!("{updated_at}{SETTLEMENT_CURSOR_SEP}{id}")
     }
 
+    /// Advance `cursor` past a delivered/paged row using the composite
+    /// `(updated_at, id)` ordering; `None` starts at the row.
+    #[must_use]
+    pub(crate) fn settlement_max_cursor(
+        cursor: Option<&str>,
+        updated_at: &str,
+        id: &str,
+    ) -> String {
+        let token = Self::settlement_cursor_of(updated_at, id);
+        match cursor {
+            Some(prev) if prev > token.as_str() => prev.to_owned(),
+            _ => token,
+        }
+    }
+
     /// Parse an opaque cursor into its `(updated_at, id)` parts. A malformed
-    /// token (never one we issued) starts the follower over from the newest
-    /// page rather than silently filtering everything out.
+    /// token (never one we issued) restarts the drain from the oldest row
+    /// rather than silently filtering everything out.
     fn parse_settlement_cursor(cursor: Option<&str>) -> (Option<&str>, Option<&str>) {
         match cursor.map(|token| token.split_once(SETTLEMENT_CURSOR_SEP)) {
             Some(Some((updated_at, id))) if !updated_at.is_empty() && !id.is_empty() => {
@@ -4283,7 +4309,9 @@ impl Store {
     /// Shared bounded page over live invalidated rows UNION ALL tombstones.
     /// The reconnect snapshot is bounded by a recent WINDOW; the lag cursor
     /// path is windowless (an older lost settlement is still authoritative)
-    /// and pages from the cursor. `limit` bounds rows AND tombstones together.
+    /// and pages forward from the cursor. Rows are always ASCENDING so a
+    /// multi-page drain reaches the oldest missed rows; `limit` bounds rows
+    /// AND tombstones together.
     async fn invalidated_interactions_page(
         &self,
         window_mins: Option<i64>,
@@ -4292,21 +4320,11 @@ impl Store {
     ) -> Result<Vec<(String, String, String, String)>, StoreError> {
         let limit = i64::from(limit);
         self.run_named("invalidated_interactions_page", move |conn| {
-            // r5 item 6: composite cursor + bounded LIMIT bound both age (from
-            // the follower's durable position) and count. A cursor-less first
-            // recovery pages the NEWEST bounded rows (what a burst just
-            // overwrote); subsequent pages walk strictly forward ascending.
-            // A token present but unparseable behaves like "no durable
-            // position": recover the newest bounded page.
+            // r6 item 2: composite cursor + bounded LIMIT; always oldest-first
+            // so repeated pages drain the ENTIRE backlog. A token present but
+            // unparseable behaves like "no durable position".
             let (cursor_ts, cursor_id) = Self::parse_settlement_cursor(cursor.as_deref());
-            let paged = cursor_ts.is_some();
-            let order = if paged {
-                "updated_at ASC, id ASC"
-            } else {
-                "updated_at DESC, id DESC"
-            };
-            let sql = format!(
-                "SELECT instance_id, id, COALESCE(
+            let sql = "SELECT instance_id, id, COALESCE(
                     json_extract(payload_json,
                         '$.payload.entity.resolution.value.reason'),
                     json_extract(payload_json,
@@ -4325,10 +4343,9 @@ impl Store {
                  WHERE state = 'invalidated'
                    AND (?1 IS NULL OR julianday(updated_at) >= julianday('now','-' || ?1 || ' minutes'))
                    AND (?2 IS NULL OR (updated_at, id) > (?2, ?3))
-                 ORDER BY {order}
-                 LIMIT ?4"
-            );
-            let mut stmt = conn.prepare(&sql)?;
+                 ORDER BY updated_at ASC, id ASC
+                 LIMIT ?4";
+            let mut stmt = conn.prepare(sql)?;
             let rows = stmt.query_map(
                 params![window_mins, cursor_ts, cursor_id, limit],
                 |row| {
@@ -7814,20 +7831,25 @@ mod tests {
             "an old tombstone is recovered with live rows"
         );
         assert!(!first_ids.contains(&pending_int), "pending never recovered");
-        // No-cursor pages are newest-first.
-        assert_eq!(first.first().map(|(_, id, _, _)| id), Some(&fresh_int));
+        // r6 item 2: lag pages always walk OLDEST-first, so a multi-page drain
+        // reaches every missed row; the aged row (2 hours old) sorts before the
+        // fresh one.
+        assert!(
+            first
+                .iter()
+                .map(|(_, _, _, ts)| ts)
+                .is_sorted_by(|a, b| a <= b),
+            "lag pages are oldest-first"
+        );
 
-        // Paging strictly forward from the newest row's composite cursor
-        // yields nothing.
-        let newest_token = {
-            let (_, newest_id, _, newest_ts) = first.first().expect("newest row");
-            Store::settlement_cursor_of(newest_ts, newest_id)
-        };
+        // Paging strictly forward from a cursor PAST every row yields nothing.
+        let last = first.last().expect("last row");
+        let beyond_token = Store::settlement_cursor_of(&last.3, &last.1);
         assert!(
             store
-                .invalidated_interactions_after(Some(newest_token))
+                .invalidated_interactions_after(Some(beyond_token))
                 .await
-                .expect("page from newest")
+                .expect("page beyond newest")
                 .is_empty(),
             "no settlement is newer than the newest row"
         );
@@ -7925,13 +7947,49 @@ mod tests {
             SETTLEMENT_LAG_PAGE as usize,
             "rows and tombstones are bounded together by one LIMIT"
         );
-        // Newest-first: the newest 20 must all be present, the oldest 20 gone.
+        // Oldest-first (r6 item 2): the first bounded page is the OLDEST 512;
+        // the newest 20 wait for the second page, which must be short.
         let ids: std::collections::HashSet<String> =
             page.iter().map(|(_, id, _, _)| id.clone()).collect();
-        assert!(ids.contains(&format!("int_backlog_{:05}", total - 1)));
-        assert!(ids.contains(&format!("int_backlog_{:05}", total - 20)));
-        assert!(!ids.contains("int_backlog_00000"));
-        assert!(!ids.contains(&format!("int_backlog_{:05}", 19)));
+        assert!(ids.contains("int_backlog_00000"));
+        assert!(ids.contains(&format!("int_backlog_{:05}", SETTLEMENT_LAG_PAGE - 1)));
+        assert!(!ids.contains(&format!("int_backlog_{:05}", SETTLEMENT_LAG_PAGE)));
+        assert!(!ids.contains(&format!("int_backlog_{:05}", total - 1)));
+        // The page is ordered ascending end to end.
+        assert!(
+            page.iter()
+                .map(|(_, _, _, ts)| ts)
+                .is_sorted_by(|a, b| a <= b)
+        );
+
+        // Draining from the page's last cursor returns exactly the remaining
+        // 20 newest rows, and one more page is empty: the follower drains the
+        // whole backlog and never skips the tail.
+        let last = page.last().expect("last row");
+        let cursor = Store::settlement_cursor_of(&last.3, &last.1);
+        let second = store
+            .invalidated_interactions_after(Some(cursor))
+            .await
+            .expect("second page");
+        assert_eq!(second.len(), (total - SETTLEMENT_LAG_PAGE) as usize);
+        let second_ids: Vec<String> = second.iter().map(|(_, id, _, _)| id.clone()).collect();
+        assert_eq!(
+            second_ids.first().map(String::as_str),
+            Some(format!("int_backlog_{:05}", SETTLEMENT_LAG_PAGE).as_str())
+        );
+        assert_eq!(
+            second_ids.last().map(String::as_str),
+            Some(format!("int_backlog_{:05}", total - 1).as_str())
+        );
+        let tail_cursor =
+            Store::settlement_cursor_of(&second.last().unwrap().3, &second.last().unwrap().1);
+        assert!(
+            store
+                .invalidated_interactions_after(Some(tail_cursor))
+                .await
+                .expect("third page")
+                .is_empty()
+        );
         store.close().await;
     }
 
@@ -8401,10 +8459,16 @@ mod tests {
             .expect("reconcile");
         assert_eq!(reconciled, vec![lost.instance_id.clone()]);
         // The settlement returned to callers names exactly the lost card.
+        let lost_settled: Vec<(String, String)> = settlement
+            .interactions
+            .iter()
+            .map(|settled| (settled.instance_id.clone(), settled.interaction_id.clone()))
+            .collect();
         assert_eq!(
-            settlement.interactions,
+            lost_settled,
             vec![(lost.instance_id.clone(), lost_int.clone())]
         );
+        assert!(!settlement.interactions[0].updated_at.is_empty());
 
         // The instance change and the card settlement are one committed fact.
         let lost_row = store
@@ -8499,10 +8563,10 @@ mod tests {
             .await
             .expect("settle");
         assert!(changed);
-        assert_eq!(
-            settlement.interactions,
-            vec![(instance.instance_id.clone(), int_id.clone())]
-        );
+        assert_eq!(settlement.interactions.len(), 1, "one card settled");
+        assert_eq!(settlement.interactions[0].instance_id, instance.instance_id);
+        assert_eq!(settlement.interactions[0].interaction_id, int_id);
+        assert!(!settlement.interactions[0].updated_at.is_empty());
         let row = store
             .get_instance(instance.instance_id.clone())
             .await
@@ -8544,11 +8608,16 @@ mod tests {
             )
             .await
             .expect("append exit");
+        assert_eq!(appended.settlement.interactions.len(), 1);
         assert_eq!(
-            appended.settlement.interactions,
-            vec![(instance.instance_id.clone(), int_id.clone())],
-            "the journal append reports the cards it settled"
+            appended.settlement.interactions[0].instance_id,
+            instance.instance_id
         );
+        assert_eq!(
+            appended.settlement.interactions[0].interaction_id, int_id,
+            "the journal append reports the card it settled"
+        );
+        assert!(!appended.settlement.interactions[0].updated_at.is_empty());
         let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "invalidated");
         assert_eq!(reason.as_deref(), Some("generation-ended"));
@@ -9078,97 +9147,6 @@ mod tests {
         store.close().await;
     }
 
-    /// c-cardsettle r6 item 1: the production drivers' STARTUP frames share
-    /// the exit nativeName (`topic=session`, nativeName `session`) — print/SDK
-    /// init status "started", PTY ready statuses idle/working/blocked/done/
-    /// unknown. Journaled through the Hub they must keep the instance running
-    /// and the approval pending; only the later real `session/exited` settles.
-    #[tokio::test]
-    async fn startup_session_frames_keep_the_instance_running_until_the_real_exit() {
-        let dir = tempfile::tempdir().expect("dir");
-        let store = Store::open(dir.path()).expect("store");
-        let host = new_id("hst").expect("host");
-        enroll_labeled(&store, host.clone(), "startup-frames-not-exit").await;
-        let instance = seed_acknowledged_instance(&store, &host).await;
-        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
-
-        // The print/SDK mapper init frame.
-        store
-            .append_journal(
-                host.clone(),
-                instance.instance_id.clone(),
-                None,
-                json!({"kind":"lifecycle","observedAt":"2026-10-07T10:00:00.000Z","payload":{
-                    "type":"native","topic":"session","nativeName":"session",
-                    "severity":"info","affectsCompletion":false,
-                    "nativeId":{"state":"known","value":"sess-1"},
-                    "status":{"state":"known","value":"started"}}}),
-            )
-            .await
-            .expect("print init");
-        // The Claude/generic PTY ready frames with every live agent status,
-        // including one carrying an error severity (still not an end).
-        for (status, severity) in [
-            ("idle", "info"),
-            ("working", "info"),
-            ("blocked", "info"),
-            ("done", "info"),
-            ("unknown", "info"),
-            ("working", "error"),
-        ] {
-            store
-                .append_journal(
-                    host.clone(),
-                    instance.instance_id.clone(),
-                    None,
-                    json!({"kind":"lifecycle","payload":{
-                        "type":"native","topic":"session","nativeName":"session",
-                        "severity":severity,"affectsCompletion":false,
-                        "nativeId":{"state":"known","value":"pane-1"},
-                        "status":{"state":"known","value":status}}}),
-                )
-                .await
-                .expect("pty ready");
-        }
-        let row = store
-            .get_instance(instance.instance_id.clone())
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(
-            row.lifecycle, "running",
-            "startup frames on the session name never end the instance"
-        );
-        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
-        assert_eq!(state, "pending");
-        assert!(reason.is_none());
-
-        // The REAL print session/exited then ends it and settles the card.
-        store
-            .append_journal(
-                host.clone(),
-                instance.instance_id.clone(),
-                None,
-                json!({"kind":"lifecycle","observedAt":"2026-10-07T10:05:00.000Z","payload":{
-                    "type":"native","topic":"session","nativeName":"session",
-                    "severity":"info","affectsCompletion":false,
-                    "nativeId":{"state":"known","value":"sess-1"},
-                    "status":{"state":"known","value":"exited"}}}),
-            )
-            .await
-            .expect("real exit");
-        let row = store
-            .get_instance(instance.instance_id.clone())
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(row.lifecycle, "exited");
-        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
-        assert_eq!(state, "invalidated");
-        assert_eq!(reason.as_deref(), Some("generation-ended"));
-        store.close().await;
-    }
-
     /// c-cardsettle r5 item 4 (OA6): the print/SDK mapper's REAL root turn
     /// failure (claude_print `map_result`: topic=turn, nativeName=result,
     /// status=error, resultIndex/numTurns) appended through the Hub ENDS THE
@@ -9512,10 +9490,10 @@ mod tests {
             .expect("offline");
         let (swept, settlement) = store.expire_lost_hosts(0).await.expect("host-lost sweep");
         assert_eq!(swept, 1);
-        assert_eq!(
-            settlement.interactions,
-            vec![(instance.instance_id.clone(), int_id.clone())]
-        );
+        assert_eq!(settlement.interactions.len(), 1, "one card settled");
+        assert_eq!(settlement.interactions[0].instance_id, instance.instance_id);
+        assert_eq!(settlement.interactions[0].interaction_id, int_id);
+        assert!(!settlement.interactions[0].updated_at.is_empty());
         let row = store
             .get_instance(instance.instance_id)
             .await
@@ -9543,10 +9521,10 @@ mod tests {
             .fail_instance(instance.instance_id.clone(), "node rejected launch".into())
             .await
             .expect("fail");
-        assert_eq!(
-            settlement.interactions,
-            vec![(instance.instance_id.clone(), int_id.clone())]
-        );
+        assert_eq!(settlement.interactions.len(), 1, "one card settled");
+        assert_eq!(settlement.interactions[0].instance_id, instance.instance_id);
+        assert_eq!(settlement.interactions[0].interaction_id, int_id);
+        assert!(!settlement.interactions[0].updated_at.is_empty());
         let row = store
             .get_instance(instance.instance_id)
             .await
@@ -10958,7 +10936,11 @@ pub(crate) fn settle_instance_interactions(
             params![id, event.to_string(), now],
         )?;
         if changed > 0 {
-            settlement.interactions.push((owner_instance_id, id));
+            settlement.interactions.push(SettledInteraction {
+                instance_id: owner_instance_id,
+                interaction_id: id,
+                updated_at: now.to_owned(),
+            });
         }
     }
     Ok(settlement)

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { mkdir } from "node:fs/promises";
 import pathFn from "node:path";
 import { fileURLToPath } from "node:url";
 import { login } from "./hub-auth";
@@ -21,13 +22,23 @@ import { login } from "./hub-auth";
  * here.
  */
 
-const evidenceDir =
-  process.env.REMUDA_EVIDENCE === "1"
-    ? pathFn.resolve(pathFn.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence")
-    : pathFn.resolve("test-results/evidence");
+// Every case drives the in-process fake Node's scripted scenarios; against an
+// operator-provided hub (HUB_E2E_EXTERNAL=1) the prompts and the
+// e2e-fake-node host do not exist. Same idiom as hub-live/font-swap specs.
+test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
+
+// A default run must not write screenshots: captures happen only with
+// REMUDA_EVIDENCE=1, straight into docs/design/evidence. The functional
+// assertions in this suite do not depend on the files.
+const evidence = process.env.REMUDA_EVIDENCE === "1";
+const evidenceDir = evidence
+  ? pathFn.resolve(pathFn.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence")
+  : null;
 
 async function shot(page: Page, name: string): Promise<void> {
-  await page.screenshot({ path: pathFn.join(evidenceDir, name) });
+  if (!evidence || !evidenceDir) return;
+  await mkdir(evidenceDir, { recursive: true });
+  await page.screenshot({ path: pathFn.join(evidenceDir, name), animations: "disabled" });
 }
 
 // Release every instance this spec creates (force is a u8 query param).
@@ -276,6 +287,26 @@ test.describe("with a coarse pointer", () => {
     );
     await expect(page.getByTestId("compact-fold-wrap").getByTestId("workflow-card")).toHaveCount(0);
   });
+});
+
+test("the compact tool group collapses again from the same summary row; the caret flips", async ({ page }) => {
+  await openLiveSession(page);
+  const fold = page.getByTestId("compact-fold");
+  const wrap = page.getByTestId("compact-fold-wrap");
+
+  await expect(fold).toHaveAttribute("aria-expanded", "false");
+  await expect(fold).toContainText("▸");
+
+  await fold.click();
+  await expect(fold).toHaveAttribute("aria-expanded", "true");
+  await expect(fold).toContainText("▾");
+  await expect(wrap.getByTestId("tool-card")).toBeVisible();
+
+  // c-uifold: the same summary row is also the collapse affordance.
+  await fold.click();
+  await expect(fold).toHaveAttribute("aria-expanded", "false");
+  await expect(fold).toContainText("▸");
+  await expect(wrap.getByTestId("tool-card")).toHaveCount(0);
 });
 
 test("the desktop default folds settled cards (D-053); collapse-all folds every non-failed card", async ({

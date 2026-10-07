@@ -207,10 +207,10 @@ fn classify(
     // emit_startup_failure uses the EXACT name "error" with severity=error and
     // a prose status (a transient error the live process survives uses the
     // DISTINCT name transient_runtime_error), so the exact name plus
-    // severity=error is attested launch failure.
+    // severity=error is attested launch failure. Only COMPLETE explicit shapes
+    // match — never a name substring.
     if reason_code == START_FAILED_REASON
         || name == START_FAILED_REASON
-        || name.contains("start-fail")
         || (name == GENERIC_STARTUP_ERROR_NAME && severity == Severity::Error)
     {
         return Some(ProcessEnd::new(ProcessEndKind::Failed));
@@ -220,28 +220,39 @@ fn classify(
         return Some(ProcessEnd::new(ProcessEndKind::Failed));
     }
 
-    // Real process-exit event names.
-    let is_exit_name =
-        name == SHELL_PTY_EXIT_NAME || name == PRINT_EXIT_NAME || name == GENERIC_EXIT_NAME;
-    if !is_exit_name {
-        return None;
-    }
-    if let Some(status) = status {
-        return match status {
-            "exited" | "clean" => Some(ProcessEnd::new(ProcessEndKind::Exited)),
-            "failed" | "error" | "crashed" | "killed" | "terminated" => {
+    // Real process-exit names. The rules differ by driver:
+    match name.as_str() {
+        // shell_pty NATIVE_EXIT and the print/SDK `emit_exit` both reuse
+        // nativeName="session"/"native_exit" for NON-end frames too — the
+        // print init frame (status "started") and the Claude/generic PTY
+        // ready frames (status idle/working/blocked/done/unknown). They are
+        // an end ONLY when the status is the exact end token these drivers
+        // emit at process end; a missing/other status is NOT an end (never a
+        // severity fallback — that turned every startup frame into a clean
+        // Exited, c-cardsettle r6 item 1).
+        SHELL_PTY_EXIT_NAME | PRINT_EXIT_NAME => match status {
+            Some("exited" | "clean") => Some(ProcessEnd::new(ProcessEndKind::Exited)),
+            Some("failed") => Some(ProcessEnd::new(ProcessEndKind::Failed)),
+            _ => None,
+        },
+        // The generic PTY carrier's PaneExited: nativeName="exit" with a
+        // PROSE status (e.g. "pane exited; agent process is gone") or a pane
+        // id, so the severity is the verdict. Info = a clean pane close.
+        GENERIC_EXIT_NAME => match status {
+            Some("exited" | "clean") => Some(ProcessEnd::new(ProcessEndKind::Exited)),
+            Some("failed" | "error" | "crashed" | "killed" | "terminated") => {
                 Some(ProcessEnd::new(ProcessEndKind::Failed))
             }
-            // status is an agent/pane id (generic_pty failure_lifecycle sets
-            // it to the pane id): fall back to severity.
             _ => severity_fallback(severity),
-        };
+        },
+        _ => None,
     }
-    severity_fallback(severity)
 }
 
 /// Exit name present but no usable status: severity=info is a clean exit,
-/// severity=error a failed one.
+/// severity=error a failed one. ONLY the generic PTY `exit` event reaches
+/// this (a pane id or prose status) — never `session`/`native_exit`, whose
+/// status is always an exact token.
 fn severity_fallback(severity: Severity) -> Option<ProcessEnd> {
     match severity {
         Severity::Error => Some(ProcessEnd::new(ProcessEndKind::Failed)),
@@ -356,17 +367,127 @@ mod tests {
                 ),
                 Some(ProcessEndKind::Failed),
             ),
-            // shell-pty EOF with no status (status unknown) → severity error → Failed.
+            // shell-pty PTY EOF: ExitEvidence::Eof.lifecycle() = "failed",
+            // so the driver still emits status "failed" (severity error).
             (
                 "shell-pty EOF",
                 native(
                     LifecycleTopic::Session,
                     SHELL_PTY_EXIT_NAME,
-                    None,
+                    Some("failed"),
                     Severity::Error,
                     &[("reason", "native-exit-eof")],
                 ),
                 Some(ProcessEndKind::Failed),
+            ),
+            // ── r6 item 1: STARTUP / liveness frames on the exit NAMES ──────
+            // print/SDK init: map_init emits topic=session nativeName=session
+            // status="started" severity info. NOT an end.
+            (
+                "print SDK init started",
+                native(
+                    LifecycleTopic::Session,
+                    PRINT_EXIT_NAME,
+                    Some("started"),
+                    Severity::Info,
+                    &[("tools", "Bash,Read")],
+                ),
+                None,
+            ),
+            // Claude PTY ready: nativeName=session, status = the herdr agent
+            // status string, severity info. Every value is non-terminal.
+            (
+                "claude pty ready idle",
+                native(
+                    LifecycleTopic::Session,
+                    PRINT_EXIT_NAME,
+                    Some("idle"),
+                    Severity::Info,
+                    &[("paneId", "pane-1")],
+                ),
+                None,
+            ),
+            (
+                "claude pty ready working",
+                native(
+                    LifecycleTopic::Session,
+                    PRINT_EXIT_NAME,
+                    Some("working"),
+                    Severity::Info,
+                    &[("paneId", "pane-1")],
+                ),
+                None,
+            ),
+            (
+                "claude pty ready blocked",
+                native(
+                    LifecycleTopic::Session,
+                    PRINT_EXIT_NAME,
+                    Some("blocked"),
+                    Severity::Info,
+                    &[("paneId", "pane-1")],
+                ),
+                None,
+            ),
+            (
+                "claude pty ready done",
+                native(
+                    LifecycleTopic::Session,
+                    PRINT_EXIT_NAME,
+                    Some("done"),
+                    Severity::Info,
+                    &[("paneId", "pane-1")],
+                ),
+                None,
+            ),
+            (
+                "pty ready unknown",
+                native(
+                    LifecycleTopic::Session,
+                    PRINT_EXIT_NAME,
+                    Some("unknown"),
+                    Severity::Info,
+                    &[("paneId", "pane-1")],
+                ),
+                None,
+            ),
+            // generic_pty ready: same name/status shape.
+            (
+                "generic pty ready",
+                native(
+                    LifecycleTopic::Session,
+                    PRINT_EXIT_NAME,
+                    Some("idle"),
+                    Severity::Info,
+                    &[("paneId", "pane-9"), ("kind", "claude")],
+                ),
+                None,
+            ),
+            // A native_exit frame with NO status (hypothetical/dropped field)
+            // must not severity-fallback to an end.
+            (
+                "native_exit missing status",
+                native(
+                    LifecycleTopic::Session,
+                    SHELL_PTY_EXIT_NAME,
+                    None,
+                    Severity::Info,
+                    &[],
+                ),
+                None,
+            ),
+            // A session frame with severity ERROR but a non-end status is a
+            // liveness error, not a process end.
+            (
+                "session working with error severity",
+                native(
+                    LifecycleTopic::Session,
+                    PRINT_EXIT_NAME,
+                    Some("working"),
+                    Severity::Error,
+                    &[],
+                ),
+                None,
             ),
             // print/SDK emit_exit clean: name "session", status "exited",
             // severity INFO, affectsCompletion=false → Exited.

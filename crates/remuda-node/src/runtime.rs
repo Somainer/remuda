@@ -3425,6 +3425,129 @@ mod tests {
         }
     }
 
+    /// c-cardsettle r6 item 1: the drivers' STARTUP frames reuse the exit name
+    /// (`topic=session, nativeName=session`) with live statuses — print/SDK
+    /// `map_init` status "started", the PTY ready frames carrying the herdr
+    /// agent status (idle/working/blocked). Fed through the REAL pump they
+    /// must leave a live instance Ready; only the driver's later real exit
+    /// ends it (print `emit_exit("exited")` → Exited).
+    #[tokio::test]
+    async fn startup_session_frames_never_end_the_live_instance() {
+        use remuda_protocol::{DriverKind, SourceChannel};
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudePrint,
+        )
+        .unwrap();
+        let id = instance.meta.id.clone();
+        store.insert_instance(instance).unwrap();
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+        );
+
+        let frame = |channel: SourceChannel,
+                     driver: DriverKind,
+                     name: &str,
+                     native_id: &str,
+                     status: &str,
+                     severity: remuda_protocol::Severity| {
+            let mut observation = native_lifecycle_full(
+                remuda_protocol::LifecycleTopic::Session,
+                name,
+                native_id,
+                &[],
+                severity,
+                false,
+                status,
+            );
+            observation.source.channel = channel;
+            observation.source.driver_kind = driver;
+            observation
+        };
+
+        // 1) The print/SDK init frame (stdout channel).
+        tx.send(frame(
+            SourceChannel::Stdout,
+            DriverKind::ClaudePrint,
+            "session",
+            "sess-1",
+            "started",
+            remuda_protocol::Severity::Info,
+        ))
+        .await
+        .unwrap();
+        // 2) The Claude PTY ready frame with each live agent status.
+        for status in ["idle", "working", "blocked", "done", "unknown"] {
+            tx.send(frame(
+                SourceChannel::Herdr,
+                DriverKind::ClaudePty,
+                "session",
+                "pane-7",
+                status,
+                remuda_protocol::Severity::Info,
+            ))
+            .await
+            .unwrap();
+        }
+        // 3) Even an ERROR-severity live status must not be an end.
+        tx.send(frame(
+            SourceChannel::Herdr,
+            DriverKind::GenericPty,
+            "session",
+            "pane-8",
+            "working",
+            remuda_protocol::Severity::Error,
+        ))
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let live = store.get_instance(&id).unwrap();
+        assert!(
+            !matches!(
+                live.lifecycle,
+                InstanceLifecycle::Failed | InstanceLifecycle::Exited
+            ),
+            "startup frames must never end the session: {:?}",
+            live.lifecycle
+        );
+
+        // 4) The REAL print driver exit: name=session, status=exited.
+        tx.send(frame(
+            SourceChannel::Stdout,
+            DriverKind::ClaudePrint,
+            "session",
+            "sess-1",
+            "exited",
+            remuda_protocol::Severity::Info,
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.get_instance(&id).unwrap().lifecycle == InstanceLifecycle::Exited {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the real print session/exited ends the instance");
+
+        drop(tx);
+        pump.await.unwrap();
+    }
+
     /// c-cardsettle r3 item 1: a severity=error configure observation on a live
     /// PTY (model/effort/permission switch failed) is NOT classified as a task
     /// exit — otherwise the Node journals a FAILED entity and the Hub kills the

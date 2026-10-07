@@ -2450,3 +2450,130 @@ mod tests {
         assert_eq!(rollup.session_input_tokens, Some(250), "counters unchanged");
     }
 }
+
+/// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a
+/// real migrated store TWICE must converge durably: the same 24 turn rows
+/// with the same counters after each pass (the second pass is a
+/// re-hydration — it projects and re-inserts, but nothing changes).
+#[test]
+fn real_fixture_double_replay_is_durable() {
+    use remuda_driver::TranscriptMapper;
+    use remuda_protocol::{DriverKind, HostId, Id as PId, InstanceId, ObservationPayload, RunId};
+    use std::path::Path;
+
+    let fixture_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../remuda-journal/tests/fixtures/effort-21289");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&fixture_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    paths.sort();
+
+    let instance = "ins_double_replay";
+    let open_mapper = || {
+        TranscriptMapper::new(
+            DriverKind::ShellPty,
+            InstanceId::new(),
+            RunId::new(),
+            PId::new("obj").unwrap(),
+            HostId::new(),
+            "double-replay-session".into(),
+            "2.1.289".into(),
+        )
+    };
+    let one_pass =
+        |mapper: &mut TranscriptMapper, conn: &Connection, seq_start: i64| -> (i64, usize, i64) {
+            let mut emitted = 0usize;
+            let mut seq = seq_start;
+            for path in &paths {
+                let body = std::fs::read_to_string(path).unwrap();
+                for line in body.lines().filter(|line| !line.trim().is_empty()) {
+                    for obs in mapper.map_line(line).expect("fixture maps") {
+                        if !matches!(obs.body, ObservationPayload::Usage(_)) {
+                            continue;
+                        }
+                        let record = JournalRecord {
+                            instance_id: instance.into(),
+                            seq,
+                            event_id: format!("evt_dr_{seq}"),
+                            event: serde_json::to_value(&obs).unwrap(),
+                            // Deliberately a fresh ingest time: the payload
+                            // carries nativeAt, which must win.
+                            observed_at: "2030-01-01T00:00:00.000Z".into(),
+                        };
+                        let row = project_usage_event(&record, None, None).unwrap();
+                        insert_usage_event(conn, &row).unwrap();
+                        emitted += 1;
+                        seq += 1;
+                    }
+                }
+                for obs in mapper.flush().expect("flush") {
+                    if !matches!(obs.body, ObservationPayload::Usage(_)) {
+                        continue;
+                    }
+                    let record = JournalRecord {
+                        instance_id: instance.into(),
+                        seq,
+                        event_id: format!("evt_dr_{seq}"),
+                        event: serde_json::to_value(&obs).unwrap(),
+                        observed_at: "2030-01-01T00:00:00.000Z".into(),
+                    };
+                    let row = project_usage_event(&record, None, None).unwrap();
+                    insert_usage_event(conn, &row).unwrap();
+                    emitted += 1;
+                    seq += 1;
+                }
+            }
+            let turn_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_events WHERE instance_id=?1 AND scope='turn'",
+                    params![instance],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let input_sum: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(input_tokens),0) FROM usage_events
+                     WHERE instance_id=?1 AND scope='turn'",
+                    params![instance],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (seq, emitted, turn_rows * 1000 + input_sum)
+        };
+
+    let conn = Connection::open_in_memory().unwrap();
+    migrate(&conn).unwrap();
+
+    let mut mapper = open_mapper();
+    let (next_seq, emitted1, signature1) = one_pass(&mut mapper, &conn, 1);
+    assert_eq!(
+        signature1 / 1000,
+        24,
+        "pass 1 durably persists exactly 24 turn rows (emitted {emitted1} usage obs)"
+    );
+
+    // Second fresh mapper pass: byte-0 re-hydration with its own seqs.
+    let mut mapper = open_mapper();
+    let (_seq, emitted2, signature2) = one_pass(&mut mapper, &conn, next_seq);
+    assert_eq!(
+        signature2, signature1,
+        "pass 2 leaves the SAME 24 rows and counters (emitted {emitted2} obs)"
+    );
+
+    // Every durable row is native-timestamped, never the 2030 ingest value.
+    let bad_times: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id=?1 AND observed_at LIKE '2030-%'",
+            params![instance],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        bad_times, 0,
+        "nativeAt wins over the ingest fallback on replay"
+    );
+}

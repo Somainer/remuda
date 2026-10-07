@@ -6614,10 +6614,7 @@ fn apply_instance_projection(
     // turn/configure/liveness event.
     let mut end_evidence: Option<remuda_protocol::process_end::ProcessEnd> = None;
     let mut last_error: Option<String> = None;
-    if kind == "lifecycle"
-        && payload_type == "entity"
-        && payload_is_instance_entity(&payload)
-    {
+    if kind == "lifecycle" && payload_type == "entity" && payload_is_instance_entity(&payload) {
         let entity_state = payload.get("state").and_then(Value::as_str);
         // ma-lineage r4: an INSTANCE entity terminal is process end through
         // the shared classifier (exited → exited, failed → failed); `ready`
@@ -6730,11 +6727,11 @@ fn apply_instance_projection(
         // severity info) classify as `exited`, NOT failed. Subagent-scoped
         // native events never end the root.
         let subagent_scoped = native_payload_is_subagent(&payload);
-        if !subagent_scoped {
-            if let Some(end) = remuda_protocol::process_end::process_end_event(event) {
-                lifecycle = Some(end.lifecycle());
-                end_evidence = Some(end);
-            }
+        if !subagent_scoped
+            && let Some(end) = remuda_protocol::process_end::process_end_event(event)
+        {
+            lifecycle = Some(end.lifecycle());
+            end_evidence = Some(end);
         }
         let _ = native_name;
     }
@@ -11916,8 +11913,10 @@ fn stamp_ended_at(conn: &Connection, instance_id: &str, at: &str) -> Result<(), 
 /// row has no `ended_at` yet (ma-lineage r4 item 1).
 fn is_attested_launch_failure_marker(last_error: &str) -> bool {
     let text = last_error.to_ascii_lowercase();
-    text.contains("start-fail") || text.contains("start failed") ||
-        text.contains("never acknowledged") || text.contains("never started")
+    text.contains("start-fail")
+        || text.contains("start failed")
+        || text.contains("never acknowledged")
+        || text.contains("never started")
 }
 
 /// ma-lineage r4 item 1 (OA6) pure row-level predicate for the continuation
@@ -11941,10 +11940,7 @@ pub(crate) fn lifecycle_has_process_end_evidence(
 ) -> bool {
     match lifecycle {
         "exited" | "closed" => true,
-        "failed" => {
-            ended_at.is_some()
-                || last_error.is_some_and(is_attested_launch_failure_marker)
-        }
+        "failed" => ended_at.is_some() || last_error.is_some_and(is_attested_launch_failure_marker),
         _ => false,
     }
 }

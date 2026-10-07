@@ -653,6 +653,104 @@ async fn a_live_chapter_after_a_failed_turn_is_closed_when_the_lineage_continues
     Ok(())
 }
 
+/// ma-lineage r4 item 1: a LEGACY `failed` row (marked failed by a
+/// configure/turn error while the process was alive — no `ended_at`, a
+/// non-attestation `last_error`) is POTENTIALLY LIVE. With a known native
+/// session the continuation still closes the predecessor before resuming (a
+/// genuinely exited row would skip that close); without a session it is
+/// refused with 409.
+#[tokio::test]
+async fn an_ambiguous_legacy_failed_row_with_a_session_is_closed_before_continuation() -> Result<()>
+{
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE instances SET lifecycle = 'failed',
+                last_error = 'api-error: 429', ended_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+    }
+
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = response["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(x, y, "a known session resumes even from an ambiguous failed row");
+
+    // Potentially live: the predecessor is closed FIRST, then the resume runs.
+    let (method, close_params) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    assert_eq!(close_params["instanceId"], json!(x));
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    // The same ambiguous row WITHOUT a session is refused, not relaunched.
+    let ctx2 = Ctx::boot().await?;
+    let mut node2 = FakeNode::connect(&ctx2.hub, &ctx2.host).await?;
+    let (z, _token2) = ctx2.seat(&mut node2, None).await?;
+    {
+        let db = rusqlite::Connection::open(&ctx2.db_path)?;
+        db.execute(
+            "UPDATE instances SET lifecycle = 'failed',
+                last_error = 'configure failed: model-control-unavailable:x',
+                ended_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![z],
+        )?;
+    }
+    let status = ctx2.resume(&z, &ctx2.human).await?.status();
+    assert_eq!(
+        status, 409,
+        "an ambiguous failed row with no session is potentially live: 409"
+    );
+    Ok(())
+}
+
+/// ma-lineage r4 item 1: a `failed` row WITH recorded end evidence (ended_at
+/// stamped) is treated as ended even without an attested-launch marker — the
+/// close is skipped and continuation proceeds straight to the resume.
+#[tokio::test]
+async fn a_failed_row_with_ended_at_is_ended_for_continuation_and_close() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE instances SET lifecycle = 'failed', ended_at = '2026-09-01T08:30:00.000Z'
+             WHERE id = ?1",
+            rusqlite::params![x],
+        )?;
+    }
+
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_ne!(
+        response["instance"]["instanceId"],
+        json!(x),
+        "the ended failed row continues"
+    );
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume", "an ended predecessor is not closed");
+    Ok(())
+}
+
 // --- 5. endedAt is the immutable end event -------------------------------
 
 #[tokio::test]

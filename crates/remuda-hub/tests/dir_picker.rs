@@ -355,6 +355,10 @@ struct Fixture {
     /// `allowed/link/../proj`: lexical `..` lands on `allowed/proj`,
     /// realpath lands on `other/proj`.
     alias_dotdot: std::path::PathBuf,
+    /// Owned so the real temp tree is deleted after the hub shuts down
+    /// (c-dirpicker r7 item 9; previously `mem::forget` leaked ~12 trees per
+    /// run under the shared $TMPDIR).
+    _dir: tempfile::TempDir,
 }
 
 async fn fixture() -> Result<Fixture> {
@@ -402,8 +406,6 @@ async fn fixture() -> Result<Fixture> {
         aborts: Mutex::new(Vec::new()),
     });
     hub.test_set_node_transport(&host, node.clone()).await;
-    // Keep the temp dir alive for the fixture's life.
-    std::mem::forget(dir);
     Ok(Fixture {
         hub,
         cookie,
@@ -413,6 +415,7 @@ async fn fixture() -> Result<Fixture> {
         symlink_path,
         alias_other,
         alias_dotdot,
+        _dir: dir,
     })
 }
 

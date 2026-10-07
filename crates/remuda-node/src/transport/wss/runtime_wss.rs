@@ -398,6 +398,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
     };
     let mut request = CreateInstanceRequest {
         origin: crate::origin::wire_origin(params),
+        initiator: crate::origin::wire_initiator(params),
         agent_credential: params
             .get("agentCredential")
             .cloned()
@@ -496,6 +497,7 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::Send,
                 prompt: Some(prompt),
@@ -539,6 +541,7 @@ async fn cancel_from_params(
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::Cancel,
                 prompt: None,
@@ -578,6 +581,7 @@ async fn close_from_params(
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::Close,
                 prompt: None,
@@ -642,6 +646,7 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::WriteTty,
                 prompt: None,
@@ -693,6 +698,7 @@ async fn respond_from_params(
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id,
                 operation: CommandAction::RespondInteraction,
                 prompt: None,

@@ -526,6 +526,11 @@ pub struct Command {
     pub actor: ActorRef,
     /// `origin`; protocol §2.5.
     pub origin: CommandOrigin,
+    /// D-057 §7.1: Hub-stamped initiator carried on Agent-initiated commands.
+    /// Absent for Human/Bot-origin work and frames from older Hubs. The Node
+    /// persists it on the ledger and journals it with command events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<crate::Initiator>,
     /// `operation`; protocol §2.5.
     pub operation: CommandOperation,
     /// `target`; protocol §2.5.

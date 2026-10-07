@@ -1629,6 +1629,17 @@
           "$ref": "#/$defs/CommandId",
           "description": "`id`; protocol §1.1."
         },
+        "initiator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Initiator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.1: Hub-stamped initiator carried on Agent-initiated commands.\nAbsent for Human/Bot-origin work and frames from older Hubs. The Node\npersists it on the ledger and journals it with command events."
+        },
         "nodeReceipt": {
           "$ref": "#/$defs/Knowledge10",
           "description": "`node_receipt`; protocol §2.5."
@@ -4970,6 +4981,17 @@
           "$ref": "#/$defs/GateJobId",
           "description": "`gjb_…` id."
         },
+        "initiator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Initiator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.1: Hub-stamped initiator of an Agent-enqueued job; the gate\njob row is the `gate.run` admission record (main-agent.md §7.5)."
+        },
         "keepLogs": {
           "default": false,
           "description": "Retain the bounded run log even when the run passes (`--keep-logs`).",
@@ -6705,6 +6727,30 @@
     "Id": {
       "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc|wkr|gjb|wtl)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "Initiator": {
+      "description": "The chapter instance a mutation was initiated by, with its place in the\nlineage. `{instanceId, lineageId, generation}` — D-057 §7.1.\n\nThe generation is the chapter generation stamped at authentication time.\nA fence bumps the lineage's live generation, so the commit-time check can\nrefuse a request authenticated before the fence (main-agent.md §7.3).",
+      "properties": {
+        "generation": {
+          "description": "Chapter generation at authentication time.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "instanceId": {
+          "description": "The chapter instance that initiated the mutation.",
+          "type": "string"
+        },
+        "lineageId": {
+          "description": "Lineage the instance belongs to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instanceId",
+        "lineageId",
+        "generation"
+      ],
+      "type": "object"
     },
     "InputAccounting": {
       "description": "InputAccounting wire values; `protocol.md` §5.5.",

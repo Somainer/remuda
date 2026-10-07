@@ -774,6 +774,7 @@ impl DevNode {
             &self.inner.projection_epoch,
             None,
             payload_digest,
+            request.initiator.clone(),
         )?;
 
         // Idempotency, instance-id form: a retried create may carry a fresh
@@ -1078,6 +1079,7 @@ impl DevNode {
             &self.inner.projection_epoch,
             request.run_id.clone(),
             digest_json(&request)?,
+            request.initiator.clone(),
         )?;
         set_command_origin(&mut command, request.origin);
         let inserted = self
@@ -2857,6 +2859,7 @@ fn new_command(
     node_epoch: &Id,
     run_id: Option<remuda_protocol::RunId>,
     payload_digest: WireDigest,
+    initiator: Option<remuda_protocol::Initiator>,
 ) -> Result<Command, NodeError> {
     let now = timestamp_now()?;
     Ok(Command {
@@ -2874,6 +2877,7 @@ fn new_command(
             instance_id: Some(instance_id.clone()),
         },
         origin: CommandOrigin::Mcp,
+        initiator,
         operation,
         target: CommandTarget {
             host_id: host_id.clone(),
@@ -4821,5 +4825,102 @@ mod api_relay_launch_test {
             node.store().get_instance(&instance_id).ok().is_none(),
             "a refused launch creates no instance record"
         );
+    }
+}
+
+#[cfg(test)]
+mod initiator_persistence_test {
+    use super::*;
+    use crate::{FakeDriver, MemoryStore};
+
+    fn node() -> DevNode {
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_roots(remuda_testing::test_workspace_roots!());
+        let drivers = DriverRegistry::default();
+        drivers
+            .register(Arc::new(FakeDriver::default()))
+            .expect("register fake driver");
+        DevNode::with_parts(&config, Arc::new(MemoryStore::new(8)), drivers).expect("compose node")
+    }
+
+    fn request_with_initiator(
+        node: &DevNode,
+        with: bool,
+    ) -> (CreateInstanceRequest, Option<remuda_protocol::Initiator>) {
+        let initiator = with.then(|| remuda_protocol::Initiator {
+            instance_id: "ins_stamped".into(),
+            lineage_id: "ins_stamped".into(),
+            generation: 2,
+        });
+        let mut value = serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-print",
+            "hostId": node.host().meta.id,
+        });
+        if let Some(value_initiator) = &initiator {
+            value["initiator"] = serde_json::to_value(value_initiator).unwrap();
+        }
+        let request: CreateInstanceRequest = serde_json::from_value(value).expect("request");
+        (request, initiator)
+    }
+
+    /// D-057 §7.1: the forwarded initiator is persisted on the command ledger
+    /// and travels inside the command lifecycle events the Node journals.
+    #[tokio::test]
+    async fn forwarded_initiator_is_persisted_and_journaled() {
+        let node = node();
+        let (request, initiator) = request_with_initiator(&node, true);
+        let initiator = initiator.expect("fixture carries an initiator");
+        let created = node.create_instance(request).await.expect("create");
+
+        // Persisted on the ledger row exactly as stamped by the Hub.
+        let ledger = node
+            .get_command(&created.command.command_id)
+            .expect("command in ledger");
+        assert_eq!(ledger.initiator.as_ref(), Some(&initiator));
+
+        // Journaled with the command lifecycle event (its entityValue embeds
+        // the full command).
+        let page = node
+            .read_journal(&created.instance.journal_id, None, 100)
+            .expect("journal page");
+        let journaled = serde_json::to_value(&page.events).expect("events json");
+        assert!(
+            journaled.to_string().contains("ins_stamped"),
+            "journal carries the initiator: {journaled}"
+        );
+        let accepted = journaled
+            .as_array()
+            .expect("events array")
+            .iter()
+            .any(|event| {
+                event
+                    .pointer("/payload/entity/initiator/instanceId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("ins_stamped")
+                    && event
+                        .pointer("/payload/entity/initiator/generation")
+                        .and_then(serde_json::Value::as_i64)
+                        == Some(2)
+            });
+        assert!(
+            accepted,
+            "a journaled command event carries the initiator: {journaled}"
+        );
+    }
+
+    /// Additive: an older Hub forwards no initiator and the ledger/journal stay
+    /// exactly as before.
+    #[tokio::test]
+    async fn absent_initiator_stays_none() {
+        let node = node();
+        let (request, _) = request_with_initiator(&node, false);
+        let created = node.create_instance(request).await.expect("create");
+        let ledger = node
+            .get_command(&created.command.command_id)
+            .expect("command in ledger");
+        assert_eq!(ledger.initiator, None);
+        let json = serde_json::to_value(&ledger).expect("ledger json");
+        assert!(json.get("initiator").is_none(), "skipped when absent");
     }
 }

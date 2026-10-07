@@ -42,6 +42,18 @@ pub(crate) fn wire_origin(params: &Value) -> InputOrigin {
     parse_origin(params.get("origin").unwrap_or(&Value::Null))
 }
 
+/// Read the Hub-stamped D-057 §7.1 initiator off a Hub frame. Absent (older
+/// Hubs, Human/Bot work) or malformed reads as `None` — the Node never invents
+/// an initiator, and frame params are trusted only as far as the Hub envelope
+/// is (see `wire_origin`'s SPEC-ONLY note).
+pub(crate) fn wire_initiator(params: &Value) -> Option<remuda_protocol::Initiator> {
+    params
+        .get("initiator")
+        .filter(|value| value.is_object())
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 pub(crate) fn command_origin(origin: InputOrigin) -> CommandOrigin {
     match origin {
         InputOrigin::Human => CommandOrigin::Ui,

@@ -338,6 +338,7 @@ export type Command = ({
   "expiresAt": (Timestamp | (null));
   "forwardIntent": Knowledge6;
   "id": CommandId;
+  "initiator"?: (Initiator | (null));
   "nodeReceipt": Knowledge10;
   "operation": CommandOperation;
   "origin": CommandOrigin;
@@ -1044,6 +1045,7 @@ export type GateJob = ({
   "homeLandInFlight"?: (boolean);
   "hostId"?: (HostId | (null));
   "id": GateJobId;
+  "initiator"?: (Initiator | (null));
   "keepLogs": (boolean);
   "laneId"?: (string | null);
   "logObjectId"?: (string | null);
@@ -1461,6 +1463,14 @@ export type HostTransport = ({
 export type HostTransportMode = ("outbound-wss" | "ssh-tunnel");
 
 export type Id = (string);
+
+/** The chapter instance a mutation was initiated by, with its place in the lineage. `{instanceId, lineageId, generation}` — D-057 §7.1.  The generation is the chapter generation stamped at authentication time. A fence bumps the lineage's live generation, so the commit-time check can refuse a request authenticated before the fence (main-agent.md §7.3). */
+export type Initiator = ({
+  "generation": (number);
+  "instanceId": (string);
+  "lineageId": (string);
+  [key: string]: unknown;
+});
 
 /** InputAccounting wire values; `protocol.md` §5.5. */
 export type InputAccounting = ("total-including-cache" | "uncached" | "provider-specific" | "unknown");

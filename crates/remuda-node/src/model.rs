@@ -49,6 +49,11 @@ pub struct CreateInstanceRequest {
         deserialize_with = "crate::origin::deserialize_origin"
     )]
     pub origin: remuda_protocol::InputOrigin,
+    /// D-057 §7.1: Hub-stamped initiator, forwarded by the Hub on
+    /// Agent-initiated commands. The Node persists it on the command ledger
+    /// and journals it with command events. Absent on older Hubs' frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<remuda_protocol::Initiator>,
     /// Transport-only scoped credential for this instance's MCP process.
     #[serde(default, skip_serializing)]
     pub agent_credential: Option<crate::origin::AgentCredential>,
@@ -376,6 +381,10 @@ pub struct InstanceCommandRequest {
         deserialize_with = "crate::origin::deserialize_origin"
     )]
     pub origin: remuda_protocol::InputOrigin,
+    /// D-057 §7.1: Hub-stamped initiator; persisted and journaled on the
+    /// command ledger. Absent on Human/Bot commands and older Hubs' frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<remuda_protocol::Initiator>,
     /// Optional client-supplied idempotency identity.
     #[serde(default)]
     pub command_id: Option<CommandId>,

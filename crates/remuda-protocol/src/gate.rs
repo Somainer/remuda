@@ -292,6 +292,14 @@ pub struct GateJob {
     pub lane_id: Option<String>,
     /// Device that enqueued the job.
     pub requested_by: String,
+    /// D-057 §7.1: Hub-stamped initiator of an Agent-enqueued job; the gate
+    /// job row is the `gate.run` admission record (main-agent.md §7.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<crate::Initiator>,
+    /// Hub-only authenticating device id, re-checked at claim. Never sent to
+    /// Nodes and never on the wire.
+    #[serde(default, skip_serializing)]
+    pub initiator_device_id: Option<String>,
     /// Lifecycle state.
     pub state: GateJobState,
     /// Step results streamed back from the lane Node.

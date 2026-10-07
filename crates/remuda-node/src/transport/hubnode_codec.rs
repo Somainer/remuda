@@ -268,10 +268,12 @@ pub async fn dispatch_frame(
     }
     if method == "instance.close" {
         let origin = crate::origin::wire_origin(&params);
+        let initiator = crate::origin::wire_initiator(&params);
         let parsed: InstanceCancelParams = serde_json::from_value(params)?;
         let instance_id = InstanceId::from_str(&parsed.instance_id)?;
         return submit(
             origin,
+            initiator,
             node,
             &instance_id,
             CommandAction::Close,
@@ -397,6 +399,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
         // unrecognized, the create is refused rather than quietly replaced.
         Err(_) => CreateInstanceRequest {
             origin: remuda_protocol::InputOrigin::Agent,
+            initiator: None,
             agent_credential: None,
             command_id: None,
             instance_id: None,
@@ -461,6 +464,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             .and_then(|raw| raw.parse().ok());
     }
     request.origin = crate::origin::wire_origin(&params);
+    request.initiator = crate::origin::wire_initiator(&params);
     request.agent_credential = params
         .get("agentCredential")
         .cloned()
@@ -536,6 +540,7 @@ async fn dispatch_send(node: &DevNode, params: Value) -> Result<Value, NodeError
     let instance_id = InstanceId::from_str(&parsed.instance_id)?;
     submit(
         crate::origin::wire_origin(&params),
+        crate::origin::wire_initiator(&params),
         node,
         &instance_id,
         CommandAction::Send,
@@ -568,6 +573,7 @@ async fn dispatch_configure(node: &DevNode, params: Value) -> Result<Value, Node
             &instance_id,
             InstanceCommandRequest {
                 origin: crate::origin::wire_origin(&params),
+                initiator: crate::origin::wire_initiator(&params),
                 command_id: command_id.map(str::parse).transpose()?,
                 operation: CommandAction::Configure,
                 prompt: None,
@@ -593,6 +599,7 @@ async fn dispatch_cancel(node: &DevNode, params: Value) -> Result<Value, NodeErr
     let instance_id = InstanceId::from_str(&parsed.instance_id)?;
     submit(
         crate::origin::wire_origin(&params),
+        crate::origin::wire_initiator(&params),
         node,
         &instance_id,
         CommandAction::Cancel,
@@ -669,6 +676,7 @@ async fn dispatch_keys(node: &DevNode, params: Value) -> Result<Value, NodeError
     }
     submit(
         crate::origin::wire_origin(&params),
+        crate::origin::wire_initiator(&params),
         node,
         &instance_id,
         CommandAction::WriteTty,
@@ -701,6 +709,7 @@ async fn dispatch_respond(node: &DevNode, params: Value) -> Result<Value, NodeEr
     let instance_id = InstanceId::from_str(instance_id)?;
     submit(
         crate::origin::wire_origin(&params),
+        crate::origin::wire_initiator(&params),
         node,
         &instance_id,
         CommandAction::RespondInteraction,
@@ -719,6 +728,7 @@ async fn dispatch_respond(node: &DevNode, params: Value) -> Result<Value, NodeEr
 #[allow(clippy::too_many_arguments)]
 async fn submit(
     origin: remuda_protocol::InputOrigin,
+    initiator: Option<remuda_protocol::Initiator>,
     node: &DevNode,
     instance_id: &InstanceId,
     operation: CommandAction,
@@ -738,6 +748,7 @@ async fn submit(
             instance_id,
             InstanceCommandRequest {
                 origin,
+                initiator,
                 command_id: command_id.map(str::parse).transpose()?,
                 operation,
                 prompt,

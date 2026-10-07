@@ -1777,6 +1777,7 @@ mod tests {
             .expect("instance");
             let instance_id = instance.meta.id.clone();
             let request = crate::CreateInstanceRequest {
+                initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
                 command_id: None,
@@ -1990,6 +1991,7 @@ mod tests {
                 fixture_instance(InstanceId::new(), HostId::new(), WorkspaceId::new(), kind)
                     .expect("instance");
             let request = crate::CreateInstanceRequest {
+                initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
                 command_id: None,
@@ -2243,6 +2245,7 @@ mod tests {
             )
             .expect("instance");
             let request = crate::CreateInstanceRequest {
+                initiator: None,
                 origin: InputOrigin::Human,
                 agent_credential: None,
                 command_id: None,
@@ -2303,6 +2306,7 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
             command_id: None,
@@ -2354,6 +2358,7 @@ mod tests {
     #[test]
     fn parse_delegation_prefers_explicit_field_then_profile_id() {
         let mut request = crate::CreateInstanceRequest {
+            initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
             command_id: None,
@@ -2409,6 +2414,7 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
             command_id: None,
@@ -2468,6 +2474,7 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
             command_id: None,
@@ -2950,6 +2957,7 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            initiator: None,
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
             command_id: None,
@@ -3387,6 +3395,7 @@ mod tests {
 
     fn test_create_request() -> crate::CreateInstanceRequest {
         crate::CreateInstanceRequest {
+            initiator: None,
             origin: InputOrigin::Human,
             agent_credential: None,
             command_id: None,

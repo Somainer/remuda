@@ -147,6 +147,26 @@ async function gateRoute(
   };
 }
 
+type FontGate = Awaited<ReturnType<typeof gateRoute>>;
+
+/**
+ * Wait for a gated woff2 request to actually park, bounded: fail fast with a
+ * diagnostic instead of hanging to the test timeout if the revisit served the
+ * font from cache (so no request reached the gate) or the page closed.
+ */
+async function waitFontArrival(page: Page, gate: FontGate, label: string, timeoutMs = 10_000): Promise<void> {
+  let arrived = false;
+  gate.waitArrival().then(() => {
+    arrived = true;
+  });
+  const start = Date.now();
+  while (!arrived && Date.now() - start < timeoutMs) {
+    if (page.isClosed()) throw new Error(`${label}: page closed before a woff2 request reached the gate`);
+    await page.waitForTimeout(100);
+  }
+  if (!arrived) throw new Error(`${label}: no woff2 request parked within ${timeoutMs}ms (served from cache?)`);
+}
+
 async function command(page: Page, instanceId: string, prompt: string): Promise<void> {
   const ok = await page.evaluate(
     async ({ id, text }) => {
@@ -238,22 +258,38 @@ async function seedSession(
       .poll(async () => Number((await journalTail(page, instanceId)).durableSeq ?? 0), { timeout: 60_000 })
       .toBeGreaterThanOrEqual(longBurst);
   }
-  const wrapPrompt = wrapProbe === "mobile" ? "font wrap probe mobile: show me code" : wrapProbe ? "font wrap probe: show me code" : "font swap probe: show me code";
-  await command(page, instanceId, wrapPrompt);
-  // The reply must be journaled before the burst lands below it.
-  await expect
-    .poll(async () => textsAfterLastCode(await journalTail(page, instanceId)), { timeout: 30_000 })
-    .not.toBeNull();
-  await command(page, instanceId, `__journal_burst__:${BURST}`);
-  // Burst labels count across the whole fake node, so wait on the journal.
-  await expect
-    .poll(
-      async () =>
-        (textsAfterLastCode(await journalTail(page, instanceId)) ?? []).filter((text) => text.includes("__journal_burst__"))
-          .length,
-      { timeout: 30_000 },
-    )
-    .toBeGreaterThanOrEqual(BURST);
+  const wrapPrompt =
+    wrapProbe === "mobile"
+      ? "font wrap probe mobile tail: show me code"
+      : wrapProbe
+        ? "font wrap probe: show me code"
+        : "font swap probe: show me code";
+  // The PINNED mobile test needs the height-changing block in the MOUNTED
+  // TAIL: send the wrap message AFTER the burst rows there so it is the last
+  // code block and stays mounted at the pinned bottom without scrolling.
+  if (wrapProbe === "mobile") {
+    await command(page, instanceId, `__journal_burst__:${BURST}`);
+    await command(page, instanceId, wrapPrompt);
+    await expect
+      .poll(async () => textsAfterLastCode(await journalTail(page, instanceId)), { timeout: 30_000 })
+      .not.toBeNull();
+  } else {
+    await command(page, instanceId, wrapPrompt);
+    // The reply must be journaled before the burst lands below it.
+    await expect
+      .poll(async () => textsAfterLastCode(await journalTail(page, instanceId)), { timeout: 30_000 })
+      .not.toBeNull();
+    await command(page, instanceId, `__journal_burst__:${BURST}`);
+    // Burst labels count across the whole fake node, so wait on the journal.
+    await expect
+      .poll(
+        async () =>
+          (textsAfterLastCode(await journalTail(page, instanceId)) ?? []).filter((text) => text.includes("__journal_burst__"))
+            .length,
+        { timeout: 30_000 },
+      )
+      .toBeGreaterThanOrEqual(BURST);
+  }
   if (longBurst > 0) {
     const tail = await journalTail(page, instanceId);
     expect(Number(tail.fromSeq), "the journal is longer than one tail window").toBeGreaterThan(1);
@@ -317,10 +353,7 @@ async function rowOffset(scroller: Locator, n: number): Promise<number | null> {
 
 /**
  * ABSOLUTE document top (scrollTop + scroller-relative top) of the anchor
- * row. Unlike rowOffset this is defined when the row is mounted but below the
- * fold (the wrap-probe block can push the saved anchor there), and it is the
- * coordinate the restore actually preserves: a font swap must not change it.
- * Returns null only when the row is not mounted at all.
+ * row — used only to wait for the row to MOUNT.
  */
 async function anchorDocTop(scroller: Locator, n: number): Promise<number | null> {
   return scroller.evaluate((el, label) => {
@@ -331,6 +364,110 @@ async function anchorDocTop(scroller: Locator, n: number): Promise<number | null
     if (!row) return null;
     return el.scrollTop + row.getBoundingClientRect().top - el.getBoundingClientRect().top;
   }, n);
+}
+
+/**
+ * The anchor's SCROLLER-RELATIVE VIEWPORT offset, or null when it is mounted
+ * but off-screen. This is the re-anchor oracle: holdReadingAnchor changes
+ * scrollTop and the viewport top by equal/opposite amounts, so an ABSOLUTE
+ * document top is invariant whether or not the anchor was held; only the
+ * viewport offset reveals whether the reader's focal row stayed put.
+ */
+async function anchorViewport(scroller: Locator, n: number): Promise<number | null> {
+  return rowOffset(scroller, n);
+}
+
+/**
+ * Wait until the restored anchor is mounted AND on-screen, returning its
+ * viewport offset. `message` identifies the waiter. Bounded by `timeoutMs`.
+ */
+async function waitAnchorViewport(
+  scroller: Locator,
+  n: number,
+  timeoutMs: number,
+  message: string,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const off = await anchorViewport(scroller, n);
+    if (off !== null) return off;
+    if (Date.now() > deadline) throw new Error(message);
+    await scroller.page().waitForTimeout(100);
+  }
+}
+
+/** Snapshot the anchor viewport offset and the restore-active attribute. */
+async function anchorSnapshot(page: Page, scroller: Locator, n: number) {
+  return scroller.evaluate(
+    (el, label) => {
+      const re = new RegExp(`journal_burst_* event ${label}\\b`);
+      const row = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']")).find((c) =>
+        re.test(c.textContent ?? ""),
+      );
+      if (!row) return { top: null as number | null, active: "" };
+      const top = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+      return { top: top >= 0 && top <= el.clientHeight ? top : null, active: el.getAttribute("data-restore-active") ?? "" };
+    },
+    n,
+  ).then(async (s) => ({ ...s, font: await monoLoaded(page) }));
+}
+
+/**
+ * Poll the anchor's VIEWPORT offset until: the row is on screen, it has held
+ * the same offset (±1px) across three consecutive measurement frames, and the
+ * saved-position restore is no longer active. Bounded by `timeoutMs`; a
+ * re-sample that moves or drops the row restarts the streak (item 4).
+ */
+async function waitStableAnchorOnScreen(
+  page: Page,
+  scroller: Locator,
+  n: number,
+  timeoutMs = 15_000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let last: number | null = null;
+  let streak = 0;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(120);
+    const s = await anchorSnapshot(page, scroller, n);
+    if (s.top === null || s.active === "1") {
+      streak = 0;
+      last = s.top;
+      continue;
+    }
+    if (last !== null && Math.abs(s.top - last) <= 1) {
+      streak += 1;
+      if (streak >= 3) return s.top;
+    } else {
+      streak = 0;
+    }
+    last = s.top;
+  }
+  throw new Error(`anchor viewport offset did not stabilize on screen within ${timeoutMs}ms`);
+}
+
+/**
+ * After a font release, poll the wrap block's row HEIGHT until it differs from
+ * `fallbackHeight` by at least 20px (the real metrics change landed), then
+ * return it. The anchor offset stability is verified separately. Bounded.
+ */
+async function waitBlockHeightChange(
+  page: Page,
+  scroller: Locator,
+  fallbackHeight: number,
+  timeoutMs = 15_000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let lastSeen: number | null = null;
+  while (Date.now() < deadline) {
+    await waitFontLoaded(page, scroller, "block height change");
+    await page.waitForTimeout(120);
+    const h = await wrapBlockRowHeight(scroller);
+    if (h !== null) lastSeen = h;
+    if (h !== null && Math.abs(h - fallbackHeight) >= 20) return h;
+  }
+  throw new Error(`wrap block height did not change >=20px within ${timeoutMs}ms (fallback=${fallbackHeight}, last=${lastSeen})`);
 }
 
 /**
@@ -712,10 +849,10 @@ async function savedPositionSurvivesSwap(
   }, PARK_BOTTOM);
   expect(Number.isFinite(anchor), "a burst row renders below the code block").toBe(true);
   await page.waitForTimeout(400);
-  // Track the anchor by ABSOLUTE document top: it survives the restore even
-  // when the tall wrap-probe block pushes the anchor below the fold.
-  const saved = await anchorDocTop(scroller, anchor);
-  expect(saved, "saved anchor mounted").not.toBeNull();
+  // The anchor's VIEWPORT offset at the saved reading position. The two-line
+  // wrap block keeps the anchor on screen, so this is defined on every face.
+  const saved = await waitAnchorViewport(scroller, anchor, 10_000, "saved anchor off-screen");
+  expect(saved).toBeGreaterThanOrEqual(0);
 
   await page.goto("/sessions");
   await expect(page.getByTestId("session-list")).toBeVisible();
@@ -742,7 +879,7 @@ async function savedPositionSurvivesSwap(
   await page.goto(`/s/${instanceId}`);
   await expect.poll(() => anchorDocTop(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
   await afterSwap(page, scroller);
-  const control = (await anchorDocTop(scroller, anchor))!;
+  const control = await waitAnchorViewport(scroller, anchor, 15_000, "control anchor off-screen");
   const controlInput = await consumed();
   const blockControl = wrapProbe ? await wrapBlockRowHeight(scroller) : null;
 
@@ -769,24 +906,25 @@ async function savedPositionSurvivesSwap(
     await expect(page.getByTestId("session-list")).toBeVisible();
     leftByControl = await page.evaluate((key) => localStorage.getItem(key), readingKey);
     await reinstate();
-    const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/);
+    const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
     try {
       await page.goto(`/s/${instanceId}`);
-      await expect.poll(() => anchorDocTop(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
-      await fontGate.waitArrival();
+      await waitFontArrival(page, fontGate, "late arm");
       expect(await monoLoaded(page), "the held woff2 must not have swapped in yet").toBe(false);
-      // Anchor ABSOLUTE document top at the restored fallback position,
-      // recorded BEFORE any measurement scroll disturbs it.
-      beforeSwap = (await anchorDocTop(scroller, anchor))!;
-      // The 300-m block is mounted right above the on-screen anchor; read its
-      // height with no measurement scroll.
+      // Release only AFTER the restore has placed the anchor on screen, its
+      // VIEWPORT offset has held across measurement cycles, and the restore is
+      // no longer active (item 4) — not on first paint.
+      beforeSwap = await waitStableAnchorOnScreen(page, scroller, anchor);
+      // The two-line wrap block is mounted right above the on-screen anchor;
+      // read its height with no measurement scroll.
       blockFallback = wrapProbe ? await wrapBlockRowHeight(scroller) : null;
       fontGate.release();
-      await afterSwap(page, scroller);
-      // The anchor's post-swap absolute document top; read before the swapped
-      // block-height measurement.
-      settled = (await anchorDocTop(scroller, anchor))!;
-      blockSwapped = wrapProbe ? await wrapBlockRowHeight(scroller) : null;
+      // Wait until the block height has actually moved and the anchor viewport
+      // offset is stable across measurement cycles (item 5), bounded.
+      blockSwapped = wrapProbe
+        ? await waitBlockHeightChange(page, scroller, blockFallback!)
+        : null;
+      settled = await waitStableAnchorOnScreen(page, scroller, anchor);
     } finally {
       await fontGate.dispose();
     }
@@ -803,7 +941,7 @@ async function savedPositionSurvivesSwap(
     const fontGate = await gateRoute(page, /\.woff2(?:\?|$)/, { revalidate: true });
     try {
       await page.goto(`/s/${instanceId}?restoreProbe=1`);
-      await fontGate.waitArrival();
+      await waitFontArrival(page, fontGate, "mid arm");
       // The anchor mounts on the fallback face while the restore is still
       // armed (the ?restoreProbe hook keeps it pending until the font loads).
       await expect.poll(() => anchorDocTop(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
@@ -812,21 +950,16 @@ async function savedPositionSurvivesSwap(
         .toBe("1");
       expect(await monoLoaded(page), "rows must paint on the fallback face before the swap").toBe(false);
       const advanceFallback = await monoAdvance(page);
-      // Anchor docTop before the font is released (restore still armed); the
-      // 300-m block is compact enough to be mounted alongside the anchor, so
-      // read its height with NO measurement scroll.
-      beforeSwap = (await anchorDocTop(scroller, anchor))!;
+      // The two-line block is mounted above the on-screen anchor; read height.
       blockFallback = wrapProbe ? await wrapBlockRowHeight(scroller) : null;
       // Release the gate while the restore attribute is still live ("1",
-      // asserted above): the held woff2 can now only begin applying at a turn
-      // the restore is active — deterministic, no racy post-hoc recorder.
+      // asserted above) and the anchor is already on screen at a stable offset.
+      beforeSwap = await waitAnchorViewport(scroller, anchor, 5_000, "mid arm anchor off-screen pre-release");
       fontGate.release();
-      await waitFontLoaded(page, scroller, "mid arm release");
-      await page.evaluate(
-        () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null)))),
-      );
-      settled = (await anchorDocTop(scroller, anchor))!;
-      blockSwapped = wrapProbe ? await wrapBlockRowHeight(scroller) : null;
+      // The block height moves with the final face; then the restore settles
+      // the anchor on screen. Advance width must prove the face really changed.
+      blockSwapped = wrapProbe ? await waitBlockHeightChange(page, scroller, blockFallback!) : null;
+      settled = await waitStableAnchorOnScreen(page, scroller, anchor);
       const advanceSwapped = await monoAdvance(page);
       expect(advanceSwapped, "the held font never swapped to the final face").not.toBe(advanceFallback);
     } finally {
@@ -846,18 +979,16 @@ async function savedPositionSurvivesSwap(
   // position than the no-swap restore, and the anchor does not move at the
   // moment the font lands (in BOTH arms — swap racing the restore, and swap
   // after the fallback restore settled).
-  const measured = `order=${order} longBurst=${longBurst} saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} blockControl=${blockControl} blockFallback=${blockFallback} blockSwapped=${blockSwapped} input=${original} leftByControl=${leftByControl}`;
+  const measured = `order=${order} longBurst=${longBurst} savedViewport=${saved} controlViewport=${control} beforeSwapViewport=${beforeSwap} settledViewport=${settled} blockControl=${blockControl} blockFallback=${blockFallback} blockSwapped=${blockSwapped} input=${original} leftByControl=${leftByControl}`;
   test.info().annotations.push({ type: "font-swap", description: measured });
   console.log(`FONTSWAP ${measured}`);
-  // The restore recovers the saved ABSOLUTE document position (it may be
-  // below the fold because the tall wrap-probe block precedes the anchor).
-  expect(control, `the saved row did not restore (${measured})`).toBeGreaterThanOrEqual(0);
-  // The swap must have moved REAL layout (wrap-probe fixture only — the
-  // short journals): the block's transcript row changed height by at least a
-  // full line between fallback and final faces. Without this, drift 0 would
-  // prove nothing (a non-wrapping <pre> has identical height across faces).
-  // The bounded long journal uses the compact fixture and asserts drift only;
-  // the height-reanchor proof is the two short arms.
+  // The anchor stayed ON SCREEN and restored to a valid viewport offset.
+  expect(control, `the saved row did not restore on screen (${measured})`).toBeGreaterThanOrEqual(0);
+  expect(settled, `the anchor was not on screen after the swap (${measured})`).toBeGreaterThanOrEqual(0);
+  // The swap must have moved REAL layout: the block's transcript row changed
+  // HEIGHT by at least 20px between fallback and final faces. Without this, a
+  // viewport-offset match would prove nothing (a non-wrapping <pre> has
+  // identical height across faces and nothing needed re-anchoring).
   if (wrapProbe) {
     expect(blockFallback, `no fallback block height sampled (${measured})`).not.toBeNull();
     expect(blockSwapped, `no swapped block height sampled (${measured})`).not.toBeNull();
@@ -866,25 +997,21 @@ async function savedPositionSurvivesSwap(
       `the swap did not change the wrap-probe row height — drift would be unprovable (${measured})`,
     ).toBeGreaterThanOrEqual(BLOCK_HEIGHT_DELTA_PX);
   }
-  // RE-ANCHOR / RESTORE INVARIANT. The saved reading position is a *view*
-  // offset within the anchor row, not an absolute document coordinate, so the
-  // restored absolute doc-top legitimately differs between faces while the
-  // taller fallback block is present (beforeSwap). Once the final face is
-  // applied, the swap must not degrade the restore: settled must converge to
-  // exactly where a no-swap Plex visit places the row (control), within the
-  // sub-pixel rounding slack — and it must be no worse than the no-swap
-  // baseline relative to the saved record. Combined with the real
-  // block-height delta above, this proves the layout actually moved and the
-  // reader still lands on the correct position, rather than drift 0 hiding
-  // behind a height-identical non-wrapping <pre>.
-  expect(
-    Math.abs(settled - control),
-    `after the swap the restore did not converge to the no-swap Plex control position (${measured})`,
-  ).toBeLessThanOrEqual(DRIFT_PX);
-  expect(
-    Math.abs(settled - saved!),
-    `the swap moved the restore further from the saved position than the no-swap control (${measured})`,
-  ).toBeLessThanOrEqual(Math.abs(control - saved!) + DRIFT_PX);
+  // RE-ANCHOR INVARIANT (viewport offset). Absolute document tops are blind to
+  // scroll re-anchoring (a correction moves scrollTop and the viewport top by
+  // equal/opposite amounts), so compare the anchor's SCROLLER-RELATIVE offset.
+  // The reader restored at a fallback-face position (beforeSwap); after the
+  // block above changes height on the swap, re-anchoring must keep the anchor
+  // at that SAME viewport spot (settled ≈ beforeSwap), not let it slide with
+  // the reflow. The natural no-swap Plex position (control) is reported for
+  // context but intentionally differs — re-anchoring holds the reader's spot
+  // rather than following the layout shift.
+  if (beforeSwap !== null) {
+    expect(
+      Math.abs(settled - beforeSwap),
+      `post-swap anchor drifted from its pre-swap viewport offset — re-anchor failed (${measured})`,
+    ).toBeLessThanOrEqual(DRIFT_PX);
+  }
   await assertRowsStacked(scroller);
 }
 
@@ -952,62 +1079,64 @@ test("a pinned transcript stays pinned through a late monospace swap", async ({ 
     expect(await monoLoaded(page), "the final visit must start with the font unloaded").toBe(false);
     await assertPinned("the final visit before the swap");
     await expect(page.getByTestId("jump-latest")).not.toBeVisible();
-  // In a PINNED transcript the pin effect re-scrolls to the bottom after
-  // commits, so each attempt scrolls the block up and reads its height in one
-  // poll tick (after the virtualiser has mounted from the previous tick).
-  const scrollToBlockOnce = (): Promise<number | null> =>
-    scroller.evaluate(() => {
-      const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']")!;
-      const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
-        b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("mmmmmmmmmmmmmmmmmmmm"),
-      );
-      if (!block) {
-        // Walk upward from the pinned bottom to mount the block.
-        el.scrollTop = Math.max(0, el.scrollTop - el.clientHeight * 0.6);
-        el.dispatchEvent(new Event("scroll", { bubbles: true }));
-        return null;
+    // The tail wrap block is MOUNTED while pinned (no measurement scroll):
+    // read its transcript-row HEIGHT directly, waiting for it to appear.
+    const readTailBlockHeight = () =>
+      scroller.evaluate(() => {
+        const el = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']")!;
+        const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
+          b.querySelector("[data-testid='code-code']")?.textContent?.includes("mmmm"),
+        );
+        if (!block) return null;
+        const row = block.closest<HTMLElement>("[data-testid='transcript-row']");
+        const height = (row ?? block).getBoundingClientRect().height;
+        return height > 0 ? height : null;
+      });
+    const tailBlockHeight = async (): Promise<number> => {
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        const h = await readTailBlockHeight();
+        if (h !== null) return h;
+        await new Promise((r) => setTimeout(r, 120));
       }
-      el.scrollTop = block.offsetTop;
-      el.dispatchEvent(new Event("scroll", { bubbles: true }));
-      void el.offsetHeight;
-      const mounted = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
-        b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("mmmmmmmmmmmmmmmmmmmm"),
-      );
-      if (!mounted) return null;
-      const row = mounted.closest<HTMLElement>("[data-testid='transcript-row']");
-      const h = (row ?? mounted).getBoundingClientRect().height;
-      return h > 0 ? h : null;
-    });
-  const pinnedBlockHeight = async (): Promise<number> => {
-    const deadline = Date.now() + 15_000;
-    let last: number | null = null;
-    while (Date.now() < deadline) {
-      last = await scrollToBlockOnce();
-      if (last !== null) return last;
-      await new Promise((r) => setTimeout(r, 150));
-    }
-    throw new Error("wrap block not measurable at the parked position");
-  };
-  const blockFallback = await pinnedBlockHeight();
-  expect(blockFallback, "wrap block measurable on the fallback face at 390px").not.toBeNull();
-  // Re-pin at the bottom.
-  await page.getByTestId("jump-latest").click().catch(() => undefined);
-  await assertPinned("back at the bottom before release");
+      throw new Error("tail wrap block not mounted while pinned");
+    };
+    // Capture the tight baseline gap on the fallback face.
+    const fallbackGap = await bottomGap();
+    const blockFallback = await tailBlockHeight();
 
     finalGate.release();
-    await afterSwap(page, scroller);
-    await assertPinned("the final visit after the swap");
-    await expect(page.getByTestId("jump-latest")).not.toBeVisible();
+    // Wait for the block HEIGHT to actually move and the pin to settle,
+    // bounded — no fixed delays.
+    const blockSwapped = await new Promise<number>((resolve, reject) => {
+      const deadline = Date.now() + 15_000;
+      const tick = async () => {
+        const gap = await bottomGap();
+        const h = await readTailBlockHeight();
+        if (h !== null && Math.abs(h - blockFallback) >= 20 && gap < 64) {
+          resolve(h);
+          return;
+        }
+        if (Date.now() > deadline) {
+          reject(new Error(`pin: block height did not move >=20px while pinned (fallback=${blockFallback} last=${h} gap=${gap})`));
+          return;
+        }
+        setTimeout(tick, 120);
+      };
+      void tick();
+    });
 
-    // Measure the swapped block (390px) synchronously and require a delta.
-    const blockSwapped = await pinnedBlockHeight();
-    expect(blockSwapped, "wrap block measurable on the swapped face at 390px").not.toBeNull();
+    // Tight baseline: the post-swap gap must match the pre-swap fallback gap,
+    // not merely "anywhere inside 64px".
+    expect(
+      await bottomGap(),
+      `pinned gap moved with the height change (fallbackGap=${fallbackGap})`,
+    ).toBeLessThanOrEqual(Math.max(8, fallbackGap + 4));
     expect(
       Math.abs(blockSwapped - blockFallback),
       `390px: the swap did not change the wrap-probe row height (fallback=${blockFallback} swapped=${blockSwapped})`,
     ).toBeGreaterThanOrEqual(20);
-
-    await page.getByTestId("jump-latest").click().catch(() => undefined);
+    await expect(page.getByTestId("jump-latest")).not.toBeVisible();
     await assertRowsStacked(scroller);
   } finally {
     await finalGate.dispose();

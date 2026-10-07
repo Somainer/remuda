@@ -217,6 +217,11 @@ function TranscriptInner({
   // Row heights keyed by STABLE NODE ID, never array index (see the `sizes`
   // memo below); reset per session in the route-reset block.
   const [rowHeights, setRowHeights] = useState<Map<string, number>>(new Map());
+  // Mirror of rowHeights for the before-paint setRowSize height-delta hold.
+  const rowHeightsRef = useRef(rowHeights);
+  useEffect(() => {
+    rowHeightsRef.current = rowHeights;
+  }, [rowHeights]);
 
   // The route keeps this component mounted while the reader moves directly
   // between sessions (tab switch). Per-instance refs must therefore reset on
@@ -238,6 +243,14 @@ function TranscriptInner({
   // Held anchor for a load-earlier prepend; repinned across post-prepend
   // estimate/size changes (see the effect near the scroll math).
   const prependAnchorRef = useRef<{ anchorId: string; offset: number; tries: number } | null>(null);
+  /**
+   * The row a saved-position restore settled on, kept stable across a later
+   * font reflow of rows above it (unlike readingAnchorRef, which scroll events
+   * re-sample to the topmost visible row). Cleared on route change / nav.
+   */
+  const reflowAnchorRef = useRef<{ id: string } | null>(null);
+  /** Set for one sizes commit when the reflow self-correction held the anchor. */
+  const reflowCorrectedThisCommitRef = useRef(false);
   // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
   // click on a held transcript row posts exactly once.
   const steeringRef = useRef<Set<string>>(new Set());
@@ -248,9 +261,11 @@ function TranscriptInner({
     scrollTopRef.current = 0;
     pendingScroll.current = null;
     prependAnchorRef.current = null;
+    reflowAnchorRef.current = null;
     steeringRef.current.clear();
     setLoadingEarlier(false);
     setRowHeights(new Map());
+    rowHeightsRef.current = new Map();
     setExpandedTools(new Set());
     if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
     setDismissedWorkflows(instanceId ? readDismissedWorkflows(instanceId) : new Set());
@@ -491,8 +506,57 @@ function TranscriptInner({
   // read) for every visible row on every scroll frame.
   const setRowSize = useCallback((id: string, height: number) => {
     if (height <= 0) return;
-    // The row has already grown in the DOM: hold the reader before paint.
-    holdReadingAnchor();
+    // A web-font swap (or async reflow) changes the HEIGHT of a row above the
+    // row the reader restored to. The generic holdReadingAnchor anchors to the
+    // topmost on-screen row and cannot compensate when the changing row is a
+    // tall block above (or wrapping) the held message node, so hold the
+    // restored row explicitly against the measured height delta.
+    const el = scrollerRef.current;
+    let selfDelta = 0;
+    // Note: allowed even while a saved-position restore is still pending (the
+    // mid-restore font-swap arm) — the reflow anchor IS that pending restore's
+    // target, and the restore correction alone converges to the wrong (post-
+    // reflow) spot without this height-delta compensation.
+    if (el && !pinRef.current && !prependAnchorRef.current) {
+      const reflow = reflowAnchorRef.current;
+      if (reflow) {
+        const prevHeight = rowHeightsRef.current.get(id);
+        const resized = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(id)}"]`);
+        const anchorRow = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(reflow.id)}"]`);
+        if (prevHeight !== undefined && resized && anchorRow) {
+          // Compensate only when the resized row sits above (or is) the
+          // restored anchor row — its height change moves the anchor.
+          const resizedDoc = el.scrollTop + resized.getBoundingClientRect().top - el.getBoundingClientRect().top;
+          const anchorDoc = el.scrollTop + anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top;
+          if (resizedDoc <= anchorDoc + 1) selfDelta = height - prevHeight;
+        }
+      }
+    }
+    if (selfDelta !== 0 && el) {
+      el.scrollTop += selfDelta;
+      scrollTopRef.current = el.scrollTop;
+      const held = readingAnchorRef.current;
+      if (held) held.top = el.scrollTop;
+      // Align the generic reading anchor with the post-correction restored row
+      // so the subsequent sizes-commit hold does not scroll it back.
+      const ra = reflowAnchorRef.current;
+      const raRow = ra
+        ? el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(ra.id)}"]`)
+        : null;
+      if (ra && raRow) {
+        readingAnchorRef.current = {
+          id: ra.id,
+          offset: raRow.getBoundingClientRect().top - el.getBoundingClientRect().top,
+          top: el.scrollTop,
+        };
+        // The reflow correction held the restored anchor this commit; the
+        // pending restore must not also run its post-metrics DOM correction
+        // (it would undo the hold and converge to the reflowed position).
+        reflowCorrectedThisCommitRef.current = true;
+      }
+    } else {
+      holdReadingAnchor();
+    }
     // Sub-pixel tolerance: measured heights jitter by fractions of a px
     // between frames; ignore deltas under 1 instead of thrashing state.
     setRowHeights((prev) => {
@@ -599,6 +663,11 @@ function TranscriptInner({
   // measures the rows around it. pendingScroll is declared with the other
   // per-instance refs so the route-switch reset can clear it.
   useLayoutEffect(() => {
+    // Consume-or-clear the per-commit reflow-correction flag; child row
+    // measuring layout effects (setRowSize) run just before this parent
+    // layout effect on the same commit, so a set flag is always consumed here.
+    const reflowCorrected = reflowCorrectedThisCommitRef.current;
+    reflowCorrectedThisCommitRef.current = false;
     const el = scrollerRef.current;
     const pending = pendingScroll.current;
     if (!el || !pending || !nodesRef.current.length) return;
@@ -621,6 +690,20 @@ function TranscriptInner({
           ? true
           : document.fonts.check('400 13px "IBM Plex Mono"');
       if (rowEl) {
+        // Pin the reflow anchor to the restored row for the WHOLE restore
+        // (including a restoreProbe-held restore that is still pending when a
+        // font swap lands), so height changes of rows above it hold this row.
+        reflowAnchorRef.current = { id: pending.anchorId };
+        // A font-metrics reflow self-correction already held the anchor this
+        // commit; trust that placement and finalize instead of re-correcting
+        // against the post-reflow geometry (which would undo the hold).
+        if (reflowCorrected) {
+          if (probeFontReady()) {
+            pendingScroll.current = null;
+            restoringRef.current = false;
+          }
+          return;
+        }
         const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - pending.offset;
         if (Math.abs(delta) <= 2) {
           if (!probeFontReady()) return;

@@ -74,6 +74,22 @@ pub fn persist_bootstrap(data_dir: &Path, token: &str) -> Result<(), HubError> {
     Ok(())
 }
 
+/// Persist a HUB-MINTED code (fresh start, post-bind adoption, or
+/// rotate-bootstrap): the token is committed atomically FIRST, then the stamp.
+///
+/// Round 6 item 3: an interrupted mint/rotate must fail CLOSED, not grant the
+/// old code another TTL. With token-first a crash after the token rename
+/// leaves a NEW token with the OLD/missing stamp, which is expired or
+/// backfilled — neither the old nor the new code pairs — instead of the old
+/// token with a fresh stamp (old code accepted 24 h more).
+pub fn persist_minted_bootstrap(data_dir: &Path, token: &str) -> Result<(), HubError> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
+    replace_private(&data_dir.join("bootstrap-token"), token)?;
+    write_private(&data_dir.join("bootstrap-issued-at"), &now_rfc3339())?;
+    Ok(())
+}
+
 /// Atomically replace a file: write a fresh 0600 temp file in the SAME
 /// directory, fsync it, rename it over `path`, and fsync the directory.
 ///
@@ -355,7 +371,7 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
     std::fs::create_dir_all(&data_dir)
         .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
     set_bootstrap_explicit_marker(&data_dir, false)?;
-    persist_bootstrap(&data_dir, &config.bootstrap_token)?;
+    persist_minted_bootstrap(&data_dir, &config.bootstrap_token)?;
     Ok(BootstrapResolution::None)
 }
 
@@ -401,7 +417,8 @@ pub fn adopt_bootstrap_after_bind(data_dir: &Path, minted_token: &str) -> Result
     // An EMPTY token is as good as absent: replace it with the minted code so
     // an empty code is never adopted (round 6 item 2).
     if read_persisted_token(&data_dir.join("bootstrap-token"))?.is_none() {
-        persist_bootstrap(data_dir, minted_token)?;
+        // Hub mint, so token-first: an interrupted commit fails closed.
+        persist_minted_bootstrap(data_dir, minted_token)?;
     }
     set_bootstrap_explicit_marker(data_dir, false)
 }
@@ -432,11 +449,13 @@ pub fn rotate_bootstrap(data_dir: &Path) -> Result<String, HubError> {
     random_token_with_stamp(data_dir)
 }
 
-/// Mint a fresh hub-generated token and persist token + stamp (no explicit
-/// marker is written, so the result stays rotateable).
+/// Mint a fresh hub-generated token and persist it TOKEN-FIRST then stamp (no
+/// explicit marker is written, so the result stays rotateable). Token-first
+/// means an interrupted rotate fails closed: it leaves a new token with the
+/// old (expired/missing) stamp, never the old token with a fresh stamp.
 fn random_token_with_stamp(data_dir: &Path) -> Result<String, HubError> {
     let token = random_token();
-    persist_bootstrap(data_dir, &token)?;
+    persist_minted_bootstrap(data_dir, &token)?;
     Ok(token)
 }
 
@@ -1559,5 +1578,29 @@ mod tests {
             std::fs::read(dir.path().join("bootstrap-token")).unwrap(),
             token_bytes
         );
+    }
+
+    /// Round 6 item 3: rotation is TOKEN-first. The residue of an interrupted
+    /// rotate (new token committed atomically, stamp write never happened —
+    /// represented by the old expired stamp still on disk) pairs NEITHER code
+    /// with a valid fresh stamp, so the TTL stays closed instead of granting
+    /// the old code another 24 h. A follow-up rotate completes the repair.
+    #[test]
+    fn interrupted_token_first_rotate_fails_closed() {
+        let dir = tempfile::tempdir().expect("data dir");
+        write_private(&dir.path().join("bootstrap-token"), "old-code").expect("old token");
+        replace_private(&dir.path().join("bootstrap-token"), "new-minted-code")
+            .expect("new token landed first");
+        write_private(&dir.path().join("bootstrap-issued-at"), EXPIRED_STAMP)
+            .expect("stamp write never happened; old expired stamp remains");
+
+        assert!(
+            !bootstrap_within_ttl(dir.path(), 24),
+            "neither old nor new code pairs with a valid fresh stamp"
+        );
+        let fixed = rotate_bootstrap(dir.path()).expect("rotate repairs the residue");
+        assert_ne!(fixed, "old-code");
+        assert_ne!(fixed, "new-minted-code");
+        assert!(bootstrap_within_ttl(dir.path(), 24));
     }
 }

@@ -742,10 +742,11 @@ async fn spawn_inner(
     let addr = listener.local_addr()?;
     persist_listen(&config.data_dir, addr)?;
     // Bind established: a no-source start may now adopt an explicit-marker'd
-    // persisted token. A failed bind above aborts before this, leaving the
-    // provenance marker (and rotation refusal) intact.
+    // persisted token, or commit the in-memory mint of a token-less recovery
+    // path. A failed bind above aborts before this, leaving the provenance
+    // marker (and rotation refusal) intact.
     if bootstrap_resolution == BootstrapResolution::AdoptAfterBind {
-        adopt_bootstrap_after_bind(&config.data_dir)?;
+        adopt_bootstrap_after_bind(&config.data_dir, &config.bootstrap_token)?;
     }
     let (tx, rx) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {

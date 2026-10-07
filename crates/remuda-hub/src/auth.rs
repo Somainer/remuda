@@ -245,9 +245,21 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
         });
     }
 
-    // Nothing persisted: mint a hub-generated token.
+    // Nothing persisted: mint a hub-generated token IN MEMORY.
     config.bootstrap_token = random_token();
     config.bootstrap_source = crate::config::BootstrapSource::Generated;
+    if bootstrap_source_is_explicit(&data_dir) {
+        // Round 4 item 7 (HIGH): an explicit start that crashed AFTER the
+        // marker fsync but BEFORE persisting a token left marker-present +
+        // no-token. Minting and unlinking the marker here (before
+        // Store::open/bind) reopened that crash window: a later start failure
+        // would leave a hub-owned token with no marker and rotation authority.
+        // Persist nothing; adopt_bootstrap_after_bind commits the minted code
+        // and removes the marker TOGETHER, only after a successful bind.
+        return Ok(BootstrapResolution::AdoptAfterBind);
+    }
+    // Normal fresh mint on an unmarked dir: no provenance ever existed, so it
+    // is safe to persist before bind.
     std::fs::create_dir_all(&data_dir)
         .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
     set_bootstrap_explicit_marker(&data_dir, false)?;
@@ -277,11 +289,23 @@ fn file_mtime_newer_than_stamp(file: &Path, stamp: &Path) -> Result<bool, HubErr
     Ok(time::OffsetDateTime::from(modified) > parsed)
 }
 
-/// Remove the explicit-source provenance marker after a successful no-source
-/// Hub start (bind established). Called only when
-/// [`resolve_bootstrap`] returned [`BootstrapResolution::AdoptAfterBind`], so a
-/// failed bind leaves the marker and rotation refusal intact.
-pub fn adopt_bootstrap_after_bind(data_dir: &Path) -> Result<(), HubError> {
+/// Commit the post-bind adoption of provenance. Called only when
+/// [`resolve_bootstrap`] returned [`BootstrapResolution::AdoptAfterBind`], so
+/// a failed bind leaves the marker (and rotation refusal) intact.
+///
+/// Two pre-bind states reach this point:
+///   * a persisted token existed (the usual adopt): the caller passes it but
+///     nothing is overwritten — only the marker is removed;
+///   * no token existed and `resolve_bootstrap` minted one in memory (round 4
+///     item 7 recovery path): the minted code is persisted here and the marker
+///     removed together, so the directory never carries a hub-owned token
+///     without the marker — a crash between the two writes leaves marker +
+///     token, and the next successful start re-enters the first case and
+///     finishes the adoption.
+pub fn adopt_bootstrap_after_bind(data_dir: &Path, minted_token: &str) -> Result<(), HubError> {
+    if !data_dir.join("bootstrap-token").is_file() {
+        persist_bootstrap(data_dir, minted_token)?;
+    }
     set_bootstrap_explicit_marker(data_dir, false)
 }
 
@@ -775,7 +799,7 @@ mod tests {
         );
 
         // Bind succeeded: adopt the provenance, rotation now allowed.
-        adopt_bootstrap_after_bind(dir.path()).expect("adopt after bind");
+        adopt_bootstrap_after_bind(dir.path(), &cfg2.bootstrap_token).expect("adopt after bind");
         assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
         let new = rotate_bootstrap(dir.path()).expect("rotation now allowed");
         assert_ne!(new, "adoptable-code");
@@ -979,5 +1003,72 @@ mod tests {
             rotate_bootstrap(dir.path()).is_err(),
             "rotation is now refused: the example must not suggest this path"
         );
+    }
+
+    /// Round 4 item 7 (HIGH): marker present + NO persisted token (the crash
+    /// window between the explicit marker fsync and the token write). A
+    /// no-source start must mint ONLY in memory and defer persisting the code
+    /// and removing the marker to after a successful bind — a failed bind
+    /// leaves the marker intact and no token file, so rotation cannot mint
+    /// over the directory.
+    #[test]
+    fn marker_without_token_defers_the_mint_to_after_bind() {
+        let dir = tempfile::tempdir().expect("data dir");
+        std::fs::create_dir_all(dir.path()).expect("data dir");
+        let marker = dir.path().join(BOOTSTRAP_EXPLICIT_MARKER);
+        write_private(&marker, "").expect("crashed explicit start's marker");
+        let token_path = dir.path().join("bootstrap-token");
+        let stamp_path = dir.path().join("bootstrap-issued-at");
+
+        // No-source start: resolve mints in memory, writes NOTHING.
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = String::new();
+        config.bootstrap_source = BootstrapSource::Generated;
+        let resolution = resolve_bootstrap(&mut config).expect("resolve");
+        assert_eq!(resolution, BootstrapResolution::AdoptAfterBind);
+        assert!(
+            config.bootstrap_token.len() >= 16,
+            "a fresh code is minted for the running Hub"
+        );
+        let minted = config.bootstrap_token.clone();
+        assert!(!token_path.is_file(), "no token before bind");
+        assert!(!stamp_path.is_file(), "no stamp before bind");
+        assert!(
+            marker.is_file(),
+            "the marker survives a not-yet-bound start"
+        );
+        assert!(
+            rotate_bootstrap(dir.path()).is_err(),
+            "rotation refuses while the marker guards the token-less dir"
+        );
+
+        // Simulate a FAILED bind: no adopt call. A second no-source start
+        // reaches the same state and still writes nothing.
+        let mut retry = HubConfig::for_test(dir.path().to_path_buf());
+        retry.bootstrap_token = String::new();
+        retry.bootstrap_source = BootstrapSource::Generated;
+        assert_eq!(
+            resolve_bootstrap(&mut retry).expect("retry resolve"),
+            BootstrapResolution::AdoptAfterBind
+        );
+        assert!(!token_path.is_file());
+        assert!(marker.is_file());
+        assert!(rotate_bootstrap(dir.path()).is_err());
+
+        // Bind succeeded: adopt commits the minted token AND clears the marker.
+        adopt_bootstrap_after_bind(dir.path(), &retry.bootstrap_token)
+            .expect("adopt persists the mint and removes the marker");
+        assert!(
+            token_path.is_file(),
+            "the minted token lands only after bind"
+        );
+        assert!(stamp_path.is_file());
+        assert!(!marker.is_file(), "the marker is removed with the commit");
+        assert_eq!(
+            std::fs::read_to_string(&token_path).unwrap().trim(),
+            retry.bootstrap_token
+        );
+        let new = rotate_bootstrap(dir.path()).expect("rotation allowed post-bind");
+        assert_ne!(new, minted);
     }
 }

@@ -289,6 +289,56 @@ async fn failed_no_source_bind_keeps_explicit_marker() -> Result<()> {
     Ok(())
 }
 
+/// Round 4 item 7 (HIGH): a marker with NO persisted token (an explicit start
+/// that crashed after the marker fsync) plus a failed no-source bind must
+/// leave the marker intact and still no token file — the in-memory mint must
+/// not be committed before the bind, or rotation would gain authority over a
+/// Hub that never started.
+#[tokio::test]
+async fn failed_no_source_bind_keeps_marker_and_mints_no_token() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    std::fs::create_dir_all(&hub_data)?;
+    let marker = hub_data.join("bootstrap-token-source-explicit");
+    std::fs::write(&marker, "")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))?;
+    }
+    assert!(!hub_data.join("bootstrap-token").is_file());
+
+    // Hold an address with a first Hub so the no-source start fails to bind.
+    let holder = spawn(HubConfig::for_test(outer.path().join("holder"))).await?;
+
+    let mut failed = HubConfig::for_test(hub_data.clone());
+    failed.bootstrap_token = String::new();
+    failed.bootstrap_source = BootstrapSource::Generated;
+    failed.listen = holder.addr;
+    let err = spawn(failed).await;
+    match err {
+        Err(err) => eprintln!("bind failed as expected: {err}"),
+        Ok(_) => panic!("the occupied address must fail to bind"),
+    }
+
+    assert!(marker.is_file(), "the marker survives the failed start");
+    assert!(
+        !hub_data.join("bootstrap-token").is_file(),
+        "no hub-owned token may be minted before a successful bind"
+    );
+    assert!(
+        !hub_data.join("bootstrap-issued-at").is_file(),
+        "no stamp may be written for the un-committed mint"
+    );
+    assert!(
+        remuda_hub::rotate_bootstrap(&hub_data).is_err(),
+        "rotation must keep refusing the token-less marked dir"
+    );
+
+    holder.shutdown().await;
+    Ok(())
+}
+
 /// rotate-bootstrap writes into a dev-hub/ subdirectory when present.
 #[tokio::test]
 async fn rotate_bootstrap_honours_dev_hub_layout() -> Result<()> {

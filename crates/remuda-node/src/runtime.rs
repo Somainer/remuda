@@ -1852,12 +1852,43 @@ async fn pump_one_observation(
             }
         }
         Err(error) => {
-            tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed");
-            record_task_exit(
-                store.as_ref(),
-                instance_id,
-                "native-observation-commit-failed",
-            );
+            // c-cardsettle r7 item 7 (OA6): the Node's OWN store failing to
+            // commit an observation is not evidence the child ended. End the
+            // instance only when the driver reports the child actually gone;
+            // otherwise keep it (and its cards) alive and append a best-effort
+            // error observation so the failure is visible once the store
+            // recovers. The pump keeps running, so the driver's later real
+            // exit still settles the instance normally.
+            if driver.process_gone().await {
+                tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed with the child gone");
+                record_task_exit(
+                    store.as_ref(),
+                    instance_id,
+                    "native-observation-commit-failed",
+                );
+            } else {
+                tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed; child alive, keeping the instance live");
+                let diagnostic = DriverEmission::NativeLifecycle {
+                    name: "observation-commit-failed".to_owned(),
+                    status: format!("rejected: {error}"),
+                    severity: remuda_protocol::Severity::Warning,
+                };
+                match diagnostic.into_payload() {
+                    Ok(payload) => {
+                        if let Err(diag_error) = store.append_observation(
+                            instance_id,
+                            None,
+                            Completeness::Structured,
+                            payload,
+                        ) {
+                            tracing::warn!(%diag_error, "commit-failure diagnostic also not journaled; instance stays live");
+                        }
+                    }
+                    Err(payload_error) => {
+                        tracing::warn!(%payload_error, "commit-failure diagnostic could not be built; instance stays live");
+                    }
+                }
+            }
         }
     }
 }
@@ -2301,7 +2332,18 @@ async fn execute_queued(
             // cannot do) must not mark the instance itself failed.
             let is_control = matches!(queued.request, DriverRequest::Configure { .. });
             if !pty_queue::is_pty(driver.kind()) && !is_control {
-                record_task_exit(store.as_ref(), instance_id, &error.to_string());
+                // c-cardsettle r7 item 7 (OA6): a rejected command is not a
+                // process end. End the instance only when the driver itself
+                // reports the child gone (e.g. stdin closed against an exited
+                // process); with the child alive the diagnostic appended above
+                // is the whole record, the instance keeps running and its
+                // pending cards stay pending — the driver's own real exit
+                // observation settles them through the normal pump path.
+                if driver.process_gone().await {
+                    record_task_exit(store.as_ref(), instance_id, &error.to_string());
+                } else {
+                    tracing::warn!(%error, instance_id = %instance_id.as_id(), "command rejected while the child is alive; instance stays live");
+                }
             }
             settle_command(
                 &mut command,
@@ -5848,5 +5890,491 @@ mod api_relay_launch_test {
             node.store().get_instance(&instance_id).ok().is_none(),
             "a refused launch creates no instance record"
         );
+    }
+
+    /// c-cardsettle r7 item 7 (OA6) tests: the two Node sites that used to end an
+    /// instance on non-process-end evidence — a failed native-observation commit
+    /// (the Node's own store failing) and a rejected non-PTY command (control /
+    /// API error while the child may be alive). A scripted non-PTY driver keeps an
+    /// event channel (driven through the REAL observation pump) and knobs for
+    /// command failure and the driver's own child-gone report.
+    #[cfg(test)]
+    mod oa6_store_and_rejection_tests {
+        use super::*;
+        use crate::{
+            DriverEmission, DriverError, DriverFuture, DriverLaunch, DriverRegistry, DriverRequest,
+            MemoryStore,
+        };
+        use remuda_protocol::{
+            Activity, DriverKind, Knowledge, LifecyclePayload, LifecycleTopic, MessagePhase,
+            MessageRole, NativeLifecycle, Observation, ObservationPayload, Severity, SourceChannel,
+        };
+        use serde_json::json;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        /// Local copy of the shared test builder (this module is a sibling of
+        /// `runtime::tests`, which keeps that helper private).
+        fn native(
+            topic: LifecycleTopic,
+            name: &str,
+            native_id: &str,
+            severity: Severity,
+            affects_completion: bool,
+            status: &str,
+        ) -> Observation {
+            Observation {
+                schema_version: remuda_protocol::SchemaVersion,
+                event_id: remuda_protocol::EventId::new(),
+                journal_id: Id::new("obj").expect("journal id"),
+                instance_id: InstanceId::new(),
+                run_id: None,
+                host_id: HostId::new(),
+                process_generation: U64(1),
+                run_generation: None,
+                seq: U64(1),
+                observed_at: timestamp_now().expect("now"),
+                native_at: unknown("test"),
+                source: crate::driver::runtime_source(
+                    &fixture_instance(
+                        InstanceId::new(),
+                        HostId::new(),
+                        WorkspaceId::new(),
+                        DriverKind::ClaudePrint,
+                    )
+                    .expect("fixture instance"),
+                    U64(1),
+                ),
+                completeness: Completeness::Structured,
+                raw_ref: None,
+                evidence_event_ids: Vec::new(),
+                body: ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+                    NativeLifecycle {
+                        topic,
+                        native_name: name.to_owned(),
+                        native_id: Knowledge::Known {
+                            value: native_id.to_owned(),
+                        },
+                        status: Knowledge::Known {
+                            value: status.to_owned(),
+                        },
+                        related_ids: std::collections::BTreeMap::new(),
+                        data_ref: None,
+                        severity,
+                        affects_completion,
+                    },
+                )))),
+            }
+        }
+
+        /// Test-side controls for the one instance-local scripted driver.
+        #[derive(Clone)]
+        struct ScriptHandle {
+            tx: Arc<Mutex<Option<mpsc::Sender<Observation>>>>,
+            /// Next N `Send` commands fail with a control error (child alive).
+            reject_sends: Arc<AtomicUsize>,
+            /// What the driver reports from `process_gone`.
+            gone: Arc<AtomicBool>,
+            /// Every prompt the execute path actually accepted.
+            sent: Arc<Mutex<Vec<String>>>,
+        }
+
+        struct ScriptPrintDriver {
+            instance: Instance,
+            handle: ScriptHandle,
+        }
+
+        impl Driver for ScriptPrintDriver {
+            fn kind(&self) -> DriverKind {
+                DriverKind::ClaudePrint
+            }
+
+            fn start(&self) -> crate::DriverStartFuture<'_> {
+                // The real production pump consumes this channel: observations
+                // sent here go through spawn_observation_pump exactly like the
+                // print driver's stdout reader.
+                Box::pin(async move {
+                    let (tx, rx) = mpsc::channel(32);
+                    *self.handle.tx.lock().unwrap() = Some(tx);
+                    Ok(Some(rx))
+                })
+            }
+
+            fn process_gone(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                let gone = self.handle.gone.clone();
+                Box::pin(async move { gone.load(Ordering::SeqCst) })
+            }
+
+            fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
+                Box::pin(async move {
+                    match request {
+                        DriverRequest::Send { prompt, .. } => {
+                            if self
+                                .handle
+                                .reject_sends
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                    if n > 0 { Some(n - 1) } else { None }
+                                })
+                                .is_ok()
+                            {
+                                // A control/API rejection: the child is still alive.
+                                return Err(DriverError::Failed(
+                                    "scripted control rejection".into(),
+                                ));
+                            }
+                            let mut emissions = Vec::new();
+                            if prompt.contains("can_use_tool") {
+                                let interaction =
+                                    crate::interactions::fake_can_use_tool(&self.instance)
+                                        .map_err(|error| DriverError::Failed(error.to_string()))?;
+                                emissions.push(DriverEmission::InteractionRequested {
+                                    interaction: Box::new(interaction),
+                                });
+                            }
+                            self.handle.sent.lock().unwrap().push(prompt);
+                            emissions.push(DriverEmission::Message {
+                                role: MessageRole::Assistant,
+                                phase: MessagePhase::Final,
+                                text: "PONG".into(),
+                            });
+                            Ok(emissions)
+                        }
+                        // Close always works so teardown never errors.
+                        DriverRequest::Close => Ok(Vec::new()),
+                        other => {
+                            // No other request type is used by these tests.
+                            Err(DriverError::Failed(format!(
+                                "scripted driver does not handle {other:?}"
+                            )))
+                        }
+                    }
+                })
+            }
+        }
+
+        struct ScriptPrintFactory {
+            handle: ScriptHandle,
+        }
+
+        impl crate::DriverFactory for ScriptPrintFactory {
+            fn kind(&self) -> DriverKind {
+                DriverKind::ClaudePrint
+            }
+
+            fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError> {
+                Ok(Arc::new(ScriptPrintDriver {
+                    instance: launch.instance,
+                    handle: self.handle.clone(),
+                }))
+            }
+        }
+
+        fn new_handle() -> ScriptHandle {
+            ScriptHandle {
+                tx: Arc::new(Mutex::new(None)),
+                reject_sends: Arc::new(AtomicUsize::new(0)),
+                gone: Arc::new(AtomicBool::new(false)),
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn scripted_node() -> (DevNode, Arc<MemoryStore>, tempfile::TempDir, ScriptHandle) {
+            let config = crate::DevServerConfig::loopback(0)
+                .with_workspace_roots(remuda_testing::test_workspace_roots!());
+            let handle = new_handle();
+            let registry = DriverRegistry::default();
+            registry
+                .register_factory(Arc::new(ScriptPrintFactory {
+                    handle: handle.clone(),
+                }))
+                .expect("register scripted print factory");
+            // DURABLE store: pending cards live in the EntityDb, so the test can
+            // assert the card survives (and is not retired) via the same rows the
+            // hello inventory lists.
+            let data = tempfile::tempdir().expect("data dir");
+            let store =
+                Arc::new(MemoryStore::open_journaled(data.path(), 64).expect("durable store"));
+            let node = DevNode::with_parts(&config, store.clone() as Arc<dyn LocalStore>, registry)
+                .expect("compose node");
+            (node, store, data, handle)
+        }
+
+        async fn wait_for(deadline_ms: u64, mut predicate: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_millis(deadline_ms), async {
+                while !predicate() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("condition in time");
+        }
+
+        async fn create_ready(node: &DevNode) -> Instance {
+            let created = node
+                .create_instance(
+                    serde_json::from_value(json!({
+                        "kind": "claude",
+                        "driver": "claude-print",
+                        "model": "fake",
+                        "prompt": "first",
+                    }))
+                    .expect("request"),
+                )
+                .await
+                .expect("create");
+            let id = created.instance.meta.id.clone();
+            wait_for(3000, || {
+                node.get_instance(&id)
+                    .is_ok_and(|instance| matches!(instance.lifecycle, InstanceLifecycle::Ready))
+            })
+            .await;
+            wait_for(3000, || {
+                node.get_command(&created.command.command_id)
+                    .is_ok_and(|command| matches!(command.state, CommandState::Settled))
+            })
+            .await;
+            node.get_instance(&id).expect("instance")
+        }
+
+        async fn send(node: &DevNode, id: &InstanceId, prompt: &str) -> Command {
+            node.submit_command(
+                id,
+                serde_json::from_value(json!({ "operation": "send", "prompt": prompt }))
+                    .expect("request"),
+            )
+            .await
+            .expect("submit")
+            .command
+        }
+
+        /// Send a native observation over the driver's REAL pump channel.
+        fn pump_native(
+            handle: &ScriptHandle,
+            topic: LifecycleTopic,
+            name: &str,
+            status: &str,
+            severity: Severity,
+            channel: SourceChannel,
+            kind: DriverKind,
+        ) {
+            let mut observation = native(topic, name, "sess-r7", severity, false, status);
+            observation.source.channel = channel;
+            observation.source.driver_kind = kind;
+            handle
+                .tx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("driver started its observation stream")
+                .try_send(observation)
+                .expect("pump channel accepts the observation");
+        }
+
+        fn events_named(node: &DevNode, instance: &Instance, name: &str) -> bool {
+            node.read_journal(&instance.journal_id, None, 256)
+                .expect("journal")
+                .events
+                .iter()
+                .any(|event| match event {
+                    JournalEvent::Instance(observation) => matches!(&observation.body,
+                    ObservationPayload::Lifecycle(payload)
+                        if matches!(payload.as_ref(),
+                            remuda_protocol::LifecyclePayload::Native(native)
+                                if native.native_name == name)),
+                    _ => false,
+                })
+        }
+
+        /// Site 1: the Node's own store rejects an observation commit while the
+        /// child is alive. The instance stays live, its pending card stays
+        /// pending, and the driver's later REAL exit still ends the instance.
+        #[tokio::test]
+        async fn observation_commit_failure_keeps_the_live_instance_and_its_card() {
+            let (node, store, _data, handle) = scripted_node();
+
+            let instance = create_ready(&node).await;
+            let id = instance.meta.id.clone();
+
+            // A pending approval card reaches the broker through the command path.
+            let request = send(&node, &id, "please can_use_tool now").await;
+            assert!(
+                matches!(
+                    request.state,
+                    CommandState::Accepted | CommandState::Settled
+                ),
+                "the card-producing send reached the driver: {:?}",
+                request.state
+            );
+            wait_for(3000, || {
+                store
+                    .pending_interactions()
+                    .is_ok_and(|rows| rows.len() == 1)
+            })
+            .await;
+
+            // The Node's own store now fails the next driver observation commit.
+            store.fail_next_driver_observations(2);
+            pump_native(
+                &handle,
+                LifecycleTopic::Diagnostic,
+                "r7-commit-probe",
+                "ok",
+                Severity::Info,
+                SourceChannel::Stdout,
+                DriverKind::ClaudePrint,
+            );
+
+            // The fallback ERROR OBSERVATION (not a task exit) is journaled.
+            wait_for(3000, || {
+                events_named(&node, &instance, "observation-commit-failed")
+            })
+            .await;
+
+            // The failure happened and the instance is still live — not failed,
+            // not exited, no task-exit last_error, and its card still pending.
+            let after = node.get_instance(&id).expect("instance");
+            assert!(
+                matches!(after.lifecycle, InstanceLifecycle::Ready),
+                "a Node store failure never ends the child: {:?}",
+                after.lifecycle
+            );
+            assert!(after.last_error.is_none(), "no task-exit last_error");
+            assert_eq!(store.pending_interactions().unwrap().len(), 1);
+
+            // The driver's OWN real exit (the exact print session/exited shape)
+            // still ends the instance through the normal pump path; the entity
+            // event the Hub settles cards from is journaled.
+            pump_native(
+                &handle,
+                LifecycleTopic::Session,
+                "session",
+                "exited",
+                Severity::Info,
+                SourceChannel::Stdout,
+                DriverKind::ClaudePrint,
+            );
+            wait_for(3000, || {
+                node.get_instance(&id)
+                    .is_ok_and(|instance| matches!(instance.lifecycle, InstanceLifecycle::Exited))
+            })
+            .await;
+
+            node.shutdown().await.expect("shutdown");
+        }
+
+        /// Site 2: a rejected non-PTY command while the child is alive rejects the
+        /// command only — the instance stays live and its card stays pending. A
+        /// rejection the driver pairs with a confirmed child-gone DOES end it; and
+        /// an alive instance still ends on the driver's own real exit.
+        #[tokio::test]
+        async fn command_rejection_keeps_the_live_instance_until_the_child_is_gone() {
+            let (node, store, _data, handle) = scripted_node();
+            let instance = create_ready(&node).await;
+            let id = instance.meta.id.clone();
+
+            let request = send(&node, &id, "please can_use_tool now").await;
+            assert!(
+                matches!(
+                    request.state,
+                    CommandState::Accepted | CommandState::Settled
+                ),
+                "the card-producing send reached the driver: {:?}",
+                request.state
+            );
+            wait_for(3000, || {
+                store
+                    .pending_interactions()
+                    .is_ok_and(|rows| rows.len() == 1)
+            })
+            .await;
+            // Working root turn so a wrong idle/failed stamp would be visible.
+            store
+                .set_instance_state(
+                    &id,
+                    None,
+                    Some(Knowledge::Known {
+                        value: Activity::Working,
+                    }),
+                )
+                .expect("seed working");
+
+            // The next send is rejected while the driver reports the child ALIVE.
+            handle.reject_sends.store(1, Ordering::SeqCst);
+            let rejected = send(&node, &id, "retry after the error").await;
+            // The worker settles asynchronously; wait for the rejected outcome.
+            wait_for(3000, || {
+                node.get_command(&rejected.command_id)
+                    .is_ok_and(|command| matches!(command.state, CommandState::Settled))
+            })
+            .await;
+            let rejected = node.get_command(&rejected.command_id).expect("command");
+            assert_eq!(
+                rejected.state,
+                CommandState::Settled,
+                "a rejected command still settles its ledger row"
+            );
+            assert!(
+                matches!(&rejected.settlement,
+                Knowledge::Known { value } if value.outcome == SettlementOutcome::Rejected),
+                "the settlement records the rejection: {:?}",
+                rejected.settlement
+            );
+
+            // Give the worker a tick; the instance must not have ended.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let after = node.get_instance(&id).expect("instance");
+            assert!(
+                matches!(after.lifecycle, InstanceLifecycle::Ready),
+                "a command rejection with the child alive never ends the instance: {:?}",
+                after.lifecycle
+            );
+            assert_eq!(
+                after.activity,
+                Knowledge::Known {
+                    value: Activity::Working
+                },
+                "a rejection does not touch activity"
+            );
+            assert!(after.last_error.is_none(), "no task-exit last_error");
+            assert_eq!(store.pending_interactions().unwrap().len(), 1);
+            // The rejection diagnostic is recorded.
+            assert!(events_named(&node, &instance, "fake-driver-error"));
+
+            // The driver's real exit still settles it.
+            pump_native(
+                &handle,
+                LifecycleTopic::Session,
+                "session",
+                "exited",
+                Severity::Info,
+                SourceChannel::Stdout,
+                DriverKind::ClaudePrint,
+            );
+            wait_for(3000, || {
+                node.get_instance(&id)
+                    .is_ok_and(|instance| matches!(instance.lifecycle, InstanceLifecycle::Exited))
+            })
+            .await;
+            node.shutdown().await.expect("shutdown");
+
+            // A rejection the driver pairs with a confirmed child-gone DOES end
+            // the instance (the guard still honors real process-end evidence).
+            let (node2, _store2, _data2, handle2) = scripted_node();
+            let instance2 = create_ready(&node2).await;
+            let id2 = instance2.meta.id.clone();
+            handle2.gone.store(true, Ordering::SeqCst);
+            handle2.reject_sends.store(1, Ordering::SeqCst);
+            let _ = send(&node2, &id2, "send right as the child exits").await;
+            wait_for(3000, || {
+                node2
+                    .get_instance(&id2)
+                    .is_ok_and(|instance| matches!(instance.lifecycle, InstanceLifecycle::Failed))
+            })
+            .await;
+            node2.shutdown().await.expect("shutdown");
+        }
     }
 }

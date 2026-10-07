@@ -639,6 +639,14 @@ impl Driver for ClaudePrintDriver {
         Err(DriverError::ControlUnavailable)
     }
 
+    async fn process_gone(&self) -> bool {
+        // The reader task sets this (once) when the child's stdout closes and
+        // `emit_exit` runs, i.e. the driver's OWN process-end evidence; the
+        // close ladder sets it too. A failed `send` while it is still false
+        // means the child is alive (control/API error), never a task exit.
+        self.inner.exit_emitted.load(Ordering::Acquire)
+    }
+
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(DriverError::ControlUnavailable);

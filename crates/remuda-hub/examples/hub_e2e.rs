@@ -2099,6 +2099,7 @@ async fn fake_node(
                             };
                             append_n = append_configure_status(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("effort-degraded:{reason}"),

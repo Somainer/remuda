@@ -497,6 +497,11 @@ pub(crate) async fn handle_node_method(
                 )
                 .await?;
             crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
+            // c-dirpicker r7 item 1: release durable unbinding marks a dead
+            // connection left prepared; idempotent, safe before the transport
+            // is registered.
+            crate::workspaces::abort_unsettled_unregisters_on_reconnect(state, &host.host_id)
+                .await?;
             if params["daemon"] == true {
                 state
                     .store

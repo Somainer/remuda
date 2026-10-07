@@ -279,6 +279,12 @@ pub enum WorkspaceMutationPhase {
     Prepare,
     /// Revalidate and persist membership before acknowledging settlement.
     Commit,
+    /// c-dirpicker r7 item 1: cancel a prepared-but-uncommitted mutation.
+    /// For an unregister this clears the durable unbinding mark WITHOUT
+    /// touching membership, so a prepare whose commit never lands (link drop,
+    /// restart, timeout, refusal) cannot wedge the workspace. Idempotent: an
+    /// unknown or already-settled command acknowledges without change.
+    Abort,
 }
 
 /// `workspace.register` / `workspace.unregister` input (D-023).

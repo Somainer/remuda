@@ -518,6 +518,16 @@ impl RunningHub {
         crate::gatequeue::reconcile(&self.state).await;
     }
 
+    /// Test helper: run the node.hello unregister reconciliation (c-dirpicker
+    /// r7 item 1) — aborts every still-unsettled workspace.unregister command
+    /// on `host_id`.
+    #[doc(hidden)]
+    pub async fn test_reconcile_unsettled_unregisters(&self, host_id: &str) {
+        crate::workspaces::abort_unsettled_unregisters_on_reconnect(&self.state, host_id)
+            .await
+            .expect("reconcile unsettled unregisters");
+    }
+
     /// Test helper (round 6 item 3): arm a one-shot park point in the REAL
     /// unregister DELETE handler (`unregister == true`; right after the
     /// occupancy query, before the prepare RPC) or the REAL POST /v1/tasks

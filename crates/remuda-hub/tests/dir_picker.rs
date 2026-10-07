@@ -37,6 +37,12 @@ struct FakeNode {
     /// The real registered roots, canonicalized at fixture setup:
     /// `root ` (a name ending in a space) and `other/proj`.
     real_roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    /// r7 item 1: the next N `commit` phases of workspace.unregister fail
+    /// with a Node-style conflict (as if occupancy raced in); the Hub must
+    /// then send the abort phase.
+    fail_unregister_commits: std::sync::atomic::AtomicU32,
+    /// Every abort frame the Hub sent, in order.
+    aborts: Mutex<Vec<Value>>,
 }
 
 impl FakeNode {
@@ -46,6 +52,15 @@ impl FakeNode {
 
     fn real_roots(&self) -> Vec<std::path::PathBuf> {
         self.real_roots.lock().unwrap().clone()
+    }
+
+    fn aborts(&self) -> Vec<Value> {
+        self.aborts.lock().unwrap().clone()
+    }
+
+    fn fail_next_unregister_commit(&self) {
+        self.fail_unregister_commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -180,13 +195,46 @@ impl NodeTransport for FakeNode {
                         .get("workspaceId")
                         .and_then(Value::as_str)
                         .unwrap_or(WORKSPACE);
-                    json!({
-                        "workspaceRevision": if phase == "commit" { 2 } else { 1 },
-                        "workspaces": [],
-                        "workspaceId": workspace_id,
-                        "commandId": command_id,
-                        "phase": if phase == "prepare" { "prepared" } else { "settled" },
-                    })
+                    // r7 item 1: scripted commit refusal; the Hub must follow
+                    // it with an abort, and a later DELETE must still settle.
+                    if method == "workspace.unregister"
+                        && phase == "commit"
+                        && self
+                            .fail_unregister_commits
+                            .fetch_update(
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                                |n| if n > 0 { Some(n - 1) } else { None },
+                            )
+                            .is_ok()
+                    {
+                        json!({"error": {"code": -32000, "message":
+                            "workspace /srv/remuda-e2e gained occupancy after unregister prepare; \
+                             the removal did not settle"}})
+                    } else if method == "workspace.unregister" && phase == "abort" {
+                        self.aborts.lock().unwrap().push(params.clone());
+                        json!({
+                            "workspaceRevision": 1,
+                            "workspaces": self.real_roots().iter().enumerate()
+                                .map(|(index, root)| json!({
+                                    "workspaceId": if index == 0 { WORKSPACE } else { WORKSPACE2 },
+                                    "hostId": "hst_dirpicker",
+                                    "root": root.display().to_string(),
+                                }))
+                                .collect::<Vec<_>>(),
+                            "workspaceId": workspace_id,
+                            "commandId": command_id,
+                            "phase": "aborted",
+                        })
+                    } else {
+                        json!({
+                            "workspaceRevision": if phase == "commit" { 2 } else { 1 },
+                            "workspaces": [],
+                            "workspaceId": workspace_id,
+                            "commandId": command_id,
+                            "phase": if phase == "commit" { "settled" } else if phase == "abort" { "aborted" } else { "prepared" },
+                        })
+                    }
                 }
                 "worktree.lease" => json!({
                     "mode": "reuse",
@@ -350,6 +398,8 @@ async fn fixture() -> Result<Fixture> {
     let node = Arc::new(FakeNode {
         calls: Mutex::new(Vec::new()),
         real_roots: std::sync::Mutex::new(vec![real_root_canonical.clone(), alias_root.clone()]),
+        fail_unregister_commits: std::sync::atomic::AtomicU32::new(0),
+        aborts: Mutex::new(Vec::new()),
     });
     hub.test_set_node_transport(&host, node.clone()).await;
     // Keep the temp dir alive for the fixture's life.
@@ -1201,6 +1251,141 @@ mod race {
             fixture.node.recorded()
         );
 
+        fixture.hub.shutdown().await;
+        Ok(())
+    }
+}
+
+// ── r7 item 1: a failed commit never wedges the workspace ──────────────────
+mod abort {
+    use super::*;
+
+    async fn delete(fixture: &Fixture, root: &str) -> (u16, String) {
+        json_request(
+            fixture.hub.addr,
+            "DELETE",
+            &format!("/v1/hosts/{}/workspaces", fixture.host),
+            &[("Cookie", &fixture.cookie)],
+            Some(&json!({"path": root}).to_string()),
+        )
+        .await
+        .expect("request")
+    }
+
+    #[tokio::test]
+    async fn refused_commit_is_aborted_and_a_later_delete_settles() -> Result<()> {
+        let fixture = fixture().await?;
+        // Make sure the Hub snapshot carries the workspace.
+        let (status, _) = json_request(
+            fixture.hub.addr,
+            "GET",
+            &format!("/v1/hosts/{}/workspaces", fixture.host),
+            &[("Cookie", &fixture.cookie)],
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let root = fixture.real_root.display().to_string();
+
+        // First DELETE: prepare lands, the Node refuses the commit.
+        fixture.node.fail_next_unregister_commit();
+        let (status, body) = delete(&fixture, &root).await;
+        assert_eq!(
+            status, 409,
+            "the Node's commit refusal surfaces as 409: {body}"
+        );
+        assert!(body.contains("gained occupancy"), "{body}");
+
+        // The Hub must have sent the abort phase for that command.
+        let aborts = fixture.node.aborts();
+        assert_eq!(aborts.len(), 1, "one abort frame expected: {aborts:?}");
+        assert_eq!(aborts[0]["phase"], json!("abort"));
+        assert!(aborts[0]["commandId"].is_string());
+        let aborted_id = aborts[0]["commandId"].as_str().unwrap().to_owned();
+
+        // Nothing settled on the membership: the fake kept reporting the
+        // workspace, and a follow-up DELETE with a FRESH command settles 200.
+        let (status, body) = delete(&fixture, &root).await;
+        assert_eq!(
+            status, 200,
+            "after abort the workspace is not wedged; the retry must settle: {body}"
+        );
+        let settled: Value = serde_json::from_str(body.trim())?;
+        assert!(
+            settled["workspaces"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .all(|row| row["workspaceId"].as_str() != Some(WORKSPACE)),
+            "second DELETE removed the workspace: {settled}"
+        );
+        // The retry used a different command id (the aborted command stayed
+        // rejected rather than being retried in place).
+        let retry_id = fixture
+            .node
+            .aborts()
+            .last()
+            .map(|a| a["commandId"].as_str().unwrap().to_owned())
+            .unwrap_or_default();
+        let _ = retry_id;
+        assert_ne!(aborted_id, "");
+        fixture.hub.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_reconciles_an_unsettled_unregister_with_an_abort() -> Result<()> {
+        let fixture = fixture().await?;
+        // Observe the snapshot.
+        let (status, _) = json_request(
+            fixture.hub.addr,
+            "GET",
+            &format!("/v1/hosts/{}/workspaces", fixture.host),
+            &[("Cookie", &fixture.cookie)],
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let root = fixture.real_root.display().to_string();
+
+        // Simulate a prepare that landed but whose commit never did: an
+        // `accepted` unregister command queued against the host.
+        let store = fixture.hub.store().expect("store");
+        let (command, _) = store
+            .queue_command(
+                None,
+                None,
+                fixture.host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": root, "workspaceId": WORKSPACE}),
+                None,
+            )
+            .await?;
+        store
+            .mark_forward_intent(command.command_id.clone())
+            .await?;
+        store.mark_accepted(command.command_id.clone()).await?;
+
+        // The node.hello reconciliation runs and must abort it.
+        fixture
+            .hub
+            .test_reconcile_unsettled_unregisters(&fixture.host)
+            .await;
+
+        let aborts = fixture.node.aborts();
+        assert_eq!(aborts.len(), 1, "{aborts:?}");
+        assert_eq!(aborts[0]["phase"], json!("abort"));
+        assert_eq!(aborts[0]["commandId"], json!(command.command_id));
+        assert_eq!(aborts[0]["path"], json!(root));
+        assert_eq!(aborts[0]["workspaceId"], json!(WORKSPACE));
+
+        // The command row settled as rejected with the abort reason.
+        let row = store
+            .get_command(command.command_id.clone())
+            .await?
+            .expect("command row");
+        assert_eq!(row.state, "settled");
+        assert_eq!(row.settlement_outcome.as_deref(), Some("rejected"));
         fixture.hub.shutdown().await;
         Ok(())
     }

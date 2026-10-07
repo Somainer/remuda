@@ -385,18 +385,19 @@ pub(crate) fn count_workspace_users(
 
 /// Resolve an unregister DELETE `path` to the Node-authoritative
 /// `(workspaceId, canonicalRoot)` BEFORE taking the operation lock or
-/// counting occupancy (round 5 item 2; round 6 item 1).
+/// counting occupancy (round 5 item 2; round 6 item 1; r7 item 2).
 ///
-/// The exact stored snapshot root matches byte-for-byte (a real trailing
-/// space is a different name; no trimming). Anything else is resolved by the
-/// Node through the READ-ONLY `workspace.resolve` RPC, which runs the exact
-/// same resolution function as unregister prepare (`realpath` semantics on
-/// the real filesystem). A lexical `..` collapse is NEVER identity:
-/// `/allowed/link/../A` resolves where the symlink actually points, so the
-/// browse RPC (`host.dirs.list`, whose walk collapses `..` lexically) is no
-/// longer used to identify a removal target. A Node refusal (symlink
-/// escape, missing, out-of-policy) returns the error; unregister is not
-/// called and no snapshot is observed.
+/// The snapshot shortcut is strict STRING equality against the stored root
+/// bytes: a real trailing space is a different name, nothing is trimmed, and
+/// component-equivalent spellings (`/root/`, `/root/.`, `//root`) do NOT
+/// match and go through the Node like any other alias. That RPC is the
+/// READ-ONLY `workspace.resolve`, which runs `realpath` semantics on the
+/// real filesystem and returns the matched registry row's STORED root.
+/// A lexical `..` collapse is NEVER identity: `/allowed/link/../A` resolves
+/// where the symlink actually points, so the browse RPC (`host.dirs.list`,
+/// whose walk collapses `..` lexically) is never used to identify a removal
+/// target. A Node refusal (symlink escape, missing, out-of-policy) returns
+/// the error; unregister is not called and no snapshot is observed.
 async fn workspace_identity_for_path(
     state: &AppState,
     host_id: &str,
@@ -591,6 +592,20 @@ async fn mutate(
             mark_rejected(&state.store, &command.command_id, &id, &reason).await?;
             return Err(HubError::BadRequest(reason));
         }
+        Err(error) if method == "workspace.unregister" => {
+            // r7 item 1: a transport failure does not prove the prepare frame
+            // never landed and set the mark. Abort (idempotent) before
+            // returning; an unreachable host is reconciled on reconnect.
+            abort_unregister(
+                state,
+                &id,
+                &node_path,
+                &node_workspace_id,
+                &command.command_id,
+            )
+            .await;
+            return Err(error);
+        }
         result => result?,
     };
     require_phase(&prepared, &command.command_id, "prepared")?;
@@ -616,9 +631,33 @@ async fn mutate(
     let settled = match crate::http::call_node(state, &id, method, commit_params).await {
         Ok(answer) => answer,
         Err(HubError::BadRequest(reason)) if node_unregister_conflict(&reason).is_some() => {
+            // r7 item 1: a commit refusal must release the prepared unbinding
+            // mark on the Node (its own commit refusal already cleared it;
+            // this abort is the explicit, idempotent reconciliation).
+            abort_unregister(
+                state,
+                &id,
+                &node_path,
+                &node_workspace_id,
+                &command.command_id,
+            )
+            .await;
             return Err(HubError::Conflict(reason));
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            // Link drop / timeout / restart: prepare may have landed and set
+            // the mark. Best-effort abort (idempotent); if the host is gone
+            // the reconnect sweep reconciles the command.
+            abort_unregister(
+                state,
+                &id,
+                &node_path,
+                &node_workspace_id,
+                &command.command_id,
+            )
+            .await;
+            return Err(error);
+        }
     };
     require_phase(&settled, &command.command_id, "settled")?;
     // Round 5 item 2: verify the Node settled the SAME workspace identity we
@@ -639,6 +678,14 @@ async fn mutate(
         if settled_id != Some(expected_id.as_str())
             || (settled_root.is_some() && settled_root != Some(expected_root.as_str()))
         {
+            abort_unregister(
+                state,
+                &id,
+                &node_path,
+                &node_workspace_id,
+                &command.command_id,
+            )
+            .await;
             return Err(HubError::Conflict(format!(
                 "unregister settled a different workspace than resolved ({expected_id}@{expected_root})"
             )));
@@ -653,6 +700,87 @@ async fn mutate(
     // drops across every exit path, blocking task creation for the full
     // prepare→settle window.
     Ok(Json(response))
+}
+
+/// Send the idempotent `abort` phase for one prepared unregister command,
+/// clearing the Node's unbinding mark without touching membership (r7
+/// item 1). Best-effort: a refusal here is logged but never masks the
+/// original handler error, and the reconnect sweep is the backstop.
+async fn abort_unregister(
+    state: &AppState,
+    host_id: &str,
+    node_path: &str,
+    node_workspace_id: &Option<String>,
+    command_id: &str,
+) {
+    let mut params = json!({
+        "path": node_path,
+        "commandId": command_id,
+        "phase": "abort",
+    });
+    if let Some(workspace_id) = node_workspace_id {
+        params["workspaceId"] = json!(workspace_id);
+    }
+    match crate::http::call_node(state, host_id, "workspace.unregister", params).await {
+        Ok(_) => {
+            // The Node acked the abort with positive evidence the unbind did
+            // not happen; settle queued OR accepted as rejected.
+            if let Err(error) = state
+                .store
+                .settle_workspace_command_aborted(
+                    command_id.to_owned(),
+                    "workspace unregister aborted before commit".to_owned(),
+                )
+                .await
+            {
+                tracing::warn!(%command_id, %error, "could not record unregister abort");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                %command_id,
+                %error,
+                "unregister abort not delivered; reconnect reconciliation will clear the mark"
+            );
+        }
+    }
+}
+
+/// Reconcile unregister commands left unsettled across a Node (re)connect
+/// (r7 item 1): for every `workspace.unregister` command on this host still
+/// `queued` or `accepted`, send the idempotent abort so the Node drops a
+/// durable unbinding mark a dead previous connection prepared. Called from
+/// the authenticated `node.hello` path.
+pub async fn abort_unsettled_unregisters_on_reconnect(
+    state: &AppState,
+    host_id: &str,
+) -> Result<(), HubError> {
+    let pending = state
+        .store
+        .list_unsettled_workspace_unregisters(host_id)
+        .await?;
+    for command in pending {
+        let node_path = command
+            .payload
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_default();
+        let workspace_id = command
+            .payload
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        abort_unregister(
+            state,
+            host_id,
+            &node_path,
+            &workspace_id,
+            &command.command_id,
+        )
+        .await;
+    }
+    Ok(())
 }
 
 async fn mark_rejected(

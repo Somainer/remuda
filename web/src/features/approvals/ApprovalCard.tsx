@@ -280,14 +280,12 @@ export const DecisionCard = memo(function DecisionCard({
         </p>
       ) : null}
 
-      {/* c-question-alert r2: the compact /m/inbox row only deep-links to the
-          form (去回答), so the QuestionForm/ElicitationCard countdown is
-          absent there. Render the deadline for compact question/elicitation
-          rows directly; the desktop forms and the plan-review branch below
-          already carry their own InteractionDeadline. */}
-      {compact &&
-      (item.kind === "question" || item.kind === "elicitation") &&
-      !answering ? (
+      {/* c-question-alert: only the compact QUESTION row needs its own
+          deadline node — it deep-links with 去回答 and never mounts the form.
+          A compact elicitation row renders <ElicitationCard> above (it is
+          not a compactQuestion), which already carries InteractionDeadline;
+          r2 rendered it twice for that kind. */}
+      {compactQuestion ? (
         <InteractionDeadline interaction={item} testid="m-inbox-deadline" />
       ) : null}
 

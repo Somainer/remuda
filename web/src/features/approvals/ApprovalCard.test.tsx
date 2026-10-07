@@ -315,4 +315,33 @@ describe("DecisionCard unified across desktop and compact", () => {
     expect(desktop.queryByTestId("m-inbox-deadline")).toBeNull();
     expect(desktop.getByTestId("interaction-deadline")).toBeInTheDocument();
   });
+
+  // c-question-alert r3 item 3: a compact ELICITATION row mounts
+  // ElicitationCard (which carries InteractionDeadline); it must not render a
+  // second countdown. Only the compact question deep-link row gets the extra
+  // m-inbox-deadline node.
+  it("renders the countdown exactly once on a compact elicitation row", () => {
+    const elicitation = cnItem({
+      kind: "elicitation",
+      carrier: "harness-hook",
+      request: {
+        kind: "elicitation",
+        title: "Elicit",
+        mode: "form",
+        schemaRef: null,
+        schemaDialect: null,
+        url: null,
+        nativeExtension: null,
+        allowedActions: ["accept"],
+      },
+      deadline: {
+        state: "known",
+        value: new Date(Date.now() + 10 * 60_000).toISOString(),
+      },
+    });
+
+    const compact = renderCard(viewFor(elicitation), "compact");
+    expect(compact.queryByTestId("m-inbox-deadline")).toBeNull();
+    expect(compact.getAllByTestId("interaction-deadline")).toHaveLength(1);
+  });
 });

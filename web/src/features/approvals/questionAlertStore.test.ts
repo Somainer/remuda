@@ -203,6 +203,24 @@ describe("questionAlertWatcher — alerts leave when the interaction does", () =
     expect(blockingAlerts()).toHaveLength(0);
   });
 
+  it("(r3-2) an OUT-OF-ORDER remote answer: a stale pending page flickers back after resolve and never re-toasts", () => {
+    questionAlertWatcher.start();
+    setHub([]);
+    setHub([question("int-race")]);
+    expect(questionAlertWatcher.posted).toHaveLength(1);
+    expect(blockingAlerts()).toHaveLength(1);
+
+    // Resolved elsewhere: dismissed.
+    setHub([{ ...question("int-race"), state: "resolved" as const }]);
+    expect(blockingAlerts()).toHaveLength(0);
+
+    // A stale poll delivers the OLD pending page for the same id. It must not
+    // be treated as a new arrival (the id was observed on the earlier page).
+    setHub([question("int-race")]);
+    expect(questionAlertWatcher.posted, "no second toast").toHaveLength(1);
+    expect(blockingAlerts(), "the manually dismissed notification is not re-posted").toHaveLength(0);
+  });
+
   it("(r2-2) expiry dismisses the standing alert and badge", () => {
     vi.useFakeTimers();
     try {
@@ -217,6 +235,72 @@ describe("questionAlertWatcher — alerts leave when the interaction does", () =
       expect(blockingAlerts()).toHaveLength(0);
       expect(questionAlertWatcher.activeAlerts()).toHaveLength(0);
       expect(document.title).toBe("Remuda");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("questionAlertWatcher — logout/login re-baselines", () => {
+  it("(r3-2) logging out and back in does NOT toast questions already pending on the next login", () => {
+    questionAlertWatcher.start();
+    // First session: a question is already pending at hydration — badge only.
+    setHub([question("int-existing")]);
+    expect(questionAlertWatcher.posted).toHaveLength(0);
+    expect(blockingAlerts()).toHaveLength(0);
+    expect(document.title).toBe("(1) Remuda");
+
+    // Logout: the store clears the list and the hydration flag (as
+    // HubStore.logout does). The watcher forgets the previous session.
+    setHub([], { hydrated: false });
+    expect(document.title).toBe("Remuda");
+    expect(questionAlertWatcher.activeAlerts()).toHaveLength(0);
+
+    // Login again: the next SUCCESSFUL list carries the same question. It is
+    // a fresh baseline, not an arrival — no toast.
+    setHub([question("int-existing")]);
+    expect(questionAlertWatcher.posted).toHaveLength(0);
+    expect(blockingAlerts()).toHaveLength(0);
+    expect(document.title).toBe("(1) Remuda");
+
+    // A genuinely new question after the re-baseline still alerts.
+    setHub([question("int-existing"), question("int-after-login")]);
+    expect(questionAlertWatcher.posted.map((a) => a.interactionId)).toEqual(["int-after-login"]);
+    expect(blockingAlerts()).toHaveLength(1);
+  });
+});
+
+describe("questionAlertWatcher — standing notification countdown updates", () => {
+  it("(r3-1) a countdown tick updates the notification IN PLACE; a dismissed one never returns", () => {
+    vi.useFakeTimers();
+    try {
+      questionAlertWatcher.start();
+      setHub([]);
+      setHub([question("int-ticking", 30_000)]);
+      const before = blockingAlerts();
+      expect(before).toHaveLength(1);
+      const id = before[0]!.id;
+      const reason0 = before[0]!.reason;
+      // The focused jump control is present on the standing entry.
+      expect(notifyStore.getState().blocking[0]?.actions?.some((a) => a.id === "open")).toBe(true);
+
+      // Advance one tick: the countdown changes seconds; the SAME notification
+      // id stays mounted (focused controls survive) rather than being replaced.
+      vi.advanceTimersByTime(1_000);
+      const ticked = blockingAlerts();
+      expect(ticked).toHaveLength(1);
+      expect(ticked[0]!.id).toBe(id);
+      expect(ticked[0]!.reason).not.toBe(reason0);
+
+      // The owner dismisses it explicitly.
+      notifyStore.dismiss(id);
+      expect(blockingAlerts()).toHaveLength(0);
+
+      // Further ticks must NOT resurrect it (the old code re-posted on the
+      // next countdownChanged).
+      vi.advanceTimersByTime(5_000);
+      expect(blockingAlerts(), "a dismissed alert must not be re-posted").toHaveLength(0);
+      expect(questionAlertWatcher.posted, "still only the original arrival").toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }

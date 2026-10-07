@@ -93,14 +93,7 @@ export class QuestionAlertWatcher {
 
   /** Reset all state (tests). Also clears standing notifications it posted. */
   reset(): void {
-    this.dismissAllNotifications();
-    this.seen.clear();
-    this.previousPending.clear();
-    this.active = [];
-    this.hydrated = false;
-    this.posted = [];
-    this.clearTitleTimer();
-    this.restoreTitle();
+    this.dehydrate();
   }
 
   /** Currently-active unanswered question alerts (for the title badge). */
@@ -149,21 +142,23 @@ export class QuestionAlertWatcher {
     const state = hubStore.getSnapshot();
     const now = this.clockNow(at);
 
-    // Record EVERY observed question id on every pass — including questions
-    // that are not alertable right now (the owner is viewing the session or
-    // answering on this device). Leaving the session / finishing the answer
-    // must not toast a question the owner already had in front of them.
+    // No SUCCESSFUL interaction list since (re)login — logout, or a bootstrap
+    // whose first fetch failed. Forget the previous session's watcher state:
+    // drop the badge and standing alerts, and make the NEXT successful list a
+    // fresh baseline, so logging in again never toasts questions that were
+    // already pending. Return BEFORE recording the empty page as "seen".
+    if (!state.interactionsHydrated) {
+      this.dehydrate();
+      return;
+    }
+
+    // The pending questions THIS page observes.
     const pending = this.currentPendingIds(state);
-    for (const id of pending) this.seen.add(id);
 
     // Baseline only after a SUCCESSFUL interaction-list hydration. A failed
-    // first fetch emits ready with an empty list; baselining then would make
-    // the next successful poll toast every question already pending.
+    // first fetch emits ready with an empty list; the dehydration guard above
+    // handles that, so reaching here means the page is trustworthy.
     if (!this.hydrated) {
-      if (!state.interactionsHydrated) {
-        this.previousPending = pending;
-        return;
-      }
       this.hydrated = true;
       for (const id of pending) this.seen.add(id);
       this.previousPending = pending;
@@ -178,28 +173,26 @@ export class QuestionAlertWatcher {
     const alerts = this.alertsFromState(state, now);
     const alertIds = new Set(alerts.map((alert) => alert.interactionId));
 
+    // Arrival is decided against the ids known BEFORE this page is recorded:
+    // the current pass then marks every observed id (alertable or not). An
+    // out-of-order remote answer that makes a stale page flicker an id back
+    // to pending can therefore never re-toast.
     for (const alert of alerts) {
       const countdown = formatQuestionCountdown(alert.deadline, now);
-      // Toast exactly on arrival into the ALERTABLE set: absent from the
-      // previous pending page (a genuinely new question) — seen-but-viewed or
-      // seen-but-answering ids were recorded on earlier passes and never
-      // toast when they become alertable.
-      const isNew =
-        !this.previousPending.has(alert.interactionId) && !this.notifyIds.has(alert.interactionId);
-      // Keep the deadline line ticking on an already-standing notification:
-      // the same-key replace swaps its text without stacking, and stops
-      // re-posting once there is nothing left to count down.
-      const countdownChanged =
-        this.notifyIds.has(alert.interactionId) &&
-        this.notifyCountdowns.get(alert.interactionId) !== countdown;
-      if (isNew) {
-        this.seen.add(alert.interactionId);
+      const knownNotification = this.notifyIds.get(alert.interactionId);
+      const alreadyObserved = this.seen.has(alert.interactionId) || Boolean(knownNotification);
+      if (!alreadyObserved) {
         this.posted.push(alert);
-      }
-      if (isNew || countdownChanged) {
         this.postToast(alert, countdown);
+      } else if (knownNotification) {
+        this.refreshStandingToast(alert, knownNotification, countdown);
       }
     }
+    // Record EVERY observed question id on every pass — including questions
+    // that are not alertable right now (the owner is viewing the session or
+    // answering on this device). Leaving the session / finishing the answer
+    // must not toast a question the owner already had in front of them.
+    for (const id of pending) this.seen.add(id);
 
     this.active = alerts;
     // Dismiss standing alerts whose interaction is no longer active
@@ -207,6 +200,18 @@ export class QuestionAlertWatcher {
     this.syncNotifications(alertIds);
     this.previousPending = pending;
     this.syncTitle();
+  }
+
+  /** Forget every previous session's alert (logout / pre-hydration window). */
+  private dehydrate(): void {
+    this.hydrated = false;
+    this.seen.clear();
+    this.previousPending.clear();
+    this.active = [];
+    this.posted = [];
+    this.dismissAllNotifications();
+    this.clearTitleTimer();
+    this.restoreTitle();
   }
 
   private alertsFromState(
@@ -258,6 +263,27 @@ export class QuestionAlertWatcher {
     });
     this.notifyIds.set(alert.interactionId, id);
     this.notifyCountdowns.set(alert.interactionId, countdown);
+  }
+
+  /**
+   * Tick the countdown on a STANDING notification in place (same id, new
+   * reason), keeping the entry — and its focused controls — mounted. If the
+   * notification is no longer in the store the owner dismissed it: drop our
+   * tracking and never re-post (it was not a new arrival).
+   */
+  private refreshStandingToast(
+    alert: QuestionAlert,
+    notificationId: string,
+    countdown: string | null,
+  ): void {
+    if (this.notifyCountdowns.get(alert.interactionId) === countdown) return;
+    const live = notifyStore.update(notificationId, { reason: countdown ?? undefined });
+    if (live) {
+      this.notifyCountdowns.set(alert.interactionId, countdown);
+    } else {
+      this.notifyIds.delete(alert.interactionId);
+      this.notifyCountdowns.delete(alert.interactionId);
+    }
   }
 
   /**

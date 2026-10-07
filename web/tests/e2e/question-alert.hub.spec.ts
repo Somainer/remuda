@@ -169,21 +169,29 @@ test.describe("question alerts", () => {
     await expect(inboxDeadline).toBeVisible();
     await expect(inboxDeadline).toContainText(/还剩 \d+ (分钟|秒)，超时将自动拒绝/);
 
-    // Open the session: viewing suppresses the alert; the form countdown is
-    // present in the session view.
-    await row.getByTestId("m-inbox-answer").click();
+    // r3 item 4: expiry is asserted WHILE the standing alert is still
+    // showing on the inbox surface — not after navigating away. Fast-forward
+    // past the ~60 s deadline with the toast visible: the alert is dismissed
+    // in place, the inbox countdown disappears, and the title restores.
+    await page.clock.fastForward(90_000);
+    await expect(inboxDeadline).toHaveCount(0);
+    await expect(
+      page.getByTestId("blocking-error").filter({ hasText: "有问题需要你回答" }),
+    ).toHaveCount(0);
+    await expect(page).toHaveTitle("Remuda");
+
+    // The clear state survives the jump into the session (SPA nav, no reload:
+    // the expired row itself has unmounted from the inbox). Opening the
+    // expired question's session never brings the standing alert back, and
+    // the expired card renders no live countdown there either.
+    await page.evaluate((path) => {
+      window.history.pushState({}, "", path);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    }, `/s/${instanceId}/structured`);
     await page.waitForURL(/\/s\//);
     const form = page.getByTestId("question-form").first();
     await expect(form).toBeVisible({ timeout: 15_000 });
-    const deadlineEl = page.getByTestId("interaction-deadline").first();
-    await expect(deadlineEl).toBeVisible();
-    await expect(deadlineEl).toContainText(/还剩 \d+ (分钟|秒)，超时将自动拒绝/);
-
-    // Fast-forward past the ~60 s deadline with no further Hub update: the
-    // card expires, the standing alert is dismissed, and the title badge
-    // clears (r2-2/r2-4).
-    await page.clock.fastForward(90_000);
-    await expect(deadlineEl).toHaveCount(0);
+    await expect(page.getByTestId("interaction-deadline")).toHaveCount(0);
     await expect(
       page.getByTestId("blocking-error").filter({ hasText: "有问题需要你回答" }),
     ).toHaveCount(0);
@@ -213,21 +221,22 @@ test.describe("question alerts", () => {
     await waitForQuestion(page, instanceId);
     await expectStandingAlert(page);
 
-    // Open the session (full nav is fine now — the alert was already posted):
-    // the form and a live countdown are present.
+    // r3 item 4: expire the question while the standing alert is still
+    // showing on /sessions — the toast clears in place and the title restores,
+    // before any navigation.
+    await page.clock.fastForward(90_000);
+    await expect(
+      page.getByTestId("blocking-error").filter({ hasText: "有问题需要你回答" }),
+    ).toHaveCount(0);
+    await expect(page).toHaveTitle("Remuda");
+
+    // The clear state survives the jump into the expired session (full nav is
+    // fine here — the alert had already been posted and dismissed): no alert
+    // returns, and the expired card renders no live countdown.
     await page.goto(`/s/${instanceId}/structured`);
     const form = page.getByTestId("question-form").first();
     await expect(form).toBeVisible({ timeout: 15_000 });
-    const deadlineEl = page.getByTestId("interaction-deadline").first();
-    await expect(deadlineEl).toBeVisible();
-    expect(((await deadlineEl.textContent()) ?? "")).toMatch(
-      /还剩 \d+ (分钟|秒)，超时将自动拒绝/,
-    );
-
-    // Fast-forward past the deadline (no wall sleep): the countdown
-    // disappears as the card expires and the standing alert/badge clear.
-    await page.clock.fastForward(90_000);
-    await expect(deadlineEl).toHaveCount(0);
+    await expect(page.getByTestId("interaction-deadline")).toHaveCount(0);
     await expect(
       page.getByTestId("blocking-error").filter({ hasText: "有问题需要你回答" }),
     ).toHaveCount(0);

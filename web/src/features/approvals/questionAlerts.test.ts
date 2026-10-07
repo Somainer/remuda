@@ -170,7 +170,7 @@ describe("selectQuestionAlerts", () => {
         state: "known",
         value: {
           commandId: "cmd-1",
-          actor: { kind: "device", deviceId: "d1", instanceId: null },
+          actor: { principalId: "d1", type: "human", deviceId: "d1", instanceId: null },
           value: { kind: "question", answers: {} },
           committedAt: new Date(NOW).toISOString(),
         },

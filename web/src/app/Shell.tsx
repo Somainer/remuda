@@ -38,7 +38,6 @@ import { useWorkbenchKeys } from "./useWorkbenchKeys";
 import { AnnotationProvider } from "../features/tasks/AnnotationPanel";
 import { AnnotationCapture } from "../features/session/AnnotationCapture";
 import { CommitProbe } from "../components/CommitProbe";
-import { QuestionAlertHost } from "../features/approvals/QuestionAlertHost";
 import ui from "../styles/ui.module.css";
 import css from "./Shell.module.css";
 import notifyCss from "./shellNotify.module.css";
@@ -537,7 +536,6 @@ export function Shell() {
           input/key bars (tty). Back-to-list is the header back link. */}
       {chrome.phoneNav ? <PhoneNav pending={pending} newHref={newHref} /> : null}
       {!mobile && !quickFindOwned ? <QuickFind /> : null}
-      <QuestionAlertHost />
       <ShellNotify />
       <AnnotationCapture />
     </div>

@@ -274,4 +274,45 @@ describe("DecisionCard unified across desktop and compact", () => {
     const go = compact.getByRole("link", { name: "去回答" });
     expect(go).toHaveAttribute("href", "/s/ins_1");
   });
+
+  // c-question-alert r2 item 6: the compact row never mounts QuestionForm, so
+  // the countdown must be rendered by the row itself.
+  it("renders the deadline countdown for compact question/elicitation rows", () => {
+    const withDeadline = cnItem({
+      kind: "question",
+      carrier: "harness-hook",
+      request: {
+        kind: "question",
+        title: "AskUserQuestion",
+        fields: [
+          {
+            id: "q0",
+            title: "下一步",
+            description: "下一步",
+            input: "single-select",
+            required: true,
+            options: [{ id: "a", label: "A" }],
+            allowFreeText: false,
+            sensitive: false,
+          },
+        ],
+      },
+      deadline: {
+        state: "known",
+        value: new Date(Date.now() + 10 * 60_000).toISOString(),
+      },
+    });
+
+    const compact = renderCard(viewFor(withDeadline), "compact");
+    expect(compact.getByTestId("m-inbox-deadline")).toBeInTheDocument();
+    expect(compact.getByTestId("m-inbox-deadline")).toHaveTextContent(
+      /还剩 \d+ 分钟，超时将自动拒绝/,
+    );
+    compact.unmount();
+
+    // Desktop renders the form instead; no separate compact deadline node.
+    const desktop = renderCard(viewFor(withDeadline), "desktop");
+    expect(desktop.queryByTestId("m-inbox-deadline")).toBeNull();
+    expect(desktop.getByTestId("interaction-deadline")).toBeInTheDocument();
+  });
 });

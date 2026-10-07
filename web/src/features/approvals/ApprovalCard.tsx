@@ -280,6 +280,17 @@ export const DecisionCard = memo(function DecisionCard({
         </p>
       ) : null}
 
+      {/* c-question-alert r2: the compact /m/inbox row only deep-links to the
+          form (去回答), so the QuestionForm/ElicitationCard countdown is
+          absent there. Render the deadline for compact question/elicitation
+          rows directly; the desktop forms and the plan-review branch below
+          already carry their own InteractionDeadline. */}
+      {compact &&
+      (item.kind === "question" || item.kind === "elicitation") &&
+      !answering ? (
+        <InteractionDeadline interaction={item} testid="m-inbox-deadline" />
+      ) : null}
+
       {review ? <InteractionDeadline interaction={item} /> : null}
 
       {!compactQuestion && !answering && review && review.allowFeedback ? (

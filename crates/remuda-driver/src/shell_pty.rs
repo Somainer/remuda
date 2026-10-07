@@ -1097,14 +1097,16 @@ impl ShellPtyDriver {
                 Target::Agent {
                     resume: Some(session_id),
                     ..
-                } => Some(match crate::claude_transcript::ResumeBoundary::for_resume(
-                    &config_dir,
-                    &launch_cwd,
-                    session_id,
-                ) {
-                    Some(boundary) => crate::claude_transcript::ResumeMode::Boundary(boundary),
-                    None => crate::claude_transcript::ResumeMode::Unverified,
-                }),
+                } => Some(
+                    match crate::claude_transcript::ResumeBoundary::for_resume(
+                        &config_dir,
+                        &launch_cwd,
+                        session_id,
+                    ) {
+                        Some(boundary) => crate::claude_transcript::ResumeMode::Boundary(boundary),
+                        None => crate::claude_transcript::ResumeMode::Unverified,
+                    },
+                ),
                 _ => None,
             };
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
@@ -1391,6 +1393,17 @@ impl ShellPtyDriver {
                 }
                 self.events_tx.lock().await.take();
                 self.interrupt_pid.store(0, Ordering::SeqCst);
+                // Item 8: release the hook server/socket and anything parked
+                // on it, and drop the transcript claim — exactly what close()
+                // does. Without this the per-instance socket stayed bound
+                // (retire_parked held its agents' turns and the socket file
+                // remained), so the retry after this failed launch could not
+                // bind and inherited a stale epoch.
+                if let Some(hooks) = self.hooks.lock().await.as_ref() {
+                    hooks.retire_parked();
+                }
+                self.hooks.lock().await.take();
+                self.bindings.demobilize();
                 *self.inner.lock().await = None;
                 return Err(error);
             }
@@ -4678,6 +4691,49 @@ mod tests {
         assert!(
             !lifecycle::group_alive(pgid),
             "close reaps the relaunched child"
+        );
+    }
+
+    /// Item 8: a post-spawn adapter-setup failure with hooks ON must release
+    /// the hook server/socket, retire parked hooks, and drop the transcript
+    /// claim — otherwise the retry cannot bind the per-instance socket. The
+    /// retry through the REAL spawn path reuses the same instance dir.
+    #[tokio::test]
+    async fn a_post_spawn_failure_with_hooks_releases_the_socket_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let instance_dir = tmp.path().join("instance");
+        let mut options = ShellPtyOptions::login(tmp.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary: PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        options.fail_after_spawn = true;
+        let mut driver = ShellPtyDriver::new(options);
+        let err = driver.spawn().await.expect_err("injected launch must fail");
+        assert!(matches!(err, DriverError::Io(_)), "got {err:?}");
+
+        assert!(driver.hook_session().await.is_none(), "hooks taken");
+        assert!(
+            !instance_dir.join("hook.sock").exists(),
+            "the failed launch unbound the hook socket"
+        );
+
+        // The same driver retries in the SAME instance dir: the socket must be
+        // free to bind again (before item 8 the stale server held it). The hook
+        // session reports only after the child's first SessionStart, so the
+        // bound socket file is the assertion here.
+        driver.options.fail_after_spawn = false;
+        driver.spawn().await.expect("the retry launches");
+        assert!(
+            instance_dir.join("hook.sock").exists(),
+            "the retry rebound the hook socket"
+        );
+        driver.close().await.expect("clean close");
+        assert!(
+            !instance_dir.join("hook.sock").exists(),
+            "close unbind after the retry"
         );
     }
 

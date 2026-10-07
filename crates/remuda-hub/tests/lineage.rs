@@ -42,6 +42,52 @@ fn exited() -> Value {
     })
 }
 
+/// The REAL print/SDK process-exit event the driver's `emit_exit` produces:
+/// topic=session, nativeName=session, status=exited, severity INFO (the
+/// ma-lineage r4 item 2 SDK/print shape — a clean exit, never a failure).
+fn sdk_session_exited(observed_at: &str) -> Value {
+    json!({
+        "kind": "lifecycle",
+        "observedAt": observed_at,
+        "payload": {
+            "type": "native",
+            "topic": "session",
+            "nativeName": "session",
+            "severity": "info",
+            "affectsCompletion": false,
+            "status": { "state": "known", "value": "exited" },
+            "relatedIds": {}
+        }
+    })
+}
+
+/// The REAL shell/generic PTY process-exit event (shell_pty NATIVE_EXIT):
+/// nativeName=native_exit. A zero exit / INFO severity is a clean EXIT;
+/// `exit_code=1` makes it a failure.
+fn pty_native_exit(observed_at: &str, exit_code: u16) -> Value {
+    let (status, severity) = if exit_code == 0 {
+        ("exited", "info")
+    } else {
+        ("failed", "error")
+    };
+    json!({
+        "kind": "lifecycle",
+        "observedAt": observed_at,
+        "payload": {
+            "type": "native",
+            "topic": "session",
+            "nativeName": "native_exit",
+            "severity": severity,
+            "affectsCompletion": false,
+            "status": { "state": "known", "value": status },
+            "relatedIds": {
+                "exitCode": exit_code.to_string(),
+                "reason": format!("native-exit-code-{exit_code}")
+            }
+        }
+    })
+}
+
 struct FakeNode {
     frames: tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
     appends: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
@@ -1148,27 +1194,62 @@ async fn a_failed_turn_sets_no_ended_at_until_the_real_process_exit() -> Result<
     );
 
     // The real process exits later: only now is endedAt set.
-    // The real print/SDK exit shape (topic=session, nativeName=session,
-    // status exited) — not a synthetic entity event.
-    node.appends.send((
-        x.clone(),
-        json!({
-            "kind": "lifecycle",
-            "observedAt": "2026-10-06T02:00:00.000Z",
-            "payload": {
-                "type": "native", "topic": "session", "nativeName": "session",
-                "severity": "info", "affectsCompletion": false,
-                "status": { "state": "known", "value": "exited" },
-                "relatedIds": {}
-            }
-        }),
-    ))?;
+    // The REAL print/SDK exit shape via the shared helper.
+    node.appends.send((x.clone(), sdk_session_exited("2026-10-06T02:00:00.000Z")))?;
     ctx.wait_until(&x, |v| v["lifecycle"] == json!("exited"))
         .await?;
     assert_eq!(
         first_chapter_ended_at(&ctx, &x).await?,
         Some(json!("2026-10-06T02:00:00.000Z")),
         "endedAt comes from the real SDK/print exit, not the turn error"
+    );
+    Ok(())
+}
+
+/// ma-lineage r4 item 2: a clean PTY exit (native_exit / status exited /
+/// severity info) is lifecycle EXITED — not failed — and stamps endedAt; a
+/// non-zero exit is failed. Both come from the shared classifier's REAL
+/// driver shapes.
+#[tokio::test]
+async fn real_native_exit_shapes_classify_and_stamp_ended_at() -> Result<()> {
+    // Clean PTY exit → exited.
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+    node.appends.send((
+        x.clone(),
+        pty_native_exit("2026-10-06T03:00:00.000Z", 0),
+    ))?;
+    let view = ctx
+        .wait_until(&x, |v| v["lifecycle"] == json!("exited"))
+        .await?;
+    assert_eq!(
+        view["lifecycle"],
+        json!("exited"),
+        "a clean native_exit (info) is exited, not failed"
+    );
+    assert_eq!(
+        first_chapter_ended_at(&ctx, &x).await?,
+        Some(json!("2026-10-06T03:00:00.000Z"))
+    );
+
+    // Non-zero PTY exit → failed.
+    let ctx2 = Ctx::boot().await?;
+    let mut node2 = FakeNode::connect(&ctx2.hub, &ctx2.host).await?;
+    let (z, _token2) = ctx2.seat(&mut node2, None).await?;
+    ctx2.report_session(&node2, &z, false).await?;
+    node2.appends.send((
+        z.clone(),
+        pty_native_exit("2026-10-06T03:30:00.000Z", 1),
+    ))?;
+    let view2 = ctx2
+        .wait_until(&z, |v| v["lifecycle"] == json!("failed"))
+        .await?;
+    assert_eq!(view2["lifecycle"], json!("failed"), "exit 1 is a failed end");
+    assert_eq!(
+        first_chapter_ended_at(&ctx2, &z).await?,
+        Some(json!("2026-10-06T03:30:00.000Z"))
     );
     Ok(())
 }

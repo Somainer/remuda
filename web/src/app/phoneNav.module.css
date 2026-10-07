@@ -67,7 +67,8 @@
 .scrim {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  /* The PhoneNav 更多 action sheet rides the sheet tier (r3 item 1 audit). */
+  z-index: var(--z-sheet);
   display: flex;
   flex-direction: column;
   justify-content: flex-end;

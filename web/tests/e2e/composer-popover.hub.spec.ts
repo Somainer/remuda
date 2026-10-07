@@ -253,6 +253,78 @@ test.describe("stacked mobile usage sheet closes with its parent (RC4)", () => {
 });
 
 
+test.describe("overlay z tiers keep the annotation dock under real scrims (r3 item 1)", () => {
+  test("390: with the options sheet open, a hit over ＋加批注 lands on the sheet, not the dock", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await createSession(page, "composer popover dock under sheet");
+    const add = page.getByTestId("annotation-add");
+    await expect(add).toBeVisible();
+    const box = (await add.boundingBox())!;
+    const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+
+    await optionsTrigger(page).click();
+    await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+
+    // The round-2 regression: the dock (z 50) painted above the literal-40
+    // sheet scrim, so this tap opened the annotation panel UNDER the sheet.
+    const hit = await page.evaluate((p) => {
+      const el = document.elementFromPoint(p.x, p.y);
+      return {
+        dock: el?.closest("[data-testid='annotation-add']") != null,
+        sheet: el?.closest("[data-variant='sheet']") != null,
+        tag: (el as HTMLElement | null)?.dataset.testid ?? el?.tagName ?? "",
+      };
+    }, point);
+    expect(hit.dock, `hit resolved to the annotation dock (${hit.tag})`).toBe(false);
+    expect(hit.sheet).toBe(true);
+    if (process.env.REMUDA_EVIDENCE === "1") {
+      await page.screenshot({ path: "test-results/composerpop-r3-dock-under-sheet-390.png", animations: "disabled" });
+    }
+
+    // A real tap at that point must NOT open the annotation panel.
+    await page.mouse.click(point.x, point.y);
+    await expect(page.getByTestId("annotation-panel")).toHaveCount(0);
+  });
+
+  test("390: the stacked usage card paints strictly above the options sheet", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await createSession(page, "composer popover stacked tier");
+    await injectRollup(page);
+    await optionsTrigger(page).click();
+    await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+    await page.getByTestId("context-chip").click();
+    const usage = page.getByTestId("context-usage-popover");
+    await expect(usage).toHaveAttribute("data-mobile", "1");
+
+    // Numeric tier guarantee: 61 (--z-sheet-stacked) over 60 (--z-sheet).
+    // Equal values used to let the later-sibling options sheet cover the card.
+    const tiers = await page.evaluate(() => {
+      const z = (sel: string) => {
+        const el = document.querySelector<HTMLElement>(sel);
+        return el ? parseInt(getComputedStyle(el).zIndex || "0", 10) : NaN;
+      };
+      return {
+        usage: z("[data-testid='context-usage-popover']"),
+        scrim: z("[data-variant='sheet']"),
+      };
+    });
+    expect(tiers.usage).toBeGreaterThan(tiers.scrim);
+
+    // And the geometry guarantee: a hit at the stacked card's own center
+    // reaches the card, not the options sheet behind it.
+    const box = (await usage.boundingBox())!;
+    const hitIsUsage = await page.evaluate((p) => {
+      const el = document.elementFromPoint(p.x, p.y);
+      return el?.closest("[data-testid='context-usage-popover']") != null;
+    }, { x: box.x + box.width / 2, y: box.y + box.height / 2 });
+    expect(hitIsUsage).toBe(true);
+    if (process.env.REMUDA_EVIDENCE === "1") {
+      await page.screenshot({ path: "test-results/composerpop-r3-stacked-usage-390.png", animations: "disabled" });
+    }
+  });
+});
+
+
 test.describe("notification stack clears the phone home bar at 390 (r2 item 2)", () => {
   test("a blocking notice never covers the bottom PhoneNav buttons on a home route", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
@@ -419,6 +491,10 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     if (hit.ok) {
       await page.mouse.click(hit.x!, hit.y!);
       await expect(sliderPanel).toBeVisible();
+    }
+    if (process.env.REMUDA_EVIDENCE === "1") {
+      // 1440 desktop evidence paired with the 390 shots in the r3 item-1 suite.
+      await page.screenshot({ path: "test-results/composerpop-r3-menu-above-notify-1440.png", animations: "disabled" });
     }
     await clear(page);
   });

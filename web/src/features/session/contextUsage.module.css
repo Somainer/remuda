@@ -172,6 +172,9 @@
   max-width: none;
   border-radius: var(--radius) var(--radius) 0 0;
   box-shadow: 0 -8px 24px var(--scrim);
-  z-index: var(--z-sheet);
+  /* Stacked strictly ABOVE the options-sheet scrim: this card is a previous
+     DOM sibling of the options sheet, so an equal --z-sheet value would let
+     the later sheet cover it (r3 item 1). */
+  z-index: var(--z-sheet-stacked);
 }
 

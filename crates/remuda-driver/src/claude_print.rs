@@ -4462,3 +4462,126 @@ mod plan_review_mint_tests {
         assert!(remuda_driver::interaction::validate_answer(&review, &approval_answer).is_err());
     }
 }
+
+/// c-cardsettle r6 item 1: the PRODUCTION mapper's startup frames must never
+/// classify as a process end. The real captured `system/init` frame maps to
+/// `topic=session, nativeName=session, status=started, severity=info` — the
+/// same name the later `emit_exit("exited")` uses — so the classifier must
+/// distinguish them by the exact status rather than the name + a severity
+/// fallback (which ended every live session at startup).
+#[cfg(test)]
+mod process_end_startup_tests {
+    use super::*;
+    use remuda_protocol::process_end::{
+        ProcessEndKind, entity_process_end, process_end, process_end_event,
+        process_end_observation, process_end_value,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn the_real_init_frame_does_not_end_the_session() {
+        let raw = include_str!("../../remuda-testing/fixtures/claude/claude-p-init.json");
+        let init: Value = serde_json::from_str(raw).expect("real captured system/init");
+        let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "before-session-id");
+        let observations = mapper.map(init).expect("real init maps");
+
+        // The mapper adopted the init's session id and emitted exactly one
+        // session lifecycle carrying status "started".
+        let init_native = observations
+            .iter()
+            .find_map(|observation| match &observation.body {
+                ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
+                    LifecyclePayload::Native(native)
+                        if native.topic == LifecycleTopic::Session
+                            && native.native_name == "session" =>
+                    {
+                        Some(native)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("map_init emits the session lifecycle");
+        assert!(
+            matches!(&init_native.status, Knowledge::Known { value } if value == "started"),
+            "the real init status is {init_native:?}"
+        );
+        assert_eq!(init_native.severity, Severity::Info);
+
+        // Every classifier entry point refuses to end on it.
+        assert_eq!(process_end(init_native), None);
+        assert_eq!(process_end_value(&json!(init_native)), None);
+        let init_observation = observations
+            .iter()
+            .find(|observation| {
+                matches!(
+                    &observation.body,
+                    ObservationPayload::Lifecycle(payload)
+                        if matches!(payload.as_ref(), LifecyclePayload::Native(native)
+                            if native.topic == LifecycleTopic::Session)
+                )
+            })
+            .expect("observation");
+        assert_eq!(process_end_observation(init_observation), None);
+
+        // The PTY ready frames (claude_pty.rs / generic_pty.rs emit
+        // name=session with the herdr agent-status string) are live frames too.
+        for status in ["idle", "working", "blocked", "done", "unknown"] {
+            let ready = NativeLifecycle {
+                topic: LifecycleTopic::Session,
+                native_name: "session".to_owned(),
+                native_id: Knowledge::Known {
+                    value: "pane-1".into(),
+                },
+                status: Knowledge::Known {
+                    value: status.into(),
+                },
+                related_ids: std::collections::BTreeMap::new(),
+                data_ref: None,
+                severity: Severity::Info,
+                affects_completion: false,
+            };
+            assert_eq!(process_end(&ready), None, "{status} ready is not an end");
+        }
+        // Entity ready/unknown are equally not process end.
+        assert_eq!(entity_process_end(Some("instance"), Some("ready")), None);
+        assert_eq!(entity_process_end(Some("instance"), None), None);
+
+        // Sanity: the REAL later ends still classify through the same path —
+        // print emit_exit("exited") and a non-zero shell native_exit.
+        let print_exit = NativeLifecycle {
+            topic: LifecycleTopic::Session,
+            native_name: "session".to_owned(),
+            native_id: Knowledge::Known {
+                value: "sess".into(),
+            },
+            status: Knowledge::Known {
+                value: "exited".into(),
+            },
+            related_ids: std::collections::BTreeMap::new(),
+            data_ref: None,
+            severity: Severity::Info,
+            affects_completion: false,
+        };
+        assert_eq!(
+            process_end(&print_exit).map(|end| end.kind),
+            Some(ProcessEndKind::Exited)
+        );
+        let shell_failed = json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-10-07T10:00:00.000Z",
+            "payload": {
+                "type": "native",
+                "topic": "session",
+                "nativeName": "native_exit",
+                "severity": "error",
+                "status": {"state": "known", "value": "failed"},
+                "relatedIds": {"exitCode": "1"}
+            }
+        });
+        assert_eq!(
+            process_end_event(&shell_failed).map(|end| end.kind),
+            Some(ProcessEndKind::Failed)
+        );
+    }
+}

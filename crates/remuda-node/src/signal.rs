@@ -119,6 +119,18 @@ pub fn file_activity(observation: &Observation) -> Option<remuda_protocol::Activ
     }
 }
 
+/// c-cardsettle r3 item 8 / r4 item 3: a hook/lifecycle observation
+/// attributed to a SUBAGENT (a non-empty relatedIds.agentId) belongs to that
+/// subagent's scope — its start/stop/failure never moves the ROOT session's
+/// turn or activity. `agentType` is OPTIONAL (some producers stamp only the
+/// id). Only root observations (no agentId) drive the main composer.
+pub(crate) fn is_subagent_scoped(native: &NativeLifecycle) -> bool {
+    native
+        .related_ids
+        .get("agentId")
+        .is_some_and(|id| !id.is_empty())
+}
+
 /// The activity a hook observation proves, if it proves one.
 ///
 /// This is the §4.3 priority made real: without it the hook events are
@@ -134,10 +146,15 @@ pub fn file_activity(observation: &Observation) -> Option<remuda_protocol::Activ
 pub fn hook_activity(observation: &Observation) -> Option<remuda_protocol::Activity> {
     use remuda_protocol::Activity;
     let native = hook_lifecycle(observation)?;
+    // r3 item 8 clarification: a subagent's turn never moves the root turn.
+    if is_subagent_scoped(native) {
+        return None;
+    }
     match native.native_name.as_str() {
         "UserPromptSubmit" => Some(Activity::Working),
-        // A turn that ended badly still ended: the composer has to come back,
-        // or the user cannot type again after one failed turn.
+        // A ROOT turn that ended badly still ended: the composer has to come
+        // back, or the user cannot type again after one failed turn.
+        // (Subagent StopFailure is filtered above.)
         "Stop" | "StopFailure" => Some(Activity::Idle),
         // Only a real blocking request is a human turn. A `Notification` is an
         // idle-time advisory (the "waiting for your input" idle prompt fires
@@ -478,6 +495,44 @@ mod tests {
             assert!(!hooks_enabled(Some(value)), "{value}");
         }
         assert!(!hooks_enabled(None), "P1 default must be off");
+    }
+
+    /// r4 item 3: scope is a non-empty agentId ALONE; agentType is optional.
+    #[test]
+    fn subagent_scope_is_agentid_alone() {
+        let mut native = NativeLifecycle {
+            topic: LifecycleTopic::Turn,
+            native_name: "StopFailure".into(),
+            native_id: Knowledge::NotApplicable,
+            status: Knowledge::Known {
+                value: "idle".into(),
+            },
+            related_ids: BTreeMap::new(),
+            data_ref: None,
+            severity: Severity::Warning,
+            affects_completion: false,
+        };
+        assert!(!is_subagent_scoped(&native), "no agentId = root");
+        // agentId + agentType
+        native.related_ids.insert("agentId".into(), "a1".into());
+        native
+            .related_ids
+            .insert("agentType".into(), "workflow-subagent".into());
+        assert!(is_subagent_scoped(&native));
+        // agentType missing
+        native.related_ids.clear();
+        native.related_ids.insert("agentId".into(), "a1".into());
+        assert!(is_subagent_scoped(&native), "agentId alone is subagent");
+        // agentType present but empty
+        native.related_ids.insert("agentType".into(), "".into());
+        assert!(
+            is_subagent_scoped(&native),
+            "empty agentType still subagent"
+        );
+        // empty agentId does not scope
+        native.related_ids.clear();
+        native.related_ids.insert("agentId".into(), "".into());
+        assert!(!is_subagent_scoped(&native), "empty agentId = root");
     }
 
     #[test]

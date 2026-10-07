@@ -39,6 +39,25 @@ use tokio::sync::{broadcast, mpsc};
 /// Cap on remembered tty stream bindings across all hosts.
 const MAX_TTY_STREAMS: usize = 1_024;
 
+/// c-cardsettle: one interaction invalidated because its instance ended.
+/// Carried on the dedicated low-traffic [`AppState::settlement_bus`] (not the
+/// journal bus) so a follower lagging on journal frames cannot miss it.
+#[derive(Clone, Debug)]
+pub struct SettlementNotice {
+    /// Owning instance (used to filter per-instance followers).
+    pub instance_id: String,
+    /// The interaction id that was invalidated.
+    pub interaction_id: String,
+    /// Terminal state ("invalidated").
+    pub state: String,
+    /// Resolution reason ("generation-ended").
+    pub reason: String,
+    /// Durable `updated_at` of the terminal row; followers advance their
+    /// delivery cursor on every notice so a multi-page lag drain skips no row
+    /// (c-cardsettle r6 item 2).
+    pub updated_at: String,
+}
+
 /// Live event for `/v1/follow`.
 #[derive(Clone, Debug)]
 pub struct FollowEvent {
@@ -498,13 +517,14 @@ pub(crate) async fn handle_node_method(
                 .await?;
             crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
             if params["daemon"] == true {
-                state
+                let settlement = state
                     .store
                     .reconcile_daemon_instances(
                         host.host_id.clone(),
                         params["instances"].as_array().cloned().unwrap_or_default(),
                     )
                     .await?;
+                state.broadcast_settlement(&settlement);
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
             let generation = state
@@ -642,6 +662,10 @@ pub(crate) async fn handle_node_method(
                 for appended in appended_chunk {
                     if !appended.replayed {
                         publish_journal(&state.bus, &appended.record);
+                        // c-cardsettle: cards this terminal journal event
+                        // invalidated commit with the append; tell followers
+                        // immediately (a seq-less settlement control frame).
+                        state.broadcast_settlement(&appended.settlement);
                         crate::alerts::observe(state, &appended.record);
                         crate::usage_store::observe_journal(state, &appended.record).await;
                         crate::supply::observe_journal_text(state, &appended.record).await;
@@ -983,7 +1007,7 @@ async fn reconcile_lost_instances(
                 .map(str::to_string)
         })
         .collect();
-    let lost = state
+    let (lost, settlement) = state
         .store
         .reconcile_reported_instances(
             host_id.to_string(),
@@ -991,6 +1015,9 @@ async fn reconcile_lost_instances(
             NODE_EPOCH_CHANGED.to_string(),
         )
         .await?;
+    // c-cardsettle: announce the invalidated cards the same transaction
+    // produced, so an open inbox/session drops them without waiting a poll.
+    state.broadcast_settlement(&settlement);
     for instance_id in lost {
         tracing::warn!(
             %host_id,
@@ -1285,6 +1312,55 @@ enum FollowMsg {
     Binary(Vec<u8>),
 }
 
+/// c-cardsettle r6 item 2: drain a follower's missed settlement notices after
+/// the broadcast ring reports `Lagged`. Pages the AUTHORITATIVE terminal rows
+/// from durable storage in ASCENDING composite-cursor order, one bounded page
+/// at a time, until a short page — so a backlog larger than one page loses no
+/// older row. The cursor advances past EVERY row (sent or filtered out for a
+/// per-instance follower). Notices are sent before the trailing gap frame, so
+/// the client pins all of them before reconciling. A query error or a dead
+/// writer returns Err and the caller closes the follower (never a bare gap).
+async fn drain_settlement_lag(
+    store: &crate::store::Store,
+    instance_ids: &[String],
+    cursor: &mut Option<String>,
+    out_tx: &mpsc::Sender<FollowMsg>,
+) -> Result<(), ()> {
+    loop {
+        let page = store
+            .invalidated_interactions_after(cursor.clone())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "settlement lag recovery query failed; closing follower");
+            })?;
+        let short = page.len() < crate::store::SETTLEMENT_LAG_PAGE as usize;
+        for (sid, iid, reason, updated_at) in page {
+            if instance_ids.is_empty() || instance_ids.iter().any(|id| id == &sid) {
+                let frame = json!({
+                    "type": "settlement",
+                    "instanceId": sid,
+                    "interactionId": iid,
+                    "state": "invalidated",
+                    "reason": reason,
+                })
+                .to_string();
+                out_tx.send(FollowMsg::Text(frame)).await.map_err(|_| ())?;
+            }
+            // Cursor advances past EVERY paged row, sent or filtered.
+            *cursor = Some(crate::store::Store::settlement_max_cursor(
+                cursor.as_deref(),
+                &updated_at,
+                &iid,
+            ));
+        }
+        if short {
+            break;
+        }
+    }
+    let gap = json!({ "type": "gap", "reason": "settlement-backpressure" }).to_string();
+    out_tx.send(FollowMsg::Text(gap)).await.map_err(|_| ())
+}
+
 async fn follow_session(
     state: AppState,
     socket: WebSocket,
@@ -1296,6 +1372,12 @@ async fn follow_session(
     let (out_tx, mut out_rx) = mpsc::channel::<FollowMsg>(cap);
     let (mut sink, mut stream) = socket.split();
     let mut rx = state.bus.subscribe();
+    // c-cardsettle: separate receiver on the dedicated settlement bus.
+    let mut settlement_rx = state.settlement_bus.subscribe();
+    // c-cardsettle r5 item 6: this follower's durable delivery cursor — the
+    // updated_at of the newest settlement row already recovered to it. Lag
+    // pages strictly forward from it, bounded by SETTLEMENT_LAG_PAGE.
+    let mut settlement_cursor: Option<String> = None;
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
     for id in &instance_ids {
         state.followers.watch(device_id.clone(), id.clone()).await;
@@ -1320,6 +1402,29 @@ async fn follow_session(
                 .is_err()
             {
                 return;
+            }
+        }
+        // c-cardsettle r3 item 4: an UNFILTERED follower (the global inbox/
+        // settlement socket) gets the very recent invalidated interactions
+        // replayed on (re)connect, so a browser that misses the one-shot bus
+        // notice across a page-navigation socket churn still drops the card
+        // immediately instead of waiting on its (possibly halted) poll. The
+        // client de-dupes; a fresh load also converges via the durable list.
+        if instance_ids.is_empty()
+            && let Ok(recent) = state.store.recent_invalidated_interactions().await
+        {
+            for (instance_id, interaction_id, reason) in recent {
+                let frame = json!({
+                    "type": "settlement",
+                    "instanceId": instance_id,
+                    "interactionId": interaction_id,
+                    "state": "invalidated",
+                    "reason": reason,
+                })
+                .to_string();
+                if out_tx.send(FollowMsg::Text(frame)).await.is_err() {
+                    return;
+                }
             }
         }
         loop {
@@ -1372,6 +1477,9 @@ async fn follow_session(
                             if !want_tty && event.event["type"] == "tty.mode" {
                                 continue;
                             }
+                            // c-cardsettle settlements arrive on the dedicated
+                            // settlement_bus select arm below; the journal bus
+                            // carries only journal/TTY frames now.
                             let send = if want_tty && let Some(binary) = event.binary {
                                 FollowMsg::Binary(binary)
                             } else if event.binary.is_some() {
@@ -1397,6 +1505,62 @@ async fn follow_session(
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             if resync_after_gap(&state, &out_tx, &instance_ids, want_tty).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                // c-cardsettle: the dedicated settlement notice. Backpressure
+                // here must AWAIT (never try_send/drop): this channel is low
+                // traffic and the notice is the whole reason a poll-stopped
+                // client drops the card. Each follower is an independent task,
+                // so awaiting one slow writer cannot stall another.
+                notice = settlement_rx.recv() => {
+                    match notice {
+                        Ok(notice) => {
+                            let for_this_follower = instance_ids.is_empty()
+                                || instance_ids.iter().any(|id| id == &notice.instance_id);
+                            if for_this_follower {
+                                let frame = json!({
+                                    "type": "settlement",
+                                    "instanceId": notice.instance_id,
+                                    "interactionId": notice.interaction_id,
+                                    "state": notice.state,
+                                    "reason": notice.reason,
+                                }).to_string();
+                                if out_tx
+                                    .send(FollowMsg::Text(frame))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            // r6 item 2: advance the delivery cursor on EVERY
+                            // row the bus passes — including rows filtered out
+                            // for this follower — so a later lag drain never
+                            // re-scans or skips past it.
+                            settlement_cursor = Some(crate::store::Store::settlement_max_cursor(
+                                settlement_cursor.as_deref(),
+                                &notice.updated_at,
+                                &notice.interaction_id,
+                            ));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // c-cardsettle r4 item 6 / r6 item 2: drain every
+                            // missed settlement (bounded ASC pages until a
+                            // short page) BEFORE the gap frame; a query error
+                            // closes the follower.
+                            if drain_settlement_lag(
+                                &state.store,
+                                &instance_ids,
+                                &mut settlement_cursor,
+                                &out_tx,
+                            )
+                            .await
+                            .is_err()
+                            {
                                 return;
                             }
                         }
@@ -1842,6 +2006,206 @@ async fn snapshot_json(state: &AppState, instance_id: &str) -> Result<Value, Hub
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{SETTLEMENT_LAG_PAGE, Store};
+    use rusqlite::params;
+
+    /// Insert `count` invalidated interactions with ascending synthetic
+    /// timestamps, optionally one 2-hours-old lost row and one pending row.
+    async fn seed_backlog(
+        store: &Store,
+        count: u32,
+        with_aged_lost: bool,
+        with_pending: bool,
+    ) -> Vec<String> {
+        store
+            .run_named("r6_seed_settlement_backlog", move |conn| {
+                let mut ids = Vec::new();
+                {
+                    let mut stmt = conn.prepare(
+                        "INSERT INTO interactions
+                            (id, instance_id, host_id, kind, state, blocking,
+                             payload_json, created_at, updated_at)
+                         VALUES (?1, 'ins_lag', 'hst_lag', 'approval', 'invalidated', 0,
+                                 '{}', ?2, ?2)",
+                    )?;
+                    if with_aged_lost {
+                        stmt.execute(params!["int_lag_AGED", "2026-09-01T00:00:00.000Z"])?;
+                    }
+                    for n in 0..count {
+                        let id = format!("int_lag_{n:05}");
+                        // Proper RFC3339 stamps; the backlog stays under 10
+                        // minutes and sorts in seed order.
+                        let stamp = format!("2026-10-07T12:{:02}:{:02}.000Z", n / 60, n % 60);
+                        stmt.execute(params![id, stamp])?;
+                        ids.push(format!("int_lag_{n:05}"));
+                    }
+                }
+                if with_pending {
+                    conn.execute(
+                        "INSERT INTO interactions
+                            (id, instance_id, host_id, kind, state, blocking,
+                             payload_json, created_at, updated_at)
+                         VALUES ('int_lag_PENDING', 'ins_lag', 'hst_lag', 'approval', 'pending', 1,
+                                 '{}', '2026-10-07T13:00:00.000Z', '2026-10-07T13:00:00.000Z')",
+                        [],
+                    )?;
+                }
+                Ok(ids)
+            })
+            .await
+            .expect("seed backlog")
+    }
+
+    /// c-cardsettle r6 item 2: after a broadcast Lagged the recovery drains a
+    /// backlog LARGER than one page ASCENDING — including an hours-old lost
+    /// settlement — sends each notice exactly once BEFORE the single gap
+    /// frame, never includes a pending row, and leaves the cursor past the tail
+    /// so a second drain sends only another gap.
+    #[tokio::test]
+    async fn settlement_lag_drain_walks_every_page_ascending_without_skipping() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = Store::open(dir.path()).expect("store");
+        let expected_rows = SETTLEMENT_LAG_PAGE + 25;
+        seed_backlog(&store, expected_rows, true, true).await;
+
+        // Bounded channel with a concurrently draining receiver: every notice
+        // is observed (the helper awaits a slow writer just like the real
+        // follower pump).
+        let (tx, mut rx) = mpsc::channel::<FollowMsg>(8);
+        let drainer = tokio::spawn(async move {
+            let mut cursor: Option<String> = None;
+            drain_settlement_lag(&store, &[], &mut cursor, &tx)
+                .await
+                .expect("drain");
+            (store, cursor)
+        });
+
+        let mut settlements: Vec<(String, String, String)> = Vec::new();
+        let mut gaps = 0;
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                FollowMsg::Text(text) => {
+                    let frame: Value = serde_json::from_str(&text).expect("json");
+                    match frame["type"].as_str() {
+                        Some("settlement") => settlements.push((
+                            frame["instanceId"].as_str().unwrap().to_owned(),
+                            frame["interactionId"].as_str().unwrap().to_owned(),
+                            frame["reason"].as_str().unwrap().to_owned(),
+                        )),
+                        Some("gap") => gaps += 1,
+                        other => panic!("unexpected frame type {other:?}"),
+                    }
+                }
+                FollowMsg::Binary(_) => panic!("no binary frames"),
+            }
+        }
+        let (_store, cursor) = drainer.await.expect("drain task");
+
+        // Aged lost row + every backlog row, exactly once, no pending row.
+        assert_eq!(
+            settlements.len(),
+            expected_rows as usize + 1,
+            "the whole multi-page backlog and the old lost row drain"
+        );
+        let ids: Vec<&str> = settlements.iter().map(|(_, id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids.first(),
+            Some(&"int_lag_AGED"),
+            "the hours-old lost row drains first"
+        );
+        assert!(
+            !ids.contains(&"int_lag_PENDING"),
+            "pending rows never drain"
+        );
+        // After the aged row the backlog goes out in seed (timestamp) order.
+        let tail: Vec<&str> = ids[1..].to_vec();
+        let mut sorted_tail = tail.clone();
+        sorted_tail.sort_unstable();
+        assert_eq!(
+            tail, sorted_tail,
+            "notices go out oldest-first across pages"
+        );
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "no settlement is sent twice");
+        assert!(
+            settlements
+                .iter()
+                .all(|(_, _, reason)| reason == "generation-ended"),
+            "reason carried on every notice: {settlements:?}"
+        );
+        assert_eq!(gaps, 1, "exactly one gap frame follows the full drain");
+        assert!(cursor.is_some(), "the cursor advanced past the tail");
+    }
+
+    /// r6 item 2: a per-instance follower advances its cursor past rows
+    /// filtered out for it, so those rows are neither sent nor re-scanned on a
+    /// follow-up drain.
+    #[tokio::test]
+    async fn settlement_lag_drain_filters_by_instance_and_advances_past_filtered() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = Store::open(dir.path()).expect("store");
+        store
+            .run_named("r6_seed_two_instances", |conn| {
+                conn.execute(
+                    "INSERT INTO interactions
+                        (id, instance_id, host_id, kind, state, blocking,
+                         payload_json, created_at, updated_at)
+                     VALUES
+                        ('int_OWNED', 'ins_owned', 'hst', 'approval', 'invalidated', 0,
+                         '{}', '2026-10-07T12:00:01.000Z', '2026-10-07T12:00:01.000Z'),
+                        ('int_OTHER', 'ins_other', 'hst', 'approval', 'invalidated', 0,
+                         '{}', '2026-10-07T12:00:02.000Z', '2026-10-07T12:00:02.000Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed");
+        let (tx, mut rx) = mpsc::channel::<FollowMsg>(8);
+        let filter = vec!["ins_owned".to_string()];
+        let mut cursor: Option<String> = None;
+        drain_settlement_lag(&store, &filter, &mut cursor, &tx)
+            .await
+            .expect("drain");
+        drop(tx);
+        let mut ids = Vec::new();
+        let mut gaps = 0;
+        while let Some(FollowMsg::Text(text)) = rx.recv().await {
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            match frame["type"].as_str() {
+                Some("settlement") => ids.push(frame["interactionId"].as_str().unwrap().to_owned()),
+                Some("gap") => gaps += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            ids,
+            vec!["int_OWNED"],
+            "only the owned instance's row is sent"
+        );
+        assert_eq!(gaps, 1);
+        // The cursor is past BOTH rows (the filtered one advanced it): a second
+        // drain finds nothing beyond another gap.
+        let (tx2, mut rx2) = mpsc::channel::<FollowMsg>(8);
+        drain_settlement_lag(&store, &filter, &mut cursor, &tx2)
+            .await
+            .expect("drain 2");
+        drop(tx2);
+        let mut settlements_2 = 0;
+        let mut gaps_2 = 0;
+        while let Some(FollowMsg::Text(text)) = rx2.recv().await {
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["type"] == "settlement" {
+                settlements_2 += 1;
+            } else if frame["type"] == "gap" {
+                gaps_2 += 1;
+            }
+        }
+        assert_eq!(settlements_2, 0, "the filtered row is never re-sent");
+        assert_eq!(gaps_2, 1);
+    }
 
     #[test]
     fn replacement_terminal_stream_retires_stale_mode_source() {

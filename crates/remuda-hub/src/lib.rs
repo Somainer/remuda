@@ -86,6 +86,9 @@ pub use config::{
 };
 pub use error::HubError;
 pub use maintenance::migrate;
+/// Interactions invalidated when an instance generation ends — returned by the
+/// terminal settle methods and broadcast on the follow bus (c-cardsettle).
+pub use store::Settlement;
 pub use transport::{
     CallGate, ConnectedNodes, GatedTransport, NodeTransport, StdioTransport, TransportKind,
     WssTransport,
@@ -101,6 +104,12 @@ pub struct AppState {
     secrets: Arc<FileSecretStore>,
     nodes: ConnectedNodes,
     bus: Bus,
+    /// c-cardsettle: DEDICATED low-traffic bus for settlement control notices.
+    /// These ride separately from the high-volume journal bus so a follower
+    /// lagging on a journal burst during page load cannot permanently miss the
+    /// one-shot "your card was invalidated" notice (settlements are rare and
+    /// tiny, so this channel effectively never lags).
+    settlement_bus: tokio::sync::broadcast::Sender<crate::ws::SettlementNotice>,
     tty: crate::ws::TtyRelay,
     /// D-048 relay stream registry (per-Hub-process).
     api_relay: crate::api_relay::ApiRelay,
@@ -117,6 +126,32 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// c-cardsettle: publish the interactions a terminal write invalidated so
+    /// an open inbox/session following one of those instances drops the card
+    /// immediately instead of waiting for its next poll.
+    ///
+    /// These are Hub-side notices, NOT forged journal entries: each rides the
+    /// follow bus as a seq-less `settlement` control frame
+    /// ([`crate::ws::FollowEvent::settlement`]), so it can never be inserted
+    /// into a journal or make a follower mark its journal stale. A fresh
+    /// follower converges against the durable (already-invalidated) rows
+    /// regardless, so a missed notice is self-healing.
+    pub(crate) fn broadcast_settlement(&self, settlement: &Settlement) {
+        for settled in &settlement.interactions {
+            // Publish on the DEDICATED settlement bus (not the journal bus): a
+            // follower lagging on a journal burst during page load must not
+            // miss the one-shot terminal notice. Recent settlements are also
+            // replayed to unfiltered followers on connect (see follow_session).
+            let _ = self.settlement_bus.send(crate::ws::SettlementNotice {
+                instance_id: settled.instance_id.clone(),
+                interaction_id: settled.interaction_id.clone(),
+                state: "invalidated".to_string(),
+                reason: "generation-ended".to_string(),
+                updated_at: settled.updated_at.clone(),
+            });
+        }
+    }
+
     /// Raw per-chunk cap for D-048 relay streams, from the D-048 protocol
     /// default (`TransportLimits.apiChunkBytes`, 64 KiB).
     pub(crate) fn config_relay_chunk_bytes(&self) -> usize {
@@ -711,6 +746,12 @@ async fn spawn_inner(
         secrets: Arc::new(secrets),
         nodes: crate::transport::ConnectedNodes::default(),
         bus: Bus::with_capacity(config.follow_buffer_events),
+        settlement_bus: {
+            // Settlements are rare control notices; a small capacity is plenty
+            // and keeps a lagging follower from skipping the terminal state.
+            let (tx, _rx) = tokio::sync::broadcast::channel(64);
+            tx
+        },
         tty: crate::ws::TtyRelay::default(),
         api_relay: crate::api_relay::ApiRelay::new(),
         push,
@@ -726,7 +767,8 @@ async fn spawn_inner(
         challenges: passkeys::ChallengeStore::default(),
         gate_ref_swept_at: Arc::new(std::sync::Mutex::new(None)),
     };
-    store.expire_lost_hosts(config.host_lost_grace_ms).await?;
+    let (_, lost_settlement) = store.expire_lost_hosts(config.host_lost_grace_ms).await?;
+    state.broadcast_settlement(&lost_settlement);
     // A Hub restart must not inherit yesterday's unacknowledged creates: they
     // would keep holding placement slots with no Node that can ever settle them.
     expire_stale_requested(&state, config.requested_grace_ms).await;
@@ -760,8 +802,13 @@ async fn spawn_inner(
                     break;
                 }
                 _ = interval.tick() => {
-                    if let Err(err) = reaper_state.store.expire_lost_hosts(config.host_lost_grace_ms).await {
-                        tracing::error!(error = %err, "host-lost sweep failed");
+                    match reaper_state.store.expire_lost_hosts(config.host_lost_grace_ms).await {
+                        Ok((_, settlement)) => {
+                            // c-cardsettle: even the background reaper announces
+                            // the cards it invalidated.
+                            reaper_state.broadcast_settlement(&settlement);
+                        }
+                        Err(err) => tracing::error!(error = %err, "host-lost sweep failed"),
                     }
                     expire_stale_requested(&reaper_state, config.requested_grace_ms).await;
                     crate::gatequeue::tick(&reaper_state).await;
@@ -784,13 +831,14 @@ async fn spawn_inner(
 /// Each expiry gets a Hub-authored journal diagnostic so the row explains
 /// itself, and stops counting toward the host's `maxInstances` ceiling.
 async fn expire_stale_requested(state: &AppState, window_ms: u64) {
-    let expired = match state.store.expire_stale_requested(window_ms).await {
-        Ok(expired) => expired,
+    let (expired, settlement) = match state.store.expire_stale_requested(window_ms).await {
+        Ok(outcome) => outcome,
         Err(error) => {
             tracing::error!(%error, "stale-requested sweep failed");
             return;
         }
     };
+    state.broadcast_settlement(&settlement);
     for (host_id, instance_id) in expired {
         tracing::warn!(
             %host_id,

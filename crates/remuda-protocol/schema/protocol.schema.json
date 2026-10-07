@@ -8217,6 +8217,11 @@
           "const": "timed-out",
           "description": "Wire value `timed-out`.",
           "type": "string"
+        },
+        {
+          "const": "agent-demoted",
+          "description": "Wire value `agent-demoted`.",
+          "type": "string"
         }
       ]
     },

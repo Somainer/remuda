@@ -914,6 +914,73 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
     Ok(())
 }
 
+/// ma-lineage r4 item 3: the journal backfill respects LATER return-to-live
+/// evidence. A terminal row with ended_at NULL whose journal shows an exit
+/// and then a later `ready` is NOT backfilled (the process came back); a row
+/// with no qualifying end event at all also stays NULL.
+#[tokio::test]
+async fn ended_at_backfill_skips_an_end_followed_by_return_to_live() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // Veto case: a row that is exited now, but its journal shows an exit then
+    // a later ready — the process returned to live, so no end is backfilled.
+    ctx.report_session(&node, &x, false).await?;
+    node.appends.send((x.clone(), sdk_session_exited("2026-10-01T08:00:00.000Z")))?;
+    ctx.wait_until(&x, |v| v["lifecycle"] == json!("exited"))
+        .await?;
+    // Unknown case: a second row with no end event at all in its journal.
+    let (z, _token2) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &z, false).await?;
+
+    let data_dir = ctx._dir.path().to_owned();
+    let (human, host) = (ctx.human.clone(), ctx.host.clone());
+    let Ctx {
+        _dir,
+        hub,
+        http: _http,
+        human: _human,
+        host: _host,
+        db_path,
+    } = ctx;
+    hub.shutdown().await;
+    {
+        let db = rusqlite::Connection::open(&db_path)?;
+        // Wipe both ended_at and append a LATER ready to x's journal.
+        db.execute(
+            "UPDATE instances SET ended_at = NULL",
+            rusqlite::params![],
+        )?;
+        db.execute(
+            r#"INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, 9100, 'evt_ready_after_exit',
+              '{"kind":"lifecycle","payload":{"type":"entity","entityType":"instance","state":"ready","reasonCode":"driver-started"}}',
+              '2026-10-01T09:00:00.000Z')"#,
+            rusqlite::params![x],
+        )?;
+        // z carries only session lifecycle frames (started), no end event.
+    }
+    let _hub = spawn(HubConfig::for_test(data_dir.join("data"))).await?;
+    let db = rusqlite::Connection::open(&db_path)?;
+    let ended_x: Option<String> = db.query_row(
+        "SELECT ended_at FROM instances WHERE id = ?1",
+        rusqlite::params![x],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        ended_x, None,
+        "a later return-to-live vetoes the ended_at backfill"
+    );
+    let ended_z: Option<String> = db.query_row(
+        "SELECT ended_at FROM instances WHERE id = ?1",
+        rusqlite::params![z],
+        |row| row.get(0),
+    )?;
+    assert_eq!(ended_z, None, "no qualifying end event leaves ended_at NULL");
+    let _ = (human, host, _dir);
+    Ok(())
+}
+
 // --- 2. Ended chapter + host offline ------------------------------------
 
 #[tokio::test]

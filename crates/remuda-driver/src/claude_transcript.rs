@@ -560,12 +560,93 @@ pub fn stage_for_resume(
     target_cwd: &Path,
     session_id: &str,
 ) -> std::io::Result<StagedResume> {
-    stage_for_resume_with_limits(
+    let target_home_abs = absolutize(target_home);
+    // The configured target home is the trusted root for this entry point; it
+    // is pinned once and every descendant is walked O_NOFOLLOW. Round 7 item 2
+    // hardened the anchor itself: a real home reached through an intermediate
+    // symlink is refused rather than canonicalized through (the only permitted
+    // divergence is a macOS system mount symlink above the root).
+    let dest_home_fd = DirFd::anchor_or_create(&target_home_abs)?;
+    stage_for_resume_into_pinned_home(
         source_transcript,
-        target_home,
+        dest_home_fd,
+        &target_home_abs,
         target_cwd,
         session_id,
         DEFAULT_STAGE_LIMITS,
+    )
+}
+
+/// Stage into a home BELOW a Node-managed base that is pinned once.
+///
+/// Round 7 item 2: production resumes stage into
+/// `<data_dir>/instances/<NEW>/native-home`, and `data_dir` is the configured
+/// trusted root — the instance id is NOT. With the old path anchoring, a
+/// preplanted `instances/<NEW> -> /outside` (a real `/outside/native-home`)
+/// made staging canonicalize the link target and publish outside the managed
+/// base. This entry pins `managed_base` and walks/creates every component of
+/// `home_relative` (normally `instances/<id>/native-home`) from that fd with
+/// `O_NOFOLLOW`, so the symlinked instance dir is refused. The pinned home
+/// descriptor is what flows into staging — trust is never inferred from an
+/// existing descendant.
+pub fn stage_for_resume_managed(
+    source_transcript: &Path,
+    managed_base: &Path,
+    home_relative: &Path,
+    target_cwd: &Path,
+    session_id: &str,
+) -> std::io::Result<StagedResume> {
+    let base_abs = absolutize(managed_base);
+    // The managed base must already exist (the Node created its data dir); a
+    // missing base is NotFound, never created here.
+    let base_fd = DirFd::anchor_existing(&base_abs)?;
+    // The relative tail must be plain components: no absolute prefix, no `.`/`..`.
+    if home_relative.as_os_str().is_empty() || home_relative.is_absolute() {
+        return Err(invalid_input(format!(
+            "managed resume home must be a non-empty relative path, got {}",
+            home_relative.display()
+        )));
+    }
+    if !home_relative
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(invalid_input(format!(
+            "managed resume home {} must contain only plain path components",
+            home_relative.display()
+        )));
+    }
+    let dest_home_fd = base_fd.ensure_subpath(home_relative)?;
+    let dest_home_logical = base_abs.join(home_relative);
+    stage_for_resume_into_pinned_home(
+        source_transcript,
+        dest_home_fd,
+        &dest_home_logical,
+        target_cwd,
+        session_id,
+        DEFAULT_STAGE_LIMITS,
+    )
+}
+
+/// Test-only entry with custom limits: pin the configured home exactly like
+/// [`stage_for_resume`] and run the same inner staging with tighter caps.
+#[cfg(test)]
+fn stage_for_resume_with_limits(
+    source_transcript: &Path,
+    target_home: &Path,
+    target_cwd: &Path,
+    session_id: &str,
+    limits: StageLimits,
+) -> std::io::Result<StagedResume> {
+    let target_home_abs = absolutize(target_home);
+    let dest_home_fd = DirFd::anchor_or_create(&target_home_abs)?;
+    stage_for_resume_into_pinned_home(
+        source_transcript,
+        dest_home_fd,
+        &target_home_abs,
+        target_cwd,
+        session_id,
+        limits,
     )
 }
 
@@ -765,9 +846,10 @@ struct StagingManifest {
     entries: Vec<ManifestEntry>,
 }
 
-fn stage_for_resume_with_limits(
+fn stage_for_resume_into_pinned_home(
     source_transcript: &Path,
-    target_home: &Path,
+    dest_home_fd: DirFd,
+    dest_home_logical: &Path,
     target_cwd: &Path,
     session_id: &str,
     limits: StageLimits,
@@ -823,12 +905,13 @@ fn stage_for_resume_with_limits(
         )));
     }
 
-    // ---- Destination: walk/create `home/projects/<slug>` with every
-    // intermediate opened O_NOFOLLOW|O_DIRECTORY.
+    // ---- Destination: the home descriptor is ALREADY pinned by the caller
+    // (a hardened anchor of the configured home, or the managed base fd walked
+    // O_NOFOLLOW to `instances/<id>/native-home`). Walk/create
+    // `projects/<slug>` below it; trust is never re-inferred from a descendant.
     let resolved_cwd =
         std::fs::canonicalize(target_cwd).unwrap_or_else(|_| target_cwd.to_path_buf());
     let slug = encode_project_dir(&resolved_cwd);
-    let dest_home_fd = DirFd::anchor_or_create(&absolutize(target_home))?;
     let projects_fd = dest_home_fd.ensure_subdir(b"projects")?;
     let dest_dir_fd = projects_fd.ensure_subdir(slug.as_bytes())?;
     // Round 6 item 5: serialise staging per destination project directory.
@@ -839,7 +922,7 @@ fn stage_for_resume_with_limits(
     // while holding it — a free lock also proves a crashed attempt is gone.
     let _stage_lock = dest_dir_fd.lock_exclusive().map_err(std::io::Error::from)?;
     let dest_dir_identity = dest_dir_fd.dir_identity()?;
-    let dest_dir = project_dir(target_home, &resolved_cwd);
+    let dest_dir = project_dir(dest_home_logical, &resolved_cwd);
     let transcript_name = format!("{session_id}.jsonl");
     let transcript_name_bytes = transcript_name.as_bytes().to_vec();
     let dest_transcript = dest_dir.join(&transcript_name);
@@ -4119,6 +4202,117 @@ mod tests {
             std::fs::read_to_string(dest.parent().unwrap().join("memory").join("MEMORY.md"))
                 .unwrap(),
             "project memory\n"
+        );
+    }
+
+    /// Round 7 item 2: the managed base is the Node data dir, and a
+    /// `instances/<NEW>` symlink to an outside tree holding a real
+    /// `native-home/` must not let staging publish outside the managed base.
+    #[cfg(unix)]
+    #[test]
+    fn r7_managed_stage_refuses_a_symlinked_instance_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).expect("data dir");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("workspace");
+        let session = "01993ab0-0000-7000-8000-0000000000e2";
+        let old_home = tmp.path().join("old");
+        let source = transcript_layout(&old_home, &ws, session);
+        write_file(&source, "managed base transcript\n");
+        // `<data>/instances/<NEW> -> <tmp>/outside`, `/outside/native-home`
+        // already a real directory beyond the link.
+        let outside = tmp.path().join("outside");
+        let planted_home = outside.join("native-home");
+        std::fs::create_dir_all(&planted_home).expect("planted outside home");
+        let sentinel = planted_home.join("sentinel.txt");
+        write_file(&sentinel, "OUTSIDE\n");
+        let instances = data.join("instances");
+        std::fs::create_dir_all(&instances).expect("instances dir");
+        let new_id = "ins-r7-item2";
+        std::os::unix::fs::symlink(&outside, instances.join(new_id)).expect("instance dir link");
+        let home_rel = std::path::Path::new("instances")
+            .join(new_id)
+            .join("native-home");
+
+        let error = stage_for_resume_managed(&source, &data, &home_rel, &ws, session)
+            .expect_err("staging through the symlinked instance dir is refused");
+        assert!(
+            error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.to_string().contains("symlink"),
+            "{error}"
+        );
+        assert!(
+            !planted_home.join("projects").exists(),
+            "nothing is staged beyond the link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "OUTSIDE\n",
+            "the outside tree stays byte-identical"
+        );
+    }
+
+    /// Positive companion: under a normal managed base the absent
+    /// `instances/<NEW>/native-home` tail is created link-free and the
+    /// conversation publishes there.
+    #[cfg(unix)]
+    #[test]
+    fn r7_managed_stage_creates_the_home_tail_and_publishes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).expect("data dir");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("workspace");
+        let session = "01993ab0-0000-7000-8000-0000000000e3";
+        let old_home = tmp.path().join("old");
+        let source = transcript_layout(&old_home, &ws, session);
+        write_file(&source, "managed positive\n");
+        let home_rel = std::path::Path::new("instances/ins-r7-item2-ok/native-home");
+        let staged = stage_for_resume_managed(&source, &data, home_rel, &ws, session)
+            .expect("managed staging creates the tail and publishes");
+        assert_eq!(
+            std::fs::read_to_string(&staged.transcript).unwrap(),
+            "managed positive\n"
+        );
+        assert!(
+            data.join("instances/ins-r7-item2-ok/native-home/projects")
+                .is_dir(),
+            "the managed home tail was created"
+        );
+    }
+
+    /// The generic entry keeps the same guarantee for a configured home: a
+    /// real home reached through an intermediate symlink is refused, not
+    /// canonicalized through (the fdsafe anchor hardening).
+    #[cfg(unix)]
+    #[test]
+    fn r7_configured_home_through_an_intermediate_link_is_refused() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("workspace");
+        let session = "01993ab0-0000-7000-8000-0000000000e4";
+        let old_home = tmp.path().join("old");
+        let source = transcript_layout(&old_home, &ws, session);
+        write_file(&source, "intermediate link\n");
+        let outside = tmp.path().join("outside-home");
+        let beyond = outside.join("new");
+        std::fs::create_dir_all(&beyond).expect("real home beyond the link");
+        let sentinel = beyond.join("sentinel.txt");
+        write_file(&sentinel, "OUTSIDE-HOME\n");
+        std::os::unix::fs::symlink(&outside, tmp.path().join("ev")).expect("ev link");
+        let target_home = tmp.path().join("ev/new");
+        let error = stage_for_resume(&source, &target_home, &ws, session)
+            .expect_err("a configured home through an intermediate link is refused");
+        assert!(
+            error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.to_string().contains("symlink"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "OUTSIDE-HOME\n",
+            "the outside tree stays byte-identical"
         );
     }
 }

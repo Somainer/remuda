@@ -47,7 +47,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// What a directory entry is, classified without following links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +426,11 @@ impl DirFd {
         }
         let canonical = std::fs::canonicalize(&root)
             .map_err(|error| FdError::new(root.display().to_string(), errno_kind(error)))?;
+        // Round 7 item 2: the lstat loop above only refuses a symlink as the
+        // FINAL component; a real dir found through an intermediate link
+        // canonicalizes past it. Refuse any divergence a system mount does not
+        // account for.
+        let canonical = require_system_mount_divergence_only(&root, canonical)?;
         let fd = nix::fcntl::openat(
             Some(nix::libc::AT_FDCWD),
             &canonical,
@@ -488,6 +493,13 @@ impl DirFd {
         }
         let canonical = std::fs::canonicalize(&existing)
             .map_err(|error| FdError::new(existing.display().to_string(), errno_kind(error)))?;
+        // Round 7 item 2: a real-directory verdict only lstat()s the FINAL
+        // component — an existing ancestor reached THROUGH an intermediate link
+        // (`<R>/ev -> /outside`, anchoring `<R>/ev/sub`) canonicalizes past the
+        // link. The tail is walked O_NOFOLLOW, but the anchor itself must never
+        // pin the link target. System mount symlinks (macOS /tmp, /var) are the
+        // only permitted divergence.
+        let canonical = require_system_mount_divergence_only(&existing, canonical)?;
         let mut current = Self {
             file: unsafe {
                 own_fd(
@@ -914,6 +926,59 @@ fn errno_kind(error: std::io::Error) -> FdErrorKind {
     }
 }
 
+/// Whether the only difference between a LEXICAL anchor path and its
+/// canonicalised (physical) form is a system mount symlink ABOVE the anchor —
+/// `/tmp → /private/tmp` and `/var → /private/var` on macOS. Such a link is
+/// part of the OS layout, never an entry an adversary controls, so it is the
+/// one class of divergence an anchor is allowed to cross.
+///
+/// Round 7 item 2: without this check `anchor_or_create`/`anchor_existing`
+/// canonicalized a real directory found BELOW an untrusted intermediate link
+/// (`<R>/ev -> /outside`, a real `/outside/sub`): `fstatat(NOFOLLOW)` only
+/// refuses the FINAL component, so the anchor climbed to and pinned
+/// `/outside/sub`. Any other lexical/physical mismatch is a symlink in the
+/// tree the caller asked to pin and is refused.
+fn divergence_is_only_a_system_mount(lexical: &Path, canonical: &Path) -> bool {
+    if lexical == canonical {
+        return true;
+    }
+    /// Strip a prefix and return the remaining tail, component-exact.
+    fn tail_after<'a>(path: &'a Path, prefix: &Path) -> Option<&'a Path> {
+        path.strip_prefix(prefix).ok()
+    }
+    // (lexical prefix, physical counterpart) — macOS mounts /tmp and /var as
+    // symlinks into /private. On Linux both are real, the pairs simply never
+    // match a divergence.
+    const MOUNT_ALIASES: &[(&str, &str)] = &[("/tmp", "/private/tmp"), ("/var", "/private/var")];
+    for &(lex_prefix, can_prefix) in MOUNT_ALIASES {
+        if let (Some(lex_tail), Some(can_tail)) = (
+            tail_after(lexical, Path::new(lex_prefix)),
+            tail_after(canonical, Path::new(can_prefix)),
+        ) && lex_tail == can_tail
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Refuse a canonicalised anchor whose physical path diverges from its lexical
+/// path through anything but a system mount symlink (round 7 item 2). Returns
+/// the canonical path on success.
+fn require_system_mount_divergence_only(
+    lexical: &Path,
+    canonical: PathBuf,
+) -> Result<PathBuf, FdError> {
+    if divergence_is_only_a_system_mount(lexical, &canonical) {
+        Ok(canonical)
+    } else {
+        Err(FdError::new(
+            lexical.display().to_string(),
+            FdErrorKind::Symlink,
+        ))
+    }
+}
+
 /// Copy at most `cap` bytes from `src` to `dst`, failing the moment one more
 /// byte would cross the cap. The caller supplies the hashing writer so
 /// provenance hashes the bytes ACTUALLY copied. Callers that enumerated a
@@ -1222,6 +1287,40 @@ mod tests {
             .create_leaf_excl(b"keep")
             .expect("leaf");
         assert!(tmp.path().join("planted/keep").is_file());
+    }
+
+    /// Round 7 item 2: a REAL directory reached THROUGH an intermediate symlink
+    /// (`<R>/ev -> /outside`, anchoring `<R>/ev/sub`, where `/outside/sub`
+    /// exists) must not be pinnable. fstatat(NOFOLLOW) follows intermediate
+    /// components, so the final-component check alone returns a real-dir
+    /// verdict and canonicalize pins the link target. The only lexical/physical
+    /// divergence allowed is a macOS system mount (/tmp, /var).
+    #[test]
+    fn anchor_refuses_a_real_dir_reached_through_an_intermediate_link() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("sub")).expect("outside/sub");
+        symlink(&outside, tmp.path().join("ev")).expect("ev link");
+        let via = tmp.path().join("ev/sub");
+        let error = DirFd::anchor_existing(&via)
+            .expect_err("anchor through an intermediate link is refused");
+        assert_eq!(error.kind, FdErrorKind::Symlink);
+        let error = DirFd::anchor_or_create(&via)
+            .expect_err("anchor-create through an intermediate link is refused");
+        assert_eq!(error.kind, FdErrorKind::Symlink);
+        // Creating a tail through the link is refused identically.
+        let via_new = tmp.path().join("ev/sub/new");
+        let error = DirFd::anchor_or_create(&via_new)
+            .expect_err("mkdir-tail through an intermediate link is refused");
+        assert_eq!(error.kind, FdErrorKind::Symlink);
+        assert!(
+            !outside.join("sub/new").exists(),
+            "nothing is created beyond the link"
+        );
+        // The real tree itself stays pinnable, and the link remains a walk
+        // error below it.
+        anchor(&tmp).subdir(b"ev").unwrap_err();
     }
 
     #[test]

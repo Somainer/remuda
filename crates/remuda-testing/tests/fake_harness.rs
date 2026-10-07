@@ -887,8 +887,7 @@ impl Drop for RemoveOnDrop {
 #[test]
 #[cfg(unix)]
 fn r7_home_through_an_intermediate_symlink_is_refused() {
-    let root = remuda_testing::sandbox::TempHome::allocate("r7-home-link")
-        .expect("allocated root");
+    let root = remuda_testing::sandbox::TempHome::allocate("r7-home-link").expect("allocated root");
     // The "outside" tree, with the final `sub/new` tail ALREADY present beyond
     // the link (this is what made the final-component lstat verdict stop on the
     // wrong side of the link).
@@ -934,8 +933,8 @@ fn r7_home_through_an_intermediate_symlink_is_refused() {
 #[test]
 #[cfg(unix)]
 fn r7_events_log_through_an_intermediate_symlink_is_refused() {
-    let root = remuda_testing::sandbox::TempHome::allocate("r7-events-link")
-        .expect("allocated root");
+    let root =
+        remuda_testing::sandbox::TempHome::allocate("r7-events-link").expect("allocated root");
     let home = root.child("good-home");
     std::fs::create_dir_all(&home).expect("valid home");
     let sink = root.child("outside-events");

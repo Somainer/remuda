@@ -298,14 +298,31 @@ impl DriverFactory for NativeClaudeFactory {
             crate::computer_use::host_preflight(&launch.request.kind)
                 .map_err(|error| DriverError::Failed(error.to_string()))?;
         }
+        // Round 7 item 2: pin the Node data dir ONCE and create the instance
+        // subtree below it with O_NOFOLLOW at every component. A plain
+        // `create_dir_all` follows a planted `instances/<id> -> /outside`
+        // symlink and would mkdir `launch/` (and later `native-home/`) outside
+        // the managed base before any resume gate could refuse it.
+        let pin_error = |error: remuda_fdsafe::FdError| {
+            DriverError::Failed(format!(
+                "cannot prepare the managed instance directory under {}: {error}",
+                self.config.data_dir.display()
+            ))
+        };
+        let data_fd =
+            remuda_fdsafe::DirFd::anchor_or_create(&self.config.data_dir).map_err(&pin_error)?;
+        let instances_fd = data_fd.ensure_subdir(b"instances").map_err(&pin_error)?;
+        let instance_id_bytes = launch.instance.meta.id.as_id().as_str().as_bytes();
+        let instance_fd = instances_fd
+            .ensure_subdir(instance_id_bytes)
+            .map_err(&pin_error)?;
+        instance_fd.ensure_subdir(b"launch").map_err(&pin_error)?;
         let instance_dir = self
             .config
             .data_dir
             .join("instances")
             .join(launch.instance.meta.id.as_id().as_str());
         let launch_dir = instance_dir.join("launch");
-        std::fs::create_dir_all(&launch_dir)
-            .map_err(|error| DriverError::Failed(error.to_string()))?;
         let delegation = parse_delegation(&launch.request);
         let profile = provider_profile(&launch, delegation)?;
         let overlay = resolve_claude_overlay(
@@ -351,6 +368,14 @@ impl DriverFactory for NativeClaudeFactory {
                 .clone()
                 .unwrap_or_else(|| instance_dir.join("native-home"))
         };
+        // When the home lives below the pinned Node data dir, remember its
+        // data-dir-relative tail so BOTH its creation and resume staging walk
+        // it from the pinned base descriptor (round 7 item 2).
+        let managed_home_relative: Option<PathBuf> = native_home
+            .strip_prefix(&self.config.data_dir)
+            .ok()
+            .filter(|rel| !rel.as_os_str().is_empty())
+            .map(Path::to_path_buf);
         #[cfg(target_os = "macos")]
         if matches!(
             self.kind,
@@ -371,8 +396,18 @@ impl DriverFactory for NativeClaudeFactory {
             )?;
         }
         if !inherit_default_config {
-            crate::prepare_workspace(&native_home)
-                .map_err(|error| DriverError::Failed(error.to_string()))?;
+            match &managed_home_relative {
+                // Managed home: create it link-free from the pinned data-dir
+                // descriptor — never `mkdir -p` a path that can traverse a
+                // planted `instances/<id>` symlink.
+                Some(rel) => {
+                    data_fd.ensure_subpath(rel).map_err(&pin_error)?;
+                }
+                None => {
+                    crate::prepare_workspace(&native_home)
+                        .map_err(|error| DriverError::Failed(error.to_string()))?;
+                }
+            }
         }
         // c-resumehome: the resume launches in a fresh native home (this
         // instance's own config dir), but `claude --resume <id>` only finds a
@@ -392,13 +427,29 @@ impl DriverFactory for NativeClaudeFactory {
                     "cannot resume session {session_id}: predecessor transcript was not located on this host"
                 )));
             };
-            let staged = remuda_driver::claude_transcript::stage_for_resume(
-                source,
-                &native_home,
-                &launch.workspace_root,
-                session_id,
-            )
-            .map_err(|error| {
+            let stage_result = match managed_home_relative.as_deref() {
+                // Managed home: the Node data dir is the pinned trusted base;
+                // `instances/<id>/native-home` is walked/created below it
+                // O_NOFOLLOW, so a symlinked instance dir cannot redirect
+                // staging outside the managed base (round 7 item 2).
+                Some(rel) => remuda_driver::claude_transcript::stage_for_resume_managed(
+                    source,
+                    &self.config.data_dir,
+                    rel,
+                    &launch.workspace_root,
+                    session_id,
+                ),
+                // Explicit/inherited home outside the data dir: the home path
+                // itself is the configured trusted root and gets a hardened
+                // anchor (an intermediate symlink is refused).
+                None => remuda_driver::claude_transcript::stage_for_resume(
+                    source,
+                    &native_home,
+                    &launch.workspace_root,
+                    session_id,
+                ),
+            };
+            let staged = stage_result.map_err(|error| {
                 DriverError::Failed(format!("cannot resume session {session_id}: {error}"))
             })?;
             // Surface every skipped sidecar (a symlink/FIFO/socket/device the

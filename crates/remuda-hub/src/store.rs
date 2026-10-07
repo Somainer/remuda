@@ -2411,6 +2411,7 @@ impl Store {
                     (id, instance_id, host_id, state, reason, created_at, updated_at)
                  SELECT id, instance_id, host_id, state,
                         COALESCE(
+                            json_extract(payload_json, '$.payload.reasonCode'),
                             json_extract(payload_json,
                                 '$.payload.entity.resolution.value.reason'),
                             json_extract(payload_json,
@@ -4325,6 +4326,7 @@ impl Store {
             // unparseable behaves like "no durable position".
             let (cursor_ts, cursor_id) = Self::parse_settlement_cursor(cursor.as_deref());
             let sql = "SELECT instance_id, id, COALESCE(
+                    json_extract(payload_json, '$.payload.reasonCode'),
                     json_extract(payload_json,
                         '$.payload.entity.resolution.value.reason'),
                     json_extract(payload_json,
@@ -9068,7 +9070,8 @@ mod tests {
         let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
 
         // The exact shell_pty retire_payload("invalidated", "agent-demoted")
-        // entity lifecycle.
+        // entity lifecycle: the producer supplies reasonCode but the
+        // Interaction entity's resolution is still UNKNOWN (r6 item 4).
         store
             .append_journal(
                 host.clone(),
@@ -9090,10 +9093,7 @@ mod tests {
                             "state": "invalidated",
                             "blocking": false,
                             "answerable": false,
-                            "resolution": {
-                                "state": "known",
-                                "value": { "reason": "agent-demoted", "eventIds": [] }
-                            }
+                            "resolution": { "state": "unknown" }
                         }
                     }
                 }),
@@ -9106,7 +9106,7 @@ mod tests {
         assert_eq!(
             reason.as_deref(),
             Some("agent-demoted"),
-            "a demotion stores its reason on the durable row"
+            "a demotion with an Unknown entity resolution still stores its reasonCode"
         );
 
         // The snapshot/lag recovery carries the demotion reason through.
@@ -10730,11 +10730,17 @@ fn apply_interaction_event(
                 entity.get("state").and_then(Value::as_str),
             )
         {
-            // c-cardsettle r5 item 8: the entity lifecycle's reasonCode names
-            // WHY the interaction left pending (a transcript picker demotion
-            // is agent-demoted). Carry it as the entity resolution reason so
-            // reconnect/lag replay and the delete-tombstone label the row
-            // correctly instead of defaulting to generation-ended.
+            // c-cardsettle r5 item 8 / r6 item 4: the entity lifecycle's
+            // reasonCode names WHY the interaction left pending (a transcript
+            // picker demotion is agent-demoted). The real producer
+            // (shell_pty promotion retire_payload) sends reasonCode WITHOUT a
+            // known resolution — the Interaction entity still carries
+            // resolution Unknown — so build the known resolution from
+            // reasonCode when one is not already present; an existing known
+            // resolution wins and is only back-filled with the reason. Carry
+            // it through so reconnect/lag replay and the delete-tombstone
+            // label the row correctly instead of defaulting to
+            // generation-ended.
             let payload_json = match event
                 .pointer("/payload/reasonCode")
                 .and_then(Value::as_str)
@@ -10742,7 +10748,20 @@ fn apply_interaction_event(
             {
                 Some(reason_code) if matches!(state, "invalidated" | "expired") => {
                     let mut stamped = event.clone();
-                    if let Some(value) = stamped
+                    let already_known = stamped
+                        .pointer("/payload/entity/resolution/state")
+                        .and_then(Value::as_str)
+                        .is_some_and(|state| state == "known");
+                    if !already_known
+                        && let Some(entity) = stamped
+                            .pointer_mut("/payload/entity")
+                            .filter(|entity| entity.is_object())
+                    {
+                        entity["resolution"] = json!({
+                            "state": "known",
+                            "value": { "reason": reason_code, "eventIds": [] }
+                        });
+                    } else if let Some(value) = stamped
                         .pointer_mut("/payload/entity/resolution/value")
                         .filter(|value| value.is_object())
                     {

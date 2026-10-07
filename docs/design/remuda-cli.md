@@ -101,8 +101,8 @@ clients:
 | `--scope-project <prj_…>` | `scope.projectIds` | Repeatable. Scope only narrows along the delegation tree. |
 | `--scope-host <hst_…>` | `scope.hostIds` | Repeatable. |
 | `--scope-workspace <wsp_…>` | `scope.workspaceIds` | Repeatable. |
-| `--project <prj_…>` | `projectId` | Single-project shortcut when no explicit project scope is given. |
-| `--permission-mode <mode>` | `permissionMode` | A value from the harness's own vocabulary. For an Agent caller, a mode that switches the harness's own permission control off is admitted only if the caller itself runs with it off, and an omitted mode inherits the caller's own mode (D-057). |
+| `--project <prj_…>` | `projectId` | Single-project shortcut. Mutually exclusive with the three `--scope-*` flags: the Hub ignores `projectId` whenever an explicit `scope` object is present, so combining them is a CLI usage error (exit 2) before any request is sent. |
+| `--permission-mode <mode>` | `permissionMode` | A value from the harness's own vocabulary. The "never beyond the creator" rule (a control-off mode is admitted only when the Agent caller itself runs control-off) and omitted-mode inheritance land with `ma-admission`; until then an Agent caller is restricted to `manual`/`plan` and an omitted mode defaults to `manual` (D-057, OA1). |
 | `--model <id>` | `model` | Model id. |
 | `--restart <none\|process-loss:N>` | `restart` | `process-loss:N` sets `{onProcessLoss: true, maxPerHour: N}` with N >= 1; `none` omits the field. Parsed client-side, so a bad value is a usage error (exit 2) before any request. Human devices only; Agent and Bot callers get 403 and the CLI prints the Hub's reason. The suggested cap is 3 per hour. |
 

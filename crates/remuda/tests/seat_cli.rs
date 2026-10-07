@@ -332,8 +332,6 @@ fn seating_flags_round_trip_into_the_request_body() {
             "hst_seat",
             "--scope-workspace",
             "wsp_persistent",
-            "--project",
-            "prj_one",
             "--permission-mode",
             "acceptEdits",
             "--model",
@@ -358,12 +356,35 @@ fn seating_flags_round_trip_into_the_request_body() {
             "workspaceIds": ["wsp_persistent"],
         })
     );
-    assert_eq!(body["projectId"], json!("prj_one"));
+    // An explicit scope object is sent on its own; --project is its mutually
+    // exclusive shortcut, so no projectId field rides along.
+    assert!(body.get("projectId").is_none());
     assert_eq!(body["permissionMode"], json!("acceptEdits"));
     assert_eq!(body["model"], json!("claude-model-1"));
     assert_eq!(
         body["restart"],
         json!({ "onProcessLoss": true, "maxPerHour": 3 })
+    );
+}
+
+#[test]
+fn project_shortcut_maps_to_project_id_without_a_scope_object() {
+    let (hub, state) = spawn_fake();
+    let output = run_create(
+        &hub,
+        "human-token",
+        &["--host", "hst_seat", "--project", "prj_one"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = last_create_body(&state);
+    assert_eq!(body["projectId"], json!("prj_one"));
+    assert!(
+        body.get("scope").is_none(),
+        "shortcut sends no scope object"
     );
 }
 
@@ -524,6 +545,57 @@ fn a_second_address_owner_holder_prints_the_conflict_text() {
         stderr.contains("address-owner grant"),
         "CLI must surface the Hub conflict text: {stderr}"
     );
+}
+
+#[test]
+fn project_shortcut_conflicts_with_explicit_scope_flags() {
+    // The Hub ignores projectId whenever a scope object is sent, so the CLI
+    // refuses the misleading combination as a usage error (exit 2) and sends
+    // nothing.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(Mutex::new(0u64));
+    let counter = accepts.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            *counter.lock().unwrap() += 1;
+            drop(stream);
+        }
+    });
+    for extra in [
+        vec!["--scope-project", "prj_two"],
+        vec!["--scope-host", "hst_seat"],
+        vec!["--scope-workspace", "wsp_one"],
+    ] {
+        let mut args = vec![
+            "instance",
+            "create",
+            "--host",
+            "hst_seat",
+            "--project",
+            "prj_one",
+        ];
+        args.extend(extra);
+        let output = Command::new(bin())
+            .args(args)
+            .env("REMUDA_HUB", format!("http://{addr}"))
+            .env("REMUDA_TOKEN", "human-token")
+            .env_remove("REMUDA_BOOTSTRAP_TOKEN")
+            .output()
+            .expect("run remuda");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "--project + --scope-* must be a usage error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--project") && stderr.contains("scope"),
+            "error names both flags: {stderr}"
+        );
+    }
+    assert_eq!(*accepts.lock().unwrap(), 0, "no request may be sent");
 }
 
 // ── client-side usage validation ───────────────────────────────────────────

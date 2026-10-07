@@ -203,12 +203,17 @@ pub(crate) struct CreateArgs {
     /// Scope: workspace id (`wsp_…`), repeatable (D-057 §3.2).
     #[arg(long = "scope-workspace")]
     pub scope_workspace: Vec<String>,
-    /// Single-project scope shortcut (`prj_…`); ignored for scope
-    /// resolution when any `--scope-*` flag is given (D-057 §3.2).
+    /// Single-project scope shortcut (`prj_…`). Mutually exclusive with the
+    /// `--scope-*` flags: when an explicit scope object is sent the Hub
+    /// ignores `projectId`, so combining them would silently drop the project
+    /// limit — the CLI rejects the combination (exit 2).
     #[arg(long)]
     pub project: Option<String>,
     /// Harness-native permission mode, e.g. Claude `manual` /
-    /// `acceptEdits` / `plan` / `bypassPermissions` (D-057 §3.3).
+    /// `acceptEdits` / `plan` / `bypassPermissions` (D-057 §3.3). The
+    /// "never beyond the creator" / omitted-mode inheritance rules land with
+    /// ma-admission; today an Agent caller is restricted to `manual`/`plan`
+    /// and an omitted mode defaults to `manual`.
     #[arg(long)]
     pub permission_mode: Option<String>,
     /// Model id recorded on the create spec.
@@ -316,6 +321,24 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                     model,
                     restart,
                 } = *args;
+                // `--project` is the single-project scope shortcut; the Hub
+                // ignores `projectId` whenever an explicit `scope` object is
+                // sent (resolve_delegation), so combining it with any
+                // `--scope-*` flag would silently drop the project limit.
+                // Fail as a usage error before any request is sent.
+                if project.is_some()
+                    && (!scope_project.is_empty()
+                        || !scope_host.is_empty()
+                        || !scope_workspace.is_empty())
+                {
+                    clap::Error::raw(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        "--project is a single-project scope shortcut and cannot be combined with \
+                         --scope-project/--scope-host/--scope-workspace; put the project in the \
+                         scope with --scope-project instead\n",
+                    )
+                    .exit();
+                }
                 let prompt = match (prompt, prompt_file) {
                     (Some(_), Some(_)) => bail!("use --prompt or --prompt-file, not both"),
                     (Some(text), None) => Some(text),

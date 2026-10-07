@@ -520,6 +520,11 @@ pub struct SpawnRequest {
     pub idempotency_key: Option<String>,
     /// Delegation-tree state (scope, grants, preset, task); §2.5.
     pub delegation: crate::store::InstanceDelegation,
+    /// D-057 §7.1: Hub-stamped initiator of the create/resume, carried on the
+    /// queued command and forwarded to the Node. None for Human/Bot callers.
+    pub initiator: Option<remuda_protocol::Initiator>,
+    /// Hub-only authenticating device id re-checked at commit.
+    pub initiator_device_id: Option<String>,
 }
 
 /// Hosts with `online` derived from a live Hub<->Node session, not SQLite state.
@@ -576,6 +581,8 @@ pub async fn spawn_on_host(
             request.operation.to_owned(),
             payload,
             request.idempotency_key,
+            request.initiator,
+            request.initiator_device_id,
         )
         .await?;
     let command = crate::http::forward_if_online(state, command, true).await?;

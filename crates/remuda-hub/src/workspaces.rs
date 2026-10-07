@@ -180,7 +180,17 @@ async fn mutate(
     crate::agent_scope::stamp(&mut payload, &device);
     let (command, _) = state
         .store
-        .queue_command(None, None, id.clone(), method.into(), payload, None)
+        .queue_command(
+            None,
+            None,
+            id.clone(),
+            method.into(),
+            payload,
+            None,
+            // Operator-only workspace registration: never an Agent initiator.
+            None,
+            None,
+        )
         .await?;
     state
         .store

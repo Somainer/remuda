@@ -9,7 +9,7 @@
 //! the Node. Cross-layer state lives in the roster, not in a shell script.
 
 use crate::AppState;
-use crate::agent_scope::{caller, caller_project_scope, require_grant};
+use crate::agent_scope::{caller, caller_project_scope, initiator_and_device, require_grant};
 use crate::auth::require_origin;
 use crate::error::HubError;
 use crate::http::map_store;
@@ -254,6 +254,9 @@ pub(crate) async fn dispatch_core(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
+    // D-057 §7.1: every mutation this dispatch admits (provision admission,
+    // create + brief commands, the roster row) carries the caller's initiator.
+    let (dispatch_initiator, dispatch_device_id) = initiator_and_device(&state, &device).await?;
     if !scope.allows_project(body.project_id.as_id().as_str()) {
         return Err(HubError::Forbidden);
     }
@@ -606,6 +609,8 @@ pub(crate) async fn dispatch_core(
                 operation: "instance.create",
                 idempotency_key: None,
                 delegation: delegation_tree,
+                initiator: dispatch_initiator.clone(),
+                initiator_device_id: dispatch_device_id.clone(),
             },
         )
         .await?;
@@ -646,6 +651,8 @@ pub(crate) async fn dispatch_core(
                 "instance.send".into(),
                 send_payload,
                 None,
+                dispatch_initiator.clone(),
+                dispatch_device_id.clone(),
             )
             .await
             .map_err(map_store)?;
@@ -1307,6 +1314,9 @@ pub(crate) async fn retire_core(
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
+    // D-057 §7.1: the stop/remove the Hub authors in retire carry the
+    // caller's initiator (a command made on the caller's behalf).
+    let (retire_initiator, retire_device_id) = initiator_and_device(&state, &device).await?;
     if worker.state.is_working() && !force {
         return Err(HubError::Conflict(
             "worker is still working; retire --force to reclaim anyway".into(),
@@ -1325,6 +1335,8 @@ pub(crate) async fn retire_core(
                 "instance.close".into(),
                 json!({ "instanceId": instance_id.as_id() }),
                 None,
+                retire_initiator.clone(),
+                retire_device_id.clone(),
             )
             .await
             .map_err(map_store)?;
@@ -1502,6 +1514,7 @@ async fn send_worker_brief(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
+    let (brief_initiator, brief_device_id) = initiator_and_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
     if !worker.state.is_active() {
         return Err(HubError::Conflict("worker is retired".into()));
@@ -1535,6 +1548,8 @@ async fn send_worker_brief(
             "instance.send".into(),
             payload,
             None,
+            brief_initiator,
+            brief_device_id,
         )
         .await
         .map_err(map_store)?;

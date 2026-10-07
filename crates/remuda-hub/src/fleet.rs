@@ -117,6 +117,10 @@ async fn broadcast(
         ));
     }
     crate::agent_scope::stamp(&mut body.payload, &device);
+    // D-057 §7.1: every broadcast command carries the caller's stamped
+    // initiator and device id.
+    let (broadcast_initiator, broadcast_device_id) =
+        crate::agent_scope::initiator_and_device(&state, &device).await?;
     let filtered = !body.hosts.is_empty() || !body.labels.is_empty() || !body.kinds.is_empty();
     if !body.all && !filtered {
         return Err(HubError::BadRequest(
@@ -213,6 +217,8 @@ async fn broadcast(
                 body.operation.clone(),
                 payload,
                 key,
+                broadcast_initiator.clone(),
+                broadcast_device_id.clone(),
             )
             .await
             .map_err(crate::http::map_store);
@@ -367,6 +373,8 @@ async fn create_fleet(
     }
     let mut members = Vec::new();
     let mut instance_ids = Vec::new();
+    let (fleet_initiator, fleet_device_id) =
+        crate::agent_scope::initiator_and_device(&state, &device).await?;
     for host in &chosen {
         let mut host_spec = spec.clone();
         if let Some(obj) = host_spec.as_object_mut() {
@@ -392,6 +400,8 @@ async fn create_fleet(
                 operation: "instance.create",
                 idempotency_key: None,
                 delegation: crate::store::InstanceDelegation::default(),
+                initiator: fleet_initiator.clone(),
+                initiator_device_id: fleet_device_id.clone(),
             },
         )
         .await?;
@@ -467,6 +477,9 @@ async fn fleet_commands(
                 host_id.clone(),
                 body.operation.clone(),
                 payload,
+                None,
+                // Agent callers are refused at the top of this handler.
+                None,
                 None,
             )
             .await

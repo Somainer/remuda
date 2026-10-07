@@ -9,23 +9,11 @@ use axum::{
     routing::{get, post},
 };
 use remuda_protocol::InputOrigin;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// D-057 §7.1 / main-agent.md §7.1: the Hub-stamped initiator of an
-/// Agent-initiated mutation. Derived ONLY from the authenticating device's
-/// bound instance (never the request body) and forwarded to Nodes without the
-/// device id. `None` for Human and Bot callers and for Hub-internal cleanup.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Initiator {
-    /// The chapter instance that initiated the mutation.
-    pub instance_id: String,
-    /// Lineage the instance belongs to.
-    pub lineage_id: String,
-    /// Chapter generation at authentication time.
-    pub generation: i64,
-}
+/// D-057 §7.1 / main-agent.md §7.1: the Hub-stamped initiator type lives in
+/// the shared protocol crate so Nodes persist the same shape.
+pub use remuda_protocol::Initiator;
 
 /// Terminal aliases all resolve to a raw shell on the Node.
 pub fn shell_driver(driver: &str) -> bool {
@@ -86,6 +74,20 @@ pub async fn initiator_for(
         lineage_id: instance.lineage_id,
         generation: instance.generation,
     }))
+}
+
+/// The stamped pair every Agent-admitted writer job carries: the initiator
+/// and the authenticating device id (Hub-only). `(None, None)` for Human/Bot
+/// callers. Hub-internal successor work constructs the initiator without a
+/// device id by hand.
+pub async fn initiator_and_device(
+    state: &AppState,
+    device: &Device,
+) -> Result<(Option<Initiator>, Option<String>), HubError> {
+    match initiator_for(state, device).await? {
+        Some(initiator) => Ok((Some(initiator), Some(device.id.clone()))),
+        None => Ok((None, None)),
+    }
 }
 
 pub fn stamp(payload: &mut Value, device: &Device) {

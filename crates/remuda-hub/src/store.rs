@@ -52,6 +52,11 @@ pub enum StoreError {
     /// A passkey with the same credential id is already registered.
     #[error("duplicate credential")]
     DuplicateCredential,
+    /// D-057 §7.3: the commit-time initiator check refused this write — the
+    /// initiator's instance was fenced or superseded, the lineage paused, or
+    /// the authenticating device row no longer exists. Maps to 409 `fenced`.
+    #[error("fenced")]
+    Fenced,
 }
 
 fn sqlite_is_busy(err: &rusqlite::Error) -> bool {
@@ -208,6 +213,16 @@ pub struct Store {
     readers: Arc<ReaderPool>,
     /// Joins the writer thread after the last clone drops its channel sender.
     _join: Arc<StoreJoin>,
+    /// Test-only seam: when armed, the NEXT `queue_command` writer job marks
+    /// the named instance fenced (and bumps its lineage generation) BEFORE
+    /// running `check_initiator`, deterministically reproducing a fence F that
+    /// commits between request authentication and the write. Drained after
+    /// one fire. Always present; production code never arms it.
+    test_fence_before_queue: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam, device-specific companion: when armed the NEXT
+    /// `queue_command` writer job deletes that device row before the authority
+    /// check (the fence F also deletes predecessor devices).
+    test_delete_device_before_queue: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Result of presenting a Node enroll or host token.
@@ -1534,6 +1549,14 @@ pub struct CommandRecord {
     /// Protocol §2.5 settlement projection, present only once settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<CommandSettlement>,
+    /// D-057 §7.1: Hub-stamped initiator of an Agent-initiated command; null
+    /// for Human/Bot commands. Projected to the wire and forwarded to Nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<remuda_protocol::Initiator>,
+    /// D-057 §7.1: authenticating device id. Hub-only ledger column: never
+    /// serialized to clients and never sent to Nodes.
+    #[serde(skip)]
+    pub initiator_device_id: Option<String>,
     /// Original payload.
     pub payload: Value,
     /// Optional caller idempotency key.
@@ -2066,6 +2089,8 @@ impl Store {
             _join: Arc::new(StoreJoin {
                 thread: Mutex::new(Some(thread)),
             }),
+            test_fence_before_queue: Arc::new(std::sync::Mutex::new(None)),
+            test_delete_device_before_queue: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -2107,6 +2132,48 @@ impl Store {
         let out = rx.await.map_err(|_| StoreError::Closed)?;
         note_slow(name, "write", queued.elapsed());
         out
+    }
+
+    /// Test-only: mark `instance_id` fenced and bump its lineage generation,
+    /// the same authority effects the fence transaction F produces (minus F's
+    /// cancellations, which land in ma-fence). Used by the initiator suite to
+    /// put an instance in the post-fence state without the F machinery.
+    #[doc(hidden)]
+    pub async fn test_fence_instance(&self, instance_id: String) -> Result<(), StoreError> {
+        self.run_named("test_fence_instance", move |conn| {
+            test_apply_fence(conn, &instance_id)
+        })
+        .await
+    }
+
+    /// Test-only: arm the fence-between-authentication-and-commit seam.
+    #[doc(hidden)]
+    pub fn test_arm_fence_before_queue(&self, instance_id: String) {
+        *self
+            .test_fence_before_queue
+            .lock()
+            .expect("fence seam lock") = Some(instance_id);
+    }
+
+    /// Test-only: arm the device-deletion-between-authentication-and-commit
+    /// seam.
+    #[doc(hidden)]
+    pub fn test_arm_delete_device_before_queue(&self, device_id: String) {
+        *self
+            .test_delete_device_before_queue
+            .lock()
+            .expect("device seam lock") = Some(device_id);
+    }
+
+    /// Test-only: delete one device row (the fence F also removes predecessor
+    /// Agent devices).
+    #[doc(hidden)]
+    pub async fn test_delete_device(&self, device_id: String) -> Result<(), StoreError> {
+        self.run_named("test_delete_device", move |conn| {
+            conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
+            Ok(())
+        })
+        .await
     }
 
     /// Run a read on the read-only pool instead of the writer thread.
@@ -4106,6 +4173,11 @@ impl Store {
     }
 
     /// Queue a command. Same `command_id` or idempotency key returns the original row.
+    ///
+    /// D-057 §7.3: when `initiator` is set the commit-time authority check
+    /// runs inside this writer job, so a request authenticated before a fence
+    /// cannot be admitted after it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn queue_command(
         &self,
         command_id: Option<String>,
@@ -4114,8 +4186,34 @@ impl Store {
         operation: String,
         payload: Value,
         idempotency_key: Option<String>,
+        initiator: Option<remuda_protocol::Initiator>,
+        initiator_device_id: Option<String>,
     ) -> Result<(CommandRecord, bool), StoreError> {
+        // Drain the test-only fence seam at enqueue time; it is applied at the
+        // top of the writer job below.
+        let armed_fence = self
+            .test_fence_before_queue
+            .lock()
+            .expect("fence seam lock")
+            .take();
+        let armed_device_delete = self
+            .test_delete_device_before_queue
+            .lock()
+            .expect("device seam lock")
+            .take();
         self.run_named("queue_command", move |conn| {
+            // Test-only seam: a fence armed by the test lands inside THIS
+            // writer job, immediately before the authority check — a
+            // deterministic F-between-authentication-and-commit.
+            if let Some(fenced_instance) = armed_fence {
+                test_apply_fence(conn, &fenced_instance)?;
+            }
+            if let Some(device_id) = armed_device_delete {
+                conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
+            }
+            // D-057 §7.3: re-check authority inside the writer, before any
+            // row exists. On Fenced the job errors and writes nothing.
+            check_initiator(conn, initiator.as_ref(), initiator_device_id.as_deref())?;
             if let Some(key) = idempotency_key.as_ref()
                 && let Some(existing) = load_command_by_key(conn, key)?
             {
@@ -4168,8 +4266,10 @@ impl Store {
             conn.execute(
                 "INSERT INTO commands
                     (id, instance_id, host_id, operation, state, resolution, forwarded,
-                     payload_json, idempotency_key, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7)",
+                     payload_json, idempotency_key, created_at, updated_at,
+                     initiator_instance_id, initiator_lineage_id, initiator_generation,
+                     initiator_device_id)
+                 VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     command_id,
                     instance_id,
@@ -4177,7 +4277,11 @@ impl Store {
                     operation,
                     payload.to_string(),
                     idempotency_key,
-                    now
+                    now,
+                    initiator.as_ref().map(|i| i.instance_id.clone()),
+                    initiator.as_ref().map(|i| i.lineage_id.clone()),
+                    initiator.as_ref().map(|i| i.generation),
+                    initiator_device_id,
                 ],
             )?;
             let row = load_command(conn, &command_id)?
@@ -4188,11 +4292,20 @@ impl Store {
     }
 
     /// Persist forward intent. Returns false if already forwarded (do not resend).
+    ///
+    /// D-057 §7.3: re-checks the initiator and device id STAMPED ON THE ROW,
+    /// inside the writer job. A same-id replay of a held row by a since-fenced
+    /// initiator is refused here, before any frame is written to a Node.
     pub async fn mark_forward_intent(&self, command_id: String) -> Result<bool, StoreError> {
         self.run_named("mark_forward_intent", move |conn| {
             let Some(row) = load_command(conn, &command_id)? else {
                 return Err(StoreError::Id("unknown command".into()));
             };
+            check_initiator(
+                conn,
+                row.initiator.as_ref(),
+                row.initiator_device_id.as_deref(),
+            )?;
             if row.forwarded {
                 return Ok(false);
             }
@@ -4424,7 +4537,9 @@ impl Store {
                 "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                         payload_json, idempotency_key, created_at, updated_at,
                         settlement_outcome, settlement_reason,
-                        settlement_http_status, settlement_http_body
+                        settlement_http_status, settlement_http_body,
+                        initiator_instance_id, initiator_lineage_id, initiator_generation,
+                        initiator_device_id
                  FROM commands
                  WHERE instance_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -5601,7 +5716,11 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             settlement_outcome TEXT,
             settlement_reason TEXT,
             settlement_http_status INTEGER,
-            settlement_http_body TEXT
+            settlement_http_body TEXT,
+            initiator_instance_id TEXT,
+            initiator_lineage_id TEXT,
+            initiator_generation INTEGER,
+            initiator_device_id TEXT
         );
         CREATE TABLE IF NOT EXISTS journal (
             instance_id TEXT NOT NULL,
@@ -5817,6 +5936,13 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "instances", "chapter_cause", "TEXT")?;
     ensure_column(&conn, "instances", "fenced_at", "TEXT")?;
     ensure_column(&conn, "instances", "restart_json", "TEXT")?;
+    // D-057 §7.1 (ma-initiator): every Agent-initiated command row carries
+    // the Hub-stamped initiator and the authenticating device id. The device
+    // id stays Hub-only and is never sent to Nodes. NULL for Human/Bot work.
+    ensure_column(&conn, "commands", "initiator_instance_id", "TEXT")?;
+    ensure_column(&conn, "commands", "initiator_lineage_id", "TEXT")?;
+    ensure_column(&conn, "commands", "initiator_generation", "INTEGER")?;
+    ensure_column(&conn, "commands", "initiator_device_id", "TEXT")?;
     // ma-lineage round 2: an immutable timestamp for the chapter's real end
     // event (a transition into exited/failed/closed), kept separate from the
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
@@ -6712,6 +6838,8 @@ mod tests {
                 "instance.create".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
+                None,
             )
             .await
             .expect("command");
@@ -6848,6 +6976,8 @@ mod tests {
                 "instance.create".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
+                None,
             )
             .await
             .expect("command");
@@ -6943,6 +7073,8 @@ mod tests {
                 host_id.clone(),
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
+                None,
+                None,
                 None,
             )
             .await
@@ -7056,6 +7188,8 @@ mod tests {
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
+                None,
             )
             .await
             .expect("command");
@@ -7113,6 +7247,8 @@ mod tests {
                 host_id.clone(),
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
+                None,
+                None,
                 None,
             )
             .await
@@ -7181,6 +7317,8 @@ mod tests {
                         host_id.clone(),
                         "instance.send".into(),
                         json!({"instanceId": instance.instance_id}),
+                        None,
+                        None,
                         None,
                     )
                     .await
@@ -7499,6 +7637,8 @@ mod tests {
                 "instance.configure".into(),
                 payload.clone(),
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -7691,6 +7831,8 @@ mod tests {
                     host.clone(),
                     "instance.configure".into(),
                     payload.clone(),
+                    None,
+                    None,
                     None,
                 )
                 .await
@@ -9209,12 +9351,96 @@ fn load_journal_row(
     .map_err(StoreError::from)
 }
 
+/// D-057 §7.3: the single commit-time authority check, run INSIDE the writer
+/// job that admits an Agent-initiated mutation. Passes for `None` (Human/Bot
+/// callers and Hub-internal cleanup). Otherwise it requires all of:
+/// - the initiator's instance exists and is not fenced;
+/// - its stamped generation equals the lineage's live generation;
+/// - the lineage is not paused;
+/// - when a device id is given, that exact device row still exists and is
+///   either bound to the initiator's instance (launch credential / MCP token)
+///   or is the unbound Human device that narrowed to it
+///   (`x-remuda-instance-id`). Hub-internal successor initiators pass `None`
+///   and skip the device clause.
+///
+/// Any failure is [`StoreError::Fenced`] (409 `fenced`); the surrounding
+/// writer job writes nothing because the error rolls the transaction back.
+pub(crate) fn check_initiator(
+    conn: &Connection,
+    initiator: Option<&remuda_protocol::Initiator>,
+    device_id: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(initiator) = initiator else {
+        return Ok(());
+    };
+    let authority: Option<(Option<String>, i64, Option<String>)> = conn
+        .query_row(
+            "SELECT i.fenced_at, COALESCE(l.generation, i.generation), l.state
+             FROM instances i
+             LEFT JOIN lineages l ON l.lineage_id = i.lineage_id
+             WHERE i.id = ?1",
+            params![initiator.instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((fenced_at, live_generation, lineage_state)) = authority else {
+        return Err(StoreError::Fenced);
+    };
+    if fenced_at.is_some()
+        || live_generation != initiator.generation
+        || lineage_state.as_deref() == Some("paused")
+    {
+        return Err(StoreError::Fenced);
+    }
+    if let Some(device_id) = device_id {
+        let device: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT kind, instance_id FROM devices WHERE id = ?1",
+                params![device_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let device_ok = match device {
+            // The launch credential or an MCP token bound to this instance.
+            Some((_, Some(bound))) => bound == initiator.instance_id,
+            // The unbound Human device that narrowed with x-remuda-instance-id.
+            Some((kind, None)) => kind == "human",
+            None => false,
+        };
+        if !device_ok {
+            return Err(StoreError::Fenced);
+        }
+    }
+    Ok(())
+}
+
+/// Test-only: apply the authority effects of a fence to one instance — marks
+/// the chapter fenced and bumps its lineage's live generation into `paused`.
+/// The cancellations and device deletions of the real F land in ma-fence.
+#[doc(hidden)]
+pub(crate) fn test_apply_fence(conn: &Connection, instance_id: &str) -> Result<(), StoreError> {
+    let now = now_rfc3339();
+    conn.execute(
+        "UPDATE instances SET fenced_at = ?1, updated_at = ?1 WHERE id = ?2",
+        params![now, instance_id],
+    )?;
+    conn.execute(
+        "UPDATE lineages
+            SET generation = generation + 1, state = 'paused', paused_at = ?1, updated_at = ?1
+          WHERE lineage_id = (SELECT lineage_id FROM instances WHERE id = ?2)",
+        params![now, instance_id],
+    )?;
+    Ok(())
+}
+
 fn load_command(conn: &Connection, id: &str) -> Result<Option<CommandRecord>, StoreError> {
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                 payload_json, idempotency_key, created_at, updated_at,
                 settlement_outcome, settlement_reason,
-                settlement_http_status, settlement_http_body
+                settlement_http_status, settlement_http_body,
+                initiator_instance_id, initiator_lineage_id, initiator_generation,
+                initiator_device_id
          FROM commands WHERE id = ?1",
         params![id],
         command_from_row,
@@ -9228,7 +9454,9 @@ fn load_command_by_key(conn: &Connection, key: &str) -> Result<Option<CommandRec
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
                 payload_json, idempotency_key, created_at, updated_at,
                 settlement_outcome, settlement_reason,
-                settlement_http_status, settlement_http_body
+                settlement_http_status, settlement_http_body,
+                initiator_instance_id, initiator_lineage_id, initiator_generation,
+                initiator_device_id
          FROM commands WHERE idempotency_key = ?1",
         params![key],
         command_from_row,
@@ -9698,6 +9926,25 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
     let settlement_reason: Option<String> = row.get(12)?;
     let settlement_http_status: Option<i64> = row.get(13)?;
     let settlement_http_body: Option<String> = row.get(14)?;
+    // D-057 §7.1: the three initiator columns are all NULL (legacy/Human/Bot
+    // rows) or all set together.
+    let initiator_instance_id: Option<String> = row.get(15)?;
+    let initiator_lineage_id: Option<String> = row.get(16)?;
+    let initiator_generation: Option<i64> = row.get(17)?;
+    let initiator = match (
+        initiator_instance_id,
+        initiator_lineage_id,
+        initiator_generation,
+    ) {
+        (Some(instance_id), Some(lineage_id), Some(generation)) => {
+            Some(remuda_protocol::Initiator {
+                instance_id,
+                lineage_id,
+                generation,
+            })
+        }
+        _ => None,
+    };
     Ok(CommandRecord {
         command_id: row.get(0)?,
         instance_id: row.get(1)?,
@@ -9714,6 +9961,8 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
         settlement_reason,
         settlement_http_status,
         settlement_http_body,
+        initiator,
+        initiator_device_id: row.get(18)?,
         payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
         idempotency_key: row.get(8)?,
         created_at: row.get(9)?,

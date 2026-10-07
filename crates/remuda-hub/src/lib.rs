@@ -346,6 +346,14 @@ pub mod store_test_support {
             idempotency_key: Some("idem_sample".into()),
             created_at: "2026-09-18T00:00:00.000Z".into(),
             updated_at: "2026-09-18T00:00:01.000Z".into(),
+            // D-057 §7.1: Agent-initiated commands serialize the stamped
+            // initiator (the device id never leaves the Hub).
+            initiator: Some(remuda_protocol::Initiator {
+                instance_id: "ins_sample".into(),
+                lineage_id: "ins_sample".into(),
+                generation: 1,
+            }),
+            initiator_device_id: None,
         };
         serde_json::to_value(record).expect("command record serializes")
     }

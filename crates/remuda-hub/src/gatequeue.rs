@@ -223,6 +223,10 @@ async fn enqueue_job(
         web,
         lane_id: body.lane_id,
         requested_by: device.id.clone(),
+        // Replaced with the resolved Hub-stamped initiator in the gate job
+        // wiring commit.
+        initiator: None,
+        initiator_device_id: None,
         state: GateJobState::Queued,
         steps: Vec::new(),
         host_id: None,

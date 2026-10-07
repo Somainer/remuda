@@ -711,6 +711,10 @@ async fn stop_before_delete(
             "instance.close".into(),
             json!({ "instanceId": instance.instance_id, "origin": "human" }),
             None,
+            // Hub-internal cleanup before an operator delete (main-agent.md
+            // §7.1): never fenced.
+            None,
+            None,
         )
         .await
         .map_err(map_store)?;
@@ -1536,6 +1540,8 @@ pub async fn create_instance(
         }
         binding_claim = Some((host_id, workspace_id, dir_key, claim));
     }
+    let (create_initiator, create_device_id) =
+        crate::agent_scope::initiator_and_device(&state, &device).await?;
     let spawn_result = crate::placement::spawn_on_host(
         &state,
         &host,
@@ -1549,6 +1555,8 @@ pub async fn create_instance(
             operation: "instance.create",
             idempotency_key: None,
             delegation,
+            initiator: create_initiator,
+            initiator_device_id: create_device_id,
         },
     )
     .await;
@@ -1829,6 +1837,10 @@ pub async fn resume_instance(
             operation: "instance.resume",
             idempotency_key: Some(idempotency_key),
             delegation: crate::store::InstanceDelegation::default(),
+            // Operator-only resume route (D-026); worker respawn uses the
+            // internal helper, not this path.
+            initiator: None,
+            initiator_device_id: None,
         },
     )
     .await?;
@@ -2119,6 +2131,9 @@ async fn resume_lineage(
                 fenced.host_id.clone(),
                 "instance.close".into(),
                 json!({ "instanceId": fenced.instance_id, "origin": "human" }),
+                None,
+                // Hub-internal cleanup inside a continuation resume.
+                None,
                 None,
             )
             .await?;
@@ -2413,6 +2428,9 @@ pub async fn post_command(
     // in-flight 409. Commands without a client id cannot be replayed before
     // the response reveals the minted id, so they need no marker.
     let mut dispatch = body.command_id.as_deref().map(begin_dispatch);
+    // D-057 §7.1: Hub-stamped from the authenticated device, never the body.
+    let (initiator, initiator_device_id) =
+        crate::agent_scope::initiator_and_device(&state, &device).await?;
     let (command, created) = state
         .store
         .queue_command(
@@ -2422,6 +2440,8 @@ pub async fn post_command(
             body.operation,
             payload,
             body.idempotency_key,
+            initiator,
+            initiator_device_id,
         )
         .await
         .map_err(map_store)?;
@@ -3801,7 +3821,8 @@ pub(crate) async fn forward_if_online(
             let first = state
                 .store
                 .mark_forward_intent(command.command_id.clone())
-                .await?;
+                .await
+                .map_err(map_store)?;
             if !first {
                 // Durably forwarded/advanced already: a committed row. A
                 // follower could only have joined the slot before this point
@@ -3843,6 +3864,14 @@ pub(crate) async fn forward_if_online(
         .as_object_mut()
         .ok_or_else(|| HubError::BadRequest("command payload must be an object".into()))?;
     object.insert("commandId".into(), json!(command.command_id));
+    // D-057 §7.1: forward the Hub-stamped initiator (never the device id).
+    // Older Hubs sent no initiator; the Node treats its absence as before.
+    if let Some(initiator) = &command.initiator {
+        object.insert(
+            "initiator".into(),
+            serde_json::to_value(initiator).unwrap_or(Value::Null),
+        );
+    }
     if matches!(
         command.operation.as_str(),
         "instance.create" | "instance.resume"
@@ -4227,6 +4256,7 @@ pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {
             HubError::Conflict(msg.clone())
         }
         crate::store::StoreError::Conflict(msg) => HubError::Conflict(msg.clone()),
+        crate::store::StoreError::Fenced => HubError::Fenced,
         crate::store::StoreError::Forbidden(_) => HubError::Forbidden,
         crate::store::StoreError::Id(msg) => HubError::BadRequest(msg.clone()),
         other => HubError::Store(other.clone_as_internal()),
@@ -4261,6 +4291,8 @@ mod forward_slot_tests {
             settlement_http_status: None,
             settlement_http_body: None,
             settlement: None,
+            initiator: None,
+            initiator_device_id: None,
         }
     }
 

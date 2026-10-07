@@ -297,6 +297,16 @@
               "null"
             ]
           },
+          "initiator": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Initiator"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "instanceId": {
             "type": [
               "string",
@@ -1054,6 +1064,28 @@
         },
         "required": [
           "path"
+        ],
+        "type": "object"
+      },
+      "Initiator": {
+        "description": "D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers.",
+        "properties": {
+          "generation": {
+            "description": "Chapter generation at authentication time; a fence bumps the lineage's live generation.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "instanceId": {
+            "type": "string"
+          },
+          "lineageId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation",
+          "instanceId",
+          "lineageId"
         ],
         "type": "object"
       },

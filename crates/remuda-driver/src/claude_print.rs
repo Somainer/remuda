@@ -2709,14 +2709,19 @@ impl TranscriptMapper {
                 name: request.name,
                 ultracode: request.ultracode,
             });
+        // `cleared` only proves a projected state existed (the edge is
+        // emitted once). It is NOT republished: name and ultracode withdraw
+        // to None so the Hub nulls its projection and the UI renders `?`
+        // instead of keeping the stale level/flag.
+        let _ = cleared;
         let obs = self.mapper.observation(
             Completeness::Structured,
             remuda_protocol::NativeRequestKey::None,
             ObservationPayload::Effort(Box::new(EffortPayload {
                 requested,
                 effective: EffortEffective {
-                    name: cleared.name,
-                    ultracode: cleared.ultracode,
+                    name: None,
+                    ultracode: None,
                     // The provenance loss is not a level observation: source
                     // unknown, so the UI cannot attribute it to a switch.
                     source: remuda_protocol::EffortSource::Unknown,
@@ -3121,7 +3126,7 @@ impl TranscriptMapper {
         let payload = ObservationPayload::Effort(Box::new(EffortPayload {
             requested,
             effective: EffortEffective {
-                name: observed.name,
+                name: Some(observed.name),
                 ultracode: observed.ultracode,
                 source,
                 observed_at: now()?,

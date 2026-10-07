@@ -5324,6 +5324,27 @@ fn apply_effective_effort_projection(
     Ok(())
 }
 
+fn nullify_effective_effort_projection(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<(), StoreError> {
+    let spec_raw: String = conn.query_row(
+        "SELECT spec_json FROM instances WHERE id = ?1",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    let mut spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
+    if let Some(object) = spec.as_object_mut()
+        && object.remove("effortEffective").is_some()
+    {
+        conn.execute(
+            "UPDATE instances SET spec_json = ?1 WHERE id = ?2",
+            params![Value::Object(object.clone()).to_string(), instance_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// §5.1: persist the transcript-observed effective permission mode onto the
 /// spec, mirroring `effortEffective`.
 fn apply_effective_permission_projection(
@@ -5360,7 +5381,15 @@ fn apply_instance_projection(
     if kind == "effort"
         && let Some(effective) = payload.get("effective")
     {
-        apply_effective_effort_projection(conn, instance_id, effective)?;
+        if effective.get("readbackAvailable").and_then(Value::as_bool) == Some(false) {
+            // D-056 (4): the driver withdrew the projected level/flag (a
+            // verified resume boundary became unverifiable mid-run). NULL the
+            // projection rather than storing the placeholder: clients render
+            // `?` and must not treat a pending switch as applied.
+            nullify_effective_effort_projection(conn, instance_id)?;
+        } else {
+            apply_effective_effort_projection(conn, instance_id, effective)?;
+        }
     }
     if kind == "model"
         && let Some(effective) = payload.get("effective")
@@ -7661,6 +7690,68 @@ mod tests {
         assert_eq!(
             effective.get("source").and_then(Value::as_str),
             Some("slash")
+        );
+    }
+
+    /// D-056 (4): an effort edge with `readbackAvailable:false` WITHDRAWS the
+    /// projected level/flag — the Hub nulls `effortEffective` instead of
+    /// storing a placeholder carrying the stale tier.
+    #[tokio::test]
+    async fn readback_unavailable_effort_edge_nulls_the_projection() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cap-node").await;
+        let instance = seed_instance(&store, &host).await;
+        let edge = |effective: Value| {
+            json!({"kind":"effort","payload":{
+                "requested":{"name":"max","ultracode":false},
+                "effective": effective}})
+        };
+        // A normal edge projects first.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                edge(json!({"name":"high","ultracode":true,
+                    "source":"slash","observedAt":"2026-10-08T12:00:00.000Z"})),
+            )
+            .await
+            .expect("high event");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.effort_effective
+                .as_ref()
+                .and_then(|v| v.get("name"))
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        // The read-back-unavailable edge withdraws it.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(2),
+                edge(json!({"name":null,"ultracode":null,"source":"unknown",
+                    "observedAt":"2026-10-08T12:05:00.000Z",
+                    "readbackAvailable":false})),
+            )
+            .await
+            .expect("withdrawn event");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(
+            row.effort_effective.is_none(),
+            "effortEffective must be nulled, got {:?}",
+            row.effort_effective
         );
     }
 

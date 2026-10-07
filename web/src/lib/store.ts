@@ -736,7 +736,20 @@ class HubStore {
     let pendingSettled = false;
     for (const instance of instances) {
       const view = effectiveFromRecord(instance.effortEffective);
-      if (!view) continue;
+      if (!view) {
+        // D-056 (4): the Hub nulls effortEffective on the
+        // read-back-unavailable edge. When the record is newer than the
+        // projection the client still holds, withdraw it here too (a gapped
+        // follow / late attach). A pending switch is left intact — the
+        // configure outcome or its timeout owns it. An instance that has
+        // simply never observed a level does not clear anything.
+        const held = next[instance.id];
+        if (held && instance.updatedAt && instance.updatedAt > held.observedAt) {
+          delete next[instance.id];
+          effectiveUpdated = true;
+        }
+        continue;
+      }
       const current = next[instance.id];
       if (!current || view.observedAt >= current.observedAt) {
         next[instance.id] = view;
@@ -922,12 +935,26 @@ class HubStore {
   private noteEffortObservation(instanceId: Id, observation: Observation): boolean {
     const parsed = effectiveFromObservation(observation);
     if (!parsed) return false;
+    // D-056 (4) read-back-unavailable edge: the driver withdrew the
+    // projected level/flag (a verified resume became unverifiable). Clear the
+    // live projection so the chip renders `?`, but do NOT settle or delete the
+    // pending switch and do not move the optimistic slider — the configure
+    // outcome (or its bounded timeout) owns the pending indicator.
+    if (parsed.withdrawn) {
+      if (!this.state.effortEffective[instanceId]) return true;
+      const effortEffective = { ...this.state.effortEffective };
+      delete effortEffective[instanceId];
+      this.emit({ effortEffective });
+      return true;
+    }
+    const view = parsed.effective;
+    if (!view) return false;
     const current = this.state.effortEffective[instanceId];
-    if (current && parsed.effective.observedAt < current.observedAt) return false;
+    if (current && view.observedAt < current.observedAt) return false;
     const patch: Partial<HubState> = {
       effortEffective: {
         ...this.state.effortEffective,
-        [instanceId]: parsed.effective,
+        [instanceId]: view,
       },
     };
     const pending = this.state.effortPending[instanceId];
@@ -958,9 +985,9 @@ class HubStore {
       const kind = (instance?.kind ?? "claude") as EffortKind;
       const selection = effortFromRecord(
         kind,
-        parsed.effective.name,
+        view.name,
         null,
-        parsed.effective.ultracode === true,
+        view.ultracode === true,
       );
       if (selection) {
         const stored = this.state.effort[instanceId];

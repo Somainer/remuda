@@ -347,10 +347,16 @@ impl<'de> Deserialize<'de> for EffortSelection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EffortEffective {
-    /// Observed level name.
-    pub name: EffortName,
+    /// Observed level name. `None` ONLY on the read-back-unavailable edge
+    /// (`readback_available == Some(false)`): a verified resume boundary
+    /// became unverifiable mid-run, so the previously projected level is
+    /// withdrawn and consumers must render `?` rather than keep the stale
+    /// tier. Normal observations always carry `Some(name)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<EffortName>,
     /// Observed dynamic-workflow flag; `None` when the transcript does not
-    /// expose it (the common case).
+    /// expose it (the common case), and also withdrawn on the
+    /// read-back-unavailable edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ultracode: Option<bool>,
     /// What established this level.

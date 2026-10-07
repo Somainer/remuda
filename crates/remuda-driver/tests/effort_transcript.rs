@@ -74,7 +74,12 @@ fn effort_edges(out: &[remuda_protocol::Observation]) -> Vec<(String, EffortSour
     out.iter()
         .filter_map(|obs| match &obs.body {
             ObservationPayload::Effort(payload) => Some((
-                payload.effective.name.wire().to_string(),
+                payload
+                    .effective
+                    .name
+                    .expect("edge carries a level")
+                    .wire()
+                    .to_string(),
                 payload.effective.source,
                 payload.effective.ultracode,
             )),
@@ -204,7 +209,12 @@ fn replay_version(path: &str, version: &str) -> Vec<EffortEdge> {
         for obs in mapper.map_line(line).expect("map") {
             if let ObservationPayload::Effort(payload) = &obs.body {
                 edges.push(EffortEdge {
-                    name: payload.effective.name.wire().to_string(),
+                    name: payload
+                        .effective
+                        .name
+                        .expect("edge carries a level")
+                        .wire()
+                        .to_string(),
                     source: payload.effective.source,
                     ultracode: payload.effective.ultracode,
                 });
@@ -379,7 +389,12 @@ async fn real_21273_four_consecutive_switches_each_resolve_their_own_generation(
         for obs in mapper.map_line(line).expect("map") {
             if let ObservationPayload::Effort(payload) = &obs.body {
                 edges.push((
-                    payload.effective.name.wire().to_string(),
+                    payload
+                        .effective
+                        .name
+                        .expect("edge carries a level")
+                        .wire()
+                        .to_string(),
                     payload.effective.ultracode,
                 ));
             }
@@ -902,7 +917,10 @@ fn model_verdict_with_the_effort_suffix_emits_an_effort_observation() {
             _ => None,
         })
         .expect("effort edge from the /model suffix");
-    assert_eq!(edge.effective.name, remuda_protocol::EffortName::Xhigh);
+    assert_eq!(
+        edge.effective.name,
+        Some(remuda_protocol::EffortName::Xhigh)
+    );
     // Without the suffix the 2.1.289 walk's /model verdict emits no edge:
     let mut mapper2 = mapper_version("2.1.289");
     mapper2
@@ -962,7 +980,12 @@ fn journal_edges(body: &str, instance: &InstanceId) -> Vec<(EdgeTriple, String)>
             if let ObservationPayload::Effort(payload) = &envelope.body {
                 edges.push((
                     (
-                        payload.effective.name.wire().to_string(),
+                        payload
+                            .effective
+                            .name
+                            .expect("edge carries a level")
+                            .wire()
+                            .to_string(),
                         payload.effective.source,
                         payload.effective.ultracode,
                     ),
@@ -996,7 +1019,12 @@ fn live_edges_with_ids(body: &str, version: &str) -> (InstanceId, Vec<(EdgeTripl
             if let ObservationPayload::Effort(payload) = &obs.body {
                 edges.push((
                     (
-                        payload.effective.name.wire().to_string(),
+                        payload
+                            .effective
+                            .name
+                            .expect("edge carries a level")
+                            .wire()
+                            .to_string(),
                         payload.effective.source,
                         payload.effective.ultracode,
                     ),

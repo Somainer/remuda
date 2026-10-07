@@ -26,21 +26,32 @@ export type EffortObservationPayload = {
   payload: {
     requested?: { name?: string; ultracode?: boolean } | null;
     effective: {
-      name: string;
+      name?: string | null;
       ultracode?: boolean | null;
       source?: string;
       observedAt?: string;
-    };
+      /** D-056 (4): false withdraws the projected level/flag. */
+      readbackAvailable?: boolean | null;
+    } | null;
     raw?: string | null;
   };
 };
 
+/** Whether an effective record withdraws read-back (D-056 (4)). */
+function readbackWithdrawn(record: Record<string, unknown>): boolean {
+  return record.readbackAvailable === false;
+}
+
 const SOURCES: ReadonlySet<string> = new Set(["launch", "slash", "remuda", "unknown"]);
 
-/** Normalize an `effortEffective` object off a Hub InstanceRecord. */
+/** Normalize an `effortEffective` object off a Hub InstanceRecord.
+ *  Returns null both before the first observation AND when the driver
+ *  withdraws read-back (`readbackAvailable:false`, name/flag null) — the UI
+ *  renders `?` and a pending switch is never treated as applied. */
 export function effectiveFromRecord(value: unknown): EffortEffectiveView | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
+  if (readbackWithdrawn(record)) return null;
   if (typeof record.name !== "string" || !record.name) return null;
   const source =
     typeof record.source === "string" && SOURCES.has(record.source)
@@ -54,21 +65,36 @@ export function effectiveFromRecord(value: unknown): EffortEffectiveView | null 
   };
 }
 
-/** Extract effective effort from an observation, when it is an `effort` event. */
-export function effectiveFromObservation(
-  observation: unknown,
-): { effective: EffortEffectiveView; requested?: { name?: string; ultracode?: boolean } } | null {
+/** Result of folding one `effort` observation. */
+export type EffortObservationResult = {
+  /** The projected effective state, or null when still unknown. */
+  effective: EffortEffectiveView | null;
+  /** True when this is the read-back-unavailable edge: the driver withdrew
+   *  the previous projection; consumers must clear it WITHOUT settling or
+   *  deleting a pending switch. */
+  withdrawn: boolean;
+  requested?: { name?: string; ultracode?: boolean };
+};
+
+/** Extract effective effort from an observation, when it is an `effort` event.
+ *  Returns null for non-effort events. An effort event whose effective is the
+ *  read-back-unavailable edge returns `{effective:null, withdrawn:true}`. */
+export function effectiveFromObservation(observation: unknown): EffortObservationResult | null {
   const event = observation as { body?: EffortObservationPayload } | null;
   const body = event?.body;
   // Observations are `{kind, payload}` tagged enums; accept both a nested body
   // and a flattened shape defensively.
   const payload = body ?? (observation as EffortObservationPayload | null);
   if (!payload || payload.kind !== "effort" || !payload.payload?.effective) return null;
-  const effective = payload.payload.effective;
-  const view = effectiveFromRecord(effective);
-  if (!view) return null;
+  const effectiveRecord = payload.payload.effective as Record<string, unknown>;
+  const withdrawn = readbackWithdrawn(effectiveRecord);
+  const view = effectiveFromRecord(effectiveRecord);
   const requested = payload.payload.requested ?? undefined;
-  return requested ? { effective: view, requested } : { effective: view };
+  return {
+    effective: view,
+    withdrawn,
+    ...(requested ? { requested } : {}),
+  };
 }
 
 /** Display name for an effective level: a positively observed ultracode flag

@@ -434,7 +434,7 @@ fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
         .iter()
         .find_map(|env| match &env.body {
             ObservationPayload::Effort(payload)
-                if payload.effective.name == remuda_protocol::EffortName::Max =>
+                if payload.effective.name == Some(remuda_protocol::EffortName::Max) =>
             {
                 Some(env.event_id.clone())
             }
@@ -466,7 +466,7 @@ fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
         .iter()
         .find_map(|env| match &env.body {
             ObservationPayload::Effort(payload)
-                if payload.effective.name == remuda_protocol::EffortName::Max =>
+                if payload.effective.name == Some(remuda_protocol::EffortName::Max) =>
             {
                 Some(env.event_id.clone())
             }
@@ -476,12 +476,18 @@ fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
         .expect("derived again");
     assert_eq!(id_a, id_b, "effort event id is stable across mappings");
 
-    assert_eq!(effort[0].effective.name, remuda_protocol::EffortName::High);
+    assert_eq!(
+        effort[0].effective.name,
+        Some(remuda_protocol::EffortName::High)
+    );
     assert_eq!(
         effort[0].effective.source,
         remuda_protocol::EffortSource::Unknown
     );
-    assert_eq!(effort[1].effective.name, remuda_protocol::EffortName::Max);
+    assert_eq!(
+        effort[1].effective.name,
+        Some(remuda_protocol::EffortName::Max)
+    );
     assert_eq!(
         effort[1].effective.source,
         remuda_protocol::EffortSource::Slash
@@ -535,7 +541,10 @@ fn effort_triples(
         .iter()
         .filter_map(|env| match &env.body {
             ObservationPayload::Effort(payload) => Some((
-                payload.effective.name,
+                payload
+                    .effective
+                    .name
+                    .expect("normal journal effort edges always carry a level"),
                 payload.effective.source,
                 payload.effective.ultracode,
             )),

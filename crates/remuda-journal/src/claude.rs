@@ -602,7 +602,7 @@ fn effort_envelope(
         ObservationPayload::Effort(Box::new(EffortPayload {
             requested: None,
             effective: EffortEffective {
-                name: observed.name,
+                name: Some(observed.name),
                 ultracode: observed.ultracode,
                 source,
                 observed_at: timestamp_now()?,

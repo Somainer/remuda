@@ -2693,7 +2693,10 @@ mod tests {
         let ObservationPayload::Effort(payload) = effort.body else {
             panic!("effort payload");
         };
-        assert_eq!(payload.effective.name, remuda_protocol::EffortName::High);
+        assert_eq!(
+            payload.effective.name,
+            Some(remuda_protocol::EffortName::High)
+        );
     }
 
     /// c-effortread r4 item 5, claude-pty pump: a VERIFIED resume whose bound
@@ -2779,7 +2782,7 @@ mod tests {
         let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
         assert_eq!(
             effort_names(&obs),
-            vec![(remuda_protocol::EffortName::High, None)]
+            vec![(Some(remuda_protocol::EffortName::High), None)]
         );
 
         // A Remuda switch is armed; its slash record is a current record.
@@ -2802,7 +2805,7 @@ mod tests {
         let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
         assert_eq!(
             effort_names(&obs),
-            vec![(remuda_protocol::EffortName::High, Some(false))],
+            vec![(None, Some(false))],
             "the pump publishes one read-back-unavailable edge: {obs:?}"
         );
         assert!(bridge.has_pending());

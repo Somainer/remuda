@@ -354,3 +354,48 @@ it("an older poll projection cannot overwrite a newer live effective or move the
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });
+
+it("a read-back-unavailable edge clears the projection but keeps the pending switch (D-056 (4))", async () => {
+  const ctx = await startFollowing("withdrawn");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // A verified resume projected high+ultracode.
+  ctx.receive(effortEvent(2, "high", true, "launch"));
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("high");
+
+  // Remuda arms a switch to max: pending indicator on.
+  await hubStore.setEffort(ctx.instance.id, {
+    index: 4,
+    name: "max",
+    kind: "claude",
+    ultracode: false,
+  });
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.word).toBe("max");
+
+  // The transcript is replaced: the driver withdraws read-back (name/flag
+  // null, readbackAvailable false).
+  const withdrawn = {
+    eventId: "evt_eff_withdrawn",
+    instanceId: "x",
+    journalId: "x",
+    seq: "9",
+    kind: "effort",
+    observedAt: "2026-10-08T12:05:00Z",
+    source: { channel: "transcript" },
+    payload: {
+      effective: {
+        name: null,
+        ultracode: null,
+        source: "unknown",
+        observedAt: "2026-10-08T12:05:00Z",
+        readbackAvailable: false,
+      },
+      raw: null,
+    },
+  } as unknown as Observation;
+  ctx.receive(withdrawn);
+
+  // Projected state is withdrawn -> the chip renders ? ...
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  // ... but the pending switch is neither settled nor rejected.
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.word).toBe("max");
+});

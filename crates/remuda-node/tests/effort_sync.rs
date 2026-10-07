@@ -125,19 +125,17 @@ fn terminal_to_structured_emits_a_slash_attributed_effort_observation_without_an
     let slash_high = edges
         .iter()
         .find(|p| {
-            p.effective.name == remuda_protocol::EffortName::High
+            p.effective.name == Some(remuda_protocol::EffortName::High)
                 && p.effective.source == EffortSource::Slash
                 && p.effective.ultracode == Some(false)
         })
         .expect("high stdout edge attributed to slash with flag cleared");
     assert_eq!(slash_high.effective.ultracode, Some(false));
     // Sanity: ultracode was observed in the same walk.
-    assert!(
-        edges
-            .iter()
-            .any(|p| p.effective.name == remuda_protocol::EffortName::Xhigh
-                && p.effective.ultracode == Some(true))
-    );
+    assert!(edges.iter().any(
+        |p| p.effective.name == Some(remuda_protocol::EffortName::Xhigh)
+            && p.effective.ultracode == Some(true)
+    ));
 }
 
 fn collect_effort(

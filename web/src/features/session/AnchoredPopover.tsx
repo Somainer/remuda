@@ -132,7 +132,17 @@ export function computeAnchored(
   } else {
     placement = !blockedUpByCard && roomAbove > roomBelow ? "up" : "down";
   }
-  const room = placement === "up" ? roomAbove : roomBelow;
+  // When the panel stays UP despite the parked card (below has no room for a
+  // usable panel), it must still be HEIGHT-CAPPED to the card-cleared room so
+  // its bottom edge never overlaps the card — the inner region scrolls.
+  // Using plain viewport room here let a 206px menu cover a parked approval
+  // card by ~28px (composer-effort overlap e2e).
+  const room =
+    placement === "up"
+      ? blockedUpByCard
+        ? roomAboveCleared
+        : roomAbove
+      : roomBelow;
   const cap = Math.min(vhCap, room);
   const maxHeight = cap > 0 ? cap : undefined;
   const panelHeight = Math.min(need, maxHeight ?? need);

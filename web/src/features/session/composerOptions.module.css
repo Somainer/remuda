@@ -284,3 +284,11 @@
   height: var(--touch);
   transform: translate(-50%, -50%);
 }
+
+/* c-effortui r2 item 9: when the fused trigger does not fit, hide ONLY the
+   "· ultracode" suffix (the ember sparks remain). The measuring pass
+   temporarily un-collapses to read the full content width. The permission
+   word and tier never hide. */
+.trigger[data-collapsed="1"]:not([data-measuring="1"]) .triggerUltraSuffix {
+  display: none;
+}

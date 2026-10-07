@@ -12,7 +12,7 @@ import {
 } from "../../lib/imageAnchors";
 import {
   isLiveReachable,
-  launchPermissionTable,
+  structuredPermissionTable,
   normalizePermissionMode,
 } from "./permissions";
 import type { PermissionEffectiveView } from "./permissionEffective";
@@ -31,6 +31,7 @@ import {
   effortStopName,
   effortTable,
   effortWireName,
+  EFFORT_MENU_FOOTER,
   harnessMeta,
   isEmberEffort,
   mapEffort,
@@ -59,6 +60,7 @@ import type { AttachmentRef, Attachment } from "../../lib/attachments";
 import popover from "./popover.module.css";
 import css from "./composer.module.css";
 import opt from "./composerOptions.module.css";
+import { useChipSuffixCollapse } from "./useChipSuffixCollapse";
 
 type MenuId = "effort" | "permission" | "usage" | null;
 
@@ -446,7 +448,9 @@ export function Composer({
   // Permission: the chip renders the read-back mode; pending overrides it
   // with 切换中/排队中. The menu lists the harness's real launch table, with
   // launch-only rows greyed for the live session.
-  const permOptions = launchPermissionTable(harness);
+  // Structured composer: the unified four-row permission menu (New Session
+  // and the live wheel share it); the row's native word maps per CLI.
+  const permOptions = structuredPermissionTable(harness);
   const liveMode = normalizePermissionMode(
     harness,
     permissionPending?.mode ?? permissionEffective?.mode ?? permissionMode,
@@ -977,6 +981,7 @@ export function Composer({
     ultraEffective: effortEffective?.ultracode ?? null,
     defaultIndex: effortDefaultIndex,
     onModel: caps.model ? onModel : undefined,
+    listFooter: EFFORT_MENU_FOOTER,
   };
 
   const effortSliderNode = caps.effort ? (
@@ -1062,7 +1067,7 @@ export function Composer({
       </span>
       {effectiveFlagWord ? (
         <span
-          className={effortEffective?.ultracode === true || pending?.ultracode ? css.chipUltra : css.chipUltraMuted}
+          className={`${effortEffective?.ultracode === true || pending?.ultracode ? css.chipUltra : css.chipUltraMuted} ${opt.triggerUltraSuffix}`}
           data-testid="model-effort-ultracode"
           data-effective={effortEffective?.ultracode === true ? "on" : effortEffective?.ultracode === false ? "off" : "unknown"}
         >
@@ -1168,6 +1173,13 @@ export function Composer({
     : effectiveUnknown
       ? "unknown"
       : `${effectiveLevelWord}${effortEffective?.ultracode ? " ultracode" : ""}`;
+  // r2 item 9: on a narrow phone trigger the "· ultracode" suffix collapses to
+  // the ember sparks; the permission word and tier never collapse.
+  const ultraSuffixCollapsed = useChipSuffixCollapse(optionsTriggerRef, [
+    triggerModeWord,
+    effectiveLevelWord,
+    effectiveFlagWord,
+  ]);
   const mobileTriggerNode = (
     <span className={opt.triggerGroup}>
       <button
@@ -1177,6 +1189,7 @@ export function Composer({
         data-testid={caps.effort ? "model-effort-chip" : "composer-options-trigger"}
         data-options-trigger="1"
         data-ember={ember ? "1" : "0"}
+        data-collapsed={caps.effort && ultraSuffixCollapsed ? "1" : "0"}
         data-permission={caps.permission ? liveMode : undefined}
         data-permission-danger={caps.permission && permDanger ? "1" : "0"}
         data-effort-effective={

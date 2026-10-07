@@ -628,6 +628,61 @@ describe("Composer mobile options trigger (D-042)", () => {
     expect(screen.getByTestId("composer-trigger-permission")).toHaveTextContent("绕过全部");
   });
 
+  it("r2 item 9: collapses only the ultracode suffix when the fused trigger does not fit", () => {
+    const stubWidths = (client: number, scroll: number) => {
+      const btn = screen.getByTestId("model-effort-chip");
+      Object.defineProperty(btn, "clientWidth", { configurable: true, get: () => client });
+      Object.defineProperty(btn, "scrollWidth", { configurable: true, get: () => scroll });
+      fireEvent(window, new Event("resize"));
+    };
+    render(
+      <Composer
+        instanceId="ins_m_ultra_narrow"
+        mobile
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 3, true)}
+        effortEffective={{ name: "xhigh", ultracode: true, source: "remuda", observedAt: "2026-10-06T00:00:00Z" }}
+        onPermission={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByTestId("model-effort-chip");
+    // 132 px box, 150 px content: overflows.
+    stubWidths(132, 150);
+    expect(trigger).toHaveAttribute("data-collapsed", "1");
+    // The permission word and tier are intact; only the suffix collapses.
+    expect(screen.getByTestId("composer-trigger-permission")).toHaveTextContent("询问");
+    expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("xhigh");
+    expect(screen.getByTestId("model-effort-ultracode")).toBeInTheDocument();
+
+    // Room returns: the suffix comes back.
+    stubWidths(200, 150);
+    expect(trigger).toHaveAttribute("data-collapsed", "0");
+  });
+
+  it("r2 item 9: keeps the ultracode suffix when the full content fits at 132 px", () => {
+    render(
+      <Composer
+        instanceId="ins_m_ultra_fit"
+        mobile
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 3, true)}
+        effortEffective={{ name: "xhigh", ultracode: true, source: "remuda", observedAt: "2026-10-06T00:00:00Z" }}
+        onPermission={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByTestId("model-effort-chip");
+    Object.defineProperty(trigger, "clientWidth", { configurable: true, get: () => 132 });
+    Object.defineProperty(trigger, "scrollWidth", { configurable: true, get: () => 128 });
+    fireEvent(window, new Event("resize"));
+    expect(trigger).toHaveAttribute("data-collapsed", "0");
+    expect(screen.getByTestId("composer-trigger-permission")).toHaveTextContent("询问");
+    expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("xhigh");
+  });
+
   it("keeps the option-only controls in the sheet and the primary control outside", async () => {
     const user = userEvent.setup();
     render(

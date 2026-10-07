@@ -454,7 +454,30 @@ mod tests {
         // Opus input price is carried from the (provisional) driver card.
         assert_eq!(opus.input_price_per_mtok(), Some(15.0));
         assert!(opus.price_is_provisional());
-        assert_eq!(CATALOG_REVISION, 3);
+        assert_eq!(CATALOG_REVISION, 4);
+    }
+
+    #[test]
+    fn opus_4_7_canonical_alias_dated_and_context_resolve() {
+        // D-056 §6: every spelling lands on the 4.7 row, never the current
+        // Opus 5 — longest candidate wins.
+        for id in [
+            "claude-opus-4-7",
+            "opus-4-7",
+            "claude-opus-4-7[1m]",
+            "claude-opus-4-7-20250824",
+            "Claude-Opus-4-7-20250824",
+        ] {
+            assert_eq!(lookup(id).unwrap().id, "claude-opus-4-7", "{id}");
+        }
+        // The bare alias stays the CURRENT opus (5); "opus-4-7" is longer and
+        // prefix-distinct.
+        assert_eq!(lookup("opus").unwrap().id, "claude-opus-5");
+        let row = lookup("claude-opus-4-7").unwrap();
+        assert_eq!(row.default_effort, Some("xhigh"));
+        assert!(row.ultracode_capable);
+        assert_eq!(default_effort_of("opus-4-7"), Some("xhigh"));
+        assert!(ultracode_capable("claude-opus-4-7-20250824"));
     }
 
     #[test]

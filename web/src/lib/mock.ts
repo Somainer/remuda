@@ -14,7 +14,7 @@ import type { Workspace } from "../types/workspace";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import { printCapabilities, ptyCapabilities } from "./capabilities";
 import type { ResumeMode, ResumeResult } from "./api";
-import type { DriverKind } from "../types/nativeRef";
+import type { DriverKind, CapabilitySnapshot } from "../types/nativeRef";
 import { HubHttpError } from "./httpError";
 import { digestPlaceholder, id, now } from "./ids";
 import { MOCK_BOOTSTRAP_TOKEN, readSession, type DeviceSession, type PairCode, type PairedDevice } from "./session";
@@ -29,6 +29,17 @@ export type MockPasskey = {
 import { thisDeviceId } from "./interactionStatus";
 import { LONG_EVENT_COUNT, LONG_SESSION_TITLE, buildLongObservations } from "../fixtures/session/longEvents";
 import { BATCH_E_EVENT_COUNT, BATCH_E_TITLE, buildBatchEObservations } from "../fixtures/session/batchE";
+
+/** Capabilities for a mock AGENT PTY session. The demo fleet runs the current
+ *  decoupled Claude build (D-056 >=2.1.284), so the accepted five-stop slider
+ *  + orthogonal-switch UI exercises the live shape; the print/legacy carrier
+ *  keeps printCapabilities()'s 2.1.268. The version is an explicit REPORTED
+ *  snapshot, never synthesized in the capability matrix (r2 item 1). */
+function mockAgentPtyCaps(kind: Kind, driver: DriverKind): CapabilitySnapshot {
+  const caps = ptyCapabilities(driver);
+  if (kind === "claude") caps.binaryVersion = "2.1.289";
+  return caps;
+}
 
 const ts = now();
 
@@ -68,6 +79,9 @@ const nativeSession = String(claudeInit.session_id);
 
 function instanceBase(entityId: Id, journal: Id, lifecycle: Instance["lifecycle"], activity: Instance["activity"]): Instance {
   const caps = printCapabilities();
+  // Explicitly reported current (decoupled) Claude build for the demo
+  // sessions the effort UI drives in the browser (r2 item 1).
+  caps.binaryVersion = "2.1.289";
   return {
     ...meta(entityId),
     hostId,
@@ -824,7 +838,7 @@ function addPty(kind: Kind, driver: DriverKind, name: string, activity: Instance
   ins.driver = driver;
   ins.workspaceId = workspace;
   ins.nativeRef = { ...ins.nativeRef, kind };
-  ins.capabilities = ptyCapabilities(driver);
+  ins.capabilities = mockAgentPtyCaps(kind, driver);
   if (activity.state === "known" && activity.value === "idle") ins.activeRunIds = [];
   instances.push(ins);
   titles.set(ins.id, name);
@@ -1248,7 +1262,8 @@ export function mockResume(instanceId: Id, mode: ResumeMode = "structured"): Res
   child.kind = parent.kind;
   child.driver = driver;
   child.cwd = parent.cwd;
-  child.capabilities = driver === "claude-print" ? printCapabilities() : ptyCapabilities(driver);
+  child.capabilities =
+    driver === "claude-print" ? printCapabilities() : mockAgentPtyCaps(parent.kind, driver);
   child.nativeRef = { ...parent.nativeRef };
   child.parent = { instanceId, runId: id("run_"), commandId: id("cmd_") };
   child.activeRunIds = [];
@@ -1338,7 +1353,7 @@ export function mockCreate(prompt: string, extras?: { hostId?: Id; workspaceId?:
   if (extras?.driver) ins.driver = extras.driver;
   if (extras?.kind) ins.kind = extras.kind;
   if (extras?.driver === "generic-pty" || extras?.driver === "claude-pty" || extras?.driver === "shell-pty") {
-    ins.capabilities = ptyCapabilities(extras.driver);
+    ins.capabilities = mockAgentPtyCaps(ins.kind, extras.driver);
   }
   if (extras?.kind === "terminal") {
     ins.capabilities = ptyCapabilities(extras.driver ?? "shell-pty");

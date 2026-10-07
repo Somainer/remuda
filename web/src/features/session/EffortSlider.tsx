@@ -41,6 +41,7 @@ export function EffortSlider({
   idPrefix = "effort",
   label = "effort",
   footer,
+  listFooter,
   variant = "popover",
   model,
   launchModel = null,
@@ -73,6 +74,8 @@ export function EffortSlider({
   idPrefix?: string;
   label?: string;
   footer?: string;
+  /** Foot of the expanded tier/model LIST view only (the pill keeps `footer`). */
+  listFooter?: string;
   variant?: "popover" | "inline";
   model?: string;
   launchModel?: string | null;
@@ -545,7 +548,7 @@ export function EffortSlider({
             </>
           ) : null}
         </div>
-        {footer ? <div className={css.menuFoot}>{footer}</div> : null}
+        {(listFooter ?? footer) ? <div className={css.menuFoot}>{listFooter ?? footer}</div> : null}
       </div>
     );
   }

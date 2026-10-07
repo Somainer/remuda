@@ -20,6 +20,7 @@ import {
   codexSandboxTable,
   defaultPermissionForKind,
   launchPermissionTable,
+  structuredPermissionTable,
   normalizePermissionMode,
   type PermissionOption,
 } from "../features/session/permissions";
@@ -310,7 +311,11 @@ export function NewSessionPage() {
 
   // The launch table for the active harness; terminal has none.
   const permissionTable: PermissionOption[] =
-    activeKind === "terminal" ? [] : launchPermissionTable(activeKind);
+    activeKind === "terminal"
+      ? []
+      : activeKind === "codex"
+        ? launchPermissionTable("codex")
+        : structuredPermissionTable(activeKind);
   // The dangerous/yolo row varies per harness and gates the ack checkbox.
   const dangerPermission = permissionTable.find((option) => option.danger);
   const yoloModeActive = Boolean(dangerPermission && permissionMode === dangerPermission.id);
@@ -379,7 +384,9 @@ export function NewSessionPage() {
       ? effort
       : mapEffort(effort, activeKind as EffortKind)
     : (activeKind as string) === "claude"
-      ? effortAt("claude", modelDefault?.index ?? 2, false)
+      ? // The operator's device Settings default (settings-effort-*) wins over
+        // the per-model catalog default for the unpinned slider.
+        effortAt("claude", device.defaultEffortIndex ?? modelDefault?.index ?? 2, false)
       : effortAt(activeKind as EffortKind, defaultEffortIndex(activeKind));
   // What the form shows/sends: a pinned draft, else the model default
   // (unpinned — no effort fields on create).

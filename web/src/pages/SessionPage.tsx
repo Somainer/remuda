@@ -12,8 +12,7 @@ import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
 import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
-import { CLAUDE_XHIGH_INDEX, claudeDefaultTier, contextPercent } from "../features/session/effort";
-import { ptyYoloChipLabel } from "../lib/sessionOptions";
+import { claudeDefaultTier, contextPercent } from "../features/session/effort";
 import { Transcript } from "../features/session/Transcript";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
 import { projectTurnDecision } from "../features/session/live/turnDecision";
@@ -832,14 +831,10 @@ export function SessionPage({
           onSteerHeld={(id) => hubStore.steerHeld(instance.id, id)}
           onFlushHeld={() => hubStore.flushHeld(instance.id)}
           onInterrupt={() => hubStore.cancel(instance.id)}
-          permissionMode={
-            genericPty ? ptyYoloChipLabel(instance.kind) : hubStore.permissionModeOf(instance.id)
-          }
-          launchPermissionMode={
-            genericPty ? undefined : hubStore.launchPermissionModeOf(instance.id)
-          }
-          permissionEffective={genericPty ? null : hubStore.permissionEffectiveOf(instance.id)}
-          permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}
+          permissionMode={hubStore.permissionModeOf(instance.id)}
+          launchPermissionMode={hubStore.launchPermissionModeOf(instance.id)}
+          permissionEffective={hubStore.permissionEffectiveOf(instance.id)}
+          permissionPending={hubStore.permissionPendingOf(instance.id)}
           kind={instance.kind}
           model={hubStore.modelOf(instance.id, instance.kind)}
           launchModel={instance.model ?? null}
@@ -873,48 +868,28 @@ export function SessionPage({
             return pct == null ? null : `${pct}%`;
           })()}
           usageRollup={hubStore.usageRollupOf(instance.id)}
+          // Every structured agent (claude/grok/agy — not a raw terminal)
+          // gets the unified four-row permission menu; its native wire id is
+          // mapped by the driver/materializer. The print/generic-pty fixture
+          // drives the same menu (composer-effort e2e contract).
           onPermission={
-            genericPty || instance.kind !== "claude"
+            instance.kind === "terminal"
               ? undefined
               : (mode) => {
                   void hubStore.setPermission(instance.id, mode);
                 }
           }
           effortDisabled={status === "exited" || instance.ownership === "observed-only"}
-          onEffort={(next) => {
-            // D-056 coupled-build linkage lives HERE (the slider never moves
-            // itself): on 2.1.203–2.1.283 sliding away from xhigh turns the
-            // switch off; on ≥2.1.284 the flag is orthogonal and rides along.
-            // Return the promise (the store owns failure: it rolls back and
-            // toasts; it never rejects) rather than voiding it.
-            if (
-              next.kind === "claude"
-              && hubStore.effortVersionGate(instance.id) === "coupled"
-              && (hubStore.effortOf(instance.id).ultracode === true)
-              && next.index !== CLAUDE_XHIGH_INDEX
-            ) {
-              return hubStore.setEffort(instance.id, { ...next, ultracode: false });
-            }
-            return hubStore.setEffort(instance.id, next);
-          }}
-          onUltracode={(on) => {
-            // Coupled build: turning the switch on also moves the slider to
-            // xhigh and says so; turning off leaves the tier where it is.
-            if (
-              on
-              && instance.kind === "claude"
-              && hubStore.effortVersionGate(instance.id) === "coupled"
-            ) {
-              const current = hubStore.effortOf(instance.id, instance.kind);
-              return hubStore.setEffort(instance.id, {
-                ...current,
-                index: CLAUDE_XHIGH_INDEX,
-                name: "xhigh",
-                ultracode: true,
-              });
-            }
-            return hubStore.setUltracode(instance.id, on);
-          }}
+          // D-056 live configure is the STRUCTURED two-axis wire
+          // ({name, ultracode}) — the slider and switch stay orthogonal on
+          // every build that exposes the switch (legacy/unknown builds lock
+          // it inside the slider). The argv coupling (`--effort ultracode`
+          // ⇒ xhigh) is a LAUNCH-only materializer limit handled in New
+          // Session; a live session can post max+ultracode, which the driver
+          // accepts while it clamps plain max. Return the promise (the store
+          // owns failure: it rolls back and toasts; it never rejects).
+          onEffort={(next) => hubStore.setEffort(instance.id, next)}
+          onUltracode={(on) => hubStore.setUltracode(instance.id, on)}
           // The store owns the failure mouth: it reverts modelPending and
           // toasts the Hub/Node reason. Return the promise (never void it) so
           // a rejected configure is not an unhandled rejection and the

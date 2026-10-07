@@ -318,7 +318,14 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
     // manual run.
     crate::sandbox::ensure_home_allocated(&home, "FAKE_HARNESS_ALLOW_HOME_WRITE")
         .map_err(RunError::Io)?;
-    remuda_fdsafe::DirFd::anchor_or_create(&home).map_err(std::io::Error::from)?;
+    // Round 7 item 1: create/reach the home by pinning the allocated ROOT and
+    // walking every component below it O_NOFOLLOW. DirFd::anchor_or_create
+    // only lstat()s the FINAL component — `fstatat(NOFOLLOW)` still follows
+    // INTERMEDIATE links — so `--home <R>/ev/sub/new` with `ev -> /outside`
+    // and a real /outside/sub made anchor_or_create canonicalize /outside/sub
+    // and mkdir the home OUTSIDE the allocated root. rooted_ensure_subdir
+    // pins the sentinel root and refuses the `ev` hop instead.
+    let _home_fd = crate::sandbox::rooted_ensure_subdir(&home).map_err(RunError::Io)?;
     let session_id = opts
         .session_id
         .clone()
@@ -375,34 +382,18 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
 
     let events_file = match &events_path {
         Some(path) => {
-            crate::sandbox::ensure_path_in_temp(path, "FAKE_HARNESS_ALLOW_HOME_WRITE")?;
-            // Open the events log through the descriptor walk too.
-            let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-            let Some(name) = path.file_name() else {
-                return Err(RunError::Io(std::io::Error::other(
-                    "events path has no file name",
-                )));
-            };
-            let parent_fd =
-                remuda_fdsafe::DirFd::anchor_or_create(parent).map_err(std::io::Error::from)?;
-            let file = match parent_fd.classify_leaf(name.as_encoded_bytes()) {
-                Ok(Some(entry)) if matches!(entry.kind, remuda_fdsafe::LeafKind::Regular) => {
-                    parent_fd
-                        .open_append_leaf(name.as_encoded_bytes())
-                        .map_err(std::io::Error::from)?
-                }
-                Ok(None) => parent_fd
-                    .create_leaf_excl(name.as_encoded_bytes())
-                    .map_err(std::io::Error::from)?,
-                Ok(_) => {
-                    return Err(RunError::Io(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "events path is a symlink or non-regular file",
-                    )));
-                }
-                Err(error) => return Err(RunError::Io(error.into())),
-            };
-            Some(file)
+            // Round 7 item 1: pin the allocated ROOT and walk/create the whole
+            // events path below it O_NOFOLLOW. The previous code anchored the
+            // events PARENT with anchor_or_create, which follows an INTERMEDIATE
+            // link: `--events-out <R>/ev/sub/events.jsonl` with
+            // `ev -> /outside` and a real /outside/sub created the log OUTSIDE
+            // the allocated root. append_or_create authorizes the root, creates
+            // parents link-free, appends an existing regular leaf and EXCL-
+            // creates a missing one.
+            Some(
+                crate::sandbox::append_or_create(path, "FAKE_HARNESS_ALLOW_HOME_WRITE")
+                    .map_err(RunError::Io)?,
+            )
         }
         None => None,
     };

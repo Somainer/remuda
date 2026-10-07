@@ -879,6 +879,101 @@ impl Drop for RemoveOnDrop {
     }
 }
 
+/// Round 7 item 1 (home writer): `--home <R>/ev/sub/new` with
+/// `ev -> /outside` and a real `/outside/sub` must not mkdir through the
+/// intermediate link. anchor_or_create fstatat()s only the FINAL component, so
+/// it canonicalized the real dir beyond the link; the pinned-root walk refuses
+/// the `ev` hop. The outside tree stays byte-identical.
+#[test]
+#[cfg(unix)]
+fn r7_home_through_an_intermediate_symlink_is_refused() {
+    let root = remuda_testing::sandbox::TempHome::allocate("r7-home-link")
+        .expect("allocated root");
+    // The "outside" tree, with the final `sub/new` tail ALREADY present beyond
+    // the link (this is what made the final-component lstat verdict stop on the
+    // wrong side of the link).
+    let sink = root.child("outside-home");
+    let sink_sub = sink.join("sub");
+    std::fs::create_dir_all(&sink_sub).expect("outside sub");
+    let sentinel = sink_sub.join("sentinel.txt");
+    std::fs::write(&sentinel, b"OUTSIDE-BYTES\n").expect("seed outside bytes");
+    // `<R>/ev -> <R>/outside-home`, so the requested home is `R/ev/sub/new`.
+    std::os::unix::fs::symlink(&sink, root.child("ev")).expect("intermediate ev link");
+    let requested_home = root.child("ev/sub/new");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fake-harness"))
+        .args(["--kind", "claude", "--no-alt-screen"])
+        .arg("--home")
+        .arg(&requested_home)
+        .output()
+        .expect("spawn fake-harness");
+    assert!(
+        !output.status.success(),
+        "a home reached through an intermediate link is a non-zero exit"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fake-harness") && stderr.contains("is a symlink"),
+        "the specific O_NOFOLLOW refusal must be printed, got: {stderr}"
+    );
+    assert!(
+        !sink_sub.join("new").exists(),
+        "no home directory is created beyond the link"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).expect("sentinel still readable"),
+        b"OUTSIDE-BYTES\n",
+        "the outside tree stays byte-identical"
+    );
+}
+
+/// Round 7 item 1 (events-log writer): `--events-out <R>/ev/sub/events.jsonl`
+/// with `ev -> /outside` and a real `/outside/sub` must not create the log
+/// beyond the intermediate link. The home is a valid allocated home, so the
+/// refusal comes specifically from the events-log writer.
+#[test]
+#[cfg(unix)]
+fn r7_events_log_through_an_intermediate_symlink_is_refused() {
+    let root = remuda_testing::sandbox::TempHome::allocate("r7-events-link")
+        .expect("allocated root");
+    let home = root.child("good-home");
+    std::fs::create_dir_all(&home).expect("valid home");
+    let sink = root.child("outside-events");
+    let sink_sub = sink.join("sub");
+    std::fs::create_dir_all(&sink_sub).expect("outside sub");
+    let sentinel = sink_sub.join("sentinel.txt");
+    std::fs::write(&sentinel, b"OUTSIDE-EVENTS\n").expect("seed outside bytes");
+    std::os::unix::fs::symlink(&sink, root.child("ev")).expect("intermediate ev link");
+    let requested_log = root.child("ev/sub/events.jsonl");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fake-harness"))
+        .args(["--kind", "claude", "--no-alt-screen"])
+        .arg("--home")
+        .arg(&home)
+        .arg("--events-out")
+        .arg(&requested_log)
+        .output()
+        .expect("spawn fake-harness");
+    assert!(
+        !output.status.success(),
+        "an events path reached through an intermediate link is a non-zero exit"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fake-harness") && stderr.contains("is a symlink"),
+        "the specific O_NOFOLLOW refusal must be printed, got: {stderr}"
+    );
+    assert!(
+        !sink_sub.join("events.jsonl").exists(),
+        "no events log is created beyond the link"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).expect("sentinel still readable"),
+        b"OUTSIDE-EVENTS\n",
+        "the outside tree stays byte-identical"
+    );
+}
+
 #[test]
 fn binary_rejects_unknown_kind() {
     let _serial = support::serial();

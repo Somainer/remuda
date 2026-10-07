@@ -2660,8 +2660,25 @@ impl Driver for ShellPtyDriver {
             worker.abort();
         }
         self.events_tx.lock().await.take();
+        // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
+        // first, then give the poller one window to read the final append and
+        // publish its last turn via `finish()` (an assistant record with usage
+        // and no stop_reason would otherwise never reach usage_events). The
+        // poller holds its own events sender clone, so finalised observations
+        // still reach the RunHandle while it winds down.
+        if let Some(inner) = self.inner.lock().await.as_ref() {
+            inner.closed.store(true, Ordering::SeqCst);
+        }
         if let Some(poller) = self.poller.lock().await.take() {
-            poller.abort();
+            const PROMOTER_SHUTDOWN_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(2);
+            let mut poller = poller;
+            if tokio::time::timeout(PROMOTER_SHUTDOWN_TIMEOUT, &mut poller)
+                .await
+                .is_err()
+            {
+                poller.abort();
+            }
         }
         if let Ok(mut slot) = self.promoted.lock() {
             *slot = None;

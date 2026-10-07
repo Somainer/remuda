@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -198,6 +198,10 @@ struct PtyLive {
     interaction_task: JoinHandle<()>,
     hook_task: Option<JoinHandle<()>>,
     transcript_task: Option<JoinHandle<()>>,
+    /// Cooperative shutdown for the transcript pump; closing sets it so the
+    /// pump reads the final append and publishes a finalised last turn
+    /// (c-ctxusage r4 item 2) before the task ends.
+    transcript_shutdown: Option<watch::Sender<bool>>,
     tty_task: Option<JoinHandle<()>>,
     /// Current alt-screen mode seen by the attach relay's byte scanner.
     alt_screen: Arc<AtomicBool>,
@@ -572,11 +576,13 @@ impl ClaudePtyDriver {
         let permission_queue = Arc::new(crate::permission::PermissionQueue::new());
         // The TUI's tool calls exist only in the native transcript; follow it as
         // soon as the hook names the file (D-025's mapper, claude-pty's carrier).
+        let (transcript_shutdown, transcript_shutdown_rx) = watch::channel(false);
         let transcript_task = spawn_transcript_pump(
             Arc::clone(&transcript_path),
             tx.clone(),
             ctx.clone(),
             Arc::clone(&self.seq),
+            transcript_shutdown_rx,
             Some(Arc::clone(&effort_bridge)),
             spec.effort,
             Some(TranscriptModelSync {
@@ -699,6 +705,7 @@ impl ClaudePtyDriver {
             interaction_task,
             hook_task: Some(hook_task),
             transcript_task: Some(transcript_task),
+            transcript_shutdown: Some(transcript_shutdown),
             tty_task: None,
             alt_screen: Arc::new(AtomicBool::new(false)),
             closed: false,
@@ -1148,8 +1155,22 @@ impl Driver for ClaudePtyDriver {
         if let Some(task) = live.hook_task.take() {
             task.abort();
         }
+        // c-ctxusage r4 item 2: cooperative transcript shutdown — signal, let
+        // the pump read the final append and publish a finalised last turn,
+        // then wait one poll window before forcing the issue.
+        if let Some(shutdown) = live.transcript_shutdown.take() {
+            let _ = shutdown.send(true);
+        }
         if let Some(task) = live.transcript_task.take() {
-            task.abort();
+            const TRANSCRIPT_SHUTDOWN_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(2);
+            let mut task = task;
+            if tokio::time::timeout(TRANSCRIPT_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
         }
         if let Some(task) = live.tty_task.take() {
             task.abort();
@@ -1357,6 +1378,7 @@ fn spawn_transcript_pump(
     tx: mpsc::Sender<Observation>,
     ctx: ObsCtx,
     seq: Arc<AtomicU64>,
+    mut shutdown: watch::Receiver<bool>,
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<EffortSelection>,
     model: Option<TranscriptModelSync>,
@@ -1488,7 +1510,59 @@ fn spawn_transcript_pump(
                     }
                 }
             }
-            tokio::time::sleep(TRANSCRIPT_POLL).await;
+            // c-ctxusage r4 item 2: cooperative shutdown. On close, read the
+            // final append and `finish()` the buffered assistant run so its
+            // usage reaches usage_events even with no stop_reason and no
+            // superseding record, instead of being aborted mid-run.
+            let shutdown_fired = *shutdown.borrow_and_update();
+            tokio::select! {
+                () = tokio::time::sleep(TRANSCRIPT_POLL), if !shutdown_fired => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        if let Some((tail, mapper)) = hydrator.take() {
+                            // Owned move through the blocking task, mirroring
+                            // the regular poll batch.
+                            let (_tail, _mapper, batches) =
+                                tokio::task::spawn_blocking(move || -> (
+                                    crate::claude_transcript::TranscriptTail,
+                                    TranscriptMapper,
+                                    Vec<Result<Vec<Observation>, DriverError>>,
+                                ) {
+                                    let (mut tail, mut mapper) = (tail, mapper);
+                                    let lines = tail.poll().unwrap_or_default();
+                                    let mut batches: Vec<_> =
+                                        lines.iter().map(|line| mapper.map_line(line)).collect();
+                                    batches.push(mapper.finish());
+                                    (tail, mapper, batches)
+                                })
+                                .await
+                                .unwrap_or_else(|error| {
+                                    panic!("transcript mapping task panicked: {error}")
+                                });
+                            for batch in batches {
+                                let Ok(mapped) = batch else {
+                                    continue;
+                                };
+                                for observation in mapped {
+                                    if emit_native_obs(
+                                        &tx,
+                                        &seq,
+                                        &ctx,
+                                        SourceChannel::Transcript,
+                                        &observation,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
         }
     })
 }

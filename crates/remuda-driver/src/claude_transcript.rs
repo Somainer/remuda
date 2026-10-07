@@ -763,6 +763,10 @@ struct ResumeState {
     verified: bool,
     /// Set once the tracked file shrank, was replaced, or vanished.
     displaced: bool,
+    /// The most recent displacement was a vanish (ENOENT): when the file
+    /// returns under a new identity, everything it then contains is new to
+    /// this tail and is hydrated (Unverified) rather than anchored over.
+    absent: bool,
 }
 
 /// Whether a batch of lines is provenanced to the current process.
@@ -860,6 +864,7 @@ impl TranscriptTail {
                 head: boundary.head,
                 verified,
                 displaced: false,
+                absent: false,
             }),
         }
     }
@@ -903,6 +908,7 @@ impl TranscriptTail {
                 // restored file can never replay history as current.
                 if let Some(state) = self.resume.as_mut() {
                     state.displaced = true;
+                    state.absent = true;
                     return Ok(TailRead {
                         lines: Vec::new(),
                         provenance: TailProvenance::Unverified,
@@ -942,8 +948,13 @@ impl TranscriptTail {
             {
                 // Boundary lost. Re-anchor at the present EOF so a recreated
                 // file's bytes are not replayed; from here appends hydrate
-                // conversation only.
+                // conversation only. Adopt the replacement's identity/head so
+                // a later append is read as an append rather than as yet
+                // another replacement (the head is now shorter than the old
+                // probe after a shrink).
                 state.displaced = true;
+                state.identity = identity;
+                state.head = hash_head(&self.path, len);
                 self.offset = len;
                 self.partial.clear();
                 return Ok(TailRead {
@@ -954,9 +965,50 @@ impl TranscriptTail {
             // A displaced/unverified tail follows appends for message
             // hydration only, skipping any gap/truncation, never as Current.
             if state.displaced || !state.verified {
-                if len < self.offset {
-                    self.offset = len;
-                    self.partial.clear();
+                let identity_now = FileIdentity::from_metadata(&metadata);
+                // The head fingerprint guards every branch: on tmpfs a freed
+                // inode is reused after a vanish AND a same-path rewrite can
+                // keep the same identity, so identity/length alone cannot tell
+                // a replacement from an append. After a vanish the SAME head
+                // would mean the original file merely reappeared.
+                let head_matches = match state.head {
+                    Some(probe) => {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let mut buf = vec![0_u8; probe.len as usize];
+                        file.seek(SeekFrom::Start(0))
+                            .ok()
+                            .and_then(|_| file.read_exact(&mut buf).ok())
+                            .is_some_and(|()| fingerprint_bytes(&buf, probe.len) == probe)
+                    }
+                    None => true,
+                };
+                if identity_now != state.identity || !head_matches {
+                    if state.absent {
+                        // The file came back after an ENOENT. Every byte on the
+                        // restored file is new to THIS tail: hydrate the whole
+                        // thing (still Unverified — the gate is closed), then
+                        // follow appends on the restored identity.
+                        self.offset = 0;
+                        self.partial.clear();
+                    } else {
+                        // A replacement seen while the file stayed present may
+                        // carry replayed history: anchor at the new EOF.
+                        self.offset = len;
+                        self.partial.clear();
+                    }
+                    state.identity = identity_now;
+                    state.head = hash_head(&self.path, len);
+                    state.absent = false;
+                } else {
+                    // The same file continued (or reappeared on its identity
+                    // with an intact head): ordinary tailing resumes; the
+                    // absent-restore rule no longer applies to a later
+                    // replacement.
+                    state.absent = false;
+                    if len < self.offset {
+                        self.offset = len;
+                        self.partial.clear();
+                    }
                 }
                 let lines = Self::read_lines(&mut file, len, &mut self.offset, &mut self.partial)?;
                 return Ok(TailRead {
@@ -1392,11 +1444,11 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_tail_that_disappears_errors_then_degrades_when_the_file_returns() {
-        // Item 2: while absent, poll is an error (the caller degrades, never
-        // silently rebinds); when it returns under a new inode there is no
-        // current-process provenance, so read-back stays unverified rather than
-        // trusting the (possibly replayed) bytes.
+    fn a_one_poll_enoent_keeps_the_resume_tail_and_comes_back_unverified() {
+        // Item 6: a one-poll ENOENT (the bound file is being rotated/recreated)
+        // does NOT end the tail: the hydrator keeps its anchor, the missing poll
+        // returns no lines as Unverified, and appends after the restore hydrate
+        // conversation — never as Current.
         let tmp = tempfile::tempdir().expect("tmp");
         let path = tmp.path().join("t.jsonl");
         write(&path, "{\"old\":1}\n");
@@ -1404,14 +1456,33 @@ mod tests {
         let mut tail = TranscriptTail::resumed(path.clone(), boundary);
         assert!(tail.poll().expect("poll").lines.is_empty());
         std::fs::remove_file(&path).expect("remove");
-        assert!(tail.poll().is_err(), "missing file is a poll error");
-        // Recreated at the SAME identity (e.g. an atomic rewrite that reused the
-        // inode is not representable on Unix; here a plain reopen with new
-        // identity must displace, so assert the conservative outcome).
-        append(&path, "{\"new\":1}\n");
-        let read = tail.poll().expect("poll");
-        // New identity after a delete => unverified, regardless of length.
+        let missing = tail.poll().expect("ENOENT keeps the tail alive");
+        assert!(missing.lines.is_empty());
+        assert_eq!(missing.provenance, TailProvenance::Unverified);
+        assert!(tail.displaced(), "the anchor is now unprovable");
+        // The file returns under a new identity (tmpfs may even reuse the
+        // inode; the head fingerprint makes the replacement detectable):
+        // every byte on the restored file is new to this tail and hydrates,
+        // but the gate stays closed.
+        append(&path, "{\"new\":1}\n{\"new\":2}\n");
+        let read = tail.poll().expect("poll after restore");
         assert_eq!(read.provenance, TailProvenance::Unverified);
+        assert_eq!(read.lines, vec!["{\"new\":1}", "{\"new\":2}"]);
+        // A second transient ENOENT is still survivable, and its restore also
+        // hydrates.
+        std::fs::remove_file(&path).expect("remove again");
+        let missing = tail.poll().expect("second ENOENT still keeps the tail");
+        assert_eq!(missing.provenance, TailProvenance::Unverified);
+        append(&path, "{\"new\":3}\n");
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.provenance, TailProvenance::Unverified);
+        assert_eq!(read.lines, vec!["{\"new\":3}"]);
+        // A present-file replacement afterwards anchors at EOF (replayed
+        // bytes suppressed), then appends hydrate.
+        write(&path, "{\"rotated\":1}\n");
+        assert!(tail.poll().expect("poll").lines.is_empty());
+        append(&path, "{\"new\":4}\n");
+        assert_eq!(tail.poll().expect("poll").lines, vec!["{\"new\":4}"]);
     }
     #[test]
     fn a_partial_trailing_line_ends_the_process_start_scan_at_that_offset() {

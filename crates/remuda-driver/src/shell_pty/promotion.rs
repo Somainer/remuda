@@ -3296,4 +3296,28 @@ mod tests {
         );
         assert!(conversation_hydrated(&observations, "reply 3"));
     }
+    #[tokio::test]
+    async fn item6_a_one_poll_enoent_keeps_the_hydrator_and_resumes_unverified() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(tmp.path(), "{}\n");
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Unverified, None);
+        pump_once(&mut hydrator, &fx).await;
+        drain(&mut fx);
+        // The bound file vanishes for one poll (rotation/recreate): the pump
+        // survives, the hydrator is NOT torn down.
+        std::fs::remove_file(&fx.binding.path).expect("vanish");
+        pump_once(&mut hydrator, &fx).await;
+        assert!(drain(&mut fx).is_empty(), "no observations while absent");
+        // It returns under a new identity: appended conversation hydrates,
+        // still Unverified, so an effort record on it cannot open the gate.
+        append_line(&fx.binding.path, &user_line(1, "after restore"));
+        append_line(&fx.binding.path, &assistant_line(Some("high"), 2));
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(
+            effort_rows(&observations).is_empty(),
+            "post-restore bytes stay gated: {observations:?}"
+        );
+        assert!(conversation_hydrated(&observations, "after restore"));
+    }
 }

@@ -328,8 +328,8 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
 
     // Sync assertions captured so cleanup always runs, then the failure (if
     // any) is resumed.
-    let checks: std::thread::Result<()> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || {
+    let checks: std::thread::Result<()> =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let turns = rollup["turns"].as_i64().unwrap_or(0);
             assert!(turns >= 1, "at least one per-turn usage row: {rollup}");
             // 1000 uncached + 9000 read + 340 write(5m+1h) = 10340 → 5% of 200k.
@@ -349,10 +349,13 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
                 "5m+1h split sums: {rollup}"
             );
             assert_eq!(rollup["cacheReadTokens"].as_i64(), Some(9_000), "{rollup}");
-            assert_eq!(rollup["sessionInputTokens"].as_i64(), Some(1_000), "{rollup}");
+            assert_eq!(
+                rollup["sessionInputTokens"].as_i64(),
+                Some(1_000),
+                "{rollup}"
+            );
             assert_eq!(rollup["sessionOutputTokens"].as_i64(), Some(50), "{rollup}");
-        },
-    ));
+        }));
     // Guaranteed cleanup runs whether the assertions passed or failed.
     cleanup.await;
     checks.expect("usage rollup assertions");

@@ -1708,7 +1708,7 @@ mod tests {
         // The identical stock arriving again (adapter restart, fresh seq) is
         // frozen.
         assert!(
-            !insert_usage_event(&conn, &r2).unwrap() || true,
+            !insert_usage_event(&conn, &r2).unwrap(),
             "dedup is by content not seq"
         );
         assert_eq!(

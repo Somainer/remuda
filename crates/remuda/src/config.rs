@@ -1353,7 +1353,11 @@ secret_refs = { token = "env:UNREAD_TEST_SECRET" }
     }
 
     /// On Unix a non-UTF-8 env value yields an error whose rendering does not
-    /// carry the offending bytes.
+    /// carry the offending bytes OR their ASCII neighbours. The payload is
+    /// distinctive (`LEAKME` + 0xFF) so a leak of either the raw byte or a
+    /// lossy replacement is caught, under both the `{:#}` context chain and the
+    /// `{:?}` Debug rendering (a plain `{}` on an anyhow error hides the
+    /// chain and cannot hold 0xFF in a String anyway, so it could never fail).
     #[cfg(unix)]
     #[test]
     fn secret_ref_non_utf8_env_error_does_not_contain_the_byte() {
@@ -1361,7 +1365,7 @@ secret_refs = { token = "env:UNREAD_TEST_SECRET" }
             return;
         }
         use std::os::unix::ffi::OsStrExt;
-        let bad = std::ffi::OsStr::from_bytes(&[b's', 0xFF, b'z']).to_owned();
+        let bad = std::ffi::OsStr::from_bytes(b"LEAKME\xFF").to_owned();
         let output = run_secret_child("config::tests::secret_ref_non_utf8_env_error_child", bad);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
@@ -1379,14 +1383,26 @@ secret_refs = { token = "env:UNREAD_TEST_SECRET" }
         let err = SecretRef::Env(SECRET_VALUE_ENV.into())
             .resolve()
             .expect_err("non-UTF-8 env value must not resolve");
-        let rendered = format!("{err}");
-        // 0xFF can never occur in valid UTF-8; resolving it to a String error
-        // must not surface the raw OsString bytes either.
+        // Every rendering callers actually use when surfacing startup errors.
+        for rendered in [format!("{err:#}"), format!("{err:?}")] {
+            let bytes = rendered.as_bytes();
+            assert!(
+                !bytes.contains(&0xFF),
+                "error rendering leaks the raw secret byte: {rendered}"
+            );
+            assert!(
+                !rendered.contains('\u{FFFD}'),
+                "error rendering leaks a lossy replacement of the secret: {rendered}"
+            );
+            assert!(
+                !rendered.contains("LEAKME"),
+                "error rendering leaks the secret's ASCII payload: {rendered}"
+            );
+        }
         assert!(
-            !rendered.as_bytes().contains(&0xFF),
-            "error rendering leaks the secret byte: {rendered}"
+            format!("{err}").contains(SECRET_VALUE_ENV),
+            "error names the var, never its value"
         );
-        assert!(rendered.contains(SECRET_VALUE_ENV), "error names the var");
         println!("CHILD-OK");
     }
 }

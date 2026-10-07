@@ -646,6 +646,70 @@ describe("Composer context usage chip", () => {
     expect(screen.getByTestId("composer-options-sheet")).toBeVisible();
     expect(chip).toHaveFocus();
   });
+
+  // r2 item 1: EVERY parent-close path must funnel through dismissOptions, so
+  // a stacked usage card can never be orphaned.
+  it("attach/paste from the sheet closes a stacked usage card with the sheet", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_sheet_paste" mobile onSend={vi.fn()} usageRollup={rollup} />,
+    );
+    await user.click(screen.getByTestId("model-effort-chip"));
+    const sheet = screen.getByTestId("composer-options-sheet");
+    await user.click(within(sheet).getByTestId("context-chip"));
+    expect(screen.getByTestId("context-usage-popover")).toBeInTheDocument();
+    // The sheet's 粘贴附件 button runs the same close-before-insert path as
+    // the file picker (sheetAttachHandlers). Clipboard read rejects in jsdom;
+    // the dismiss happens first and must still win.
+    await user.click(within(sheet).getByTestId("attach-paste"));
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+    expect(screen.queryByTestId("composer-options-sheet")).toBeNull();
+  });
+
+  it("picking an in-sheet permission clears the usage pin and closes both layers", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer
+        instanceId="ins_sheet_perm"
+        mobile
+        onSend={vi.fn()}
+        onPermission={vi.fn()}
+        permissionMode="manual"
+        usageRollup={rollup}
+      />,
+    );
+    await user.click(screen.getByTestId("model-effort-chip"));
+    const sheet = screen.getByTestId("composer-options-sheet");
+    await user.click(within(sheet).getByTestId("context-chip"));
+    expect(screen.getByTestId("context-usage-popover")).toBeInTheDocument();
+    // Pick a reachable permission row (manual is live-reachable for claude).
+    const row = within(sheet)
+      .getAllByTestId(/^permission-option-/)
+      .find((el) => !el.hasAttribute("disabled"))!;
+    expect(row).toBeTruthy();
+    await user.click(row);
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+    expect(screen.queryByTestId("composer-options-sheet")).toBeNull();
+    // Reopening starts clean: the pin was cleared, so the usage card is not
+    // auto-pinned open again.
+    await user.click(screen.getByTestId("model-effort-chip"));
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+  });
+
+  it("the in-sheet effort slider's Escape (model list) closes the sheet via the same funnel", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_sheet_effort_close" mobile onSend={vi.fn()} kind="claude" />,
+    );
+    await user.click(screen.getByTestId("model-effort-chip"));
+    const sheet = screen.getByTestId("composer-options-sheet");
+    // Open the slider's model/tier list; its Escape fires the slider's own
+    // onClose, which must route through dismissOptions.
+    await user.click(within(sheet).getByTestId("effort-open-list"));
+    expect(within(sheet).getByTestId("effort-list")).toBeInTheDocument();
+    fireEvent.keyDown(within(sheet).getByTestId("effort-list"), { key: "Escape" });
+    expect(screen.queryByTestId("composer-options-sheet")).toBeNull();
+  });
 });
 
 describe("Composer held-queue flush (turn-end boundary)", () => {

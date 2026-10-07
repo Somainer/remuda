@@ -496,6 +496,14 @@ export function Composer({
     cancelHoverClose();
     setMenu(null);
   };
+  // r2: EVERY parent-close path closes the stacked usage sheet too — scrim,
+  // Escape, attach/paste, the in-sheet effort slider's close, and the
+  // in-sheet permission pick. One funnel so a path can't leave an orphaned
+  // pinned usage card behind.
+  const dismissOptions = () => {
+    dismissUsage();
+    setOptionsOpen(false);
+  };
   useEffect(() => () => cancelHoverClose(), []);
 
   const controls = composerState(
@@ -899,14 +907,13 @@ export function Composer({
   // otherwise insertForAttachments focuses/scrolls the textarea behind the
   // aria-modal scrim, violating the focus trap. After close the textarea
   // focus is correct (the staged chip renders above the input).
-  const closeOptions = () => setOptionsOpen(false);
   const sheetAttachHandlers = {
     onFiles: (files: File[]) => {
-      closeOptions();
+      dismissOptions();
       insertForAttachments(images.add(files));
     },
     onPasteClick: async () => {
-      closeOptions();
+      dismissOptions();
       insertForAttachments(await images.pasteFromClipboard());
     },
   };
@@ -961,7 +968,7 @@ export function Composer({
       onChange={(next) => onEffort?.(next)}
       onModel={caps.model ? onModel : undefined}
       onClose={() => {
-        setOptionsOpen(false);
+        dismissOptions();
         optionsTriggerRef.current?.focus();
       }}
     />
@@ -983,8 +990,10 @@ export function Composer({
           onClick={() => {
             if (!reachable) return;
             onPermission?.(m.id);
-            setMenu(null);
-            if (inSheet) setOptionsOpen(false);
+            // In the sheet this is a parent-close: clear a stacked usage card
+            // (incl. its pin) together with the sheet, never orphan it.
+            if (inSheet) dismissOptions();
+            else setMenu(null);
           }}
         >
           <span className={`${css.radio} ${active ? css.radioOn : ""}`} />
@@ -1514,14 +1523,7 @@ export function Composer({
       ) : null}
       <ComposerOptionsSheet
         open={mobile && optionsOpen}
-        onClose={() => {
-          // RC4: the stacked usage sheet closes WITH ITS PARENT — one scrim
-          // tap or Escape dismisses usage and the options sheet together, so
-          // the composer trigger is hit-testable again after a single
-          // dismissal. (The usage panel's own × closes only usage.)
-          dismissUsage();
-          setOptionsOpen(false);
-        }}
+        onClose={dismissOptions}
         returnFocusRef={optionsTriggerRef}
         attach={
           <AttachButtons

@@ -41,6 +41,7 @@ import { endReason } from "../lib/endReason";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
 import { hubStore, useHub } from "../lib/store";
+import { e2eSeamsEnabled } from "../lib/e2eSeams";
 import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
@@ -121,10 +122,11 @@ export function SessionPage({
   }, [instanceId]);
 
   // c-composerpop e2e seam: inject a Hub-computed usage rollup as if a poll
-  // had delivered it (fake-node sessions never report usage). Same shape as
-  // the window.__notifyLab seam in app/Shell.tsx; e2e-only.
+  // had delivered it (fake-node sessions never report usage). Installed ONLY
+  // when the e2e seam marker is set (hub-auth addInitScript); a production
+  // session never gets this handle.
   useEffect(() => {
-    if (!instanceId || isTtyLabFixtureId(instanceId)) return;
+    if (!e2eSeamsEnabled() || !instanceId || isTtyLabFixtureId(instanceId)) return;
     window.__usageLab = {
       setRollup: (rollup: UsageRollup) => hubStore.setUsageRollupForTest(instanceId, rollup),
     };

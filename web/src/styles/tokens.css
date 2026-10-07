@@ -293,12 +293,17 @@
   --ease-in: cubic-bezier(0.3, 0, 1, 1);
 
   /*
-   * Stacking order. Popovers/menus/sheets must sit ABOVE the notification
-   * stack so a toast or standing error never covers or dismisses an open
-   * menu (c-composerpop item 8).
+   * Stacking order (c-composerpop). Final order, low → high:
+   *   notify stack 30 < popover/menu 40 < annotation dock 50 < sheet 60
+   *   < fullscreen terminal 80.
+   * Popovers/menus sit above the notification stack so a toast or standing
+   * error never covers or dismisses an open menu; the annotation dock rides
+   * above menus (the 批注 bar must not hide behind an open slider) but below
+   * a sheet/scrim.
    */
   --z-notify-stack: 30;
   --z-popover: 40;
+  --z-annotation-dock: 50;
   --z-sheet: 60;
 }
 

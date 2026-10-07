@@ -85,6 +85,7 @@ const HELD_RETRY_BASE_MS = 2_000;
 const HELD_RETRY_MAX_MS = 30_000;
 import { liveSummary } from "../features/session/liveSummary";
 import { HubHttpError, isUnauthorized } from "./httpError";
+import { e2eSeamsEnabled } from "./e2eSeams";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
 import { mockGappedTail, mockJournalIds } from "./mock";
@@ -3564,9 +3565,10 @@ class HubStore {
 
   /** c-composerpop e2e seam: inject a Hub-computed usage rollup exactly as a
    *  poll hydration would have folded it in (fake-node sessions never report
-   *  usage, so the mobile stacked-sheet cases inject one). Mirrors the
-   *  window.__notifyLab / window.__ttyLab seams; no production call site. */
+   *  usage, so the mobile stacked-sheet cases inject one). Inert unless the
+   *  e2e seam marker is set — no production call site can reach it. */
   setUsageRollupForTest(instanceId: Id, rollup: UsageRollup) {
+    if (!e2eSeamsEnabled()) return;
     this.emit({ usageRollup: { ...this.state.usageRollup, [instanceId]: rollup } });
   }
 

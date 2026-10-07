@@ -23,6 +23,7 @@ import { ADMIN_NAV, PRIMARY_NAV, isSessionRoute, isUnder } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
 import { formatDiagnostic, notify, notifyStore, toastAdapter, useLiveAnnouncement, useNotifications, type Notification, type NotifyInput } from "../lib/notify";
 import { useWorkbenchViewport } from "../lib/viewport";
+import { e2eSeamsEnabled } from "../lib/e2eSeams";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { SpaceTabs } from "../features/spaces/SpaceTabs";
 import { spaceStore } from "../features/spaces/store";
@@ -106,6 +107,9 @@ export function ShellNotify() {
    * backend facts.
    */
   useEffect(() => {
+    // c-composerpop r2 item 4: the notification test seam exists only in e2e,
+    // behind the explicit addInitScript marker — never in a production session.
+    if (!e2eSeamsEnabled()) return;
     window.__notifyLab = { notify, dismissAllBlocking: notifyStore.dismissAllBlocking };
     return () => {
       delete window.__notifyLab;

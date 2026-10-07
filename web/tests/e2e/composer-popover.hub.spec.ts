@@ -13,6 +13,10 @@ import { login } from "./hub-auth";
  */
 test.describe.configure({ mode: "serial" });
 
+// Drives the in-process fake Node (creates e2e-fake-node sessions); never run
+// against an external hub that has no fake node.
+test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
+
 type NotifyLab = {
   notify: (input: { severity?: "info" | "blocking"; subject?: string; stage?: string; reason?: string }) => string;
   dismissAllBlocking: () => void;
@@ -249,6 +253,43 @@ test.describe("stacked mobile usage sheet closes with its parent (RC4)", () => {
 });
 
 
+test.describe("notification stack clears the phone home bar at 390 (r2 item 2)", () => {
+  test("a blocking notice never covers the bottom PhoneNav buttons on a home route", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    // login() lands a compact viewport on /m where PhoneNav renders (home
+    // route); no session is needed.
+    await login(page);
+    await expect(page.getByTestId("phone-nav-home")).toBeVisible();
+    await page.evaluate(() => {
+      const lab = (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab;
+      lab?.notify({ severity: "blocking", subject: "standing one", stage: "standing error" });
+    });
+    await expect(page.getByText("standing error")).toBeVisible();
+
+    // Each bottom nav button is hit-testable at its own center — the stack
+    // must clear the 56px home bar (+ safe area), not park over it.
+    for (const id of ["phone-nav-home", "phone-nav-new", "phone-nav-more"]) {
+      const btn = page.getByTestId(id);
+      const box = (await btn.boundingBox())!;
+      const hit = await page.evaluate((p) => {
+        const el = document.elementFromPoint(p.x, p.y);
+        return el?.closest(`[data-testid='${p.id}']`) != null;
+      }, { id, x: box.x + box.width / 2, y: box.y + box.height / 2 });
+      expect(hit, `${id} covered by the notification stack`).toBe(true);
+    }
+
+    // A REAL tap on 更多 reaches the button (toggles its menu) rather than the
+    // standing notice.
+    await page.getByTestId("phone-nav-more").click();
+    await expect(page.getByTestId("phone-nav-more")).toHaveAttribute("aria-expanded", "true");
+
+    await page.evaluate(() => {
+      (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab?.dismissAllBlocking();
+    });
+  });
+});
+
+
 test.describe("notification stack does not cover menus (item 8)", () => {
   const raiseTwo = (page: Page) =>
     page.evaluate(() => {
@@ -271,27 +312,48 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     // the overlap hit resolves to the stack and stack pointer-events is
     // "auto". Fixed: popover z-40, .stack pointer-events:none, only
     // .blocking auto — the hit lands on the panel.
-    const probeOverlap = (menuTestId: string) =>
-      page.evaluate((testId) => {
-        const rectOf = (el: Element) => {
-          const r = el.getBoundingClientRect();
-          return { x: r.x, y: r.y, w: r.width, h: r.height };
-        };
-        const menu = document.querySelector<HTMLElement>(`[data-testid='${testId}']`);
-        const blocker = document.querySelector<HTMLElement>("[data-testid='blocking-errors']");
-        if (!menu || !blocker) return { ok: false as const, reason: "missing nodes" };
-        const a = rectOf(menu);
-        const b = rectOf(blocker);
-        const x1 = Math.max(a.x, b.x);
-        const y1 = Math.max(a.y, b.y);
-        const x2 = Math.min(a.x + a.w, b.x + b.w);
-        const y2 = Math.min(a.y + a.h, b.y + b.h);
-        if (x2 - x1 < 8 || y2 - y1 < 8) return { ok: false as const, reason: "no overlap" };
-        const x = x1 + (x2 - x1) / 2;
-        const y = y2 - 12; // 12 px above the panel bottom, deep in both boxes
-        const el = document.elementFromPoint(x, y);
-        return { ok: true as const, onMenu: !!el?.closest(`[data-testid='${testId}']`), x, y };
-      }, menuTestId);
+    // Find a REAL-clickable INERT point — panel/menu chrome, never a control
+    // (whose own click would close or change something). When useBlocker is
+    // set the point is constrained to the menu∩standing-error intersection:
+    // elementFromPoint resolving inside the menu THERE proves both z-order
+    // and that the click reaches the menu, and a real click at that point must
+    // leave the menu open.
+    const inertPoint = (menuTestId: string, useBlocker: boolean) =>
+      page.evaluate(
+        ({ testId, withBlocker }) => {
+          const rectOf = (el: Element) => {
+            const r = el.getBoundingClientRect();
+            return { x: r.x, y: r.y, w: r.width, h: r.height };
+          };
+          const menu = document.querySelector<HTMLElement>(`[data-testid='${testId}']`);
+          if (!menu) return { ok: false as const, reason: "missing menu" };
+          const a = rectOf(menu);
+          let region = a;
+          if (withBlocker) {
+            const blocker = document.querySelector<HTMLElement>("[data-testid='blocking-errors']");
+            if (!blocker) return { ok: false as const, reason: "missing blocker" };
+            const b = rectOf(blocker);
+            const x1 = Math.max(a.x, b.x);
+            const y1 = Math.max(a.y, b.y);
+            const x2 = Math.min(a.x + a.w, b.x + b.w);
+            const y2 = Math.min(a.y + a.h, b.y + b.h);
+            if (x2 - x1 < 8 || y2 - y1 < 8) return { ok: false as const, reason: "no overlap" };
+            region = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+          }
+          const interactive =
+            'button,input,select,textarea,a[href],[role="button"],[role="slider"],[role="switch"],[tabindex]';
+          for (let yy = region.y + 4; yy < region.y + region.h - 4; yy += 4) {
+            for (let xx = region.x + 4; xx < region.x + region.w - 4; xx += 4) {
+              const el = document.elementFromPoint(xx, yy);
+              if (el?.closest(`[data-testid='${testId}']`) && !(el as HTMLElement).closest(interactive)) {
+                return { ok: true as const, x: xx, y: yy };
+              }
+            }
+          }
+          return { ok: false as const, reason: "no inert point" };
+        },
+        { testId: menuTestId, withBlocker: useBlocker },
+      );
 
     const styleGuarantees = (page: Page) =>
       page.evaluate(() => {
@@ -312,8 +374,9 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await createSession(page, "composer popover zorder");
 
-    // Permission menu bottom row: the hit stays on the menu and a trial
-    // click does not close it while standing errors are up.
+    // Permission menu: a REAL click on the menu's own chrome (not a row,
+    // which selects-and-closes by design) is delivered to the menu and keeps
+    // it open while standing errors are up.
     await page.getByTestId("permission-chip").click();
     const permMenu = page.getByTestId("permission-menu");
     await expect(permMenu).toBeVisible();
@@ -326,8 +389,12 @@ test.describe("notification stack does not cover menus (item 8)", () => {
       return !!el?.closest("[data-testid='permission-menu']");
     }, permBox);
     expect(onPermRow).toBe(true);
-    await permRow.click({ trial: true });
-    await expect(permMenu).toBeVisible();
+    const permPoint = await inertPoint("permission-menu", false);
+    expect(permPoint.ok, permPoint.ok ? "" : permPoint.reason).toBe(true);
+    if (permPoint.ok) {
+      await page.mouse.click(permPoint.x!, permPoint.y!);
+      await expect(permMenu).toBeVisible();
+    }
     await clear(page);
     await page.keyboard.press("Escape");
 
@@ -345,14 +412,12 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     expect(styles!.blockingPointerEvents).toBe("auto");
     expect(styles!.panelZ).toBeGreaterThan(styles!.stackZ);
 
-    // The overlap hit lands on the panel, not the standing error, and the
-    // point is clickable without dismissing the panel.
-    const hit = await probeOverlap("effort-slider-panel");
+    // A REAL click in the menu∩stack overlap lands on the panel (not the
+    // standing error) and keeps the panel open.
+    const hit = await inertPoint("effort-slider-panel", true);
     expect(hit.ok, hit.ok ? "" : hit.reason).toBe(true);
     if (hit.ok) {
-      expect(hit.onMenu).toBe(true);
-      const box = (await sliderPanel.boundingBox())!;
-      await sliderPanel.click({ position: { x: hit.x! - box.x, y: hit.y! - box.y }, trial: true });
+      await page.mouse.click(hit.x!, hit.y!);
       await expect(sliderPanel).toBeVisible();
     }
     await clear(page);

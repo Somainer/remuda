@@ -146,6 +146,21 @@
   }
 }
 
+/*
+ * Compact phones render the PhoneNav home bar on HOME-level routes
+ * (Shell.chrome: phoneNav = mobile && !session). There the stack must clear
+ * the 56px bar + safe area or it covers the bottom nav buttons; keep the
+ * legacy --phone-nav-h offset under the same compact query as the layout
+ * (COMPACT_WORKBENCH_QUERY). On /s/* no bar renders, and on desktop the
+ * offset stays dropped (c-composerpop item 8).
+ */
+@media (max-width: 767px),
+  (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
+  .stack {
+    bottom: calc(var(--phone-nav-h) + var(--safe-bottom) + var(--space-3));
+  }
+}
+
 /* A screen-reader-only live region: announced, never seen. */
 .srOnly {
   position: absolute;

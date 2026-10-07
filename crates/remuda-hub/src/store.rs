@@ -7775,6 +7775,112 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r7 item 3: the settlement vector one terminal write
+    /// publishes must be MONOTONIC in the follower's delivery cursor key
+    /// `(updated_at, id)` — ascending id within one sweep (all rows share the
+    /// call's `now`), ascending timestamp across two sweeps. A high id before
+    /// a low id of the same batch would advance a backpressured follower's
+    /// max-cursor past it, and the lag drain's strict `(updated_at, id) >
+    /// cursor` filter would then skip the dropped row forever.
+    #[tokio::test]
+    async fn settle_publication_is_monotonic_in_the_cursor_key() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "settle-order").await;
+        let inst_a = seed_acknowledged_instance(&store, &host).await;
+        let inst_b = seed_acknowledged_instance(&store, &host).await;
+
+        // Insert pending rows with deliberately NON-sorted ids so SQLite's
+        // natural (rowid) return order would be wrong without the ORDER BY.
+        async fn make_rows(store: &Store, instance: &str, ids: [&'static str; 3]) {
+            store
+                .run_named("r7_seed_pending_for_order", {
+                    let instance = instance.to_string();
+                    move |conn| {
+                        for id in ids {
+                            conn.execute(
+                                "INSERT INTO interactions
+                                    (id, instance_id, host_id, kind, state, blocking,
+                                     payload_json, created_at, updated_at)
+                                 VALUES (?1, ?2, 'hst_order', 'approval', 'pending', 1,
+                                     '{}', '2026-10-08T00:00:00.000Z',
+                                            '2026-10-08T00:00:00.000Z')",
+                                params![id, instance],
+                            )?;
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+                .expect("seed pending rows");
+        }
+        make_rows(
+            &store,
+            &inst_a.instance_id,
+            ["int_ord_z", "int_ord_a", "int_ord_m"],
+        )
+        .await;
+        make_rows(
+            &store,
+            &inst_b.instance_id,
+            ["int_ord_q", "int_ord_b", "int_ord_t"],
+        )
+        .await;
+
+        async fn settle(store: &Store, ids: Vec<String>, now: &str) -> Settlement {
+            let now = now.to_string();
+            store
+                .run_named("r7_settle_for_order", move |conn| {
+                    settle_instance_interactions(conn, &ids, &now)
+                })
+                .await
+                .expect("settle")
+        }
+        // inst_b settles at an EARLIER timestamp than inst_a: its rows must
+        // sort first in the merged publication key.
+        let mut published = settle(
+            &store,
+            vec![inst_b.instance_id.clone()],
+            "2026-10-08T12:00:00.000Z",
+        )
+        .await;
+        published.merge(
+            settle(
+                &store,
+                vec![inst_a.instance_id.clone()],
+                "2026-10-08T12:00:00.001Z",
+            )
+            .await,
+        );
+
+        let keys: Vec<(String, String)> = published
+            .interactions
+            .iter()
+            .map(|s| (s.updated_at.clone(), s.interaction_id.clone()))
+            .collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(
+            keys, sorted_keys,
+            "publication follows the (updated_at, id) cursor order"
+        );
+        // Within the same-timestamp sweep ids are ascending, not rowid order.
+        let within_a: Vec<&str> = keys
+            .iter()
+            .filter(|(_, id)| ["int_ord_z", "int_ord_a", "int_ord_m"].contains(&id.as_str()))
+            .map(|(_, id)| id.as_str())
+            .collect();
+        assert_eq!(
+            within_a,
+            vec!["int_ord_a", "int_ord_m", "int_ord_z"],
+            "one sweep publishes ascending id despite insert order"
+        );
+        // The earlier sweep precedes the later one regardless of id.
+        assert_eq!(keys.first().unwrap().1, "int_ord_b");
+        store.close().await;
+    }
+
     /// c-cardsettle r7 item 2: with more than SETTLEMENT_LAG_PAGE settlements
     /// inside the 5-minute reconnect window, the cursor-less snapshot must be
     /// the NEWEST page (DESC) — after a Node restart or multi-session sweep the
@@ -11321,9 +11427,18 @@ pub(crate) fn settle_instance_interactions(
         return Ok(Settlement::default());
     }
     let placeholders = vec!["?"; instance_ids.len()].join(",");
+    // r7 item 3: publication order MUST be monotonic in the follower's
+    // delivery cursor `(updated_at, id)`. Every row this call settles is
+    // stamped with the SAME `now`, so the resulting cursor key is
+    // `(now, id)`; ordering the select by `id` therefore publishes the
+    // sweep in ascending cursor order. A high id published first would
+    // advance the follower's cursor past the lower ids of the same batch,
+    // and the lag recovery's `(updated_at, id) > cursor` filter would
+    // exclude those dropped notices permanently. Never select unordered.
     let sql = format!(
         "SELECT id, instance_id, payload_json FROM interactions
-         WHERE state = 'pending' AND instance_id IN ({placeholders})"
+         WHERE state = 'pending' AND instance_id IN ({placeholders})
+         ORDER BY id ASC"
     );
     let params: Vec<&dyn rusqlite::types::ToSql> = instance_ids
         .iter()

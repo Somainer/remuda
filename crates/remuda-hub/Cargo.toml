@@ -58,6 +58,10 @@ ece = { version = "2.2", default-features = false, features = ["backend-openssl"
 # Software ES256 authenticator for the passkey ceremony tests (D-029).
 openssl = "0.10"
 # The offline Anthropic-Messages gateway the api-routing relay e2e runs against.
+# SO_RCVBUF on a follower's unread socket, so the r7 settlement-order test
+# can deterministically force writer backpressure (no new crate; nix is
+# already a dependency, this only turns on the socket options).
+nix = { version = "0.28", default-features = false, features = ["net", "socket"] }
 remuda-journal.workspace = true
 remuda-testing.workspace = true
 serde_cbor_2 = "0.13"

@@ -864,3 +864,191 @@ async fn hello_reconcile_exits_then_replayed_request_never_reopens_the_card() ->
     hub.shutdown().await;
     Ok(())
 }
+
+/// r7 item 3 (the r6 item 2 test as actually asked): a REAL follower through
+/// `/v1/follow`, with its writer blocked by socket backpressure, receives a
+/// ONE-timestamp settlement sweep LARGER than the 64-notice broadcast ring
+/// (the node-epoch reconcile settles many cards on one instance in one
+/// transaction). When the client drains, EVERY dropped settlement must be
+/// recovered from the durable lag drain in ascending `(updated_at, id)` order
+/// BEFORE the single `settlement-backpressure` gap — a high id published first
+/// would advance the cursor past same-batch low ids and skip them forever.
+#[tokio::test]
+async fn follower_lag_drains_a_large_single_sweep_before_the_gap() -> Result<()> {
+    let mut config = HubConfig::for_test(tempfile::tempdir()?.path().join("data"));
+    // A 1-deep pump→writer queue so a backed-up socket parks the pump fast;
+    // the settlement ring itself stays the production 64.
+    config.follow_buffer_events = 1;
+    let hub = spawn(config).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+
+    // One instance carrying MANY pending cards.
+    let create_body = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "delegation": "none",
+        "permissionMode": "bypass",
+        "prompt": "cardsettle r7 lag order",
+    })
+    .to_string();
+    let (status, create_response) =
+        http(addr, "POST", "/v1/instances", &cookie, Some(&create_body)).await?;
+    assert_eq!(status, 200, "create {create_response}");
+    let create_json: Value = serde_json::from_str(&create_response)?;
+    let instance_id = create_json["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+    node.append(
+        "jready",
+        &instance_id,
+        json!({ "kind": "lifecycle", "payload": {
+            "type": "entity", "entityType": "instance", "state": "ready"
+        }}),
+    )
+    .await?;
+
+    const CARD_COUNT: usize = 70; // > the 64-notice settlement ring
+    let mut card_ids = Vec::with_capacity(CARD_COUNT);
+    for n in 0..CARD_COUNT {
+        // Zero-padded so lexicographic id order is the numeric cursor order.
+        let id = format!("int_r7lag_{n:05}");
+        node.append(
+            &format!("jreq-{n}"),
+            &instance_id,
+            approval_requested_event(&id),
+        )
+        .await?;
+        card_ids.push(id);
+    }
+
+    // A REAL unfiltered follower over a socket whose receive buffer is tiny,
+    // and we never read from it: the writer blocks on the kernel buffer, the
+    // 1-deep queue fills, and the follower task parks WITHOUT polling the
+    // settlement ring.
+    let mut follow_req = format!("ws://{addr}/v1/follow").into_client_request()?;
+    follow_req.headers_mut().insert("Cookie", cookie.parse()?);
+    let follow_tcp = tokio::net::TcpStream::connect(addr).await?;
+    // Shrink the kernel receive window before the WS handshake: SO_RCVBUF via
+    // nix (Linux doubles/clamps it to the 4 KiB floor). This bounds how much
+    // the unread client can buffer, so the server writer provably blocks on a
+    // few large frames.
+    #[cfg(unix)]
+    {
+        nix::sys::socket::setsockopt(&follow_tcp, nix::sys::socket::sockopt::RcvBuf, &256)?;
+    }
+    let (mut follow, _) = tokio_tungstenite::client_async(follow_req, follow_tcp).await?;
+
+    // ONE large JOURNAL event (the follower receives every one unfiltered),
+    // bigger than the shrunken receive window: the writer blocks finishing
+    // this single frame and can never service the settlement ring while the
+    // client never reads. No flood — one blocked send is the same parking
+    // condition, and keeps the settlement drain behind only ~16 KiB.
+    node.append(
+        "jpad-0",
+        &instance_id,
+        json!({ "kind": "message", "payload": { "text": "x".repeat(16 * 1024) } }),
+    )
+    .await?;
+    // Let the blocked state settle: the writer is parked inside sink.send and
+    // the pump cannot flush a second frame.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The one-timestamp sweep: a new epoch with an empty, attested inventory
+    // reconciles the instance exited and invalidates all 70 cards in ONE
+    // transaction at one updated_at, broadcast in the select's id order.
+    let mut reconnect_req = format!("ws://{addr}/v1/node").into_client_request()?;
+    reconnect_req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", node.node_token()).parse()?,
+    );
+    let (mut reconnect, _) = tokio_tungstenite::connect_async(reconnect_req).await?;
+    reconnect
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0", "id": "hello2", "method": "node.hello",
+                "params": {
+                    "hostId": host_id.as_id().as_str(),
+                    "nodeVersion": "0.1.0",
+                    "nodeEpoch": "cs-r7lag-epoch-2",
+                    "instanceStoreFound": true,
+                    "instances": []
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    // Drain the hub→node frames on the raw reconnect socket up to hello2.
+    while let Ok(Some(Ok(msg))) =
+        tokio::time::timeout(Duration::from_secs(8), reconnect.next()).await
+    {
+        let Message::Text(text) = msg else { continue };
+        let frame: Value = serde_json::from_str(&text)?;
+        if frame.get("id").and_then(Value::as_str) == Some("hello2") {
+            anyhow::ensure!(
+                frame.get("result").is_some(),
+                "reconcile hello failed: {frame}"
+            );
+            break;
+        }
+    }
+    // Give the blocked follower's ring time to hold/skip the whole burst.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // UNBLOCK: pump every queued server frame out of the client socket. The
+    // pump resumes, observes the broadcast Lagged, and drains the durable
+    // settlement pages before its gap notice.
+    let mut got: Vec<String> = Vec::new();
+    let mut settlement_gaps = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    'read: while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(next) = tokio::time::timeout(remaining, follow.next()).await.ok() else {
+            break 'read;
+        };
+        let Some(Ok(Message::Text(text))) = next else {
+            continue;
+        };
+        let frame: Value = serde_json::from_str(&text)?;
+        match frame.get("type").and_then(Value::as_str) {
+            Some("settlement") => got.push(
+                frame["interactionId"]
+                    .as_str()
+                    .context("settlement interactionId")?
+                    .to_string(),
+            ),
+            // The settlement lag drain's own trailing frame.
+            Some("gap") if frame["reason"] == "settlement-backpressure" => {
+                settlement_gaps += 1;
+                break 'read;
+            }
+            // Journal frames and the journal-bus backpressure gap are noise
+            // for this assertion.
+            _ => {}
+        }
+    }
+
+    // All 70 recovered, exactly once, in ascending cursor order, and all
+    // before the gap.
+    assert_eq!(
+        got.len(),
+        CARD_COUNT,
+        "every settlement of the over-ring sweep is recovered before the gap"
+    );
+    let mut sorted = got.clone();
+    sorted.sort();
+    assert_eq!(got, sorted, "drained settlements arrive in cursor order");
+    assert_eq!(got, card_ids, "the recovered ids are exactly the sweep");
+    assert_eq!(
+        settlement_gaps, 1,
+        "one settlement gap follows the full drain"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}

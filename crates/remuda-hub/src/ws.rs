@@ -1324,6 +1324,15 @@ enum FollowMsg {
 /// per-instance follower). Notices are sent before the trailing gap frame, so
 /// the client pins all of them before reconciling. A query error or a dead
 /// writer returns Err and the caller closes the follower (never a bare gap).
+///
+/// r7 item 3 PUBLICATION-ORDER INVARIANT: the live broadcast path publishes a
+/// sweep in ascending `(updated_at, id)` order (the store's settle select
+/// orders it so and every row of one sweep shares `updated_at`). That ordering
+/// is what lets the composite max-cursor and this strict-forward `>` recovery
+/// coexist: a dropped low-id row of the current batch always sits BEHIND the
+/// cursor's timestamp only with a lower id, and is still recovered because no
+/// higher-id row of the same batch was published ahead of it. Keep both paths
+/// ascending; out-of-order publication would permanently skip rows here.
 async fn drain_settlement_lag(
     store: &crate::store::Store,
     instance_ids: &[String],
@@ -1545,6 +1554,15 @@ async fn follow_session(
                             // row the bus passes — including rows filtered out
                             // for this follower — so a later lag drain never
                             // re-scans or skips past it.
+                            //
+                            // r7 item 3 INVARIANT: the rows of one settlement
+                            // sweep are published in ascending
+                            // `(updated_at, id)` cursor order (the store's
+                            // settle select orders them so), so advancing this
+                            // max-cursor past a published row can never exclude
+                            // a lower-id row of the SAME batch that backpressure
+                            // dropped. Lag recovery pages strictly forward from
+                            // this cursor; see drain_settlement_lag.
                             settlement_cursor = Some(crate::store::Store::settlement_max_cursor(
                                 settlement_cursor.as_deref(),
                                 &notice.updated_at,

@@ -136,6 +136,12 @@ impl AppState {
     /// into a journal or make a follower mark its journal stale. A fresh
     /// follower converges against the durable (already-invalidated) rows
     /// regardless, so a missed notice is self-healing.
+    ///
+    /// r7 item 3: notices are sent in the vector's order, which the store
+    /// produces as ascending `(updated_at, id)` (the rows of one sweep share a
+    /// timestamp and sort by id). The follower's delivery max-cursor and its
+    /// strict-forward lag recovery both rely on that monotonic publication
+    /// order — never reorder or sort these before sending.
     pub(crate) fn broadcast_settlement(&self, settlement: &Settlement) {
         for settled in &settlement.interactions {
             // Publish on the DEDICATED settlement bus (not the journal bus): a

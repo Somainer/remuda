@@ -323,6 +323,18 @@ impl Ctx {
         .await?
     }
 
+    /// Wait until the durable sequence advances past `before` — a deterministic
+    /// barrier that a journal append has been projected, replacing fixed sleeps
+    /// before NEGATIVE assertions (ma-lineage r5 item 5).
+    async fn wait_seq_advances(&self, id: &str, before: &str) -> Result<String> {
+        let view = self
+            .wait_until(id, |v| {
+                v["durableSeq"].as_str().is_some_and(|seq| seq != before)
+            })
+            .await?;
+        Ok(view["durableSeq"].as_str().unwrap_or("").to_string())
+    }
+
     async fn wait_host_offline(&self) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -638,6 +650,10 @@ async fn a_live_chapter_after_a_failed_turn_is_closed_when_the_lineage_continues
     // The chapter reports its native session; a failed turn (429) leaves the
     // row RUNNING — the process is still alive.
     ctx.report_session(&node, &x, false).await?;
+    let seq_before = ctx.get_instance(&x, &ctx.human).await?["durableSeq"]
+        .as_str()
+        .unwrap_or("0")
+        .to_string();
     node.appends.send((
         x.clone(),
         json!({
@@ -650,7 +666,9 @@ async fn a_live_chapter_after_a_failed_turn_is_closed_when_the_lineage_continues
             }
         }),
     ))?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Barrier: the result event is applied (durable seq advanced) before the
+    // negative assertion.
+    ctx.wait_seq_advances(&x, &seq_before).await?;
     let before = ctx.get_instance(&x, &ctx.human).await?;
     assert_eq!(
         before["lifecycle"],
@@ -845,6 +863,10 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
     );
 
     // A second end event with a different timestamp does not rewrite it.
+    let seq_before = ctx.get_instance(&x, &ctx.human).await?["durableSeq"]
+        .as_str()
+        .unwrap_or("0")
+        .to_string();
     node.appends.send((
         x.clone(),
         json!({
@@ -853,7 +875,7 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
             "payload": { "type": "entity", "state": "exited", "reasonCode": "duplicate" }
         }),
     ))?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    ctx.wait_seq_advances(&x, &seq_before).await?;
     let lineage: Value = ctx
         .http
         .get(format!("{}/v1/lineages/{x}", ctx.base()))
@@ -1508,6 +1530,10 @@ async fn an_error_severity_event_then_ready_leaves_ended_at_null() -> Result<()>
     let (x, _token) = ctx.seat(&mut node, None).await?;
     ctx.report_session(&node, &x, false).await?;
 
+    let seq_before = ctx.get_instance(&x, &ctx.human).await?["durableSeq"]
+        .as_str()
+        .unwrap_or("0")
+        .to_string();
     node.appends.send((
         x.clone(),
         json!({
@@ -1521,7 +1547,7 @@ async fn an_error_severity_event_then_ready_leaves_ended_at_null() -> Result<()>
             }
         }),
     ))?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    ctx.wait_seq_advances(&x, &seq_before).await?;
     let view = ctx.get_instance(&x, &ctx.human).await?;
     assert_ne!(
         view["lifecycle"],

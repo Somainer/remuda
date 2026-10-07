@@ -460,6 +460,88 @@ it("a failed configure for a replaced request does not clobber the newer one", a
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });
 
+it("a replaced request's late HTTP SUCCESS does not overwrite the newer choice", async () => {
+  const ctx = await startFollowing("configure-success-replaced");
+  // A hangs; B resolves immediately; A resolves successfully only later.
+  let resolveA: () => void = () => {};
+  vi.spyOn(api, "instanceConfigure").mockImplementation((_id, _perm, extras) => {
+    if (extras?.effort?.name === "xhigh") {
+      return new Promise((resolve) => {
+        resolveA = () => resolve({} as never);
+      });
+    }
+    return Promise.resolve({} as never);
+  });
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+
+  const a = hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
+  const b = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  await b;
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+
+  // A's late 200 carries xhigh; its post-success optimistic emit is nonce-stale
+  // and must not replace B's max.
+  resolveA();
+  await a;
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+});
+
+it("a null threshold is not 'newer': a terminal projection for another level never settles the request", async () => {
+  const ctx = await startFollowing("null-threshold");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // No effective state exists yet (threshold null). Request max+ultracode on.
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, true));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.thresholdObservedAt).toBeNull();
+
+  // A terminal-side /effort observation (NOT a remuda configure read-back)
+  // names a DIFFERENT level with the flag off — someone/something else's
+  // state, not our request. With a null threshold it must settle NOTHING.
+  ctx.receive(effortEvent(2, "high", false, "slash"));
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending).not.toBeNull();
+  expect(pending?.levelSettled).toBe(false);
+  expect(pending?.flagSettled).toBe(false);
+
+  // A terminal observation that DOES name our requested level settles the
+  // level axis but still not the flag (it reports off, we asked on).
+  ctx.receive(effortEvent(3, "max", false, "slash"));
+  const pending2 = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending2?.levelSettled).toBe(true);
+  expect(pending2?.flagSettled).toBe(false);
+
+  // Our own remuda read-back then settles the flag (delivered off = refusal
+  // of the flag) and clears the indicator.
+  ctx.receive(effortEvent(4, "max", false, "remuda"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+
+it("a degraded lifecycle for replaced request A never reverts/clears request B", async () => {
+  const ctx = await startFollowing("degraded-after-replace");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+  // A = xhigh, replaced immediately by B = max before either settles.
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, false));
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+
+  // A's level-degraded verdict (names xhigh) lands while B is in flight.
+  ctx.receive(configureLifecycle(3, "effort-degraded:xhigh:no-readback-within-window", ctx.instance.id));
+
+  // B survives intact: still optimistic max, still pending, no stale toast.
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+
+  // B's own read-back then settles normally.
+  ctx.receive(effortEvent(4, "max", false, "remuda"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+});
+
 it("history replay hydrates effective but never records a refusal, pending or toast", async () => {
   // A fresh follow whose SEEDED HISTORY contains both an effort observation
   // (hydrate) and a degraded ultracode lifecycle (must be ignored on replay).
@@ -542,16 +624,24 @@ it("success on model B does not erase model A's refusal", async () => {
   // Establish model A first so the refusal binds to its id.
   await hubStore.setModel(ctx.instance.id, "model-a");
   // Refusal on model A.
-  ctx.receive(configureLifecycle(2, ctx.instance.id, modelRefuse));
+  ctx.receive(configureLifecycle(2, modelRefuse, ctx.instance.id));
   expect(hubStore.effortRefusalOf(ctx.instance.id)?.scope).toBe("model");
   expect(hubStore.effortRefusalOf(ctx.instance.id)?.modelId).toBe("model-a");
-  // A positive flag read-back still naming model A's environment is gated by
-  // model id; simulate a switch to a DIFFERENT model then positive evidence.
+  // A positive flag read-back is gated by model id; simulate a switch to a
+  // DIFFERENT model, then positive evidence for the new model.
   await hubStore.setModel(ctx.instance.id, "model-b");
   ctx.receive(flagOn(3, "xhigh"));
-  // Model A refusal persists because the current model is now B (different
-  // id): positive evidence for B cannot clear A's block.
-  expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
+  // On B the switch is enabled (the model-A refusal does not block B)…
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
+  // …but B's positive evidence must NOT erase A's stored refusal: the raw
+  // model-scoped record survives.
+  const raw = (
+    hubStore as unknown as { state: { effortRefusal: Record<string, { scope: string; modelId: string | null }> } }
+  ).state.effortRefusal[ctx.instance.id];
+  expect(raw).toMatchObject({ scope: "model", modelId: "model-a" });
+  // Switching back to A re-arms the block without any new degraded event.
+  await hubStore.setModel(ctx.instance.id, "model-a");
+  expect(hubStore.effortRefusalOf(ctx.instance.id)?.modelId).toBe("model-a");
 });
 
 it("a refusal recorded with a null model id never auto-clears", async () => {
@@ -566,4 +656,62 @@ it("a refusal recorded with a null model id never auto-clears", async () => {
   // A positive flag read-back must not clear it (model unbound).
   ctx.receive(flagOn(2, "xhigh"));
   expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
+});
+
+it("r2 item 1: the version gate prefers the snapshot version, then the host's pinned CLI, else unknown", () => {
+  const base: Instance = {
+    ...mockDb.instances[0],
+    id: "ins_version_gate",
+    hostId: "host-version-gate",
+    kind: "claude",
+  };
+  const host = {
+    id: "host-version-gate",
+    label: "version host",
+    state: "online",
+    cli: [{ kind: "claude", version: "2.1.268", installed: true }],
+  } as never;
+  const baseNoSnapshot: Instance = {
+    ...base,
+    capabilities: { ...base.capabilities, binaryVersion: "" },
+  };
+  hubStore["emit"]({
+    hosts: [...hubStore.getSnapshot().hosts, host],
+    instances: [baseNoSnapshot],
+  });
+
+  // 1. No snapshot version → pinned host CLI wins (2.1.268 = coupled).
+  expect(hubStore.effortVersionGate(base.id)).toBe("coupled");
+
+  // 2. A reported snapshot version outranks the host pin (2.1.289 decoupled).
+  hubStore["emit"]({
+    instances: [{ ...baseNoSnapshot, capabilities: { ...base.capabilities, binaryVersion: "2.1.289" } }],
+  });
+  expect(hubStore.effortVersionGate(base.id)).toBe("decoupled");
+
+  // 3. No host pin and no snapshot → unknown (switch locks, never fabricated).
+  const orphan: Instance = { ...base, id: "ins_version_orphan", hostId: "host-does-not-exist" };
+  hubStore["emit"]({
+    instances: [{ ...orphan, capabilities: { ...orphan.capabilities, binaryVersion: "" } }],
+  });
+  expect(hubStore.effortVersionGate(orphan.id)).toBe("unknown");
+
+  // 4. An old pinned binary → legacy.
+  const legacyHost = {
+    id: "host-legacy-claude",
+    label: "legacy host",
+    state: "online",
+    cli: [{ kind: "claude", version: "2.1.150", installed: true }],
+  } as never;
+  const legacyInstance: Instance = {
+    ...base,
+    id: "ins_version_legacy",
+    hostId: "host-legacy-claude",
+    capabilities: { ...base.capabilities, binaryVersion: "" },
+  };
+  hubStore["emit"]({
+    hosts: [...hubStore.getSnapshot().hosts, legacyHost],
+    instances: [legacyInstance],
+  });
+  expect(hubStore.effortVersionGate(legacyInstance.id)).toBe("legacy");
 });

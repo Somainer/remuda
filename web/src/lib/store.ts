@@ -89,6 +89,7 @@ const HELD_RETRY_BASE_MS = 2_000;
 const HELD_RETRY_MAX_MS = 30_000;
 import { liveSummary } from "../features/session/liveSummary";
 import { HubHttpError, isUnauthorized } from "./httpError";
+import { hostClaudeVersion } from "./driverMatrix";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
 import { mockGappedTail, mockJournalIds } from "./mock";
@@ -132,6 +133,15 @@ export type EffortPending = {
   levelSettled: boolean;
   /** Switch axis confirmed by a newer projection. */
   flagSettled: boolean;
+  /**
+   * Who owns this in-flight request: "client" when this tab posted the
+   * configure (its axes are the nonce-identified request), "lifecycle" when
+   * the only evidence is a wire `effort-queued` edge (configure posted outside
+   * the UI). A mismatched degraded verdict is trusted as terminal only for a
+   * wire-owned request; against a client request it is a replaced request's
+   * stale verdict and is ignored (c-effortui r2 item 2).
+   */
+  source: "client" | "lifecycle";
 };
 
 /**
@@ -800,16 +810,40 @@ class HubStore {
     pending: EffortPending,
     view: EffortEffectiveView,
   ): EffortPending | null {
-    const newer = !pending.thresholdObservedAt || view.observedAt > pending.thresholdObservedAt;
+    // Evidence freshness:
+    //  - with a baseline threshold, a projection settles only when STRICTLY
+    //    newer than the request's own queued timestamp;
+    //  - with a NULL baseline (no effective state when the request was made)
+    //    a timestamp proves nothing, so only a projection that is our
+    //    configure's outcome settles: a `remuda` driver read-back (including
+    //    the delivered level clamp / flag refusal) or one naming the requested
+    //    level. A terminal-originated (`slash`) projection that does not name
+    //    the request is another request's evidence and must not settle B
+    //    (c-effortui r2 item 2).
+    const threshold = pending.thresholdObservedAt;
+    const namesLevel = view.name === pending.name;
+    const remuda = view.source === "remuda";
+    const ours = remuda || namesLevel;
+    const newer = threshold != null ? view.observedAt > threshold : ours;
     let { levelSettled, flagSettled } = pending;
-    // A remuda-sourced projection, or one agreeing with the request, is the
-    // outcome of OUR push-down (keeps the slider put on clamp); a terminal
-    // `/effort` edge is folded as a switch instead.
-    const ours = view.source === "remuda" || view.name === pending.name;
-    if (newer && !levelSettled) {
-      if (view.source === "remuda" || view.name === pending.name) levelSettled = true;
+    if (newer && !levelSettled && ours) {
+      levelSettled = true;
     }
-    if (newer && !flagSettled && effortFlagSettles(view.ultracode)) {
+    // The flag axis needs process-local evidence.
+    //  - non-null baseline: any definitive value newer than the request
+    //    settles (an opposite value is the delivered refusal, rendered as a
+    //    mismatch);
+    //  - null baseline: a remuda read-back is our verdict (even an opposite
+    //    flag); a terminal-origin flag settles only when it equals the
+    //    requested one — otherwise it could be request A's flag proving
+    //    nothing for B.
+    const flagEvidence =
+      threshold != null
+        ? effortFlagSettles(view.ultracode)
+        : remuda
+          ? effortFlagSettles(view.ultracode)
+          : view.ultracode === pending.ultracode;
+    if (newer && !flagSettled && flagEvidence) {
       flagSettled = true;
     }
     if (ours && (levelSettled || flagSettled)) {
@@ -1164,6 +1198,7 @@ class HubStore {
           thresholdObservedAt: this.state.effortEffective[instanceId]?.observedAt ?? null,
           levelSettled: false,
           flagSettled: false,
+          source: "lifecycle",
         };
         this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: current.nonce } });
       }
@@ -1194,27 +1229,35 @@ class HubStore {
     // degraded
     const isUltraRefusal =
       parsed.reason === ULTRA_MODEL_REASON || parsed.reason === ULTRA_WORKFLOWS_REASON;
-    // An ultracode refusal disables the switch even when no client pending
-    // exists (the configure can be posted outside the UI, and a refusal can
-    // race the indicator). A LEVEL degradation must match the in-flight
-    // request so a stale reject for a replaced request is ignored.
-    // A degraded verdict is TERMINAL for the indicator: clear any pending
-    // regardless of its named axes (the e2e driver queues one word and rejects
-    // another, and a replaced request's late reject must not leave the current
-    // indicator spinning — that freshness is owned by the queued/per-axis
-    // projection paths, not by a terminal lifecycle). An ultracode refusal
-    // also applies with no client pending at all (posted outside the UI).
+    // Request identity (c-effortui r2 item 2): does this verdict name the
+    // CURRENT request's axes?
+    //  - no pending at all: an unsolicited refusal from a configure posted
+    //    outside the UI — it applies (refusal recorded, tier untouched).
+    //  - wire-owned pending (synthesized from effort-queued): the driver owns
+    //    the request; its terminal verdict is trusted even when the rejected
+    //    word differs from the queued one (the e2e driver queues one word and
+    //    rejects another).
+    //  - client-owned pending: a mismatched verdict belongs to a REPLACED
+    //    request A. It must not clear B's indicator nor revert B's optimistic
+    //    axes. Only refusal EVIDENCE is process-local and still recorded (an
+    //    ultra refusal describes the environment, not the level request).
+    const namesCurrent = current ? effortLifecycleMatches(current, parsed.word) : false;
+    const mutatesRequest = !current || current.source === "lifecycle" || namesCurrent;
+    if (!mutatesRequest && !isUltraRefusal) return;
+
     const pendingNext = { ...this.state.effortPending };
-    delete pendingNext[instanceId];
-    // The push-down ended via a lifecycle, not a projected read-back: no settled
-    // edge owes the later live frame the "our push-down" treatment.
-    this.settledEffortPushdown.delete(instanceId);
+    if (mutatesRequest) {
+      delete pendingNext[instanceId];
+      // The push-down ended via a lifecycle, not a projected read-back: no
+      // settled edge owes a later live frame the "our push-down" treatment.
+      this.settledEffortPushdown.delete(instanceId);
+    }
     // The native side refused: revert the affected axes to the last observed
     // state (or drop the optimistic request so the record default returns).
     // An unsolicited ultracode refusal (no pending) leaves the tier untouched.
     const effective = this.state.effortEffective[instanceId];
     const effort = { ...this.state.effort };
-    if (current) {
+    if (mutatesRequest && current) {
       if (effective) {
         const instance = this.state.instances.find((row) => row.id === instanceId);
         const kind = (instance?.kind ?? "claude") as EffortKind;
@@ -1248,6 +1291,10 @@ class HubStore {
         scope === "model"
           ? `模型 ${modelId ?? "当前模型"} 不支持 ultracode`
           : "需要开启 dynamic workflows";
+    } else if (!mutatesRequest) {
+      // A stale level verdict for a replaced request: no visible mutation, no
+      // toast — B is still in flight.
+      return;
     } else {
       toastReason =
         ({ "dialog-kept": "已取消切换", "invalid-argument": "档位无效", "no-readback-within-window": "未收到回读" } as Record<string, string>)[
@@ -3518,6 +3565,7 @@ class HubStore {
     instanceId: Id,
     permissionMode: string,
     extras?: { model?: string; effort?: EffortSelection },
+    freshness?: { effortNonce?: number },
   ) {
     // D-056 wire: `{name, ultracode, index}` — a native level word plus the
     // orthogonal boolean; the web never sends the legacy "ultracode" name.
@@ -3532,9 +3580,18 @@ class HubStore {
         }
       : extras;
     await api.instanceConfigure(instanceId, permissionMode, wireExtras);
+    // c-effortui r2 item 2: a request's HTTP success lands AFTER the user
+    // replaced it with a newer request must not overwrite the newer choice.
+    // The effort post-emit is gated on the captured request nonce; the
+    // authoritative projection is folded by the caller's bounded refresh.
+    const effortStillCurrent =
+      freshness?.effortNonce == null ||
+      this.state.effortPending[instanceId]?.nonce === freshness.effortNonce;
     this.emit({
       permissionMode: { ...this.state.permissionMode, [instanceId]: permissionMode },
-      ...(extras?.effort ? { effort: { ...this.state.effort, [instanceId]: extras.effort } } : {}),
+      ...(extras?.effort && effortStillCurrent
+        ? { effort: { ...this.state.effort, [instanceId]: extras.effort } }
+        : {}),
       ...(extras?.model ? { models: { ...this.state.models, [instanceId]: extras.model } } : {}),
     });
   }
@@ -3571,6 +3628,7 @@ class HubStore {
       // an unobserved flag (null) is "not proven" only when switching it ON.
       levelSettled: currentView?.name === effort.name,
       flagSettled: effort.ultracode !== true && currentView?.ultracode !== true,
+      source: "client",
     };
     this.settledEffortPushdown.delete(instanceId);
     // Optimistically adopt the requested axes SYNCHRONOUSLY, before the
@@ -3583,7 +3641,12 @@ class HubStore {
       effort: { ...this.state.effort, [instanceId]: effort },
     });
     try {
-      await this.configure(instanceId, this.permissionModeOf(instanceId), { effort });
+      await this.configure(
+        instanceId,
+        this.permissionModeOf(instanceId),
+        { effort },
+        { effortNonce: nonce },
+      );
       // Re-request authoritative state once the command is accepted. The
       // driver projects the read-back before acking, so folding the durable
       // record settles the chip from the Hub even when this client's live
@@ -3639,10 +3702,22 @@ class HubStore {
     await this.setEffort(instanceId, { ...current, ultracode });
   }
 
-  /** Claude Code version gate for a session, from its capability snapshot. */
+  /** Claude Code version gate for a session.
+   *  Source order (c-effortui r2 item 1): the per-instance capability
+   *  snapshot's reported binaryVersion (transcript/launch read-back), then the
+   *  host's PINNED claude CLI inventory version, then unknown (which disables
+   *  only the ultracode switch with a named reason). Never a fabricated
+   *  version. */
   effortVersionGate(instanceId: Id): ClaudeVersionGate {
     const instance = this.state.instances.find((row) => row.id === instanceId);
-    return claudeVersionGate(instance?.capabilities?.binaryVersion);
+    const reported = instance?.capabilities?.binaryVersion;
+    if (reported) return claudeVersionGate(reported);
+    if (instance) {
+      const host = this.state.hosts.find((row) => row.id === instance.hostId);
+      const pinned = hostClaudeVersion(host);
+      if (pinned) return claudeVersionGate(pinned);
+    }
+    return claudeVersionGate(null);
   }
 
   /** Per-session switch refusal, applying the model-scoped expiry (D-056 §5). */
@@ -3873,7 +3948,15 @@ class HubStore {
       if (kind && stored.kind !== kind) return mapEffort(stored, kind);
       return stored;
     }
-    const recorded = effortFromRecord(fallbackKind, instance?.effortName, instance?.effortIndex);
+    // c-effortui r2 item 4: restore BOTH the level and the durable flag from
+    // the Hub record when no live selection is present (e.g. after a reload
+    // whose effort event has aged out of the journal tail).
+    const recorded = effortFromRecord(
+      fallbackKind,
+      instance?.effortName,
+      instance?.effortIndex,
+      instance?.effortUltracode === true,
+    );
     if (recorded) return recorded;
     return effortAt(fallbackKind, readDeviceSettings().defaultEffortIndex ?? DEFAULT_EFFORT_INDEX);
   }

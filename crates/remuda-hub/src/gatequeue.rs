@@ -380,7 +380,12 @@ async fn cancel_project_job(
                 .map_err(map_store)?
                 .ok_or(HubError::NotFound)?;
             if let (Some(host), Some(lane)) = (&job.host_id, &job.lane_id) {
-                let params = json!({ "jobId": job.id.as_id().as_str(), "laneId": lane });
+                // §7.5: cancel is a follow-on step of the admitted job — it
+                // carries the job row's initiator, not a freshly-stamped one.
+                let mut params = json!({ "jobId": job.id.as_id().as_str(), "laneId": lane });
+                if let Some(initiator) = &job.initiator {
+                    params["initiator"] = json!(initiator);
+                }
                 // Best effort: the running tick also fails the job if the
                 // Node is gone.
                 if let Ok(Some(_)) = state
@@ -1182,6 +1187,8 @@ async fn home_land_plan(
             merge_sha,
             base_sha,
             timeout_secs: 0,
+            // §7.5: land is a follow-on step of the admitted job.
+            initiator: job.initiator.clone(),
         },
         lane_host: lane.host_id.clone(),
         lane_repo: lane.repo_path.clone(),
@@ -1369,7 +1376,14 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
     // Drop the lane's pinned refs once they can no longer be needed: the land
     // succeeded, or this attempt's merge is superseded by a re-verify.
     if matches!(job.state, GateJobState::Landed | GateJobState::Queued) {
-        unpin_lane_refs(state, &plan.lane_host, &plan.lane_repo, job_id).await;
+        unpin_lane_refs(
+            state,
+            &plan.lane_host,
+            &plan.lane_repo,
+            job_id,
+            job.initiator.clone(),
+        )
+        .await;
     }
     let action = match job.state {
         GateJobState::Landed => "gate.landed",
@@ -1415,6 +1429,7 @@ async fn drop_job_refs(state: &AppState, job: &GateJob) {
         &lane.host_id,
         &lane.repo_path,
         job.id.as_id().as_str(),
+        job.initiator.clone(),
     )
     .await;
     let _ = state
@@ -1493,10 +1508,12 @@ async fn unpin_lane_refs(
     lane_host: &remuda_protocol::HostId,
     repo_path: &str,
     job_id: &str,
+    initiator: Option<remuda_protocol::Initiator>,
 ) {
     let params = serde_json::to_value(remuda_protocol::GateUnpinParams {
         job_id: job_id.to_owned(),
         repo_path: repo_path.to_owned(),
+        initiator,
     })
     .unwrap_or(Value::Null);
     if let Err(error) = state
@@ -1536,6 +1553,8 @@ async fn run_then_hook(state: &AppState, job: &GateJob) {
         "command": command,
         "env": {},
         "timeoutSecs": 0,
+        // §7.5: the --then follow-on step carries the job's initiator.
+        "initiator": job.initiator,
     });
     let output = match state
         .nodes

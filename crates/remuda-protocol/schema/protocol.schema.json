@@ -5169,6 +5169,17 @@
           "description": "Operator's existing remote/alias on the home host that reaches the lane\nrepo, used to fetch `mergeRef`.",
           "type": "string"
         },
+        "initiator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Initiator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.5: the land step carries the admission record's initiator\n(the jobId is the opId). Absent for Human/Bot jobs and older Hubs."
+        },
         "jobId": {
           "description": "Job being landed.",
           "type": "string"
@@ -5661,6 +5672,17 @@
           "description": "Extra environment.",
           "type": "object"
         },
+        "initiator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Initiator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.5: follow-on step carrying the admission record's initiator\n(the jobId is the opId). Absent for Human/Bot jobs and older Hubs."
+        },
         "jobId": {
           "description": "Job the post-land hook belongs to.",
           "type": "string"
@@ -5708,6 +5730,17 @@
     "GateUnpinParams": {
       "description": "`gate.unpin` params: drop a job's persisted merge refs on the lane host.",
       "properties": {
+        "initiator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Initiator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.5: follow-on steps carry the admission record's initiator\n(the jobId is the opId). Absent for Human/Bot jobs and older Hubs."
+        },
         "jobId": {
           "description": "Job whose refs are dropped.",
           "type": "string"

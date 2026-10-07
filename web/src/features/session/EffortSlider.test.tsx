@@ -100,6 +100,16 @@ describe("Ultracode switch gating", () => {
     expect(screen.getByTestId("effort-ultracode-reason").textContent).toContain("2.1.203");
   });
 
+  it("r2 item 1: is disabled with a named reason when the version is unknown", () => {
+    // Never assume decoupled support from an unreported/unparsable version:
+    // only the switch locks, the five stops stay on.
+    mount({ kind: "claude", index: 3, ultraGate: "unknown", onUltracodeChange: vi.fn() });
+    expect(screen.getByTestId("effort-ultracode")).toHaveAttribute("data-disabled", "1");
+    expect(screen.getByTestId("effort-ultracode-switch")).toBeDisabled();
+    expect(screen.getByTestId("effort-ultracode-reason").textContent).toContain("版本");
+    expect(screen.getByTestId("effort-slider")).toBeInTheDocument();
+  });
+
   it("names the model on an ultracode-unavailable-for-model refusal", () => {
     mount({
       kind: "claude",

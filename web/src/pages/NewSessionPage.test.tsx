@@ -239,30 +239,95 @@ it("keeps the top tier on top across harnesses and drops the flag with it", () =
   expect(slider()).toHaveAttribute("data-ember", "0");
 });
 
-it("the orthogonal switch turns ultracode on at any tier and the create carries name+flag", async () => {
+it("r2 item 6: the launch switch couples to xhigh even on a ≥2.1.284 binary and previews the materialized argv", async () => {
+  // cliHost reports 2.1.289 (decoupled CLI), but the launch materializer
+  // (checked on main and c-effortread) emits only the coupled
+  // `--effort ultracode` and never an ultracode settings key. The LAUNCH form
+  // therefore must not promise the independent high+ultracode combination.
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
   renderWithCli();
   const slider = () => screen.getByTestId("new-session-effort-slider");
   const sw = screen.getByTestId("new-session-effort-ultracode-switch");
-  // Initially off; the pill is on high and not ember.
   expect(sw).toHaveAttribute("aria-checked", "false");
   expect(slider()).toHaveAttribute("data-name", "high");
 
-  // Flip the switch on at high — the slider NEVER moves (decoupled mock CLI).
   fireEvent.click(sw);
   expect(sw).toHaveAttribute("aria-checked", "true");
-  expect(slider()).toHaveAttribute("data-name", "high");
+  // The pill snaps to xhigh — the only combination the backend launches.
+  expect(slider()).toHaveAttribute("data-name", "xhigh");
+  expect(slider()).toHaveAttribute("data-index", "3");
   expect(slider()).toHaveAttribute("data-ultracode", "1");
   expect(screen.getByTestId("new-session-effort")).toHaveAttribute("data-pinned", "1");
 
-  // Create carries a native level plus the boolean, never the old alias.
+  fireEvent.click(screen.getByTestId("new-session-advanced"));
+  // The preview names the single coupled spelling once: no level alongside,
+  // no fabricated overlay key, no second --settings.
+  const previewText = screen.getByTestId("new-session-launch-preview").textContent ?? "";
+  expect(previewText).toContain("--effort ultracode");
+  expect(previewText).not.toContain("--effort high");
+  expect(previewText).not.toContain('{"ultracode"');
+  expect(previewText.match(/--effort/g)).toHaveLength(1);
+  expect(previewText.match(/--settings/g)).toHaveLength(1);
+
   fireEvent.click(screen.getByTestId("new-session-start"));
   await waitFor(() =>
     expect(create).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "claude", effortIndex: 2, effortName: "high", effortUltracode: true }),
+      expect.objectContaining({ kind: "claude", effortIndex: 3, effortName: "xhigh", effortUltracode: true }),
     ),
   );
   expect(create.mock.calls[0][0].effortName).not.toBe("ultracode");
+});
+
+it("r2 item 6: an untouched (unpinned) draft previews and sends NO effort at all", async () => {
+  const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+  renderWithCli();
+  // The slider shows the model default for context, marked unpinned.
+  expect(screen.getByTestId("new-session-effort")).toHaveAttribute("data-pinned", "0");
+  fireEvent.click(screen.getByTestId("new-session-advanced"));
+  const previewText = screen.getByTestId("new-session-launch-preview").textContent ?? "";
+  expect(previewText).toContain("claude");
+  expect(previewText).not.toContain("--effort");
+  expect(previewText).not.toContain("ultracode");
+
+  fireEvent.change(screen.getByTestId("new-session-cwd"), { target: { value: "src" } });
+  fireEvent.click(screen.getByTestId("new-session-start"));
+  await waitFor(() => expect(create).toHaveBeenCalled());
+  // The create payload omits every effort axis — asserted together with the
+  // preview, since the two previously disagreed.
+  const payload = create.mock.calls[0][0] as Record<string, unknown>;
+  expect(payload).not.toHaveProperty("effortIndex");
+  expect(payload).not.toHaveProperty("effortName");
+  expect(payload).not.toHaveProperty("effortUltracode");
+});
+
+it("r2 item 1/6: an unknown binary version locks the launch switch with a named reason and previews no flag", () => {
+  const unknownHost = {
+    ...cliHost,
+    cli: [{ kind: "claude", version: "", path: "/usr/bin/claude" }],
+  };
+  vi.mocked(store.useHub).mockReturnValue({
+    ...store.hubStore.getSnapshot(), hosts: [unknownHost], workspaces: [workspace], instances: [],
+  });
+  renderAt(["/sessions/new"]);
+  expect(screen.getByTestId("new-session-effort-ultracode-switch")).toBeDisabled();
+  expect(screen.getByTestId("new-session-effort-ultracode-reason").textContent).toContain("版本");
+  // The five stops are still offered; the unpinned preview carries no flag.
+  expect(screen.getByTestId("new-session-effort-slider")).toHaveAttribute("aria-valuemax", "4");
+  fireEvent.click(screen.getByTestId("new-session-advanced"));
+  expect(screen.getByTestId("new-session-launch-preview").textContent ?? "").not.toContain("--effort");
+});
+
+it("r2 item 1: a pre-2.1.203 binary locks the launch switch with the 2.1.203 reason", () => {
+  const legacyHost = {
+    ...cliHost,
+    cli: [{ kind: "claude", version: "2.1.150", path: "/usr/bin/claude" }],
+  };
+  vi.mocked(store.useHub).mockReturnValue({
+    ...store.hubStore.getSnapshot(), hosts: [legacyHost], workspaces: [workspace], instances: [],
+  });
+  renderAt(["/sessions/new"]);
+  expect(screen.getByTestId("new-session-effort-ultracode-switch")).toBeDisabled();
+  expect(screen.getByTestId("new-session-effort-ultracode-reason").textContent).toContain("2.1.203");
 });
 
 it("writes the slider's tier into the instance it creates", async () => {

@@ -127,32 +127,34 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
     expect(launchPreview({ kind: "terminal" })).toContain("$SHELL");
   });
 
-  it("previews the real D-056 ultracode argv for the Claude version", () => {
-    // ≥2.1.284 decoupled: --effort <level> plus the overlay's ultracode key,
-    // one overlay (never a second --settings that would drop the first).
-    const decoupled = launchPreview({
-      kind: "claude",
-      effortName: "max",
-      ultracode: true,
-      claudeVersion: "2.1.289",
-    });
-    expect(decoupled).toContain("--effort max");
-    expect(decoupled).toContain('{"ultracode": true}');
-    expect(decoupled).not.toContain("--effort ultracode");
+  it("previews exactly what the launch materializer emits for ultracode (r2 item 6)", () => {
+    // The materializer (remuda-driver effort_argv + launch.rs flag_value,
+    // checked on main and c-effortread) always emits the single coupled
+    // spelling, at ANY binary version, and never writes an ultracode key into
+    // the one settings overlay.
+    for (const on of [
+      launchPreview({ kind: "claude", effortName: "high", ultracode: true }),
+      launchPreview({ kind: "claude", effortName: "max", ultracode: true }),
+    ]) {
+      expect(on).toContain("--effort ultracode");
+      expect(on).not.toContain('{"ultracode": true}');
+      // Exactly one effort flag, no second overlay spelling.
+      expect(on.match(/--effort/g)).toHaveLength(1);
+      expect(on.match(/--settings/g)).toHaveLength(1);
+      // The coupled spelling itself implies xhigh: no level rides alongside.
+      expect(on).not.toContain("--effort high");
+      expect(on).not.toContain("--effort max");
+    }
 
-    // 2.1.203–2.1.283 coupled: the single spelling implies xhigh.
-    const coupled = launchPreview({
-      kind: "claude",
-      effortName: "xhigh",
-      ultracode: true,
-      claudeVersion: "2.1.277",
-    });
-    expect(coupled).toContain("--effort ultracode");
-    expect(coupled).not.toContain('{"ultracode": true}');
+    // Flag off is just the pinned level.
+    expect(launchPreview({ kind: "claude", effortName: "high", ultracode: false })).toContain(
+      "--effort high",
+    );
 
-    // Flag off is just the level, on any version.
-    expect(
-      launchPreview({ kind: "claude", effortName: "high", ultracode: false, claudeVersion: "2.1.289" }),
-    ).toBe(launchPreview({ kind: "claude", effortName: "high", claudeVersion: "2.1.289" }));
+    // An unpinned draft (no pinned fields) previews NO effort flag at all —
+    // this must match the create payload, which omits the effort axes.
+    const unpinned = launchPreview({ kind: "claude" });
+    expect(unpinned).not.toContain("--effort");
+    expect(unpinned).not.toContain("ultracode");
   });
 });

@@ -365,7 +365,14 @@ export function NewSessionPage() {
   const modelDefault = claudeDefaultTier(model ?? null, catalogRows);
   const claudeVersion = hostClaudeVersion(hostMatrix);
   const versionGate = claudeVersionGate(claudeVersion);
-  const isCoupled = (activeKind as string) === "claude" && versionGate === "coupled";
+  // D-056 r2 item 6: the launch materializer (checked on main and on
+  // c-effortread) emits ONLY the coupled spelling `--effort ultracode` (which
+  // itself implies xhigh) and never writes an ultracode settings key — the
+  // independent ≥2.1.284 combination is not materialized yet. So the LAUNCH
+  // form couples switch↔tier even on a decoupled binary; legacy/unknown
+  // builds keep the switch locked (handled by EffortSlider with its reason).
+  const launchGate: typeof versionGate = versionGate === "decoupled" ? "coupled" : versionGate;
+  const isCoupled = (activeKind as string) === "claude";
 
   const mappedEffort: EffortSelection = effort
     ? effort.kind === activeKind
@@ -390,22 +397,23 @@ export function NewSessionPage() {
     setEffort(next);
   };
   const onEffortFlag = (on: boolean) => {
-    if ((activeKind as string) === "claude" && versionGate === "coupled" && on) {
+    // Launch only knows the coupled spelling: switch on pins xhigh (it is
+    // locked entirely for legacy/unknown versions upstream).
+    if ((activeKind as string) === "claude" && on) {
       setEffort({ ...sessionEffort, index: CLAUDE_XHIGH_INDEX, name: "xhigh", ultracode: true });
       return;
     }
     setEffort({ ...sessionEffort, ultracode: on });
   };
-  // Read-only preview of the launch the Node will prefill into the PTY. The
-  // materialized recipe is Node-side (flags whitelist); until the Hub exposes
-  // it, show the honest kind + flags summary (D-028 §5.1, D-056 version argv).
+  // Read-only preview of the launch the Node will prefill into the PTY. It
+  // mirrors the create payload: an unpinned draft previews NO effort flag and
+  // sends none; only a pinned choice is named (D-028 §5.1, D-056 r2 item 6).
   const preview = plainTerminal
     ? launchPreview({ kind: "terminal" })
     : launchPreview({
         kind: activeKind as AgentKindId,
-        effortName: effortWireName(sessionEffort),
-        ultracode: sessionEffort.ultracode === true,
-        claudeVersion,
+        effortName: effortPinned ? effortWireName(sessionEffort) : null,
+        ultracode: effortPinned && sessionEffort.ultracode === true,
         yolo: yoloModeActive,
       });
   // Launch and remember what the picker shows, not a remembered id the
@@ -928,7 +936,7 @@ export function NewSessionPage() {
                 index={sessionEffort.index}
                 ultracode={sessionEffort.ultracode === true}
                 onUltracodeChange={activeKind === "claude" ? onEffortFlag : undefined}
-                ultraGate={activeKind === "claude" ? versionGate : undefined}
+                ultraGate={activeKind === "claude" ? launchGate : undefined}
                 defaultIndex={(activeKind as string) === "claude" ? (modelDefault?.index ?? null) : null}
                 variant="inline"
                 idPrefix="new-session-effort"

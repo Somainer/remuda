@@ -496,9 +496,7 @@ it("history replay hydrates effective but never records a refusal, pending or to
     reachedAfterSeq: true,
     getReadyState: () => 1,
   } as never);
-  let deliver!: Observation;
-  vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_j, _a, onBatch) => {
-    deliver = onBatch;
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async () => {
     return {
       subscriptionId: "sub_replay",
       journalId: instance.journalId,

@@ -121,6 +121,10 @@ export function EffortSlider({
     if (!switchVisible) return null;
     if (locked) return "会话已退出或为只读会话（observed-only），无法切换 ultracode";
     if (ultraGate === "legacy") return "Claude Code 2.1.203 之前不支持 ultracode";
+    // D-056 r2 item 1: an unreported/unparsable version must never be treated
+    // as decoupled-capable. Disable ONLY this switch, name why — the five
+    // effort stops stay usable.
+    if (ultraGate === "unknown") return "未获取到 Claude Code 版本，无法确认是否支持 ultracode";
     if (ultraBlocked?.reason === "ultracode-unavailable-for-model") {
       return `模型 ${ultraBlocked.model ?? "当前模型"} 不支持 ultracode`;
     }

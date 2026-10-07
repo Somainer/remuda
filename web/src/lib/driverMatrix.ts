@@ -20,25 +20,27 @@ type CliEntry = { kind?: string; version?: string; installed?: boolean };
 /**
  * Read-only preview of what the PTY will run (D-028 §5.1).
  *
- * D-056: Claude ultracode at launch renders the REAL argv for the chosen
- * version:
- * - ≥2.1.284: `--effort <level>` plus `--settings` carrying
- *   `"ultracode":true` in the one existing overlay (two `--settings` would
- *   drop the first, so the preview names the same overlay once);
- * - 2.1.203–2.1.283: `--effort ultracode` (the single coupled spelling),
- *   which implies xhigh;
- * - unknown/older: the plain `--effort <level>`.
+ * D-056 r2 item 6: preview ONLY what the current launch materializer emits
+ * (`crates/remuda-driver/src/effort.rs` `effort_argv` +
+ * `remuda-protocol/src/launch.rs` `flag_value`, checked on main and
+ * c-effortread). The materializer writes exactly ONE effort flag and never
+ * puts ultracode in the settings overlay:
+ * - ultracode on  → `--effort ultracode`, the coupled spelling that itself
+ *   implies xhigh (no separate level, no overlay key — at ANY binary version);
+ * - ultracode off → `--effort <level>` when a level was pinned;
+ * - an unpinned draft passes neither field → no effort flag at all, matching
+ *   the create payload (the Node applies the model default).
+ * Never emit a second `--settings` or a version-dependent duplicate flag.
  */
 export function launchPreview(
   opts:
     | { kind: "terminal" }
     | {
         kind: Exclude<AgentKindId, "terminal">;
+        /** Pinned level wire name; omit (unpinned draft) to preview no flag. */
         effortName?: string | null;
-        /** D-056 orthogonal launch switch. */
+        /** Pinned launch switch; materialized as the single coupled spelling. */
         ultracode?: boolean;
-        /** Selected Claude binary version (host CLI inventory); pre-pin. */
-        claudeVersion?: string | null;
         yolo?: boolean;
       },
 ): string {
@@ -54,21 +56,10 @@ export function launchPreview(
     if (opts.yolo || false) {
       argv.push("--dangerously-skip-permissions");
     }
-    const on = opts.ultracode === true;
-    const gate = versionGate(opts.claudeVersion);
-    if (on && (gate === "coupled" || gate === "legacy")) {
-      // Coupled: the single spelling forces xhigh. For a legacy (<2.1.203)
-      // binary this would be rejected at create time, but the preview still
-      // names what the materializer would attempt rather than hiding it.
+    if (opts.ultracode === true) {
       argv.push("--effort ultracode");
     } else if (opts.effortName) {
       argv.push(`--effort ${opts.effortName}`);
-    }
-    if (on && gate === "decoupled") {
-      argv.push('# overlay: {"ultracode": true}');
-    }
-    if (on && gate === "unknown") {
-      argv.push(opts.effortName ? "--effort ultracode" : '--settings {"ultracode": true}');
     }
     return argv.join(" ");
   }
@@ -87,28 +78,6 @@ export function launchPreview(
   }
 
   return ["agy", opts.yolo ? "--yolo" : ""].filter(Boolean).join(" ");
-}
-
-/** Classify a Claude version for the launch argv (mirrors effort.ts). */
-function versionGate(version: string | null | undefined): "decoupled" | "coupled" | "legacy" | "unknown" {
-  const parsed = parse(version);
-  if (!parsed) return "unknown";
-  const cmp = (to: [number, number, number]) => {
-    for (let i = 0; i < 3; i++) {
-      if (parsed[i] !== to[i]) return parsed[i] < to[i] ? -1 : 1;
-    }
-    return 0;
-  };
-  if (cmp([2, 1, 284]) >= 0) return "decoupled";
-  if (cmp([2, 1, 203]) >= 0) return "coupled";
-  return "legacy";
-}
-
-function parse(version: string | null | undefined): [number, number, number] | null {
-  if (!version) return null;
-  const match = /(\d+)\.(\d+)\.(\d+)/.exec(version);
-  if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
 
 export type MatrixDriver = {

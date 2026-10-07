@@ -466,7 +466,8 @@ export type ClaudeVersionGate =
   | "coupled"
   /** < 2.1.203: no ultracode at all; the switch is disabled with the reason. */
   | "legacy"
-  /** Version unknown/unread: treat as decoupled-capable but say nothing fixed. */
+  /** Version unknown/unread/unparsable: the ultracode switch is DISABLED with
+   *  a named reason (never assume decoupled support). The five stops stay on. */
   | "unknown";
 
 /** First build that offered `--effort ultracode`. */

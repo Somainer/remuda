@@ -26,8 +26,10 @@ pub const DEFAULT_ATTACHMENT_MAX_BYTES: usize = 25 * 1024 * 1024;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BootstrapSource {
-    /// Hub-owned / programmatic caller: the code was minted (or supplied by a
-    /// test/example standing in for the Hub). Rotation is allowed.
+    /// Hub-owned: the token field is empty and the Hub mints the code itself
+    /// (or is about to). A non-empty token with this source is a startup
+    /// error; callers supplying a fixed code use an explicit source. Rotation
+    /// is allowed.
     #[default]
     Generated,
     /// Resolved state: a no-source start loaded a persisted token and adopted
@@ -63,10 +65,11 @@ pub struct HubConfig {
     pub bootstrap_token: String,
     /// Where the bootstrap code comes from / who is allowed to mint over it.
     ///
-    /// c-bootstrap-dev round 3: provenance is explicit so a caller cannot hand
-    /// in a token and silently gain rotation authority.
-    /// * [`BootstrapSource::Generated`] — the Hub (or a programmatic/test
-    ///   caller standing in for it) owns/mints the code; rotation allowed.
+    /// Provenance is explicit so a caller cannot hand in a token and silently
+    /// gain rotation authority. A non-empty [`Self::bootstrap_token`] requires
+    /// an explicit source — `resolve_bootstrap` rejects it otherwise.
+    /// * [`BootstrapSource::Generated`] — the token field is empty and the Hub
+    ///   is allowed to mint a code itself; rotation allowed.
     /// * [`BootstrapSource::Adopted`] — set by `resolve_bootstrap` when a
     ///   no-source start loads a persisted token it now owns; rotation allowed.
     /// * [`BootstrapSource::ExplicitFile`] / [`BootstrapSource::ExplicitEnv`] —

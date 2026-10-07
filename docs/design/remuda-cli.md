@@ -65,12 +65,30 @@ the file/env. `F` must be a separate operator-managed file: pointing
 marks it explicit and blocks `rotate-bootstrap` on the normal
 stop → rotate → start flow.
 
-An explicit code does **not** skip the TTL. On a restart the issue timestamp
-is refreshed **only** when the supplied code changed (the file was replaced)
-or — for a file source — the file's mtime is newer than the stored stamp.
-Starting with an untouched file or an unchanged env var simply reuses the
-existing stamp, so that code still expires after `bootstrap_ttl_hours`
-(default **24**; set to `0` to disable expiry entirely).
+An explicit code does **not** skip the TTL. The code is trimmed of
+surrounding whitespace/newlines before use; an empty or whitespace-only value
+is refused before anything is written. On disk the issue stamp is written
+**before** the token (so a crash between the two leaves the old token with the
+new stamp and is repaired on retry). On a restart the stamp is re-written as
+follows:
+
+- **Fresh stamp (code considered newly issued)** only when the supplied code
+  differs from the persisted token, or — for a file source — the access-code
+  file's mtime is strictly newer than the parsed stamp (a redeploy that
+  touched it). There is deliberately no comparison against the token file's
+  own mtime: the token is written after the stamp on every healthy persist, so
+  it is normally fractionally newer, and reading that as "reissue" revived
+  expired codes on every restart.
+- **Backfill to "now"** on an otherwise unchanged code when there is no
+  *usable* stamp — a missing, empty, or whitespace-only
+  `bootstrap-issued-at` (a crash during the write, a pre-D-018 dir, or a
+  hand-provisioned token). A non-empty but malformed stamp is **not**
+  backfilled; it is treated as already expired.
+- Otherwise an untouched file or an unchanged env value leaves the stamp
+  byte-for-byte in place, so the code still expires after
+  `bootstrap_ttl_hours` (default **24**; set to `0` to disable expiry
+  entirely). Expiry is enforced at `/v1/login`; an expired code returns 401
+  until the operator replaces the source or rotates.
 
 `remuda hub rotate-bootstrap --data-dir D` detects the dev layout and writes
 to `D/dev-hub/` unless `--standalone` names `D` directly. If both

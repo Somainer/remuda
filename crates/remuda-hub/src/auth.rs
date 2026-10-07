@@ -102,77 +102,163 @@ fn bootstrap_source_is_explicit(data_dir: &Path) -> bool {
 }
 
 /// Write (explicit source) or remove (hub-generated / adopted) the provenance
-/// marker.
+/// marker. The containing directory is fsync'd after create/unlink so a crash
+/// cannot lose the ordering (marker is the durable source of truth).
 fn set_bootstrap_explicit_marker(data_dir: &Path, explicit: bool) -> Result<(), HubError> {
     let marker = data_dir.join(BOOTSTRAP_EXPLICIT_MARKER);
     if explicit {
         write_private(&marker, "")
     } else {
         match std::fs::remove_file(&marker) {
-            Ok(()) => Ok(()),
+            Ok(()) => fsync_dir(data_dir),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(HubError::Internal(format!("bootstrap marker: {err}"))),
         }
     }
 }
 
-/// Resolve the bootstrap access code, generating one when the config is empty.
+/// fsync the directory so a just-created/-removed entry is durable.
+fn fsync_dir(dir: &Path) -> Result<(), HubError> {
+    let handle = std::fs::File::open(dir)
+        .map_err(|err| HubError::Internal(format!("fsync dir {}: {err}", dir.display())))?;
+    handle
+        .sync_all()
+        .map_err(|err| HubError::Internal(format!("fsync dir {}: {err}", dir.display())))
+}
+
+/// Outcome of [`resolve_bootstrap`] the caller must honour after the Hub has
+/// successfully bound its listener.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootstrapResolution {
+    /// Nothing to do post-bind.
+    None,
+    /// The start used no explicit source yet found an explicit-source marker:
+    /// remove the marker (adopt the persisted token) only once the Hub is
+    /// listening, so a failed bind leaves the provenance intact.
+    AdoptAfterBind,
+}
+
+/// Resolve the bootstrap access code at startup.
 ///
-/// c-bootstrap-dev round 2: an EXPLICIT `--access-code-file` / env is the
-/// operator's source of truth, so the Hub must NEVER mint or overwrite the
-/// persisted token (rotation would re-stamp and revive a code the running Hub
-/// rejects). Provenance is recorded with a sibling marker:
-///   * explicit source present → persist the code + fresh stamp, and WRITE the
-///     explicit-source marker (rotate-bootstrap then refuses);
-///   * no explicit source        → REMOVE any explicit marker; load a restored
-///     token as hub-generated or mint a new one (rotation allowed).
-pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<(), HubError> {
-    let token_path = config.data_dir.join("bootstrap-token");
-    let explicit = !config.bootstrap_token.is_empty()
-        && (config.bootstrap_token_file.is_some() || config.bootstrap_token_from_env);
+/// c-bootstrap-dev round 3 crash-safe + correct re-stamp ordering:
+///   * EXPLICIT file/env → write the provenance marker FIRST (fsync'd), then
+///     re-persist token+stamp ONLY when the code changed or (file) the file's
+///     mtime is strictly newer than the parsed stamp. An unchanged env, or a
+///     file older than the stamp, leaves `bootstrap-issued-at` byte-identical —
+///     an expired code is NOT revived just because the process restarted.
+///   * NON-empty token with no explicit source (programmatic callers) →
+///     hub-generated: write marker removed + persist.
+///   * EMPTY token → load a persisted hub-generated token (or mint one). If an
+///     explicit marker is present the adopt-marker step is deferred until after
+///     a successful bind ([`BootstrapResolution::AdoptAfterBind`]); the token
+///     itself is still loaded.
+pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, HubError> {
+    let data_dir = config.data_dir.clone();
+    let token_path = data_dir.join("bootstrap-token");
+    let stamp_path = data_dir.join("bootstrap-issued-at");
 
-    if explicit {
-        // The explicit code is authoritative. Persist it for
-        // follow/GET-reliant reads and write a fresh issue stamp so the file/
-        // env code is valid for its full TTL from this start, and record that
-        // rotation must not mint over it.
-        persist_bootstrap(&config.data_dir, &config.bootstrap_token)?;
-        set_bootstrap_explicit_marker(&config.data_dir, true)?;
-        return Ok(());
+    // 1) Explicit operator source.
+    if config.bootstrap_source.is_explicit() {
+        // Marker FIRST, durable, before any token/stamp write — on crash the
+        // marker still correctly says "explicit; do not rotate".
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
+        write_private(&data_dir.join(BOOTSTRAP_EXPLICIT_MARKER), "")?;
+        fsync_dir(&data_dir)?;
+
+        let persisted = if token_path.is_file() {
+            std::fs::read_to_string(&token_path)
+                .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
+                .trim()
+                .to_string()
+        } else {
+            String::new()
+        };
+        let code_changed = persisted != config.bootstrap_token;
+        let file_newer_than_stamp = match &config.bootstrap_source {
+            crate::config::BootstrapSource::ExplicitFile(path) => {
+                file_mtime_newer_than_stamp(path, &stamp_path)?
+            }
+            crate::config::BootstrapSource::ExplicitEnv
+            | crate::config::BootstrapSource::Generated
+            | crate::config::BootstrapSource::Adopted => false,
+        };
+        if code_changed || file_newer_than_stamp {
+            persist_bootstrap(&data_dir, &config.bootstrap_token)?;
+        }
+        // Otherwise leave bootstrap-token AND bootstrap-issued-at untouched.
+        return Ok(BootstrapResolution::None);
     }
 
-    // No explicit source: any prior explicit-source marker is now stale and
-    // must be removed before this token is treated as hub-generated.
-    set_bootstrap_explicit_marker(&config.data_dir, false)?;
-
-    // A non-empty token supplied with NO explicit-file/env flag is treated as
-    // a hub-generated/ephemeral code (programmatic callers and tests build
-    // HubConfig directly): it is authoritative and must be persisted so the
-    // HTTP login path and follow reads agree with it. Only a truly empty token
-    // falls back to loading/minting from the data dir.
+    // 2) Hub-generated programmatic token (non-empty, no explicit source).
     if !config.bootstrap_token.is_empty() {
-        persist_bootstrap(&config.data_dir, &config.bootstrap_token)?;
-        return Ok(());
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
+        set_bootstrap_explicit_marker(&data_dir, false)?;
+        persist_bootstrap(&data_dir, &config.bootstrap_token)?;
+        config.bootstrap_source = crate::config::BootstrapSource::Generated;
+        return Ok(BootstrapResolution::None);
     }
 
+    // 3) No configured token: load a persisted one or mint. Marker adoption
+    //    (removing a stale explicit marker) is deferred to post-bind.
     if token_path.is_file() {
         config.bootstrap_token = std::fs::read_to_string(&token_path)
             .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
             .trim()
             .to_string();
-        // Pre-D-018 data dirs have no stamp; treat first sight as issue time
-        // rather than expiring an operator's working code on upgrade.
-        let stamp = config.data_dir.join("bootstrap-issued-at");
-        if !stamp.is_file() {
-            write_private(&stamp, &now_rfc3339())?;
+        // Pre-D-018 data dirs have no stamp; treat first sight as issue time.
+        if !stamp_path.is_file() {
+            write_private(&stamp_path, &now_rfc3339())?;
         }
-        return Ok(());
+        config.bootstrap_source = crate::config::BootstrapSource::Adopted;
+        // Adopt the provenance only after a successful bind if an explicit
+        // marker is currently present.
+        return Ok(if bootstrap_source_is_explicit(&data_dir) {
+            BootstrapResolution::AdoptAfterBind
+        } else {
+            BootstrapResolution::None
+        });
     }
 
-    // Nothing persisted and no explicit code: mint a hub-generated token.
+    // Nothing persisted: mint a hub-generated token.
     config.bootstrap_token = random_token();
-    persist_bootstrap(&config.data_dir, &config.bootstrap_token)?;
-    Ok(())
+    config.bootstrap_source = crate::config::BootstrapSource::Generated;
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
+    set_bootstrap_explicit_marker(&data_dir, false)?;
+    persist_bootstrap(&data_dir, &config.bootstrap_token)?;
+    Ok(BootstrapResolution::None)
+}
+
+/// Whether the access-code file's mtime is strictly newer than the parsed
+/// bootstrap stamp. An unreadable/absent file or an unparseable stamp returns
+/// false (the conservative choice: do not revive the TTL on uncertainty).
+fn file_mtime_newer_than_stamp(file: &Path, stamp: &Path) -> Result<bool, HubError> {
+    let Ok(meta) = std::fs::metadata(file) else {
+        return Ok(false);
+    };
+    let Ok(stamp_text) = std::fs::read_to_string(stamp) else {
+        return Ok(false);
+    };
+    let Ok(parsed) = time::OffsetDateTime::parse(
+        stamp_text.trim(),
+        &time::format_description::well_known::Rfc3339,
+    ) else {
+        return Ok(false);
+    };
+    let Ok(modified) = meta.modified() else {
+        return Ok(false);
+    };
+    Ok(time::OffsetDateTime::from(modified) > parsed)
+}
+
+/// Remove the explicit-source provenance marker after a successful no-source
+/// Hub start (bind established). Called only when
+/// [`resolve_bootstrap`] returned [`BootstrapResolution::AdoptAfterBind`], so a
+/// failed bind leaves the marker and rotation refusal intact.
+pub fn adopt_bootstrap_after_bind(data_dir: &Path) -> Result<(), HubError> {
+    set_bootstrap_explicit_marker(data_dir, false)
 }
 
 /// Replace the bootstrap access code with a freshly generated one (D-018).

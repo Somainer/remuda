@@ -62,7 +62,7 @@ mod workspaces;
 mod ws;
 
 use crate::alerts::{BlockedWatch, Followers};
-use crate::auth::{persist_listen, resolve_bootstrap};
+use crate::auth::{adopt_bootstrap_after_bind, persist_listen, resolve_bootstrap, BootstrapResolution};
 use crate::store::Store;
 use crate::ws::Bus;
 use axum::Router;
@@ -683,7 +683,7 @@ async fn spawn_inner(
     supervise::mark_started();
     proxy::configure_public_origin(&mut config)?;
     std::fs::create_dir_all(&config.data_dir)?;
-    resolve_bootstrap(&mut config)?;
+    let bootstrap_resolution = resolve_bootstrap(&mut config)?;
     let bootstrap_token = config.bootstrap_token.clone();
     let store = Store::open(&config.data_dir)?;
     store
@@ -738,6 +738,12 @@ async fn spawn_inner(
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     persist_listen(&config.data_dir, addr)?;
+    // Bind established: a no-source start may now adopt an explicit-marker'd
+    // persisted token. A failed bind above aborts before this, leaving the
+    // provenance marker (and rotation refusal) intact.
+    if bootstrap_resolution == BootstrapResolution::AdoptAfterBind {
+        adopt_bootstrap_after_bind(&config.data_dir)?;
+    }
     let (tx, rx) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         let shutdown = async {

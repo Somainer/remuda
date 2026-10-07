@@ -18,6 +18,41 @@ pub const DEFAULT_ENROLL_TOKEN_TTL_MINUTES: u64 = 60;
 /// Default per-file attachment staging ceiling (D-027b): 25 MiB.
 pub const DEFAULT_ATTACHMENT_MAX_BYTES: usize = 25 * 1024 * 1024;
 
+/// Provenance of the configured bootstrap access code (c-bootstrap-dev).
+///
+/// Controls whether the Hub may mint/rotate the persisted token. Serialises as
+/// a simple tag so a config dump stays debuggable; the file path inside
+/// [`BootstrapSource::ExplicitFile`] is not persisted here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BootstrapSource {
+    /// Hub-owned / programmatic caller: the code was minted (or supplied by a
+    /// test/example standing in for the Hub). Rotation is allowed.
+    Generated,
+    /// Resolved state: a no-source start loaded a persisted token and adopted
+    /// it. Rotation is allowed. Set only by `resolve_bootstrap`.
+    Adopted,
+    /// Operator-supplied via `--access-code-file PATH`; the path is retained
+    /// for the startup mtime check. Rotation is refused.
+    ExplicitFile(std::path::PathBuf),
+    /// Operator-supplied via `REMUDA_BOOTSTRAP_TOKEN`. Rotation is refused.
+    ExplicitEnv,
+}
+
+impl Default for BootstrapSource {
+    fn default() -> Self {
+        Self::Generated
+    }
+}
+
+impl BootstrapSource {
+    /// True for the two explicit operator sources.
+    #[must_use]
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, Self::ExplicitFile(_) | Self::ExplicitEnv)
+    }
+}
+
 /// How Hub binds and authenticates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,18 +66,19 @@ pub struct HubConfig {
     pub listen: SocketAddr,
     /// Device pairing access code. Empty means generate. Never enrolls a Node (D-018).
     pub bootstrap_token: String,
-    /// Path to the `--access-code-file` the non-empty `bootstrap_token` was
-    /// read from, if any (c-bootstrap-dev). When set, `resolve_bootstrap`
-    /// re-persists the token and re-stamps on startup whenever the file is
-    /// newer than the stored stamp or the token differs, so a working code
-    /// never silently expires.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bootstrap_token_file: Option<PathBuf>,
-    /// True when the non-empty `bootstrap_token` came from
-    /// `REMUDA_BOOTSTRAP_TOKEN` rather than a file. Same re-persist behaviour
-    /// as a file source, minus the mtime check (env has no file mtime).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub bootstrap_token_from_env: bool,
+    /// Where the bootstrap code comes from / who is allowed to mint over it.
+    ///
+    /// c-bootstrap-dev round 3: provenance is explicit so a caller cannot hand
+    /// in a token and silently gain rotation authority.
+    /// * [`BootstrapSource::Generated`] — the Hub (or a programmatic/test
+    ///   caller standing in for it) owns/mints the code; rotation allowed.
+    /// * [`BootstrapSource::Adopted`] — set by `resolve_bootstrap` when a
+    ///   no-source start loads a persisted token it now owns; rotation allowed.
+    /// * [`BootstrapSource::ExplicitFile`] / [`BootstrapSource::ExplicitEnv`] —
+    ///   an operator-supplied code the Hub must never mint over; rotation is
+    ///   refused until a later start adopts it by running with no source.
+    #[serde(default)]
+    pub bootstrap_source: BootstrapSource,
     /// Bootstrap access-code lifetime in hours; `0` disables expiry.
     #[serde(default = "default_bootstrap_ttl_hours")]
     pub bootstrap_ttl_hours: u64,
@@ -203,8 +239,7 @@ impl Default for HubConfig {
             data_dir: PathBuf::from("./data"),
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             bootstrap_token: String::new(),
-            bootstrap_token_file: None,
-            bootstrap_token_from_env: false,
+            bootstrap_source: BootstrapSource::Generated,
             bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
             enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: true,
@@ -239,8 +274,7 @@ impl HubConfig {
             data_dir,
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             bootstrap_token: format!("boot-{}", Uuid::new_v4().simple()),
-            bootstrap_token_file: None,
-            bootstrap_token_from_env: false,
+            bootstrap_source: BootstrapSource::Generated,
             bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
             enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: false,

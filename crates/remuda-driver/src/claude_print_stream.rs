@@ -370,7 +370,15 @@ pub(super) fn map_assistant(
     // model message, from `message.usage` — never the summed `result.usage`.
     // Sub-agent frames carry a parent and are dropped the same way transcript
     // sidechain records are. Repeated block frames for one message id dedupe.
+    //
+    // The ShellPty carrier reaches this function TWICE per frame: its
+    // transcript mapper's `emit_conversation` rebuilds the record into a
+    // stream frame after the group machinery. For ShellPty the group-gated
+    // `flush_group` is the sole usage source (it waits for stop_reason /
+    // supersede / finish), so the stream emission is print/SDK carriers only
+    // — otherwise every transcript block would bypass that gate.
     if msg.parent_tool_use_id.is_none()
+        && mapper.driver_kind != DriverKind::ShellPty
         && let Some(usage_obs) = super::usage_from_assistant_message(mapper, msg)?
     {
         out.push(usage_obs);

@@ -558,10 +558,7 @@ impl GenericPtyDriver {
             pid: None,
         };
         let stamp = crate::adapters::supervisor::stamp_ctx(
-            self.options
-                .instance_id
-                .clone()
-                .unwrap_or_else(InstanceId::new),
+            self.options.instance_id.clone().unwrap_or_default(),
             spec.host.clone(),
             ctx.journal_id.clone(),
             ctx.run_id.clone(),

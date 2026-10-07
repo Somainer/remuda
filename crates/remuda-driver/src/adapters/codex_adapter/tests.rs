@@ -238,10 +238,17 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
             _ => None,
         })
         .collect();
-    // One turn snapshot + one session snapshot.
-    assert_eq!(usages.len(), 2);
-    assert_eq!(usages[0].scope, remuda_protocol::UsageScope::Turn);
-    assert_eq!(usages[1].scope, remuda_protocol::UsageScope::Session);
+    // c-usagefu (b): one per-response Message snapshot, then the end-of-turn
+    // Turn snapshot and the cumulative Session snapshot.
+    assert_eq!(usages.len(), 3);
+    assert_eq!(usages[0].scope, remuda_protocol::UsageScope::Message);
+    assert_eq!(usages[1].scope, remuda_protocol::UsageScope::Turn);
+    assert_eq!(usages[2].scope, remuda_protocol::UsageScope::Session);
+    // The Message row is keyed on the native response id.
+    assert_eq!(usages[0].scope_id, "r1");
+    // Turn and Session rows carry the per-turn / cumulative counters; the
+    // per-request Message row is the context basket source.
+    assert_eq!(usages[1].scope_id, "t1");
     // Both estimated; cumulative token_count did not double the tokens.
     for payload in &usages {
         assert_eq!(payload.accounting, remuda_protocol::Accounting::Estimated);

@@ -2490,6 +2490,27 @@ fn now() -> DriverResult<Timestamp> {
     Timestamp::try_from(text).map_err(DriverError::Protocol)
 }
 
+/// Parse a transcript record's RFC3339 `timestamp` (variable fractional digits
+/// and a possible non-UTC offset) into the protocol's canonical millisecond-Z
+/// clock. Returns `None` for an unparseable value rather than guessing, so the
+/// observation falls back to ingest time (c-ctxusage r3 item 5).
+fn native_timestamp(text: &str) -> Option<Timestamp> {
+    use time::format_description::well_known::Rfc3339;
+    let t = time::OffsetDateTime::parse(text, &Rfc3339).ok()?;
+    let t = t.to_offset(time::UtcOffset::UTC);
+    let canonical = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond(),
+    );
+    Timestamp::try_from(canonical).ok()
+}
+
 fn dummy_digest() -> Digest {
     Digest::try_from(format!("sha256:{:0>64}", "0")).expect("digest")
 }
@@ -2636,6 +2657,14 @@ impl StdoutMapper {
     pub fn session_id(&self) -> &str {
         &self.mapper.session_id
     }
+}
+
+/// Whether a group drain happens mid-stream (a poll boundary) or at a hard
+/// boundary (a superseding message / user record / end of stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupDrain {
+    Poll,
+    Supersede,
 }
 
 /// Transcript-to-observations mapper for a live claude-pty session.
@@ -2829,37 +2858,38 @@ impl TranscriptMapper {
         self.map_record(value)
     }
 
-    /// Flush whatever assistant run is still buffered.
-    ///
-    /// A run is normally closed by the record that supersedes it, so the last
-    /// message of a transcript would otherwise sit in the buffer forever. The
-    /// tailer calls this when it reaches the end of the available input.
+    /// Poll-boundary drain (called at the end of every pump batch): publish
+    /// any new content blocks, and — only for a run that has seen its
+    /// stop_reason and carries fresh counters — a provisional, replaceable
+    /// usage snapshot. The group is retained, so a later same-message-id record
+    /// publishes a higher revision instead of reopening a fresh group.
     pub fn flush(&mut self) -> DriverResult<Vec<Observation>> {
-        self.flush_group(false)
+        self.drain_group(GroupDrain::Poll)
     }
 
-    /// Flush the buffered assistant run.
-    ///
-    /// `force` is true when the run is known complete for a reason other than
-    /// seeing its stop_reason (a superseding message or a user record):
-    /// content is always emitted, but usage is finalised only when forced OR
-    /// the group observed a `message.stop_reason`. A plain poll-boundary flush
-    /// (`force=false`, no stop) emits content only, so a message split across
-    /// polls can never publish a partial first usage snapshot (c-ctxusage r2
-    /// item 3 — the durable index would otherwise freeze the partial values).
-    fn flush_group(&mut self, force: bool) -> DriverResult<Vec<Observation>> {
-        let Some(flushed) = self.group.flush() else {
-            return Ok(Vec::new());
+    /// Explicit end-of-stream / supersede: publish any new content and FINALISE
+    /// the retained run's usage even without a stop_reason (an interrupted or
+    /// killed last turn must not lose its counters). The caller starts the next
+    /// group afterwards.
+    pub fn finish(&mut self) -> DriverResult<Vec<Observation>> {
+        self.drain_group(GroupDrain::Supersede)
+    }
+
+    /// Drain content and (depending on the trigger) finalise usage without ever
+    /// clearing the retained group's identity/counters here — `start` for the
+    /// next message is what resets it.
+    fn drain_group(&mut self, trigger: GroupDrain) -> DriverResult<Vec<Observation>> {
+        let mut out = Vec::new();
+        if let Some(content) = self.group.drain_content() {
+            out.extend(self.emit_conversation(content.record)?);
+        }
+        let publishable = match trigger {
+            GroupDrain::Poll => self.group.usage_publishable_at_poll(),
+            GroupDrain::Supersede => self.group.usage_publishable_on_supersede(),
         };
-        let mut out = self.emit_conversation(flushed.record)?;
-        if (force || flushed.finalized)
-            && let Some(usage) = flushed.usage
-            && let Some(obs) = self.usage_from_usage_object(
-                &flushed.message_id,
-                flushed.request_id.as_deref(),
-                flushed.model.as_deref(),
-                &usage,
-            )?
+        if publishable
+            && let Some(pending) = self.group.take_usage()
+            && let Some(obs) = self.usage_from_pending(&pending)?
         {
             out.push(obs);
         }
@@ -2924,25 +2954,26 @@ impl TranscriptMapper {
     /// message group from the group's last `message.usage`.
     ///
     /// D-056/context-usage: native TUI usage lives only in transcript records.
-    /// Scope is `Turn`; scope_id is the message id, namespaced with the
-    /// requestId when present (c-ctxusage r2 item 2) so distinct requests can
-    /// never collide. Counters come from the LAST block (never a sum); the Hub
-    /// durably dedupes on `(instance_id, scope, scope_id)`.
+    /// Scope is `Turn`; scope_id is the bare assistant `message.id` — the same
+    /// key round one (f890028e) persisted — so a re-hydration replays fold onto
+    /// the existing row instead of minting a second turn. `requestId` is NOT
+    /// namespaced into the key: within one instance a Claude message id is
+    /// already unique, and prefixing it made round-one rows unmergeable
+    /// (c-ctxusage r3 item 4). Counters come from the LAST block (never a sum);
+    /// `revision` lets a later same-message record replace a provisional row.
     fn usage_from_usage_object(
         &mut self,
         message_id: &str,
         request_id: Option<&str>,
         model: Option<&str>,
         usage: &Value,
+        revision: u64,
+        native_at: Option<Timestamp>,
     ) -> DriverResult<Option<Observation>> {
         if message_id.is_empty() {
             return Ok(None);
         }
-        // Key on message id, namespaced with the request when one is known.
-        let scope_id = match request_id {
-            Some(req) if !req.is_empty() => format!("{req}:{message_id}"),
-            _ => message_id.to_owned(),
-        };
+        let scope_id = message_id.to_owned();
         let event = match crate::usage::claude::usage_from_message_usage(
             Some(message_id),
             request_id,
@@ -2955,17 +2986,41 @@ impl TranscriptMapper {
         let mut totals = crate::usage::UsageTotals::default();
         totals.add(&event);
         let mut payload =
-            crate::usage::to_usage_payload(UsageScope::Turn, scope_id.clone(), 1, &totals);
+            crate::usage::to_usage_payload(UsageScope::Turn, scope_id.clone(), revision, &totals);
         payload.usage_id = remuda_protocol::Id::derive(
             "obj",
             self.mapper.instance_id.as_id().as_str(),
             &format!("usage:turn:{scope_id}"),
         )?;
-        Ok(Some(self.mapper.observation(
+        let mut obs = self.mapper.observation(
             Completeness::Structured,
             remuda_protocol::NativeRequestKey::None,
             ObservationPayload::Usage(Box::new(payload)),
-        )?))
+        )?;
+        // c-ctxusage r3 item 5: carry the record's own timestamp so a historical
+        // replay stays out of the TPM/lastTurnAt windows (the pump builders
+        // preserve it rather than rebuilding the envelope as unknown).
+        if let Some(at) = native_at {
+            obs.native_at = Knowledge::Known { value: at };
+        }
+        Ok(Some(obs))
+    }
+
+    /// Build the usage observation for a group's pending snapshot, parsing its
+    /// record timestamp into the protocol millisecond clock.
+    fn usage_from_pending(
+        &mut self,
+        pending: &records::PendingUsage,
+    ) -> DriverResult<Option<Observation>> {
+        let native_at = pending.native_at.as_deref().and_then(native_timestamp);
+        self.usage_from_usage_object(
+            &pending.message_id,
+            pending.request_id.as_deref(),
+            pending.model.as_deref(),
+            &pending.usage,
+            pending.revision,
+            native_at,
+        )
     }
 
     /// Map one decoded transcript record.
@@ -2997,8 +3052,8 @@ impl TranscriptMapper {
         let mut mapped = match kind {
             "assistant" => self.map_assistant_record(value),
             "user" => {
-                // Any user record ends the assistant run before it.
-                let mut out = self.flush_group(true)?;
+                // Any user record ends (supersedes) the assistant run before it.
+                let mut out = self.finish()?;
                 out.extend(self.map_user_record(value)?);
                 Ok(out)
             }
@@ -3340,7 +3395,7 @@ impl TranscriptMapper {
         let Some(key) = records::GroupKey::of(&value, &message) else {
             // No `message.id` to group on — replay it on its own rather than
             // dropping a real assistant turn.
-            let mut out = self.flush_group(true)?;
+            let mut out = self.finish()?;
             out.extend(self.emit_conversation(value)?);
             return Ok(out);
         };
@@ -3348,7 +3403,7 @@ impl TranscriptMapper {
             self.group.push(&value, &message);
             return Ok(Vec::new());
         }
-        let out = self.flush_group(true)?;
+        let out = self.finish()?;
         self.group.start(key, value.clone());
         self.group.push(&value, &message);
         Ok(out)

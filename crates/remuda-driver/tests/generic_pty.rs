@@ -569,8 +569,7 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
         .join(SESSION_ID);
     fs::create_dir_all(&session_dir).unwrap();
     fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/usage/grok-updates-usage.jsonl"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/usage/grok-updates-usage.jsonl"),
         session_dir.join("updates.jsonl"),
     )
     .expect("seed updates.jsonl");

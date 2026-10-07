@@ -466,6 +466,17 @@ pub struct UsageSpec {
     /// Cached read tokens.
     #[serde(default)]
     pub cached_tokens: Option<u64>,
+    /// 5-minute-TTL cache CREATION tokens. Setting this switches the written
+    /// transcript usage to the 2.1.289 dialect: a non-zero
+    /// `cache_creation_input_tokens` plus the split
+    /// `cache_creation.{ephemeral_5m,ephemeral_1h}_input_tokens` object
+    /// (c-ctxusage r4 item 7c). `None` keeps the legacy 2.1.270 shape (fixed
+    /// zero).
+    #[serde(default)]
+    pub cache_creation_5m: Option<u64>,
+    /// 1-hour-TTL cache creation tokens (paired with `cache_creation_5m`).
+    #[serde(default)]
+    pub cache_creation_1h: Option<u64>,
 }
 
 impl Scenario {

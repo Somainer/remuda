@@ -913,12 +913,12 @@ pub(super) fn spawn(
                     return;
                 }
                 bindings.demobilize();
-                hydrator = None;
+                finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
                 announced = None;
             }
             if saw_promote {
                 bindings.begin_epoch(&ctx.cwd, &ctx.claude_home);
-                hydrator = None;
+                finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
                 announced = None;
                 bypass_announced = false;
                 trust_attempted = false;
@@ -955,7 +955,7 @@ pub(super) fn spawn(
                         found.as_ref().expect("matched foreground"),
                         &report,
                     ) {
-                        hydrator = None;
+                        finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
                         announced = None;
                     }
                     bindings.ingest_session_start(report);
@@ -1296,12 +1296,17 @@ pub(super) fn spawn(
                     )
                     .await;
                 }
-                _ => hydrator = None,
+                _ => finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await,
             }
             if events.is_closed() {
-                return;
+                // Channel already gone: nothing can receive the finalise.
+                break;
             }
         }
+        // c-ctxusage r4 item 2: cooperative shutdown finalises the last
+        // assistant run (usage with no stop_reason) instead of dropping the
+        // hydrator on close/process exit.
+        finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
     })
 }
 
@@ -1521,7 +1526,7 @@ async fn maintain_binding(
     }
 
     if bindings.degraded() {
-        hydrator.take();
+        finalize_hydrator(hydrator, events, seq, ctx).await;
         let related = bindings
             .binding()
             .map(|binding| {
@@ -1590,7 +1595,7 @@ async fn maintain_binding(
     // collision once records carrying a cwd have actually been written.
     if !bindings.content_cwd_check() {
         bindings.mark_degraded("transcript cwd does not match the promoted terminal");
-        hydrator.take();
+        finalize_hydrator(hydrator, events, seq, ctx).await;
         let mut related = BTreeMap::from([
             ("sessionId".to_owned(), binding.session_id.clone()),
             ("source".to_owned(), binding.source.as_wire().to_owned()),
@@ -1626,7 +1631,7 @@ async fn maintain_binding(
             Err(()) => {
                 // The bound file vanished: degrade, never silently rebind.
                 bindings.mark_degraded("bound transcript file vanished");
-                hydrator.take();
+                finalize_hydrator(hydrator, events, seq, ctx).await;
                 let related = BTreeMap::from([
                     ("sessionId".to_owned(), binding.session_id.clone()),
                     ("source".to_owned(), binding.source.as_wire().to_owned()),
@@ -1851,6 +1856,54 @@ impl Hydrator {
             pending,
         })
     }
+
+    /// Final drain before the hydrator is dropped (demote / promote / rebind /
+    /// degrade / close — c-ctxusage r4 item 2): read whatever the tail gained,
+    /// then `finish()` the mapper so an assistant record with usage and no
+    /// stop_reason still publishes its counters. A poll read error is treated
+    /// as "nothing new" here: the finalise itself must never be skipped.
+    ///
+    /// Best-effort by contract: when the event channel is already gone the
+    /// observations are dropped rather than failing the shutdown.
+    async fn finalize(
+        mut self,
+        events: &mpsc::Sender<Observation>,
+        seq: &AtomicU64,
+        ctx: &PromoteCtx,
+    ) {
+        let lines = self.tail.poll().unwrap_or_default();
+        let mut batches: Vec<_> = lines
+            .iter()
+            .map(|line| self.mapper.map_line(line))
+            .collect();
+        batches.push(self.mapper.finish());
+        for batch in batches {
+            let Ok(mapped) = batch else {
+                continue;
+            };
+            for observation in mapped {
+                if emit_native(events, seq, ctx, SourceChannel::Transcript, &observation)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Finalise and discard the current hydrator, if any, preserving the last
+/// turn's observations across an epoch boundary (c-ctxusage r4 item 2).
+async fn finalize_hydrator(
+    hydrator: &mut Option<Hydrator>,
+    events: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &PromoteCtx,
+) {
+    if let Some(active) = hydrator.take() {
+        active.finalize(events, seq, ctx).await;
+    }
 }
 
 /// Drain whatever the transcript gained since the last poll.
@@ -1901,16 +1954,12 @@ async fn pump(
             }
         };
         for observation in mapped {
-            if emit(
-                events,
-                seq,
-                ctx,
-                SourceChannel::Transcript,
-                observation.completeness,
-                observation.body,
-            )
-            .await
-            .is_err()
+            // c-ctxusage r3 item 5: preserve the mapper-provided native time
+            // (historical usage timestamps) instead of rebuilding the envelope
+            // with native_at: Unknown.
+            if emit_native(events, seq, ctx, SourceChannel::Transcript, &observation)
+                .await
+                .is_err()
             {
                 return Err(());
             }
@@ -1951,7 +2000,36 @@ async fn emit(
         channel,
         completeness,
         body,
+        Knowledge::Unknown {
+            reason: "not-emitted".into(),
+            evidence_event_ids: Vec::new(),
+        },
     )?;
+    events
+        .send(observation)
+        .await
+        .map_err(|_| DriverError::ControlUnavailable)
+}
+
+/// Send an observation the mapper already stamped, preserving its envelope's
+/// `native_at` (c-ctxusage r3 item 5 — historical usage must keep its time).
+async fn emit_native(
+    events: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &PromoteCtx,
+    channel: SourceChannel,
+    stamped: &Observation,
+) -> DriverResult<()> {
+    let mut observation = build(
+        ctx,
+        seq.fetch_add(1, Ordering::SeqCst) + 1,
+        channel,
+        stamped.completeness,
+        stamped.body.clone(),
+        stamped.native_at.clone(),
+    )?;
+    // The replay completeness/evidence the mapper computed rides along.
+    observation.evidence_event_ids = stamped.evidence_event_ids.clone();
     events
         .send(observation)
         .await
@@ -1964,6 +2042,7 @@ fn build(
     channel: SourceChannel,
     completeness: Completeness,
     body: ObservationPayload,
+    native_at: Knowledge<Timestamp>,
 ) -> DriverResult<Observation> {
     Ok(Observation {
         schema_version: SchemaVersion,
@@ -1976,10 +2055,7 @@ fn build(
         run_generation: Some(U64(1)),
         seq: U64(seq),
         observed_at: now_ts()?,
-        native_at: Knowledge::Unknown {
-            reason: "not-emitted".into(),
-            evidence_event_ids: Vec::new(),
-        },
+        native_at,
         source: ObservationSource {
             driver_kind: remuda_protocol::DriverKind::ShellPty,
             driver_version: "shell-pty".into(),
@@ -2643,5 +2719,107 @@ mod tests {
         bindings.begin_epoch(&cwd, tmp.path());
         assert!(bindings.binding().is_none());
         assert!(!bindings.degraded());
+    }
+    /// c-ctxusage r4 item 2, carrier level: the real Hydrator (bound tail +
+    /// mapper + emit path) must keep an assistant run with usage but NO
+    /// stop_reason unpublished across ordinary poll flushes, then publish it
+    /// on `finalize` — the exact path exit / close / demote now take. A plain
+    /// `flush()` used to be the only call, so the last turn's usage never
+    /// reached the Hub and the chip stayed "—".
+    #[tokio::test]
+    async fn hydrator_finalise_publishes_usage_without_stop_reason_on_close() {
+        use crate::claude_transcript::{BindingSource, TranscriptBinding};
+        use remuda_protocol::Knowledge;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session = "dddddddd-aaaa-4bbb-8ccc-dddddddddddd";
+
+        // One assistant record: real counters, stop_reason deliberately null
+        // (a process killed right after the final block, before Claude writes
+        // the terminal record).
+        let body = serde_json::json!({
+            "type": "assistant",
+            "uuid": "uuid-final",
+            "timestamp": "2026-10-08T00:00:00.000Z",
+            "isSidechain": false,
+            "message": {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_last_turn",
+                "model": "claude-opus-5-5",
+                "content": [{"type": "text", "text": "DONE"}],
+                "stop_reason": null,
+                "usage": {
+                    "input_tokens": 3,
+                    "cache_read_input_tokens": 4000,
+                    "cache_creation_input_tokens": 7,
+                    "output_tokens": 11,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 7,
+                        "ephemeral_1h_input_tokens": 0
+                    }
+                }
+            }
+        });
+        let path = slug_session(&home, &cwd, session, &format!("{}\n", body));
+
+        let binding = TranscriptBinding {
+            session_id: session.into(),
+            path: path.clone(),
+            cwd: cwd.clone(),
+            source: BindingSource::Hook,
+        };
+        let ctx = ctx_in(&cwd);
+        let mut hydrator = Hydrator::open(&ctx, &binding, None, None, None, None, None)
+            .expect("hydrator binds the seeded transcript");
+
+        let (tx, mut rx) = mpsc::channel::<Observation>(64);
+
+        // Ordinary poll cycle: content is journaled, but usage with no
+        // stop_reason stays with the run.
+        pump(
+            &mut hydrator,
+            &tx,
+            &std::sync::atomic::AtomicU64::new(0),
+            &ctx,
+        )
+        .await
+        .expect("pump");
+        let mut saw_usage_after_poll = false;
+        while let Ok(observation) = rx.try_recv() {
+            if matches!(observation.body, ObservationPayload::Usage(_)) {
+                saw_usage_after_poll = true;
+            }
+        }
+        assert!(
+            !saw_usage_after_poll,
+            "a poll flush must not publish usage for a run without stop_reason"
+        );
+
+        // Close/exit/demotion all route through Hydrator::finalize now.
+        hydrator
+            .finalize(&tx, &std::sync::atomic::AtomicU64::new(0), &ctx)
+            .await;
+        drop(tx);
+
+        let mut finalised = Vec::new();
+        while let Some(observation) = rx.recv().await {
+            if let ObservationPayload::Usage(payload) = observation.body {
+                finalised.push(payload);
+            }
+        }
+        assert_eq!(finalised.len(), 1, "the last turn finalises exactly once");
+        let payload = &finalised[0];
+        let known = |value: &Knowledge<remuda_protocol::U64>| match value {
+            Knowledge::Known { value } => value.0,
+            other => panic!("expected Known counter, got {other:?}"),
+        };
+        assert_eq!(known(&payload.input_tokens), 3);
+        assert_eq!(known(&payload.cache_read_tokens), 4_000);
+        assert_eq!(known(&payload.cache_write_tokens), 7);
+        assert_eq!(known(&payload.output_tokens), 11);
     }
 }

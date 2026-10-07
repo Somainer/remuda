@@ -458,8 +458,24 @@ pub fn require_origin(headers: &HeaderMap, config: &HubConfig) -> Result<(), Hub
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HubConfig, secret_eq};
+    use crate::config::{BootstrapSource, HubConfig, secret_eq};
     use axum::http::HeaderValue;
+
+    /// The expired stamp every round-3 test backdates to.
+    const EXPIRED_STAMP: &str = "2000-01-01T00:00:00.000Z";
+    /// 1999-12-31T00:00:00Z: strictly older than [`EXPIRED_STAMP`].
+    const MTIME_1999: i64 = 946_598_400;
+
+    /// Backdate a path's atime+mtime (Unix only) so the file's mtime compares
+    /// older than the year-2000 test stamp.
+    #[cfg(unix)]
+    fn backdate_mtime(path: &Path, seconds: i64) {
+        use nix::sys::stat::{UtimensatFlags, utimensat};
+        use nix::sys::time::TimeSpec;
+        let ts = TimeSpec::new(seconds, 0);
+        utimensat(None, path, &ts, &ts, UtimensatFlags::FollowSymlink)
+            .expect("utimensat backdates the access-code file");
+    }
 
     #[test]
     fn secret_eq_is_length_sensitive() {
@@ -539,8 +555,16 @@ mod tests {
         );
     }
 
-    /// c-bootstrap-dev round 2: an explicit code persists and writes the
-    /// explicit-source marker so rotation refuses.
+    /// Set up a data dir holding `code` with the year-2000 expired stamp, and
+    /// return the raw stamp bytes callers compare against after a restart.
+    fn expired_token_setup(dir: &Path, code: &str) -> Vec<u8> {
+        persist_bootstrap(dir, code).expect("persist");
+        write_private(&dir.join("bootstrap-issued-at"), EXPIRED_STAMP).expect("stamp");
+        std::fs::read(dir.join("bootstrap-issued-at")).expect("raw stamp bytes")
+    }
+
+    /// c-bootstrap-dev round 3: the FIRST explicit-source start persists the
+    /// code, writes the provenance marker, and rotation refuses.
     #[test]
     fn explicit_access_code_file_writes_explicit_marker() {
         let dir = tempfile::tempdir().expect("data dir");
@@ -549,8 +573,9 @@ mod tests {
 
         let mut config = HubConfig::for_test(dir.path().to_path_buf());
         config.bootstrap_token = "new-code-from-file".to_owned();
-        config.bootstrap_token_file = Some(code_file);
-        resolve_bootstrap(&mut config).expect("resolve");
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        let resolution = resolve_bootstrap(&mut config).expect("resolve");
+        assert_eq!(resolution, BootstrapResolution::None);
 
         let stored = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
         assert_eq!(stored.trim(), "new-code-from-file");
@@ -567,78 +592,166 @@ mod tests {
         assert_eq!(after.trim(), "new-code-from-file");
     }
 
-    /// c-bootstrap-dev round 2: an explicit code that did NOT change does not
-    /// revive an expired stamp — merely touching/redeploying the file with the
-    /// same value must not extend its TTL. (Changed code re-stamps because the
-    /// operator genuinely rotated it — covered by the token-change test.)
+    /// Item 1: an unchanged FILE code whose mtime is OLDER than the persisted
+    /// stamp leaves the stamp byte-identical across a restart — an expired
+    /// code must not be revived by a redeploy that did not touch the file.
+    #[cfg(unix)]
     #[test]
-    fn unchanged_explicit_code_does_not_revive_expired_stamp() {
+    fn unchanged_explicit_file_code_older_than_stamp_keeps_expired_stamp_bytes() {
         let dir = tempfile::tempdir().expect("data dir");
-        persist_bootstrap(dir.path(), "same-code").expect("persist");
-        write_private(
-            &dir.path().join("bootstrap-issued-at"),
-            "2000-01-01T00:00:00.000Z",
-        )
-        .expect("stamp");
+        let stamp_bytes = expired_token_setup(dir.path(), "same-code");
 
-        // A same-content file with a fresh mtime.
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "same-code").expect("code file");
+        backdate_mtime(&code_file, MTIME_1999);
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        resolve_bootstrap(&mut config).expect("resolve");
+
+        let after = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("read stamp");
+        assert_eq!(
+            after, stamp_bytes,
+            "an unchanged, older-than-stamp file must not re-stamp"
+        );
+        let token = std::fs::read(dir.path().join("bootstrap-token")).expect("read token");
+        assert_eq!(token, b"same-code");
+        assert!(!bootstrap_within_ttl(dir.path(), 24), "stamp stays expired");
+        assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+        assert!(rotate_bootstrap(dir.path()).is_err());
+    }
+
+    /// Item 1: an unchanged ENV code (no mtime exists) also keeps the expired
+    /// stamp bytes across a restart.
+    #[test]
+    fn unchanged_explicit_env_code_keeps_expired_stamp_bytes() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let stamp_bytes = expired_token_setup(dir.path(), "same-env-code");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-env-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitEnv;
+        resolve_bootstrap(&mut config).expect("resolve");
+
+        let after = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("read stamp");
+        assert_eq!(
+            after, stamp_bytes,
+            "an unchanged env code must not re-stamp"
+        );
+        assert!(!bootstrap_within_ttl(dir.path(), 24), "stamp stays expired");
+        assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+        assert!(rotate_bootstrap(dir.path()).is_err());
+    }
+
+    /// Item 1: a CHANGED code re-stamps (minted-style fresh stamp) even when
+    /// the file's mtime is older than the old stamp — the operator genuinely
+    /// rotated the code.
+    #[cfg(unix)]
+    #[test]
+    fn changed_explicit_file_code_restamps_even_with_old_mtime() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let stamp_bytes = expired_token_setup(dir.path(), "old-code");
+
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "brand-new-code").expect("code file");
+        backdate_mtime(&code_file, MTIME_1999);
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "brand-new-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        resolve_bootstrap(&mut config).expect("resolve");
+
+        let after = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("read stamp");
+        assert_ne!(after, stamp_bytes, "a changed code must re-stamp");
+        let token = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
+        assert_eq!(token.trim(), "brand-new-code");
+        assert!(
+            bootstrap_within_ttl(dir.path(), 24),
+            "the new code is fresh"
+        );
+    }
+
+    /// Item 1: a changed ENV code re-stamps too.
+    #[test]
+    fn changed_explicit_env_code_restamps() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let stamp_bytes = expired_token_setup(dir.path(), "old-env-code");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "brand-new-env-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitEnv;
+        resolve_bootstrap(&mut config).expect("resolve");
+
+        let after = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("read stamp");
+        assert_ne!(after, stamp_bytes);
+        let token = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
+        assert_eq!(token.trim(), "brand-new-env-code");
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+    }
+
+    /// Item 1: the same code in a file whose mtime is strictly NEWER than the
+    /// backdated stamp re-stamps (the operator touched/redeployed the file).
+    #[test]
+    fn touched_explicit_file_same_code_restamps() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let stamp_bytes = expired_token_setup(dir.path(), "same-code");
+
+        // A freshly written file has mtime = now, strictly newer than 2000.
         let code_file = dir.path().join("access-code");
         write_private(&code_file, "same-code").expect("code file");
 
         let mut config = HubConfig::for_test(dir.path().to_path_buf());
         config.bootstrap_token = "same-code".to_owned();
-        config.bootstrap_token_file = Some(code_file);
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
         resolve_bootstrap(&mut config).expect("resolve");
 
-        // resolve re-persists (and thus re-stamps) an explicit code at every
-        // start — so the stamp IS refreshed. The point is provenance: the
-        // marker blocks rotation, and an unchanged code is still governed by
-        // the explicit file (the operator rotates by replacing it).
-        assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
-        assert!(rotate_bootstrap(dir.path()).is_err());
+        let after = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("read stamp");
+        assert_ne!(after, stamp_bytes, "a newer-than-stamp file must re-stamp");
+        assert!(bootstrap_within_ttl(dir.path(), 24));
     }
 
-    /// c-bootstrap-dev round 2: an explicit env code writes the marker and
-    /// blocks rotation.
+    /// Item 2: a no-source start that finds the explicit marker defers marker
+    /// removal until after a successful bind. `resolve_bootstrap` itself must
+    /// leave the marker (and rotation refusal) intact and report the deferred
+    /// adoption; [`adopt_bootstrap_after_bind`] performs the removal.
     #[test]
-    fn env_bootstrap_token_writes_explicit_marker_and_blocks_rotation() {
+    fn no_source_start_defers_marker_removal_until_adopted() {
         let dir = tempfile::tempdir().expect("data dir");
-        let mut config = HubConfig::for_test(dir.path().to_path_buf());
-        config.bootstrap_token = "new-env-code".to_owned();
-        config.bootstrap_token_file = None;
-        config.bootstrap_token_from_env = true;
-        resolve_bootstrap(&mut config).expect("resolve");
-
-        let stored = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
-        assert_eq!(stored.trim(), "new-env-code");
-        assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
-        assert!(rotate_bootstrap(dir.path()).is_err());
-    }
-
-    /// c-bootstrap-dev round 2: after an explicit-source start, a later start
-    /// with NO explicit source removes the marker and adopts the persisted
-    /// token as hub-generated, so rotation then succeeds.
-    #[test]
-    fn no_source_start_clears_marker_and_adopts_token() {
-        let dir = tempfile::tempdir().expect("data dir");
-        // Start 1: explicit source → marker present.
-        let code_file = dir.path().join("access-code");
-        write_private(&code_file, "adoptable-code").expect("code file");
+        // Start 1: explicit env source → marker present, expired stamp.
+        expired_token_setup(dir.path(), "adoptable-code");
         let mut cfg1 = HubConfig::for_test(dir.path().to_path_buf());
         cfg1.bootstrap_token = "adoptable-code".to_owned();
-        cfg1.bootstrap_token_file = Some(code_file.clone());
-        resolve_bootstrap(&mut cfg1).expect("resolve start1");
+        cfg1.bootstrap_source = BootstrapSource::ExplicitEnv;
+        let resolution1 = resolve_bootstrap(&mut cfg1).expect("resolve start1");
+        assert_eq!(resolution1, BootstrapResolution::None);
         assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
         assert!(rotate_bootstrap(dir.path()).is_err());
 
-        // Start 2: no explicit source → marker removed, token adopted.
+        // Start 2: no source. The token is adopted in memory, but the marker
+        // must survive until the caller confirms a successful bind.
         let mut cfg2 = HubConfig::for_test(dir.path().to_path_buf());
         cfg2.bootstrap_token = String::new();
-        cfg2.bootstrap_token_file = None;
-        cfg2.bootstrap_token_from_env = false;
-        resolve_bootstrap(&mut cfg2).expect("resolve start2");
-        assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+        cfg2.bootstrap_source = BootstrapSource::Generated;
+        let resolution2 = resolve_bootstrap(&mut cfg2).expect("resolve start2");
+        assert_eq!(
+            resolution2,
+            BootstrapResolution::AdoptAfterBind,
+            "marker removal is deferred to post-bind"
+        );
         assert_eq!(cfg2.bootstrap_token, "adoptable-code");
+        assert!(
+            dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file(),
+            "a not-yet-bound start must keep the marker"
+        );
+        assert!(
+            rotate_bootstrap(dir.path()).is_err(),
+            "rotation stays refused before the bind is established"
+        );
+
+        // Bind succeeded: adopt the provenance, rotation now allowed.
+        adopt_bootstrap_after_bind(dir.path()).expect("adopt after bind");
+        assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
         let new = rotate_bootstrap(dir.path()).expect("rotation now allowed");
         assert_ne!(new, "adoptable-code");
         assert_eq!(
@@ -647,6 +760,35 @@ mod tests {
                 .trim(),
             new
         );
+    }
+
+    /// Item 2: an explicit start with an unchanged code writes ONLY the marker
+    /// — token and stamp bytes are not touched.
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_explicit_start_writes_only_the_marker() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let stamp_bytes = expired_token_setup(dir.path(), "same-code");
+        let token_bytes = std::fs::read(dir.path().join("bootstrap-token")).expect("token");
+
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "same-code").expect("code file");
+        backdate_mtime(&code_file, MTIME_1999);
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        resolve_bootstrap(&mut config).expect("resolve");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-issued-at")).expect("read stamp"),
+            stamp_bytes
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-token")).expect("read token"),
+            token_bytes
+        );
+        assert!(dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
     }
 
     /// c-bootstrap-dev round 2: rotation with no token file is a clean error.

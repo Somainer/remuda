@@ -62,7 +62,9 @@ mod workspaces;
 mod ws;
 
 use crate::alerts::{BlockedWatch, Followers};
-use crate::auth::{adopt_bootstrap_after_bind, persist_listen, resolve_bootstrap, BootstrapResolution};
+use crate::auth::{
+    BootstrapResolution, adopt_bootstrap_after_bind, persist_listen, resolve_bootstrap,
+};
 use crate::store::Store;
 use crate::ws::Bus;
 use axum::Router;
@@ -81,8 +83,9 @@ use tokio::task::JoinHandle;
 pub use agent_scope::instance_token;
 pub use auth::{bootstrap_issued_at, persist_bootstrap, rotate_bootstrap};
 pub use config::{
-    DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_BOOTSTRAP_TTL_HOURS, DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
-    DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS,
+    BootstrapSource, DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_BOOTSTRAP_TTL_HOURS,
+    DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS, DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig,
+    MIN_CREATE_SETTLE_TIMEOUT_MS,
 };
 pub use error::HubError;
 pub use maintenance::migrate;

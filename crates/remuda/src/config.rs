@@ -1288,4 +1288,105 @@ secret_refs = { token = "env:UNREAD_TEST_SECRET" }
         // No assignment operator / value payload.
         assert!(!msg.contains('='), "error carries no value: {msg}");
     }
+
+    // c-bootstrap-dev round 3 (item 4): positive env resolution needs a real
+    // setenv, and the workspace forbids unsafe code (`env::set_var` is unsafe
+    // on edition 2024). The cases that set an env value therefore run in a
+    // child process fed through Command::env, mirroring remuda-signal tests.
+    const SECRET_CHILD_ENV: &str = "REMUDA_TEST_SECRET_CHILD";
+    const SECRET_MARKER_ENV: &str = "REMUDA_TEST_SECRET_MARKER";
+    const SECRET_VALUE_ENV: &str = "REMUDA_TEST_SECRET_VALUE";
+
+    fn run_secret_child(name: &str, value: std::ffi::OsString) -> std::process::Output {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", name, "--nocapture"])
+            .env(SECRET_CHILD_ENV, "1")
+            .env(SECRET_VALUE_ENV, value)
+            .output()
+            .expect("spawn child");
+        assert!(
+            output.status.success(),
+            "child {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// An env value carrying leading/trailing spaces and newlines is trimmed
+    /// to the inner secret on resolve.
+    #[test]
+    fn secret_ref_env_value_with_spaces_and_newline_is_trimmed() {
+        // Child marker doubles as the return channel: the child writes the
+        // resolved secret into it.
+        if std::env::var_os(SECRET_CHILD_ENV).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("resolved");
+        let value = std::ffi::OsString::from("  \ns3cret-value-with-padding\n\t \n");
+        std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "config::tests::secret_ref_env_value_trims_child",
+                "--nocapture",
+            ])
+            .env(SECRET_CHILD_ENV, "1")
+            .env(SECRET_VALUE_ENV, value)
+            .env(SECRET_MARKER_ENV, &marker)
+            .status()
+            .expect("spawn child");
+        let resolved = std::fs::read_to_string(&marker).expect("child result");
+        assert_eq!(resolved, "s3cret-value-with-padding");
+    }
+
+    #[test]
+    fn secret_ref_env_value_trims_child() {
+        if std::env::var_os(SECRET_CHILD_ENV).is_none() {
+            return;
+        }
+        let secret = SecretRef::Env(SECRET_VALUE_ENV.into())
+            .resolve()
+            .expect("padded env value resolves");
+        let marker =
+            std::path::PathBuf::from(std::env::var_os(SECRET_MARKER_ENV).expect("marker path"));
+        std::fs::write(marker, secret.into_string()).expect("write marker");
+    }
+
+    /// On Unix a non-UTF-8 env value yields an error whose rendering does not
+    /// carry the offending bytes.
+    #[cfg(unix)]
+    #[test]
+    fn secret_ref_non_utf8_env_error_does_not_contain_the_byte() {
+        if std::env::var_os(SECRET_CHILD_ENV).is_some() {
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(&[b's', 0xFF, b'z']).to_owned();
+        let output = run_secret_child("config::tests::secret_ref_non_utf8_env_error_child", bad);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("CHILD-OK"),
+            "child did not confirm a value-free error: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_ref_non_utf8_env_error_child() {
+        if std::env::var_os(SECRET_CHILD_ENV).is_none() {
+            return;
+        }
+        let err = SecretRef::Env(SECRET_VALUE_ENV.into())
+            .resolve()
+            .expect_err("non-UTF-8 env value must not resolve");
+        let rendered = format!("{err}");
+        // 0xFF can never occur in valid UTF-8; resolving it to a String error
+        // must not surface the raw OsString bytes either.
+        assert!(
+            !rendered.as_bytes().contains(&0xFF),
+            "error rendering leaks the secret byte: {rendered}"
+        );
+        assert!(rendered.contains(SECRET_VALUE_ENV), "error names the var");
+        println!("CHILD-OK");
+    }
 }

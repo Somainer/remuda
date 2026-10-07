@@ -1,11 +1,14 @@
-//! c-bootstrap-dev integration tests:
-//! - a stale stamp plus an explicit access-code file survives restart;
+//! c-bootstrap-dev round 3 integration tests:
+//! - an unchanged explicit code with an older-than-stamp file keeps the
+//!   expired stamp across restart and the login is REFUSED;
+//! - a changed code, or a touched file, re-stamps and the login succeeds;
+//! - a no-source start that fails to bind leaves the explicit marker intact.
 //! - rotate-bootstrap targets the dev-hub data layout.
 
 use anyhow::{Context, Result};
-use remuda_hub::{HubConfig, spawn};
+use remuda_hub::{BootstrapSource, HubConfig, spawn};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -53,26 +56,18 @@ async fn http(
     ))
 }
 
-async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> Result<String> {
+/// POST /v1/login; returns the raw HTTP status so tests can assert refusal.
+async fn login_status(addr: std::net::SocketAddr, bootstrap: &str) -> Result<u16> {
     let body =
         json!({"bootstrapToken": bootstrap, "deviceName": "bootstrap-dev-phone"}).to_string();
-    let (status, head, _) = http(addr, "POST", "/v1/login", &[], Some(&body)).await?;
-    assert_eq!(status, 200, "login failed");
-    for line in head.lines() {
-        if line.to_ascii_lowercase().starts_with("set-cookie:") {
-            return Ok(line
-                .split(':')
-                .nth(1)
-                .unwrap()
-                .trim()
-                .split(';')
-                .next()
-                .unwrap()
-                .trim()
-                .to_string());
-        }
-    }
-    anyhow::bail!("no set-cookie")
+    let (status, _head, _body) = http(addr, "POST", "/v1/login", &[], Some(&body)).await?;
+    Ok(status)
+}
+
+async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> Result<()> {
+    let status = login_status(addr, bootstrap).await?;
+    assert_eq!(status, 200, "login must succeed");
+    Ok(())
 }
 
 /// Write the access-code file at 0600.
@@ -87,13 +82,32 @@ fn write_code_file(path: &Path, code: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stale stamp + explicit access-code file: first Hub writes an expired
-/// stamp for the old code; the second Hub (simulating restart) is given the
-/// same file code and must re-persist/re-stamp so login still succeeds.
+/// Backdate a path's atime+mtime (Unix only) so it compares older than the
+/// year-2000 test stamp (1999-12-31T00:00:00Z).
+#[cfg(unix)]
+fn backdate_mtime(path: &Path) {
+    use nix::sys::stat::{UtimensatFlags, utimensat};
+    use nix::sys::time::TimeSpec;
+    let ts = TimeSpec::new(946_598_400, 0);
+    utimensat(None, path, &ts, &ts, UtimensatFlags::FollowSymlink)
+        .expect("utimensat backdates the access-code file");
+}
+
+fn explicit_file_config(hub_data: PathBuf, code_file: PathBuf, code: &str) -> HubConfig {
+    HubConfig {
+        bootstrap_token: code.to_owned(),
+        bootstrap_source: BootstrapSource::ExplicitFile(code_file),
+        ..HubConfig::for_test(hub_data)
+    }
+}
+
+const EXPIRED_STAMP: &str = "2000-01-01T00:00:00.000Z";
+
+/// Same code, but the access-code file was touched (mtime newer than the
+/// backdated stamp): restart re-stamps and login succeeds.
 #[tokio::test]
-async fn restart_with_explicit_access_code_file_refreshes_expired_stamp() -> Result<()> {
+async fn restart_with_touched_explicit_file_restamps_and_login_succeeds() -> Result<()> {
     let outer = tempfile::tempdir()?;
-    // remuda dev writes the Hub data under <data-dir>/dev-hub.
     let hub_data = outer.path().join("dev-hub");
     std::fs::create_dir_all(&hub_data)?;
     let code_file = outer.path().join("access-code");
@@ -102,36 +116,176 @@ async fn restart_with_explicit_access_code_file_refreshes_expired_stamp() -> Res
 
     // First Hub: persists the code + stamps now.
     {
-        let config = HubConfig {
-            bootstrap_token: code.to_owned(),
-            bootstrap_token_file: Some(code_file.clone()),
-            bootstrap_token_from_env: false,
-            ..HubConfig::for_test(hub_data.clone())
-        };
-        let hub = spawn(config).await?;
-        let _cookie = login(hub.addr, code).await?;
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            code,
+        ))
+        .await?;
+        login(hub.addr, code).await?;
         hub.shutdown().await;
     }
 
-    // Backdate the persisted stamp past the 24h TTL (as if a long time
-    // passed between restarts).
-    let stamp = hub_data.join("bootstrap-issued-at");
-    std::fs::write(&stamp, "2000-01-01T00:00:00.000Z")?;
+    // Backdate the persisted stamp; then REWRITE the same file so its mtime is
+    // strictly newer than the stamp, as a redeploy that touched the file would.
+    std::fs::write(hub_data.join("bootstrap-issued-at"), EXPIRED_STAMP)?;
+    write_code_file(&code_file, code)?;
 
-    // Second Hub with the SAME access-code file: resolve must re-stamp.
     {
-        let config = HubConfig {
-            bootstrap_token: code.to_owned(),
-            bootstrap_token_file: Some(code_file.clone()),
-            bootstrap_token_from_env: false,
-            ..HubConfig::for_test(hub_data.clone())
-        };
-        let hub = spawn(config).await?;
-        // Login succeeds because the stamp was refreshed despite the
-        // backdated persisted stamp.
-        let _cookie = login(hub.addr, code).await?;
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            code,
+        ))
+        .await?;
+        login(hub.addr, code).await?;
         hub.shutdown().await;
     }
+    Ok(())
+}
+
+/// Item 1: unchanged code AND a file mtime older than the backdated stamp —
+/// neither trigger fires, so the expired stamp bytes survive the restart and
+/// the login is REFUSED.
+#[cfg(unix)]
+#[tokio::test]
+async fn unchanged_older_explicit_file_keeps_expired_login_rejected() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    std::fs::create_dir_all(&hub_data)?;
+    let code_file = outer.path().join("access-code");
+    let code = "explicit-file-code-that-is-at-least-sixteen";
+    write_code_file(&code_file, code)?;
+
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            code,
+        ))
+        .await?;
+        login(hub.addr, code).await?;
+        hub.shutdown().await;
+    }
+
+    // Expire the stamp AND make the file older than it.
+    let stamp_path = hub_data.join("bootstrap-issued-at");
+    std::fs::write(&stamp_path, EXPIRED_STAMP)?;
+    backdate_mtime(&code_file);
+    let stamp_bytes_before = std::fs::read(&stamp_path)?;
+
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            code,
+        ))
+        .await?;
+        let status = login_status(hub.addr, code).await?;
+        assert_eq!(
+            status, 401,
+            "an expired, non-revived explicit code must be refused"
+        );
+        // Stamp bytes are untouched by the refused login AND the restart.
+        let stamp_bytes_after = std::fs::read(&stamp_path)?;
+        assert_eq!(
+            stamp_bytes_before, stamp_bytes_after,
+            "restart plus refusal must leave the stamp byte-identical"
+        );
+        assert!(hub_data.join("bootstrap-token-source-explicit").is_file());
+        hub.shutdown().await;
+    }
+    Ok(())
+}
+
+/// Item 1: a changed code re-stamps regardless of file mtime — login with the
+/// new code succeeds, the old code is rejected.
+#[cfg(unix)]
+#[tokio::test]
+async fn changed_explicit_file_code_restarts_and_login_succeeds() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    std::fs::create_dir_all(&hub_data)?;
+    let code_file = outer.path().join("access-code");
+    let old_code = "explicit-file-code-that-is-at-least-sixteen";
+    let new_code = "rotated-explicit-code-also-16-plus-x";
+    write_code_file(&code_file, old_code)?;
+
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            old_code,
+        ))
+        .await?;
+        login(hub.addr, old_code).await?;
+        hub.shutdown().await;
+    }
+
+    // Expire the stamp, then replace the code in the file and even backdate
+    // the file: a code change must re-stamp on its own.
+    std::fs::write(hub_data.join("bootstrap-issued-at"), EXPIRED_STAMP)?;
+    write_code_file(&code_file, new_code)?;
+    backdate_mtime(&code_file);
+
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            new_code,
+        ))
+        .await?;
+        assert_eq!(login_status(hub.addr, old_code).await?, 401);
+        login(hub.addr, new_code).await?;
+        hub.shutdown().await;
+    }
+    Ok(())
+}
+
+/// Item 2: a no-source start that fails to BIND must leave the explicit-source
+/// marker (and rotation refusal) intact — provenance is adopted only after a
+/// successful bind.
+#[tokio::test]
+async fn failed_no_source_bind_keeps_explicit_marker() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    std::fs::create_dir_all(&hub_data)?;
+    let code = "explicit-env-code-at-least-sixteen-x";
+
+    // First Hub: explicit env source → marker present, holds the listener.
+    let first = {
+        let config = HubConfig {
+            bootstrap_token: code.to_owned(),
+            bootstrap_source: BootstrapSource::ExplicitEnv,
+            ..HubConfig::for_test(hub_data.clone())
+        };
+        spawn(config).await?
+    };
+    let marker = hub_data.join("bootstrap-token-source-explicit");
+    assert!(marker.is_file(), "explicit start writes the marker");
+
+    // Second start: no source, but force the bind to fail by reusing the exact
+    // address the first Hub is listening on.
+    let mut failed = HubConfig::for_test(hub_data.clone());
+    failed.bootstrap_token = String::new();
+    failed.bootstrap_source = BootstrapSource::Generated;
+    failed.listen = first.addr;
+    let err = spawn(failed).await;
+    match err {
+        Err(err) => eprintln!("bind failed as expected: {err}"),
+        Ok(_) => panic!("the occupied address must fail to bind"),
+    }
+
+    assert!(
+        marker.is_file(),
+        "a start that never bound must not remove the explicit marker"
+    );
+    assert!(
+        remuda_hub::rotate_bootstrap(&hub_data).is_err(),
+        "rotation must still refuse while the marker survives"
+    );
+
+    first.shutdown().await;
     Ok(())
 }
 

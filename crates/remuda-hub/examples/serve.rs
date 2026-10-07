@@ -4,7 +4,7 @@
 //! so the Hub crate can be run before that subcommand is wired.
 
 use anyhow::Context;
-use remuda_hub::{HubConfig, serve};
+use remuda_hub::{BootstrapSource, HubConfig, serve};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -25,7 +25,9 @@ async fn main() -> anyhow::Result<()> {
         config.listen = listen.parse::<SocketAddr>().context("REMUDA_LISTEN")?;
     }
     if let Ok(token) = std::env::var("REMUDA_BOOTSTRAP_TOKEN") {
+        // Operator-supplied provenance: the Hub must never mint over this code.
         config.bootstrap_token = token;
+        config.bootstrap_source = BootstrapSource::ExplicitEnv;
     }
     if let Ok(value) = std::env::var("REMUDA_COOKIE_SECURE") {
         config.cookie_secure = value != "0" && value != "false";

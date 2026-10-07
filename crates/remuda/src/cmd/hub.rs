@@ -86,39 +86,44 @@ fn rotate_bootstrap(config: &Config) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn start(config: &Config) -> anyhow::Result<remuda_hub::RunningHub> {
-    // c-bootstrap-dev round 2: resolve through SecretRef::resolve so
+    // c-bootstrap-dev round 2/3: resolve through SecretRef::resolve so
     // trailing-whitespace normalisation and empty-secret rejection apply
     // uniformly (a manual read regressed both). The secret value is NEVER put
     // in an error: SecretRef::resolve names only the env var / file path, and
-    // the file context adds the path only. Provenance for the hub's marker is
-    // derived from the reference separately.
-    let (bootstrap_token, bootstrap_token_file, bootstrap_token_from_env) =
-        match config.hub.bootstrap_token.as_ref() {
-            Some(crate::config::SecretRef::File(path)) => {
-                let secret = crate::config::SecretRef::File(path.clone())
-                    .resolve()
-                    .with_context(|| format!("cannot read access-code file {}", path.display()))?;
-                (secret.into_string(), Some(path.clone()), false)
-            }
-            Some(crate::config::SecretRef::Env(_var)) => {
-                // Re-resolve the same reference; the error names only the env
-                // var, never its value.
-                let secret = config
-                    .hub
-                    .bootstrap_token
-                    .as_ref()
-                    .expect("matched Some")
-                    .resolve()?;
-                (secret.into_string(), None, true)
-            }
-            None => (String::new(), None, false),
-        };
+    // the file context adds the path only. Provenance travels explicitly as a
+    // BootstrapSource so a caller-supplied code cannot silently gain rotation
+    // authority.
+    let (bootstrap_token, bootstrap_source) = match config.hub.bootstrap_token.as_ref() {
+        Some(crate::config::SecretRef::File(path)) => {
+            let secret = crate::config::SecretRef::File(path.clone())
+                .resolve()
+                .with_context(|| format!("cannot read access-code file {}", path.display()))?;
+            (
+                secret.into_string(),
+                remuda_hub::BootstrapSource::ExplicitFile(path.clone()),
+            )
+        }
+        Some(crate::config::SecretRef::Env(_var)) => {
+            // Re-resolve the same reference; the error names only the env
+            // var, never its value.
+            let secret = config
+                .hub
+                .bootstrap_token
+                .as_ref()
+                .expect("matched Some")
+                .resolve()?;
+            (
+                secret.into_string(),
+                remuda_hub::BootstrapSource::ExplicitEnv,
+            )
+        }
+        None => (String::new(), remuda_hub::BootstrapSource::Generated),
+    };
     remuda_hub::spawn(remuda_hub::HubConfig {
         data_dir: config.data_dir.clone(),
         listen: config.hub.listen,
         bootstrap_token,
-        bootstrap_token_file,
-        bootstrap_token_from_env,
+        bootstrap_source,
         cookie_secure: config.hub.cookie_secure,
         public_origin: config.hub.public_origin.clone(),
         trusted_proxies: config.hub.trusted_proxies.clone(),

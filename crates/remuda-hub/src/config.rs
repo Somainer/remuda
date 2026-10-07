@@ -23,11 +23,12 @@ pub const DEFAULT_ATTACHMENT_MAX_BYTES: usize = 25 * 1024 * 1024;
 /// Controls whether the Hub may mint/rotate the persisted token. Serialises as
 /// a simple tag so a config dump stays debuggable; the file path inside
 /// [`BootstrapSource::ExplicitFile`] is not persisted here.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BootstrapSource {
     /// Hub-owned / programmatic caller: the code was minted (or supplied by a
     /// test/example standing in for the Hub). Rotation is allowed.
+    #[default]
     Generated,
     /// Resolved state: a no-source start loaded a persisted token and adopted
     /// it. Rotation is allowed. Set only by `resolve_bootstrap`.
@@ -37,12 +38,6 @@ pub enum BootstrapSource {
     ExplicitFile(std::path::PathBuf),
     /// Operator-supplied via `REMUDA_BOOTSTRAP_TOKEN`. Rotation is refused.
     ExplicitEnv,
-}
-
-impl Default for BootstrapSource {
-    fn default() -> Self {
-        Self::Generated
-    }
 }
 
 impl BootstrapSource {

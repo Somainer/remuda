@@ -71,9 +71,15 @@ fn rotate_bootstrap_cli_refuses_explicit_source_without_touching_token() {
     let stamp_path = dev_hub.join("bootstrap-issued-at");
     let marker = dev_hub.join("bootstrap-token-source-explicit");
 
+    // Deliberately no trailing newline: raw-byte equality must hold exactly.
     write(&token_path, "operator-file-code-abcdef12345");
     write(&stamp_path, "2000-01-01T00:00:00.000Z");
     write(&marker, ""); // explicit-source provenance
+
+    // Snapshot the raw bytes BEFORE the refusal.
+    let token_before = fs::read(&token_path).unwrap();
+    let stamp_before = fs::read(&stamp_path).unwrap();
+    let marker_before = fs::read(&marker).unwrap();
 
     let output = Command::new(bin())
         .args(["hub", "rotate-bootstrap", "--data-dir"])
@@ -91,10 +97,13 @@ fn rotate_bootstrap_cli_refuses_explicit_source_without_touching_token() {
         "stderr explains the refusal: {stderr}"
     );
 
-    // Token and stamp are byte-for-byte unchanged.
-    assert_eq!(read(&token_path), "operator-file-code-abcdef12345");
-    assert_eq!(read(&stamp_path), "2000-01-01T00:00:00.000Z");
-    assert!(marker.exists(), "marker itself must not be removed");
+    // Token, stamp, and the marker are byte-for-byte unchanged (no trim/re-write
+    // hiding a content-preserving rewrite).
+    assert_eq!(fs::read(&token_path).unwrap(), token_before);
+    assert_eq!(fs::read(&stamp_path).unwrap(), stamp_before);
+    assert_eq!(fs::read(&marker).unwrap(), marker_before);
+    assert_eq!(token_before, b"operator-file-code-abcdef12345");
+    assert_eq!(stamp_before, b"2000-01-01T00:00:00.000Z");
 }
 
 /// Rotation also refuses when there is no persisted token at all (a hub

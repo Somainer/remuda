@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
-use remuda_hub::{HubConfig, spawn};
+use remuda_hub::{BootstrapSource, HubConfig, spawn};
 use remuda_protocol::HostId;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -37,7 +37,10 @@ async fn main() -> Result<()> {
     if let Ok(token) = std::env::var("REMUDA_BOOTSTRAP_TOKEN")
         && !token.is_empty()
     {
+        // Operator-supplied provenance: the demo Hub treats it as explicit,
+        // never as a code it may rotate.
         config.bootstrap_token = token;
+        config.bootstrap_source = BootstrapSource::ExplicitEnv;
     }
     if let Ok(listen) = std::env::var("REMUDA_LISTEN")
         && !listen.is_empty()

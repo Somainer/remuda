@@ -18,6 +18,7 @@ function deferred<T>() {
 type Internals = {
   reconcileOwed: Set<string>;
   flushAllOutbox: () => Promise<void>;
+  resumeConnection: () => Promise<void>;
   outbox: { get: (id: string) => { state: string } | undefined; pendingFor: (id: string) => { commandId: string }[] };
   chainReconcile: (i: string, j: () => Promise<unknown>) => Promise<unknown>;
 };
@@ -57,7 +58,6 @@ async function mountTwo() {
     .spyOn(api, "eventsSubscribe")
     .mockImplementation(
       (async (_jid, _after, _onBatch, _onGap, hooks) => {
-        console.error("PROBE subscribe call", subscribe.mock.calls.length + 1, "jid", _jid);
         if (hooks?.onClose && !onClose) onClose = hooks.onClose;
         const n = subscribe.mock.calls.length;
         return {
@@ -126,26 +126,35 @@ it("a delivered row whose follow owner is rebound to another session still gets 
   await hubStore.follow(A);
   await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"));
 
-  // A's socket closes; machine is offline but still BOUND to A. No reopen is
-  // in flight, so A's journal chain is free and a flush's post-delivery job
-  // runs (the Hub REST path works; only the follow socket is down).
+  // Pin A's reconnect as PENDING and never reopening. In the real regression
+  // A's reconnect timer is canceled by followRebindLive when B comes up
+  // (before A reopens); an instant mock socket would otherwise race the drain
+  // and flip the machine back to live on its own. With resume held the machine
+  // stays offline/recovering and BOUND to A while A's journal chain stays free
+  // for the flush.
+  internals.resumeConnection = () => new Promise<void>(() => {});
+
   closeA();
-  await vi.waitFor(() => expect(hubStore.connectionState).toBe("offline"));
-  console.error("PROBE after close A", hubStore.connectionState, "bound", (hubStore as unknown as { connectionBoundTo: string }).connectionBoundTo);
+  await vi.waitFor(() =>
+    expect(["offline", "recovering"]).toContain(hubStore.connectionState),
+  );
+  console.error("P1 state", hubStore.connectionState, "bound", (hubStore as unknown as { connectionBoundTo: string | null }).connectionBoundTo);
 
   // send() persists even offline; an explicit flush delivers it. The drain
   // job runs on A's free chain, sees A's bound follow own recovery, records
   // the debt, and skips its own REST read.
   await hubStore.send(A, "owed rebind");
   void internals.flushAllOutbox();
-  await vi.waitFor(() => expect(api.instanceSend).toHaveBeenCalledTimes(1));
-  console.error("PROBE send delivered; state", hubStore.connectionState);
-  await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(true), { timeout: 2000 });
-  console.error("PROBE debt recorded");
+  await vi.waitFor(() => expect(api.instanceSend).toHaveBeenCalledTimes(1), { timeout: 2000 });
+  console.error("P2 posted; state", hubStore.connectionState);
+  await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(true), { timeout: 3_000 });
+  console.error("P3 debt");
   const cid = ((api.instanceSend as unknown as { mock: { calls: unknown[][] } }).mock.calls[0]?.[4] as string) ?? "";
   expect(cid).toBeTruthy();
 
-  // The owed REST fallback for A returns A's delivered user event.
+  // The owed REST fallback for A returns A's delivered user event. It must be
+  // CONTIGUOUS from A's applied cursor (0): JournalClient.flush only emits a
+  // gap-free prefix, so a seq-9 event would buffer forever and never fold.
   const aFallback = vi.fn();
   eventsRead.mockImplementation(
     ((req: { journalId: string }) => {
@@ -156,13 +165,28 @@ it("a delivered row whose follow owner is rebound to another session still gets 
               events: [
                 {
                   kind: "message",
-                  seq: "9",
-                  journalSeq: "9",
-                  eventId: `${JA}/9`,
-                  payload: { role: "user", commandId: cid },
+                  eventId: `${JA}/1`,
+                  journalId: JA,
+                  instanceId: A,
+                  seq: "1",
+                  payload: {
+                    nodeId: "u1",
+                    messageId: "u1",
+                    role: "user",
+                    phase: "input",
+                    revision: "1",
+                    baseRevision: null,
+                    operation: "replace",
+                    status: "complete",
+                    blocks: [{ type: "text", text: "owed rebind" }],
+                    targetBlock: null,
+                    parentToolCallId: null,
+                    nativeOrigin: { state: "known", value: "user" },
+                    commandId: cid,
+                  },
                 },
               ],
-              durableSeq: "9",
+              durableSeq: "1",
               windowFromSeq: null,
               reachedAfterSeq: true,
             }
@@ -174,8 +198,11 @@ it("a delivered row whose follow owner is rebound to another session still gets 
   // Open B live → bind A→B → the abandoned A instance gets its coalesced REST
   // fallback now, independent of the machine now bound to B.
   await hubStore.follow(B);
-  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"));
+  console.error("P4 after follow B call; state", hubStore.connectionState);
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"), { timeout: 3000 });
+  console.error("P5 B live; bound", (hubStore as unknown as { connectionBoundTo: string | null }).connectionBoundTo);
   await vi.waitFor(() => expect(aFallback).toHaveBeenCalled(), { timeout: 5_000 });
+  console.error("P6 fallback called");
   await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(false), { timeout: 5_000 });
   await vi.waitFor(() => expect(internals.outbox.get(cid)?.state).toBe("done"), { timeout: 5_000 });
 

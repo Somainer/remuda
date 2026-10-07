@@ -15,6 +15,10 @@ pub enum HubError {
     /// Origin/Host mismatch or insufficient scope.
     #[error("forbidden")]
     Forbidden,
+    /// Origin/scope refusal with a caller-readable reason; renders 403 with
+    /// the same `FORBIDDEN` code as [`Self::Forbidden`].
+    #[error("{0}")]
+    ForbiddenReason(String),
     /// Agent operation is held until a human approves this exact action.
     #[error(
         "human approval required; answer interaction {interaction_id}, then retry with approvalId"
@@ -132,6 +136,7 @@ impl HubError {
         match self {
             Self::Unauthenticated => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::ForbiddenReason(_) => StatusCode::FORBIDDEN,
             Self::ApprovalRequired { .. } => StatusCode::CONFLICT,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
@@ -167,6 +172,7 @@ impl HubError {
         match self {
             Self::Unauthenticated => "UNAUTHENTICATED",
             Self::Forbidden => "FORBIDDEN",
+            Self::ForbiddenReason(_) => "FORBIDDEN",
             Self::ApprovalRequired { .. } => "HUMAN_APPROVAL_REQUIRED",
             Self::NotFound => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",

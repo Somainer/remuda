@@ -15,6 +15,7 @@ import {
 } from "./approvalRows";
 import { QuestionForm } from "./QuestionForm";
 import { ElicitationCard } from "./ElicitationCard";
+import { InteractionDeadline } from "./InteractionDeadline";
 import { PtyQuestionAnswers } from "../../components/PtyQuestionAnswers";
 import css from "./decision.module.css";
 
@@ -278,6 +279,17 @@ export const DecisionCard = memo(function DecisionCard({
           {submitError}
         </p>
       ) : null}
+
+      {/* c-question-alert: only the compact QUESTION row needs its own
+          deadline node — it deep-links with 去回答 and never mounts the form.
+          A compact elicitation row renders <ElicitationCard> above (it is
+          not a compactQuestion), which already carries InteractionDeadline;
+          r2 rendered it twice for that kind. */}
+      {compactQuestion ? (
+        <InteractionDeadline interaction={item} testid="m-inbox-deadline" />
+      ) : null}
+
+      {review ? <InteractionDeadline interaction={item} /> : null}
 
       {!compactQuestion && !answering && review && review.allowFeedback ? (
         <textarea

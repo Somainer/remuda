@@ -105,7 +105,7 @@ print 退役条件引用的是「连续 3 次全绿」的 parity gate；本次�
 3. **缓存写 TTL 是估价最大的敏感点**：无 `cache_creation` 拆分时整笔记 5m 价（较便宜档）；若供应商实际按 1h 计费会系统性低估。上述 opus-5 帧即全 5m 记录。
 4. **Grok `usage.json` 文件体未实测**：结构按 headless `end.modelUsage` 反推；首次读到真实文件时需复核字段名与 input 是否含缓存。
 5. **Codex 输入含缓存 / Grok ACP 含缓存 vs headless 不含**：归一已按各源处理，但不同源之间不可直接相减假定等价（§5.5）。
-6. **输出 token 的最终值在流中会变**：content-block 记录上的 `output_tokens` 在 block 停止时理论上可能只是中间值。当前实现按 `message.id` 去重保留**第一条**；已抽样确认真实 transcript 同 id 各记录 usage 完全一致，故无实际差异。若未来观察到同 id usage 真有变化，需改为「同 id 取最后一条」。
+6. **输出 token 的最终值在流中会变**：content-block 记录上的 `output_tokens` 在 block 停止时可能只是中间值。实现上 `TranscriptMapper` 对同一 `message.id` 的缓冲记录保留**最后一条** `message.usage`（poll 先按 stop_reason 发临时快照、后续同 id 记录以更高 `metricRevision` 修订到最终值；Hub 按 revision 替换该 turn 行），不再「取第一条」。已用真实 2.1.289 transcript（24 条消息逐桶校验）固定。
 7. **协议可见性**：负载已有 `accounting:"estimated"|"reported"` 枚举，本适配器全部发 `estimated`，这是「估算」标签的协议通道。**给协议 owner 的请求**：若 UI 后续要展示「本地表 revision」「估算值 vs 原生 reported 值并列」或 provisional 置信度，现有字段不够，需要在 §5.5 增字段（如 `costBasis:{tableRevision, reported?}`）；本模块不私改协议 crate，只在事件层保留 `reported_cost_usd` 与表 revision 常量备用。
 8. **无 usage 即 unknown**：所有未上报桶映射为 `Knowledge::Unknown`（reason `not-emitted`/`unpriced-model-or-no-usage`），不写 0；空 totals 的 session 负载 cost 也是 Unknown（有测试固定）。
 

@@ -6633,11 +6633,17 @@ fn apply_instance_projection(
         } else if entity_state == Some("ready") {
             lifecycle = Some("ready");
         }
-        if let Some(reason) = payload.get("reasonCode").and_then(Value::as_str) {
-            last_error = Some(reason.to_string());
-        }
-        if let Some(entity_error) = payload.pointer("/entity/lastError").and_then(Value::as_str) {
-            last_error = Some(entity_error.to_string());
+        // A reason/lastError is an error marker ONLY on a terminal entity; a
+        // ready event's "driver-started" reason is a liveness note and must
+        // never populate last_error (it would surface as a phantom failure).
+        if end_evidence.is_some() {
+            if let Some(reason) = payload.get("reasonCode").and_then(Value::as_str) {
+                last_error = Some(reason.to_string());
+            }
+            if let Some(entity_error) = payload.pointer("/entity/lastError").and_then(Value::as_str)
+            {
+                last_error = Some(entity_error.to_string());
+            }
         }
         conn.execute(
             "UPDATE instances SET spec_json = json_set(spec_json, '$.nativeSignalTier', ?1) WHERE id = ?2",

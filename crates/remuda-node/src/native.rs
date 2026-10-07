@@ -429,6 +429,9 @@ impl DriverFactory for NativeClaudeFactory {
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
+                // c-usagefu (d): stamp the codex/grok file-tail adapter
+                // observations with the real Hub-issued instance id.
+                options.instance_id = Some(launch.instance.meta.id.clone());
                 Arc::new(GenericPtyDriver::new(options))
             }
             DriverKind::ShellPty => {

@@ -58,6 +58,10 @@ pub struct UsageEventRow {
     pub cost_usd: Option<String>,
     /// `reported` / `estimated`.
     pub accounting: String,
+    /// Native per-model context window the harness reported
+    /// (`UsagePayload.contextWindow`, e.g. stream-json
+    /// `modelUsage.<model>.contextWindow`), when it reported one.
+    pub native_context_window: Option<i64>,
     /// Observed-at timestamp.
     pub observed_at: String,
 }
@@ -83,6 +87,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             cache_write_tokens INTEGER,
             cost_usd TEXT,
             accounting TEXT NOT NULL DEFAULT 'estimated',
+            native_context_window INTEGER,
             observed_at TEXT NOT NULL,
             metric_revision INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY (instance_id, seq)
@@ -100,6 +105,8 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     crate::store::ensure_column(conn, "usage_events", "scope_id", "TEXT")?;
     // r2: snapshot revision for revision-aware Session upserts (default 1).
     crate::store::ensure_column(conn, "usage_events", "metric_revision", "INTEGER")?;
+    // c-usagefu: native-reported per-model context window.
+    crate::store::ensure_column(conn, "usage_events", "native_context_window", "INTEGER")?;
     // Now the column exists on both a fresh CREATE and an upgraded DB.
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_scope_dedupe
@@ -127,8 +134,9 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
             "INSERT OR IGNORE INTO usage_events
                 (instance_id, seq, profile_id, model, scope, scope_id, mode,
                  metric_revision, total_tokens, input_tokens, output_tokens,
-                 cache_read_tokens, cache_write_tokens, cost_usd, accounting, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+                 native_context_window, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 row.instance_id,
                 row.seq,
@@ -145,6 +153,7 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
                 row.cache_write_tokens,
                 row.cost_usd,
                 row.accounting,
+                row.native_context_window,
                 row.observed_at,
             ],
         )?;
@@ -160,8 +169,9 @@ fn upsert_session_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::
         "INSERT INTO usage_events
             (instance_id, seq, profile_id, model, scope, scope_id, mode,
              metric_revision, total_tokens, input_tokens, output_tokens,
-             cache_read_tokens, cache_write_tokens, cost_usd, accounting, observed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+             native_context_window, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(instance_id, scope, scope_id) WHERE scope_id IS NOT NULL
          DO UPDATE SET
             seq = excluded.seq,
@@ -176,6 +186,7 @@ fn upsert_session_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::
             cache_write_tokens = excluded.cache_write_tokens,
             cost_usd = excluded.cost_usd,
             accounting = excluded.accounting,
+            native_context_window = excluded.native_context_window,
             observed_at = excluded.observed_at
          WHERE excluded.metric_revision > usage_events.metric_revision",
         params![
@@ -194,6 +205,7 @@ fn upsert_session_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::
             row.cache_write_tokens,
             row.cost_usd,
             row.accounting,
+            row.native_context_window,
             row.observed_at,
         ],
     )?;
@@ -207,6 +219,15 @@ fn knowledge_u64(value: &Value) -> Option<i64> {
         return text.parse().ok();
     }
     inner.as_i64()
+}
+
+/// Parse a bare U64 scalar (decimal string on the wire, accepting bare
+/// integers from looser producers).
+fn scalar_u64(value: &Value) -> Option<i64> {
+    if let Some(text) = value.as_str() {
+        return text.parse().ok();
+    }
+    value.as_i64()
 }
 
 /// Project one journal record into a usage row when it is `kind:"usage"`.
@@ -261,9 +282,7 @@ pub fn project_usage_event(
             .map(str::to_string),
         metric_revision: payload
             .get("metricRevision")
-            .and_then(knowledge_u64)
-            .map(i64::try_from)
-            .and_then(Result::ok)
+            .and_then(scalar_u64)
             .unwrap_or(1),
         mode: payload
             .get("mode")
@@ -281,6 +300,9 @@ pub fn project_usage_event(
             .and_then(Value::as_str)
             .unwrap_or("estimated")
             .to_string(),
+        // c-usagefu (a): native per-model window (U64 wire string, but accept
+        // bare integers from older/looser producers too).
+        native_context_window: payload.get("contextWindow").and_then(scalar_u64),
         observed_at: native_at,
     })
 }
@@ -400,6 +422,10 @@ pub struct InstanceUsageRollup {
     pub context_window_tokens: Option<i64>,
     /// `context_used / context_window`, rounded and clamped to 0..=100.
     pub context_pct: Option<i64>,
+    /// True when `context_window_tokens` came from the harness-kind fallback
+    /// (no native report, no effective/profile/catalog evidence). The chip
+    /// paints `≈%`; false for a window the model or harness actually stated.
+    pub context_pct_approximate: bool,
     /// Sum of fresh (uncached) input tokens across the session.
     pub session_input_tokens: Option<i64>,
     /// Sum of output tokens across the session.
@@ -432,20 +458,88 @@ fn kind_context_window(kind: &str) -> Option<i64> {
     }
 }
 
-/// Resolve a session's context window: explicit `[1m]` long-context tag,
-/// then the static model catalog, then the harness-kind fallback.
+/// True for a model id carrying the explicit long-context tag, regardless of
+/// catalog knowledge (`<gateway-model>[1m]` is not in the static table).
+fn is_one_million_tag(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().ends_with("[1m]")
+}
+
+/// Exact evidence from one model id: the `[1m]` tag wins, then the static
+/// capability catalog.
+fn window_from_model_id(model: &str) -> Option<i64> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    if is_one_million_tag(model) {
+        return Some(1_000_000);
+    }
+    crate::model_catalog::lookup(model).map(|row| row.context_window as i64)
+}
+
+/// A context window declared on the provider profile's model catalog for the
+/// given wire id (exact match; a `[1m]` spelling retries without the tag).
+fn profile_context_window(
+    conn: &Connection,
+    profile_id: &str,
+    model_id: &str,
+) -> rusqlite::Result<Option<i64>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT models_json FROM provider_profiles WHERE id = ?1",
+            params![profile_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let models = crate::provider_models::parse_models_json(&raw);
+    let wanted = model_id.trim();
+    let wanted_no_tag = wanted.strip_suffix("[1m]").unwrap_or(wanted);
+    Ok(models
+        .iter()
+        .filter(|entry| entry.id == wanted || entry.id == wanted_no_tag)
+        .find_map(|entry| entry.context_window.map(i64::try_from).and_then(Result::ok)))
+}
+
+/// Resolve a session's context window and whether the value is only an
+/// estimate.
+///
+/// Order (c-usagefu (c)): native usage-reported window (the CLI's own
+/// `modelUsage.contextWindow`, exact) → effective model id after a `/model`
+/// switch (`[1m]` tag, then static catalog) → the provider profile's declared
+/// `contextWindow` (effective id, then launch model) → static catalog on the
+/// launch model → harness-kind fallback. Only the last step is approximate;
+/// the chip paints `≈` for it and an unknown generic kind reports no window.
 #[must_use]
-pub fn context_window_tokens(kind: &str, model: Option<&str>) -> Option<i64> {
-    if let Some(model) = model {
-        let trimmed = model.trim();
-        if trimmed.to_ascii_lowercase().ends_with("[1m]") {
-            return Some(1_000_000);
-        }
-        if let Some(row) = crate::model_catalog::lookup(trimmed) {
-            return Some(row.context_window as i64);
+fn resolve_context_window(
+    conn: &Connection,
+    req: &RollupRequest<'_>,
+    native_window: Option<i64>,
+) -> (Option<i64>, bool) {
+    if let Some(window) = native_window {
+        return (Some(window), false);
+    }
+    if let Some(window) = req.effective_model.and_then(window_from_model_id) {
+        return (Some(window), false);
+    }
+    if let Some(profile_id) = req.profile_id {
+        for candidate in [req.effective_model, req.spec_model].into_iter().flatten() {
+            if let Ok(Some(window)) = profile_context_window(conn, profile_id, candidate) {
+                return (Some(window), false);
+            }
         }
     }
-    kind_context_window(kind)
+    if let Some(window) = req.spec_model.and_then(window_from_model_id) {
+        return (Some(window), false);
+    }
+    match kind_context_window(req.kind) {
+        Some(window) => (Some(window), true),
+        // A generic/terminal kind with an unknown model has no window at all;
+        // "approximate" is meaningless without a percentage.
+        None => (None, false),
+    }
 }
 
 /// RFC3339 UTC millisecond timestamp `seconds` in the past, byte-comparable
@@ -469,13 +563,29 @@ fn sum_tokens_since(
     conn: &Connection,
     instance_id: &str,
     since: &str,
+    scope: &str,
 ) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
     conn.query_row(
         "SELECT SUM(input_tokens), SUM(output_tokens)
-         FROM usage_events WHERE instance_id = ?1 AND observed_at >= ?2",
-        params![instance_id, since],
+         FROM usage_events
+         WHERE instance_id = ?1 AND observed_at >= ?2 AND scope = ?3",
+        params![instance_id, since, scope],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
+}
+
+/// Inputs to [`rollup_instance`] beyond the connection: what the Hub knows
+/// about the session's current model. The rollup is folded on every read, so
+/// a `modelEffective` change is picked up with no invalidation.
+pub struct RollupRequest<'a> {
+    pub instance_id: &'a str,
+    pub kind: &'a str,
+    /// Launch-pinned model (`instances.model`).
+    pub spec_model: Option<&'a str>,
+    /// Transcript-observed effective model id (`spec.modelEffective.id`),
+    /// i.e. the model a `/model` switch actually selected.
+    pub effective_model: Option<&'a str>,
+    pub profile_id: Option<&'a str>,
 }
 
 /// Session-wide totals of one rollup query (named so the fold signature
@@ -497,21 +607,34 @@ struct RollupTotals {
     last_turn_at: Option<String>,
 }
 
+/// One bucket of the turn-vs-session coverage check: a cumulative Session
+/// value is covered by the turn rows only when it reports the same total.
+/// A bucket the session snapshot does not report imposes no constraint.
+fn bucket_covers(turn_sum: Option<i64>, session_total: Option<i64>) -> bool {
+    match session_total {
+        None => true,
+        Some(total) => turn_sum == Some(total),
+    }
+}
+
 /// Fold every persisted usage event of one instance into
 /// [`InstanceUsageRollup`]. Returns `None` when the session has no usage
 /// observations yet, so the field stays off the instance record entirely.
 ///
 /// Turn and Session scopes are kept separate (c-ctxusage r2): Codex emits both
 /// per-turn additive rows and a cumulative session snapshot, so summing both
-/// double-counts. Additive totals come from turn rows when any exist,
-/// otherwise from session-snapshot rows (the Grok shape, which emits session
-/// snapshots that are replaced in place by revision).
+/// double-counts. c-usagefu (b) decides which is authoritative:
+/// - no turn rows → the cumulative Session snapshot (Grok);
+/// - turn rows and no cumulative token snapshot → the turn rows (Claude, and
+///   print whose `result` rows carry cost only);
+/// - both → turn rows only when they COVER the cumulative total in every
+///   bucket the snapshot reports (a tail bound mid-session never does),
+///   otherwise the authoritative cumulative Session total.
 pub fn rollup_instance(
     conn: &Connection,
-    instance_id: &str,
-    kind: &str,
-    model: Option<&str>,
+    req: &RollupRequest<'_>,
 ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
+    let instance_id = req.instance_id;
     let totals = conn.query_row(
         "SELECT
             COUNT(CASE WHEN scope='turn' THEN 1 END) AS turns,
@@ -546,7 +669,25 @@ pub fn rollup_instance(
     if !totals.has_any {
         return Ok(None);
     }
-    let use_turn = totals.turns > 0;
+    let session_reports_tokens = [
+        totals.sess_input,
+        totals.sess_output,
+        totals.sess_cache_read,
+        totals.sess_cache_write,
+    ]
+    .iter()
+    .any(Option::is_some);
+    let use_turn = if totals.turns == 0 {
+        false
+    } else if !session_reports_tokens {
+        true
+    } else {
+        bucket_covers(totals.turn_input, totals.sess_input)
+            && bucket_covers(totals.turn_output, totals.sess_output)
+            && bucket_covers(totals.turn_cache_read, totals.sess_cache_read)
+            && bucket_covers(totals.turn_cache_write, totals.sess_cache_write)
+    };
+    let authoritative_scope = if use_turn { "turn" } else { "session" };
     let session_input = if use_turn {
         totals.turn_input
     } else {
@@ -568,27 +709,52 @@ pub fn rollup_instance(
         totals.sess_cache_write
     };
 
-    // What the next request carries comes from the newest observation:
-    // fresh input plus every cached bucket, summed over whichever buckets
-    // that turn actually reported.
-    let context_used_tokens = conn
+    // What the next request carries comes from the NEWEST per-REQUEST row:
+    // one model response's fresh input plus every cached bucket, summed over
+    // whichever buckets that response actually reported. Codex emits Message
+    // rows (one per response_id) because its Turn rows sum multiple responses
+    // in a turn; Claude's Turn rows are themselves per-request; Grok gives
+    // only cumulative Session rows. Scope preference makes a later
+    // end-of-turn summary never mask the latest single response. The same
+    // row's native window is preferred; a later cost-only row may still
+    // carry one, so fall back to the newest reported window of any scope.
+    let (context_used_tokens, row_native_window) = conn
         .query_row(
-            "SELECT input_tokens, cache_read_tokens, cache_write_tokens
-             FROM usage_events WHERE instance_id = ?1
-             ORDER BY seq DESC LIMIT 1",
+            "SELECT input_tokens, cache_read_tokens, cache_write_tokens, native_context_window
+             FROM usage_events
+             WHERE instance_id = ?1
+               AND scope IN ('message', 'turn', 'session')
+             ORDER BY CASE scope
+                        WHEN 'message' THEN 0
+                        WHEN 'turn' THEN 1
+                        ELSE 2 END,
+                      seq DESC
+             LIMIT 1",
             params![instance_id],
             |row| {
                 let input: Option<i64> = row.get(0)?;
                 let cache_read: Option<i64> = row.get(1)?;
                 let cache_write: Option<i64> = row.get(2)?;
+                let window: Option<i64> = row.get(3)?;
                 let components = [input, cache_read, cache_write].into_iter().flatten();
-                Ok::<_, rusqlite::Error>(components.reduce(i64::saturating_add))
+                Ok::<_, rusqlite::Error>((components.reduce(i64::saturating_add), window))
             },
         )
+        .unwrap_or((None, None));
+    let native_window = row_native_window.or_else(|| {
+        conn.query_row(
+            "SELECT native_context_window FROM usage_events
+             WHERE instance_id = ?1 AND native_context_window IS NOT NULL
+             ORDER BY seq DESC LIMIT 1",
+            params![instance_id],
+            |row| row.get(0),
+        )
         .ok()
-        .flatten();
+        .flatten()
+    });
 
-    let context_window_tokens = context_window_tokens(kind, model);
+    let (context_window_tokens, window_approximate) =
+        resolve_context_window(conn, req, native_window);
     let context_pct = context_used_tokens
         .zip(context_window_tokens)
         .map(|(used, window)| {
@@ -596,9 +762,14 @@ pub fn rollup_instance(
                 .round()
                 .clamp(0.0, 100.0) as i64
         });
+    // Without a window there is no percentage, so there is nothing to mark
+    // approximate.
+    let context_pct_approximate = context_pct.is_some() && window_approximate;
 
-    let (in_60s, out_60s) = sum_tokens_since(conn, instance_id, &threshold_rfc3339(60))?;
-    let (in_5m, out_5m) = sum_tokens_since(conn, instance_id, &threshold_rfc3339(300))?;
+    let (in_60s, out_60s) =
+        sum_tokens_since(conn, instance_id, &threshold_rfc3339(60), authoritative_scope)?;
+    let (in_5m, out_5m) =
+        sum_tokens_since(conn, instance_id, &threshold_rfc3339(300), authoritative_scope)?;
     // The 5-minute figure is an average per-minute rate (sum / 5).
     let per_minute_5m =
         |total: Option<i64>| -> Option<i64> { total.map(|n| (n as f64 / 5.0).round() as i64) };
@@ -607,6 +778,7 @@ pub fn rollup_instance(
         context_used_tokens,
         context_window_tokens,
         context_pct,
+        context_pct_approximate,
         session_input_tokens: session_input,
         session_output_tokens: session_output,
         cache_read_tokens: cache_read,
@@ -746,7 +918,7 @@ mod tests {
         );
         // Rollup still works after upgrade.
         assert!(
-            rollup_instance(&conn, "ins_old", "claude", Some("fake"))
+            fold_rollup(&conn, "ins_old", "claude", Some("fake"))
                 .unwrap()
                 .is_some()
         );
@@ -888,8 +1060,29 @@ mod tests {
             cache_write_tokens: cache_write,
             cost_usd: None,
             accounting: "estimated".into(),
+            native_context_window: None,
             observed_at: observed_at.into(),
         }
+    }
+
+    /// Rollup with no effective-model / profile inputs (the static catalog
+    /// and kind fallback path).
+    fn fold_rollup(
+        conn: &Connection,
+        instance_id: &str,
+        kind: &str,
+        model: Option<&str>,
+    ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
+        rollup_instance(
+            conn,
+            &RollupRequest {
+                instance_id,
+                kind,
+                spec_model: model,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
     }
 
     /// Three real `message.usage` frames recorded from a Claude Code 2.1.x
@@ -921,6 +1114,7 @@ mod tests {
             cache_write_tokens: Some(0),
             cost_usd: None,
             accounting: "estimated".into(),
+            native_context_window: None,
             observed_at: format!("2026-10-06T00:00:0{seq}.000Z"),
         };
         // Revision 1, then 2 (replaces), then a stale 1 re-delivery (frozen).
@@ -946,7 +1140,7 @@ mod tests {
             .unwrap();
         assert_eq!((rev, input, output), (2, 200, 20), "newest revision wins");
         // Session-only totals roll up from the session row (no turn rows).
-        let rollup = rollup_instance(&conn, "ins_g", "grok", Some("grok-x"))
+        let rollup = fold_rollup(&conn, "ins_g", "grok", Some("grok-x"))
             .unwrap()
             .unwrap();
         assert_eq!(rollup.turns, 0, "session snapshots are not turns");
@@ -976,6 +1170,7 @@ mod tests {
             cache_write_tokens: Some(0),
             cost_usd: None,
             accounting: "estimated".into(),
+            native_context_window: None,
             observed_at: format!("2026-10-06T00:00:0{seq}.000Z"),
         };
         let cumulative = |seq: i64, input: i64, output: i64| UsageEventRow {
@@ -989,7 +1184,7 @@ mod tests {
         insert_usage_event(&conn, &turn(2, 50, 5)).unwrap();
         insert_usage_event(&conn, &cumulative(2, 150, 15)).unwrap();
 
-        let rollup = rollup_instance(&conn, "ins_c", "codex", Some("codex"))
+        let rollup = fold_rollup(&conn, "ins_c", "codex", Some("codex"))
             .unwrap()
             .unwrap();
         assert_eq!(rollup.turns, 2);
@@ -1028,7 +1223,7 @@ mod tests {
             .unwrap();
         }
 
-        let rollup = rollup_instance(&conn, "ins_test", "claude", None)
+        let rollup = fold_rollup(&conn, "ins_test", "claude", None)
             .unwrap()
             .unwrap();
         assert_eq!(rollup.turns, 3);
@@ -1063,7 +1258,7 @@ mod tests {
         // A Grok-like turn: output only, no input/cache breakdown.
         insert_usage_event(&conn, &row(1, &ago(2), None, Some(420), None, None)).unwrap();
 
-        let rollup = rollup_instance(&conn, "ins_test", "grok", None)
+        let rollup = fold_rollup(&conn, "ins_test", "grok", None)
             .unwrap()
             .unwrap();
         assert_eq!(rollup.turns, 1);
@@ -1078,7 +1273,7 @@ mod tests {
         assert_eq!(rollup.tpm_out_60s, Some(420));
 
         // A generic/terminal kind has no window table either.
-        let rollup = rollup_instance(&conn, "ins_test", "generic", None)
+        let rollup = fold_rollup(&conn, "ins_test", "generic", None)
             .unwrap()
             .unwrap();
         assert_eq!(rollup.context_window_tokens, None);
@@ -1090,28 +1285,269 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         assert!(
-            rollup_instance(&conn, "ins_empty", "claude", None)
+            fold_rollup(&conn, "ins_empty", "claude", None)
                 .unwrap()
                 .is_none()
         );
     }
 
+    fn rollup_request<'a>(
+        instance_id: &'a str,
+        kind: &'a str,
+        spec_model: Option<&'a str>,
+        effective_model: Option<&'a str>,
+        profile_id: Option<&'a str>,
+    ) -> RollupRequest<'a> {
+        RollupRequest {
+            instance_id,
+            kind,
+            spec_model,
+            effective_model,
+            profile_id,
+        }
+    }
+
     #[test]
     fn context_window_resolution_order() {
-        // Explicit [1m] tag wins over everything.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let req = |spec: Option<&'static str>, eff: Option<&'static str>| {
+            rollup_request("ins_x", "claude", spec, eff, None)
+        };
+
+        // Explicit [1m] tag on the effective id wins, even for a gateway
+        // model the static catalog has never heard of. Not approximate.
         assert_eq!(
-            context_window_tokens("claude", Some("gw/model_x[1m]")),
-            Some(1_000_000)
+            resolve_context_window(
+                &conn,
+                &req(Some("passthrough/ark/seed-evolving"), Some("passthrough/ark/seed-evolving[1m]")),
+                None
+            ),
+            (Some(1_000_000), false)
         );
-        // Static catalog row for a real model.
-        assert!(context_window_tokens("claude", Some("claude-opus-5")).is_some());
-        // Kind fallback when the model is unknown.
+        // A catalog row for the effective model.
         assert_eq!(
-            context_window_tokens("grok", Some("mystery-model")),
-            Some(128_000)
+            resolve_context_window(
+                &conn,
+                &req(Some("claude-haiku-4-5"), Some("claude-opus-5")),
+                None
+            ),
+            (Some(1_048_576), false)
         );
-        assert_eq!(context_window_tokens("claude", None), Some(200_000));
-        // Nothing to say for a generic PTY.
-        assert_eq!(context_window_tokens("generic", None), None);
+        // Static catalog on the launch model.
+        assert_eq!(
+            resolve_context_window(&conn, &req(Some("claude-opus-5"), None), None),
+            (Some(1_048_576), false)
+        );
+        // Unknown model keeps the harness-kind fallback — and is approximate.
+        assert_eq!(
+            resolve_context_window(&conn, &req(Some("mystery-model"), None), None),
+            (Some(200_000), true)
+        );
+        // No model at all: kind fallback, approximate.
+        assert_eq!(
+            resolve_context_window(&conn, &req(None, None), None),
+            (Some(200_000), true)
+        );
+        // Nothing to say for a generic PTY with an unknown model.
+        assert_eq!(
+            resolve_context_window(
+                &conn,
+                &rollup_request("ins_x", "generic", Some("mystery"), None, None),
+                None
+            ),
+            (None, false)
+        );
+        // The native-reported window beats every other source.
+        assert_eq!(
+            resolve_context_window(
+                &conn,
+                &req(Some("mystery-model"), Some("mystery-model[1m]")),
+                Some(123_456)
+            ),
+            (Some(123_456), false)
+        );
+    }
+
+    #[test]
+    fn provider_profile_window_beats_kind_fallback_and_is_not_approximate() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "CREATE TABLE provider_profiles (
+                id TEXT PRIMARY KEY,
+                models_json TEXT NOT NULL DEFAULT '[]'
+             );",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_profiles (id, models_json) VALUES (?1, ?2)",
+            params![
+                "pvp_test",
+                r#"[{"id":"gw/model-x","contextWindow":250000,"enabled":true}]"#
+            ],
+        )
+        .unwrap();
+
+        let req = rollup_request(
+            "ins_x",
+            "claude",
+            Some("gw/model-x"),
+            Some("gw/model-x"),
+            Some("pvp_test"),
+        );
+        assert_eq!(
+            resolve_context_window(&conn, &req, None),
+            (Some(250_000), false),
+            "profile-declared window is evidence, not an estimate"
+        );
+        // The effective id is checked before the launch model: a switch to
+        // the profile's 1m spelling wins through the profile too.
+        conn.execute(
+            "UPDATE provider_profiles SET models_json = ?1 WHERE id = 'pvp_test'",
+            params![r#"[{"id":"gw/model-x[1m]","contextWindow":1000000,"enabled":true}]"#],
+        )
+        .unwrap();
+        let req = rollup_request(
+            "ins_x",
+            "claude",
+            Some("gw/model-x"),
+            Some("gw/model-x[1m]"),
+            Some("pvp_test"),
+        );
+        assert_eq!(
+            resolve_context_window(&conn, &req, None),
+            (Some(1_000_000), false)
+        );
+    }
+
+    /// c-usagefu (b): the REAL 0.154.0 Codex rollout, replayed through the
+    /// driver's `CodexAdapter` and projected into the Hub exactly as the
+    /// `journal.append` path does. Six turns, ten model responses, each with
+    /// input=100/cached=10 (uncached 90): the rollup must fold the additive
+    /// turn rows to 900 uncached input (the cumulative session snapshot alone
+    /// agrees, so turn coverage is complete), and the context figure must come
+    /// from the last per-request MESSAGE row (90 fresh + 10 read = 100),
+    /// never the summed turn row (200) or the cumulative session row (1000).
+    #[test]
+    fn codex_fixture_replay_rolls_up_six_turns_and_900_uncached_input() {
+        use remuda_driver::adapters::{AdapterHome, CodexAdapter, FileSignalAdapter};
+
+        const ROLLOUT: &str =
+            include_str!("../../remuda-driver/tests/fixtures/codex/interactive-0.154.0.jsonl");
+        let session = "01a09c00-64d4-7ce1-8537-984e896b8e8a";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\",\"session_id\":\"{session}\"}}}}\n{ROLLOUT}"
+            ),
+        )
+        .unwrap();
+
+        let mut adapter = CodexAdapter::new(AdapterHome {
+            home: dir.path().to_path_buf(),
+            cwd: dir.path().to_path_buf(),
+            pid: None,
+        });
+        adapter.bind_rollout(session, path);
+        let observations = adapter.poll().unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut seq = 0i64;
+        for observed in observations {
+            let remuda_protocol::ObservationPayload::Usage(payload) = observed.payload else {
+                continue;
+            };
+            seq += 1;
+            let record = JournalRecord {
+                instance_id: "ins_codex".into(),
+                seq,
+                event_id: format!("evt_{seq}"),
+                event: serde_json::json!({
+                    "kind": "usage",
+                    "payload": serde_json::to_value(&payload).unwrap(),
+                }),
+                observed_at: format!("2026-09-13T18:21:{:02}.000Z", 40 + (seq % 10)),
+            };
+            let row = project_usage_event(&record, None, Some("gpt-5.4")).expect("usage row");
+            assert!(insert_usage_event(&conn, &row).unwrap());
+        }
+        assert!(seq >= 6, "the fixture emits turn/session usage rows: {seq}");
+
+        let rollup = rollup_instance(
+            &conn,
+            &rollup_request("ins_codex", "codex", Some("gpt-5.4"), None, None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rollup.turns, 6, "six end-of-turn snapshots");
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(900),
+            "uncached input: ten responses × (100 - 10 cached)"
+        );
+        assert_eq!(
+            rollup.context_used_tokens,
+            Some(100),
+            "context comes from the last per-request row, not the 1000-token cumulative session row"
+        );
+    }
+
+    #[test]
+    fn one_million_switch_refreshes_the_rollup_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        insert_usage_event(
+            &conn,
+            &row(
+                1,
+                &ago(2),
+                Some(50_000),
+                Some(100),
+                Some(100_000),
+                Some(0),
+            ),
+        )
+        .unwrap();
+
+        // Before the switch: unknown gateway model, 200k kind fallback.
+        let before = rollup_instance(
+            &conn,
+            &rollup_request(
+                "ins_test",
+                "claude",
+                Some("passthrough/ark/seed-evolving"),
+                None,
+                None,
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(before.context_window_tokens, Some(200_000));
+        assert!(before.context_pct_approximate, "fallback is approximate");
+        assert_eq!(before.context_pct, Some(75));
+
+        // After a /model switch to the 1m spelling: window flips to 1,000,000
+        // and the percentage recomputes (same folded rows; rollup is on read).
+        let after = rollup_instance(
+            &conn,
+            &rollup_request(
+                "ins_test",
+                "claude",
+                Some("passthrough/ark/seed-evolving"),
+                Some("passthrough/ark/seed-evolving[1m]"),
+                None,
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(after.context_window_tokens, Some(1_000_000));
+        assert!(!after.context_pct_approximate, "[1m] tag is evidence");
+        assert_eq!(after.context_pct, Some(15));
     }
 }

@@ -1524,52 +1524,145 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
     Ok(out)
 }
 
+/// Per-call usage from one stream-json `assistant` frame's `message.usage`.
+///
+/// c-usagefu (a): the authoritative per-call counters live on the assistant
+/// message, not on the `result` frame (whose usage is summed over every call
+/// in the turn). One Turn-scoped payload per top-level model message, keyed by
+/// message id so the Hub durably dedupes the repeated content-block frames.
+/// Sub-agent (nested) frames are skipped, matching transcript sidechains.
+/// All-zero usage yields nothing.
+fn usage_from_assistant_message(
+    mapper: &mut Mapper,
+    msg: &AssistantMessage,
+) -> DriverResult<Option<Observation>> {
+    let Some(message_id) = msg
+        .message
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !mapper.stream.usage_messages.insert(message_id.to_owned()) {
+        return Ok(None);
+    };
+    let Some(usage) = msg.message.get("usage") else {
+        return Ok(None);
+    };
+    let model = msg.message.get("model").and_then(Value::as_str);
+    let Some(event) =
+        crate::usage::claude::usage_from_message_usage(Some(message_id), None, model, usage)
+    else {
+        return Ok(None);
+    };
+    // Skip an all-zero call (no fresh input, no output, no cache buckets).
+    let counters = &event.tokens;
+    if counters.uncached_input == 0
+        && counters.output == 0
+        && counters.cache_read == 0
+        && counters.cache_write() == 0
+    {
+        return Ok(None);
+    }
+    let mut totals = crate::usage::UsageTotals::default();
+    totals.add(&event);
+    let mut payload =
+        crate::usage::to_usage_payload(UsageScope::Turn, message_id.to_owned(), 1, &totals);
+    payload.usage_id = Id::derive(
+        "obj",
+        mapper.instance_id.as_id().as_str(),
+        &format!("usage:turn:{message_id}"),
+    )?;
+    if let Some(model) = model
+        && let Some(&window) = mapper.stream.model_windows.get(model)
+    {
+        payload.context_window = Some(U64(window));
+    }
+    Ok(Some(mapper.observation(
+        Completeness::Structured,
+        NativeRequestKey::None,
+        ObservationPayload::Usage(Box::new(payload)),
+    )?))
+}
+
+/// Session-level evidence from one stream-json `result` frame.
+///
+/// c-usagefu (a): token counters are NOT read here — `result.usage` is summed
+/// over every call in the turn and double counts cache buckets once per-call
+/// assistant usage is emitted (`usage_from_assistant_message`). The result is
+/// still authoritative for the cumulative reported cost and carries the
+/// per-model `modelUsage.contextWindow`, so this emits a token-less
+/// Session-scoped snapshot the Hub revision-replaces in place. Results with no
+/// cost and no modelUsage (including all-zero results) produce nothing.
 fn usage_from_result(
     mapper: &mut Mapper,
     result: &ResultMessage,
 ) -> DriverResult<Option<Observation>> {
-    let usage = result.usage.clone().unwrap_or(Value::Null);
-    let input = usage.get("input_tokens").and_then(Value::as_u64);
-    let output = usage.get("output_tokens").and_then(Value::as_u64);
-    if input.is_none() && output.is_none() && result.total_cost_usd.is_none() {
-        return Ok(None);
+    // Learn native per-model windows from modelUsage for later calls.
+    if let Some(model_usage) = result.model_usage.as_ref().and_then(Value::as_object) {
+        for (model, blob) in model_usage {
+            if let Some(window) = blob
+                .get("contextWindow")
+                .and_then(Value::as_u64)
+                .filter(|window| *window > 0)
+            {
+                mapper.stream.model_windows.insert(model.clone(), window);
+            }
+        }
     }
     let cost = result.total_cost_usd.map(|amount| Cost {
         amount: amount.to_string(),
         currency: "USD".into(),
     });
+    // A single reported window only when the result named exactly one model;
+    // a multi-model session total cannot be pinned to one window.
+    let window = result
+        .model_usage
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|models| models.len() == 1)
+        .and_then(|models| {
+            models
+                .values()
+                .next()
+                .and_then(|blob| blob.get("contextWindow"))
+                .and_then(Value::as_u64)
+                .filter(|window| *window > 0)
+        });
+    if cost.is_none() && window.is_none() {
+        return Ok(None);
+    }
+    // Monotonic across turns and the two Workflow sub-results.
+    let revision = result
+        .num_turns
+        .unwrap_or(1)
+        .saturating_mul(1000)
+        .saturating_add(result.result_index.map(|index| index + 1).unwrap_or(1));
+    let session_id = mapper.session_id.clone();
     Ok(Some(mapper.observation(
         Completeness::Structured,
         NativeRequestKey::None,
         ObservationPayload::Usage(Box::new(UsagePayload {
             usage_id: Id::new("obj")?,
-            scope: UsageScope::Turn,
-            scope_id: match (result.num_turns, result.result_index) {
-                // Stable across turns AND the two workflow sub-results: the
-                // Hub durably dedupes on (instance, scope, scope_id).
-                (Some(turn), Some(index)) => format!("{turn}:{index}"),
-                (Some(turn), None) => turn.to_string(),
-                (None, Some(index)) => index.to_string(),
-                (None, None) => "0".into(),
-            },
+            scope: UsageScope::Session,
+            scope_id: session_id,
             mode: UsageMode::Snapshot,
-            metric_revision: U64(result.result_index.unwrap_or(0) + 1),
-            input_tokens: opt_u64(input),
+            metric_revision: U64(revision),
+            input_tokens: unknown("not-emitted-on-result"),
             input_accounting: InputAccounting::Unknown,
-            output_tokens: opt_u64(output),
-            reasoning_tokens: unknown("not-emitted"),
-            cache_read_tokens: unknown("not-emitted"),
-            cache_write_tokens: unknown("not-emitted"),
-            total_tokens: match (input, output) {
-                (Some(a), Some(b)) => Knowledge::Known { value: U64(a + b) },
-                _ => unknown("partial"),
-            },
+            output_tokens: unknown("not-emitted-on-result"),
+            reasoning_tokens: unknown("not-emitted-on-result"),
+            cache_read_tokens: unknown("not-emitted-on-result"),
+            cache_write_tokens: unknown("not-emitted-on-result"),
+            total_tokens: unknown("not-emitted-on-result"),
             cost: match cost {
                 Some(cost) => Knowledge::Known { value: cost },
                 None => unknown("not-emitted"),
             },
             accounting: remuda_protocol::Accounting::Reported,
             native_fields_ref: None,
+            context_window: window.map(U64),
         })),
     )?))
 }
@@ -2424,13 +2517,6 @@ fn unknown<T>(reason: &str) -> Knowledge<T> {
     Knowledge::Unknown {
         reason: reason.into(),
         evidence_event_ids: Vec::<EventId>::new(),
-    }
-}
-
-fn opt_u64(value: Option<u64>) -> Knowledge<U64> {
-    match value {
-        Some(value) => Knowledge::Known { value: U64(value) },
-        None => unknown("not-emitted"),
     }
 }
 

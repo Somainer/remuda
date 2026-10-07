@@ -89,6 +89,10 @@ pub struct GenericPtyOptions {
     pub liveness_timeout_ms: u64,
     /// Optional screen regex; emits a lifecycle event when a line matches.
     pub line_matcher: Option<String>,
+    /// Hub-issued instance id, set by the Node for launched instances. Used to
+    /// stamp the file-tail adapter observations for codex/grok (c-usagefu (d));
+    /// absent in standalone tests, which mint a fresh id.
+    pub instance_id: Option<InstanceId>,
 }
 
 impl GenericPtyOptions {
@@ -114,6 +118,7 @@ impl GenericPtyOptions {
             agent_start_timeout_ms: 120_000,
             liveness_timeout_ms: 60_000,
             line_matcher: Some("^DONE".into()),
+            instance_id: None,
         }
     }
 }
@@ -132,6 +137,8 @@ struct PtyLive {
     interactions: Arc<PtyInteractions>,
     interaction_task: JoinHandle<()>,
     matcher_task: Option<JoinHandle<()>>,
+    /// codex/grok file-tail adapters (c-usagefu (d)); aborted on close.
+    adapter_handle: Option<crate::adapters::supervisor::AdapterHandle>,
     closed: bool,
     failed: Arc<AtomicBool>,
 }
@@ -308,6 +315,14 @@ impl GenericPtyDriver {
         // config dir the two drivers share must not be mistaken for a login.
         if crate::claude_onboarding::has_login_material(std::path::Path::new(&recipe.native_home)) {
             env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
+        }
+        // c-usagefu (d): pin the harness-native home for codex/grok the same
+        // way the shell-pty path does, so a launched session keeps its
+        // rollout/usage files in the Node-prepared per-instance home instead
+        // of the real `~/.codex` / `~/.grok`, and the file-tail adapter has
+        // an unambiguous home to discover the session in.
+        if let Some(home_env) = preset.home_env {
+            env.insert(home_env.into(), recipe.native_home.clone());
         }
         // D-045: driver-computed capability handshakes, attached only when
         // granted; they pass the REMUDA_ deny prefix that guards caller env.
@@ -490,6 +505,10 @@ impl GenericPtyDriver {
             .insert("agentName".into(), agent_name.clone());
         ack.native_ids
             .insert("herdrKind".into(), preset.herdr_kind.into());
+        // c-usagefu (d): tail the codex/grok session files from the pinned
+        // native home so generic-pty dispatch gets usage/live observations the
+        // way shell-pty launches do.
+        let adapter_handle = self.spawn_file_tail_adapters(&spec, &recipe, &ctx, &tx);
         *self.inner.lock().await = Some(PtyLive {
             ctx,
             client,
@@ -502,12 +521,70 @@ impl GenericPtyDriver {
             interactions,
             interaction_task,
             matcher_task,
+            adapter_handle,
             closed: false,
             failed,
         });
         self.mark_ready();
         info!(kind = preset.id, "generic-pty agent.start dispatched");
         Ok(RunHandle::new(recipe, ack, rx))
+    }
+
+    /// Start the file-tail adapters for a codex/grok generic-pty launch
+    /// (c-usagefu (d)). Before this the only spawn sites were the shell-pty
+    /// carrier, while Hub dispatch forces every non-claude harness onto
+    /// generic-pty — so Grok/Codex sessions never produced structured usage.
+    ///
+    /// The pane's `CODEX_HOME`/`GROK_HOME` was pinned to the prepared native
+    /// home above; the adapter discovers the session there (registry cwd match;
+    /// the herdr pane reports no child pid). A tail that cannot start yet (the
+    /// session has not registered) keeps retrying on its poll tick. Failure to
+    /// spawn degrades silently, like the promoted-adapter watch — losing the
+    /// file channel never fails the launch.
+    fn spawn_file_tail_adapters(
+        &self,
+        spec: &InstanceSpec,
+        recipe: &LaunchRecipe,
+        ctx: &crate::claude_pty::ObsCtx,
+        events: &mpsc::Sender<Observation>,
+    ) -> Option<crate::adapters::supervisor::AdapterHandle> {
+        let kind = match spec.kind {
+            AgentKind::Codex | AgentKind::Grok => spec.kind,
+            _ => return None,
+        };
+        let home = crate::adapters::AdapterHome {
+            home: PathBuf::from(&recipe.native_home),
+            cwd: PathBuf::from(&recipe.cwd),
+            pid: None,
+        };
+        let stamp = crate::adapters::supervisor::stamp_ctx(
+            self.options
+                .instance_id
+                .clone()
+                .unwrap_or_else(InstanceId::new),
+            spec.host.clone(),
+            ctx.journal_id.clone(),
+            ctx.run_id.clone(),
+            format!("{kind:?}-pending"),
+        );
+        let adapter_ctx = crate::adapters::supervisor::AdapterCtx {
+            stamp,
+            seq: Arc::clone(&self.seq),
+            events: events.clone(),
+            home,
+            fallback_model: Some(recipe.provider.model_requested.clone())
+                .filter(|model| !model.is_empty()),
+            hooks: None,
+            agent_pid: None,
+        };
+        match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
+            Ok(Some(handle)) => Some(handle),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::debug!(%error, ?kind, "generic-pty file adapter failed to start");
+                None
+            }
+        }
     }
 }
 
@@ -688,6 +765,8 @@ impl Driver for GenericPtyDriver {
         }
         live.closed = true;
         live.interaction_task.abort();
+        // Dropping the handle aborts the codex/grok file-tail tasks.
+        live.adapter_handle.take();
         if let Some(task) = live.status_task.take() {
             task.abort();
         }

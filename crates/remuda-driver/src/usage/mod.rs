@@ -348,6 +348,7 @@ pub fn to_usage_payload(
         cost: cost_knowledge(totals),
         accounting: Accounting::Estimated,
         native_fields_ref: None,
+        context_window: None,
     }
 }
 

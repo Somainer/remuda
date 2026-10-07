@@ -720,6 +720,13 @@ pub struct UsagePayload {
     /// `native_fields_ref`; protocol §5.5.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub native_fields_ref: Option<Id>,
+    /// `context_window`; protocol §5.5. Native per-model context window in
+    /// tokens (e.g. stream-json `result.modelUsage.<model>.contextWindow`),
+    /// when the harness reports one. Additive optional field: absent on
+    /// adapters that do not know it; the Hub then resolves a window from the
+    /// effective model / provider profile / static catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<U64>,
 }
 
 /// BlobLocator; `protocol.md` §5.5.

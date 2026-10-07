@@ -14,6 +14,14 @@ pub(super) struct StreamState {
     active: HashMap<Option<String>, String>,
     blocks: HashMap<(Option<String>, String), BTreeMap<u32, Block>>,
     snapshots: HashSet<String>,
+    /// Message ids whose per-call `message.usage` has already been emitted.
+    /// Successive content-block frames repeat one message id with an identical
+    /// usage blob (usage-adapter §3.1); only the first frame is a call.
+    pub(super) usage_messages: HashSet<String>,
+    /// Native context window per model learned from `result.modelUsage`
+    /// (`modelUsage.<model>.contextWindow`), stamped onto later per-call
+    /// usage payloads for that model.
+    pub(super) model_windows: std::collections::BTreeMap<String, u64>,
     /// Mapped ids of TOP-LEVEL (`parent_tool_use_id == null`) ExitPlanMode
     /// tool_use blocks seen on assistant messages. D-051 (6a): only such a
     /// call is minted as a PlanReview; sub-agent (nested) ExitPlanMode calls
@@ -358,6 +366,15 @@ pub(super) fn map_assistant(
         }
     }
     mapper.stream.blocks.insert(key, blocks);
+    // Per-call usage (c-usagefu (a)): one Turn usage payload per top-level
+    // model message, from `message.usage` — never the summed `result.usage`.
+    // Sub-agent frames carry a parent and are dropped the same way transcript
+    // sidechain records are. Repeated block frames for one message id dedupe.
+    if msg.parent_tool_use_id.is_none()
+        && let Some(usage_obs) = super::usage_from_assistant_message(mapper, msg)?
+    {
+        out.push(usage_obs);
+    }
     if let Some(id) = &msg.uuid {
         mapper.stream.snapshots.insert(id.clone());
     }

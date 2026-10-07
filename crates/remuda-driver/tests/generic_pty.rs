@@ -116,6 +116,7 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: Some("^DONE ".into()),
+        instance_id: None,
     });
 
     let mut requested = spec(&cwd, AgentKind::Codex);
@@ -232,6 +233,7 @@ async fn fake_herdr_start_failure_emits_error_lifecycle() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: None,
+        instance_id: None,
     });
 
     let spec = spec(&cwd, AgentKind::Grok);
@@ -307,6 +309,7 @@ async fn fake_herdr_slow_start_emits_ready_lifecycle() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: None,
+        instance_id: None,
     });
 
     let started_at = tokio::time::Instant::now();
@@ -380,6 +383,7 @@ async fn fake_herdr_send_before_start_defers_without_blocking_control() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: Some("^DONE".into()),
+        instance_id: None,
     }));
     fs::create_dir_all(tmp.path().join("home")).unwrap();
 
@@ -431,6 +435,7 @@ async fn fake_herdr_journals_bounded_screen_snapshot() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: Some("^DONE".into()),
+        instance_id: None,
     });
 
     let mut handle = driver
@@ -530,4 +535,108 @@ async fn agent_origin_bypass_create_uses_non_yolo_preset() {
         Some("bypassPermissions")
     );
     driver.close().await.unwrap();
+}
+
+/// c-usagefu (d): Hub dispatch forces Grok onto generic-pty, so the
+/// codex/grok file adapters must spawn there too. A Grok home pinned into the
+/// pane (GROK_HOME), with a registered session whose `updates.jsonl` carries
+/// usage, yields `Usage` observations on the launch's observation channel.
+#[tokio::test]
+async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
+    const SESSION_ID: &str = "01a09c24-usage-7a03-9c89-88f1bc00bd0c";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_workspace_bin("fake-herdr");
+    let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
+
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let bin = stub_bin(tmp.path(), "grok");
+
+    // Native Grok home as a real TUI would leave it: an active_sessions.json
+    // registry and a session directory keyed by encoded cwd.
+    let session_dir = home
+        .join("sessions")
+        .join(remuda_driver::grok_session::encode_session_cwd(&cwd))
+        .join(SESSION_ID);
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/usage/grok-updates-usage.jsonl"),
+        session_dir.join("updates.jsonl"),
+    )
+    .expect("seed updates.jsonl");
+    fs::write(
+        home.join("active_sessions.json"),
+        serde_json::json!([{
+            "session_id": SESSION_ID,
+            "pid": std::process::id(),
+            "cwd": cwd,
+            "opened_at": "2026-09-13T18:21:00.000Z"
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut options = GenericPtyOptions {
+        profile: profile(),
+        launch_dir: launch,
+        native_home: home,
+        binary: BinarySource::Pinned(pin_binary(&bin).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-test".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker::env_only()),
+        extra_env: Default::default(),
+        agent_mcp: None,
+        agent_start_timeout_ms: 5_000,
+        liveness_timeout_ms: 5_000,
+        line_matcher: Some("^DONE".into()),
+        instance_id: Some(remuda_protocol::InstanceId::new()),
+    };
+    // OpenAI-shaped test profile; the grok usage counters are priced
+    // independently, this only satisfies launch materialization.
+    options.profile = ProviderProfile {
+        kind: ProviderKind::OpenaiResponses,
+        ..options.profile
+    };
+
+    let driver = GenericPtyDriver::new(options);
+    let mut requested = spec(&cwd, AgentKind::Grok);
+    if let remuda_protocol::PermissionMode::Claude(permission) = &mut requested.permission_mode {
+        permission.mode = remuda_protocol::ClaudePermissionMode::BypassPermissions;
+    }
+    let mut handle = driver.start(requested).await.expect("grok start");
+
+    // The file adapter polls every 250 ms; a Usage observation from the
+    // seeded updates.jsonl must arrive on the same channel as the pane's own
+    // observations.
+    let mut saw_usage = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(500), handle.recv()).await
+        else {
+            continue;
+        };
+        if let ObservationPayload::Usage(payload) = &obs.body {
+            assert_eq!(payload.scope, remuda_protocol::UsageScope::Session);
+            saw_usage = true;
+            break;
+        }
+    }
+    assert!(
+        saw_usage,
+        "grok generic-pty launch must tail updates.jsonl and emit usage"
+    );
+
+    driver.close().await.expect("stop");
 }

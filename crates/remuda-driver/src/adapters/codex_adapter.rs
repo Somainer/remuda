@@ -165,8 +165,9 @@ impl CodexAdapter {
         };
         // Usage first: the extractor is stateful (turn→model map) and must see
         // records in file order regardless of what else they map to.
-        if let Some(event) = self.usage.on_record(&record) {
-            self.usage_totals.push(&event);
+        let usage_event = self.usage.on_record(&record);
+        if let Some(event) = &usage_event {
+            self.usage_totals.push(event);
         }
         let turn = turn_id(&record);
         match &record.event {
@@ -249,9 +250,32 @@ impl CodexAdapter {
             }
             CodexRolloutEvent::Message { .. }
             | CodexRolloutEvent::Reasoning { .. }
-            | CodexRolloutEvent::TokenUsage { .. }
             | CodexRolloutEvent::TurnContext { .. }
             | CodexRolloutEvent::Compacted => Vec::new(),
+            CodexRolloutEvent::TokenUsage { .. } => {
+                // c-usagefu (b): one Message-scoped snapshot PER MODEL
+                // RESPONSE, keyed on the native response_id. A turn may hold
+                // several responses (retries/steers), and the end-of-turn
+                // snapshot SUMS them — fine for session totals, but the
+                // context ring asks "what does the next request carry", which
+                // is the latest single response's input+cache counters.
+                // Cumulative `token_count` snapshots (a different source) are
+                // ignored here as they are in the aggregator.
+                let Some(event) = usage_event.as_ref().filter(|event| {
+                    event.source == crate::usage::UsageSource::CodexTokenUsageRecord
+                }) else {
+                    return Vec::new();
+                };
+                let Some(response_id) = event.request_id.clone() else {
+                    return Vec::new();
+                };
+                let mut totals = crate::usage::UsageTotals::default();
+                totals.add(event);
+                let payload = to_usage_payload(UsageScope::Message, response_id, 1, &totals);
+                vec![AdapterObservation::structured(ObservationPayload::Usage(
+                    Box::new(payload),
+                ))]
+            }
             // The merged parser types the abort; only an explicit interruption
             // is a turn end here — a future/unknown abort reason must not
             // silently mean "interrupted" (A5: the only observed value is

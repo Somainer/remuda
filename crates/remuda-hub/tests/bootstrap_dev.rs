@@ -168,10 +168,13 @@ async fn unchanged_older_explicit_file_keeps_expired_login_rejected() -> Result<
         hub.shutdown().await;
     }
 
-    // Expire the stamp AND make the file older than it.
+    // Expire the stamp AND age both the access file and the persisted token
+    // older than it (a genuinely expired code was written long ago; aging the
+    // token too keeps item-8's crash-window repair from firing).
     let stamp_path = hub_data.join("bootstrap-issued-at");
     std::fs::write(&stamp_path, EXPIRED_STAMP)?;
     backdate_mtime(&code_file);
+    backdate_mtime(&hub_data.join("bootstrap-token"));
     let stamp_bytes_before = std::fs::read(&stamp_path)?;
 
     {
@@ -239,6 +242,45 @@ async fn changed_explicit_file_code_restarts_and_login_succeeds() -> Result<()> 
         login(hub.addr, new_code).await?;
         hub.shutdown().await;
     }
+    Ok(())
+}
+
+/// Round 4 item 8: the previous start persisted a NEW token but was killed
+/// before writing its stamp (stale year-2000 stamp left behind), and the
+/// access file keeps the same code with an OLD mtime (cp -p / rsync -t). The
+/// restart must self-heal via the token file's newer mtime so login with the
+/// new code succeeds.
+#[cfg(unix)]
+#[tokio::test]
+async fn restart_after_token_write_crash_restamps_and_login_succeeds() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    std::fs::create_dir_all(&hub_data)?;
+    let code_file = outer.path().join("access-code");
+    let code = "replaced-after-kill-at-least-sixteen";
+
+    // The crashed state: new token on disk NOW, stale stamp, same code in the
+    // access file whose mtime predates the stamp.
+    write_code_file(&code_file, code)?;
+    backdate_mtime(&code_file);
+    std::fs::write(hub_data.join("bootstrap-token"), code)?;
+    std::fs::write(hub_data.join("bootstrap-issued-at"), EXPIRED_STAMP)?;
+    backdate_mtime(&hub_data.join("bootstrap-issued-at"));
+
+    let hub = spawn(explicit_file_config(
+        hub_data.clone(),
+        code_file.clone(),
+        code,
+    ))
+    .await?;
+    login(hub.addr, code).await?;
+    // The repair wrote a fresh stamp.
+    assert_ne!(
+        std::fs::read_to_string(hub_data.join("bootstrap-issued-at"))?.trim(),
+        EXPIRED_STAMP,
+        "the crash window re-stamped"
+    );
+    hub.shutdown().await;
     Ok(())
 }
 

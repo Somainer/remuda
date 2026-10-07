@@ -191,13 +191,23 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
         let code_changed = persisted != config.bootstrap_token;
         let file_newer_than_stamp = match &config.bootstrap_source {
             crate::config::BootstrapSource::ExplicitFile(path) => {
-                file_mtime_newer_than_stamp(path, &stamp_path)?
+                mtime_newer_than_stamp(path, &stamp_path)?
             }
             crate::config::BootstrapSource::ExplicitEnv
             | crate::config::BootstrapSource::Generated
             | crate::config::BootstrapSource::Adopted => false,
         };
-        if code_changed || file_newer_than_stamp {
+        // Round 4 item 8: persist_bootstrap writes the token BEFORE the
+        // stamp. A crash (or kill) after the token write leaves the new code
+        // paired with the previous start's stamp — with an unchanged code and
+        // a `cp -p`/`rsync -t` access file whose mtime predates the stamp, the
+        // two rules above both miss and the new code 401s forever. The token
+        // file's mtime is newer than the parsed stamp exactly in that window,
+        // so re-stamp and self-heal. In a healthy directory the stamp is
+        // always written just after the token, so its parsed time is the later
+        // one and this never fires on a mere restart.
+        let token_newer_than_stamp = mtime_newer_than_stamp(&token_path, &stamp_path)?;
+        if code_changed || file_newer_than_stamp || token_newer_than_stamp {
             persist_bootstrap(&data_dir, &config.bootstrap_token)?;
         } else if !stamp_path.is_file() {
             // Round 4 item 3: backfill a MISSING stamp on an unchanged code.
@@ -267,10 +277,13 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
     Ok(BootstrapResolution::None)
 }
 
-/// Whether the access-code file's mtime is strictly newer than the parsed
-/// bootstrap stamp. An unreadable/absent file or an unparseable stamp returns
-/// false (the conservative choice: do not revive the TTL on uncertainty).
-fn file_mtime_newer_than_stamp(file: &Path, stamp: &Path) -> Result<bool, HubError> {
+/// Whether `file`'s mtime is strictly newer than the parsed bootstrap stamp.
+/// Used both for the operator access-code file (round 3: a touched file
+/// re-stamps) and the persisted token itself (round 4 item 8: a crash after
+/// the token write self-heals). An unreadable/absent file or an unparseable
+/// stamp returns false (the conservative choice: do not revive the TTL on
+/// uncertainty).
+fn mtime_newer_than_stamp(file: &Path, stamp: &Path) -> Result<bool, HubError> {
     let Ok(meta) = std::fs::metadata(file) else {
         return Ok(false);
     };
@@ -606,9 +619,16 @@ mod tests {
 
     /// Set up a data dir holding `code` with the year-2000 expired stamp, and
     /// return the raw stamp bytes callers compare against after a restart.
+    /// Set up a data dir holding `code` with the year-2000 expired stamp, and
+    /// return the raw stamp bytes callers compare against after a restart.
+    ///
+    /// The token file's mtime is backdated too: a genuinely expired code was
+    /// written long ago, so its token cannot look newer than the parsed stamp
+    /// (which is exactly the round-4 item-8 self-heal trigger).
     fn expired_token_setup(dir: &Path, code: &str) -> Vec<u8> {
         persist_bootstrap(dir, code).expect("persist");
         write_private(&dir.join("bootstrap-issued-at"), EXPIRED_STAMP).expect("stamp");
+        backdate_mtime(&dir.join("bootstrap-token"), MTIME_1999);
         std::fs::read(dir.join("bootstrap-issued-at")).expect("raw stamp bytes")
     }
 
@@ -958,9 +978,12 @@ mod tests {
         assert!(bootstrap_within_ttl(dir.path(), 24));
 
         // Expire the backfilled stamp, restart with the same code and a file
-        // older than the stamp: it must not be revived.
+        // older than the stamp: it must not be revived. Age the token file too
+        // so the item-8 crash repair does not fire (a genuinely expired code
+        // was written long ago).
         write_private(&dir.path().join("bootstrap-issued-at"), EXPIRED_STAMP).expect("expired");
         backdate_mtime(&code_file, MTIME_1999);
+        backdate_mtime(&dir.path().join("bootstrap-token"), MTIME_1999);
         let expired_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("bytes");
         let mut config = HubConfig::for_test(dir.path().to_path_buf());
         config.bootstrap_token = "same-code".to_owned();
@@ -1070,5 +1093,75 @@ mod tests {
         );
         let new = rotate_bootstrap(dir.path()).expect("rotation allowed post-bind");
         assert_ne!(new, minted);
+    }
+
+    /// Round 4 item 8: persist_bootstrap wrote the new token and was KILLED
+    /// before writing the stamp. The access file carries the same code with an
+    /// OLD mtime (`cp -p`/`rsync -t`), so neither the code-change nor the
+    /// file-mtime rule fires — but the token file's mtime is newer than the
+    /// stale parsed stamp, so the restart re-stamps and the code is usable.
+    #[cfg(unix)]
+    #[test]
+    fn crash_between_token_and_stamp_writes_restamps_via_token_mtime() {
+        let dir = tempfile::tempdir().expect("data dir");
+
+        // The pre-crash state from the previous start: old code + old stamp.
+        expired_token_setup(dir.path(), "previous-code");
+
+        // New start wrote the new token (mtime = now) but died before the
+        // stamp write; the operator file holds the new code with an OLD mtime.
+        write_private(&dir.path().join("bootstrap-token"), "replaced-code").expect("new token");
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "replaced-code").expect("code file");
+        backdate_mtime(&code_file, MTIME_1999);
+        let stale_stamp = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("stamp");
+        assert!(
+            !bootstrap_within_ttl(dir.path(), 24),
+            "precondition: stamp is old"
+        );
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "replaced-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        resolve_bootstrap(&mut config).expect("restart self-heals");
+
+        let repaired = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("stamp");
+        assert_ne!(repaired, stale_stamp, "the crash window re-stamps");
+        assert!(
+            bootstrap_within_ttl(dir.path(), 24),
+            "the new code is usable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bootstrap-token"))
+                .unwrap()
+                .trim(),
+            "replaced-code"
+        );
+    }
+
+    /// Round 4 item 8 negative: a healthy directory (stamp written just after
+    /// the token) with an unchanged code and an old access file does NOT
+    /// re-stamp — the token-mtime repair must not read a healthy pair as
+    /// crashed.
+    #[cfg(unix)]
+    #[test]
+    fn healthy_token_stamp_pair_with_old_file_does_not_trigger_repair() {
+        let dir = tempfile::tempdir().expect("data dir");
+        persist_bootstrap(dir.path(), "same-code").expect("persist writes token then stamp");
+        let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("stamp");
+
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "same-code").expect("code file");
+        backdate_mtime(&code_file, MTIME_1999);
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        resolve_bootstrap(&mut config).expect("resolve");
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+            stamp_bytes,
+            "a healthy pair is left untouched"
+        );
     }
 }

@@ -161,12 +161,19 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<BootstrapResolution, 
 
     // 1) Explicit operator source.
     if config.bootstrap_source.is_explicit() {
+        // Round 4 item 9: normalise the code exactly like the CLI's
+        // SecretRef::resolve does (leading/trailing spaces and newlines come
+        // from `$'secret\n'` or a file with a trailing newline). Without this
+        // a raw env value with padding differed from the trimmed persisted
+        // token on every start, so the code re-stamped forever and the TTL
+        // never elapsed.
+        config.bootstrap_token = config.bootstrap_token.trim().to_owned();
         // Round 4 item 2: an empty (or whitespace-only) explicit code must be
         // refused BEFORE writing anything — accepting it would let an empty
         // string log in (secret_eq("", "") passes) or overwrite a previously
         // persisted real code, and writing the marker first would additionally
         // lock rotation onto the empty value.
-        if config.bootstrap_token.trim().is_empty() {
+        if config.bootstrap_token.is_empty() {
             return Err(HubError::Internal(
                 "explicit bootstrap access code is empty; provide a non-empty \
                  --access-code-file / REMUDA_BOOTSTRAP_TOKEN value"
@@ -659,6 +666,63 @@ mod tests {
         // Refusal must not change the token or stamp.
         let after = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
         assert_eq!(after.trim(), "new-code-from-file");
+    }
+
+    /// Round 4 item 9: a padded explicit code (`"  code\n"`, the shape of
+    /// `$'secret\n'` or a file with a trailing newline) is trimmed before
+    /// persistence AND before the restart comparison. Repeated starts with the
+    /// same padded value must therefore be "unchanged" — no re-stamp every
+    /// restart — and the stored code carries no padding.
+    #[cfg(unix)]
+    #[test]
+    fn padded_explicit_env_code_is_trimmed_and_does_not_restamp() {
+        let dir = tempfile::tempdir().expect("data dir");
+
+        // First start: padded env value persists the trimmed code + stamp.
+        let mut cfg1 = HubConfig::for_test(dir.path().to_path_buf());
+        cfg1.bootstrap_token = "  padded-secret\n".to_owned();
+        cfg1.bootstrap_source = BootstrapSource::ExplicitEnv;
+        resolve_bootstrap(&mut cfg1).expect("first resolve");
+        assert_eq!(cfg1.bootstrap_token, "padded-secret");
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-token")).unwrap(),
+            b"padded-secret",
+            "the persisted token is stored without padding"
+        );
+
+        // Age the directory like a genuinely old code (stamp + token).
+        write_private(&dir.path().join("bootstrap-issued-at"), EXPIRED_STAMP).expect("expired");
+        backdate_mtime(&dir.path().join("bootstrap-token"), MTIME_1999);
+        let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap();
+
+        // Second start with the SAME padded env value: trimmed to the same
+        // code, so nothing is re-persisted; the expired stamp survives.
+        let mut cfg2 = HubConfig::for_test(dir.path().to_path_buf());
+        cfg2.bootstrap_token = "  padded-secret\n".to_owned();
+        cfg2.bootstrap_source = BootstrapSource::ExplicitEnv;
+        resolve_bootstrap(&mut cfg2).expect("second resolve");
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+            stamp_bytes,
+            "an unchanged padded value must not re-stamp"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("bootstrap-token")).unwrap(),
+            b"padded-secret"
+        );
+        assert!(!bootstrap_within_ttl(dir.path(), 24));
+
+        // A third start with a different padded value DOES re-stamp.
+        let mut cfg3 = HubConfig::for_test(dir.path().to_path_buf());
+        cfg3.bootstrap_token = "\trotated-secret  ".to_owned();
+        cfg3.bootstrap_source = BootstrapSource::ExplicitEnv;
+        resolve_bootstrap(&mut cfg3).expect("third resolve");
+        assert_eq!(cfg3.bootstrap_token, "rotated-secret");
+        assert_ne!(
+            std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+            stamp_bytes
+        );
+        assert!(bootstrap_within_ttl(dir.path(), 24));
     }
 
     /// Item 1: an unchanged FILE code whose mtime is OLDER than the persisted

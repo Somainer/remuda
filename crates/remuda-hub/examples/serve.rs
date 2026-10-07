@@ -25,9 +25,11 @@ async fn main() -> anyhow::Result<()> {
         config.listen = listen.parse::<SocketAddr>().context("REMUDA_LISTEN")?;
     }
     match std::env::var("REMUDA_BOOTSTRAP_TOKEN") {
-        // Operator-supplied provenance: the Hub must never mint over this code.
-        Ok(token) if !token.is_empty() => {
-            config.bootstrap_token = token;
+        // Operator-supplied provenance: the Hub must never mint over this
+        // code. Trim the way SecretRef::resolve does so a trailing newline or
+        // spaces from `$'secret\n'` cannot re-stamp the code on every restart.
+        Ok(token) if !token.trim().is_empty() => {
+            config.bootstrap_token = token.trim().to_owned();
             config.bootstrap_source = BootstrapSource::ExplicitEnv;
         }
         // An empty code would accept empty-string logins and overwrite a

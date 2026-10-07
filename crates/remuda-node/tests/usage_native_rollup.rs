@@ -99,6 +99,13 @@ const HOOKS_ENV: &str = "REMUDA_PTY_HOOKS";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
+    // Self-skip when the fake-harness trigger is missing instead of failing
+    // deep in the launch (c-ctxusage r4 item 7c).
+    let trigger = remuda_testing::ensure_workspace_bin("fake-harness");
+    if !trigger.is_file() {
+        eprintln!("skipping: fake-harness not built at {}", trigger.display());
+        return;
+    }
     // agent_pty_kind reads REMUDA_PTY_CARRIER from the process env, so re-exec
     // under the native-carrier flags like the other shell-pty e2es.
     if std::env::var(RUN_MARKER).is_err() {
@@ -167,7 +174,17 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
                     "exit_code": 0
                 }],
                 "stop_reason": "end_turn",
-                "usage": { "input_tokens": 1000, "output_tokens": 50, "cached_tokens": 9000 }
+                // 2.1.289 dialect: split cache buckets with non-zero cache
+                // creation (c-ctxusage r4 item 7c). Context the next request
+                // carries = 1000 input + 9000 read + 333 write(5m) = 10333 →
+                // 6% of the 200k fallback window.
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 50,
+                    "cached_tokens": 9000,
+                    "cache_creation_5m": 333,
+                    "cache_creation_1h": 7
+                }
             }],
             "quit_after_turns": 1
         })
@@ -244,7 +261,24 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
     let instance_id = created["instance"]["instanceId"]
         .as_str()
         .or_else(|| created["instance"]["id"].as_str())
-        .expect("instance id");
+        .expect("instance id")
+        .to_owned();
+
+    // Guaranteed cleanup runs whether the assertions below pass or fail.
+    let cleanup = async {
+        let (delete_status, _) = http(
+            hub.addr,
+            "DELETE",
+            &format!("/v1/instances/{instance_id}?force=1"),
+            &cookie,
+            None,
+        )
+        .await;
+        assert!(
+            delete_status == 200 || delete_status == 204 || delete_status == 404,
+            "cleanup delete: {delete_status}"
+        );
+    };
 
     // Wait for the transcript-derived usage rollup to land.
     let rollup = tokio::time::timeout(Duration::from_secs(45), async {
@@ -254,7 +288,7 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
             let items = page["items"].as_array().cloned().unwrap_or_default();
             if let Some(found) = items
                 .iter()
-                .find(|item| item["instanceId"].as_str() == Some(instance_id))
+                .find(|item| item["instanceId"].as_str() == Some(instance_id.as_str()))
                 .or_else(|| items.first())
                 .cloned()
             {
@@ -279,6 +313,7 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
     let rollup = match rollup {
         Ok(r) => r,
         Err(_) => {
+            cleanup.await;
             let (_, journal) = http(
                 hub.addr,
                 "GET",
@@ -291,10 +326,34 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
         }
     };
 
-    let turns = rollup["turns"].as_i64().unwrap_or(0);
-    assert!(turns >= 1, "at least one per-turn usage row: {rollup}");
-    assert!(
-        rollup["contextPct"].is_number(),
-        "context window percentage is present: {rollup}"
-    );
+    // Sync assertions captured so cleanup always runs, then the failure (if
+    // any) is resumed.
+    let checks: std::thread::Result<()> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || {
+            let turns = rollup["turns"].as_i64().unwrap_or(0);
+            assert!(turns >= 1, "at least one per-turn usage row: {rollup}");
+            // 1000 uncached + 9000 read + 340 write(5m+1h) = 10340 → 5% of 200k.
+            assert_eq!(
+                rollup["contextUsedTokens"].as_i64(),
+                Some(10_340),
+                "split cache buckets from the 2.1.289 transcript: {rollup}"
+            );
+            assert_eq!(
+                rollup["contextPct"].as_i64(),
+                Some(5),
+                "10340/200000 rounds to 5%: {rollup}"
+            );
+            assert_eq!(
+                rollup["cacheCreationTokens"].as_i64(),
+                Some(340),
+                "5m+1h split sums: {rollup}"
+            );
+            assert_eq!(rollup["cacheReadTokens"].as_i64(), Some(9_000), "{rollup}");
+            assert_eq!(rollup["sessionInputTokens"].as_i64(), Some(1_000), "{rollup}");
+            assert_eq!(rollup["sessionOutputTokens"].as_i64(), Some(50), "{rollup}");
+        },
+    ));
+    // Guaranteed cleanup runs whether the assertions passed or failed.
+    cleanup.await;
+    checks.expect("usage rollup assertions");
 }

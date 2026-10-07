@@ -1298,12 +1298,8 @@ pub(super) fn spawn(
                     // a DIFFERENT session, or a pid change, kills it for the
                     // rest of the epoch; that new foreground agent is bounded
                     // from its own detected provenance instead.
-                    let epoch_mode = epoch_mode(
-                        &mut launch_mode,
-                        pre_resume_mode,
-                        session_rebound,
-                        found,
-                    );
+                    let epoch_mode =
+                        epoch_mode(&mut launch_mode, pre_resume_mode, session_rebound, found);
                     maintain_binding(
                         &bindings,
                         &ctx,
@@ -2952,5 +2948,352 @@ mod tests {
             epoch_mode(&mut binding, None, false, &found),
             ResumeMode::Fresh
         );
+    }
+    // ----- items 1/2/5/6/7: the production promotion pump ------------------
+
+    const PUMP_SESSION: &str = "dddddddd-2222-4333-8444-eeeeeeeeeeee";
+    const DECOUPLED: &str = "2.1.289";
+
+    struct PumpFixture {
+        ctx: PromoteCtx,
+        binding: TranscriptBinding,
+        seq: Arc<AtomicU64>,
+        tx: mpsc::Sender<Observation>,
+        rx: mpsc::Receiver<Observation>,
+    }
+
+    fn pump_fixture(tmp: &Path, initial: &str) -> PumpFixture {
+        let cwd = tmp.join("repo");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let path = slug_session(tmp, &cwd, PUMP_SESSION, initial);
+        let binding = TranscriptBinding {
+            session_id: PUMP_SESSION.to_owned(),
+            path,
+            cwd,
+            source: crate::claude_transcript::BindingSource::PidFile,
+        };
+        let (tx, rx) = mpsc::channel(256);
+        PumpFixture {
+            ctx: ctx_in(tmp),
+            binding,
+            seq: Arc::new(AtomicU64::new(0)),
+            tx,
+            rx,
+        }
+    }
+
+    fn open_hydrator(
+        fx: &PumpFixture,
+        mode: ResumeMode,
+        bridge: Option<&Arc<crate::effort::EffortBridge>>,
+    ) -> Hydrator {
+        Hydrator::open(&fx.ctx, &fx.binding, bridge, None, None, None, None, mode)
+            .expect("hydrator opens against the bound transcript")
+    }
+
+    async fn pump_once(hydrator: &mut Hydrator, fx: &PumpFixture) {
+        pump(hydrator, &fx.tx, &fx.seq, &fx.ctx)
+            .await
+            .expect("the production promotion pump");
+    }
+
+    fn drain(fx: &mut PumpFixture) -> Vec<Observation> {
+        let mut out = Vec::new();
+        while let Ok(observation) = fx.rx.try_recv() {
+            out.push(observation);
+        }
+        out
+    }
+
+    /// `(level, readback_available)` for every emitted effort observation.
+    fn effort_rows(
+        observations: &[Observation],
+    ) -> Vec<(remuda_protocol::EffortName, Option<bool>)> {
+        observations
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                ObservationPayload::Effort(payload) => {
+                    Some((payload.effective.name, payload.effective.readback_available))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn conversation_hydrated(observations: &[Observation], needle: &str) -> bool {
+        observations
+            .iter()
+            .filter(|observation| {
+                matches!(
+                    observation.body,
+                    ObservationPayload::Message(_)
+                        | ObservationPayload::Thought(_)
+                        | ObservationPayload::ToolCall(_)
+                        | ObservationPayload::ToolResult(_)
+                )
+            })
+            .any(|observation| {
+                serde_json::to_string(&observation.body).is_ok_and(|body| body.contains(needle))
+            })
+    }
+
+    fn append_line(path: &Path, line: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open append");
+        file.write_all(line.as_bytes()).expect("append");
+    }
+
+    fn assistant_line(effort: Option<&str>, n: u64) -> String {
+        let mut record = serde_json::json!({
+            "type": "assistant",
+            "uuid": format!("msg-{n}"),
+            "sessionId": PUMP_SESSION,
+            "version": DECOUPLED,
+            "timestamp": "2026-10-07T10:00:00.000Z",
+            "message": {
+                "id": format!("msg-{n}"),
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": format!("reply {n}")}],
+                "stop_reason": "end_turn",
+            },
+            "perTurnEffort": null,
+        });
+        if let Some(level) = effort {
+            record
+                .as_object_mut()
+                .expect("object")
+                .insert("effort".into(), serde_json::json!(level));
+        }
+        let mut line = record.to_string();
+        line.push('\n');
+        line
+    }
+
+    fn user_line(n: u64, text: &str) -> String {
+        let mut line = serde_json::json!({
+            "type": "user",
+            "uuid": format!("prompt-{n}"),
+            "sessionId": PUMP_SESSION,
+            "version": DECOUPLED,
+            "message": {"role": "user", "content": text},
+        })
+        .to_string();
+        line.push('\n');
+        line
+    }
+
+    #[allow(dead_code)] // used by the item-5 test added later
+    fn slash_line(args: &str, n: u64) -> String {
+        let mut line = serde_json::json!({
+            "type": "user",
+            "uuid": format!("cmd-{n}"),
+            "sessionId": PUMP_SESSION,
+            "version": DECOUPLED,
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n\
+                     <command-args>{args}</command-args>"
+                ),
+            },
+        })
+        .to_string();
+        line.push('\n');
+        line
+    }
+
+    #[allow(dead_code)] // used by the item-5 test added later
+    fn stdout_verdict(stdout: &str, n: u64) -> String {
+        user_line(
+            n,
+            &format!("<local-command-stdout>{stdout}</local-command-stdout>"),
+        )
+    }
+
+    /// Core unverifiable-resume assertion shared by the item 1/2 cases: the
+    /// pump anchors at current EOF, conversation appended afterwards still
+    /// hydrates, and the effort gate never opens.
+    async fn assert_unverified_pump_gates_history(history: &str, appended: &str, needle: &str) {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(tmp.path(), history);
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Unverified, None);
+        pump_once(&mut hydrator, &fx).await;
+        assert!(effort_rows(&drain(&mut fx)).is_empty(), "no edge at EOF");
+        append_line(&fx.binding.path, appended);
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(
+            effort_rows(&observations).is_empty(),
+            "unverified records never open the effort gate: {observations:?}"
+        );
+        assert!(
+            conversation_hydrated(&observations, needle),
+            "conversation still hydrates: {observations:?}"
+        );
+    }
+    #[tokio::test]
+    async fn item1_a_resume_without_a_uuid_is_unverified_through_the_pump() {
+        // `--resume` with no id and `--resume latest` keep the resume bit while
+        // yielding no session id; `latest` is not uuid-shaped.
+        let cases = [
+            "claude --resume",
+            "claude --resume latest",
+            "claude -r",
+            "node /opt/claude/cli.js --resume",
+        ];
+        for argv in cases {
+            let (session_id, is_resume) = crate::promote::resume_provenance(argv);
+            assert_eq!((session_id, is_resume), (None, true), "argv {argv:?}");
+            let found = Detected {
+                resume: is_resume,
+                ..detected_claude(7, None)
+            };
+            assert_eq!(shell_resume_mode(&found), ResumeMode::Unverified);
+        }
+        assert_unverified_pump_gates_history(
+            &assistant_line(Some("high"), 1),
+            &user_line(2, "question after resume"),
+            "question after resume",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn item1_without_process_start_evidence_a_resume_is_unverified() {
+        // macOS (and a pid the table cannot time on Linux) give no start
+        // instant, so a time-based boundary is impossible.
+        assert_eq!(crate::promote::process_started_at(99_999_999), None);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            crate::promote::process_started_at(std::process::id() as i32),
+            None
+        );
+        let found = Detected {
+            resume: true,
+            ..detected_claude(7, None)
+        };
+        assert_eq!(shell_resume_mode(&found), ResumeMode::Unverified);
+        assert_unverified_pump_gates_history(
+            &assistant_line(Some("high"), 1),
+            &assistant_line(Some("max"), 2),
+            "reply 2",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn item1_a_partial_trailing_line_still_gates_the_resume_at_the_pump() {
+        use crate::claude_transcript::{ResumeBoundary, TranscriptTail};
+        // The resumed process is mid-write on an effort record (no newline).
+        // at_process_start ends its scan at the partial line instead of
+        // failing; the line is held back until its newline arrives.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("t.jsonl");
+        let history_line = "{\"timestamp\":\"1970-01-01T00:00:10Z\",\"body\":\"history\"}\n";
+        let partial = "{\"timestamp\":\"1970-01-01T00:00:20Z\",\"body\":\"partial\"}";
+        std::fs::write(&path, format!("{history_line}{partial}")).expect("write");
+        let started = time::OffsetDateTime::from_unix_timestamp(15).expect("start");
+        let boundary = ResumeBoundary::at_process_start(&path, started)
+            .expect("a partial trailing line ends the scan at that offset instead of failing");
+        assert_eq!(boundary.start as usize, history_line.len());
+        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
+        assert!(tail.poll().expect("poll").lines.is_empty());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open")
+            .write_all(b"\n")
+            .expect("finish the line");
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.provenance, TailProvenance::Current);
+        assert_eq!(read.lines, vec![partial]);
+
+        // Through the production promotion pump the same shape is an
+        // Unverified anchor: EOF sits mid-record, completing it with a newline
+        // neither errors nor reopens the gate (the half-written bytes were
+        // before the anchor; only a genuinely new record hydrates).
+        let mut fx = pump_fixture(tmp.path(), &format!("{history_line}{partial}"));
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Unverified, None);
+        pump_once(&mut hydrator, &fx).await;
+        assert!(drain(&mut fx).is_empty());
+        append_line(&fx.binding.path, "\n");
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(
+            effort_rows(&observations).is_empty(),
+            "completing the partial line never opens the gate: {observations:?}"
+        );
+        append_line(&fx.binding.path, &user_line(1, "real next question"));
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(effort_rows(&observations).is_empty());
+        assert!(conversation_hydrated(&observations, "real next question"));
+    }
+
+    #[tokio::test]
+    async fn item2_an_exec_resume_keeping_the_shell_pid_is_never_time_verified() {
+        // `exec claude --resume <id>` replaces the shell but KEEPS its pid and
+        // process start time: the argv says resume, but the boundary cannot be
+        // proven from process time.
+        let argv = "claude --resume dddddddd-2222-4333-8444-eeeeeeeeeeee";
+        let (session_id, is_resume) = crate::promote::resume_provenance(argv);
+        assert_eq!(
+            session_id.as_deref(),
+            Some("dddddddd-2222-4333-8444-eeeeeeeeeeee")
+        );
+        assert!(is_resume);
+        assert_unverified_pump_gates_history(
+            &assistant_line(Some("high"), 1),
+            &assistant_line(Some("max"), 2),
+            "reply 2",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn item2_a_backward_clock_step_cannot_verify_a_resume_from_timestamps() {
+        // The history record claims a timestamp in the FUTURE relative to the
+        // process start — a backward clock step makes wall-clock reasoning
+        // lie. Timestamps alone never verify: the record stays gated history.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(tmp.path(), "{}\n");
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Unverified, None);
+        append_line(&fx.binding.path, &assistant_line(Some("high"), 1));
+        pump_once(&mut hydrator, &fx).await;
+        assert!(
+            effort_rows(&drain(&mut fx)).is_empty(),
+            "a future-timestamped history effort record never sets the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn item7_the_unverified_anchor_is_built_once_per_epoch_not_per_poll() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // History already carries an effort record at the anchor instant.
+        let mut fx = pump_fixture(tmp.path(), &assistant_line(Some("high"), 1));
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Unverified, None);
+        pump_once(&mut hydrator, &fx).await;
+        assert!(effort_rows(&drain(&mut fx)).is_empty());
+        // A record appended between polls would be skipped by an anchor
+        // rebuilt at EOF every poll; a once-per-epoch anchor still reads it
+        // (as Unverified, hydrating conversation only).
+        append_line(&fx.binding.path, &user_line(2, "between polls"));
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(effort_rows(&observations).is_empty());
+        assert!(conversation_hydrated(&observations, "between polls"));
+        append_line(&fx.binding.path, &assistant_line(Some("max"), 3));
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(
+            effort_rows(&observations).is_empty(),
+            "the gate never opens for the whole epoch: {observations:?}"
+        );
+        assert!(conversation_hydrated(&observations, "reply 3"));
     }
 }

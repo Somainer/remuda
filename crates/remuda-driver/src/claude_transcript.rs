@@ -867,7 +867,9 @@ impl TranscriptTail {
     /// Whether the resume boundary was proven (false for an unverified resume).
     #[must_use]
     pub fn verified(&self) -> bool {
-        self.resume.as_ref().is_none_or(|s| s.verified && !s.displaced)
+        self.resume
+            .as_ref()
+            .is_none_or(|s| s.verified && !s.displaced)
     }
 
     /// File being followed.
@@ -933,7 +935,10 @@ impl TranscriptTail {
                 _ => true,
             };
             if !state.displaced
-                && (!state.verified || !head_intact || identity != state.identity || len < self.offset)
+                && (!state.verified
+                    || !head_intact
+                    || identity != state.identity
+                    || len < self.offset)
             {
                 // Boundary lost. Re-anchor at the present EOF so a recreated
                 // file's bytes are not replayed; from here appends hydrate
@@ -1407,5 +1412,33 @@ mod tests {
         let read = tail.poll().expect("poll");
         // New identity after a delete => unverified, regardless of length.
         assert_eq!(read.provenance, TailProvenance::Unverified);
+    }
+    #[test]
+    fn a_partial_trailing_line_ends_the_process_start_scan_at_that_offset() {
+        // Item 1 (Linux): a record the resumed process is mid-write (no trailing
+        // newline yet) used to make at_process_start fail entirely, which sent
+        // the pump down the fresh byte-0/current path. The scan now ends at the
+        // partial line's offset: it is treated as the first current record.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("t.jsonl");
+        write(&path, "");
+        append(&path, &ts_record(100, "history-a"));
+        let partial = "{\"timestamp\":\"1970-01-01T00:00:20Z\",\"body\":\"partial\"}";
+        append(&path, partial);
+        let started = time::OffsetDateTime::from_unix_timestamp(150).expect("start");
+        let boundary = ResumeBoundary::at_process_start(&path, started).expect("boundary");
+        assert_eq!(
+            boundary.start as usize,
+            ts_record(100, "history-a").len(),
+            "the boundary starts at the un-newline-terminated record"
+        );
+        let mut tail = TranscriptTail::resumed(path.clone(), boundary);
+        let read = tail.poll().expect("poll holds the partial line back");
+        assert!(read.lines.is_empty());
+        // The writer finishes the line: it now reads whole, as current.
+        append(&path, "\n");
+        let read = tail.poll().expect("poll");
+        assert_eq!(read.provenance, TailProvenance::Current);
+        assert_eq!(read.lines, vec![partial]);
     }
 }

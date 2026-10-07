@@ -223,6 +223,9 @@ pub struct Store {
     /// `queue_command` writer job deletes that device row before the authority
     /// check (the fence F also deletes predecessor devices).
     test_delete_device_before_queue: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam shared by gate-claim and node-op admission: arm a fence
+    /// applied at the top of the NEXT such writer job.
+    test_fence_before_authority: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Result of presenting a Node enroll or host token.
@@ -2091,6 +2094,7 @@ impl Store {
             }),
             test_fence_before_queue: Arc::new(std::sync::Mutex::new(None)),
             test_delete_device_before_queue: Arc::new(std::sync::Mutex::new(None)),
+            test_fence_before_authority: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -2174,6 +2178,27 @@ impl Store {
             Ok(())
         })
         .await
+    }
+
+    /// Test-only: arm a fence that the NEXT `claim_gate_job` or
+    /// `admit_node_op` writer job applies immediately before its authority
+    /// check — a deterministic F between enqueue/admission and the next
+    /// admission. Drained after one fire.
+    #[doc(hidden)]
+    pub fn test_arm_fence_before_authority_check(&self, instance_id: String) {
+        *self
+            .test_fence_before_authority
+            .lock()
+            .expect("authority seam lock") = Some(instance_id);
+    }
+
+    /// Test-only: drain (at most) the armed authority-check fence. Called
+    /// inside the claim/admission writer jobs.
+    pub(crate) fn take_test_authority_fence(&self) -> Option<String> {
+        self.test_fence_before_authority
+            .lock()
+            .expect("authority seam lock")
+            .take()
     }
 
     /// Run a read on the read-only pool instead of the writer thread.
@@ -3744,11 +3769,16 @@ impl Store {
             title,
             spec,
             InstanceDelegation::default(),
+            // Non-delegated inserts are operator/internal paths.
+            crate::agent_scope::CallerAuthority::internal(),
         )
         .await
     }
 
     /// Insert with explicit delegation-tree state; design §2.5.
+    ///
+    /// D-057 §7.3: an Agent child create carries the caller's authority pair,
+    /// checked in this writer job before the instance row exists.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_instance_delegated(
         &self,
@@ -3759,8 +3789,11 @@ impl Store {
         title: Option<String>,
         spec: Value,
         delegation: InstanceDelegation,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<InstanceRecord, StoreError> {
         self.run_named("insert_instance_delegated", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            check_initiator(conn, initiator, device_id)?;
             let host =
                 load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
             let running: i64 = conn.query_row(
@@ -6073,6 +6106,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::supply::migrate(&conn)?;
     crate::workers::migrate(&conn)?;
     crate::gatequeue::migrate(&conn)?;
+    crate::node_ops::migrate(&conn)?;
     crate::usage_store::migrate(&conn)?;
     migrate_provider_models(&conn)?;
     crate::store_tickets::migrate(&conn)?;

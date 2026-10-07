@@ -250,7 +250,11 @@ async fn create_project(
     project.policy.enforced = Default::default();
     let created = state
         .store
-        .insert_project(project, device.id.clone())
+        .insert_project(
+            project,
+            device.id.clone(),
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?;
     let route_doc = route_override_doc(body.api_via.as_deref(), body.api_route.as_deref())?;
@@ -356,55 +360,59 @@ async fn set_project(
     }
     let updated = state
         .store
-        .patch_project(id.clone(), move |project| {
-            if let Some(name) = body.name {
-                if name.trim().is_empty() {
-                    return Err(StoreError::Id("project name required".into()));
+        .patch_project(
+            id.clone(),
+            move |project| {
+                if let Some(name) = body.name {
+                    if name.trim().is_empty() {
+                        return Err(StoreError::Id("project name required".into()));
+                    }
+                    project.name = name.trim().to_string();
                 }
-                project.name = name.trim().to_string();
-            }
-            if let Some(home) = body.home_host {
-                project.home_host = home
-                    .map(|raw| {
-                        remuda_protocol::HostId::try_from(raw)
-                            .map_err(|err| StoreError::Id(format!("homeHost: {err}")))
-                    })
-                    .transpose()?;
-            }
-            if let Some(remote) = body.repo_remote {
-                project.repo_remote = remote;
-            }
-            if let Some(branch) = body.default_base_branch {
-                project.default_base_branch = branch;
-            }
-            if let Some(pattern) = body.branch_pattern {
-                project.branch_pattern = pattern;
-            }
-            if let Some(provider) = body.provider {
-                project.provider = provider;
-            }
-            if let Some(effort) = body.default_effort {
-                project.default_effort = effort;
-            }
-            if let Some(posture) = body.permission_posture {
-                project.permission_posture = posture;
-            }
-            if let Some(policy) = body.policy {
-                // D-031: keep the stored enforced switches; only configurable
-                // policy is mutable after creation.
-                project.policy.configurable = policy.configurable;
-            }
-            if let Some(placement) = body.placement {
-                project.placement = placement;
-            }
-            if let Some(gate) = body.gate {
-                project.gate = gate;
-            }
-            if let Some(hosts) = hosts {
-                project.hosts = hosts;
-            }
-            Ok(())
-        })
+                if let Some(home) = body.home_host {
+                    project.home_host = home
+                        .map(|raw| {
+                            remuda_protocol::HostId::try_from(raw)
+                                .map_err(|err| StoreError::Id(format!("homeHost: {err}")))
+                        })
+                        .transpose()?;
+                }
+                if let Some(remote) = body.repo_remote {
+                    project.repo_remote = remote;
+                }
+                if let Some(branch) = body.default_base_branch {
+                    project.default_base_branch = branch;
+                }
+                if let Some(pattern) = body.branch_pattern {
+                    project.branch_pattern = pattern;
+                }
+                if let Some(provider) = body.provider {
+                    project.provider = provider;
+                }
+                if let Some(effort) = body.default_effort {
+                    project.default_effort = effort;
+                }
+                if let Some(posture) = body.permission_posture {
+                    project.permission_posture = posture;
+                }
+                if let Some(policy) = body.policy {
+                    // D-031: keep the stored enforced switches; only configurable
+                    // policy is mutable after creation.
+                    project.policy.configurable = policy.configurable;
+                }
+                if let Some(placement) = body.placement {
+                    project.placement = placement;
+                }
+                if let Some(gate) = body.gate {
+                    project.gate = gate;
+                }
+                if let Some(hosts) = hosts {
+                    project.hosts = hosts;
+                }
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -464,15 +472,20 @@ async fn add_member(
     .expect("one resolved member");
     let updated = state
         .store
-        .patch_project(id.clone(), move |project| {
-            if project.members.iter().any(|existing| {
-                existing.host_id == member.host_id && existing.workspace_id == member.workspace_id
-            }) {
-                return Err(StoreError::Id("member already exists".into()));
-            }
-            project.members.push(member);
-            Ok(())
-        })
+        .patch_project(
+            id.clone(),
+            move |project| {
+                if project.members.iter().any(|existing| {
+                    existing.host_id == member.host_id
+                        && existing.workspace_id == member.workspace_id
+                }) {
+                    return Err(StoreError::Id("member already exists".into()));
+                }
+                project.members.push(member);
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -503,16 +516,20 @@ async fn remove_member(
         .map_err(|err| HubError::BadRequest(format!("workspaceId: {err}")))?;
     let updated = state
         .store
-        .patch_project(id.clone(), move |project| {
-            let before = project.members.len();
-            project
-                .members
-                .retain(|member| !(member.host_id == host && member.workspace_id == workspace));
-            if project.members.len() == before {
-                return Err(StoreError::Id("member not found".into()));
-            }
-            Ok(())
-        })
+        .patch_project(
+            id.clone(),
+            move |project| {
+                let before = project.members.len();
+                project
+                    .members
+                    .retain(|member| !(member.host_id == host && member.workspace_id == workspace));
+                if project.members.len() == before {
+                    return Err(StoreError::Id("member not found".into()));
+                }
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -628,8 +645,11 @@ impl Store {
         &self,
         project: Project,
         created_by: String,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Project, StoreError> {
         self.run_named("insert_project", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
             let id = project.meta.id.as_id().to_string();
             let now = crate::config::now_rfc3339();
             let doc = serde_json::to_string(&project)?;
@@ -672,11 +692,14 @@ impl Store {
         &self,
         project_id: String,
         mutate: F,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Option<Project>, StoreError>
     where
         F: FnOnce(&mut Project) -> Result<(), StoreError> + Send + 'static,
     {
         self.run_named("patch_project", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
             let Some(mut project) = load_project(conn, &project_id)? else {
                 return Ok(None);
             };

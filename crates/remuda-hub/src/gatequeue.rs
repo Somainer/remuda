@@ -215,6 +215,10 @@ async fn enqueue_job(
         ));
     }
     let now = now();
+    // D-057 §7.1: the gate job doc carries the caller's stamped initiator and
+    // device id; the claim re-checks them (§7.3). insert refuses a fenced one.
+    let (gate_initiator, gate_device_id) =
+        crate::agent_scope::initiator_and_device(&state, &device).await?;
     let job = GateJob {
         id: GateJobId::new(),
         project_id,
@@ -223,10 +227,8 @@ async fn enqueue_job(
         web,
         lane_id: body.lane_id,
         requested_by: device.id.clone(),
-        // Replaced with the resolved Hub-stamped initiator in the gate job
-        // wiring commit.
-        initiator: None,
-        initiator_device_id: None,
+        initiator: gate_initiator,
+        initiator_device_id: gate_device_id,
         state: GateJobState::Queued,
         steps: Vec::new(),
         host_id: None,
@@ -723,19 +725,11 @@ async fn dispatch(
     let claim_host = lane.host_id.clone();
     let claimed = state
         .store
-        .mutate_gate_job(job.id.as_id().as_str(), move |row| {
-            if row.state != GateJobState::Queued {
-                return None;
-            }
-            row.state = GateJobState::Running;
-            row.lane_id = Some(claim_lane.clone());
-            row.host_id = Some(claim_host.clone());
-            row.started_at = Some(now_ts());
-            row.attempts = row.attempts.saturating_add(1);
-            Some(())
-        })
+        .claim_gate_job(job.id.as_id().as_str(), claim_lane, claim_host)
         .await;
     let Ok(Some(job)) = claimed else {
+        // Not queued, or the job's initiator was fenced: the claim job
+        // settled the row canceled(fenced); no gate.run is sent.
         return;
     };
     let params = GateRunParams {
@@ -758,6 +752,9 @@ async fn dispatch(
         push_from,
         keep_logs: job.keep_logs,
         binary: None,
+        // §7.5: gate.run carries the admission record's initiator; the jobId
+        // is the opId. Node-side refusal arrives with ma-fence.
+        initiator: job.initiator.clone(),
     };
     journal(state, &job.requested_by, "gate.running", &job).await;
     let state = state.clone();
@@ -1623,7 +1620,14 @@ impl Store {
         let lane = job.lane_id.clone();
         let queued = String::from(job.queued_at.clone());
         let created = String::from(job.queued_at.clone());
+        // D-057 §7.1: authority pair checked inside the writer job (§7.3);
+        // the device id is not part of the wire but lives in the job doc.
+        let job_initiator = job.initiator.clone();
+        let job_device_id = job.initiator_device_id.clone();
         self.run_named("insert_gate_job", move |conn| {
+            // D-057 §7.3: gate job insert is an Agent-admitted write; the
+            // job row is the gate.run admission record (main-agent.md §7.5).
+            crate::store::check_initiator(conn, job_initiator.as_ref(), job_device_id.as_deref())?;
             conn.execute(
                 "INSERT INTO gate_jobs
                     (id, project_id, state, lane_id, queued_at, doc_json, revision,
@@ -1721,6 +1725,75 @@ impl Store {
                         updated_at = ?4
                   WHERE id = ?5",
                 params![doc, job.state.as_str(), job.lane_id, now, id],
+            )?;
+            Ok(Some(job))
+        })
+        .await
+    }
+
+    /// D-057 §7.3/§7.5: claim a queued gate job for dispatch, re-checking the
+    /// initiator STAMPED ON THE ROW (and its device id) inside the writer job.
+    /// A job fenced after enqueue is not claimed: it settles `canceled` with
+    /// reason `fenced` in the same job, and the caller treats `None` as "no
+    /// gate.run must reach the lane". Human/Bot jobs (`initiator: None`) claim
+    /// exactly as before.
+    pub(crate) async fn claim_gate_job(
+        &self,
+        id: &str,
+        claim_lane: String,
+        claim_host: remuda_protocol::HostId,
+    ) -> Result<Option<GateJob>, crate::store::StoreError> {
+        let id = id.to_owned();
+        // Test-only seam: fence lands inside this writer job.
+        let armed_fence = self.take_test_authority_fence();
+        self.run_named("claim_gate_job", move |conn| {
+            if let Some(fenced_instance) = armed_fence {
+                crate::store::test_apply_fence(conn, &fenced_instance)?;
+            }
+            let Some(mut job) = conn
+                .query_row(
+                    "SELECT doc_json FROM gate_jobs WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|text| serde_json::from_str::<GateJob>(&text).ok())
+            else {
+                return Ok(None);
+            };
+            if job.state != GateJobState::Queued {
+                return Ok(None);
+            }
+            if let Err(crate::store::StoreError::Fenced) = crate::store::check_initiator(
+                conn,
+                job.initiator.as_ref(),
+                job.initiator_device_id.as_deref(),
+            ) {
+                job.state = GateJobState::Canceled;
+                job.finished_at = Some(now_ts());
+                job.reason = Some("fenced".into());
+                let doc = serde_json::to_string(&job)?;
+                conn.execute(
+                    "UPDATE gate_jobs
+                        SET doc_json = ?1, state = ?2, lane_id = ?3, revision = revision + 1,
+                            updated_at = ?4
+                      WHERE id = ?5",
+                    params![doc, job.state.as_str(), job.lane_id, now(), id],
+                )?;
+                return Ok(None);
+            }
+            job.state = GateJobState::Running;
+            job.lane_id = Some(claim_lane);
+            job.host_id = Some(claim_host);
+            job.started_at = Some(now_ts());
+            job.attempts = job.attempts.saturating_add(1);
+            let doc = serde_json::to_string(&job)?;
+            conn.execute(
+                "UPDATE gate_jobs
+                    SET doc_json = ?1, state = ?2, lane_id = ?3, revision = revision + 1,
+                        updated_at = ?4
+                  WHERE id = ?5",
+                params![doc, job.state.as_str(), job.lane_id, now(), id],
             )?;
             Ok(Some(job))
         })

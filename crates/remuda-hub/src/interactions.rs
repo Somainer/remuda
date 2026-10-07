@@ -647,16 +647,26 @@ pub async fn answer_interaction(
         Some(row) => vec![row.host_id],
         None => state.nodes.host_ids().await,
     };
+    // D-057 §7.5: interaction.answer is a direct RPC outside the command
+    // table. The answer's commandId is the op id; the admission row exists
+    // BEFORE the Node is called (main-agent.md §7.5), so a fenced answering
+    // instance never reaches the Node and the interaction stays pending.
+    let answer_auth = crate::node_ops::NodeOpAuth {
+        initiator: crate::agent_scope::initiator_for(&state, &device).await?,
+        device_id: Some(device.id.clone()),
+    };
     for host_id in hosts {
-        match state
-            .nodes
-            .call(
-                &host_id,
-                "interaction.answer",
-                params.clone(),
-                NODE_RPC_TIMEOUT,
-            )
-            .await
+        match crate::node_ops::call_admitted_frame(
+            &state,
+            &host_id,
+            "interaction.answer",
+            None,
+            command_id.as_id().to_string(),
+            params.clone(),
+            NODE_RPC_TIMEOUT,
+            &answer_auth,
+        )
+        .await
         {
             Ok(Some(frame)) => match rpc_result(frame) {
                 Ok(result) => {

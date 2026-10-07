@@ -505,16 +505,26 @@ pub(crate) async fn dispatch_core(
     };
 
     // ── provision through the Node (worktree + target dir) ─────────────────
-    let provision = crate::http::call_node(
+    // D-057 §7.5: worker.provision is a direct RPC; admit it (check + row)
+    // before any worktree exists on the Node.
+    let provision_op_id = uuid::Uuid::now_v7().to_string();
+    let provision = crate::node_ops::call_admitted(
         &state,
         &host.host_id,
         "worker.provision",
+        Some(name.clone()),
+        provision_op_id,
         json!({
             "name": name,
             "branch": branch,
             "workspaceId": workspace_id.as_id(),
             "startPoint": format!("origin/{}", project.default_base_branch),
         }),
+        crate::http::WORKTREE_RPC_TIMEOUT,
+        &crate::node_ops::NodeOpAuth {
+            initiator: dispatch_initiator.clone(),
+            device_id: dispatch_device_id.clone(),
+        },
     )
     .await?;
     let worktree_path = provision
@@ -731,7 +741,14 @@ pub(crate) async fn dispatch_core(
         };
         let row = state
             .store
-            .insert_worker(worker, device.id.clone())
+            .insert_worker(
+                worker,
+                device.id.clone(),
+                crate::agent_scope::CallerAuthority {
+                    initiator: dispatch_initiator.clone(),
+                    device_id: dispatch_device_id.clone(),
+                },
+            )
             .await
             .map_err(map_store)?;
         let _ = command;
@@ -1383,16 +1400,25 @@ pub(crate) async fn retire_core(
         // Return the actual slot directory (a pool lease names the
         // `<worker>-s<n>` slot); the root key "." maps back to "." on the Node.
         let node_name = lease.worktree_name.clone().unwrap_or_else(|| ".".into());
-        let returned = crate::http::call_node(
+        // D-057 §7.5: the worktree return on retire carries the caller's
+        // initiator; its admission is in this call.
+        let returned = crate::node_ops::call_admitted(
             &state,
             worker.host_id.as_id().as_str(),
             "worktree.return",
+            Some(worker.name.clone()),
+            format!("wtr_{}", uuid::Uuid::now_v7()),
             json!({
                 "hostId": worker.host_id.as_id(),
                 "workspaceId": worker.workspace_id.as_id(),
                 "name": node_name,
                 "taskId": task_id,
             }),
+            crate::http::WORKTREE_RPC_TIMEOUT,
+            &crate::node_ops::NodeOpAuth {
+                initiator: retire_initiator.clone(),
+                device_id: retire_device_id.clone(),
+            },
         )
         .await?;
         // The lease row is released/parked on the store side too.
@@ -1428,15 +1454,23 @@ pub(crate) async fn retire_core(
             "leaseRefcount": row.as_ref().map(|r| r.refcount).unwrap_or(0),
         })
     } else {
-        let removed = crate::http::call_node(
+        // D-057 §7.5: worker.remove on retire carries the caller's initiator.
+        let removed = crate::node_ops::call_admitted(
             &state,
             worker.host_id.as_id().as_str(),
             "worker.remove",
+            Some(worker.name.clone()),
+            format!("wrm_{}", uuid::Uuid::now_v7()),
             json!({
                 "name": worker.name,
                 "workspaceId": worker.workspace_id.as_id(),
                 "instanceId": worker.instance_id.as_ref().map(|id| id.as_id()),
             }),
+            crate::http::WORKTREE_RPC_TIMEOUT,
+            &crate::node_ops::NodeOpAuth {
+                initiator: retire_initiator.clone(),
+                device_id: retire_device_id.clone(),
+            },
         )
         .await?;
         if let Some(bytes) = removed.get("reclaimedBytes").and_then(Value::as_u64) {
@@ -1447,11 +1481,18 @@ pub(crate) async fn retire_core(
 
     let updated = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
-            row.state = WorkerState::Retired;
-            row.reclaimed_bytes = reclaimed;
-            Ok(())
-        })
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            move |row| {
+                row.state = WorkerState::Retired;
+                row.reclaimed_bytes = reclaimed;
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority {
+                initiator: retire_initiator,
+                device_id: retire_device_id,
+            },
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1485,6 +1526,7 @@ async fn set_worker_state(
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
     let next = WorkerState::from_update(&body.state, body.sha.as_deref(), body.reason.as_deref())
         .map_err(HubError::BadRequest)?;
@@ -1494,10 +1536,14 @@ async fn set_worker_state(
     }
     let updated = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
-            row.state = next;
-            Ok(())
-        })
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            move |row| {
+                row.state = next;
+                Ok(())
+            },
+            authority,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1548,8 +1594,8 @@ async fn send_worker_brief(
             "instance.send".into(),
             payload,
             None,
-            brief_initiator,
-            brief_device_id,
+            brief_initiator.clone(),
+            brief_device_id.clone(),
         )
         .await
         .map_err(map_store)?;
@@ -1561,13 +1607,20 @@ async fn send_worker_brief(
     let command = crate::http::forward_if_online(&state, command, live).await?;
     let updated = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), {
-            let object_id = object_id.clone();
-            move |row| {
-                row.brief_object_id = Some(object_id);
-                Ok(())
-            }
-        })
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            {
+                let object_id = object_id.clone();
+                move |row| {
+                    row.brief_object_id = Some(object_id);
+                    Ok(())
+                }
+            },
+            crate::agent_scope::CallerAuthority {
+                initiator: brief_initiator,
+                device_id: brief_device_id,
+            },
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1660,8 +1713,11 @@ impl Store {
         &self,
         worker: WorkerRoster,
         created_by: String,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<WorkerRoster, StoreError> {
         self.run_named("insert_worker", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
             let id = worker.meta.id.as_id().to_string();
             let now = crate::config::now_rfc3339();
             let doc = serde_json::to_string(&worker)?;
@@ -1767,11 +1823,14 @@ impl Store {
         &self,
         id: String,
         mutate: F,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Option<WorkerRoster>, StoreError>
     where
         F: FnOnce(&mut WorkerRoster) -> Result<(), StoreError> + Send + 'static,
     {
         self.run_named("mutate_worker", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
             let Some(mut worker) = load_worker(conn, &id)? else {
                 return Ok(None);
             };

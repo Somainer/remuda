@@ -294,7 +294,7 @@ pub(crate) struct ReturnWorktreeBody {
     task_id: String,
 }
 
-const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `GET /healthz`
 ///
@@ -3365,9 +3365,10 @@ pub async fn lease_worktree(
     Json(body): Json<LeaseWorktreeBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = require_device(&state.store, &headers).await?;
     validate_worktree_key(&path.name)?;
     let host = pick_worktree_host(&state, body.host_id.as_deref()).await?;
+    let auth = crate::node_ops::NodeOpAuth::for_device(&state, &device).await?;
     let outcome = lease_on_host(
         &state,
         &host.host_id,
@@ -3375,6 +3376,7 @@ pub async fn lease_worktree(
         &path.name,
         body.base.as_deref(),
         &body.task_id,
+        &auth,
     )
     .await?;
     Ok(Json(outcome.result))
@@ -3402,6 +3404,7 @@ pub(crate) async fn lease_on_host(
     path_name: &str,
     base: Option<&str>,
     task_id: &str,
+    auth: &crate::node_ops::NodeOpAuth,
 ) -> Result<LeaseOutcome, HubError> {
     validate_worktree_key(path_name)?;
     let task = parse_task_id(task_id)?;
@@ -3417,7 +3420,17 @@ pub(crate) async fn lease_on_host(
     if let Some(base) = base.map(str::trim).filter(|raw| !raw.is_empty()) {
         params["base"] = json!(base);
     }
-    let result = call_node(state, host_id, "worktree.lease", params).await?;
+    let result = crate::node_ops::call_admitted(
+        state,
+        host_id,
+        "worktree.lease",
+        Some(path_name.to_owned()),
+        format!("wtl_{}", uuid::Uuid::now_v7()),
+        params,
+        WORKTREE_RPC_TIMEOUT,
+        auth,
+    )
+    .await?;
     // The pool is full and no clean slot exists: the Node refuses explicitly
     // instead of rerouting, and the Hub projects the 429 vocabulary (D-035).
     if result.get("deferred").and_then(Value::as_bool) == Some(true) {
@@ -3515,19 +3528,30 @@ pub async fn return_worktree(
     Json(body): Json<ReturnWorktreeBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = require_device(&state.store, &headers).await?;
     validate_worktree_key(&path.name)?;
     let task = parse_task_id(&body.task_id)?;
     let host = pick_worktree_host(&state, body.host_id.as_deref()).await?;
     let node_name = node_worktree_name(&path.name);
     let workspace_id = body.workspace_id.unwrap_or_default();
+    let auth = crate::node_ops::NodeOpAuth::for_device(&state, &device).await?;
     let params = json!({
         "hostId": host.host_id,
         "workspaceId": workspace_id,
         "name": node_name,
         "taskId": task.as_id().as_str(),
     });
-    let result = call_node(&state, &host.host_id, "worktree.return", params).await?;
+    let result = crate::node_ops::call_admitted(
+        &state,
+        &host.host_id,
+        "worktree.return",
+        Some(node_name.to_owned()),
+        format!("wtr_{}", uuid::Uuid::now_v7()),
+        params,
+        WORKTREE_RPC_TIMEOUT,
+        &auth,
+    )
+    .await?;
     let dir_key = result
         .get("dirKey")
         .and_then(Value::as_str)

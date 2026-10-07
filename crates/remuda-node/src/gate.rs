@@ -1815,6 +1815,7 @@ mod tests {
 
     fn params(fixture: &Fixture, mode: &str) -> GateRunParams {
         GateRunParams {
+            initiator: None,
             job_id: "gjb_test".into(),
             lane_id: "lane1".into(),
             repo_path: fixture.lane.to_string_lossy().into_owned(),
@@ -2459,6 +2460,7 @@ JSON
     /// tests fill the pieces they exercise.
     fn bare_run_params() -> GateRunParams {
         GateRunParams {
+            initiator: None,
             job_id: "gjb_env".into(),
             lane_id: "lane1".into(),
             repo_path: "/tmp/lane".into(),

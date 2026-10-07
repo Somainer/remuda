@@ -32,11 +32,17 @@ pub use interactions::delegated_decisions_test_support;
 /// Test-only seam for the D-057 continuation-resume race.
 #[doc(hidden)]
 pub use store::lineage_test_support;
+/// Test support for the D-057 commit-time initiator authority.
+#[doc(hidden)]
+pub mod agent_scope_test_support {
+    pub use crate::agent_scope::CallerAuthority;
+}
 mod inventory;
 mod maintenance;
 mod model_catalog;
 /// Built-in model catalog revision (tests compare the served catalog against it).
 pub use model_catalog::CATALOG_REVISION;
+mod node_ops;
 mod objects;
 mod passkeys;
 mod placement;
@@ -139,6 +145,9 @@ pub mod store_test_support {
     use std::collections::BTreeSet;
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
+
+    /// D-057 §7.3 commit-time check error (the initiator suite matches on it).
+    pub use crate::store::StoreError;
 
     /// D-057 continuation-resume inputs/outcomes for the race suite.
     pub use crate::store::{ContinuationResumeRequest, ContinuationResumeResult};
@@ -529,6 +538,42 @@ impl RunningHub {
         crate::gatequeue::reconcile(&self.state).await;
     }
 
+    /// Test-only: claim a queued gate job the way the scheduler tick would,
+    /// without needing a registered lane Node. Returns the claimed job.
+    #[doc(hidden)]
+    pub async fn test_claim_gate_job(
+        &self,
+        job_id: &str,
+        lane_id: &str,
+        host_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let host: remuda_protocol::HostId = host_id
+            .parse()
+            .map_err(|err: remuda_protocol::WireValueError| anyhow::anyhow!("{err}"))?;
+        let job = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .claim_gate_job(job_id, lane_id.to_owned(), host)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(job.map(|job| serde_json::to_value(job).expect("gate job serializes")))
+    }
+
+    /// Test-only: the current stored gate job doc.
+    #[doc(hidden)]
+    pub async fn test_get_gate_job(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let job = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .get_gate_job(job_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(job.map(|job| serde_json::to_value(job).expect("gate job serializes")))
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into
@@ -569,12 +614,16 @@ impl RunningHub {
         let stamp = remuda_protocol::Timestamp::try_from(rfc3339.to_string())
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         store
-            .mutate_worker(worker_id.to_string(), move |row| {
-                if let Some(watch) = row.watch.as_mut() {
-                    watch.last_activity_at = Some(stamp);
-                }
-                Ok(())
-            })
+            .mutate_worker(
+                worker_id.to_string(),
+                move |row| {
+                    if let Some(watch) = row.watch.as_mut() {
+                        watch.last_activity_at = Some(stamp);
+                    }
+                    Ok(())
+                },
+                crate::agent_scope::CallerAuthority::internal(),
+            )
             .await
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         Ok(())

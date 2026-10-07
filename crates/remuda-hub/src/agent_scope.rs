@@ -90,6 +90,39 @@ pub async fn initiator_and_device(
     }
 }
 
+/// Owned authority pair handed to a store writer job. `None` pair for
+/// Human/Bot requests and Hub-internal cleanup; Hub-internal successor work
+/// carries an initiator with no device id.
+#[derive(Clone, Debug, Default)]
+pub struct CallerAuthority {
+    /// Hub-stamped initiator, when the caller is an Agent.
+    pub initiator: Option<Initiator>,
+    /// Authenticating device id; absent for Human/Bot and successor work.
+    pub device_id: Option<String>,
+}
+
+impl CallerAuthority {
+    /// Resolve the authority from an authenticated device.
+    pub async fn for_device(state: &AppState, device: &Device) -> Result<Self, HubError> {
+        let (initiator, device_id) = initiator_and_device(state, device).await?;
+        Ok(Self {
+            initiator,
+            device_id,
+        })
+    }
+
+    /// Hub-internal work: no initiator, never fenced.
+    #[must_use]
+    pub fn internal() -> Self {
+        Self::default()
+    }
+
+    /// References for the in-job `check_initiator`.
+    pub(crate) fn as_check(&self) -> (Option<&Initiator>, Option<&str>) {
+        (self.initiator.as_ref(), self.device_id.as_deref())
+    }
+}
+
 pub fn stamp(payload: &mut Value, device: &Device) {
     payload["origin"] = json!(origin(device));
     if let Some(input) = payload.get_mut("input").and_then(Value::as_object_mut) {
@@ -714,6 +747,42 @@ fn is_node_host_file_stage(path: &str) -> bool {
     )
 }
 
+/// `POST/GET /v1/workers/{id}/<verb>` intervention routes a coordinator
+/// chapter may reach (D-057 §2 decision 2: worker routes are Agent-reachable).
+/// Handlers still require the `dispatch` grant, prove lineage ownership of
+/// the worker, and run the commit-time authority check — admitting the path
+/// only removes the pre-handler middleware wall.
+fn worker_route_target(path: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "/retire",
+        "/state",
+        "/brief",
+        "/hostcap",
+        "/observe",
+        "/nudge",
+        "/answer",
+        "/switch-model",
+        "/resume",
+        "/replace",
+        "/stop",
+    ];
+    match path.strip_prefix("/v1/workers/") {
+        Some(rest) => match rest.split_once('/') {
+            Some((_id, suffix)) => SUFFIXES.contains(&suffix),
+            None => false,
+        },
+        None => false,
+    }
+}
+
+/// Whether a path is a GET-reachable worker route: the collection, a single
+/// worker detail, or one of the intervention sub-routes.
+fn worker_read_target(path: &str) -> bool {
+    path == "/v1/workers"
+        || matches!(path.strip_prefix("/v1/workers/"), Some(rest) if !rest.contains('/'))
+        || worker_route_target(path)
+}
+
 /// Scoped credentials cannot mint operator credentials, answer their own
 /// approvals, mutate host/worktree administration, or use the raw tty socket.
 pub async fn restrict_agent_routes(
@@ -770,6 +839,12 @@ pub async fn restrict_agent_routes(
                     // and the feature switch; admitting the path loosens
                     // nothing by itself.
                     || path == "/v1/interactions"
+                    // D-057 §2 decision 2: Agent callers reach the worker
+                    // routes (list/detail/hostcap/observe); every handler
+                    // still re-checks the `dispatch` grant and lineage
+                    // ownership of the addressed worker.
+                    || path == "/v1/workers"
+                    || worker_read_target(path)
                     || match lineage_read_target(path) {
                         Some(id) => agent_owns_lineage(&state, &device, id).await?,
                         None => false,
@@ -792,6 +867,10 @@ pub async fn restrict_agent_routes(
                     // implicitly. The handler owns the authorization decision.
                     || (path.starts_with("/v1/interactions/") && path.ends_with("/answer"))
                     || (path.starts_with("/v1/projects/") && path.ends_with("/members"))
+                    // D-057 §2 decision 2: worker dispatch + intervention
+                    // verbs are Agent-admitted write routes.
+                    || path == "/v1/workers/dispatch"
+                    || worker_route_target(path)
                     // Batch 6 gate-queue enqueue/cancel POSTs.
                     || project_write_target(path)
                     || task_write_target(request.method(), path))

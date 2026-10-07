@@ -474,6 +474,10 @@ pub struct GateRunParams {
     /// Test seam: override the merge binary (defaults to the Node's own exe).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+    /// D-057 §7.5: Hub-stamped initiator carried on Agent-enqueued gate runs;
+    /// the opId is the `jobId`. Absent for Human/Bot jobs and older Hubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<crate::Initiator>,
 }
 
 fn default_base_branch() -> String {

@@ -5385,6 +5385,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "initiator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Initiator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "D-057 §7.5: Hub-stamped initiator carried on Agent-enqueued gate runs;\nthe opId is the `jobId`. Absent for Human/Bot jobs and older Hubs."
+        },
         "jobId": {
           "description": "Hub job id (`gjb_…`); key for cancel and for streamed events.",
           "type": "string"

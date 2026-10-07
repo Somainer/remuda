@@ -355,6 +355,7 @@ async fn create_task(
 ) -> Result<Json<Value>, HubError> {
     let device = require_dispatch(&state, &headers).await?;
     let (_, scope) = require_project_scope(&state, &headers).await?;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     if !scope.allows_project(body.project_id.as_id().as_str()) {
         return Err(HubError::Forbidden);
     }
@@ -386,6 +387,7 @@ async fn create_task(
                 Ok(task)
             },
             device.id.clone(),
+            authority.clone(),
         )
         .await
         .map_err(map_store)?;
@@ -394,14 +396,18 @@ async fn create_task(
     // silently creates the task on another directory: the half-written row is
     // rolled back and the refusal is returned (D-035).
     let sharing = if let Some(request) = binding_request.as_ref() {
-        match bind_task_directory(&state, &body.project_id, &task, request).await {
+        match bind_task_directory(&state, &body.project_id, &task, request, &authority).await {
             Ok((binding, sharing)) => {
                 let updated = state
                     .store
-                    .mutate_task(task.meta.id.as_id().to_string(), move |task, _conn| {
-                        task.workspace_binding = Some(binding);
-                        Ok(())
-                    })
+                    .mutate_task(
+                        task.meta.id.as_id().to_string(),
+                        move |task, _conn| {
+                            task.workspace_binding = Some(binding);
+                            Ok(())
+                        },
+                        authority.clone(),
+                    )
                     .await
                     .map_err(map_store)?
                     .unwrap_or(task.clone());
@@ -464,6 +470,7 @@ async fn bind_task_directory(
     project_id: &remuda_protocol::ProjectId,
     task: &Task,
     request: &BindingBody,
+    authority: &crate::agent_scope::CallerAuthority,
 ) -> Result<(TaskSpaceBinding, Value), HubError> {
     let mode = match request.mode.as_str() {
         "reuse" => TaskBindingMode::Reuse,
@@ -570,6 +577,10 @@ async fn bind_task_directory(
         path_name,
         base,
         task.meta.id.as_id().as_str(),
+        &crate::node_ops::NodeOpAuth {
+            initiator: authority.initiator.clone(),
+            device_id: authority.device_id.clone(),
+        },
     )
     .await
     .map_err(crate::http::lease_refusal)?;
@@ -697,29 +708,34 @@ async fn set_task_state(
 ) -> Result<Json<Value>, HubError> {
     let device = require_dispatch(&state, &headers).await?;
     let (_, scope) = require_project_scope(&state, &headers).await?;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let target = parse_state(&body.state)?;
     let reason = body.reason.clone();
     let updated = state
         .store
-        .mutate_task(id.clone(), move |task, conn| {
-            if !scope.allows_project(task.project_id.as_id().as_str()) {
-                return Err(StoreError::Forbidden("project outside scope".into()));
-            }
-            if !task.state.can_transition_to(target) {
-                return Err(StoreError::Conflict(format!(
-                    "illegal task transition {:?} → {:?}",
-                    task.state, target
-                )));
-            }
-            task.state = target;
-            if matches!(target, TaskState::Failed) {
-                task.blocked_reason = reason.clone();
-            }
-            if target.is_terminal() {
-                release_all_claims(conn, &task.meta.id.as_id().to_string())?;
-            }
-            Ok(())
-        })
+        .mutate_task(
+            id.clone(),
+            move |task, conn| {
+                if !scope.allows_project(task.project_id.as_id().as_str()) {
+                    return Err(StoreError::Forbidden("project outside scope".into()));
+                }
+                if !task.state.can_transition_to(target) {
+                    return Err(StoreError::Conflict(format!(
+                        "illegal task transition {:?} → {:?}",
+                        task.state, target
+                    )));
+                }
+                task.state = target;
+                if matches!(target, TaskState::Failed) {
+                    task.blocked_reason = reason.clone();
+                }
+                if target.is_terminal() {
+                    release_all_claims(conn, &task.meta.id.as_id().to_string())?;
+                }
+                Ok(())
+            },
+            authority,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -749,19 +765,24 @@ async fn archive_task(
 ) -> Result<Json<Value>, HubError> {
     let device = require_dispatch(&state, &headers).await?;
     let (_, scope) = require_project_scope(&state, &headers).await?;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let archived_at = now_timestamp()?;
     let updated = state
         .store
-        .mutate_task(id.clone(), move |task, _conn| {
-            if !scope.allows_project(task.project_id.as_id().as_str()) {
-                return Err(StoreError::Forbidden("project outside scope".into()));
-            }
-            if task.archived_at.is_some() {
-                return Err(StoreError::Conflict("task is already archived".into()));
-            }
-            task.archived_at = Some(archived_at.clone());
-            Ok(())
-        })
+        .mutate_task(
+            id.clone(),
+            move |task, _conn| {
+                if !scope.allows_project(task.project_id.as_id().as_str()) {
+                    return Err(StoreError::Forbidden("project outside scope".into()));
+                }
+                if task.archived_at.is_some() {
+                    return Err(StoreError::Conflict("task is already archived".into()));
+                }
+                task.archived_at = Some(archived_at.clone());
+                Ok(())
+            },
+            authority,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -787,6 +808,7 @@ async fn split_task(
 ) -> Result<Json<Value>, HubError> {
     let device = require_dispatch(&state, &headers).await?;
     let (_, scope) = require_project_scope(&state, &headers).await?;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     if body.title.trim().is_empty() || body.intent.trim().is_empty() {
         return Err(HubError::BadRequest("title and intent are required".into()));
     }
@@ -825,6 +847,7 @@ async fn split_task(
                 Ok(child)
             },
             device.id.clone(),
+            authority,
         )
         .await
         .map_err(map_store)?
@@ -854,6 +877,7 @@ async fn land_task(
 ) -> Result<Json<Value>, HubError> {
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Land).await?;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let sha = body.sha.trim().to_string();
     if !(7..=40).contains(&sha.len()) || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(HubError::BadRequest(
@@ -862,19 +886,23 @@ async fn land_task(
     }
     let updated = state
         .store
-        .mutate_task(id.clone(), move |task, conn| {
-            if !matches!(task.state, TaskState::Running | TaskState::Done) {
-                return Err(StoreError::Conflict(format!(
-                    "can only land a running/done task (state {:?})",
-                    task.state
-                )));
-            }
-            task.landed_sha = Some(sha.clone());
-            task.state = TaskState::Done;
-            task.blocked_reason = None;
-            release_all_claims(conn, &task.meta.id.as_id().to_string())?;
-            Ok(())
-        })
+        .mutate_task(
+            id.clone(),
+            move |task, conn| {
+                if !matches!(task.state, TaskState::Running | TaskState::Done) {
+                    return Err(StoreError::Conflict(format!(
+                        "can only land a running/done task (state {:?})",
+                        task.state
+                    )));
+                }
+                task.landed_sha = Some(sha.clone());
+                task.state = TaskState::Done;
+                task.blocked_reason = None;
+                release_all_claims(conn, &task.meta.id.as_id().to_string())?;
+                Ok(())
+            },
+            authority,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -901,6 +929,7 @@ async fn claim_own(
     Json(body): Json<ClaimBody>,
 ) -> Result<Json<Value>, HubError> {
     let device = require_dispatch(&state, &headers).await?;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let patterns = normalize_globs(body.paths.clone());
     if patterns.is_empty() {
         return Err(HubError::BadRequest(
@@ -911,58 +940,63 @@ async fn claim_own(
     let audit_paths = patterns.clone();
     let updated = state
         .store
-        .mutate_task(id.clone(), move |task, conn| {
-            if task.state.is_terminal() {
-                return Err(StoreError::Conflict(
-                    "terminal tasks cannot claim paths".into(),
-                ));
-            }
-            // Other active tasks' claims (rows are released on terminal state).
-            let held: Vec<(String, String)> = {
-                let mut stmt =
-                    conn.prepare("SELECT pattern, task_id FROM task_paths WHERE task_id != ?1")?;
-                let rows = stmt.query_map(params![task.meta.id.as_id().to_string()], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            let mut conflicts = Vec::new();
-            for new in &patterns {
-                for (held_pattern, holder) in &held {
-                    if remuda_protocol::patterns_conflict(new, held_pattern) {
-                        conflicts.push(json!({
-                            "path": new,
-                            "heldBy": holder,
-                            "heldPattern": held_pattern,
-                        }));
+        .mutate_task(
+            id.clone(),
+            move |task, conn| {
+                if task.state.is_terminal() {
+                    return Err(StoreError::Conflict(
+                        "terminal tasks cannot claim paths".into(),
+                    ));
+                }
+                // Other active tasks' claims (rows are released on terminal state).
+                let held: Vec<(String, String)> = {
+                    let mut stmt = conn
+                        .prepare("SELECT pattern, task_id FROM task_paths WHERE task_id != ?1")?;
+                    let rows = stmt
+                        .query_map(params![task.meta.id.as_id().to_string()], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                let mut conflicts = Vec::new();
+                for new in &patterns {
+                    for (held_pattern, holder) in &held {
+                        if remuda_protocol::patterns_conflict(new, held_pattern) {
+                            conflicts.push(json!({
+                                "path": new,
+                                "heldBy": holder,
+                                "heldPattern": held_pattern,
+                            }));
+                        }
                     }
                 }
-            }
-            if !conflicts.is_empty() {
-                return Err(StoreError::Conflict(format!(
-                    "ownership claim conflicts: {}",
-                    conflicts
-                        .iter()
-                        .map(|value| value["heldPattern"].as_str().unwrap_or("?"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
-            let now = crate::config::now_rfc3339();
-            for pattern in &patterns {
-                conn.execute(
-                    "INSERT INTO task_paths (task_id, pattern, claimed_by, claimed_at)
+                if !conflicts.is_empty() {
+                    return Err(StoreError::Conflict(format!(
+                        "ownership claim conflicts: {}",
+                        conflicts
+                            .iter()
+                            .map(|value| value["heldPattern"].as_str().unwrap_or("?"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                let now = crate::config::now_rfc3339();
+                for pattern in &patterns {
+                    conn.execute(
+                        "INSERT INTO task_paths (task_id, pattern, claimed_by, claimed_at)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT (task_id, pattern) DO UPDATE SET claimed_by = ?3, claimed_at = ?4",
-                    params![task.meta.id.as_id().to_string(), pattern, device_id, now],
-                )?;
-                if !task.owns.iter().any(|owned| owned == pattern) {
-                    task.owns.push(pattern.clone());
+                        params![task.meta.id.as_id().to_string(), pattern, device_id, now],
+                    )?;
+                    if !task.owns.iter().any(|owned| owned == pattern) {
+                        task.owns.push(pattern.clone());
+                    }
                 }
-            }
-            task.owns = normalize_globs(std::mem::take(&mut task.owns));
-            Ok(())
-        })
+                task.owns = normalize_globs(std::mem::take(&mut task.owns));
+                Ok(())
+            },
+            authority,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -989,25 +1023,30 @@ async fn release_own(
     Json(body): Json<ClaimBody>,
 ) -> Result<Json<Value>, HubError> {
     let device = require_dispatch(&state, &headers).await?;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let patterns = normalize_globs(body.paths.clone());
     let audit_paths = patterns.clone();
     let updated = state
         .store
-        .mutate_task(id.clone(), move |task, conn| {
-            if patterns.is_empty() {
-                release_all_claims(conn, &task.meta.id.as_id().to_string())?;
-                task.owns.clear();
-            } else {
-                for pattern in &patterns {
-                    conn.execute(
-                        "DELETE FROM task_paths WHERE task_id = ?1 AND pattern = ?2",
-                        params![task.meta.id.as_id().to_string(), pattern],
-                    )?;
+        .mutate_task(
+            id.clone(),
+            move |task, conn| {
+                if patterns.is_empty() {
+                    release_all_claims(conn, &task.meta.id.as_id().to_string())?;
+                    task.owns.clear();
+                } else {
+                    for pattern in &patterns {
+                        conn.execute(
+                            "DELETE FROM task_paths WHERE task_id = ?1 AND pattern = ?2",
+                            params![task.meta.id.as_id().to_string(), pattern],
+                        )?;
+                    }
+                    task.owns.retain(|owned| !patterns.contains(owned));
                 }
-                task.owns.retain(|owned| !patterns.contains(owned));
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+            authority,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1115,6 +1154,7 @@ async fn add_placement(
 ) -> Result<Json<Value>, HubError> {
     let device = require_dispatch(&state, &headers).await?;
     let (_, scope) = require_project_scope(&state, &headers).await?;
+    let authority = crate::agent_scope::CallerAuthority::for_device(&state, &device).await?;
     let kind = body.kind.clone();
     let target_state = match body.kind.as_str() {
         remuda_protocol::PLACEMENT_KIND_DISPATCH => Some(TaskState::Placed),
@@ -1179,6 +1219,7 @@ async fn add_placement(
                 Ok(())
             },
             device.id.clone(),
+            authority,
         )
         .await
         .map_err(map_store)?
@@ -1355,6 +1396,7 @@ impl Store {
         project_id: remuda_protocol::ProjectId,
         build: F,
         created_by: String,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Task, StoreError>
     where
         F: FnOnce(&remuda_protocol::ProjectId, &mut Connection) -> Result<Task, StoreError>
@@ -1362,6 +1404,8 @@ impl Store {
             + 'static,
     {
         self.run_named("create_task", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
             let task = build(&project_id, conn)?;
             insert_task_row(conn, &task, &created_by)?;
             Ok(task)
@@ -1375,11 +1419,14 @@ impl Store {
         parent_id: String,
         build: F,
         created_by: String,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Option<Task>, StoreError>
     where
         F: FnOnce(&Task, &mut Connection) -> Result<Task, StoreError> + Send + 'static,
     {
         self.run_named("split_task", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
             let Some(parent) = load_task(conn, &parent_id)? else {
                 return Ok(None);
             };
@@ -1399,11 +1446,14 @@ impl Store {
         &self,
         task_id: String,
         mutate: F,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Option<Task>, StoreError>
     where
         F: FnOnce(&mut Task, &mut Connection) -> Result<(), StoreError> + Send + 'static,
     {
         self.run_named("mutate_task", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
             let Some(mut task) = load_task(conn, &task_id)? else {
                 return Ok(None);
             };
@@ -1423,6 +1473,7 @@ impl Store {
         body: PlacementBody,
         apply: F,
         created_by: String,
+        authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Option<(PlacementLedgerRow, Task)>, StoreError>
     where
         F: FnOnce(&mut Task, &mut Connection, &PlacementLedgerRow) -> Result<(), StoreError>
@@ -1430,6 +1481,8 @@ impl Store {
             + 'static,
     {
         self.run_named("append_placement", move |conn| {
+            let (initiator, device_id) = authority.as_check();
+            crate::store::check_initiator(conn, initiator, device_id)?;
             let Some(mut task) = load_task(conn, &task_id)? else {
                 return Ok(None);
             };

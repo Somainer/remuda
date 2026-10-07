@@ -1075,12 +1075,16 @@ async fn fail_workers_holding(
         );
         state
             .store
-            .mutate_worker(worker.meta.id.as_id().to_string(), |row| {
-                row.state = WorkerState::Blocked {
-                    reason: NODE_EPOCH_CHANGED.to_string(),
-                };
-                Ok(())
-            })
+            .mutate_worker(
+                worker.meta.id.as_id().to_string(),
+                |row| {
+                    row.state = WorkerState::Blocked {
+                        reason: NODE_EPOCH_CHANGED.to_string(),
+                    };
+                    Ok(())
+                },
+                crate::agent_scope::CallerAuthority::internal(),
+            )
             .await?;
     }
     Ok(())

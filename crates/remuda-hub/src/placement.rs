@@ -553,6 +553,10 @@ pub async fn spawn_on_host(
             host_id: host.host_id.clone(),
         });
     }
+    let spawn_authority = crate::agent_scope::CallerAuthority {
+        initiator: request.initiator.clone(),
+        device_id: request.initiator_device_id.clone(),
+    };
     let instance = state
         .store
         .insert_instance_delegated(
@@ -563,6 +567,7 @@ pub async fn spawn_on_host(
             request.title,
             request.spec.clone(),
             request.delegation,
+            spawn_authority,
         )
         .await
         .map_err(crate::http::map_store)?;

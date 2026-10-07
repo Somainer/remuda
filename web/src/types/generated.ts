@@ -1124,6 +1124,7 @@ export type GateRunParams = ({
   [key: string]: (string);
 });
   "gateTimeoutSecs": (number);
+  "initiator"?: (Initiator | (null));
   "jobId": (string);
   "keepLogs": (boolean);
   "laneId": (string);

@@ -579,22 +579,27 @@ async fn observe_one(
 
     let row = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
-            if let Some(next) = next_state {
-                row.state = next;
-            }
-            row.watch = Some(watch);
-            // A launch divergence writes the observed id; a later
-            // slash/remuda switch clears it. Both arms run only once the
-            // instance row was read this pass, so a row that could not be read
-            // leaves the recorded value untouched.
-            if model_effective.is_some() {
-                row.model_effective = model_effective;
-            } else if clear_model_effective {
-                row.model_effective = None;
-            }
-            Ok(())
-        })
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            move |row| {
+                if let Some(next) = next_state {
+                    row.state = next;
+                }
+                row.watch = Some(watch);
+                // A launch divergence writes the observed id; a later
+                // slash/remuda switch clears it. Both arms run only once the
+                // instance row was read this pass, so a row that could not be
+                // read leaves the recorded value untouched.
+                if model_effective.is_some() {
+                    row.model_effective = model_effective;
+                } else if clear_model_effective {
+                    row.model_effective = None;
+                }
+                Ok(())
+            },
+            // Observation projection: Hub-internal, no initiator.
+            crate::agent_scope::CallerAuthority::internal(),
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -808,20 +813,27 @@ async fn nudge_worker(
         &device.id,
         &text,
         "nudge.md",
-        nudge_initiator,
-        nudge_device_id,
+        nudge_initiator.clone(),
+        nudge_device_id.clone(),
     )
     .await?;
     let now = crate::config::now_rfc3339();
     let updated = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
-            row.last_nudge_at = Some(
-                remuda_protocol::Timestamp::try_from(now)
-                    .map_err(|err| StoreError::Id(err.to_string()))?,
-            );
-            Ok(())
-        })
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            move |row| {
+                row.last_nudge_at = Some(
+                    remuda_protocol::Timestamp::try_from(now)
+                        .map_err(|err| StoreError::Id(err.to_string()))?,
+                );
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority {
+                initiator: nudge_initiator,
+                device_id: nudge_device_id,
+            },
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1138,8 +1150,8 @@ async fn switch_worker_model(
             &device.id,
             "Continue where you left off.",
             "nudge.md",
-            switch_initiator,
-            switch_device_id,
+            switch_initiator.clone(),
+            switch_device_id.clone(),
         )
         .await;
     }
@@ -1162,18 +1174,28 @@ async fn switch_worker_model(
     let previous_model = worker.model.clone();
     let updated = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
-            if applied {
-                row.model = Some(recorded_model.clone());
-                if confirmed {
-                    row.last_nudge_at = Some(
-                        remuda_protocol::Timestamp::try_from(now)
-                            .map_err(|err| StoreError::Id(err.to_string()))?,
-                    );
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            move |row| {
+                if applied {
+                    row.model = Some(recorded_model.clone());
+                    if confirmed {
+                        row.last_nudge_at = Some(
+                            remuda_protocol::Timestamp::try_from(now)
+                                .map_err(|err| StoreError::Id(err.to_string()))?,
+                        );
+                    }
                 }
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+            // switch_initiator was consumed by the note delivery; the model
+            // The note delivery consumed the authority clones; the model
+            // write is the same caller's act.
+            crate::agent_scope::CallerAuthority {
+                initiator: switch_initiator,
+                device_id: switch_device_id,
+            },
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1318,8 +1340,8 @@ async fn resume_worker(
             "instance.send".into(),
             payload,
             None,
-            resume_initiator,
-            resume_device_id,
+            resume_initiator.clone(),
+            resume_device_id.clone(),
         )
         .await
         .map_err(map_store)?;
@@ -1333,27 +1355,34 @@ async fn resume_worker(
     let now = crate::config::now_rfc3339();
     let row = state
         .store
-        .mutate_worker(worker.meta.id.as_id().to_string(), {
-            let old_instance_id = old_instance_id.clone();
-            let new_instance_id = new_instance_id.clone();
-            let object_id = object_id.clone();
-            move |row| {
-                row.resumed_from = Some(old_instance_id.parse().map_err(
-                    |err: remuda_protocol::WireValueError| StoreError::Id(err.to_string()),
-                )?);
-                row.instance_id = Some(new_instance_id.parse().map_err(
-                    |err: remuda_protocol::WireValueError| StoreError::Id(err.to_string()),
-                )?);
-                row.brief_object_id = Some(object_id);
-                row.state = WorkerState::Working;
-                row.watch = None;
-                row.last_nudge_at = Some(
-                    remuda_protocol::Timestamp::try_from(now.clone())
-                        .map_err(|err| StoreError::Id(err.to_string()))?,
-                );
-                Ok(())
-            }
-        })
+        .mutate_worker(
+            worker.meta.id.as_id().to_string(),
+            {
+                let old_instance_id = old_instance_id.clone();
+                let new_instance_id = new_instance_id.clone();
+                let object_id = object_id.clone();
+                move |row| {
+                    row.resumed_from = Some(old_instance_id.parse().map_err(
+                        |err: remuda_protocol::WireValueError| StoreError::Id(err.to_string()),
+                    )?);
+                    row.instance_id = Some(new_instance_id.parse().map_err(
+                        |err: remuda_protocol::WireValueError| StoreError::Id(err.to_string()),
+                    )?);
+                    row.brief_object_id = Some(object_id);
+                    row.state = WorkerState::Working;
+                    row.watch = None;
+                    row.last_nudge_at = Some(
+                        remuda_protocol::Timestamp::try_from(now.clone())
+                            .map_err(|err| StoreError::Id(err.to_string()))?,
+                    );
+                    Ok(())
+                }
+            },
+            crate::agent_scope::CallerAuthority {
+                initiator: resume_initiator,
+                device_id: resume_device_id,
+            },
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
@@ -1625,10 +1654,14 @@ async fn replace_worker(
         .to_string();
     let updated = state
         .store
-        .mutate_worker(new_id.clone(), move |row| {
-            row.replace_count = Some(U64(previous_count + 1));
-            Ok(())
-        })
+        .mutate_worker(
+            new_id.clone(),
+            move |row| {
+                row.replace_count = Some(U64(previous_count + 1));
+                Ok(())
+            },
+            crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
+        )
         .await
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;

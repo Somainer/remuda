@@ -1065,33 +1065,20 @@ impl ShellPtyDriver {
                 pty_err(io::Error::other(format!("materialize panicked: {error}")))
             })??
         };
-        let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
-        // D-056 (r4 items 1 & 3): build the resume mode BEFORE the child
-        // spawns, against the FINAL child config dir (an extra_env
-        // CLAUDE_CONFIG_DIR override wins over the pinned native home, which
-        // wins over the ambient options.native_home) and the effective cwd
-        // (spec.cwd, else options.cwd for a target launched without a spec).
-        // A proven EOF snapshot → Boundary; a resume whose transcript is not
-        // present yet → Unverified (never the fresh byte-0/current path).
+        // D-056 (r4 items 1 & 3), r5 item 7: build the resume mode BEFORE the
+        // child spawns against the ONE config dir the child actually receives
+        // (child_env_layers), and put that same dir on the promotion ctx so the
+        // hydrator discovers transcripts in exactly the directory the child
+        // writes to. build_command reassembles the same deterministic layers.
         let launch_cwd = spec
             .as_ref()
             .map(|s| std::path::PathBuf::from(&s.cwd))
             .unwrap_or_else(|| self.options.cwd.clone());
-        let config_dir = self
-            .options
-            .extra_env
-            .iter()
-            .find(|(key, _)| key.as_str() == "CLAUDE_CONFIG_DIR")
-            .map(|(_, value)| std::path::PathBuf::from(value))
-            .or_else(|| {
-                if self.options.pin_native_home {
-                    Some(std::path::PathBuf::from(&recipe.native_home))
-                } else {
-                    None
-                }
-            })
-            .or_else(|| self.options.claude_home.clone())
-            .unwrap_or_else(|| std::path::PathBuf::from(&recipe.native_home));
+        let child_env = child_env_layers(&self.options, &recipe)?;
+        let config_dir = child_env.claude_config_dir(&self.options, &recipe);
+        let mut hook_ctx = hook_ctx;
+        hook_ctx.claude_home = config_dir.clone();
+        let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
         let pre_resume_mode: Option<crate::claude_transcript::ResumeMode> =
             match &self.options.target {
                 Target::Agent {
@@ -1220,17 +1207,21 @@ impl ShellPtyDriver {
                     .parent()
                     .map(std::path::Path::to_path_buf)
             });
-        let catalog_env: Vec<(String, String)> =
-            agent_env(&self.options.target, &recipe, self.options.pin_native_home)
-                .into_iter()
-                .chain(
-                    self.options
-                        .extra_env
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone())),
-                )
-                .filter(|(key, _)| !crate::child_env::is_denied(key))
-                .collect();
+        let catalog_env: Vec<(String, String)> = agent_env(
+            &self.options.target,
+            &recipe,
+            self.options.pin_native_home,
+            &std::collections::HashSet::new(),
+        )
+        .into_iter()
+        .chain(
+            self.options
+                .extra_env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        )
+        .filter(|(key, _)| !crate::child_env::is_denied(key))
+        .collect();
         let model_catalog = crate::model_discovery::resolve_catalog(
             Some(std::path::Path::new(&recipe.native_home)),
             host_config_dir.as_deref(),
@@ -2979,6 +2970,77 @@ fn pty_err(err: impl std::fmt::Display) -> DriverError {
     DriverError::Io(io::Error::other(err.to_string()))
 }
 
+/// Assemble the child env in its exact application order and track which keys
+/// are set. r5 item 7: the env map is built ONCE so the launch command, the
+/// pre-spawn resume-boundary snapshot and the promotion hydrator all derive the
+/// SAME `CLAUDE_CONFIG_DIR`.
+///
+/// Layers in order: base allowlist → TERM/COLORTERM → per-launch extra_env
+/// (deny-list filtered) → native-home pin / recipe allowlist (the pin never
+/// clobbers an explicit extra_env dir) → MCP env.
+fn child_env_layers(options: &ShellPtyOptions, recipe: &LaunchRecipe) -> DriverResult<ChildEnv> {
+    let mut map = std::collections::BTreeMap::new();
+    for (key, value) in crate::child_env::base_env() {
+        map.insert(key, value);
+    }
+    map.insert("TERM".to_owned(), "xterm-256color".to_owned());
+    map.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+    for (key, value) in &options.extra_env {
+        if !crate::child_env::is_denied(key) {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    let already_set: std::collections::HashSet<String> = map.keys().cloned().collect();
+    for (key, value) in agent_env(
+        &options.target,
+        recipe,
+        options.pin_native_home,
+        &already_set,
+    ) {
+        if crate::child_env::is_denied(&key) {
+            tracing::warn!(%key, "recipe env entry is on the deny list; not forwarding");
+            continue;
+        }
+        map.insert(key, value);
+    }
+    if let Some(context) = &options.agent_mcp {
+        for (key, value) in context.environment()? {
+            map.insert(key, value);
+        }
+    }
+    Ok(ChildEnv {
+        entries: map.into_iter().collect(),
+    })
+}
+
+struct ChildEnv {
+    entries: Vec<(String, String)>,
+}
+
+impl ChildEnv {
+    /// The single effective `CLAUDE_CONFIG_DIR` the child receives. Precedence
+    /// is exactly the assembled env; absent there it falls back to the
+    /// configured/ambient home. `recipe.native_home` is only in play when the
+    /// pin pushed it into the env (an unpinned launch does not redirect the
+    /// child, so defaulting to it would invent a directory the child never
+    /// uses).
+    fn claude_config_dir(&self, options: &ShellPtyOptions, _recipe: &LaunchRecipe) -> PathBuf {
+        self.entries
+            .iter()
+            .find_map(|(key, value)| {
+                (key == "CLAUDE_CONFIG_DIR" && !value.is_empty()).then(|| PathBuf::from(value))
+            })
+            .or_else(|| options.claude_home.clone())
+            .unwrap_or_else(default_claude_home)
+    }
+
+    fn apply(&self, cmd: &mut CommandBuilder) {
+        for (key, value) in &self.entries {
+            cmd.env(key, value);
+        }
+    }
+}
+
 fn build_command(
     options: &ShellPtyOptions,
     spec_cwd: &str,
@@ -3009,43 +3071,18 @@ fn build_command(
     };
     cmd.cwd(cwd);
     cmd.env_clear();
-    let base = crate::child_env::base_env();
-    for (key, value) in &base {
-        cmd.env(key, value);
-    }
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    for (key, value) in &options.extra_env {
-        if !crate::child_env::is_denied(key) {
-            cmd.env(key, value);
-        }
-    }
-    // §5.1 step 1 / §9.1: an inherited `CLAUDE_CODE_EFFORT_LEVEL` outranks the
-    // in-session `/effort` command, so a value leaking in from the operator's
-    // shell would pin the effort for the whole session and make the UI's
-    // "effective" readout a lie. `child_env` denies it, and this loop honours
-    // that; the assertion is that nothing below re-adds it.
-    for (key, value) in agent_env(&options.target, recipe, options.pin_native_home) {
-        if crate::child_env::is_denied(&key) {
-            tracing::warn!(%key, "recipe env entry is on the deny list; not forwarding");
-            continue;
-        }
-        cmd.env(key, value);
-    }
-    if let Some(context) = &options.agent_mcp {
-        for (key, value) in context.environment()? {
-            cmd.env(key, value);
-        }
-    }
+    // r5 item 7: the SAME env map the boundary snapshot and hydrator use.
+    let child_env = child_env_layers(options, recipe)?;
+    child_env.apply(&mut cmd);
     // Last, and deliberately past the allowlist: the shim PATH and the hook
     // credential are values the *driver computed*, not values it inherited
     // (D-028 §4.2). The inherit allowlist exists to keep the Node's own
     // credentials and any `LD_PRELOAD`/proxy/CA injection out of a process the
     // model can read; it is not the channel for something we minted ourselves.
     if let Some(session) = hooks {
-        let inherited = base
-            .get("PATH")
-            .cloned()
+        let inherited = crate::child_env::base_env()
+            .into_iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value))
             .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
         for (key, value) in session.child_env(&inherited) {
             cmd.env(key, value);
@@ -3071,6 +3108,11 @@ fn agent_env(
     target: &Target,
     recipe: &LaunchRecipe,
     pin_native_home: bool,
+    // Keys already set by an EARLIER env layer (base/extra_env). The native
+    // home pin must not clobber an explicit operator/Node `CLAUDE_CONFIG_DIR`
+    // (r5 item 7): the directory used for launch capture, boundary snapshot
+    // and transcript discovery has to be the one the child actually gets.
+    already_set: &std::collections::HashSet<String>,
 ) -> Vec<(String, String)> {
     if target.agent_kind().is_none() {
         return Vec::new();
@@ -3105,6 +3147,7 @@ fn agent_env(
         && target.agent_kind() == Some(AgentKind::Claude)
         && !recipe.native_home.is_empty()
         && !entries.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+        && !already_set.contains("CLAUDE_CONFIG_DIR")
     {
         entries.push(("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone()));
         // Keep the *credentials* where the operator logged in, while the
@@ -3522,6 +3565,102 @@ mod tests {
         }
     }
 
+    /// r5 item 7: launch env, boundary snapshot and hydrator derive ONE
+    /// `CLAUDE_CONFIG_DIR` from the env the child actually receives, for both
+    /// pin values.
+    #[test]
+    fn child_env_derives_one_config_dir_for_pinned_and_unpinned_launches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native_home = tmp.path().join("native-home");
+        let custom = tmp.path().join("custom");
+        let recipe = LaunchRecipe {
+            native_home: native_home.to_string_lossy().into_owned(),
+            ..shell_recipe(
+                &ShellPtyOptions::login(tmp.path().to_path_buf()),
+                &tmp.path().to_string_lossy(),
+            )
+            .expect("recipe")
+        };
+        let claude_target = Target::Agent {
+            kind: AgentKind::Claude,
+            resume: None,
+        };
+        let value_of = |entries: &[(String, String)], key: &str| {
+            entries
+                .iter()
+                .find_map(|(name, value)| (name == key).then(|| value.clone()))
+        };
+
+        // pin=true, no explicit override: the child receives native_home.
+        let pinned = ShellPtyOptions {
+            target: claude_target.clone(),
+            pin_native_home: true,
+            ..ShellPtyOptions::login(tmp.path().to_path_buf())
+        };
+        let env = child_env_layers(&pinned, &recipe).expect("env");
+        assert_eq!(env.claude_config_dir(&pinned, &recipe), native_home);
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_CONFIG_DIR"),
+            Some(native_home.to_string_lossy().into_owned())
+        );
+
+        // pin=true WITH an explicit extra_env dir: it wins; the native home
+        // pin must not clobber it (the r5 high-severity defect).
+        let mut pinned_custom = pinned.clone();
+        pinned_custom.extra_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            custom.to_string_lossy().into_owned(),
+        );
+        let env = child_env_layers(&pinned_custom, &recipe).expect("env");
+        assert_eq!(env.claude_config_dir(&pinned_custom, &recipe), custom);
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_CONFIG_DIR"),
+            Some(custom.to_string_lossy().into_owned())
+        );
+        assert!(
+            env.entries
+                .iter()
+                .filter(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                .count()
+                == 1,
+            "the dir appears exactly once"
+        );
+
+        // pin=false + explicit override: the custom dir survives (no pin is
+        // added).
+        let mut unpinned_custom = ShellPtyOptions {
+            target: claude_target.clone(),
+            pin_native_home: false,
+            ..ShellPtyOptions::login(tmp.path().to_path_buf())
+        };
+        unpinned_custom.extra_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            custom.to_string_lossy().into_owned(),
+        );
+        let env = child_env_layers(&unpinned_custom, &recipe).expect("env");
+        assert_eq!(env.claude_config_dir(&unpinned_custom, &recipe), custom);
+
+        // pin=false and no override: options.claude_home (here unset) falls
+        // back to the ambient default — never the native_home.
+        let unpinned = ShellPtyOptions {
+            target: claude_target,
+            pin_native_home: false,
+            ..ShellPtyOptions::login(tmp.path().to_path_buf())
+        };
+        let env = child_env_layers(&unpinned, &recipe).expect("env");
+        assert!(
+            value_of(&env.entries, "CLAUDE_CONFIG_DIR").is_none(),
+            "an unpinned launch invents no config-dir env"
+        );
+        assert_eq!(
+            env.claude_config_dir(&unpinned, &recipe),
+            unpinned
+                .claude_home
+                .clone()
+                .unwrap_or_else(default_claude_home)
+        );
+    }
+
     /// c-wfdrill2 C. `promote_ctx` minted `InstanceId::new()`, so every id the
     /// driver derived — hook tool nodes through `remuda_signal`, the
     /// transcript replay's `TranscriptMapper` — was scoped to an id nothing
@@ -3740,7 +3879,12 @@ mod tests {
             }
             // The native home pin travels through the recipe env applied to
             // the child command, not via inherited ambient env.
-            let pinned = agent_env(&options.target, &recipe, options.pin_native_home);
+            let pinned = agent_env(
+                &options.target,
+                &recipe,
+                options.pin_native_home,
+                &std::collections::HashSet::new(),
+            );
             let pinned_home = native_home.to_string_lossy().into_owned();
             assert!(
                 pinned
@@ -3785,7 +3929,12 @@ mod tests {
             &interrupt_pid,
         )
         .unwrap();
-        let unpinned = agent_env(&unpinned_options.target, &recipe, false);
+        let unpinned = agent_env(
+            &unpinned_options.target,
+            &recipe,
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert!(
             !unpinned.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR"),
             "an unpinned launch must not invent a config-dir env"

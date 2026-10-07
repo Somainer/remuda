@@ -1094,3 +1094,125 @@ async fn api_via_without_a_gateway_profile_is_refused() -> Result<()> {
     );
     Ok(())
 }
+
+/// A 429 SUPPLY_DEFERRED merges the full supply decision into the HTTP body.
+/// `remuda dispatch` must surface the per-candidate `rejected[].reasons`
+/// (plus ranked/deferredUntil/retryable), not just the top-level headline —
+/// the generic HTTP renderer prints every body field beyond error/code.
+#[test]
+fn dispatch_supply_deferred_429_prints_the_rejected_candidates() -> Result<()> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let len: usize = std::str::from_utf8(&buf[..idx])
+                        .unwrap_or("")
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= idx + 4 + len {
+                        break;
+                    }
+                }
+            }
+            // The exact shape supply::solve_state merges into the 429 body.
+            let body = serde_json::json!({
+                "error": "supply deferred",
+                "code": "SUPPLY_DEFERRED",
+                "deferred": true,
+                "retryable": true,
+                "deferredUntil": "2026-10-08T12:00:00Z",
+                "ranked": [],
+                "rejected": [{
+                    "profileId": "pvp_gw",
+                    "modelId": "claude-model-1",
+                    "hostId": "hst_cap",
+                    "reasons": [
+                        "window reset at 2026-10-08T12:00:00Z",
+                        "host hst_cap is at max concurrency"
+                    ]
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let dir = tempfile::tempdir()?;
+    let brief = dir.path().join("brief.md");
+    std::fs::write(&brief, "Do the trivial task.\nReply: DONE or BLOCKED.\n")?;
+
+    let output = std::process::Command::new(bin())
+        .args([
+            "dispatch",
+            "--project",
+            "prj_defer",
+            "--brief",
+            brief.to_str().unwrap(),
+            "--force-lint",
+            "--hub",
+            &format!("http://{addr}"),
+            "--token",
+            "device-token",
+        ])
+        .env_remove("REMUDA_BOOTSTRAP_TOKEN")
+        .env_remove("REMUDA_DATA_DIR")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("429"), "{stderr}");
+    assert!(stderr.contains("supply deferred"), "{stderr}");
+    // The actionable per-candidate detail must survive rendering.
+    assert!(
+        stderr.contains("window reset at 2026-10-08T12:00:00Z"),
+        "rejected candidate reasons must be shown: {stderr}"
+    );
+    assert!(
+        stderr.contains("host hst_cap is at max concurrency"),
+        "every rejected reason must be shown: {stderr}"
+    );
+    assert!(
+        stderr.contains("pvp_gw"),
+        "candidate profile shown: {stderr}"
+    );
+    assert!(
+        stderr.contains("deferredUntil"),
+        "supply decision fields must be shown verbatim: {stderr}"
+    );
+    assert!(
+        stderr.contains("2026-10-08T12:00:00Z"),
+        "deferredUntil value shown: {stderr}"
+    );
+    Ok(())
+}

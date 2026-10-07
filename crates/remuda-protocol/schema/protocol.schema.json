@@ -3353,6 +3353,13 @@
           "$ref": "#/$defs/Timestamp",
           "description": "When the observation was made."
         },
+        "readbackAvailable": {
+          "description": "D-056 (4): whether effort read-back is available for this process.\n`Some(false)` means a resume boundary that was verified became\nunverifiable mid-run (shrink/replacement/EOF, an exec keeping the shell\npid, a backward clock step): consumers must clear any projected\neffective level/flag (the UI renders `?`) and must not treat a pending\nswitch as applied. Normal observations omit it (`None` = available).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "source": {
           "$ref": "#/$defs/EffortSource",
           "description": "What established this level."

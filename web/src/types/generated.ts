@@ -717,6 +717,7 @@ export type EffectiveModel = ({
 export type EffortEffective = ({
   "name": EffortName;
   "observedAt": Timestamp;
+  "readbackAvailable"?: (boolean | null);
   "source": EffortSource;
   "ultracode"?: (boolean | null);
   [key: string]: unknown;

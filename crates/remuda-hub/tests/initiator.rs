@@ -194,6 +194,24 @@ impl FakeNode {
         }
     }
 
+    /// Assert the next frame the Node receives is a Human command sentinel:
+    /// an earlier dispatch that leaked a frame would queue ahead of it. No
+    /// receive window — the channel delivers exactly the next frame.
+    async fn assert_next_frame_is_sentinel(&mut self, ctx: &Ctx) {
+        let (status, sentinel) = ctx
+            .send(
+                "POST",
+                &format!("/v1/instances/{}/commands", ctx.instance),
+                &ctx.human,
+                None,
+                Some(Ctx::send_body("instance.send")),
+            )
+            .await;
+        assert_eq!(status, 200, "{sentinel}");
+        let (method, params) = self.next().await;
+        assert_eq!(method, "instance.send", "an unexpected frame leaked: {params}");
+    }
+
     fn append(&self, instance_id: &str, event: Value) {
         self.appends
             .send((instance_id.to_owned(), event))
@@ -411,8 +429,40 @@ impl Ctx {
     fn send_body(operation: &str) -> Value {
         json!({"operation":operation,"payload":{"input":{"type":"prompt","text":"hi"}}})
     }
-}
 
+    /// Configure one gate lane on the connected fake Node. Deliberately a
+    /// separate call after the test is armed: with no lane configured the
+    /// enqueue-time scheduler tick cannot dispatch, so the later explicit
+    /// test_gate_tick is the unique dispatch attempt — no timing race.
+    async fn configure_gate_lane(&self) {
+        let (status, body) = self
+            .send(
+                "PATCH",
+                &format!("/v1/projects/{}", self.project),
+                &self.human,
+                None,
+                Some(json!({
+                    "gate": {
+                        "affected": true,
+                        "web": "auto",
+                        "landSerialization": "global-cas",
+                        "lanes": [{
+                            "id": "lane1",
+                            "hostId": self.host,
+                            "repoPath": "/tmp/lane1/repo",
+                            "targetDir": "/tmp/lane1/target",
+                            "ports": "58400-58409",
+                            "env": {},
+                            "lockPath": "/tmp/remuda-agents/e2e.lock",
+                            "pwEndpoint": "ws://127.0.0.1:3177/"
+                        }]
+                    }
+                })),
+            )
+            .await;
+        assert_eq!(status, 200, "configure lane: {body}");
+    }
+}
 fn assert_fenced(status: reqwest::StatusCode, body: &Value) {
     assert_eq!(status, 409, "expected 409 fenced, got {status}: {body}");
     assert_eq!(body["code"], json!("fenced"), "body: {body}");
@@ -864,12 +914,11 @@ impl Drop for InitiatorD051Guard {
     }
 }
 
-// ── 6. Gate claim after the job is enqueued ────────────────────────────────
+// ── 6. Real scheduler tick: a fence or a revoked device cancels the claim ─
 
-#[tokio::test]
-async fn gate_job_fenced_before_claim_is_canceled_fenced_and_never_dispatched() {
-    let (ctx, mut node) = Ctx::boot().await.unwrap();
-
+/// Enqueue a verify job while no lane exists, then run one scenario against
+/// a real `tick()` once the lane is configured.
+async fn queued_job(ctx: &Ctx) -> String {
     let (status, job) = ctx
         .agent_post(
             &format!("/v1/projects/{}/gate", ctx.project),
@@ -877,17 +926,18 @@ async fn gate_job_fenced_before_claim_is_canceled_fenced_and_never_dispatched() 
         )
         .await;
     assert_eq!(status, 200, "{job}");
-    let job_id = job["id"].as_str().unwrap().to_owned();
+    job["id"].as_str().unwrap().to_owned()
+}
 
-    // Fence lands inside the claim writer job (the scheduler tick after F).
-    ctx.store()
-        .test_arm_fence_before_authority_check(ctx.instance.clone());
-    let claimed = ctx
-        .hub
-        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
-        .await
-        .unwrap();
-    assert!(claimed.is_none(), "a fenced job must not be claimed");
+#[tokio::test]
+async fn gate_job_fenced_before_the_tick_is_canceled_and_never_dispatched() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let job_id = queued_job(&ctx).await;
+
+    // F lands before the claim (whole instance fenced).
+    ctx.fence().await;
+    ctx.configure_gate_lane().await;
+    ctx.hub.test_gate_tick().await;
 
     let doc = ctx
         .hub
@@ -897,7 +947,61 @@ async fn gate_job_fenced_before_claim_is_canceled_fenced_and_never_dispatched() 
         .expect("job still exists");
     assert_eq!(doc["state"], json!("canceled"), "{doc}");
     assert_eq!(doc["reason"], json!("fenced"), "{doc}");
-    node.assert_no_frame("fenced gate claim").await;
+    node.assert_next_frame_is_sentinel(&ctx).await;
+}
+
+#[tokio::test]
+async fn gate_job_whose_authenticating_device_was_deleted_is_canceled_at_claim() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let job_id = queued_job(&ctx).await;
+
+    // Only the MCP device row is revoked, as F deletes predecessor
+    // credentials: the instance is not marked fenced and the launch
+    // credential still exists.
+    let mcp_device = {
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        let id: String = db
+            .query_row(
+                "SELECT id FROM devices WHERE instance_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                rusqlite::params![ctx.instance],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "DELETE FROM devices WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+        id
+    };
+    ctx.configure_gate_lane().await;
+    ctx.hub.test_gate_tick().await;
+
+    let doc = ctx
+        .hub
+        .test_get_gate_job(&job_id)
+        .await
+        .unwrap()
+        .expect("job still exists");
+    assert_eq!(doc["state"], json!("canceled"), "{doc}");
+    assert_eq!(doc["reason"], json!("fenced"), "{doc}");
+    assert!(
+        doc.get("initiatorDeviceId").is_none(),
+        "device id stays off the API doc: {doc}"
+    );
+    node.assert_next_frame_is_sentinel(&ctx).await;
+
+    // The launch credential is untouched.
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    let launch_exists: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM devices
+              WHERE instance_id = ?1 AND id != ?2",
+            rusqlite::params![ctx.instance, mcp_device],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(launch_exists, 1, "launch device row should survive");
 }
 
 // ── 6b. Gate cancel is checked in the mutating writer (both states) ───────

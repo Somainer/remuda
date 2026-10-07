@@ -585,13 +585,26 @@ impl RunningHub {
         let host: remuda_protocol::HostId = host_id
             .parse()
             .map_err(|err: remuda_protocol::WireValueError| anyhow::anyhow!("{err}"))?;
-        let job = self
+        let claim = self
             .store()
             .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
             .claim_gate_job(job_id, lane_id.to_owned(), host)
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))?;
-        Ok(job.map(|job| serde_json::to_value(job).expect("gate job serializes")))
+        Ok(match claim {
+            crate::gatequeue::GateJobClaim::Claimed(job) => {
+                Some(serde_json::to_value(job).expect("gate job serializes"))
+            }
+            crate::gatequeue::GateJobClaim::FencedCanceled(_)
+            | crate::gatequeue::GateJobClaim::NotReady => None,
+        })
+    }
+
+    /// Test-only: run one scheduler tick deterministically (no wait for the
+    /// 1s interval).
+    #[doc(hidden)]
+    pub async fn test_gate_tick(&self) {
+        crate::gatequeue::tick(&self.state).await;
     }
 
     /// Test-only: the current stored gate job doc.

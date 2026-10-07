@@ -85,6 +85,11 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS gate_log_objects_job ON gate_log_objects(job_id);
          CREATE INDEX IF NOT EXISTS gate_log_objects_expires ON gate_log_objects(expires_at);",
     )?;
+    // D-057 §7.1: the Hub-only authenticating device id lives in its own
+    // column — GateJob.initiator_device_id is skip_serializing in the doc,
+    // so a doc-only store would always claim with None and skip the device
+    // clause. API responses keep skipping the field.
+    crate::store::ensure_column(&conn, "gate_jobs", "initiator_device_id", "TEXT")?;
     Ok(())
 }
 
@@ -726,10 +731,21 @@ async fn dispatch(
         .store
         .claim_gate_job(job.id.as_id().as_str(), claim_lane, claim_host)
         .await;
-    let Ok(Some(job)) = claimed else {
-        // Not queued, or the job's initiator was fenced: the claim job
-        // settled the row canceled(fenced); no gate.run is sent.
-        return;
+    let job = match claimed {
+        Ok(GateJobClaim::Claimed(job)) => job,
+        Ok(GateJobClaim::FencedCanceled(job)) => {
+            // The claim writer settled the row canceled(fenced); journal the
+            // outcome and send no gate.run.
+            journal(state, &job.requested_by, "gate.canceled", &job).await;
+            return;
+        }
+        Ok(GateJobClaim::NotReady) => return,
+        Err(error) => {
+            // Do not claim on an unrelated store failure: the next tick
+            // retries the queued row.
+            tracing::warn!(%error, job_id = job.id.as_id().as_str(), "gate claim failed");
+            return;
+        }
     };
     let params = GateRunParams {
         job_id: job.id.as_id().to_string(),
@@ -1620,7 +1636,8 @@ impl Store {
         let queued = String::from(job.queued_at.clone());
         let created = String::from(job.queued_at.clone());
         // D-057 §7.1: authority pair checked inside the writer job (§7.3);
-        // the device id is not part of the wire but lives in the job doc.
+        // the device id persists in its own gate_jobs column (it is
+        // skip_serializing in the doc JSON) and never reaches the wire.
         let job_initiator = job.initiator.clone();
         let job_device_id = job.initiator_device_id.clone();
         self.run_named("insert_gate_job", move |conn| {
@@ -1630,9 +1647,9 @@ impl Store {
             conn.execute(
                 "INSERT INTO gate_jobs
                     (id, project_id, state, lane_id, queued_at, doc_json, revision,
-                     created_by, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?8)",
-                params![id, project_id, state, lane, queued, doc, "", created],
+                     created_by, created_at, updated_at, initiator_device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?8, ?9)",
+                params![id, project_id, state, lane, queued, doc, "", created, job_device_id],
             )?;
             Ok(())
         })
@@ -1787,17 +1804,19 @@ impl Store {
     }
 
     /// D-057 §7.3/§7.5: claim a queued gate job for dispatch, re-checking the
-    /// initiator STAMPED ON THE ROW (and its device id) inside the writer job.
-    /// A job fenced after enqueue is not claimed: it settles `canceled` with
-    /// reason `fenced` in the same job, and the caller treats `None` as "no
-    /// gate.run must reach the lane". Human/Bot jobs (`initiator: None`) claim
-    /// exactly as before.
+    /// initiator STAMPED ON THE ROW (and the device id persisted in its own
+    /// column) inside the writer job. A job fenced after enqueue is not
+    /// claimed: it settles `canceled` with reason `fenced` in the same job
+    /// ([`GateJobClaim::FencedCanceled`], so dispatch can journal it) and no
+    /// gate.run reaches the lane. Human/Bot jobs (`initiator: None`) claim
+    /// exactly as before. Non-`Fenced` store errors propagate for a retry on
+    /// the next tick instead of claiming the job anyway.
     pub(crate) async fn claim_gate_job(
         &self,
         id: &str,
         claim_lane: String,
         claim_host: remuda_protocol::HostId,
-    ) -> Result<Option<GateJob>, crate::store::StoreError> {
+    ) -> Result<GateJobClaim, crate::store::StoreError> {
         let id = id.to_owned();
         // Test-only seam: fence lands inside this writer job.
         let armed_fence = self.take_test_authority_fence();
@@ -1805,37 +1824,52 @@ impl Store {
             if let Some(fenced_instance) = armed_fence {
                 crate::store::test_apply_fence(conn, &fenced_instance)?;
             }
-            let Some(mut job) = conn
+            // The device id is read from its own column: the doc field is
+            // skip_serializing, so doc_json never carries it.
+            let Some((mut job, device_id)) = conn
                 .query_row(
-                    "SELECT doc_json FROM gate_jobs WHERE id = ?1",
+                    "SELECT doc_json, initiator_device_id FROM gate_jobs WHERE id = ?1",
                     params![id],
-                    |row| row.get::<_, String>(0),
+                    |row| {
+                        let doc: String = row.get(0)?;
+                        let device_id: Option<String> = row.get(1)?;
+                        Ok((doc, device_id))
+                    },
                 )
                 .optional()?
-                .and_then(|text| serde_json::from_str::<GateJob>(&text).ok())
+                .and_then(|(doc, device_id)| {
+                    serde_json::from_str::<GateJob>(&doc)
+                        .ok()
+                        .map(|job| (job, device_id))
+                })
             else {
-                return Ok(None);
+                return Ok(GateJobClaim::NotReady);
             };
             if job.state != GateJobState::Queued {
-                return Ok(None);
+                return Ok(GateJobClaim::NotReady);
             }
-            if let Err(crate::store::StoreError::Fenced) = crate::store::check_initiator(
-                conn,
-                job.initiator.as_ref(),
-                job.initiator_device_id.as_deref(),
-            ) {
-                job.state = GateJobState::Canceled;
-                job.finished_at = Some(now_ts());
-                job.reason = Some("fenced".into());
-                let doc = serde_json::to_string(&job)?;
-                conn.execute(
-                    "UPDATE gate_jobs
-                        SET doc_json = ?1, state = ?2, lane_id = ?3, revision = revision + 1,
-                            updated_at = ?4
-                      WHERE id = ?5",
-                    params![doc, job.state.as_str(), job.lane_id, now(), id],
-                )?;
-                return Ok(None);
+            if let Err(error) =
+                crate::store::check_initiator(conn, job.initiator.as_ref(), device_id.as_deref())
+            {
+                match error {
+                    crate::store::StoreError::Fenced => {
+                        job.state = GateJobState::Canceled;
+                        job.finished_at = Some(now_ts());
+                        job.reason = Some("fenced".into());
+                        let doc = serde_json::to_string(&job)?;
+                        conn.execute(
+                            "UPDATE gate_jobs
+                                SET doc_json = ?1, state = ?2, lane_id = ?3, revision = revision + 1,
+                                    updated_at = ?4
+                              WHERE id = ?5",
+                            params![doc, job.state.as_str(), job.lane_id, now(), id],
+                        )?;
+                        return Ok(GateJobClaim::FencedCanceled(job));
+                    }
+                    // A genuine storage failure must not be swallowed into a
+                    // claim: propagate so the tick retries.
+                    other => return Err(other),
+                }
             }
             job.state = GateJobState::Running;
             job.lane_id = Some(claim_lane);
@@ -1850,10 +1884,21 @@ impl Store {
                   WHERE id = ?5",
                 params![doc, job.state.as_str(), job.lane_id, now(), id],
             )?;
-            Ok(Some(job))
+            Ok(GateJobClaim::Claimed(job))
         })
         .await
     }
+}
+
+/// Outcome of [`Store::claim_gate_job`].
+pub(crate) enum GateJobClaim {
+    /// Claimed for this lane; gate.run may be sent.
+    Claimed(GateJob),
+    /// The row's initiator was fenced: the job was settled canceled(fenced)
+    /// in the same writer job; no gate.run may be sent.
+    FencedCanceled(GateJob),
+    /// Missing, not queued, or otherwise not claimable this tick.
+    NotReady,
 }
 
 // ── gate log objects ───────────────────────────────────────────────────────

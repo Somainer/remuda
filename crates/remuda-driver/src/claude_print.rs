@@ -35,7 +35,7 @@ use remuda_protocol::{
     WorkflowPhasePayload, WorkflowRunPayload, WorkflowState,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -133,6 +133,137 @@ struct PendingTool {
     input: Value,
 }
 
+/// Which locally-known root turn a background workflow belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkflowOwner {
+    /// The workflow was seen with no outstanding locally-written turn (pure
+    /// fixture/transcript replay, or a frame reordered ahead of its start).
+    Implicit,
+    /// The outstanding root turn with this seq.
+    Turn(u64),
+}
+
+/// One root turn the mapper has evidence for.
+struct RootTurn {
+    /// Monotonic identity.
+    seq: u64,
+    /// `local_workflow` task ids this turn opened whose terminal
+    /// `task_notification` has not been mapped yet. The turn cannot settle
+    /// while this is non-empty, no matter what `result_index` says.
+    open_workflows: HashSet<String>,
+}
+
+/// Per-root-turn settlement evidence (D-057 OA6 ma-sdk-state r3).
+///
+/// Root-turn settlement is derived from evidence PER ROOT TURN, never from
+/// the process-global `result_index` (which grows across turns on the
+/// long-lived sdk child) or one process-global counter:
+///
+/// * every locally-written user frame opens a [`RootTurn`] (FIFO); the front
+///   is the turn the native process is currently emitting frames for;
+/// * a workflow is tracked by its TASK ID against the turn that owned it when
+///   `task_started` arrived, and is closed by its own terminal
+///   `task_notification` (completed/failed/stopped) — not by decrementing a
+///   counter on a later result;
+/// * a `result` completes the front turn only once all of THAT turn's
+///   workflows are closed, and settles the root only when no newer locally
+///   written turn is outstanding, so an older buffered result can never settle
+///   a newer input.
+#[derive(Default)]
+struct TurnBook {
+    /// Locally-written root turns not yet completed, in write order.
+    outstanding: VecDeque<RootTurn>,
+    /// Workflow task id -> owning turn.
+    workflow_owner: HashMap<String, WorkflowOwner>,
+    /// Workflows seen with no locally-known owning turn (replay bucket).
+    implicit_workflows: HashSet<String>,
+    next_seq: u64,
+}
+
+impl TurnBook {
+    fn begin_turn(&mut self) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.outstanding.push_back(RootTurn {
+            seq,
+            open_workflows: HashSet::new(),
+        });
+    }
+
+    /// Track a freshly-opened background workflow against the root turn the
+    /// native process is currently emitting for (the FIFO front), or the
+    /// implicit bucket when no local turn is known (fixture replay).
+    fn workflow_started(&mut self, task_id: &str) {
+        if task_id.is_empty() || self.workflow_owner.contains_key(task_id) {
+            return;
+        }
+        let owner = match self.outstanding.front_mut() {
+            Some(front) => {
+                front.open_workflows.insert(task_id.to_owned());
+                WorkflowOwner::Turn(front.seq)
+            }
+            None => {
+                self.implicit_workflows.insert(task_id.to_owned());
+                WorkflowOwner::Implicit
+            }
+        };
+        self.workflow_owner.insert(task_id.to_owned(), owner);
+    }
+
+    /// Close a workflow on its own terminal evidence (`task_notification`
+    /// completed/failed/stopped, or a terminal `task_updated` patch), removing
+    /// it from the OWNING turn's open set.
+    fn workflow_terminated(&mut self, task_id: &str) {
+        let Some(owner) = self.workflow_owner.remove(task_id) else {
+            return;
+        };
+        match owner {
+            WorkflowOwner::Implicit => {
+                self.implicit_workflows.remove(task_id);
+            }
+            WorkflowOwner::Turn(seq) => {
+                if let Some(turn) = self.outstanding.iter_mut().find(|turn| turn.seq == seq) {
+                    turn.open_workflows.remove(task_id);
+                }
+            }
+        }
+    }
+
+    /// Whether a `result` frame SETTLES THE ROOT TURN.
+    ///
+    /// `queued` is the native `queued_turn_count` (0/omitted = nothing queued).
+    /// A result with one of the front turn's workflows still open is that
+    /// turn's intermediate result: the turn is NOT popped (a workflow turn
+    /// emits result 0 then result 1 for the SAME user frame). Otherwise the
+    /// front turn completes here; the root settles only when no newer locally
+    /// written turn remains outstanding.
+    fn result_settles_root(&mut self, queued: u64) -> bool {
+        let front_open = self
+            .outstanding
+            .front()
+            .is_some_and(|front| !front.open_workflows.is_empty());
+        if front_open {
+            return false;
+        }
+        if self.outstanding.pop_front().is_some() {
+            queued == 0 && self.outstanding.is_empty()
+        } else {
+            // No locally-known turn (pure replay): native queue evidence plus
+            // the implicit workflow bucket.
+            queued == 0 && self.implicit_workflows.is_empty()
+        }
+    }
+}
+
+/// Terminal native workflow statuses: the task will produce no further frames
+/// (`system/task_notification` status, or a terminal `task_updated` patch).
+fn workflow_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "stopped" | "killed" | "cancelled"
+    )
+}
+
 struct Live {
     process: ClaudeProcess,
     inbound: mpsc::Sender<Inbound>,
@@ -165,14 +296,11 @@ struct Mapper {
     /// Stages image result bytes into the Hub object store (D-045 §6.2).
     /// `None` carriers degrade every image to an honest text block.
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
-    /// D-057 OA6 (ma-sdk-state r2): number of background Claude Workflows the
-    /// stream has opened (`system/task_started` with task_type=local_workflow)
-    /// whose terminal `result` has not yet been seen. While a workflow is open,
-    /// its first `result` (result_index 0) is an INTERMEDIATE result, not the
-    /// end of the root turn. This lets `map_result` decide root-turn settlement
-    /// independently of the one-shot `affects_completion` heuristic (which means
-    /// process completion for print and is wrong on the long-lived sdk child).
-    open_workflows: usize,
+    /// D-057 OA6 (ma-sdk-state r3): per-root-turn settlement evidence. See
+    /// [`TurnBook`] for why this is per-turn workflow identities plus a FIFO of
+    /// locally-written turns rather than a process-global counter or
+    /// `result_index`.
+    turns: TurnBook,
 }
 
 #[derive(Default)]
@@ -283,13 +411,19 @@ impl NativeIds {
 struct Inner {
     live: Mutex<Option<Live>>,
     mapper: Mutex<Mapper>,
-    /// D-057 OA6 r2 item 2: serializes (a) writing a user frame + emitting its
-    /// `turn_started` on the send task and (b) mapping + emitting every stdout
-    /// frame (including a turn's `result`) on the reader task into ONE total
-    /// order, so a `result` can never be published before the `turn_started`
-    /// of its own turn. Mapping and emission each had their own lock, which let
-    /// the two tasks interleave their publishes; this spans both.
-    turn_order: tokio::sync::Mutex<()>,
+    /// D-057 OA6 r3: publication FIFO. Every stdout frame's map+emit and every
+    /// locally-written turn's `turn_started` map+emit goes through ONE unbounded
+    /// queue drained by a single worker, so the published order is the causal
+    /// order (a turn's frames can never precede its start) while neither task
+    /// holds a lock across the other's work. In particular a blocked stdin write
+    /// on the send task never stalls stdout draining, and `close`/`cancel`
+    /// stay reachable (neither needs this queue to make progress).
+    publish: Mutex<Option<mpsc::UnboundedSender<PublishJob>>>,
+    /// Serializes prompt sends from enqueue through write completion to
+    /// enqueueing the matching `turn_started`, so two concurrent prompts both
+    /// write and start in FIFO order. Held across the write await by design;
+    /// `close`/`cancel` do not take it, so a blocked prompt cannot gate them.
+    write_seq: tokio::sync::Mutex<()>,
     policy: Mutex<PermissionPolicy>,
     events: Mutex<Option<mpsc::Sender<Observation>>>,
     closed: AtomicBool,
@@ -310,6 +444,9 @@ pub struct ClaudePrintDriver {
     options: ClaudePrintOptions,
     inner: Arc<Inner>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Drain task for [`Inner::publish`], joined/aborted by `close` after the
+    /// reader so the queued publication order always flushes before `exited`.
+    publisher: Mutex<Option<JoinHandle<()>>>,
     /// Carrier this object launches and stamps.
     ///
     /// `claude-print` and `claude-sdk` are the same transport (stream-json over
@@ -366,9 +503,10 @@ impl ClaudePrintDriver {
                     driver_kind: carrier,
                     channel: SourceChannel::Stdout,
                     media_stager,
-                    open_workflows: 0,
+                    turns: TurnBook::default(),
                 }),
-                turn_order: tokio::sync::Mutex::new(()),
+                publish: Mutex::new(None),
+                write_seq: tokio::sync::Mutex::new(()),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
                 closed: AtomicBool::new(false),
@@ -378,6 +516,7 @@ impl ClaudePrintDriver {
                 child_exit_status: Mutex::new(None),
             }),
             reader: Mutex::new(None),
+            publisher: Mutex::new(None),
             carrier,
         }
     }
@@ -478,7 +617,7 @@ impl ClaudePrintDriver {
                 driver_kind: self.carrier,
                 channel: SourceChannel::Stdout,
                 media_stager: self.options.media_stager.clone(),
-                open_workflows: 0,
+                turns: TurnBook::default(),
             };
         }
         *self.inner.policy.lock().await = policy;
@@ -501,10 +640,23 @@ impl ClaudePrintDriver {
             recipe: recipe.clone(),
         });
 
+        // Fresh publication FIFO for this launch. The worker drains it in
+        // order; the reader task gets its own sender clone and `close` seals
+        // the Inner's copy before joining the worker.
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel::<PublishJob>();
+        *self.inner.publish.lock().await = Some(publish_tx.clone());
+        let publisher = {
+            let inner = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                publish_worker(inner, publish_rx).await;
+            })
+        };
+        *self.publisher.lock().await = Some(publisher);
+
         let inner = Arc::clone(&self.inner);
         let carrier = self.carrier_name();
         let reader = tokio::spawn(async move {
-            map_loop(inner, outbound, carrier).await;
+            map_loop(inner, outbound, publish_tx, carrier).await;
         });
         *self.reader.lock().await = Some(reader);
         Ok(RunHandle::new(recipe, ack, rx))
@@ -661,32 +813,44 @@ impl Driver for ClaudePrintDriver {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(DriverError::ControlUnavailable);
         }
-        let live = self.inner.live.lock().await;
-        let Some(live) = live.as_ref() else {
-            return Err(DriverError::ControlUnavailable);
-        };
         match input {
             DriverInput::Prompt(prompt) => {
-                // D-057 OA6 r2 item 2: hold the single turn-ordering lock
-                // across the stdin WRITE (which now completes on write, not
-                // queue), the turn_started mapping and its emission, so a
-                // result read for this turn on the reader task cannot be mapped
-                // or published first.
-                let _order = self.inner.turn_order.lock().await;
+                // D-057 OA6 r3 item 5: never hold `live` across the write
+                // await. A child that stopped draining stdin blocks the pipe
+                // for as long as it likes; holding the process lock over that
+                // await made close() block acquiring `live` and kept the
+                // bounded close ladder from ever starting. Clone the cheap
+                // writer handle under the lock, DROP the lock, then await.
+                let writer = {
+                    let live = self.inner.live.lock().await;
+                    let Some(live) = live.as_ref() else {
+                        return Err(DriverError::ControlUnavailable);
+                    };
+                    live.process.writer()
+                };
+                // Concurrent prompts must write AND start in FIFO; write_seq
+                // spans the write and the turn_started enqueue. close/cancel
+                // never take it, so they remain reachable while a prompt is
+                // blocked.
+                let _seq = self.inner.write_seq.lock().await;
                 let client_message_id = prompt.native_client_message_id.clone();
-                live.process
+                writer
                     .send_user(prompt_content(&prompt.blocks)?)
                     .await
                     .map_err(map_wire)?;
-                // D-057 OA6: the written user frame is the turn start. Because
-                // send_user resolves only after the line reached the child's
-                // stdin (r2 item 3), activity never flips to `working` for a
-                // prompt that was merely queued or failed to write.
-                let turn_started = {
-                    let mut mapper = self.inner.mapper.lock().await;
-                    mapper.turn_started(&client_message_id)?
+                // The write reached the child's stdin: enqueue turn_started in
+                // the SAME FIFO the reader enqueues stdout frames into, so this
+                // turn's frames cannot be published before its start. The
+                // enqueue is unbounded (never parks), and a failed write above
+                // means no turn_started is ever recorded for an unwritten
+                // prompt — activity never flips working for a failed write.
+                let publisher = self.inner.publish.lock().await.clone();
+                let Some(publisher) = publisher else {
+                    return Err(DriverError::ControlUnavailable);
                 };
-                emit_all(&self.inner, vec![turn_started]).await?;
+                publisher
+                    .send(PublishJob::TurnStarted { client_message_id })
+                    .map_err(|_| DriverError::ControlUnavailable)?;
                 Ok(DriverAck::transport_written())
             }
             DriverInput::Steer(_) => Err(DriverError::CapabilityUnknown("steer".into())),
@@ -708,7 +872,14 @@ impl Driver for ClaudePrintDriver {
                     )));
                 }
                 if !switch.model_id.is_empty() {
-                    live.process
+                    let writer = {
+                        let live = self.inner.live.lock().await;
+                        let Some(live) = live.as_ref() else {
+                            return Err(DriverError::ControlUnavailable);
+                        };
+                        live.process.writer()
+                    };
+                    writer
                         .set_model(Some(switch.model_id.clone()))
                         .await
                         .map_err(map_wire)?;
@@ -719,11 +890,16 @@ impl Driver for ClaudePrintDriver {
     }
 
     async fn cancel(&self) -> DriverResult<DriverAck> {
-        let live = self.inner.live.lock().await;
-        let Some(live) = live.as_ref() else {
-            return Err(DriverError::ControlUnavailable);
+        // Clone the writer and release `live` before the enqueue await: a
+        // wedged writer channel must not pin `live` and gate close (r3 item 5).
+        let writer = {
+            let live = self.inner.live.lock().await;
+            let Some(live) = live.as_ref() else {
+                return Err(DriverError::ControlUnavailable);
+            };
+            live.process.writer()
         };
-        live.process.interrupt(true).await.map_err(map_wire)?;
+        writer.interrupt(true).await.map_err(map_wire)?;
         Ok(DriverAck::transport_written())
     }
 
@@ -732,18 +908,23 @@ impl Driver for ClaudePrintDriver {
         id: InteractionId,
         answer: InteractionAnswer,
     ) -> DriverResult<DriverAck> {
-        let mut live = self.inner.live.lock().await;
-        let Some(live) = live.as_mut() else {
-            return Err(DriverError::ControlUnavailable);
+        // Mutate pending state under the lock, but do the stdin enqueue after
+        // the guard is released (r3 item 5).
+        let (inbound, payload) = {
+            let mut live = self.inner.live.lock().await;
+            let Some(live) = live.as_mut() else {
+                return Err(DriverError::ControlUnavailable);
+            };
+            let pending = live
+                .pending
+                .remove(&id)
+                .ok_or(DriverError::ControlUnavailable)?;
+            live.pending_by_native.remove(&pending.request_id);
+            let payload = permission_from_answer(&pending.input, &answer)?;
+            (live.inbound.clone(), (pending.request_id, payload))
         };
-        let pending = live
-            .pending
-            .remove(&id)
-            .ok_or(DriverError::ControlUnavailable)?;
-        live.pending_by_native.remove(&pending.request_id);
-        let payload = permission_from_answer(&pending.input, &answer)?;
-        live.inbound
-            .send(Inbound::control_success(pending.request_id, payload))
+        inbound
+            .send(Inbound::control_success(payload.0, payload.1))
             .await
             .map_err(|_| DriverError::ControlUnavailable)?;
         Ok(DriverAck::transport_written())
@@ -786,7 +967,23 @@ impl Driver for ClaudePrintDriver {
             reader.abort();
         }
 
-        // Whichever path got there first — the reader finishing naturally, or
+        // Seal the publication FIFO now that the reader can no longer enqueue,
+        // and join its drainer so every already-queued frame (and the reader's
+        // trailing StdoutEof) is published before `exited`. Bounded, then
+        // abort: a worker parked on a wedged control-response write must not
+        // keep close open — the child is already reaped above. Same
+        // cross-launch window as the reader: no task from this launch may emit
+        // into a later launch's channel.
+        self.inner.publish.lock().await.take();
+        if let Some(mut publisher) = self.publisher.lock().await.take()
+            && tokio::time::timeout(Duration::from_millis(500), &mut publisher)
+                .await
+                .is_err()
+        {
+            publisher.abort();
+        }
+
+        // Whichever path got there first — the worker draining StdoutEof, or
         // this call covering an aborted one — emits exactly once
         // (`exit_emitted`), and only while `events` is still live.
         let _ = emit_exit(&self.inner, "exited").await;
@@ -963,37 +1160,77 @@ fn signal_child_group(pgid: i32, signal: nix::sys::signal::Signal, carrier: &str
 async fn map_loop(
     inner: Arc<Inner>,
     mut outbound: mpsc::Receiver<Outbound>,
+    publisher: mpsc::UnboundedSender<PublishJob>,
     carrier: &'static str,
 ) {
     while let Some(frame) = outbound.recv().await {
-        if let Err(error) = handle_frame(&inner, frame).await {
-            warn!(carrier, %error, "stream-json map failed");
+        if matches!(frame, Outbound::KeepAlive) {
+            continue;
+        }
+        // D-045 §6.2: stage tool-result images BEFORE the publication queue.
+        // The staging bridge parks until the Hub answers; running it on a
+        // blocking thread keeps the tokio worker moving. Critically this also
+        // runs OUTSIDE every write path: a prompt blocked on a full stdin pipe
+        // cannot stop the reader draining and pre-folding stdout (r3 item 5).
+        let frame = match prefold_user_frame(&inner, frame).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                warn!(carrier, %error, "stream-json prefold failed");
+                continue;
+            }
+        };
+        // Unbounded: enqueue never parks on the writer/sender, so stdout keeps
+        // draining even while a prompt write is blocked and close is running.
+        if publisher.send(PublishJob::Frame(frame)).is_err() {
+            break;
         }
     }
-    if let Err(error) = emit_exit(&inner, "exited").await {
-        debug!(carrier, %error, "exit lifecycle");
+    // Child stdout reached EOF. Enqueue the exit BEHIND every already-queued
+    // frame so `exited` is always the last published observation; the worker
+    // drains the queue and reaches this even while close is reaping.
+    let _ = publisher.send(PublishJob::StdoutEof);
+}
+
+/// One ordered unit of publication work. See [`Inner::publish`].
+enum PublishJob {
+    /// Map one already-prefolded stdout frame and emit its observations.
+    Frame(Outbound),
+    /// A user frame finished writing; map/emit its `turn_started` in order.
+    TurnStarted { client_message_id: String },
+    /// The child's stdout closed; emit exactly one `exited` (deduped).
+    StdoutEof,
+}
+
+/// Single drainer of [`Inner::publish`]: map + emit strictly in enqueue order.
+async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<PublishJob>) {
+    while let Some(job) = rx.recv().await {
+        let result = match job {
+            PublishJob::Frame(frame) => publish_frame(&inner, frame).await,
+            PublishJob::TurnStarted { client_message_id } => {
+                let observation = {
+                    let mut mapper = inner.mapper.lock().await;
+                    mapper.turn_started(&client_message_id)
+                };
+                match observation {
+                    Ok(observation) => emit_all(&inner, vec![observation]).await,
+                    Err(error) => Err(error),
+                }
+            }
+            PublishJob::StdoutEof => emit_exit(&inner, "exited").await,
+        };
+        if let Err(error) = result {
+            warn!("ordered publication failed: {error}");
+        }
     }
 }
 
-async fn handle_frame(inner: &Inner, frame: Outbound) -> DriverResult<()> {
-    if matches!(frame, Outbound::KeepAlive) {
-        return Ok(());
-    }
+/// Map and emit one prefetched stdout frame, in publication order.
+async fn publish_frame(inner: &Inner, frame: Outbound) -> DriverResult<()> {
     if let Outbound::ControlRequest(env) = &frame
         && let ControlRequest::CanUseTool(req) = &env.request
     {
         return handle_can_use_tool(inner, env, req).await;
     }
-    // D-045 §6.2: stage tool-result images BEFORE taking the mapper lock. The
-    // staging bridge parks until the Hub answers; running it on a blocking
-    // thread keeps the tokio worker (and every other frame) moving.
-    let frame = prefold_user_frame(inner, frame).await?;
-    // D-057 OA6 r2 item 2: hold the turn-ordering lock across mapping AND
-    // emission of this stdout frame, pairing with the send task's lock around
-    // the user write + turn_started emit. This section touches no `live` lock,
-    // so it cannot deadlock against a sender (whose lock order is live then
-    // turn_order). Control/image work above is intentionally outside the lock.
-    let _order = inner.turn_order.lock().await;
     let observations = {
         let mut mapper = inner.mapper.lock().await;
         map_outbound(&mut mapper, &frame)?
@@ -1181,11 +1418,17 @@ async fn send_control(
     request_id: &str,
     payload: ControlSuccessPayload,
 ) -> DriverResult<()> {
-    let live = inner.live.lock().await;
-    let Some(live) = live.as_ref() else {
-        return Err(DriverError::ControlUnavailable);
+    // Clone the channel under the lock, then await the enqueue lock-free: an
+    // auto-allow response must not hold `live` across a potentially blocked
+    // write (r3 item 5: close/cancel always stay reachable).
+    let inbound = {
+        let live = inner.live.lock().await;
+        let Some(live) = live.as_ref() else {
+            return Err(DriverError::ControlUnavailable);
+        };
+        live.inbound.clone()
     };
-    live.inbound
+    inbound
         .send(Inbound::control_success(request_id, payload))
         .await
         .map_err(|_| DriverError::ControlUnavailable)
@@ -1594,35 +1837,17 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
     let affects_completion =
         result.result_index.unwrap_or(0) > 0 && result.queued_turn_count.unwrap_or(0) == 0;
 
-    // D-057 OA6 (ma-sdk-state r2): decide whether THIS result settles the ROOT
-    // turn, as a signal distinct from `affects_completion`. The root turn is
-    // settled when:
-    //  * no further prompt is queued (`queued_turn_count` 0/omitted), and
-    //  * this is not an open background workflow's intermediate result.
-    //
-    // A workflow emits result_index 0 (intermediate) then 1 (final). While a
-    // workflow is open, an index-0 result is the intermediate; a later result
-    // closes one open workflow. With no open workflow, a result settles the
-    // root turn regardless of index — including the FIRST turn of a long-lived
-    // sdk session (index 0/omitted), which the print heuristic misses.
+    // D-057 OA6 (ma-sdk-state r3): decide whether THIS result settles the ROOT
+    // turn from evidence PER ROOT TURN, as a signal distinct from
+    // `affects_completion`. The decision lives in [`TurnBook`]: a result
+    // settles only when every workflow the OWNING turn opened has sent its
+    // terminal task_notification (identity-tracked, not counted), nothing is
+    // queued, and no newer locally-written turn is outstanding. In particular
+    // `result_index` is irrelevant here: it is process-global and grows across
+    // turns on the long-lived sdk child, so a workflow intermediate in a later
+    // turn must not be read from it.
     let queued = result.queued_turn_count.unwrap_or(0);
-    let result_index = result.result_index.unwrap_or(0);
-    let settles_root_turn = if queued > 0 {
-        false
-    } else if mapper.open_workflows > 0 {
-        if result_index == 0 {
-            // Workflow still running behind its intermediate result.
-            false
-        } else {
-            // The workflow's final result ends the root turn; close one open
-            // workflow span (bounded so an unexpected extra result cannot
-            // underflow).
-            mapper.open_workflows = mapper.open_workflows.saturating_sub(1);
-            true
-        }
-    } else {
-        true
-    };
+    let settles_root_turn = mapper.turns.result_settles_root(queued);
     if settles_root_turn {
         related.insert("settledRootTurn".into(), "true".into());
     }
@@ -1691,13 +1916,13 @@ fn usage_from_result(
 
 fn map_task_started(mapper: &mut Mapper, task: &TaskStarted) -> DriverResult<Vec<Observation>> {
     let task_id = task.task_id.clone().unwrap_or_default();
-    // D-057 OA6 (ma-sdk-state r2): a background workflow opens a span whose
-    // first `result` (result_index 0) is not the end of the root turn. Track it
-    // so `map_result` can tell a workflow intermediate from a normal first
-    // turn's result. local_agent/local_bash are subagent/shell tasks that do
-    // not own the root result sequence.
+    // D-057 OA6 (ma-sdk-state r3): track the workflow's IDENTITY against the
+    // root turn that is currently emitting (the FIFO front), not a
+    // process-global count. The terminal task_notification closes it.
+    // local_agent/local_bash are subagent/shell tasks that do not own the root
+    // result sequence.
     if task.task_type.as_deref() == Some("local_workflow") {
-        mapper.open_workflows = mapper.open_workflows.saturating_add(1);
+        mapper.turns.workflow_started(&task_id);
     }
     let workflow_id = mapper.ids.workflow(&task_id)?;
     let tool_call_id = match &task.tool_use_id {
@@ -1760,13 +1985,21 @@ fn map_task_progress(mapper: &mut Mapper, task: &TaskProgress) -> DriverResult<V
 
 fn map_task_updated(mapper: &mut Mapper, task: &TaskUpdated) -> DriverResult<Vec<Observation>> {
     let task_id = task.task_id.clone().unwrap_or_default();
-    let workflow_id = mapper.ids.workflow(&task_id)?;
-    let status = task
+    // Defensive companion to `map_task_notification`: real captures carry the
+    // terminal patch (status=killed) one frame BEFORE the notification. Closing
+    // on either terminal signal means a missing/renamed notification can never
+    // strand the owning root turn in "working" forever.
+    let patch_status = task
         .patch
         .as_ref()
         .and_then(|patch| patch.get("status"))
         .and_then(Value::as_str)
-        .unwrap_or("unknown");
+        .unwrap_or("");
+    if workflow_status_is_terminal(patch_status) {
+        mapper.turns.workflow_terminated(&task_id);
+    }
+    let workflow_id = mapper.ids.workflow(&task_id)?;
+    let status = patch_status;
     Ok(vec![mapper.observation(
         Completeness::Structured,
         NativeRequestKey::None,
@@ -1795,6 +2028,16 @@ fn map_task_notification(
     task: &TaskNotification,
 ) -> DriverResult<Vec<Observation>> {
     let task_id = task.task_id.clone().unwrap_or_default();
+    // D-057 OA6 (ma-sdk-state r3): the terminal task_notification
+    // (stopped/completed/failed) is the evidence that closes a workflow — the
+    // later `result` never reliably does, because in real captures the single
+    // turn result arrives AFTER the notification with result_index 0 (the
+    // process-global index), and a finished workflow turn otherwise stays
+    // "working" forever.
+    let status = task.status.as_deref().unwrap_or("completed");
+    if workflow_status_is_terminal(status) {
+        mapper.turns.workflow_terminated(&task_id);
+    }
     let workflow_id = mapper.ids.workflow(&task_id)?;
     let tool_call_id = match &task.tool_use_id {
         Some(id) => Some(mapper.ids.tool(id)?),
@@ -1809,7 +2052,7 @@ fn map_task_notification(
             native_run_id: unknown("not-emitted"),
             native_task_id: Knowledge::Known { value: task_id },
             tool_call_id,
-            state: workflow_state(task.status.as_deref().unwrap_or("completed")),
+            state: workflow_state(status),
             revision: U64(3),
             title: match &task.summary {
                 Some(text) => Knowledge::Known {
@@ -1942,10 +2185,17 @@ impl Mapper {
     /// `turn/result` lifecycle from [`map_result`]; the Hub projects activity
     /// `working` from this event and `idle` only from that settled result.
     ///
+    /// Opening the turn in [`TurnBook`] HERE — at write completion, before the
+    /// observation is published — is what lets a later `result` be correlated
+    /// with its own root turn: the FIFO front is the turn currently emitting,
+    /// and a buffered older result mapped after a newer turn_started cannot
+    /// settle the newer turn.
+    ///
     /// The Remuda command id is owned by the Node and is not known here; the
     /// native client message id (echoed by the harness on its `user` record) is
     /// carried so a later fold can join the two.
     fn turn_started(&mut self, client_message_id: &str) -> DriverResult<Observation> {
+        self.turns.begin_turn();
         let mut related = std::collections::BTreeMap::new();
         if !client_message_id.is_empty() {
             related.insert("nativeClientMessageId".into(), client_message_id.into());
@@ -2675,7 +2925,7 @@ impl StdoutMapper {
                 driver_kind: driver,
                 channel: SourceChannel::Stdout,
                 media_stager: None,
-                open_workflows: 0,
+                turns: TurnBook::default(),
             },
         }
     }
@@ -2759,7 +3009,7 @@ impl TranscriptMapper {
                 driver_kind: driver,
                 channel: SourceChannel::Transcript,
                 media_stager: None,
-                open_workflows: 0,
+                turns: TurnBook::default(),
             },
             group: records::Group::default(),
             seen_prompts: std::collections::HashSet::new(),
@@ -3574,7 +3824,7 @@ pub mod review {
                     driver_kind: DriverKind::ClaudePrint,
                     channel: SourceChannel::Stdout,
                     media_stager: None,
-                    open_workflows: 0,
+                    turns: TurnBook::default(),
                 },
             }
         }
@@ -3605,7 +3855,7 @@ pub mod review {
             driver_kind: DriverKind::ClaudePrint,
             channel: SourceChannel::Stdout,
             media_stager: None,
-            open_workflows: 0,
+            turns: TurnBook::default(),
         };
         map_outbound(&mut mapper, &frame)
     }

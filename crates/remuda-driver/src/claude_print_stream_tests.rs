@@ -20,7 +20,7 @@ fn mapper() -> Mapper {
         driver_kind: DriverKind::ClaudePrint,
         channel: SourceChannel::Stdout,
         media_stager: None,
-        open_workflows: 0,
+        turns: TurnBook::default(),
     }
 }
 

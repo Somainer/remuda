@@ -265,9 +265,10 @@ where
 type WriteDone = tokio::sync::oneshot::Sender<Result<(), Error>>;
 
 enum WriterCmd {
-    /// A message on the fire-and-forget control/init path (no write ack).
+    /// An init/control message on the fire-and-forget path (no write ack).
     Message(Box<Inbound>),
-    /// A user turn whose caller awaits write completion.
+    /// A user turn whose caller awaits write completion. Rides the SAME FIFO
+    /// queue as every [`WriterCmd::Message`]; only its reporting differs.
     UserWrite(Box<Inbound>, WriteDone),
     Close,
 }
@@ -311,14 +312,115 @@ where
     }
 }
 
+/// One FIFO writer per spawned process. Cheap to clone: every copy enqueues
+/// into the SAME ordered command queue the single writer task drains, so a
+/// control request can never be written behind a prompt that was enqueued
+/// later (D-057 OA6 ma-sdk-state r3: FIFO across ALL commands).
+#[derive(Clone)]
+pub struct ProcessWriter {
+    tx: mpsc::Sender<WriterCmd>,
+}
+
+impl ProcessWriter {
+    async fn enqueue(&self, cmd: WriterCmd) -> Result<(), Error> {
+        self.tx.send(cmd).await.map_err(|_| Error::StdinClosed)
+    }
+
+    /// Send a user turn (`content` string or blocks).
+    ///
+    /// Resolves only once the NDJSON line has been written to the child's
+    /// stdin (write-completion ack), not merely queued in a driver channel —
+    /// so the caller can safely treat "written" as the turn start. A closed or
+    /// failed pipe propagates as [`Error::StdinClosed`].
+    ///
+    /// User turns ride the SAME queue as every control command: the oneshot
+    /// ack changes how THIS command reports completion, never the ordering.
+    pub async fn send_user(&self, content: UserContent) -> Result<(), Error> {
+        let message = Inbound::User(match content {
+            UserContent::Text(text) => UserMessage::text(text),
+            UserContent::Blocks(blocks) => UserMessage::blocks(blocks),
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.enqueue(WriterCmd::UserWrite(Box::new(message), tx))
+            .await?;
+        rx.await.map_err(|_| Error::StdinClosed)?
+    }
+
+    /// Answer a CLI control request with a success payload (permission camelCase).
+    pub async fn respond_control(
+        &self,
+        request_id: impl Into<String>,
+        result: ControlSuccessPayload,
+    ) -> Result<(), Error> {
+        self.enqueue(WriterCmd::Message(Box::new(Inbound::control_success(
+            request_id, result,
+        ))))
+        .await
+    }
+
+    /// Allow a `can_use_tool` request, echoing `updatedInput`.
+    pub async fn allow_tool(
+        &self,
+        request_id: impl Into<String>,
+        updated_input: serde_json::Value,
+    ) -> Result<(), Error> {
+        self.respond_control(
+            request_id,
+            ControlSuccessPayload::Permission(PermissionResult::Allow {
+                updated_input,
+                updated_permissions: None,
+            }),
+        )
+        .await
+    }
+
+    /// Send `interrupt`. Returns the new `request_id`.
+    pub async fn interrupt(&self, cancel_queued: bool) -> Result<String, Error> {
+        self.send_control(ControlRequest::Interrupt {
+            cancel_queued: Some(cancel_queued),
+        })
+        .await
+    }
+
+    /// Send `set_permission_mode`. Returns the new `request_id`.
+    pub async fn set_permission_mode(&self, mode: PermissionMode) -> Result<String, Error> {
+        let _ = mode.as_cli_str()?;
+        self.send_control(ControlRequest::SetPermissionMode { mode })
+            .await
+    }
+
+    /// Send `set_model`. Returns the new `request_id`.
+    pub async fn set_model(&self, model: Option<String>) -> Result<String, Error> {
+        self.send_control(ControlRequest::SetModel { model }).await
+    }
+
+    /// Request stdin EOF. FIFO: the EOF is written strictly after every command
+    /// already enqueued, so an in-flight prompt/control cannot be cut off.
+    pub async fn close_stdin(&self) -> Result<(), Error> {
+        self.enqueue(WriterCmd::Close).await
+    }
+
+    async fn send(&self, msg: Inbound) -> Result<(), Error> {
+        self.enqueue(WriterCmd::Message(Box::new(msg))).await
+    }
+
+    async fn send_control(&self, request: ControlRequest) -> Result<String, Error> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.send(Inbound::ControlRequest(ControlRequestEnvelope {
+            request_id: request_id.clone(),
+            request,
+        }))
+        .await?;
+        Ok(request_id)
+    }
+}
+
 /// Live Claude print process plus helpers that write stdin.
 pub struct ClaudeProcess {
     inbound: mpsc::Sender<Inbound>,
-    /// User-turn writes that resolve only once the line is on the child's
-    /// stdin (write-completion ack), separate from the fire-and-forget
-    /// control/init `inbound` channel.
-    user_writes: mpsc::Sender<WriterCmd>,
-    writer: mpsc::Sender<WriterCmd>,
+    /// FIFO stdin writer for this process; clonable so callers never have to
+    /// hold a process lock across a (possibly blocked) write await.
+    writer: ProcessWriter,
     child: Child,
     reader: JoinHandle<()>,
     writer_task: JoinHandle<()>,
@@ -375,43 +477,21 @@ impl ClaudeProcess {
         let stderr = child.stderr.take().ok_or(Error::MissingPipe("stderr"))?;
 
         let (pub_in_tx, mut pub_in_rx) = mpsc::channel::<Inbound>(64);
-        // Control/init fire-and-forget channel.
-        let (writer_tx, writer_rx) = mpsc::channel::<WriterCmd>(64);
-        // User-turn channel with a write-completion ack (item 3).
-        let (user_tx, user_rx) = mpsc::channel::<WriterCmd>(64);
+        // ONE FIFO queue for every stdin command — init/control messages, user
+        // turns (with their write-completion oneshot) and EOF. A separate user
+        // channel let a later prompt overtake an earlier control under the
+        // writer task's `select!`; a single queue drained by one task makes
+        // wire order identical to enqueue order (r3: FIFO across all commands).
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterCmd>(64);
         let (raw_out_tx, mut raw_out_rx) = mpsc::channel::<Outbound>(256);
         let (pub_out_tx, pub_out_rx) = mpsc::channel::<Outbound>(256);
 
         let writer_task = {
             let mut stdin = stdin;
-            // Serialize every stdin write through one loop; user writes report
-            // success/failure back on their oneshot. FIFO per channel, and the
-            // two channels are selected in declaration order so an init message
-            // queued at spawn precedes a user write.
-            let mut writer_rx = writer_rx;
-            let mut user_rx = user_rx;
             tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        // Biased is unnecessary: both arms run the same single
-                        // writer; ordering between independent control/user
-                        // lines is not meaningful beyond init-first.
-                        cmd = writer_rx.recv() => match cmd {
-                            Some(cmd) => {
-                                if !handle_writer_cmd(&mut stdin, cmd).await {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        },
-                        cmd = user_rx.recv() => match cmd {
-                            Some(cmd) => {
-                                if !handle_writer_cmd(&mut stdin, cmd).await {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        },
+                while let Some(cmd) = writer_rx.recv().await {
+                    if !handle_writer_cmd(&mut stdin, cmd).await {
+                        break;
                     }
                 }
             })
@@ -531,8 +611,7 @@ impl ClaudeProcess {
 
         let process = Self {
             inbound: pub_in_tx.clone(),
-            user_writes: user_tx,
-            writer: writer_tx,
+            writer: ProcessWriter { tx: writer_tx },
             child,
             reader,
             writer_task,
@@ -548,38 +627,32 @@ impl ClaudeProcess {
         &self.inbound
     }
 
+    /// Clonable FIFO handle to this process's stdin writer. Callers that must
+    /// not hold a lock across a (possibly blocked) write await — the driver's
+    /// `live` lock in particular — clone this out, drop the lock, and await on
+    /// the handle instead.
+    #[must_use]
+    pub fn writer(&self) -> ProcessWriter {
+        self.writer.clone()
+    }
+
     /// Child pid, if still known.
     pub fn id(&self) -> Option<u32> {
         self.child.id()
     }
 
-    /// Send a user turn (`content` string or blocks).
-    ///
-    /// Resolves only once the NDJSON line has been written to the child's
-    /// stdin (write-completion ack), not merely queued in a driver channel —
-    /// so the caller can safely treat "written" as the turn start. A closed or
-    /// failed pipe propagates as [`Error::StdinClosed`].
+    /// Send a user turn. See [`ProcessWriter::send_user`].
     pub async fn send_user(&self, content: UserContent) -> Result<(), Error> {
-        let message = Inbound::User(match content {
-            UserContent::Text(text) => UserMessage::text(text),
-            UserContent::Blocks(blocks) => UserMessage::blocks(blocks),
-        });
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.user_writes
-            .send(WriterCmd::UserWrite(Box::new(message), tx))
-            .await
-            .map_err(|_| Error::StdinClosed)?;
-        rx.await.map_err(|_| Error::StdinClosed)?
+        self.writer.send_user(content).await
     }
 
-    /// Answer a CLI control request with a success payload (permission camelCase).
+    /// Answer a CLI control request with a success payload.
     pub async fn respond_control(
         &self,
         request_id: impl Into<String>,
         result: ControlSuccessPayload,
     ) -> Result<(), Error> {
-        self.send(Inbound::control_success(request_id, result))
-            .await
+        self.writer.respond_control(request_id, result).await
     }
 
     /// Allow a `can_use_tool` request, echoing `updatedInput`.
@@ -588,43 +661,28 @@ impl ClaudeProcess {
         request_id: impl Into<String>,
         updated_input: serde_json::Value,
     ) -> Result<(), Error> {
-        self.respond_control(
-            request_id,
-            ControlSuccessPayload::Permission(PermissionResult::Allow {
-                updated_input,
-                updated_permissions: None,
-            }),
-        )
-        .await
+        self.writer.allow_tool(request_id, updated_input).await
     }
 
     /// Send `interrupt`. Returns the new `request_id`.
     pub async fn interrupt(&self, cancel_queued: bool) -> Result<String, Error> {
-        self.send_control(ControlRequest::Interrupt {
-            cancel_queued: Some(cancel_queued),
-        })
-        .await
+        self.writer.interrupt(cancel_queued).await
     }
 
     /// Send `set_permission_mode`. Returns the new `request_id`.
     pub async fn set_permission_mode(&self, mode: PermissionMode) -> Result<String, Error> {
-        let _ = mode.as_cli_str()?;
-        self.send_control(ControlRequest::SetPermissionMode { mode })
-            .await
+        self.writer.set_permission_mode(mode).await
     }
 
     /// Send `set_model`. Returns the new `request_id`.
     pub async fn set_model(&self, model: Option<String>) -> Result<String, Error> {
-        self.send_control(ControlRequest::SetModel { model }).await
+        self.writer.set_model(model).await
     }
 
     /// Close Claude stdin. The process exits after in-flight work (and
     /// background Workflow/subagent wait) once no more turns can be sent.
     pub async fn close_stdin(&self) -> Result<(), Error> {
-        self.writer
-            .send(WriterCmd::Close)
-            .await
-            .map_err(|_| Error::StdinClosed)
+        self.writer.close_stdin().await
     }
 
     /// SIGKILL the child. SIGTERM is **not** interrupt (exit 143, no `result`).
@@ -635,23 +693,6 @@ impl ClaudeProcess {
     /// Wait for the child to exit.
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus, Error> {
         Ok(self.child.wait().await?)
-    }
-
-    async fn send(&self, msg: Inbound) -> Result<(), Error> {
-        self.writer
-            .send(WriterCmd::Message(Box::new(msg)))
-            .await
-            .map_err(|_| Error::StdinClosed)
-    }
-
-    async fn send_control(&self, request: ControlRequest) -> Result<String, Error> {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        self.send(Inbound::ControlRequest(ControlRequestEnvelope {
-            request_id: request_id.clone(),
-            request,
-        }))
-        .await?;
-        Ok(request_id)
     }
 }
 

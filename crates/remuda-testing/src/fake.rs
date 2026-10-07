@@ -57,6 +57,21 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // 64-slot writer channel, which is what made `close_stdin` itself able to
     // hang — a behaviour the close ladder has to bound.
     let stop_reading = std::env::var("FAKE_CLAUDE_STOP_READING").is_ok_and(|value| value == "1");
+    // `FAKE_CLAUDE_CLOSE_STDIN=1`: after the handshake, CLOSE our stdin fd and
+    // keep running with stdout open. The parent's next write then fails
+    // BrokenPipe while the process is still alive — unlike shutdown/EOF, which
+    // the driver itself initiates and maps to ControlUnavailable. This is the
+    // only way to exercise "the write itself errored" deterministically.
+    let close_stdin = std::env::var("FAKE_CLAUDE_CLOSE_STDIN").is_ok_and(|value| value == "1");
+    // `FAKE_CLAUDE_STDOUT_FLOOD=1`: after the handshake, never read stdin again
+    // and keep emitting frames on stdout forever. Bidirectional pipe pressure:
+    // the parent must keep draining stdout while a write is blocked on the
+    // full stdin pipe, otherwise close deadlocks.
+    let stdout_flood = std::env::var("FAKE_CLAUDE_STDOUT_FLOOD").is_ok_and(|value| value == "1");
+    // `FAKE_CLAUDE_STDIN_FILE=<path>`: append one marker per inbound frame in
+    // read order, so a test can assert the exact FIFO order the child saw
+    // (control-then-prompt, interrupt-then-prompt, …).
+    let stdin_file = std::env::var("FAKE_CLAUDE_STDIN_FILE").ok();
     if std::env::args()
         .skip(1)
         .any(|arg| arg == "--version" || arg == "-V")
@@ -115,11 +130,25 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
             continue;
         }
         let incoming: Value = serde_json::from_str(trimmed)?;
+        if let Some(path) = &stdin_file {
+            record_stdin_marker(path, &incoming);
+        }
         session.handle_incoming(incoming, &mut lines)?;
-        // Handshake done; from here the child never drains stdin. The parent
-        // stdin watch is suppressed for this knob (see parent_watch); the
-        // getppid() poll still reaps us when the test really goes away.
-        if stop_reading && session.saw_initialize {
+        if session.saw_initialize && (close_stdin || stdout_flood || stop_reading) {
+            // All three knobs park here with the process alive and stdout open;
+            // the parent-death watch reaps us when the test goes away.
+            #[cfg(unix)]
+            if close_stdin {
+                // Drop our read end of the stdin pipe. `std::io::stdin()` only
+                // borrows fd 0, so dropping the lock would leave the pipe's
+                // read end open; close the fd outright (nix is a safe wrapper,
+                // and unsafe is forbidden workspace-wide).
+                let _ = nix::unistd::close(0);
+            }
+            if stdout_flood {
+                flood_stdout();
+            }
+            // Handshake done; from here the child never drains stdin.
             std::thread::sleep(std::time::Duration::from_secs(300));
         }
     }
@@ -382,6 +411,50 @@ fn emit(value: &Value) -> Result<(), FakeClaudeError> {
     writeln!(out, "{}", serde_json::to_string(value)?)?;
     out.flush()?;
     Ok(())
+}
+
+/// Append one FIFO marker describing an inbound frame to `path` (best effort):
+/// `user`, `control_response`, or `control_request:<subtype>` (e.g.
+/// `control_request:interrupt`). Lets a test assert the exact wire order the
+/// child read, which is the order the single writer queue must preserve.
+fn record_stdin_marker(path: &str, incoming: &Value) {
+    let marker = match incoming.get("type").and_then(Value::as_str) {
+        Some("control_request") => incoming
+            .pointer("/request/subtype")
+            .and_then(Value::as_str)
+            .map(|subtype| format!("control_request:{subtype}"))
+            .unwrap_or_else(|| "control_request".into()),
+        Some(other) => other.to_owned(),
+        None => "unknown".to_owned(),
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{marker}");
+    }
+}
+
+/// Emit valid stream-json frames forever without touching stdin again. The
+/// loop backpressures naturally on the stdout pipe if the parent ever stops
+/// draining — which is exactly the deadlock the bidirectional-pressure test
+/// must prove cannot happen while a stdin write is blocked.
+fn flood_stdout() -> ! {
+    let mut stdout = io::stdout().lock();
+    let mut n: u64 = 0;
+    loop {
+        let _ = writeln!(stdout, "{}", json!({ "type": "keep_alive" }));
+        let frame = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_flood",
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": format!("flood {n}") }]
+            }
+        });
+        let _ = writeln!(stdout, "{frame}");
+        let _ = stdout.flush();
+        n = n.wrapping_add(1);
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
 }
 
 fn initialize_success(request_id: &str) -> Value {

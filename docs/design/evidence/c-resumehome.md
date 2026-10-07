@@ -315,3 +315,68 @@ macOS-specific code paths (to be run on the Mac before gating): the anchor
 `/private/var/folders` fixed-temp base (`sandbox.rs:51-63`), and the
 POSIX flags shared by Linux/macOS (`O_NOFOLLOW|O_DIRECTORY|O_NONBLOCK`,
 `fstatat(AT_SYMLINK_NOFOLLOW)`, exact `S_IFMT`, `lib.rs:234,267-286,522`).
+
+## Round 5 — pinned-root walks, macOS physical slug, owned inodes (2026-10-07)
+
+Review of `38ec51ef` (codex REJECT, grok REJECT) plus the coordinator's macOS
+aarch64-darwin run. One principle covers most findings: **never canonicalise
+or trust anything below a pinned root; walk every descendant from the pinned
+fd with O_NOFOLLOW; never keep an inode you did not just write unless
+provenance proves it.**
+
+### Part 1 — macOS
+
+The coordinator run failed 5 driver and 3 fake_harness tests; the first four
+driver failures shared one cause: the anchor canonicalised the trusted ROOT,
+but the project SLUG was derived inconsistently. On macOS `getcwd()` in a
+shell that `cd`'d through a `/var -> /private/var` symlink returns the
+PHYSICAL path, which is exactly the slug Claude Code uses. Fix: the slug is
+computed once from the physical cwd (`slug_for`) and agrees for source
+enumeration, destination publish and tests; canonicalising the home ROOT no
+longer changes the cwd slug. The unix-socket sidecar test bound in a long
+std-`tempfile` path exceeding macOS `sun_path` (104); it now binds in a
+randomised short `/tmp/f<hex>` 0700 scratch dir with an explicit path-length
+assertion. The FIFO process regression derives the physical slug before
+spawning and asserts the specific non-regular-file refusal.
+
+### Part 2 — fd-hardening
+
+- **Anchors (item 1).** `anchor_existing`/`anchor_or_create` lstat the path:
+  only a real directory is pinnable (a trailing symlink-to-directory is
+  refused); that one ancestor is realpath'd once; every component below is
+  walked/created O_NOFOLLOW. Source staging and the Node's
+  `readable_regular_file` pin the predecessor HOME and walk `projects/<slug>`
+  (a `home/projects -> /outside` link fails); the destination native-home
+  anchor refuses a symlinked home itself.
+- **Owned inodes (items 3/4).** Markerless byte-identical recovery renameats
+  the freshly written O_EXCL temp copy over the destination, so a planted
+  hardlink to an identical outside file is replaced (published inode has
+  nlink==1). A matching marker re-hashes the OPENED destination fd and
+  replaces when `nlink > 1` or the inode changed. Cross-home SIDECAR
+  hardlinks are always replaced by the independent staged copy.
+- **Inherited no-op (item 5).** The same-file same-directory no-op validates
+  the `<S>/` and `memory/` sidecar roots through pinned fds before returning.
+- **Fake sandbox (item 2).** `open_append_file`/`write_allowed_file`
+  authorise as (pinned allocated-root fd, relative path) and walk
+  descendants O_NOFOLLOW — they never re-anchor a descendant.
+  `private_temp_home` uses a random exclusive name, verifies uid+mode on the
+  fd, and cleans only what it created.
+- **Random allocation (item 6).** fdsafe test scratch dirs and the fake
+  private home are randomised exclusive mkdirat with uid/0700 verification.
+- **Staging diagnostics (item 8).** Skipped sidecars propagate into the
+  materialisation result; the observation pump journals a warning
+  `NativeLifecycle` diagnostic (`severity: Warning`,
+  `affects_completion: false`, `skippedSidecars`) on the native lifecycle
+  channel, mirrored by `tracing::warn`.
+
+Tests: fdsafe 11 (anchor trailing-symlink refusal, exclusive mkdir, short
+socket path); driver `claude_transcript` 48 (source/destination projects
+symlink refusal, foreign-inode markerless hardlink replacement, cross-home
+sidecar hardlink replacement, no-op sidecar-root validation, physical slug
+under a symlinked ancestor, plus all r3/r4 cases); `fake_home_guard` 6
+(physical-slug FIFO process, short-path socket); `fake_harness` 25 (Claude
+resume with only `H/projects` replaced by a symlink into a valid external
+`<slug>/<S>.jsonl` tree: non-zero exit, external bytes unchanged). Linux
+fmt + four-crate clippy `-D warnings` and the gated `nice cargo test
+--workspace` green; the coordinator re-runs fdsafe/testing/driver
+claude_transcript on the Mac.

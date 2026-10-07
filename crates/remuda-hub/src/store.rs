@@ -728,7 +728,11 @@ pub struct LineageChapter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chapter_cause: Option<String>,
     pub created_at: String,
-    /// Last update once the chapter reached an ended lifecycle.
+    /// Timestamp of the chapter's PROCESS-END evidence (the observedAt of the
+    /// classified end event / a by-construction scheduler end), stamped once
+    /// and immutable. NULL while the chapter is live or when no end evidence
+    /// has been recorded (host loss and ambiguous legacy failures leave it
+    /// NULL — the process may still be running).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
     /// When authority moved to the successor.

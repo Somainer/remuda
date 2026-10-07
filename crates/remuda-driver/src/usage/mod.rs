@@ -177,7 +177,7 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
-    fn add(&mut self, event: &UsageEvent) {
+    pub(crate) fn add(&mut self, event: &UsageEvent) {
         self.events += 1;
         self.tokens.uncached_input += event.tokens.uncached_input;
         self.tokens.output += event.tokens.output;

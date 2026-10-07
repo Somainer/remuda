@@ -1538,38 +1538,40 @@ fn usage_from_result(
         amount: amount.to_string(),
         currency: "USD".into(),
     });
-    Ok(Some(
-        mapper.observation(
-            Completeness::Structured,
-            NativeRequestKey::None,
-            ObservationPayload::Usage(Box::new(UsagePayload {
-                usage_id: Id::new("obj")?,
-                scope: UsageScope::Turn,
-                scope_id: result
-                    .result_index
-                    .map(|index| index.to_string())
-                    .unwrap_or_else(|| "0".into()),
-                mode: UsageMode::Snapshot,
-                metric_revision: U64(result.result_index.unwrap_or(0) + 1),
-                input_tokens: opt_u64(input),
-                input_accounting: InputAccounting::Unknown,
-                output_tokens: opt_u64(output),
-                reasoning_tokens: unknown("not-emitted"),
-                cache_read_tokens: unknown("not-emitted"),
-                cache_write_tokens: unknown("not-emitted"),
-                total_tokens: match (input, output) {
-                    (Some(a), Some(b)) => Knowledge::Known { value: U64(a + b) },
-                    _ => unknown("partial"),
-                },
-                cost: match cost {
-                    Some(cost) => Knowledge::Known { value: cost },
-                    None => unknown("not-emitted"),
-                },
-                accounting: remuda_protocol::Accounting::Reported,
-                native_fields_ref: None,
-            })),
-        )?,
-    ))
+    Ok(Some(mapper.observation(
+        Completeness::Structured,
+        NativeRequestKey::None,
+        ObservationPayload::Usage(Box::new(UsagePayload {
+            usage_id: Id::new("obj")?,
+            scope: UsageScope::Turn,
+            scope_id: match (result.num_turns, result.result_index) {
+                // Stable across turns AND the two workflow sub-results: the
+                // Hub durably dedupes on (instance, scope, scope_id).
+                (Some(turn), Some(index)) => format!("{turn}:{index}"),
+                (Some(turn), None) => turn.to_string(),
+                (None, Some(index)) => index.to_string(),
+                (None, None) => "0".into(),
+            },
+            mode: UsageMode::Snapshot,
+            metric_revision: U64(result.result_index.unwrap_or(0) + 1),
+            input_tokens: opt_u64(input),
+            input_accounting: InputAccounting::Unknown,
+            output_tokens: opt_u64(output),
+            reasoning_tokens: unknown("not-emitted"),
+            cache_read_tokens: unknown("not-emitted"),
+            cache_write_tokens: unknown("not-emitted"),
+            total_tokens: match (input, output) {
+                (Some(a), Some(b)) => Knowledge::Known { value: U64(a + b) },
+                _ => unknown("partial"),
+            },
+            cost: match cost {
+                Some(cost) => Knowledge::Known { value: cost },
+                None => unknown("not-emitted"),
+            },
+            accounting: remuda_protocol::Accounting::Reported,
+            native_fields_ref: None,
+        })),
+    )?))
 }
 
 fn map_task_started(mapper: &mut Mapper, task: &TaskStarted) -> DriverResult<Vec<Observation>> {
@@ -2747,15 +2749,35 @@ impl TranscriptMapper {
     /// message of a transcript would otherwise sit in the buffer forever. The
     /// tailer calls this when it reaches the end of the available input.
     pub fn flush(&mut self) -> DriverResult<Vec<Observation>> {
-        self.flush_group()
+        self.flush_group(false)
     }
 
-    /// Emit the buffered assistant run, if there is one.
-    fn flush_group(&mut self) -> DriverResult<Vec<Observation>> {
-        let Some(record) = self.group.flush() else {
+    /// Flush the buffered assistant run.
+    ///
+    /// `force` is true when the run is known complete for a reason other than
+    /// seeing its stop_reason (a superseding message or a user record):
+    /// content is always emitted, but usage is finalised only when forced OR
+    /// the group observed a `message.stop_reason`. A plain poll-boundary flush
+    /// (`force=false`, no stop) emits content only, so a message split across
+    /// polls can never publish a partial first usage snapshot (c-ctxusage r2
+    /// item 3 — the durable index would otherwise freeze the partial values).
+    fn flush_group(&mut self, force: bool) -> DriverResult<Vec<Observation>> {
+        let Some(flushed) = self.group.flush() else {
             return Ok(Vec::new());
         };
-        self.emit_conversation(record)
+        let mut out = self.emit_conversation(flushed.record)?;
+        if (force || flushed.finalized)
+            && let Some(usage) = flushed.usage
+            && let Some(obs) = self.usage_from_usage_object(
+                &flushed.message_id,
+                flushed.request_id.as_deref(),
+                flushed.model.as_deref(),
+                &usage,
+            )?
+        {
+            out.push(obs);
+        }
+        Ok(out)
     }
 
     /// Hand one already-assembled record to the stdout mapper.
@@ -2806,7 +2828,58 @@ impl TranscriptMapper {
                 }
             }
         }
+        // Usage is emitted by flush_group only when the group finalises (a
+        // stop_reason was seen or the run was superseded), never on a poll
+        // boundary mid-message (c-ctxusage r2 item 3).
         Ok(out)
+    }
+
+    /// Emit one [`ObservationPayload::Usage`] for a finalised assistant
+    /// message group from the group's last `message.usage`.
+    ///
+    /// D-056/context-usage: native TUI usage lives only in transcript records.
+    /// Scope is `Turn`; scope_id is the message id, namespaced with the
+    /// requestId when present (c-ctxusage r2 item 2) so distinct requests can
+    /// never collide. Counters come from the LAST block (never a sum); the Hub
+    /// durably dedupes on `(instance_id, scope, scope_id)`.
+    fn usage_from_usage_object(
+        &mut self,
+        message_id: &str,
+        request_id: Option<&str>,
+        model: Option<&str>,
+        usage: &Value,
+    ) -> DriverResult<Option<Observation>> {
+        if message_id.is_empty() {
+            return Ok(None);
+        }
+        // Key on message id, namespaced with the request when one is known.
+        let scope_id = match request_id {
+            Some(req) if !req.is_empty() => format!("{req}:{message_id}"),
+            _ => message_id.to_owned(),
+        };
+        let event = match crate::usage::claude::usage_from_message_usage(
+            Some(message_id),
+            request_id,
+            model,
+            usage,
+        ) {
+            Some(event) => event,
+            None => return Ok(None),
+        };
+        let mut totals = crate::usage::UsageTotals::default();
+        totals.add(&event);
+        let mut payload =
+            crate::usage::to_usage_payload(UsageScope::Turn, scope_id.clone(), 1, &totals);
+        payload.usage_id = remuda_protocol::Id::derive(
+            "obj",
+            self.mapper.instance_id.as_id().as_str(),
+            &format!("usage:turn:{scope_id}"),
+        )?;
+        Ok(Some(self.mapper.observation(
+            Completeness::Structured,
+            remuda_protocol::NativeRequestKey::None,
+            ObservationPayload::Usage(Box::new(payload)),
+        )?))
     }
 
     /// Map one decoded transcript record.
@@ -2839,7 +2912,7 @@ impl TranscriptMapper {
             "assistant" => self.map_assistant_record(value),
             "user" => {
                 // Any user record ends the assistant run before it.
-                let mut out = self.flush_group()?;
+                let mut out = self.flush_group(true)?;
                 out.extend(self.map_user_record(value)?);
                 Ok(out)
             }
@@ -3181,7 +3254,7 @@ impl TranscriptMapper {
         let Some(key) = records::GroupKey::of(&value, &message) else {
             // No `message.id` to group on — replay it on its own rather than
             // dropping a real assistant turn.
-            let mut out = self.flush_group()?;
+            let mut out = self.flush_group(true)?;
             out.extend(self.emit_conversation(value)?);
             return Ok(out);
         };
@@ -3189,7 +3262,7 @@ impl TranscriptMapper {
             self.group.push(&value, &message);
             return Ok(Vec::new());
         }
-        let out = self.flush_group()?;
+        let out = self.flush_group(true)?;
         self.group.start(key, value.clone());
         self.group.push(&value, &message);
         Ok(out)

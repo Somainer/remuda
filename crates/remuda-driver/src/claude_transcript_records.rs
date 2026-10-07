@@ -170,7 +170,30 @@ pub(crate) struct Group {
     blocks: Vec<(Option<u64>, usize, Value)>,
     /// The record the assembled message inherits its envelope from.
     head: Option<Value>,
+    /// The LAST record's `message.usage` for the group. Every block repeats
+    /// the same usage; we keep the last one explicitly (never a sum) so the
+    /// emitted usage snapshot is the final per-call counters.
+    last_usage: Option<Value>,
+    /// True once a buffered record carried a non-null `message.stop_reason`:
+    /// that is the point a model message is final, so usage may be finalised.
+    /// A poll-boundary flush without it is an in-flight message split across
+    /// polls and must NOT emit usage (c-ctxusage r2 item 3).
+    saw_stop_reason: bool,
     seen: usize,
+}
+
+/// What a [`Group::flush`] hands back: the assembled record, its final usage
+/// (when the message carried one), and whether the message is final.
+pub(crate) struct FlushedGroup {
+    pub record: Value,
+    /// Assistant message id (`message.id`).
+    pub message_id: String,
+    /// Top-level `requestId` when the record carried one.
+    pub request_id: Option<String>,
+    /// Model from `message.model` or the top-level record.
+    pub model: Option<String>,
+    pub usage: Option<Value>,
+    pub finalized: bool,
 }
 
 impl Group {
@@ -188,13 +211,29 @@ impl Group {
     /// Start a new run at `key`, carrying `record` as the envelope source.
     pub(crate) fn start(&mut self, key: GroupKey, record: Value) {
         self.key = Some(key);
-        self.head = Some(record);
+        self.head = Some(record.clone());
+        self.last_usage = record
+            .pointer("/message/usage")
+            .filter(|value| value.is_object())
+            .cloned();
+        self.saw_stop_reason = record
+            .pointer("/message/stop_reason")
+            .and_then(Value::as_str)
+            .is_some();
         self.blocks.clear();
         self.seen = 0;
     }
 
     /// Buffer one record's content blocks.
     pub(crate) fn push(&mut self, record: &Value, message: &Value) {
+        // The last block record carries the final usage for the message; keep
+        // the most recent object-shaped usage seen.
+        if let Some(usage) = message.get("usage").filter(|value| value.is_object()) {
+            self.last_usage = Some(usage.clone());
+        }
+        if message.get("stop_reason").and_then(Value::as_str).is_some() {
+            self.saw_stop_reason = true;
+        }
         let index = record.get("apiBlockIndex").and_then(Value::as_u64);
         let Some(blocks) = message.get("content").and_then(Value::as_array) else {
             return;
@@ -209,18 +248,46 @@ impl Group {
     ///
     /// Ordering is by `(apiBlockIndex, arrival)`. Records without the field —
     /// every record in claude 2.1.221 — keep pure file order, which is the
-    /// order Claude appended them in and therefore already correct.
-    pub(crate) fn flush(&mut self) -> Option<Value> {
+    /// order Claude appended them in and therefore already correct. The
+    /// assembled record carries the last `usage`; [`FlushedGroup::finalized`]
+    /// tells the caller whether it may publish that usage (a stop_reason was
+    /// seen) or whether the message was merely flushed at a poll boundary
+    /// while still in flight.
+    pub(crate) fn flush(&mut self) -> Option<FlushedGroup> {
         let mut head = self.head.take()?;
         let mut blocks = std::mem::take(&mut self.blocks);
+        let usage = self.last_usage.take();
+        let finalized = self.saw_stop_reason;
         self.key = None;
+        self.saw_stop_reason = false;
         self.seen = 0;
+        let message_id = head
+            .pointer("/message/id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let request_id = head
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let model = head
+            .pointer("/message/model")
+            .or_else(|| head.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         blocks.sort_by_key(|(index, arrival, _)| (index.unwrap_or(0), *arrival));
         let content: Vec<Value> = blocks.into_iter().map(|(_, _, block)| block).collect();
         if let Some(message) = head.get_mut("message").and_then(Value::as_object_mut) {
             message.insert("content".into(), Value::Array(content));
         }
-        Some(head)
+        Some(FlushedGroup {
+            record: head,
+            message_id,
+            request_id,
+            model,
+            usage,
+            finalized,
+        })
     }
 }
 
@@ -402,7 +469,9 @@ mod tests {
         assert!(group.continues(&key), "the second record continues the run");
         group.push(&second, &second["message"]);
         let flushed = group.flush().expect("flush");
-        let content = flushed["message"]["content"].as_array().expect("content");
+        let content = flushed.record["message"]["content"]
+            .as_array()
+            .expect("content");
         assert_eq!(content.len(), 2, "both blocks land in one message");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "tool_use");
@@ -429,7 +498,9 @@ mod tests {
         group.push(&late, &late["message"]);
         group.push(&early, &early["message"]);
         let flushed = group.flush().expect("flush");
-        let content = flushed["message"]["content"].as_array().expect("content");
+        let content = flushed.record["message"]["content"]
+            .as_array()
+            .expect("content");
         assert_eq!(content[0]["type"], "text", "index 0 sorts first");
         assert_eq!(content[1]["type"], "tool_use");
     }

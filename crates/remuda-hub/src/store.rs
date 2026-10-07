@@ -2674,16 +2674,22 @@ impl Store {
                 let rows = stmt.query_map(params![&now, grace], |row| row.get::<_, String>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
+            // ma-lineage r5 item 1: host loss is CONTACT loss, never process
+            // end (D-019) — do NOT stamp ended_at. The row is exited +
+            // host-lost with no end time, so continuation treats it as
+            // potentially live and closes the possibly-alive predecessor
+            // before resuming; a same-epoch daemon reconcile reporting running
+            // clears the exit.
             let changed = tx.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                    connectivity = 'disconnected', last_error = 'host-lost',
-                    updated_at = ?1, ended_at = COALESCE(ended_at, ?1)
+                    connectivity = 'disconnected', last_error = ?3,
+                    updated_at = ?1
                  WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
                     SELECT id FROM hosts WHERE state != 'online' AND
                     (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
                     (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
                  )",
-                params![&now, grace],
+                params![&now, grace, HOST_LOST_MARKER],
             )?;
             let settlement = settle_instance_interactions(&tx, &lost, &now)?;
             tx.commit()?;
@@ -11915,6 +11921,13 @@ fn stamp_ended_at(conn: &Connection, instance_id: &str, at: &str) -> Result<(), 
     Ok(())
 }
 
+/// The `last_error` marker `expire_lost_hosts` stamps when the Hub loses
+/// contact with a host past grace. Host loss is CONTACT loss, never process
+/// end (D-019: the process keeps running and is reconciled when the host
+/// returns): such an `exited` row is treated as potentially live until it
+/// carries a real `ended_at`.
+pub(crate) const HOST_LOST_MARKER: &str = "host-lost";
+
 /// `last_error` markers that ATTEST a launch never started even when an older
 /// row has no `ended_at` yet (ma-lineage r4 item 1).
 fn is_attested_launch_failure_marker(last_error: &str) -> bool {
@@ -11945,7 +11958,14 @@ pub(crate) fn lifecycle_has_process_end_evidence(
     ended_at: Option<&str>,
 ) -> bool {
     match lifecycle {
-        "exited" | "closed" => true,
+        "closed" => true,
+        "exited" => {
+            // Genuine once an end time is recorded; otherwise only a
+            // host-lost sweep exit (contact loss) is treated as potentially
+            // live — any other/absent marker is a real exit.
+            ended_at.is_some()
+                || last_error.is_none_or(|error| error != HOST_LOST_MARKER)
+        }
         "failed" => ended_at.is_some() || last_error.is_some_and(is_attested_launch_failure_marker),
         _ => false,
     }

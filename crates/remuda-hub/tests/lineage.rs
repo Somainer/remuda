@@ -981,6 +981,64 @@ async fn ended_at_backfill_skips_an_end_followed_by_return_to_live() -> Result<(
     Ok(())
 }
 
+
+// --- 1a. Host loss is contact loss, never process end (ma-lineage r5 item 1)
+
+/// A seat whose HOST link is lost past grace is marked exited+host-lost but
+/// keeps no ended_at (D-019: the process may still be running). When the same
+/// host reconnects with the node alive, continuing the seat closes the
+/// predecessor before resuming, and the chapter's endedAt stays null
+/// throughout.
+#[tokio::test]
+async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // Mark the host offline (as the WS-disconnect / boot sweep would), then
+    // run the host-lost sweep at grace 0 directly (the periodic sweeper uses
+    // the same path with a real grace window).
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE hosts SET state = 'unreachable', offline_since = '2000-01-01T00:00:00.000Z'
+             WHERE id = ?1",
+            rusqlite::params![ctx.host],
+        )?;
+    }
+    let (changed, _settlement) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
+    assert_eq!(changed, 1, "the seat's row is host-lost");
+    let row = ctx.get_instance(&x, &ctx.human).await?;
+    assert_eq!(row["lifecycle"], json!("exited"), "{row}");
+    assert_eq!(row["lastError"], json!("host-lost"), "{row}");
+    assert_eq!(
+        first_chapter_ended_at(&ctx, &x).await?,
+        None,
+        "host loss stamps no endedAt: the process may still be running"
+    );
+
+    // The node is still connected (same epoch). Continuation closes the
+    // possibly-alive predecessor BEFORE the successor resume.
+    let response: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = response["instance"]["instanceId"].as_str().unwrap().to_owned();
+    assert_ne!(x, y, "host-lost continues into a new chapter");
+
+    let (method, close_params) = node.next_frame().await?;
+    assert_eq!(method, "instance.close", "the potentially live predecessor is closed");
+    assert_eq!(close_params["instanceId"], json!(x));
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    assert_eq!(first_chapter_ended_at(&ctx, &x).await?, None);
+    Ok(())
+}
+
 // --- 2. Ended chapter + host offline ------------------------------------
 
 #[tokio::test]

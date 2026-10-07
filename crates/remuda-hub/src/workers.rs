@@ -581,6 +581,7 @@ pub(crate) async fn dispatch_core(
         grants: Vec::new(),
         task_id: task.as_ref().map(|task| task.meta.id.as_id().to_string()),
         enforce_tree: true,
+        restart: None,
     };
     // Capture what a rollback needs before the block below moves these.
     let rollback_name = name.clone();

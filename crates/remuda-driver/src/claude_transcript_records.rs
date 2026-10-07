@@ -176,6 +176,16 @@ pub(crate) struct Group {
     key: Option<GroupKey>,
     /// The record the assembled message inherits its envelope from.
     head: Option<Value>,
+    /// Envelope of the FIRST record whose blocks are not drained yet.
+    ///
+    /// `head` is always the run's FIRST record (kept for key/model/usage
+    /// provenance), but a content drain must forward the envelope of the
+    /// record whose blocks it actually carries: a second poll drains a later
+    /// record, which has its OWN uuid. Reusing `head`'s uuid made the stdout
+    /// mapper reject the assembled frame as an already-seen snapshot AFTER the
+    /// blocks were taken, dropping every later block of one message
+    /// (c-ctxusage r4 item 1 regression).
+    pending_head: Option<Value>,
     /// `(apiBlockIndex, arrival order, block)` not yet drained as content.
     blocks: Vec<(Option<u64>, usize, Value)>,
     /// The LAST record's `message.usage` for the group (never a sum): the final
@@ -233,6 +243,7 @@ impl Group {
     pub(crate) fn start(&mut self, key: GroupKey, record: Value) {
         self.key = Some(key);
         self.head = Some(record.clone());
+        self.pending_head = None;
         self.blocks.clear();
         self.last_usage = None;
         self.last_usage_at = None;
@@ -267,6 +278,11 @@ impl Group {
         let Some(blocks) = message.get("content").and_then(Value::as_array) else {
             return;
         };
+        if self.blocks.is_empty() {
+            // Earliest record not yet drained: its envelope carries the next
+            // drain's uuid.
+            self.pending_head = Some(record.clone());
+        }
         for block in blocks {
             self.blocks.push((index, self.seen, block.clone()));
             self.seen += 1;
@@ -289,11 +305,13 @@ impl Group {
     /// Drain only the content blocks not yet sent, assembled on the retained
     /// envelope. Does NOT touch the usage/key/stop state.
     pub(crate) fn drain_content(&mut self) -> Option<DrainedContent> {
-        let head = self.head.as_ref()?;
         if self.blocks.is_empty() {
             return None;
         }
-        let mut assembled = head.clone();
+        // The first undrained record's envelope; fall back to `head` only for
+        // robustness (a record with blocks always set `pending_head`).
+        let envelope = self.pending_head.take().or_else(|| self.head.clone())?;
+        let mut assembled = envelope;
         let mut blocks = std::mem::take(&mut self.blocks);
         blocks.sort_by_key(|(index, arrival, _)| (index.unwrap_or(0), *arrival));
         let content: Vec<Value> = blocks.into_iter().map(|(_, _, block)| block).collect();

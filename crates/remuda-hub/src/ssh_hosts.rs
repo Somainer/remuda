@@ -935,7 +935,10 @@ mod tests {
             )
             .await
             .unwrap();
-        store.ssh_status(host.clone(), "online", None).await.unwrap();
+        store
+            .ssh_status(host.clone(), "online", None)
+            .await
+            .unwrap();
         let instance = store
             .insert_instance(
                 host.clone(),
@@ -982,9 +985,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.lifecycle, "running", "daemon running report revives the row");
+        assert_eq!(
+            row.lifecycle, "running",
+            "daemon running report revives the row"
+        );
         assert_eq!(row.connectivity, "connected");
-        assert!(row.last_error.is_none(), "host-lost marker cleared: {row:?}");
+        assert!(
+            row.last_error.is_none(),
+            "host-lost marker cleared: {row:?}"
+        );
         store.close().await;
     }
 }

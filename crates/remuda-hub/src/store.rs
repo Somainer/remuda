@@ -833,8 +833,27 @@ impl Default for InstanceDelegation {
     }
 }
 
-/// Lifecycles that still occupy coordinator seats (design §2.5 uniqueness).
-const ACTIVE_HOLDER_SQL: &str = "lifecycle NOT IN ('exited', 'failed', 'closed')";
+/// A row is "live enough to occupy a seat / fan-out slot" unless it carries
+/// DEFINITE process-end evidence — the SQL mirror of
+/// [`lifecycle_has_process_end_evidence`] (ma-lineage r5 item 7).
+///
+/// Occupies:
+/// * any non-terminal lifecycle (requested/starting/running/…);
+/// * an ambiguous terminal row with no end evidence — an `exited` host-lost
+///   contact-loss row, or a legacy `failed` row a turn/configure error marked
+///   while the process was alive. Such a row is potentially live and must keep
+///   holding its seat/fan-out slot so a second live credential/child cannot
+///   appear; continuation closes the process before taking the slot.
+const SEAT_OCCUPIED_SQL: &str = "(
+        lifecycle NOT IN ('exited', 'failed', 'closed')
+        OR (lifecycle = 'exited' AND ended_at IS NULL
+            AND COALESCE(last_error, '') = 'host-lost')
+        OR (lifecycle = 'failed' AND ended_at IS NULL
+            AND LOWER(COALESCE(last_error, '')) <> 'create-never-acknowledged'
+            AND LOWER(COALESCE(last_error, '')) NOT LIKE '%start-fail%'
+            AND LOWER(COALESCE(last_error, '')) NOT LIKE '%start failed%'
+            AND LOWER(COALESCE(last_error, '')) NOT LIKE '%never started%')
+    )";
 
 /// Enforce the two §2.5 seat rules inside the writer thread.
 ///
@@ -854,7 +873,7 @@ fn enforce_grant_uniqueness(
         let exists: bool = conn
             .query_row(
                 &format!(
-                    "SELECT 1 FROM instances WHERE {ACTIVE_HOLDER_SQL}
+                    "SELECT 1 FROM instances WHERE {SEAT_OCCUPIED_SQL}
                  AND fenced_at IS NULL
                  AND grants_json LIKE '%\"address-owner\"%' LIMIT 1"
                 ),
@@ -878,7 +897,7 @@ fn enforce_grant_uniqueness(
             let exists: bool = conn
                 .query_row(
                     &format!(
-                        "SELECT 1 FROM instances WHERE {ACTIVE_HOLDER_SQL}
+                        "SELECT 1 FROM instances WHERE {SEAT_OCCUPIED_SQL}
                      AND fenced_at IS NULL
                      AND grants_json LIKE '%\"dispatch\"%'
                      AND scope_json LIKE ?1 LIMIT 1"
@@ -1144,8 +1163,17 @@ pub(crate) fn count_active_lineage_children(
     let count: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT COALESCE(child.lineage_id, child.id))
          FROM instances child
-         WHERE child.lifecycle NOT IN ('exited', 'failed', 'closed')
-           AND child.fenced_at IS NULL
+         WHERE child.fenced_at IS NULL
+           AND (
+                child.lifecycle NOT IN ('exited', 'failed', 'closed')
+                OR (child.lifecycle = 'exited' AND child.ended_at IS NULL
+                    AND COALESCE(child.last_error, '') = 'host-lost')
+                OR (child.lifecycle = 'failed' AND child.ended_at IS NULL
+                    AND LOWER(COALESCE(child.last_error, '')) <> 'create-never-acknowledged'
+                    AND LOWER(COALESCE(child.last_error, '')) NOT LIKE '%start-fail%'
+                    AND LOWER(COALESCE(child.last_error, '')) NOT LIKE '%start failed%'
+                    AND LOWER(COALESCE(child.last_error, '')) NOT LIKE '%never started%')
+           )
            AND COALESCE(child.lineage_id, child.id) <>
                (SELECT COALESCE(lineage_id, id) FROM instances WHERE id = ?1)
            AND EXISTS (
@@ -11965,8 +11993,7 @@ fn stamp_ended_at(conn: &Connection, instance_id: &str, at: &str) -> Result<(), 
 /// carries a real `ended_at`.
 /// The exact `last_error` marker the stale-create sweep stamps when a create
 /// is never acknowledged by the node. Attests the launch never started.
-pub(crate) const CREATE_NEVER_ACKNOWLEDGED_MARKER: &str =
-    "create-never-acknowledged";
+pub(crate) const CREATE_NEVER_ACKNOWLEDGED_MARKER: &str = "create-never-acknowledged";
 
 pub(crate) const HOST_LOST_MARKER: &str = "host-lost";
 
@@ -12007,8 +12034,7 @@ pub(crate) fn lifecycle_has_process_end_evidence(
             // Genuine once an end time is recorded; otherwise only a
             // host-lost sweep exit (contact loss) is treated as potentially
             // live — any other/absent marker is a real exit.
-            ended_at.is_some()
-                || last_error.is_none_or(|error| error != HOST_LOST_MARKER)
+            ended_at.is_some() || last_error.is_none_or(|error| error != HOST_LOST_MARKER)
         }
         "failed" => ended_at.is_some() || last_error.is_some_and(is_attested_launch_failure_marker),
         _ => false,

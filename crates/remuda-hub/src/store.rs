@@ -4244,8 +4244,14 @@ impl Store {
     pub async fn recent_invalidated_interactions(
         &self,
     ) -> Result<Vec<(String, String, String)>, StoreError> {
+        // r7 item 2: a cursor-less WINDOW page returns the NEWEST settlements
+        // (DESC). A Node restart or multi-session sweep with more than
+        // SETTLEMENT_LAG_PAGE invalidations inside the window must still
+        // replay the newest ones — the rows a page navigation just missed —
+        // not the oldest 512, whose miss an older in-flight response could
+        // resurrect. Only the windowless lag-drain walk below is ascending.
         let rows = self
-            .invalidated_interactions_page(Some(5), None, SETTLEMENT_LAG_PAGE)
+            .invalidated_interactions_page(Some(5), None, SETTLEMENT_LAG_PAGE, false)
             .await?;
         Ok(rows
             .into_iter()
@@ -4270,7 +4276,9 @@ impl Store {
         &self,
         cursor: Option<String>,
     ) -> Result<Vec<(String, String, String, String)>, StoreError> {
-        self.invalidated_interactions_page(None, cursor, SETTLEMENT_LAG_PAGE)
+        // The lag drain is the only ASCENDING walk: it pages strictly forward
+        // from a per-follower delivery cursor (r6 item 2).
+        self.invalidated_interactions_page(None, cursor, SETTLEMENT_LAG_PAGE, true)
             .await
     }
 
@@ -4308,24 +4316,38 @@ impl Store {
     }
 
     /// Shared bounded page over live invalidated rows UNION ALL tombstones.
-    /// The reconnect snapshot is bounded by a recent WINDOW; the lag cursor
-    /// path is windowless (an older lost settlement is still authoritative)
-    /// and pages forward from the cursor. Rows are always ASCENDING so a
-    /// multi-page drain reaches the oldest missed rows; `limit` bounds rows
-    /// AND tombstones together.
+    /// The reconnect snapshot is bounded by a recent WINDOW and returns the
+    /// NEWEST page (`ascending == false`); the lag cursor path is windowless
+    /// (an older lost settlement is still authoritative), starts at the
+    /// cursor and walks ASCENDING (`ascending == true`, always cursor-less
+    /// callers excluded). `limit` bounds rows AND tombstones together.
+    ///
+    /// The ordering token is a Rust-matched `ASC`/`DESC` literal, never an
+    /// external string, so the single parameterised statement cannot be
+    /// steered by input.
     async fn invalidated_interactions_page(
         &self,
         window_mins: Option<i64>,
         cursor: Option<String>,
         limit: u32,
+        ascending: bool,
     ) -> Result<Vec<(String, String, String, String)>, StoreError> {
         let limit = i64::from(limit);
         self.run_named("invalidated_interactions_page", move |conn| {
-            // r6 item 2: composite cursor + bounded LIMIT; always oldest-first
-            // so repeated pages drain the ENTIRE backlog. A token present but
-            // unparseable behaves like "no durable position".
+            // r6 item 2: composite cursor + bounded LIMIT; the lag drain pages
+            // oldest-first so repeated pages drain the ENTIRE backlog. r7
+            // item 2: a cursor-less window page is newest-first, so a burst
+            // larger than one page still replays the settlements a reconnect
+            // most recently missed. A token present but unparseable behaves
+            // like "no durable position".
             let (cursor_ts, cursor_id) = Self::parse_settlement_cursor(cursor.as_deref());
-            let sql = "SELECT instance_id, id, COALESCE(
+            // Only the ASC lag walk supplies a cursor; DESC snapshot callers
+            // are cursor-less, so the `?2 IS NULL` predicate stays valid for
+            // both directions.
+            debug_assert!(ascending || cursor_ts.is_none());
+            let direction: &'static str = if ascending { "ASC" } else { "DESC" };
+            let sql = format!(
+                "SELECT instance_id, id, COALESCE(
                     json_extract(payload_json, '$.payload.reasonCode'),
                     json_extract(payload_json,
                         '$.payload.entity.resolution.value.reason'),
@@ -4345,9 +4367,10 @@ impl Store {
                  WHERE state = 'invalidated'
                    AND (?1 IS NULL OR julianday(updated_at) >= julianday('now','-' || ?1 || ' minutes'))
                    AND (?2 IS NULL OR (updated_at, id) > (?2, ?3))
-                 ORDER BY updated_at ASC, id ASC
-                 LIMIT ?4";
-            let mut stmt = conn.prepare(sql)?;
+                 ORDER BY updated_at {direction}, id {direction}
+                 LIMIT ?4"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(
                 params![window_mins, cursor_ts, cursor_id, limit],
                 |row| {
@@ -7748,6 +7771,84 @@ mod tests {
         assert!(
             !ids.iter().any(|id| id == &_pending_int),
             "pending rows are not settlements"
+        );
+        store.close().await;
+    }
+
+    /// c-cardsettle r7 item 2: with more than SETTLEMENT_LAG_PAGE settlements
+    /// inside the 5-minute reconnect window, the cursor-less snapshot must be
+    /// the NEWEST page (DESC) — after a Node restart or multi-session sweep the
+    /// rows a page navigation just missed are the newest ones; an oldest-first
+    /// page would never replay/pin them and an in-flight pending response would
+    /// resurrect those cards.
+    #[tokio::test]
+    async fn reconnect_window_returns_the_newest_settlements_when_over_one_page() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let count = SETTLEMENT_LAG_PAGE + 112; // 624 > one 512-row page
+        store
+            .run_named("r7_seed_window_burst", move |conn| {
+                use time::format_description::well_known::Rfc3339;
+                use time::{Duration, OffsetDateTime};
+                let stamp = |t: OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
+                let base = OffsetDateTime::now_utc();
+                // One aged settlement well outside the window.
+                let aged = stamp(base - Duration::seconds(400));
+                conn.execute(
+                    "INSERT INTO interactions
+                        (id, instance_id, host_id, kind, state, blocking,
+                         payload_json, created_at, updated_at)
+                     VALUES ('int_r7_AGED', 'ins_r7', 'hst_r7', 'approval', 'invalidated', 0,
+                         '{}', ?1, ?1)",
+                    params![aged],
+                )?;
+                // `count` settlements across the present window, ascending
+                // timestamps so the largest n is the NEWEST settlement.
+                let mut stmt = conn.prepare(
+                    "INSERT INTO interactions
+                        (id, instance_id, host_id, kind, state, blocking,
+                         payload_json, created_at, updated_at)
+                     VALUES (?1, 'ins_r7', 'hst_r7', 'approval', 'invalidated', 0, '{}',
+                         ?2, ?2)",
+                )?;
+                for n in 0..count {
+                    stmt.execute(params![
+                        format!("int_r7_{n:05}"),
+                        stamp(base + Duration::milliseconds(i64::from(n)))
+                    ])?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed window burst");
+
+        let recent = store
+            .recent_invalidated_interactions()
+            .await
+            .expect("recent window page");
+        assert_eq!(
+            recent.len(),
+            SETTLEMENT_LAG_PAGE as usize,
+            "the snapshot is one bounded page"
+        );
+        let ids: Vec<&str> = recent.iter().map(|(_, id, _)| id.as_str()).collect();
+        let newest = format!("int_r7_{:05}", count - 1);
+        assert_eq!(
+            ids.first(),
+            Some(&newest.as_str()),
+            "the newest settlement leads the newest-first page"
+        );
+        assert!(
+            ids.contains(&newest.as_str()),
+            "the reconnect replay contains the newest settlement"
+        );
+        assert!(
+            !ids.contains(&"int_r7_00000"),
+            "the oldest in-window settlement drops off a newest-first page"
+        );
+        assert!(
+            !ids.contains(&"int_r7_AGED"),
+            "the window still excludes aged settlements"
         );
         store.close().await;
     }

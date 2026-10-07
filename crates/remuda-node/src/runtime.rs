@@ -3522,6 +3522,31 @@ mod tests {
             live.lifecycle
         );
 
+        // 3b) A failed first TURN (the print mapper's exact result-error
+        // frame on stdout): composer idles but the process stays alive — it
+        // must accept the next prompt rather than being marked ended.
+        tx.send(native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1"), ("numTurns", "1")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let after_turn = store.get_instance(&id).unwrap();
+        assert!(
+            !matches!(
+                after_turn.lifecycle,
+                InstanceLifecycle::Failed | InstanceLifecycle::Exited
+            ),
+            "a failed result is turn-level, not a process end: {:?}",
+            after_turn.lifecycle
+        );
+
         // 4) The REAL print driver exit: name=session, status=exited.
         tx.send(frame(
             SourceChannel::Stdout,

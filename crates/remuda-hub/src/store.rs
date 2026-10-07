@@ -9147,6 +9147,97 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r6 item 1: the production drivers' STARTUP frames share
+    /// the exit nativeName (`topic=session`, nativeName `session`) — print/SDK
+    /// init status "started", PTY ready statuses idle/working/blocked/done/
+    /// unknown. Journaled through the Hub they must keep the instance running
+    /// and the approval pending; only the later real `session/exited` settles.
+    #[tokio::test]
+    async fn startup_session_frames_keep_the_instance_running_until_the_real_exit() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "startup-frames-not-exit").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        // The print/SDK mapper init frame.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","observedAt":"2026-10-07T10:00:00.000Z","payload":{
+                    "type":"native","topic":"session","nativeName":"session",
+                    "severity":"info","affectsCompletion":false,
+                    "nativeId":{"state":"known","value":"sess-1"},
+                    "status":{"state":"known","value":"started"}}}),
+            )
+            .await
+            .expect("print init");
+        // The Claude/generic PTY ready frames with every live agent status,
+        // including one carrying an error severity (still not an end).
+        for (status, severity) in [
+            ("idle", "info"),
+            ("working", "info"),
+            ("blocked", "info"),
+            ("done", "info"),
+            ("unknown", "info"),
+            ("working", "error"),
+        ] {
+            store
+                .append_journal(
+                    host.clone(),
+                    instance.instance_id.clone(),
+                    None,
+                    json!({"kind":"lifecycle","payload":{
+                        "type":"native","topic":"session","nativeName":"session",
+                        "severity":severity,"affectsCompletion":false,
+                        "nativeId":{"state":"known","value":"pane-1"},
+                        "status":{"state":"known","value":status}}}),
+                )
+                .await
+                .expect("pty ready");
+        }
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.lifecycle, "running",
+            "startup frames on the session name never end the instance"
+        );
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "pending");
+        assert!(reason.is_none());
+
+        // The REAL print session/exited then ends it and settles the card.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","observedAt":"2026-10-07T10:05:00.000Z","payload":{
+                    "type":"native","topic":"session","nativeName":"session",
+                    "severity":"info","affectsCompletion":false,
+                    "nativeId":{"state":"known","value":"sess-1"},
+                    "status":{"state":"known","value":"exited"}}}),
+            )
+            .await
+            .expect("real exit");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
     /// c-cardsettle r5 item 4 (OA6): the print/SDK mapper's REAL root turn
     /// failure (claude_print `map_result`: topic=turn, nativeName=result,
     /// status=error, resultIndex/numTurns) appended through the Hub ENDS THE

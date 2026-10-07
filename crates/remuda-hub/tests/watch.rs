@@ -681,11 +681,13 @@ fn turn_error_event() -> Value {
     })
 }
 
-/// The real process-end evidence the PRINT/SDK driver emits from `emit_exit`
-/// (crates/remuda-driver/src/claude_print.rs): topic=session,
-/// nativeName="session", status "exited" (clean) or "failed" (non-zero). It
-/// follows the turn-result error; THIS — not the turn result — is the process
-/// end. Here the one-shot process failed its first turn, so status=failed.
+/// The REAL process-end evidence the print/SDK driver emits from `emit_exit`
+/// (crates/remuda-driver/src/claude_print.rs, both call sites): exactly
+/// `topic=session, nativeName="session", status="exited", severity=info,
+/// affectsCompletion=false`. The driver has no non-zero exit frame — it always
+/// emits "exited" (the print driver ends when stdout closes). It follows the
+/// turn-result error; THIS — not the turn result — is the process end, and the
+/// instance settles Exited.
 fn session_exit_event() -> Value {
     json!({
         "kind": "lifecycle",
@@ -693,10 +695,10 @@ fn session_exit_event() -> Value {
             "type": "native",
             "topic": "session",
             "nativeName": "session",
-            "severity": "error",
-            "affectsCompletion": true,
-            "status": { "state": "known", "value": "failed" },
-            "relatedIds": { "lastError": "pane exited; agent process is gone" },
+            "severity": "info",
+            "affectsCompletion": false,
+            "nativeId": { "state": "known", "value": "sess-failed-1" },
+            "status": { "state": "known", "value": "exited" },
         },
     })
 }
@@ -801,17 +803,19 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
 
     let observed = ctx.observe().await;
     let row = &observed["items"][0];
+    // The real session/exited ends the PROCESS (clean print close after a
+    // failed turn); watch failure remains the classification of the turn.
     assert_eq!(
         row["watch"]["status"], "failed",
-        "the real session exit settles as failed: {row}"
+        "the failed-turn watch classification persists: {row}"
     );
 
-    // The Hub instance row itself converged to failed from the journal.
+    // The Hub instance row converged to EXITED from the real session/exited.
     let (status, instance) = ctx
         .request("GET", &format!("/v1/instances/{instance_id}"), None)
         .await;
     assert_eq!(status, 200, "{instance}");
-    assert_eq!(instance["lifecycle"], "failed");
+    assert_eq!(instance["lifecycle"], "exited");
 
     // Persisted on the roster, sticky on the next observation, with timestamp.
     let (_, roster) = ctx.request("GET", "/v1/workers", None).await;

@@ -27,9 +27,9 @@ use super::{PROMOTE_POLL, PtyState};
 use crate::claude_print::TranscriptMapper;
 use crate::claude_pty::now_ts;
 use crate::claude_transcript::{
-    ResumeBoundary, ResumeMode, SessionStartReport, TailProvenance, TranscriptBinding,
-    TranscriptCandidate, TranscriptTail, bind_by_pid_file, bind_by_session_id, bind_manual,
-    cwd_matches, list_candidates, recorded_cwd, transcript_belongs_to_cwd,
+    ResumeMode, SessionStartReport, TailProvenance, TranscriptBinding, TranscriptCandidate,
+    TranscriptTail, bind_by_pid_file, bind_by_session_id, bind_manual, cwd_matches,
+    list_candidates, recorded_cwd, transcript_belongs_to_cwd,
 };
 use crate::error::{DriverError, DriverResult};
 use crate::promote::{
@@ -842,9 +842,12 @@ pub(super) fn spawn(
         // yet; `Some(None)` = healthy; `Some(Some(r))` = a failed check.
         let mut silence_ticks: u32 = 0;
         let mut last_silence: Option<Option<remuda_signal::hook_silence::HookSilenceReason>> = None;
-        // The (pid, session) the Remuda-launched pre_resume_mode was applied
-        // to, so a SessionStart rebind to another session invalidates it.
-        let mut launch_mode_session: Option<(i32, String)> = None;
+        // Sticky tri-state (item 4) for the Remuda-launched pre_resume_mode:
+        // the boundary proves one (pid, session) only. A plain Option could
+        // not say "applied, then invalidated by a rebind", so the rebound arm
+        // used to clear the slot and the next tick immediately re-applied the
+        // stale launch mode to the new session.
+        let mut launch_mode = LaunchModeBinding::Unbound;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -936,6 +939,7 @@ pub(super) fn spawn(
             // binding. Without this bridge only Claude's separate pid file
             // could hydrate, leaving a spurious manual picker over a hooked
             // session. begin_epoch must happen first so it cannot erase it.
+            let mut session_rebound = false;
             if let Some(hooks) = hooks.as_ref()
                 && let Some(binding) = hooks.binding()
                 && found.as_ref().is_some_and(|found| found.pid == binding.pid)
@@ -963,6 +967,7 @@ pub(super) fn spawn(
                         found.as_ref().expect("matched foreground"),
                         &report,
                     ) {
+                        session_rebound = true;
                         hydrator = None;
                         announced = None;
                     }
@@ -1289,23 +1294,16 @@ pub(super) fn spawn(
                 // Claude is the only kind that hydrates a transcript in the MVP.
                 (Some(AgentKind::Claude), Some(found)) if found.hydrates_transcript => {
                     // Item 4: the pre-spawn launch mode belongs to the
-                    // Remuda-launched (pid, session). A rebind to a DIFFERENT
-                    // session invalidates it; that new foreground agent is
-                    // bounded from its own detected provenance instead.
-                    let key = (found.pid, found.session_id.clone().unwrap_or_default());
-                    if let Some((lp, ls)) = &launch_mode_session {
-                        if (*lp, ls.as_str()) != (key.0, key.1.as_str()) {
-                            launch_mode_session = None;
-                        }
-                    }
-                    let epoch_mode = match pre_resume_mode.clone() {
-                        Some(mode) if launch_mode_session.is_none() => {
-                            launch_mode_session = Some(key);
-                            mode
-                        }
-                        Some(mode) => mode,
-                        None => shell_resume_mode(found),
-                    };
+                    // Remuda-launched (pid, session). A SessionStart rebind to
+                    // a DIFFERENT session, or a pid change, kills it for the
+                    // rest of the epoch; that new foreground agent is bounded
+                    // from its own detected provenance instead.
+                    let epoch_mode = epoch_mode(
+                        &mut launch_mode,
+                        pre_resume_mode,
+                        session_rebound,
+                        found,
+                    );
                     maintain_binding(
                         &bindings,
                         &ctx,
@@ -1507,15 +1505,80 @@ fn current_turn_interrupted(grid: &remuda_screen::ScreenGrid) -> Option<bool> {
     (remuda_screen::screen_status(grid) == Some(ScreenStatus::Idle)).then_some(true)
 }
 
-/// One tick of the deterministic binding state machine for a promoted Claude.
-/// Boundary for an agent that resumed itself inside a login shell (a hand-typed
-/// `claude --resume <id>`): Remuda did not launch it, so there is no pre-spawn
-/// snapshot. Use the foreground process's verifiable start instant against the
-/// deterministic transcript's record timestamps (D-056 (4): records the resumed
-/// process wrote before it was promoted are still its own; older ones are
-/// history). `None` for a non-resume process, or when start time/transcript
-/// cannot be established (the caller then tails live from byte 0 — there is
-/// nothing older than the live shell epoch to gate against there).
+/// Item 4 sticky tri-state for the Remuda-launched pre-spawn [`ResumeMode`].
+///
+/// The boundary captured before spawn proves records only for ONE
+/// `(pid, session)`. A plain `Option<(pid, session)>` cannot distinguish
+/// "not applied yet" from "applied and then invalidated", so the rebound arm
+/// used to clear the slot and the very next tick re-applied the stale launch
+/// mode to the rebound session. [`LaunchModeBinding::Dead`] is sticky.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchModeBinding {
+    /// No foreground session has used the pre-spawn mode yet.
+    Unbound,
+    /// The pre-spawn mode belongs to this `(pid, session)`. An empty session
+    /// means detection had not learned the id on that sample.
+    Bound(i32, String),
+    /// The foreground rebound to another session (or changed pid): the
+    /// pre-spawn mode is dead for the rest of the promoted epoch.
+    Dead,
+}
+
+/// Decide one tick's epoch [`ResumeMode`] and advance the sticky
+/// [`LaunchModeBinding`].
+///
+/// `rebound` says THIS tick's authenticated SessionStart replaced the bound
+/// session with another one. The pre-spawn mode applies only to the process
+/// it was captured for: it survives a session id simply becoming known for the
+/// same pid, dies on a rebind or a pid change, and never revives afterwards.
+/// A login shell (no pre-spawn mode) is always bounded per detected
+/// provenance via [`shell_resume_mode`].
+fn epoch_mode(
+    binding: &mut LaunchModeBinding,
+    pre_resume_mode: Option<ResumeMode>,
+    rebound: bool,
+    found: &Detected,
+) -> ResumeMode {
+    let Some(mode) = pre_resume_mode else {
+        return shell_resume_mode(found);
+    };
+    let (pid, session) = (found.pid, found.session_id.clone().unwrap_or_default());
+    match *binding {
+        LaunchModeBinding::Unbound if rebound => {
+            // The first sighting was already an authenticated rebind: the
+            // launched boundary belongs to the prior session, never this one.
+            *binding = LaunchModeBinding::Dead;
+            shell_resume_mode(found)
+        }
+        LaunchModeBinding::Unbound => {
+            *binding = LaunchModeBinding::Bound(pid, session);
+            mode
+        }
+        // Same process and a compatible session (still unknown on one side, or
+        // unchanged): the pre-spawn boundary still proves this foreground.
+        // Refine a remembered empty id once the hook reports it.
+        LaunchModeBinding::Bound(bound_pid, ref bound_session)
+            if !rebound
+                && bound_pid == pid
+                && (bound_session.is_empty()
+                    || session.is_empty()
+                    || bound_session == &session) =>
+        {
+            if bound_session.is_empty() && !session.is_empty() {
+                *binding = LaunchModeBinding::Bound(pid, session);
+            }
+            mode
+        }
+        // An authenticated rebind, a session id changing to a different known
+        // id, or a different pid: establish the new session's own boundary.
+        // Dead is sticky.
+        LaunchModeBinding::Bound(..) | LaunchModeBinding::Dead => {
+            *binding = LaunchModeBinding::Dead;
+            shell_resume_mode(found)
+        }
+    }
+}
+
 /// Epoch resume mode for an agent the terminal did NOT launch (a hand-typed
 /// `claude --resume` in a login shell).
 ///
@@ -2759,5 +2822,135 @@ mod tests {
         bindings.begin_epoch(&cwd, tmp.path());
         assert!(bindings.binding().is_none());
         assert!(!bindings.degraded());
+    }
+
+    // =======================================================================
+    // c-effortread r4
+    //
+
+    // ----- item 4: sticky tri-state launch mode ----------------------------
+
+    fn boundary_mode() -> ResumeMode {
+        // A distinct value is all the helper needs; the boundary itself is not
+        // consulted by epoch_mode.
+        ResumeMode::Unverified
+    }
+
+    #[test]
+    fn launch_mode_applies_once_and_refines_a_later_known_session() {
+        let mut binding = LaunchModeBinding::Unbound;
+        // First sighting: ps gave no session id yet.
+        let mode = epoch_mode(
+            &mut binding,
+            Some(boundary_mode()),
+            false,
+            &detected_claude(7, None),
+        );
+        assert_eq!(mode, boundary_mode());
+        assert_eq!(binding, LaunchModeBinding::Bound(7, String::new()));
+        // The authenticated SessionStart reports the id for the SAME pid:
+        // refine the slot, keep the pre-spawn mode.
+        let mode = epoch_mode(
+            &mut binding,
+            Some(boundary_mode()),
+            false,
+            &detected_claude(7, Some(CORRECT)),
+        );
+        assert_eq!(mode, boundary_mode());
+        assert_eq!(binding, LaunchModeBinding::Bound(7, CORRECT.to_owned()));
+        // Steady state keeps applying it.
+        let mode = epoch_mode(
+            &mut binding,
+            Some(boundary_mode()),
+            false,
+            &detected_claude(7, Some(CORRECT)),
+        );
+        assert_eq!(mode, boundary_mode());
+    }
+
+    #[test]
+    fn a_session_start_rebind_kills_the_launch_mode_stickily() {
+        let mut binding = LaunchModeBinding::Bound(7, CORRECT.to_owned());
+        // Same pid, DIFFERENT session via an authenticated rebind: the new
+        // session is bounded from its own detected provenance (fresh here)...
+        let mode = epoch_mode(
+            &mut binding,
+            Some(boundary_mode()),
+            true,
+            &detected_claude(7, Some(LATE_STARTER)),
+        );
+        assert_eq!(mode, ResumeMode::Fresh, "the stale launch mode is dead");
+        assert_eq!(binding, LaunchModeBinding::Dead);
+        // ...and it never revives, not even back on the original key.
+        let mode = epoch_mode(
+            &mut binding,
+            Some(boundary_mode()),
+            false,
+            &detected_claude(7, Some(CORRECT)),
+        );
+        assert_eq!(mode, ResumeMode::Fresh);
+        assert_eq!(binding, LaunchModeBinding::Dead);
+        // A resumed rebound session is Unverified on its own merits, never the
+        // launch boundary.
+        let mut binding = LaunchModeBinding::Bound(7, CORRECT.to_owned());
+        let mut rebound = detected_claude(7, Some(LATE_STARTER));
+        rebound.resume = true;
+        let mode = epoch_mode(&mut binding, Some(boundary_mode()), true, &rebound);
+        assert_eq!(mode, ResumeMode::Unverified);
+        assert_eq!(binding, LaunchModeBinding::Dead);
+    }
+
+    #[test]
+    fn a_pid_change_or_a_session_id_flip_kills_the_launch_mode() {
+        let mut binding = LaunchModeBinding::Bound(7, CORRECT.to_owned());
+        let mode = epoch_mode(
+            &mut binding,
+            Some(boundary_mode()),
+            false,
+            &detected_claude(8, Some(CORRECT)),
+        );
+        assert_eq!(mode, ResumeMode::Fresh, "a new pid is a new process");
+        assert_eq!(binding, LaunchModeBinding::Dead);
+        // A known session id silently changing to another known id at the same
+        // pid (without an authenticated rebind) is also not the launch.
+        let mut binding = LaunchModeBinding::Bound(7, CORRECT.to_owned());
+        let mode = epoch_mode(
+            &mut binding,
+            Some(boundary_mode()),
+            false,
+            &detected_claude(7, Some(BUSY_OTHER)),
+        );
+        assert_eq!(mode, ResumeMode::Fresh);
+        assert_eq!(binding, LaunchModeBinding::Dead);
+    }
+
+    #[test]
+    fn a_rebound_on_the_very_first_sighting_is_dead_too() {
+        let mut binding = LaunchModeBinding::Unbound;
+        let mode = epoch_mode(
+            &mut binding,
+            Some(boundary_mode()),
+            true,
+            &detected_claude(7, Some(LATE_STARTER)),
+        );
+        assert_eq!(mode, ResumeMode::Fresh);
+        assert_eq!(binding, LaunchModeBinding::Dead);
+    }
+
+    #[test]
+    fn a_login_shell_always_uses_detected_provenance_and_never_binds() {
+        let mut binding = LaunchModeBinding::Unbound;
+        let mut found = detected_claude(7, Some(CORRECT));
+        found.resume = true;
+        assert_eq!(
+            epoch_mode(&mut binding, None, false, &found),
+            ResumeMode::Unverified
+        );
+        assert_eq!(binding, LaunchModeBinding::Unbound);
+        found.resume = false;
+        assert_eq!(
+            epoch_mode(&mut binding, None, false, &found),
+            ResumeMode::Fresh
+        );
     }
 }

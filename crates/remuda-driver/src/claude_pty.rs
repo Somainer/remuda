@@ -1474,10 +1474,7 @@ fn spawn_transcript_pump(
                     // unverifiable resume; an unverifiable resume whose
                     // transcript is still absent leaves the hydrator unbound
                     // until the file appears — never a byte-0/current tail.
-                    hydrator = match resume_mode.open_tail(&path) {
-                        Some(tail) => Some((tail, mapper)),
-                        None => None,
-                    };
+                    hydrator = resume_mode.open_tail(&path).map(|tail| (tail, mapper));
                 }
             }
             if let Some(hydrated) = hydrator.take() {
@@ -2664,8 +2661,19 @@ mod tests {
             transcript.to_string_lossy().into_owned(),
         )));
         // A live (new-session) boundary: the pump reads from byte 0 as current.
-        let task =
-            spawn_transcript_pump(slot, tx, ctx, seq, None, None, None, None, None, None, None);
+        let task = spawn_transcript_pump(
+            slot,
+            tx,
+            ctx,
+            seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::claude_transcript::ResumeMode::Fresh,
+        );
 
         // Drain the real channel until the effort edge arrives.
         let mut found: Option<Observation> = None;

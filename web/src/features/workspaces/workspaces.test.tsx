@@ -350,25 +350,41 @@ it("an IME composition-confirmation Enter on the manual path submits nothing, a 
   await waitFor(() => expect(register).toHaveBeenCalledWith(workspace.hostId, "/srv/项目"));
 });
 
-it("activates a breadcrumb with the keyboard and navigates to its path", async () => {
-  // r7 item 3: breadcrumb keyboard activation (Enter on a focused crumb).
+it("activates a non-home breadcrumb with the keyboard and navigates to its path", async () => {
+  // r8 item 4: the old test focused the 主目录 home shortcut (dir-browser-home),
+  // which is not a crumb. Serve a listing with at least TWO crumbs
+  // (/srv › /app › /api) and keyboard-activate the middle crumb.
+  vi.mocked(api.hostDirsList).mockImplementation(() =>
+    Promise.resolve(
+      listing({
+        path: "/srv/app/api",
+        parent: "/srv/app",
+        home: "/home/dev",
+        roots: ["/srv"],
+        dirs: [],
+      }),
+    ),
+  );
   const user = userEvent.setup();
   const dirsList = vi.mocked(api.hostDirsList);
   render(<DirBrowser hostId={workspace.hostId} open onClose={vi.fn()} onRegistered={vi.fn()} />);
   const browser = await screen.findByTestId("dir-browser");
-  // /home/dev -> one breadcrumb ("dev"); activate the home shortcut via
-  // keyboard to prove keyboard activation path end to end.
-  const home = within(browser).getByTestId("dir-browser-home");
-  (home as HTMLElement).focus();
+  // Boundary /srv, then /app, then the current /api (disabled).
+  const crumbs = await within(browser).findAllByTestId("dir-browser-crumb");
+  expect(crumbs).toHaveLength(3);
+  const appCrumb = within(browser).getByRole("button", { name: "/app" });
+  expect(appCrumb).not.toBeDisabled();
+  appCrumb.focus();
   await user.keyboard("{Enter}");
   await waitFor(() =>
-    expect(dirsList.mock.calls.at(-1)?.[1]).toMatchObject({ path: "/home/dev" }),
+    expect(dirsList.mock.calls.at(-1)?.[1]).toMatchObject({ path: "/srv/app" }),
   );
 });
 
 it("the Cancel button closes the browser dialog", async () => {
-  // r7 item 3: Cancel must assert the dialog actually closed: onClose fires
-  // and once the parent stops rendering it the portalled browser is removed.
+  // r8 item 4: Modal portals to document.body, so a container.querySelector
+  // could never see the browser and the old assertion passed vacuously.
+  // Assert through the document-body queries (screen) after Cancel.
   function Host() {
     const [open, setOpen] = useState(true);
     return (
@@ -380,10 +396,10 @@ it("the Cancel button closes the browser dialog", async () => {
       />
     );
   }
-  const { container } = render(<Host />);
+  render(<Host />);
   await screen.findByTestId("dir-browser");
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
   fireEvent.click(screen.getByTestId("dir-browser-cancel"));
-  await waitFor(() =>
-    expect(container.querySelector('[data-testid="dir-browser"]')).toBeNull(),
-  );
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(screen.queryByTestId("dir-browser")).toBeNull();
 });

@@ -19915,6 +19915,17 @@
           "$ref": "#/$defs/Knowledge3",
           "description": "`cache_write_tokens`; protocol §5.5."
         },
+        "contextWindow": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`context_window`; protocol §5.5. Native per-model context window in\ntokens (e.g. stream-json `result.modelUsage.<model>.contextWindow`),\nwhen the harness reports one. Additive optional field: absent on\nadapters that do not know it; the Hub then resolves a window from the\neffective model / provider profile / static catalog."
+        },
         "cost": {
           "$ref": "#/$defs/Knowledge25",
           "description": "`cost`; protocol §5.5."

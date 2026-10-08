@@ -379,6 +379,7 @@ pub(super) fn map_assistant(
     // — otherwise every transcript block would bypass that gate.
     if msg.parent_tool_use_id.is_none()
         && mapper.driver_kind != DriverKind::ShellPty
+        && mapper.driver_kind != DriverKind::ClaudeSdk
         && let Some(usage_obs) = super::usage_from_assistant_message(mapper, msg)?
     {
         out.push(usage_obs);

@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "eventId": "evt_01993ab0-0000-7000-8000-000000000001",
+  "journalId": "obj_01993ab0-0000-7000-8000-000000000002",
+  "instanceId": "ins_01993ab0-0000-7000-8000-000000000003",
+  "runId": "run_01993ab0-0000-7000-8000-000000000004",
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000005",
+  "processGeneration": "1",
+  "runGeneration": "1",
+  "seq": "42",
+  "observedAt": "2026-10-08T03:37:18.123Z",
+  "nativeAt": {
+    "state": "known",
+    "value": "2026-10-08T03:37:18.000Z"
+  },
+  "source": {
+    "driverKind": "claude-print",
+    "driverVersion": "2.1.289",
+    "adapterVersion": "1",
+    "channel": "stdout",
+    "delivery": "live",
+    "nativeSessionId": {
+      "state": "known",
+      "value": "sess_019abc"
+    },
+    "nativeTurnId": {
+      "state": "unknown",
+      "reason": "not-emitted",
+      "evidenceEventIds": []
+    },
+    "nativeAgentId": {
+      "state": "not-applicable"
+    },
+    "nativeItemId": {
+      "state": "unknown",
+      "reason": "not-emitted",
+      "evidenceEventIds": []
+    },
+    "nativeEventId": {
+      "state": "unknown",
+      "reason": "not-emitted",
+      "evidenceEventIds": []
+    },
+    "nativeRequestId": {
+      "type": "none"
+    },
+    "sourceCursor": {
+      "type": "runtime",
+      "ledgerRevision": "42"
+    }
+  },
+  "completeness": "structured",
+  "rawRef": null,
+  "evidenceEventIds": [],
+  "kind": "usage",
+  "payload": {
+    "usageId": "obj_01993ab0-0000-7000-8000-000000000006",
+    "scope": "message",
+    "scopeId": "msg_019abc",
+    "mode": "snapshot",
+    "metricRevision": "1",
+    "inputTokens": {
+      "state": "known",
+      "value": "30000"
+    },
+    "inputAccounting": "uncached",
+    "outputTokens": {
+      "state": "known",
+      "value": "718"
+    },
+    "reasoningTokens": {
+      "state": "known",
+      "value": "1200"
+    },
+    "cacheReadTokens": {
+      "state": "known",
+      "value": "5000"
+    },
+    "cacheWriteTokens": {
+      "state": "not-applicable"
+    },
+    "totalTokens": {
+      "state": "known",
+      "value": "35718"
+    },
+    "cost": {
+      "state": "unknown",
+      "reason": "not-emitted",
+      "evidenceEventIds": []
+    },
+    "accounting": "estimated",
+    "contextWindow": "200000",
+    "nativeFieldsRef": null
+  }
+}

@@ -1630,7 +1630,29 @@ fn usage_from_result(
                 .and_then(Value::as_u64)
                 .filter(|window| *window > 0)
         });
-    if cost.is_none() && window.is_none() {
+    // The SDK carrier has no separate per-call assistant usage channel: its
+    // terminal `result.usage` IS the authoritative turn total, so it keeps
+    // emitting those tokens. On the stream-json/print carrier per-call usage
+    // rides the assistant message (item (a)); the result frame contributes
+    // only the cumulative cost and any native modelUsage window here, never a
+    // duplicate/additive token frame.
+    let sdk = mapper.driver_kind == DriverKind::ClaudeSdk;
+    let result_event = if sdk {
+        let frame = serde_json::json!({
+            "type": "result",
+            "usage": result.usage.clone().unwrap_or(Value::Null),
+            "total_cost_usd": result.total_cost_usd,
+        });
+        crate::usage::claude::usage_from_result_frame(&frame, None)
+    } else {
+        None
+    };
+    // Whether the (SDK) result carried any non-zero counters.
+    let has_tokens = result_event.as_ref().is_some_and(|event| {
+        let t = &event.tokens;
+        t.uncached_input != 0 || t.output != 0 || t.cache_read != 0 || t.cache_write() != 0
+    });
+    if cost.is_none() && window.is_none() && !has_tokens {
         return Ok(None);
     }
     // Monotonic across turns and the two Workflow sub-results.
@@ -1640,13 +1662,24 @@ fn usage_from_result(
         .saturating_mul(1000)
         .saturating_add(result.result_index.map(|index| index + 1).unwrap_or(1));
     let session_id = mapper.session_id.clone();
-    Ok(Some(mapper.observation(
-        Completeness::Structured,
-        NativeRequestKey::None,
-        ObservationPayload::Usage(Box::new(UsagePayload {
+    // Build token buckets from the (SDK) result event when present; for the
+    // stream-json/print carrier the event is absent and every bucket is
+    // not-emitted (per-call tokens ride the assistant message).
+    let mut payload = match result_event {
+        Some(event) if has_tokens => {
+            let mut totals = crate::usage::UsageTotals::default();
+            totals.add(&event);
+            crate::usage::to_usage_payload(
+                UsageScope::Session,
+                session_id.clone(),
+                revision,
+                &totals,
+            )
+        }
+        _ => UsagePayload {
             usage_id: Id::new("obj")?,
             scope: UsageScope::Session,
-            scope_id: session_id,
+            scope_id: session_id.clone(),
             mode: UsageMode::Snapshot,
             metric_revision: U64(revision),
             input_tokens: unknown("not-emitted-on-result"),
@@ -1656,14 +1689,23 @@ fn usage_from_result(
             cache_read_tokens: unknown("not-emitted-on-result"),
             cache_write_tokens: unknown("not-emitted-on-result"),
             total_tokens: unknown("not-emitted-on-result"),
-            cost: match cost {
-                Some(cost) => Knowledge::Known { value: cost },
-                None => unknown("not-emitted"),
-            },
-            accounting: remuda_protocol::Accounting::Reported,
+            cost: unknown("not-emitted"),
+            accounting: remuda_protocol::Accounting::Estimated,
             native_fields_ref: None,
-            context_window: window.map(U64),
-        })),
+            context_window: None,
+        },
+    };
+    // The result frame is the source of truth for reported cost; the native
+    // modelUsage window rides along. Both carriers keep these.
+    if let Some(cost) = cost {
+        payload.cost = Knowledge::Known { value: cost };
+        payload.accounting = remuda_protocol::Accounting::Reported;
+    }
+    payload.context_window = window.map(U64);
+    Ok(Some(mapper.observation(
+        Completeness::Structured,
+        NativeRequestKey::None,
+        ObservationPayload::Usage(Box::new(payload)),
     )?))
 }
 

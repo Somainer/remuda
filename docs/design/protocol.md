@@ -1079,7 +1079,7 @@ type InteractionAnswer =
 | --- | --- |
 | `lifecycle`, `type=entity` | `{type:"entity", entityType:host\|workspace\|instance\|run\|command\|interaction, entityId:Id, revision:U64, previousState:string\|null, state:string, reasonCode:string, evidenceEventIds:Id[], entity:对应完整实体}`；state 必须落在对应实体枚举，entity.state/lifecycle 一致 |
 | `lifecycle`, `type=native` | `{type:"native", topic:session\|turn\|hook\|subagent\|task\|plan\|configuration\|permission\|diagnostic\|reconciliation, nativeName:string, nativeId:Knowledge<string>, status:Knowledge<string>, relatedIds:Record<string,string>, dataRef:Id\|null, severity:info\|warning\|error, affectsCompletion:boolean}`；这类事件本身不强制终结 Run |
-| `usage` | `{usageId:Id, scope:message\|turn\|session\|workflow-member, scopeId:string, mode:snapshot\|delta, metricRevision:U64, inputTokens:Knowledge<U64>, inputAccounting:total-including-cache\|uncached\|provider-specific\|unknown, outputTokens:Knowledge<U64>, reasoningTokens:Knowledge<U64>, cacheReadTokens:Knowledge<U64>, cacheWriteTokens:Knowledge<U64>, totalTokens:Knowledge<U64>, cost:Knowledge<{amount:string,currency:string}>, accounting:reported\|estimated, nativeFieldsRef:Id\|null}` |
+| `usage` | `{usageId:Id, scope:message\|turn\|session\|workflow-member, scopeId:string, mode:snapshot\|delta, metricRevision:U64, inputTokens:Knowledge<U64>, inputAccounting:total-including-cache\|uncached\|provider-specific\|unknown, outputTokens:Knowledge<U64>, reasoningTokens:Knowledge<U64>, cacheReadTokens:Knowledge<U64>, cacheWriteTokens:Knowledge<U64>, totalTokens:Knowledge<U64>, cost:Knowledge<{amount:string,currency:string}>, accounting:reported\|estimated, contextWindow:U64?, nativeFieldsRef:Id\|null}`；`contextWindow` 可选、additive：harness 上报的该模型原生上下文窗口（如 stream-json `result.modelUsage[m].contextWindow`），Hub 用它而非静态目录解析窗口百分比 |
 | `artifact` | `{artifactId:Id, revision:U64, action:declared\|available\|updated\|removed, type:file\|image\|html\|url\|native\|diff, title:Knowledge<string>, mediaType:Knowledge<string>, sizeBytes:Knowledge<U64>, locator:ArtifactLocator, producerToolCallId:Id\|null, verification:declared\|read-verified\|native-confirmed}` |
 | `raw_tty`, `direction=output` | `{streamId:Id, streamEpoch:Id, direction:"output", representation:pty-bytes\|rendered-ansi, offset:U64, byteLength:U64, dataRef:RawRef, nativeFrame:Knowledge<{seq:U64,width:number,height:number,full:boolean}>}`；rendered-ansi 只表示原生 carrier 重绘的终端画面，不是原进程 stdout/PTY 原字节 |
 | `raw_tty`, `direction=input` | `{streamId:Id, streamEpoch:Id, direction:"input", inputId:Id, byteLength:U64, dataRef:RawRef\|null, actor:ActorRef, delivery:written\|unknown}`；交互输入可只记长度/身份，原文是否保存由明确 retention policy 决定 |
@@ -2278,5 +2278,63 @@ PTY carrier 的完整 Herdr pin：
   "streamUuid": "01993ab0-0000-7000-8000-000000000001",
   "offset": "9007199254740993",
   "payloadLength": 3
+}
+~~~
+
+<!-- golden: usage-context-window -->
+一个 `scope=message` 的 per-call usage 观察携带 harness 上报的原生模型窗口（stream-json `result.modelUsage[m].contextWindow`）。`contextWindow` 是 additive 可选字段；未上报时该键直接缺席（`skip_serializing_if`），Hub 回退到 effective-model → profile → 目录 → kind 默认解析窗口百分比。
+
+~~~json
+{
+  "schemaVersion": 1,
+  "eventId": "evt_01993ab0-0000-7000-8000-000000000001",
+  "journalId": "obj_01993ab0-0000-7000-8000-000000000002",
+  "instanceId": "ins_01993ab0-0000-7000-8000-000000000003",
+  "runId": "run_01993ab0-0000-7000-8000-000000000004",
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000005",
+  "processGeneration": "1",
+  "runGeneration": "1",
+  "seq": "42",
+  "observedAt": "2026-10-08T03:37:18.123Z",
+  "nativeAt": { "state": "known", "value": "2026-10-08T03:37:18.000Z" },
+  "source": {
+    "driverKind": "claude-print",
+    "driverVersion": "2.1.289",
+    "adapterVersion": "1",
+    "channel": "stdout",
+    "delivery": "live",
+    "nativeSessionId": { "state": "known", "value": "sess_019abc" },
+    "nativeTurnId": { "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] },
+    "nativeAgentId": { "state": "not-applicable" },
+    "nativeItemId": { "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] },
+    "nativeEventId": { "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] },
+    "nativeRequestId": { "type": "none" },
+    "sourceCursor": {
+      "type": "runtime",
+      "ledgerRevision": "42"
+    }
+  },
+  "completeness": "structured",
+  "rawRef": null,
+  "evidenceEventIds": [],
+  "kind": "usage",
+  "payload": {
+    "usageId": "obj_01993ab0-0000-7000-8000-000000000006",
+    "scope": "message",
+    "scopeId": "msg_019abc",
+    "mode": "snapshot",
+    "metricRevision": "1",
+    "inputTokens": { "state": "known", "value": "30000" },
+    "inputAccounting": "uncached",
+    "outputTokens": { "state": "known", "value": "718" },
+    "reasoningTokens": { "state": "known", "value": "1200" },
+    "cacheReadTokens": { "state": "known", "value": "5000" },
+    "cacheWriteTokens": { "state": "not-applicable" },
+    "totalTokens": { "state": "known", "value": "35718" },
+    "cost": { "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] },
+    "accounting": "estimated",
+    "contextWindow": "200000",
+    "nativeFieldsRef": null
+  }
 }
 ~~~

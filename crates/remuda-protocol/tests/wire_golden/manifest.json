@@ -126,5 +126,13 @@
     "block": 12,
     "frame": 1,
     "kind": "binary-header"
+  },
+  {
+    "file": "17-usage-context-window.json",
+    "source": "docs/design/protocol.md",
+    "section": "5.5 Lifecycle、Usage、Artifact、TTY 与 Opaque",
+    "block": 13,
+    "frame": 1,
+    "kind": "native-json"
   }
 ]

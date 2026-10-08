@@ -1668,7 +1668,8 @@ async fn fake_node(
                         // nativeAt at the EVENT level (event.nativeAt), not
                         // inside payload. Lift it so the sentinel is a live
                         // observation that enters the rate window.
-                        let native_at = usage.as_object_mut().and_then(|obj| obj.remove("nativeAt"));
+                        let native_at =
+                            usage.as_object_mut().and_then(|obj| obj.remove("nativeAt"));
                         if let Some(native_at) = native_at {
                             append_n = append_full_event(
                                 &mut ws,

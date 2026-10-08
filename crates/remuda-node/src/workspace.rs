@@ -2229,6 +2229,63 @@ mod tests {
         assert!(registry.state.unbinding.is_empty());
     }
 
+    /// r7 item 2 (restored r8 item 3): dot, repeated-separator and
+    /// trailing-slash spellings are not the stored-root shortcut — they
+    /// realpath to the workspace but resolve returns the MATCHED ROW's stored
+    /// bytes, never the caller's alias.
+    #[test]
+    fn resolve_returns_stored_root_bytes_for_component_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let stored = registry.workspaces()[0].root_path.clone();
+        let (id_shortcut, root_shortcut) = registry
+            .resolve_unregister_locked(Path::new(&stored))
+            .unwrap();
+        assert_eq!(root_shortcut.as_os_str(), Path::new(&stored).as_os_str());
+
+        for alias in [
+            format!("{stored}/."),
+            format!("{stored}//"),
+            format!("{stored}/./"),
+        ] {
+            let (id, resolved) = registry
+                .resolve_unregister_locked(Path::new(&alias))
+                .unwrap_or_else(|error| panic!("alias {alias:?} realpaths: {error}"));
+            assert_eq!(
+                id.as_id(),
+                id_shortcut.as_id(),
+                "alias {alias:?} resolves to the same workspace"
+            );
+            assert_eq!(
+                resolved.as_os_str(),
+                Path::new(&stored).as_os_str(),
+                "resolver returns the stored root bytes, not the alias {alias:?}"
+            );
+        }
+    }
+    /// r7 item 2 (restored r8 item 3): the stored-root shortcut itself is
+    /// byte-exact; nothing trims or component-matches it.
+    #[test]
+    fn stored_root_shortcut_is_byte_exact() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let stored = registry.workspaces()[0].root_path.clone();
+        assert!(registry.stored_root_shortcut(Path::new(&stored)).is_some());
+        for alias in [
+            format!("{stored}/"),
+            format!("{stored}/."),
+            format!("{stored}//"),
+        ] {
+            assert!(
+                registry.stored_root_shortcut(Path::new(&alias)).is_none(),
+                "{alias:?} must not take the byte-exact shortcut"
+            );
+        }
+    }
     /// r7 item 1: a mark persisted by a prepare is dropped when the registry
     /// reopens — at process start no command can be in flight, so the mark
     /// would otherwise wedge the workspace across a Node restart.

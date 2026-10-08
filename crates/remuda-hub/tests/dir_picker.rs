@@ -44,6 +44,10 @@ struct FakeNode {
     /// with a Node-style conflict (as if occupancy raced in); the Hub must
     /// then send the abort phase.
     fail_unregister_commits: std::sync::atomic::AtomicU32,
+    /// r8 item 2 race B: the next `abort` reports the commit had already
+    /// SETTLED on the Node, returning phase "settled" with the post-commit
+    /// snapshot (the target workspace removed, revision advanced).
+    abort_reports_settled: std::sync::atomic::AtomicBool,
     /// Every abort frame the Hub sent, in order.
     aborts: Mutex<Vec<Value>>,
 }
@@ -64,6 +68,13 @@ impl FakeNode {
     fn fail_next_unregister_commit(&self) {
         self.fail_unregister_commits
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make the next `abort` frame answer as if commit had already settled on
+    /// the Node (r8 item 2 race B).
+    fn next_abort_reports_settled(&self) {
+        self.abort_reports_settled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -226,19 +237,49 @@ impl NodeTransport for FakeNode {
                              the removal did not settle"}})
                     } else if method == "workspace.unregister" && phase == "abort" {
                         self.aborts.lock().unwrap().push(params.clone());
-                        json!({
-                            "workspaceRevision": 1,
-                            "workspaces": self.real_roots().iter().enumerate()
-                                .map(|(index, root)| json!({
-                                    "workspaceId": if index == 0 { WORKSPACE } else { WORKSPACE2 },
-                                    "hostId": "hst_dirpicker",
-                                    "root": root.display().to_string(),
-                                }))
-                                .collect::<Vec<_>>(),
-                            "workspaceId": workspace_id,
-                            "commandId": command_id,
-                            "phase": "aborted",
-                        })
+                        // r8 item 2 race B: commit had already completed before
+                        // the abort arrived — answer "settled" with the
+                        // post-commit snapshot (the removed root is gone and
+                        // the revision advanced).
+                        let settled_on_node = self
+                            .abort_reports_settled
+                            .swap(false, std::sync::atomic::Ordering::SeqCst);
+                        if settled_on_node {
+                            let remaining = self
+                                .real_roots()
+                                .iter()
+                                .enumerate()
+                                .filter(|(index, _)| *index != 0)
+                                .map(|(index, root)| {
+                                    json!({
+                                        "workspaceId": if index == 0 { WORKSPACE } else { WORKSPACE2 },
+                                        "hostId": "hst_dirpicker",
+                                        "root": root.display().to_string(),
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            json!({
+                                "workspaceRevision": 2,
+                                "workspaces": remaining,
+                                "workspaceId": workspace_id,
+                                "commandId": command_id,
+                                "phase": "settled",
+                            })
+                        } else {
+                            json!({
+                                "workspaceRevision": 1,
+                                "workspaces": self.real_roots().iter().enumerate()
+                                    .map(|(index, root)| json!({
+                                        "workspaceId": if index == 0 { WORKSPACE } else { WORKSPACE2 },
+                                        "hostId": "hst_dirpicker",
+                                        "root": root.display().to_string(),
+                                    }))
+                                    .collect::<Vec<_>>(),
+                                "workspaceId": workspace_id,
+                                "commandId": command_id,
+                                "phase": "aborted",
+                            })
+                        }
                     } else {
                         json!({
                             "workspaceRevision": if phase == "commit" { 2 } else { 1 },
@@ -416,6 +457,7 @@ async fn fixture() -> Result<Fixture> {
         calls: Mutex::new(Vec::new()),
         real_roots: std::sync::Mutex::new(vec![real_root_canonical.clone(), alias_root.clone()]),
         fail_unregister_commits: std::sync::atomic::AtomicU32::new(0),
+        abort_reports_settled: std::sync::atomic::AtomicBool::new(false),
         aborts: Mutex::new(Vec::new()),
     });
     hub.test_set_node_transport(&host, node.clone()).await;
@@ -1467,6 +1509,89 @@ mod abort {
             .expect("command row");
         assert_eq!(row.state, "settled");
         assert_eq!(row.settlement_outcome.as_deref(), Some("rejected"));
+        fixture.hub.shutdown().await;
+        Ok(())
+    }
+
+    /// r8 item 2 race B: the commit completed on the Node while the Hub timed
+    /// out. The Node answers the abort with phase "settled" and the post-commit
+    /// snapshot; the Hub must OBSERVE that snapshot (drop the membership) and
+    /// settle `completed` — never record a phantom "rejected" that leaves a
+    /// stale projection a later task bind could read.
+    #[tokio::test]
+    async fn a_settled_abort_is_observed_and_settles_completed() -> Result<()> {
+        let fixture = fixture().await?;
+        // Observe the two-workspace snapshot.
+        let (status, _) = json_request(
+            fixture.hub.addr,
+            "GET",
+            &format!("/v1/hosts/{}/workspaces", fixture.host),
+            &[("Cookie", &fixture.cookie)],
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200);
+        let root = fixture.real_root.display().to_string();
+
+        // An `accepted` unregister (prepare landed, Hub's commit timed out).
+        let store = fixture.hub.store().expect("store");
+        let (command, _) = store
+            .queue_command(
+                None,
+                None,
+                fixture.host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": root, "workspaceId": WORKSPACE}),
+                None,
+            )
+            .await?;
+        store
+            .mark_forward_intent(command.command_id.clone())
+            .await?;
+        store.mark_accepted(command.command_id.clone()).await?;
+
+        // The Node reports the abort as an already-settled commit.
+        fixture.node.next_abort_reports_settled();
+        fixture
+            .hub
+            .test_reconcile_unsettled_unregisters(&fixture.host)
+            .await;
+
+        let aborts = fixture.node.aborts();
+        assert_eq!(aborts.len(), 1, "{aborts:?}");
+        assert_eq!(aborts[0]["phase"], json!("abort"));
+        assert_eq!(aborts[0]["commandId"], json!(command.command_id));
+
+        // Settled COMPLETED, not rejected.
+        let row = store
+            .get_command(command.command_id.clone())
+            .await?
+            .expect("command row");
+        assert_eq!(row.state, "settled");
+        assert_eq!(row.settlement_outcome.as_deref(), Some("completed"));
+
+        // The observed projection already omits the removed workspace while
+        // keeping the other root — even though a fresh workspace.list would
+        // answer revision 1, the stored revision 2 wins and is not regressed.
+        let (status, view) = json_request(
+            fixture.hub.addr,
+            "GET",
+            &format!("/v1/hosts/{}/workspaces", fixture.host),
+            &[("Cookie", &fixture.cookie)],
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200, "{view}");
+        let view: Value = serde_json::from_str(view.trim())?;
+        assert_eq!(view["workspaceRevision"], json!(2));
+        let ids = view["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["workspaceId"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&WORKSPACE), "{ids:?}");
+        assert!(ids.contains(&WORKSPACE2), "{ids:?}");
         fixture.hub.shutdown().await;
         Ok(())
     }

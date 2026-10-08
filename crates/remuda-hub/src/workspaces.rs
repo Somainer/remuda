@@ -159,6 +159,8 @@ const NODE_UNREGISTER_CONFLICT_MARKERS: &[&str] = &[
     // Round 6 item 1: the resolved id/root must match at both phases.
     "identity does not match the resolved workspace",
     "identity changed between prepare and commit",
+    // r8 item 2: a prepare/commit arrived after the command's abort fence.
+    "was aborted before",
 ];
 
 fn node_unregister_conflict(reason: &str) -> Option<&str> {
@@ -709,10 +711,19 @@ async fn mutate(
     Ok(Json(response))
 }
 
-/// Send the idempotent `abort` phase for one prepared unregister command,
-/// clearing the Node's unbinding mark without touching membership (r7
-/// item 1). Best-effort: a refusal here is logged but never masks the
-/// original handler error, and the reconnect sweep is the backstop.
+/// Send the idempotent `abort` phase for one prepared unregister command.
+/// Best-effort: a refusal here is logged but never masks the original handler
+/// error, and the reconnect sweep is the backstop.
+///
+/// r8 item 2: the Node is the authority on whether the unbind actually ran.
+/// Two distinct acks:
+///  - `phase: "aborted"` — positive evidence the membership was NOT removed;
+///    settle the command `rejected` (r7 item 1).
+///  - `phase: "settled"`  — commit had already completed on the Node while the
+///    Hub timed out (race B). The workspace really is gone, so OBSERVE the
+///    returned snapshot and settle `completed`. Recording "rejected" here would
+///    leave a stale projection that a later `create_task` could bind against.
+///  - any transport error — leave the row unsettled; the next hello retries.
 async fn abort_unregister(
     state: &AppState,
     host_id: &str,
@@ -729,6 +740,26 @@ async fn abort_unregister(
         params["workspaceId"] = json!(workspace_id);
     }
     match crate::http::call_node(state, host_id, "workspace.unregister", params).await {
+        Ok(answer) if answer.get("phase").and_then(Value::as_str) == Some("settled") => {
+            // The commit really landed on the Node before the abort arrived.
+            // Mark completed FIRST (the row is still accepted here), then
+            // observe the post-commit snapshot so the Hub drops the
+            // membership. observe_snapshot's command update leaves the
+            // `completed` outcome intact; calling it first would settle the
+            // row and make mark_settled a no-op (losing the outcome).
+            if let Err(error) = state
+                .store
+                .mark_settled(command_id.to_owned(), host_id.to_owned())
+                .await
+            {
+                tracing::warn!(%command_id, %error, "could not settle unregister completed");
+            }
+            if let Err(error) =
+                observe_snapshot(state, host_id, answer, Some(command_id.to_owned())).await
+            {
+                tracing::warn!(%command_id, %error, "could not observe settled unregister snapshot");
+            }
+        }
         Ok(_) => {
             // The Node acked the abort with positive evidence the unbind did
             // not happen; settle queued OR accepted as rejected.

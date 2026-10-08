@@ -1648,3 +1648,31 @@ hubnode），Node `workspace.unregister` 接受第三阶段；`workspace.resolve
 （round 6）入参 `{path}`、出参 `{workspaceId,canonicalRoot}` 不变，但语义收紧为
 「返回命中行的存储根字节」，unregister prepare/commit 的入参继续携带
 `workspaceId` 与精确 `path` 供 Node 双重核验。
+
+**修订（2026-10-08，c-dirpicker round 8）**：
+
+1. **重连 abort 清扫必须在新 transport 注册之后、于独立任务中执行。**
+   round 7 把 unsettled-unregister 清扫放在 `node.hello` 内、`state.nodes.insert`
+   之前：此时 `call_node` 找不到链路（`Ok(None)`→Unsatisfiable，abort 未投递）；
+   若旧的半开槽仍在注册表里，每个 abort 还会把 hello 阻塞满一个
+   `WORKTREE_RPC_TIMEOUT`；而 hello 处理器本就跑在该会话的读循环里，insert 之后
+   再内联发 RPC 又会等待自己的应答而死锁。现规定：`state.nodes.insert` 之后，在
+   hello 应答已入队之后 `tokio::spawn` 执行清扫（与 `spawn_egress_reinstall`
+   同构，帧排在 hello 应答之后）；未投递成功的命令保持 `queued`/`accepted`，
+   下一次 hello 再扫；命令只在 Node 确认后结算。unregister 命令的 payload
+   持久化解析得到的 `workspaceId`，使清扫 abort 帧能带上 Node 复核所需的 id。
+2. **abort 是一道栅栏，并对「已结算」命令如实回报。**
+   - 对**未知**命令的 abort 记录一座 aborted 墓碑（method/path/commandId）；此后
+     同一 commandId 的 prepare 与 commit 一律拒绝——避免「Hub prepare 超时、Node
+     prepare 仍排队等注册表写锁」时 abort 先到先确认、迟到 prepare 又置下标记却再
+     无人清理（竞态 A）。重试必须用新 commandId。
+   - 对**已 settled** 命令的 abort 不改动任何状态，回 `phase:"settled"` 与当前
+     快照；Hub 据此刻画「completed」并 `observe_snapshot` 该快照，而不是记成
+     「rejected: aborted before commit」并跳过观测，否则陈旧投影会让随后的
+     create_task 复查误绑已移除的工作区（竞态 B）。
+   - 已 prepared 但未 commit 的命令收到 abort 后清标记、记 aborted；排队中的
+     commit 读取 aborted 并拒绝，绝不在 Hub 以为「什么都没发生」时移除成员关系
+     （竞态 C）。
+3. **e2e 浏览根按次运行派生。** `hub_e2e` 假 Node 的 dirpicker 浏览树不再写死
+   `/tmp/remuda-dirpicker`（多 worker 共享且从不清理）；根取 `HUB_E2E_DIR_PICKER_ROOT`
+   或 harness 自有的 per-run TempDir 子目录，正常退出时清理。

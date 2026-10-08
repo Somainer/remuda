@@ -444,16 +444,56 @@ impl WorkspaceRegistry {
                 "workspace commandId was reused with different input".into(),
             ));
         }
-        // r7 item 1: abort is idempotent and stands alone — an unknown
-        // command acks without change, an already-settled one acks as-is.
+        // c-dirpicker r8 item 2: abort is a fence. Three cases.
+        //  - The command is unknown: its prepare may still be queued on the
+        //    write lock or its frame was lost. Record an aborted TOMBSTONE keyed
+        //    by this command id so that late prepare/commit refuses instead of
+        //    setting the unbinding mark after the Hub already gave up (race A).
+        //  - The command was prepared but not committed: clear THIS command's
+        //    mark and record the abort, so a queued commit cannot still remove
+        //    the membership (race C).
+        //  - The command already SETTLED: commit completed on the Node while
+        //    the Hub timed out. Do not mutate anything; reply phase "settled"
+        //    with the current snapshot so the Hub observes the real outcome
+        //    instead of recording a phantom rejection (race B).
         if params.phase == WorkspaceMutationPhase::Abort {
-            if let Some(mut command) = command {
-                next.unbinding.remove(&command.workspace_id);
-                command.aborted = true;
-                next.commands.insert(params.command_id.clone(), command);
-                self.persist(&next)?;
-                self.state = next;
+            if let Some(existing) = &command
+                && existing.settled
+            {
+                let mut result = self.snapshot();
+                result["workspaceId"] = json!(&existing.workspace_id);
+                result["commandId"] = json!(&params.command_id);
+                result["phase"] = json!("settled");
+                return Ok(result);
             }
+            if let Some(mut existing) = command {
+                next.unbinding.remove(&existing.workspace_id);
+                existing.aborted = true;
+                next.commands.insert(params.command_id.clone(), existing);
+            } else {
+                let workspace_id = params
+                    .workspace_id
+                    .as_deref()
+                    .and_then(|raw| <WorkspaceId as std::str::FromStr>::from_str(raw).ok())
+                    .unwrap_or_default();
+                next.commands.insert(
+                    params.command_id.clone(),
+                    Mutation {
+                        method: method.into(),
+                        path: params.path.clone(),
+                        // Abort performs no filesystem resolution; the
+                        // tombstone only fences this command id, it never
+                        // identifies a workspace to unbind.
+                        canonical: PathBuf::new(),
+                        workspace_id,
+                        was_registered: false,
+                        settled: false,
+                        aborted: true,
+                    },
+                );
+            }
+            self.persist(&next)?;
+            self.state = next;
             let mut result = self.snapshot();
             result["workspaceId"] = json!(
                 self.state
@@ -461,7 +501,7 @@ impl WorkspaceRegistry {
                     .get(&params.command_id)
                     .map(|command| &command.workspace_id)
             );
-            result["commandId"] = json!(params.command_id);
+            result["commandId"] = json!(&params.command_id);
             result["phase"] = json!("aborted");
             return Ok(result);
         }
@@ -471,6 +511,20 @@ impl WorkspaceRegistry {
                 unreachable!("abort phase returns before this match")
             }
             WorkspaceMutationPhase::Prepare => {
+                // r8 item 2 race A: an abort for this command landed first
+                // (recorded as an aborted tombstone) or this prepared command
+                // was already aborted. Refuse — never set the mark — and let
+                // the caller issue a NEW command to retry.
+                if command
+                    .as_ref()
+                    .is_some_and(|existing| existing.aborted && !existing.settled)
+                {
+                    return Err(NodeError::Conflict(format!(
+                        "workspace command {} was aborted before it settled; start a new command \
+                         to retry",
+                        params.command_id
+                    )));
+                }
                 if command.is_none() {
                     let (canonical, workspace_id, was_registered) =
                         if method == "workspace.register" {
@@ -571,6 +625,16 @@ impl WorkspaceRegistry {
                         "workspace mutation must be prepared before commit".into(),
                     ));
                 };
+                // r8 item 2 race C: abort landed before this queued commit.
+                // The mark is already cleared and the membership must stay;
+                // refuse without removing anything.
+                if command.aborted && !command.settled {
+                    return Err(NodeError::Conflict(format!(
+                        "workspace command {} was aborted before commit; the workspace stays \
+                         registered",
+                        params.command_id
+                    )));
+                }
                 if !command.settled {
                     if method == "workspace.register" {
                         let canonical = self.validate(Path::new(&params.path))?;
@@ -2265,6 +2329,7 @@ mod tests {
             );
         }
     }
+
     /// r7 item 2 (restored r8 item 3): the stored-root shortcut itself is
     /// byte-exact; nothing trims or component-matches it.
     #[test]
@@ -2286,6 +2351,231 @@ mod tests {
             );
         }
     }
+
+    /// r8 item 2 race A: an abort for an UNKNOWN command lands before the
+    /// (lock-queued / delayed) prepare. The abort records an aborted tombstone;
+    /// the later prepare for the SAME command id must be refused without
+    /// setting the unbinding mark or touching membership, so nothing wedges.
+    #[test]
+    fn abort_before_prepare_tombstone_blocks_the_late_prepare() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+
+        // Abort arrives first; no such command exists yet.
+        let aborted = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-a".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Abort,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert_eq!(aborted["phase"], json!("aborted"));
+        assert!(registry.state.unbinding.is_empty());
+        assert!(registry.state.commands["cmd-r8-race-a"].aborted);
+
+        // The delayed prepare (same command id) must NOT run.
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-a".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("was aborted before it settled"), "{error}");
+        assert!(
+            !registry.state.unbinding.contains(&workspace.meta.id),
+            "the refused prepare must not set the mark"
+        );
+        assert!(
+            registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id),
+            "membership untouched"
+        );
+        // A NEW command (fresh id) is allowed — the fence is per command id.
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-a-retry".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(registry.state.unbinding.contains(&workspace.meta.id));
+    }
+
+    /// r8 item 2 race B: commit completes on the Node while the Hub's commit
+    /// call times out. The late abort must report phase "settled" WITH the
+    /// post-commit snapshot and must NOT mark the settled command aborted.
+    #[test]
+    fn abort_after_a_settled_commit_reports_settled_and_the_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+        let revision_before = registry.snapshot()["workspaceRevision"].as_u64().unwrap();
+
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-b".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-b".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Commit,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(
+            !registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id),
+            "commit removed the membership"
+        );
+
+        // The Hub's late abort.
+        let answer = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-b".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Abort,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert_eq!(answer["phase"], json!("settled"));
+        let workspaces = answer["workspaces"].as_array().unwrap();
+        assert!(
+            !workspaces
+                .iter()
+                .any(|w| w["workspaceId"] == json!(workspace.meta.id.as_id())),
+            "the settled snapshot already omits the removed workspace"
+        );
+        assert!(
+            answer["workspaceRevision"].as_u64().unwrap() > revision_before,
+            "the settled snapshot carries the advanced revision"
+        );
+        assert!(
+            !registry.state.commands["cmd-r8-race-b"].aborted,
+            "a settled command must never be flipped to aborted"
+        );
+        assert!(registry.state.commands["cmd-r8-race-b"].settled);
+    }
+
+    /// r8 item 2 race C: abort lands on a prepared (queued) command BEFORE its
+    /// commit. The mark is cleared; the later commit must refuse and leave the
+    /// membership in place rather than removing it while the Hub believes
+    /// nothing happened.
+    #[test]
+    fn commit_after_an_abort_refuses_and_keeps_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-c".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(registry.state.unbinding.contains(&workspace.meta.id));
+
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-c".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Abort,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(!registry.state.unbinding.contains(&workspace.meta.id));
+        assert!(registry.state.commands["cmd-r8-race-c"].aborted);
+
+        // The queued commit now arrives — it must not remove the membership.
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-c".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Commit,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("was aborted before commit"), "{error}");
+        assert!(
+            registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id),
+            "the aborted commit must not remove the membership"
+        );
+        // The workspace is usable again.
+        let reservation = registry.reserve_locked(&workspace.meta.id).unwrap();
+        drop(reservation);
+    }
+
     /// r7 item 1: a mark persisted by a prepare is dropped when the registry
     /// reopens — at process start no command can be in flight, so the mark
     /// would otherwise wedge the workspace across a Node restart.

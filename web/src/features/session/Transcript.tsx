@@ -534,6 +534,8 @@ function TranscriptInner({
     }
     const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) < 1) return;
+    // Internal growth-anchor write, not a reader scroll: keep reflowAnchorRef.
+    reflowOwnScrollRef.current = true;
     el.scrollTop += delta;
     scrollTopRef.current = el.scrollTop;
     held.top = el.scrollTop;
@@ -577,13 +579,12 @@ function TranscriptInner({
         const resized = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(id)}"]`);
         const anchorRow = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(reflow.id)}"]`);
         if (resized && anchorRow && resized !== anchorRow) {
-          // Compensate only when a DIFFERENT row strictly ABOVE the restored
-          // anchor row grows: its height change pushes the anchor down. When
-          // the saved row ITSELF grows (the viewport top lies inside that
-          // tall assistant row), scrolling by its delta would throw the
-          // saved row's own top up while the rows below it stay put — that
-          // breaks the very position we must keep. Its own top is held by the
-          // generic reading anchor instead.
+          // Compensate only for a DIFFERENT row strictly ABOVE the restored
+          // anchor. A row's OWN growth never moves its own top, so counter-
+          // scrolling it would push that top off the saved spot (the r5 item-1
+          // bug): the anchor row's own top is held without a write, both while
+          // a restore is active (its top is layout-stable across self-growth)
+          // and after it finalizes (the generic anchor holds it).
           const resizedDoc = el.scrollTop + resized.getBoundingClientRect().top - el.getBoundingClientRect().top;
           const anchorDoc = el.scrollTop + anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top;
           if (resizedDoc < anchorDoc) selfDelta = height - prevHeight;
@@ -762,10 +763,16 @@ function TranscriptInner({
       // restore provably pending (data-restore-active="1") until the e2e arm
       // releases the font, so the swap deterministically lands while the
       // restore is active. Zero effect without the query parameter.
+      //
+      // Probe at a NON-STANDARD 12px: the 13px used by the app is matched by
+      // the font stack's generic `monospace` fallback, so fonts.check at 13px
+      // returns true even with IBM Plex Mono unloaded and would finalize on
+      // the fallback face. 12px is not a metric the generic face is declared
+      // for, so the check stays false until the real Plex woff2 is in.
       const probeFontReady = () =>
         !restoreProbe || typeof document === "undefined"
           ? true
-          : document.fonts.check('400 13px "IBM Plex Mono"');
+          : document.fonts.check('400 12px "IBM Plex Mono"');
       if (rowEl) {
         // Pin the reflow anchor to the restored row for the WHOLE restore
         // (including a restoreProbe-held restore that is still pending when a
@@ -786,13 +793,14 @@ function TranscriptInner({
           restoringRef.current = false;
           setRestoreActiveAttr();
         };
-        // A font-metrics reflow self-correction already counter-scrolled the
-        // rows ABOVE this anchor this commit. That does not prove the anchor is
-        // at its saved offset: when the anchor row ITSELF grew (strictly-above
-        // rule leaves it to the generic hold), or the estimate was still off,
-        // delta can be large. Correct it rather than finalizing at an
-        // unfinished position; finalize only when |delta| <= 2.
+        // A font-metrics reflow was self-corrected this commit (rows ABOVE the
+        // anchor counter-scrolled). That does not prove the anchor reached its
+        // saved offset — an estimate miss or a second same-commit correction can
+        // still leave |delta| large. Run the offset correction rather than
+        // finalizing at an unfinished position; finalize only at |delta| <= 2.
         if (reflowCorrected && Math.abs(delta) > 2) {
+          // Own restore write: its scroll event must not retire reflowAnchorRef.
+          reflowOwnScrollRef.current = true;
           el.scrollTop += delta;
           scrollTopRef.current = el.scrollTop;
           pending.tries += 1;
@@ -803,6 +811,7 @@ function TranscriptInner({
           finalizeRestore();
           return;
         }
+        reflowOwnScrollRef.current = true;
         el.scrollTop += delta;
         scrollTopRef.current = el.scrollTop;
       } else {
@@ -810,6 +819,7 @@ function TranscriptInner({
         if (index >= 0) {
           const { offsets } = rowOffsets(nodesRef.current.length, sizesHold.current, estimateRef.current);
           const top = Math.round((offsets[index] ?? 0) + pending.offset);
+          reflowOwnScrollRef.current = true;
           el.scrollTop = top;
           scrollTopRef.current = top;
         }

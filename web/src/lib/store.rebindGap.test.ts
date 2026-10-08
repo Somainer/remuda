@@ -188,3 +188,138 @@ it("navigating back to a gap-backfilling session keeps its socket and lets the f
 
   hubStore.logout();
 });
+
+type StoreInternals = {
+  resumeConnection: () => Promise<void>;
+};
+
+/**
+ * c-reconnfu gate 6 item 1 (HIGH): B's journal seed is in flight (recovering,
+ * B's 20 s watchdog armed). More than 5 s later the user navigates BACK to an
+ * already-mounted A whose socket is OPEN but not freshly framed. B's stale
+ * watchdog must NOT take A offline and reopen a second socket:
+ *  - noteBinding(A) retires B's in-flight attempt (resumeInFlight + watchdog);
+ *  - the rebind uses followBound's frame/probe deadline instead of inheriting
+ *    B's recovering state (which used to reach beginResume at 15 s);
+ *  - a frame on A certifies the existing socket — no reopenFollow ever runs.
+ * Fake timers make the exact sequence deterministic.
+ */
+it("a B-seed watchdog never takes the returned-to mounted A offline or reopens its socket", async () => {
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+
+    const hooks = new Map<string, Hooks>();
+    const subscribed: string[] = [];
+    let releaseBSeed: () => void = () => {};
+
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [
+        { id: INSTANCE_A, journalId: JOURNAL_A, revision: "0", durableSeq: "0", lifecycle: "running" },
+        { id: INSTANCE_B, journalId: JOURNAL_B, revision: "0", durableSeq: "0", lifecycle: "running" },
+      ] as never,
+      nextCursor: null,
+    });
+    vi.spyOn(api, "interactionList").mockResolvedValue([]);
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "eventsRead").mockImplementation(
+      (async (args?: { journalId?: string }) => {
+        if (args?.journalId === JOURNAL_B) {
+          // B's seed stays parked for the whole test: its recovering attempt
+          // and watchdog are what the regression is about.
+          await new Promise<void>((resolve) => {
+            releaseBSeed = resolve;
+          });
+          return { events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true };
+        }
+        return {
+          events: [ttyEvent("1")],
+          durableSeq: "1",
+          windowFromSeq: null,
+          reachedAfterSeq: true,
+        };
+      }) as Api["eventsRead"],
+    );
+    vi.spyOn(api, "eventsSubscribe").mockImplementation(
+      (async (journalId: string, _a: unknown, _b: unknown, _c: unknown, h?: Hooks) => {
+        subscribed.push(journalId);
+        if (h) hooks.set(journalId, h);
+        return {
+          subscriptionId: `sub_${journalId}`,
+          journalId,
+          durableSeq: "0",
+          windowFromSeq: null,
+          reachedAfterSeq: true,
+          getReadyState: () => 1,
+          snapshot: {
+            projectionVersion: "v1",
+            projectionEpoch: `epoch_${journalId}`,
+            asOfSeq: "0",
+            instance: {} as never,
+            runs: [],
+            commands: [],
+            pendingInteractions: [],
+            nodes: [],
+            history: { earliestRetainedSeq: "0", complete: true },
+          },
+        };
+      }) as Api["eventsSubscribe"],
+    );
+
+    await hubStore.bootstrap();
+
+    // 1. A mounts live with one open, framed socket.
+    const mountA = hubStore.follow(INSTANCE_A);
+    await mountA;
+    expect(subscribed).toContain(JOURNAL_A);
+    expect(hubStore.connectionState).toBe("live");
+
+    // 2. Follow B; its REST seed parks → recovering with a watchdog (gen B).
+    const mountB = hubStore.follow(INSTANCE_B);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(hubStore.connectionState).toBe("recovering");
+
+    // 3. After >5 s, back to A — its socket is OPEN but no longer freshly
+    // framed (the exact followSocketLive()=false rebind condition).
+    await vi.advanceTimersByTimeAsync(6_000);
+    hubStore.setFollowLiveForTest(true, false);
+    // Any machine-triggered reopen would call resumeConnection: it must never
+    // run during this sequence.
+    const reopen = vi.fn(() => new Promise<void>(() => {}));
+    (hubStore as unknown as StoreInternals).resumeConnection = reopen;
+
+    const mountABack = hubStore.follow(INSTANCE_A);
+    await vi.advanceTimersByTimeAsync(10);
+    await mountABack;
+    expect(reopen).not.toHaveBeenCalled();
+
+    // 4. A frame lands on A 1 s after the rebind and certifies its socket.
+    await vi.advanceTimersByTimeAsync(1_000);
+    hooks.get(JOURNAL_A)?.onFrame?.();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // 5. Cross B's 20 s watchdog (t=20 s) and A's 15 s bind deadline
+    // (t=21 s), keeping A framed. A stays live with its ONE socket.
+    await vi.advanceTimersByTimeAsync(13_000);
+    hooks.get(JOURNAL_A)?.onFrame?.();
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(hubStore.connectionState).toBe("live");
+    expect(subscribed.filter((j) => j === JOURNAL_A)).toHaveLength(1);
+    expect(reopen).not.toHaveBeenCalled();
+
+    // Let B's parked mount finish so its promise does not outlive the test.
+    releaseBSeed();
+    await vi.advanceTimersByTimeAsync(0);
+    await mountB.catch(() => undefined);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});

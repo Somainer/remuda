@@ -1366,7 +1366,11 @@ class HubStore {
   private rebindMountedConnection() {
     if (!this.connection) return;
     if (this.followSocketLive()) this.connection.followRebindLive();
-    else this.connection.followBound();
+    // rebind: judge the EXISTING socket on its frame/probe deadline. The
+    // machine may still sit in a previous mount's recovering state; without
+    // the rebind flag followBound would inherit that and beginResume() a
+    // second socket (c-reconnfu gate 6 item 1).
+    else this.connection.followBound({ rebind: true });
   }
 
   /**

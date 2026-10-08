@@ -51,6 +51,16 @@ export type MachineDeps = {
   /** Lightweight REST probe used while the socket looks silently stale. */
   probe: () => Promise<boolean>;
   /**
+   * Called exactly once when an in-flight resume attempt is closed while still
+   * bound to the CURRENT generation: `why: "ok"` on success, `"failed"` when the
+   * resume action rejected, `"watchdog"` when the 20 s watchdog gave up on a
+   * hung resume. The store uses it to settle post-delivery debt the attempt
+   * owed: a failed/hung follow must not leave an accepted row at 已受理 while
+   * REST works. Never called for a superseded (stale generation) attempt — the
+   * bind-away path owns that instance's debt.
+   */
+  onAttemptFinish?: (info: { gen: number; attemptId: number; why: "ok" | "failed" | "watchdog" }) => void;
+  /**
    * Whether the follow link is genuinely usable RIGHT NOW: the socket is OPEN
    * AND a frame was received within LIVE_FRAME_MS. Foreground/online resume
    * from a cached "live" trusts the link only when this is true; an OPEN but
@@ -157,14 +167,23 @@ export class ConnectionMachine {
    * dispatches {frame} and takes over via armFrameWatchdog; silence means the
    * open socket is not actually carrying data — live degrades to stale (probe
    * then reopen), recovering retries the resume.
+   *
+   * `rebind` is set when the store rebounds to an ALREADY-MOUNTED session
+   * (navigation back, or a racing mount the user returns to). Such a call must
+   * judge the EXISTING socket by the frame/probe deadline alone: the machine
+   * may currently sit in a PREVIOUS mount's recovering state, and inheriting
+   * it via `wasLive === false` would immediately beginResume() and open a
+   * second socket for a session that still has a working one. A genuinely dead
+   * socket is still reopened later — the stale-state probe path certifies REST
+   * reachability and only then resumes.
    */
-  followBound() {
+  followBound(opts: { rebind?: boolean } = {}) {
     this.clearTimer("bind");
-    if (this.state === "offline") {
+    if (!opts.rebind && this.state === "offline") {
       this.beginResume();
       return;
     }
-    const wasLive = this.state === "live";
+    const wasLive = opts.rebind || this.state === "live";
     this.timers.set(
       "bind",
       this.schedule(() => {
@@ -261,6 +280,7 @@ export class ConnectionMachine {
         // from an attempt the watchdog already timed out (B is now running)
         // must not certify live nor consume B's outcome.
         if (!this.resumeInFlight || event.attemptId !== this.resumeAttemptId) return;
+        const gen = this.resumeBindGen;
         this.resumeInFlight = false;
         this.clearTimer("watchdog");
         if (event.ok) {
@@ -269,6 +289,16 @@ export class ConnectionMachine {
           this.armFrameWatchdog();
         } else {
           this.goOfflineAndSchedule();
+        }
+        // Bind match is defence in depth: noteBinding retires a superseded
+        // attempt before its completion can arrive, so only a current-binding
+        // finish is reported.
+        if (gen === this.latestBindGen) {
+          this.deps.onAttemptFinish?.({
+            gen,
+            attemptId: event.attemptId,
+            why: event.ok ? "ok" : "failed",
+          });
         }
         return;
       }
@@ -349,9 +379,33 @@ export class ConnectionMachine {
    * Store hook: report the generation of the current session binding. The
    * store bumps it on every bind to a DIFFERENT journal (navigation A → B).
    * Once advanced, an attempt armed for an older generation is superseded.
+   *
+   * The supersession is RETIRED here, not merely remembered: an attempt for
+   * the journal the user left keeps its 20 s watchdog armed, and a frame on
+   * the session returned to flips state to live without clearing that
+   * watchdog (`armFrameWatchdog` owns only the frame timers). Without the
+   * retire, the stale watchdog later fires and takes the RETURNED session
+   * offline, reopening a second socket. The store's bind-away handler is the
+   * other half — it settles the abandoned instance's own debt over REST.
    */
   noteBinding(gen: number) {
+    if (gen === this.latestBindGen) return;
     this.latestBindGen = gen;
+    if (this.resumeInFlight && this.resumeBindGen !== gen) {
+      this.resumeInFlight = false;
+      this.clearTimer("watchdog");
+    }
+  }
+
+  /**
+   * Identity of the resume attempt currently owning the link for the BOUND
+   * binding, or null when none (idle live, or a just-superseded attempt). The
+   * store stamps post-delivery catch-up debt with it so a later failure can
+   * tell whether THIS attempt owed the row.
+   */
+  attemptRef(): { gen: number; attemptId: number } | null {
+    if (!this.resumeInFlight || this.resumeBindGen !== this.latestBindGen) return null;
+    return { gen: this.resumeBindGen, attemptId: this.resumeAttemptId };
   }
 
   /**
@@ -424,10 +478,21 @@ export class ConnectionMachine {
     this.timers.set(
       "watchdog",
       this.schedule(() => {
-        if (!this.resumeInFlight || this.resumeAttemptId !== attemptId) return;
+        // The bind-generation guard is independent of the attempt-id guard:
+        // noteBinding retires a superseded attempt, but a late re-entry must
+        // never drive the CURRENT session offline from an attempt bound to a
+        // journal the user already left.
+        if (
+          !this.resumeInFlight ||
+          this.resumeAttemptId !== attemptId ||
+          this.resumeBindGen !== this.latestBindGen
+        ) {
+          return;
+        }
         this.resumeInFlight = false;
         this.attempt += 1;
         this.goOfflineAndSchedule();
+        this.deps.onAttemptFinish?.({ gen, attemptId, why: "watchdog" });
       }, RECOVERING_WATCHDOG_MS),
     );
     this.attempt += 1;

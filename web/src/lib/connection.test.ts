@@ -416,4 +416,60 @@ describe("ConnectionMachine", () => {
     machine.followAttemptEnd(false, 1, 1);
     expect(machine.state).toBe("recovering");
   });
+
+  it("gate6 item1: returning to a mounted A retires B's watchdog; a frame on A never leads offline or a reopen", () => {
+    const { clock, machine, resume, onState } = setupTracked();
+    machine.bootstrapLive();
+    // B's journal seed is in flight under gen 1: recovering + 20 s watchdog.
+    machine.noteBinding(1);
+    const idB = machine.followAttemptBegin(1);
+    expect(machine.state).toBe("recovering");
+    expect(machine.attemptRef()).toEqual({ gen: 1, attemptId: idB });
+    // >5 s later the user returns to already-mounted A (gen 2): noteBinding
+    // retires B's attempt immediately.
+    clock.advance(6_000);
+    machine.noteBinding(2);
+    expect(machine.attemptRef()).toBeNull();
+    // A's socket is OPEN but not freshly framed: the rebind takes the
+    // frame/probe deadline rather than inheriting recovering -> beginResume.
+    machine.followBound({ rebind: true });
+    expect(resume).toHaveBeenCalledTimes(0);
+    // A frame lands on A 1 s after the rebind.
+    clock.advance(1_000);
+    machine.dispatch({ type: "frame" });
+    // t=20 s: B's old watchdog deadline passes (retired — a no-op). Keep A
+    // framed (as a live socket would) and run past A's frame window.
+    clock.advance(13_000);
+    machine.dispatch({ type: "frame" });
+    expect(machine.state).toBe("live");
+    clock.advance(8_000);
+    expect(machine.state).toBe("live");
+    expect(resume).toHaveBeenCalledTimes(0);
+    expect(onState.mock.calls.map((call) => call[0])).not.toContain("offline");
+  });
+
+  it("gate6 item1: a rebind while offline takes the probe path, never an immediate resume", () => {
+    const { clock, machine, resume } = setupTracked();
+    machine.bootstrapLive();
+    // Navigator offline: goOffline() WITHOUT a scheduled reconnect, so the
+    // assertion isolates followBound's own behaviour.
+    machine.dispatch({ type: "offline" });
+    expect(machine.state).toBe("offline");
+    machine.followBound({ rebind: true });
+    expect(resume).toHaveBeenCalledTimes(0);
+    // Deadline reached with no frame: stale + probe/offline timers, still no
+    // reopen (the probe decides whether a reopen is justified).
+    clock.advance(LIVE_FRAME_MS);
+    expect(machine.state).toBe("stale");
+    expect(resume).toHaveBeenCalledTimes(0);
+  });
+
+  it("gate6 item1: a non-rebind followBound from offline resumes immediately", () => {
+    const { machine, resume } = setupTracked();
+    machine.bootstrapLive();
+    machine.dispatch({ type: "offline" });
+    machine.followBound();
+    expect(machine.state).toBe("recovering");
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
 });

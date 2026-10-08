@@ -13,6 +13,13 @@ export type UsageRollup = {
   contextWindowTokens: number | null;
   /** 0..100; null until both sides are known. */
   contextPct: number | null;
+  /**
+   * True when `contextPct` is computed against a window only GUESSED from the
+   * harness kind fallback (an unknown model / no native report / no catalog
+   * row). The UI marks such a percentage with `≈`; a native/model/profile
+   * window is exact and leaves this false.
+   */
+  contextPctApproximate: boolean;
   /** Session sum of fresh (uncached) input. */
   sessionInputTokens: number | null;
   /** Session sum of output. */
@@ -53,6 +60,9 @@ export function coerceUsageRollup(raw: unknown): UsageRollup | null {
     contextUsedTokens: asCount(r.contextUsedTokens),
     contextWindowTokens: asCount(r.contextWindowTokens),
     contextPct: asCount(r.contextPct),
+    // Only an explicit boolean `true` marks an estimate; absent/loose values
+    // render the percentage as exact (the Hub defaults the flag to false).
+    contextPctApproximate: r.contextPctApproximate === true,
     sessionInputTokens: asCount(r.sessionInputTokens),
     sessionOutputTokens: asCount(r.sessionOutputTokens),
     cacheReadTokens: asCount(r.cacheReadTokens),
@@ -102,6 +112,7 @@ const MISSING: Record<string, string> = {
 
 export function contextHeadline(rollup: UsageRollup): {
   text: string;
+  approximate: boolean;
   missing: string | null;
 } {
   if (rollup.contextUsedTokens == null || rollup.contextWindowTokens == null) {
@@ -109,16 +120,20 @@ export function contextHeadline(rollup: UsageRollup): {
       text: `${formatTokenCount(rollup.contextUsedTokens)}/${formatTokenCount(
         rollup.contextWindowTokens,
       )} (—%)`,
+      approximate: false,
       missing: rollup.contextUsedTokens == null ? MISSING.context : MISSING.window,
     };
   }
   const pct =
     rollup.contextPct ??
     Math.round((rollup.contextUsedTokens / rollup.contextWindowTokens) * 100);
+  // A kind-fallback window (unknown model) is only an estimate.
+  const approximate = rollup.contextPctApproximate;
   return {
     text: `${formatTokenCount(rollup.contextUsedTokens)}/${formatTokenCount(
       rollup.contextWindowTokens,
-    )} (${pct}%)`,
+    )} (${approximate ? "≈" : ""}${pct}%)`,
+    approximate,
     missing: null,
   };
 }

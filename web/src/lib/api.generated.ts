@@ -2338,6 +2338,8 @@ export interface components {
             cacheReadTokens?: number | null;
             /** @description contextUsedTokens / contextWindowTokens, rounded and clamped to 0..100; null until both are known. */
             contextPct?: number | null;
+            /** @description True when contextWindowTokens came only from the harness-kind fallback (an unknown model with no native report, catalog row, or provider-profile window): contextPct is then an estimate and the client marks it ≈. False for native/profile/catalog evidence. */
+            contextPctApproximate?: boolean;
             /** @description Tokens the next request carries: the last turn's fresh input + cache read + cache creation; null when no component was reported. */
             contextUsedTokens?: number | null;
             /** @description Context window size from the [1m] tag, the model catalog, or the harness kind; null for kinds without a known window. */

@@ -1872,6 +1872,10 @@
               "null"
             ]
           },
+          "contextPctApproximate": {
+            "description": "True when contextWindowTokens came only from the harness-kind fallback (an unknown model with no native report, catalog row, or provider-profile window): contextPct is then an estimate and the client marks it ≈. False for native/profile/catalog evidence.",
+            "type": "boolean"
+          },
           "contextUsedTokens": {
             "description": "Tokens the next request carries: the last turn's fresh input + cache read + cache creation; null when no component was reported.",
             "type": [

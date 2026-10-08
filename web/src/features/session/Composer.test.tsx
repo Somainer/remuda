@@ -408,6 +408,7 @@ describe("Composer context usage chip", () => {
     contextUsedTokens: 35_839,
     contextWindowTokens: 200_000,
     contextPct: 18,
+    contextPctApproximate: false,
     sessionInputTokens: 7_856,
     sessionOutputTokens: 589,
     cacheReadTokens: 97_704,
@@ -449,6 +450,36 @@ describe("Composer context usage chip", () => {
     await user.click(screen.getByTestId("context-usage-close"));
     expect(screen.queryByTestId("context-usage-popover")).toBeNull();
     expect(chip).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("marks the chip ≈ when the rollup window is only a kind-fallback estimate", () => {
+    render(
+      <Composer
+        instanceId="ins_rollup_approx"
+        mobile={false}
+        onSend={vi.fn()}
+        usageRollup={{ ...rollup, contextPct: 4, contextPctApproximate: true }}
+      />,
+    );
+    const chip = screen.getByTestId("context-chip");
+    expect(chip).toHaveTextContent("≈4%");
+    expect(chip).toHaveAttribute("data-approximate", "1");
+    expect(chip.getAttribute("aria-label")).toContain("约 ");
+  });
+
+  it("does not mark the chip ≈ for an exact native/catalog window", () => {
+    render(
+      <Composer
+        instanceId="ins_rollup_exact"
+        mobile={false}
+        onSend={vi.fn()}
+        usageRollup={{ ...rollup, contextPctApproximate: false }}
+      />,
+    );
+    const chip = screen.getByTestId("context-chip");
+    expect(chip).toHaveTextContent("18%");
+    expect(chip).not.toHaveTextContent("≈");
+    expect(chip).toHaveAttribute("data-approximate", "0");
   });
 
   it("opens the popover on hover for precise pointers and closes on leave", async () => {

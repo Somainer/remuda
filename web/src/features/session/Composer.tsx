@@ -455,7 +455,13 @@ export function Composer({
     : contextLabel?.endsWith("%")
       ? Number(contextLabel.slice(0, -1))
       : null;
-  const contextChipLabel = contextPct == null || !Number.isFinite(contextPct) ? "—" : `${contextPct}%`;
+  // An approximate percentage (Hub kind-fallback window for an unknown model)
+  // is shown with a leading ≈; exact native/catalog/profile windows are not.
+  const contextApprox = usageRollup?.contextPctApproximate === true;
+  const contextChipLabel =
+    contextPct == null || !Number.isFinite(contextPct)
+      ? "—"
+      : `${contextApprox ? "≈" : ""}${contextPct}%`;
   const hoverCapable = () =>
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
@@ -1037,11 +1043,12 @@ export function Composer({
       className={`${css.chip} ${opt.sheetTouch}`}
       data-testid="context-chip"
       data-has-popover={usageRollup ? "1" : "0"}
+      data-approximate={contextApprox ? "1" : "0"}
       aria-haspopup={usageRollup ? "dialog" : undefined}
       aria-expanded={menu === "usage"}
       aria-label={
         usageRollup
-          ? `上下文用量 ${contextChipLabel}，查看明细`
+          ? `上下文用量 ${contextApprox ? "约 " : ""}${contextChipLabel}，查看明细`
           : `上下文用量 ${contextChipLabel}`
       }
       onClick={() => {
@@ -1063,11 +1070,12 @@ export function Composer({
       className={css.chip}
       data-testid="context-chip"
       data-has-popover={usageRollup ? "1" : "0"}
+      data-approximate={contextApprox ? "1" : "0"}
       aria-haspopup={usageRollup ? "dialog" : undefined}
       aria-expanded={menu === "usage"}
       aria-label={
         usageRollup
-          ? `上下文用量 ${contextChipLabel}，查看明细`
+          ? `上下文用量 ${contextApprox ? "约 " : ""}${contextChipLabel}，查看明细`
           : `上下文用量 ${contextChipLabel}`
       }
       onClick={() => {

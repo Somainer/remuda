@@ -93,6 +93,24 @@ describe("contextHeadline", () => {
     expect(head.text).toBe("—/200.0k (—%)");
     expect(head.missing).toMatch(/usage 观察/);
   });
+
+  it("prefixes an approximate (kind-fallback window) percentage with ≈", () => {
+    const head = contextHeadline({
+      contextUsedTokens: 900,
+      contextWindowTokens: 200_000,
+      contextPct: 1,
+      contextPctApproximate: true,
+    } as UsageRollup);
+    expect(head.text).toBe("900/200.0k (≈1%)");
+    expect(head.approximate).toBe(true);
+  });
+
+  it("coerces contextPctApproximate only on an explicit boolean true", () => {
+    expect(coerceUsageRollup({ contextPctApproximate: true })?.contextPctApproximate).toBe(true);
+    expect(coerceUsageRollup({ contextPctApproximate: false })?.contextPctApproximate).toBe(false);
+    expect(coerceUsageRollup({ contextPctApproximate: 1 })?.contextPctApproximate).toBe(false);
+    expect(coerceUsageRollup({})?.contextPctApproximate).toBe(false);
+  });
 });
 
 describe("sessionCells / tpmCells / lastTurnLabel", () => {

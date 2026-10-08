@@ -18,6 +18,7 @@ const rollup1: UsageRollup = {
   contextUsedTokens: 34_290,
   contextWindowTokens: 200_000,
   contextPct: 17,
+  contextPctApproximate: false,
   sessionInputTokens: 4_794,
   sessionOutputTokens: 260,
   cacheReadTokens: 29_496,

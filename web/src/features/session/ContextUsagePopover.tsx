@@ -105,8 +105,9 @@ export function ContextUsagePopover({
             aria-label={
               rollup.contextPct == null
                 ? "上下文占用未知"
-                : `上下文占用 ${rollup.contextPct}%`
+                : `上下文占用 ${head.approximate ? "约 " : ""}${rollup.contextPct}%`
             }
+            data-approximate={head.approximate ? "1" : "0"}
           >
             <span style={{ width: `${pct}%` }} />
           </div>

@@ -177,7 +177,7 @@ const DesktopRecentRow = memo(
             {row.title}
           </Link>
           <span className={desktopCss.recentSpacer} />
-          <ContextRing pct={row.contextPct} />
+          <ContextRing pct={row.contextPct} approximate={row.contextPctApproximate} />
         </div>
         {row.subtitle ? (
           <p className={desktopCss.recentSubtitle} title={row.subtitle}>
@@ -318,14 +318,27 @@ export function DepartedList({
 /* Compact-only recent-instance row (进行中 · 最近).                   */
 /* ------------------------------------------------------------------ */
 
-function ContextRing({ pct }: { pct: number | null }) {
+function ContextRing({
+  pct,
+  approximate = false,
+}: {
+  pct: number | null;
+  approximate?: boolean;
+}) {
   if (pct == null) return null;
   const clamped = Math.max(0, Math.min(100, pct));
   const r = 11;
   const circ = 2 * Math.PI * r;
   const label = contextRingLabel(clamped);
+  const approxLabel = approximate ? `约 ${clamped}%` : null;
   return (
-    <span className={compactCss.ring} title={label ?? undefined} role="img" aria-label={label ?? ""}>
+    <span
+      className={compactCss.ring}
+      title={approxLabel ?? label ?? undefined}
+      role="img"
+      aria-label={approxLabel ?? label ?? ""}
+      data-approximate={approximate ? "1" : "0"}
+    >
       <svg viewBox="0 0 28 28" width="28" height="28" aria-hidden="true">
         <circle className={compactCss.ringTrack} cx="14" cy="14" r={r} />
         <circle
@@ -338,6 +351,7 @@ function ContextRing({ pct }: { pct: number | null }) {
         />
       </svg>
       <span className={compactCss.ringText} aria-hidden="true">
+        {approximate ? "≈" : ""}
         {clamped}%
       </span>
     </span>
@@ -373,7 +387,7 @@ const RecentRowCard = memo(
             {row.title}
           </Link>
           <span className={compactCss.rowSpacer} />
-          <ContextRing pct={row.contextPct} />
+          <ContextRing pct={row.contextPct} approximate={row.contextPctApproximate} />
         </div>
         {row.subtitle ? (
           <p className={compactCss.subtitle} title={row.subtitle}>

@@ -7,13 +7,21 @@ import css from "./home.module.css";
  * renders nothing at all — no ring, no "0%", no guessed value — because an
  * unknown share is "不知道怎么画", not zero. Values coming from outside the
  * 0..100 band are clamped rather than trusted, so a bad rollup can never
- * bend the arc backwards.
+ * bend the arc backwards. `approximate` marks a percentage computed against a
+ * kind-fallback window (unknown model): the text gets a leading ≈.
  */
-export function ContextRing({ pct }: { pct: number | null | undefined }) {
+export function ContextRing({
+  pct,
+  approximate = false,
+}: {
+  pct: number | null | undefined;
+  approximate?: boolean;
+}) {
   if (pct == null || !Number.isFinite(pct)) return null;
   const used = Math.max(0, Math.min(100, Math.round(pct)));
   const remaining = 100 - used;
   const radius = 8;
+  const label = `${approximate ? "约 " : ""}${used}%`;
   // SVG stroke direction is clockwise from the 3 o'clock point; rotate to
   // start at 12 o'clock and grow the used arc clockwise.
   return (
@@ -21,9 +29,10 @@ export function ContextRing({ pct }: { pct: number | null | undefined }) {
       className={css.ring}
       data-testid="context-ring"
       data-pct={used}
+      data-approximate={approximate ? "1" : "0"}
       role="img"
-      aria-label={`上下文已用 ${used}%，剩余 ${remaining}%`}
-      title={`上下文已用 ${used}% · 剩余 ${remaining}%`}
+      aria-label={`上下文已用 ${label}，剩余 ${remaining}%`}
+      title={`上下文已用 ${label} · 剩余 ${remaining}%`}
     >
       <svg viewBox="0 0 20 20" width="20" height="20" aria-hidden="true">
         <circle className={css.ringTrack} cx="10" cy="10" r={radius} />
@@ -37,6 +46,7 @@ export function ContextRing({ pct }: { pct: number | null | undefined }) {
         />
       </svg>
       <span className={css.ringText} data-testid="context-ring-pct">
+        {approximate ? "≈" : ""}
         {used}%
       </span>
     </span>

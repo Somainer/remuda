@@ -74,6 +74,8 @@ export type HomeRow = {
   bodyDetail: string | null;
   /** 0..100 used-context share; null = unknown, and the ring must not render. */
   contextPct: number | null;
+  /** True when contextPct uses a kind-fallback window guess (render ≈). */
+  contextPctApproximate: boolean;
   blocked: boolean;
   /** Exited rows advertise 恢复 only when the resume capability is really there (D-026). */
   canResume: boolean;
@@ -233,6 +235,7 @@ export function buildHomeRows(
         bodyTone: ended?.tone ?? null,
         bodyDetail: ended?.detail ?? null,
         contextPct: input.rollupOf(instance.id)?.contextPct ?? null,
+        contextPctApproximate: input.rollupOf(instance.id)?.contextPctApproximate ?? false,
         blocked: status === "blocked",
         canResume,
         timeLabel: formatListTime(instance.updatedAt, nowMs),
@@ -356,7 +359,7 @@ export function homeRowsSignature(
   const rowPart = [...rows.values()]
     .map(
       (row) =>
-        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.bodyTone ?? "-"}|${row.bodyDetail ?? "-"}|${row.contextPct ?? "-"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
+        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.bodyTone ?? "-"}|${row.bodyDetail ?? "-"}|${row.contextPct ?? "-"}|${row.contextPctApproximate ? "a" : "x"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
     )
     .join("\n");
   // Prefs/closed tabs and workspace membership change WHICH instances a space

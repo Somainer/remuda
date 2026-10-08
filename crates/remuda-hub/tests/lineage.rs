@@ -335,13 +335,11 @@ impl Ctx {
     /// Wait until the durable sequence advances past `before` — a deterministic
     /// barrier that a journal append has been projected, replacing fixed sleeps
     /// before NEGATIVE assertions (ma-lineage r5 item 5).
-    async fn wait_seq_advances(&self, id: &str, before: &str) -> Result<String> {
-        let view = self
-            .wait_until(id, |v| {
-                v["durableSeq"].as_str().is_some_and(|seq| seq != before)
-            })
-            .await?;
-        Ok(view["durableSeq"].as_str().unwrap_or("").to_string())
+    async fn wait_seq_advances(&self, id: &str, before: &str) -> Result<Value> {
+        self.wait_until(id, |v| {
+            v["durableSeq"].as_str().is_some_and(|seq| seq != before)
+        })
+        .await
     }
 
     async fn wait_host_offline(&self) -> Result<()> {
@@ -1040,21 +1038,17 @@ async fn ended_at_backfill_skips_an_end_followed_by_return_to_live() -> Result<(
 #[tokio::test]
 async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -> Result<()> {
     let ctx = Ctx::boot().await?;
-    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let node_token = node_token.context("nodeToken")?;
     let (x, _token) = ctx.seat(&mut node, None).await?;
     ctx.report_session(&node, &x, false).await?;
 
-    // Mark the host offline (as the WS-disconnect / boot sweep would), then
-    // run the host-lost sweep at grace 0 directly (the periodic sweeper uses
-    // the same path with a real grace window).
-    {
-        let db = rusqlite::Connection::open(&ctx.db_path)?;
-        db.execute(
-            "UPDATE hosts SET state = 'unreachable', offline_since = '2000-01-01T00:00:00.000Z'
-             WHERE id = ?1",
-            rusqlite::params![ctx.host],
-        )?;
-    }
+    // ma-lineage r6 item 6: drive the real disconnect → host-offline path (no
+    // hand-edited hosts table), then the host-lost sweep at grace 0.
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
     let (changed, _settlement) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
     assert_eq!(changed, 1, "the seat's row is host-lost");
     let row = ctx.get_instance(&x, &ctx.human).await?;
@@ -1066,8 +1060,10 @@ async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -
         "host loss stamps no endedAt: the process may still be running"
     );
 
-    // The node is still connected (same epoch). Continuation closes the
-    // possibly-alive predecessor BEFORE the successor resume.
+    // Reconnect the node with the persistent token (D-018): the link is live
+    // again, then continuation closes the possibly-alive predecessor BEFORE
+    // the successor resume.
+    let mut node = FakeNode::connect_with_token(&ctx.hub, &ctx.host, &node_token).await?;
     let response: Value = ctx
         .resume(&x, &ctx.human)
         .await?
@@ -1090,6 +1086,84 @@ async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -
     assert_eq!(method, "instance.resume");
 
     assert_eq!(first_chapter_ended_at(&ctx, &x).await?, None);
+    Ok(())
+}
+
+/// ma-lineage r6 item 4: X→Y with a session; the host link drops and Y is
+/// swept host-lost while Y's process stays alive. A resume addressed to the
+/// OLDER chapter X (or the lineage id) must NOT replay dead Y and must run
+/// the continuation: instance.close for Y precedes instance.resume, a new
+/// successor is minted, and repeating the resume does not replay forever.
+#[tokio::test]
+async fn a_resume_after_a_host_lost_current_chapter_runs_continuation_not_replay() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, true).await?;
+
+    // Continue X → Y (Y carries the native session).
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    // Y reaches a live lifecycle (the Node launches and initializes it).
+    ctx.report_session(&node, &y, false).await?;
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE hosts SET state = 'unreachable', offline_since = '2000-01-01T00:00:00Z'
+             WHERE id = ?1",
+            rusqlite::params![ctx.host],
+        )?;
+    }
+    let (changed, _) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
+    assert_eq!(changed, 1, "Y is host-lost");
+
+    // Bring the node back (same host link; resume endpoint tolerates this via
+    // the continuation's own checks when the link is live in the test).
+    {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.execute(
+            "UPDATE hosts SET state = 'online', offline_since = NULL WHERE id = ?1",
+            rusqlite::params![ctx.host],
+        )?;
+    }
+
+    // Resume addressed to the OLD chapter X while the CURRENT chapter Y is
+    // host-lost: continuation, not a {replayed} dead Y.
+    let response = ctx.resume(&x, &ctx.human).await?.error_for_status()?;
+    assert_eq!(response.status(), 200);
+    let third: Value = response.json().await?;
+    assert_ne!(
+        third["replayed"],
+        json!(true),
+        "host-lost current chapter is not replayed"
+    );
+    let z = third["instance"]["instanceId"].as_str().unwrap().to_owned();
+    assert_ne!(z, y);
+
+    // The live Y was closed before Z resumed.
+    let (method, close_params) = node.next_frame().await?;
+    assert_eq!(method, "instance.close", "the potentially live Y is closed");
+    assert_eq!(close_params["instanceId"], json!(y));
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    // Repeating the resume addresses the new current Z (live): an idempotent
+    // replay is correct here, and it must not send more close frames.
+    let replay = ctx.resume(&x, &ctx.human).await?.error_for_status()?;
+    assert_eq!(replay.status(), 200);
+    let body: Value = replay.json().await?;
+    assert_eq!(body["replayed"], json!(true), "the live successor replays");
+    assert!(
+        node.has_no_pending_frames().await,
+        "replaying the live successor sends no new frames"
+    );
     Ok(())
 }
 
@@ -1709,6 +1783,12 @@ async fn a_failed_turn_sets_no_ended_at_until_the_real_process_exit() -> Result<
 
     // A settled turn error (the print/sdk mapper's `result` is_error frame):
     // topic=turn, status error, queued 0. The chapter is still running.
+    // ma-lineage r6 item 6: capture the durable seq and wait until THIS event
+    // is applied (durableSeq != "0" is already true after report_session).
+    let seq_before = ctx.get_instance(&x, &ctx.human).await?["durableSeq"]
+        .as_str()
+        .unwrap_or("0")
+        .to_string();
     node.appends.send((
         x.clone(),
         json!({
@@ -1722,9 +1802,7 @@ async fn a_failed_turn_sets_no_ended_at_until_the_real_process_exit() -> Result<
             }
         }),
     ))?;
-    let view = ctx
-        .wait_until(&x, |v| v["durableSeq"].as_str().is_some_and(|s| s != "0"))
-        .await?;
+    let view = ctx.wait_seq_advances(&x, &seq_before).await?;
     assert_ne!(
         view["lifecycle"],
         json!("failed"),
@@ -1918,10 +1996,12 @@ async fn a_swept_never_acknowledged_create_with_the_real_marker_recovers_fresh()
     let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
     let (x, _token) = ctx.seat(&mut node, None).await?;
     // Simulate the stale-create sweep exactly: failed, no session ever
-    // reported, last_error is the constant the sweep stamps.
+    // reported, last_error is the constant the sweep stamps. ma-lineage r6
+    // item 6: leave ended_at NULL — the marker alone is the evidence (it must
+    // not require ended_at to recover).
     let db = rusqlite::Connection::open(&ctx.db_path)?;
     db.execute(
-        "UPDATE instances SET lifecycle = 'failed', ended_at = '2026-10-06T01:00:00.000Z',
+        "UPDATE instances SET lifecycle = 'failed', ended_at = NULL,
             last_error = 'create-never-acknowledged'
          WHERE id = ?1",
         rusqlite::params![x],

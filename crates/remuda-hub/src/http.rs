@@ -1917,36 +1917,33 @@ async fn resume_lineage(
         .get_instance_read(lineage.current_instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
-    // ma-lineage round 3 item 4 + round 5 item 2: the owner may address an
-    // OLDER chapter.
+    // ma-lineage rounds 3-6: decide whether to replay the current chapter or
+    // continue it.
     //
-    // * If the lineage's CURRENT chapter is still LIVE (requested/starting/
-    //   running), the addressed chapter's continuation already happened —
-    //   resolve that idempotent replay here, before any launch validation, and
-    //   never mint a fourth chapter for a live one.
-    // * If the CURRENT chapter has itself ENDED with process-end evidence, a
-    //   replay would hand back a dead lineage with no new chapter. Instead
-    //   retarget the continuation at the current chapter so the transactional
-    //   flow below fences it and mints the next one (Z from ended Y), no
-    //   matter which older chapter (X) the client happened to address.
-    if addressed.instance_id != current.instance_id {
-        if state
-            .store
-            .instance_has_process_end_evidence(&current)
-            .await?
-        {
-            // Retarget at the current chapter; `current` is still needed below
-            // for host id / predecessor bookkeeping.
-            addressed = current.clone();
-        } else {
-            return Ok(Json(json!({
-                "instance": current,
-                "hostId": current.host_id,
-                "mode": mode.as_str(),
-                "replayed": true
-            })));
-        }
+    // * Replay (idempotent, no new chapter) only while the lineage's CURRENT
+    //   chapter is genuinely LIVE (requested/starting/running) AND the owner
+    //   addressed an older chapter (the current chapter already represents
+    //   that continuation).
+    // * Otherwise continue the current chapter into a NEW one:
+    //   - the current chapter has process-end evidence (r5 item 2), OR
+    //   - it is host-lost / ambiguous-failed with NO end evidence (r6 item 4):
+    //     the process may still be alive, so continuation must run and the
+    //     post-commit close reaches it; a replay would strand the live process
+    //     forever and never close it.
+    //   - the owner addressed the current chapter itself (normal resume).
+    if addressed.instance_id != current.instance_id
+        && crate::store::current_chapter_is_live(&current)
+    {
+        return Ok(Json(json!({
+            "instance": current,
+            "hostId": current.host_id,
+            "mode": mode.as_str(),
+            "replayed": true
+        })));
     }
+    // Continue the current chapter (retarget when an older one was
+    // addressed); `current` is still needed below for host id / bookkeeping.
+    addressed = current.clone();
     let host = state
         .store
         .get_host(current.host_id.clone())
@@ -2014,8 +2011,11 @@ async fn resume_lineage(
             let mut spec = current.spec_for_resume();
             if let Some(object) = spec.as_object_mut() {
                 // A continuation keeps the same carrier (claude-sdk resumes as
-                // claude-sdk; ResumeMode no longer downgrades it).
-                object.insert("driver".into(), json!(current.driver));
+                // claude-sdk; ma-lineage r6 item 5: honour the requested resume
+                // mode's driver when it differs, rather than forcing the
+                // structured/SDK driver for a {mode:"terminal"} continuation).
+                let driver = mode.driver(&current.driver);
+                object.insert("driver".into(), json!(driver));
                 object.insert("resumeSessionId".into(), json!(session_id));
                 object.insert("resumedFrom".into(), json!(current.instance_id));
                 object.insert("parentInstanceId".into(), json!(current.parent_instance_id));
@@ -2256,13 +2256,34 @@ pub async fn get_lineage(
     } else if let Some(current) = &current {
         let host_live = state.nodes.kind_of(&current.host_id).await.is_some();
         let chapter_running = matches!(current.lifecycle.as_str(), "ready" | "running");
+        // ma-lineage r6 item 5: a terminal chapter WITHOUT process-end
+        // evidence (host-lost contact loss / ambiguous failed) is still a
+        // possibly-alive process, so when its host is down it derives
+        // host-offline too — not the stored `starting`/exited state.
+        let chapter_ambiguously_terminal =
+            matches!(current.lifecycle.as_str(), "exited" | "failed")
+                && !state
+                    .store
+                    .instance_has_process_end_evidence(current)
+                    .await
+                    .unwrap_or(false);
         lineage_state = if chapter_running && host_live {
             "running".into()
-        } else if chapter_running {
-            // D-057 §5 derived state: the chapter was running but its host
-            // link is gone. It is not `starting` — the process may be alive
-            // (D-019); report it truthfully as running with an offline host.
-            "host-offline".into()
+        } else if chapter_running || chapter_ambiguously_terminal {
+            if host_live {
+                // Running with a live link; an ambiguous terminal on a live
+                // link is being reconciled/continued — show starting.
+                if chapter_running {
+                    "running".into()
+                } else {
+                    "starting".into()
+                }
+            } else {
+                // The chapter was/possibly-is running but its host link is
+                // gone. It is not a clean terminal — the process may be alive
+                // (D-019); report it truthfully as host-offline.
+                "host-offline".into()
+            }
         } else {
             "starting".into()
         };

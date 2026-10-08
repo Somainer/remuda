@@ -2669,25 +2669,15 @@ impl Store {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             let grace = grace_ms.min(i64::MAX as u64) as i64;
-            // Find the rows this sweep is about to end so their pending
-            // interactions are invalidated in the SAME transaction
-            // (c-cardsettle).
-            let lost: Vec<String> = {
-                let mut stmt = tx.prepare(
-                    "SELECT id FROM instances
-                     WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
-                        SELECT id FROM hosts WHERE state != 'online' AND
-                        (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
-                        (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
-                     )",
-                )?;
-                let rows = stmt.query_map(params![&now, grace], |row| row.get::<_, String>(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
             let changed = tx.execute(
+                // r8 item 2 (OA6): host loss is CONTACT loss, never process
+                // end. Mark the rows host-lost but leave ended_at untouched
+                // (COALESCE would stamp the sweep time as process-end
+                // evidence); the still-running child is reconciled when the
+                // host returns, via revive_host_lost_instances.
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                     connectivity = 'disconnected', last_error = 'host-lost',
-                    updated_at = ?1, ended_at = COALESCE(ended_at, ?1)
+                    updated_at = ?1
                  WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
                     SELECT id FROM hosts WHERE state != 'online' AND
                     (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
@@ -2695,9 +2685,12 @@ impl Store {
                  )",
                 params![&now, grace],
             )?;
-            let settlement = settle_instance_interactions(&tx, &lost, &now)?;
+            // r8 item 2(c): the host-lost sweep must NOT settle cards — the
+            // process behind the lost contact may still be live and a new
+            // approval from it must stay answerable after reconnect. Only a
+            // real process end settles a generation.
             tx.commit()?;
-            Ok((changed, settlement))
+            Ok((changed, Settlement::default()))
         }).await
     }
 
@@ -3592,6 +3585,48 @@ impl Store {
             let settlement = settle_instance_interactions(&tx, &lost, &now)?;
             tx.commit()?;
             Ok((lost, settlement))
+        })
+        .await
+    }
+
+    /// Same-epoch reconnect revival (c-cardsettle r8 item 2, OA6): bring rows
+    /// the contact-loss sweep marked `exited`/host-lost back to `running` when
+    /// the SAME Node reports them live in its hello inventory.
+    ///
+    /// Host loss is CONTACT loss, never process end: the child kept running
+    /// while the Hub could not see the host, the sweep only marked the row
+    /// host-lost (no `ended_at`, cards untouched), and on reconnect the live
+    /// process's own inventory is the evidence that the chapter never ended.
+    /// Only rows with exactly that shape revive — a real exit
+    /// (`ended_at` set or any other marker) is never resurrected.
+    ///
+    /// Returns the revived instance ids.
+    pub async fn revive_host_lost_instances(
+        &self,
+        host_id: String,
+        live_inventory: &[(String, String)],
+    ) -> Result<Vec<String>, StoreError> {
+        let live: Vec<(String, String)> = live_inventory.to_vec();
+        self.run_named("revive_host_lost_instances", move |conn| {
+            let tx = immediate_tx(conn)?;
+            let now = now_rfc3339();
+            let mut revived = Vec::new();
+            for (id, activity) in &live {
+                let changed = tx.execute(
+                    "UPDATE instances SET lifecycle = 'running', activity = ?3,
+                        connectivity = 'connected', last_error = NULL, updated_at = ?4
+                     WHERE id = ?1 AND host_id = ?2
+                       AND lifecycle = 'exited'
+                       AND COALESCE(last_error, '') = 'host-lost'
+                       AND ended_at IS NULL",
+                    params![id, &host_id, activity, &now],
+                )?;
+                if changed > 0 {
+                    revived.push(id.clone());
+                }
+            }
+            tx.commit()?;
+            Ok(revived)
         })
         .await
     }
@@ -10655,11 +10690,12 @@ mod tests {
         store.close().await;
     }
 
-    /// c-cardsettle (host-lost sweep): expire_lost_hosts settles the instances
-    /// of an unreachable host and invalidates their still-pending interactions
-    /// in the same transaction.
+    /// c-cardsettle r8 item 2 (OA6): the host-lost sweep marks the ROW
+    /// exited/host-lost but host loss is CONTACT loss, not process end — it
+    /// does NOT invalidate pending cards and does NOT stamp `ended_at`. The
+    /// row is the potentially-live shape the same-epoch revive clears.
     #[tokio::test]
-    async fn expire_lost_hosts_invalidates_pending_interactions() {
+    async fn expire_lost_hosts_marks_contact_loss_without_settling_cards() {
         let dir = tempfile::tempdir().expect("dir");
         let store = Store::open(dir.path()).expect("store");
         let host = new_id("hst").expect("host");
@@ -10673,19 +10709,59 @@ mod tests {
             .expect("offline");
         let (swept, settlement) = store.expire_lost_hosts(0).await.expect("host-lost sweep");
         assert_eq!(swept, 1);
-        assert_eq!(settlement.interactions.len(), 1, "one card settled");
-        assert_eq!(settlement.interactions[0].instance_id, instance.instance_id);
-        assert_eq!(settlement.interactions[0].interaction_id, int_id);
-        assert!(!settlement.interactions[0].updated_at.is_empty());
+        assert!(
+            settlement.interactions.is_empty(),
+            "contact loss never settles cards: {settlement:?}"
+        );
         let row = store
-            .get_instance(instance.instance_id)
+            .get_instance(instance.instance_id.clone())
             .await
             .expect("get")
             .expect("row");
         assert_eq!(row.lifecycle, "exited");
+        assert_eq!(row.last_error.as_deref(), Some("host-lost"));
+        let ended_at_id = instance.instance_id.clone();
+        let ended_at: Option<String> = store
+            .run_named("r8_ended_at_check", move |conn| {
+                conn.query_row(
+                    "SELECT ended_at FROM instances WHERE id = ?1",
+                    params![&ended_at_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+            })
+            .await
+            .expect("query ended_at")
+            .flatten();
+        assert!(
+            ended_at.is_none(),
+            "contact loss must not stamp process-end evidence"
+        );
+        // The card is untouched: still pending, still blocking.
         let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
-        assert_eq!(state, "invalidated");
-        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        assert_eq!(state, "pending");
+        assert!(reason.is_none(), "no generation-ended resolution: {reason:?}");
+
+        // A same-epoch inventory reporting the instance live revives the row;
+        // the pending card survives the revival too.
+        let revived = store
+            .revive_host_lost_instances(
+                host.clone(),
+                &[(instance.instance_id.clone(), "idle".to_string())],
+            )
+            .await
+            .expect("revive");
+        assert_eq!(revived, vec![instance.instance_id.clone()]);
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "running");
+        assert!(row.last_error.is_none(), "revival clears host-lost: {row:?}");
+        let (state, _reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "pending", "the card stays pending through revival");
         store.close().await;
     }
 
@@ -12145,23 +12221,71 @@ pub(crate) fn native_payload_is_subagent(payload: &Value) -> bool {
 /// queue.
 const TERMINAL_INSTANCE_LIFECYCLES: &[&str] = &["exited", "failed", "closed"];
 
+/// The exact `last_error` marker [`Store::expire_lost_hosts`] stamps when
+/// contact with a host is lost past grace (OA6, c-cardsettle r8 item 2).
+pub(crate) const HOST_LOST_MARKER: &str = "host-lost";
+
+/// c-cardsettle r8 item 2 (OA6), mirrored from ma-lineage r5: does a row
+/// DEFINITELY carry process-end evidence?
+///
+/// * `closed` — a real observed/operator-driven process end.
+/// * `exited` — genuine once an `ended_at` is recorded or the marker is
+///   anything OTHER than [`HOST_LOST_MARKER`]; a host-lost sweep exit with no
+///   end time is CONTACT loss (the child may still run) and reads as
+///   potentially live.
+/// * `failed` — only with an end time or an attested launch-failure marker.
+///
+/// The interaction insert gate ([`owner_instance_ended`]) and the
+/// continuation/resume gates share this predicate, so a host-lost row can
+/// never be treated as a dead owner while its process is still answerable.
+pub(crate) fn lifecycle_has_process_end_evidence(
+    lifecycle: &str,
+    last_error: Option<&str>,
+    ended_at: Option<&str>,
+) -> bool {
+    match lifecycle {
+        "closed" => true,
+        "exited" => ended_at.is_some() || last_error.is_none_or(|error| error != HOST_LOST_MARKER),
+        "failed" => {
+            ended_at.is_some()
+                || last_error.is_some_and(|error| {
+                    let text = error.to_ascii_lowercase();
+                    text == "create-never-acknowledged"
+                        || text.contains("start-fail")
+                        || text.contains("start failed")
+                        || text.contains("never started")
+                })
+        }
+        _ => false,
+    }
+}
+
 /// c-cardsettle r7 item 1: whether an interaction request's owner is already
 /// ended at insert time. An ABSENT instances row also counts as ended — the
 /// owner is deleted (its row deleted together with the instance) or was never
 /// known to the Hub — so a request replayed by a Node after the hello
 /// reconcile can never be inserted as a live, answerable card.
+///
+/// r8 item 2 (OA6): a terminal-shaped row carrying NO process-end evidence —
+/// the `exited`/host-lost sweep marker with no `ended_at` — is NOT an ended
+/// owner: the process behind the lost contact may still run and the row is
+/// revived on a same-epoch reconnect.
 fn owner_instance_ended(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
-    let lifecycle: Option<String> = conn
+    let row: Option<(String, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT lifecycle FROM instances WHERE id = ?1",
+            "SELECT lifecycle, last_error, ended_at FROM instances WHERE id = ?1",
             params![instance_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    Ok(match lifecycle {
-        None => true,
-        Some(state) => TERMINAL_INSTANCE_LIFECYCLES.contains(&state.as_str()),
-    })
+    let Some((lifecycle, last_error, ended_at)) = row else {
+        return Ok(true);
+    };
+    Ok(lifecycle_has_process_end_evidence(
+        &lifecycle,
+        last_error.as_deref(),
+        ended_at.as_deref(),
+    ))
 }
 
 /// Open a write transaction that takes the RESERVED lock immediately

@@ -865,6 +865,225 @@ async fn hello_reconcile_exits_then_replayed_request_never_reopens_the_card() ->
     Ok(())
 }
 
+/// r8 item 2 (OA6): host loss is CONTACT loss, not process end. The
+/// host-lost sweep marks a still-running instance's ROW exited/host-lost but
+/// must NOT settle its cards and must NOT stamp process-end evidence
+/// (`ended_at`). On a SAME-epoch reconnect whose inventory lists the instance
+/// live, the Hub revives the row BEFORE the journal catch-up; an approval the
+/// still-running child then raises lands PENDING and is answerable (the
+/// answer is forwarded over the RECONNECT socket — item 5).
+#[tokio::test]
+async fn host_loss_sweep_keeps_cards_and_revives_a_live_inventory_row_on_reconnect() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+
+    // A live instance with one pending, blocking card.
+    let (instance_id, first_card) =
+        seed_live_card(addr, &cookie, &node, &host_id, "cardsettle r8 host loss").await?;
+    assert_eq!(
+        poll_card_state(addr, &cookie, &instance_id).await?,
+        "pending"
+    );
+
+    // Contact loss past grace. The sweep marks the ROW host-lost; its
+    // settlement must be EMPTY (the card is not invalidated).
+    let store = hub.store().expect("hub store exposed to tests");
+    store
+        .mark_host_offline(host_id.as_id().as_str().to_string())
+        .await?;
+    let (swept, settlement) = store.expire_lost_hosts(0).await?;
+    assert_eq!(swept, 1, "the live instance row is marked host-lost");
+    assert!(
+        settlement.interactions.is_empty(),
+        "a host-lost sweep must not settle cards: {settlement:?}"
+    );
+
+    // Durable truth after the sweep: row exited/host-lost with NO ended_at,
+    // card still pending and still blocking.
+    let (status, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &cookie,
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let swept_row: Value = serde_json::from_str(&body)?;
+    assert_eq!(swept_row["lifecycle"], "exited");
+    assert_eq!(swept_row["lastError"], json!("host-lost"));
+    assert!(
+        swept_row.get("endedAt").is_none() || swept_row["endedAt"].is_null(),
+        "contact loss must not stamp process-end evidence: {swept_row}"
+    );
+    assert_eq!(
+        poll_card_state(addr, &cookie, &instance_id).await?,
+        "pending"
+    );
+
+    // SAME-epoch reconnect (the same Node process) with the instance listed
+    // LIVE. A raw socket services journal.append RPCs and captures the answer
+    // frame the Hub must later forward to THIS socket.
+    let mut reconnect_req = format!("ws://{addr}/v1/node").into_client_request()?;
+    reconnect_req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", node.node_token()).parse()?,
+    );
+    let (mut reconnect, _) = tokio_tungstenite::connect_async(reconnect_req).await?;
+    reconnect
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0", "id": "hello2", "method": "node.hello",
+                "params": {
+                    "hostId": host_id.as_id().as_str(),
+                    "nodeVersion": "0.1.0",
+                    "nodeEpoch": "cs-fake-epoch-1",
+                    "instanceStoreFound": true,
+                    "instances": [
+                        { "id": instance_id, "hostId": host_id.as_id().as_str(),
+                          "lifecycle": "running", "activity": "idle" }
+                    ]
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    // Service the raw reconnect socket: ack every JSON-RPC request, recording
+    // a forwarded interaction.answer; result frames (hello2) are ignored.
+    let answers = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let answers_task = Arc::clone(&answers);
+    let service_task = tokio::spawn(async move {
+        use futures::{SinkExt, StreamExt};
+        let (mut sink, mut stream) = reconnect.split();
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_secs(8), stream.next()).await
+        {
+            let Message::Text(text) = msg else { continue };
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(id) = frame.get("id").cloned() else {
+                continue;
+            };
+            let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+            if method == "interaction.answer" {
+                answers_task.lock().unwrap().push(frame.clone());
+            }
+            let reply = json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } });
+            if sink
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Read the hello2 result (serviced by the first socket's task only when
+    // the Hub routes by generation; the frame actually returns on whichever
+    // socket owns the request) — give the Hub a moment to process revival,
+    // then assert the row came back.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) = http(
+            addr,
+            "GET",
+            &format!("/v1/instances/{instance_id}"),
+            &cookie,
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let row: Value = serde_json::from_str(&body)?;
+        if row["lifecycle"] == "running" {
+            assert!(
+                row.get("lastError").is_none() || row["lastError"].is_null(),
+                "revival clears the host-lost marker: {row}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "row never revived: {row}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The still-running child raises a NEW approval over the reconnected
+    // link. The host-lost row was NOT a dead owner, so this must land PENDING
+    // — not invalidated at insert.
+    let new_card = format!("int_{}", uuid::Uuid::now_v7());
+    node.append("jnew", &instance_id, approval_requested_event(&new_card))
+        .await?;
+    // jnew goes through the FIRST fake-node socket (which still services
+    // frames); the Hub accepts it regardless of which socket carries it.
+    let (status, interactions_body) = http(
+        addr,
+        "GET",
+        &format!("/v1/interactions?instanceId={instance_id}"),
+        &cookie,
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{interactions_body}");
+    let page: Value = serde_json::from_str(&interactions_body)?;
+    for wire in [&first_card, &new_card] {
+        let item = page["items"]
+            .as_array()
+            .context("items")?
+            .iter()
+            .find(|item| {
+                item.pointer("/event/payload/interaction/id")
+                    .and_then(Value::as_str)
+                    == Some(wire.as_str())
+                    || item["interactionId"] == json!(wire)
+            })
+            .unwrap_or_else(|| panic!("card {wire} missing: {page}"));
+        assert_eq!(item["state"], json!("pending"), "{wire} must stay pending");
+        assert_eq!(item["blocking"], json!(true), "{wire} must stay blocking");
+    }
+
+    // The new approval is ANSWERABLE: the HTTP answer succeeds and the Hub
+    // forwards interaction.answer over the RECONNECT socket (the owner row is
+    // live again, so no pre-RPC 404).
+    let (status, answer_body) = post_answer(addr, &cookie, &new_card).await?;
+    assert_eq!(
+        status, 200,
+        "the revived owner's card is answerable: {answer_body}"
+    );
+    let forwarded_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !answers.lock().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < forwarded_deadline,
+            "interaction.answer never forwarded over the reconnect socket"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let forwarded = answers.lock().unwrap()[0].clone();
+    assert_eq!(forwarded["method"], json!("interaction.answer"));
+    assert_eq!(
+        forwarded
+            .pointer("/params/interactionId")
+            .or_else(|| forwarded.pointer("/params/interaction/id"))
+            .and_then(Value::as_str),
+        Some(new_card.as_str())
+    );
+
+    service_task.abort();
+    hub.shutdown().await;
+    Ok(())
+}
+
 /// r7 item 3 (the r6 item 2 test as actually asked): a REAL follower through
 /// `/v1/follow`, with its writer blocked by socket backpressure, receives a
 /// ONE-timestamp settlement sweep LARGER than the 64-notice broadcast ring

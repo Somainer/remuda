@@ -983,6 +983,14 @@ async fn reconcile_lost_instances(
         .record_node_epoch(host_id.to_string(), epoch)
         .await?;
     if !changed {
+        // c-cardsettle r8 item 2 (OA6): a SAME-epoch hello means the SAME Node
+        // process reconnected after a contact loss — not a restart. The host
+        // sweep may have marked still-running rows exited/host-lost while the
+        // link was down. Revive the rows this inventory reports LIVE BEFORE
+        // anything else (journal catch-up / card dispatch): host loss is
+        // contact loss, never process end, and a new approval from the revived
+        // process must stay pending and answerable.
+        revive_live_inventory(state, host_id, params).await?;
         return Ok(());
     }
     let Some(reported) = params.get("instances").and_then(Value::as_array) else {
@@ -1042,6 +1050,70 @@ async fn reconcile_lost_instances(
             "node epoch changed; instance lost",
         )
         .await;
+    }
+    Ok(())
+}
+
+/// Extract the instances a hello inventory reports as LIVE
+/// (`ready`/`running`) as `(id, activity)` pairs, the input to
+/// [`Store::revive_host_lost_instances`].
+fn live_inventory_entries(params: &Value) -> Vec<(String, String)> {
+    params
+        .get("instances")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| !entry_is_terminal(item))
+        .filter_map(|item| {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("instanceId"))
+                .and_then(Value::as_str)?
+                .to_string();
+            // Only rows the Node claims are live revive a host-lost row.
+            let lifecycle = item.get("lifecycle").and_then(Value::as_str).unwrap_or("");
+            if !matches!(lifecycle, "ready" | "running") {
+                return None;
+            }
+            let activity = match item
+                .get("activity")
+                .and_then(Value::as_str)
+                .or_else(|| item.pointer("/activity/value").and_then(Value::as_str))
+            {
+                Some("waiting-interaction") => "blocked",
+                Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
+                _ => "idle",
+            };
+            Some((id, activity.to_string()))
+        })
+        .collect()
+}
+
+/// Same-epoch reconnect: revive host-lost rows the reconnecting Node still
+/// reports live (c-cardsettle r8 item 2). Runs on BOTH daemon and plain
+/// runtime hellos — the daemon inventory overlay
+/// (`reconcile_daemon_instances`) already rewrites the rows it names, and the
+/// host-lost predicate revival here is idempotent for those and the only
+/// revival path for a non-daemon runtime link.
+async fn revive_live_inventory(
+    state: &AppState,
+    host_id: &str,
+    params: &Value,
+) -> Result<(), HubError> {
+    let live = live_inventory_entries(params);
+    if live.is_empty() {
+        return Ok(());
+    }
+    let revived = state
+        .store
+        .revive_host_lost_instances(host_id.to_string(), &live)
+        .await?;
+    for instance_id in revived {
+        tracing::info!(
+            %host_id,
+            %instance_id,
+            "same-epoch reconnect reports a host-lost instance live; revived without settling cards"
+        );
     }
     Ok(())
 }

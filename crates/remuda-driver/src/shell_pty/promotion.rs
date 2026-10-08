@@ -796,7 +796,23 @@ pub(super) fn spawn(
     // Per-instance hook relay/socket paths for the silence diagnostic; absent
     // on a launch with no hook tier.
     silence_paths: Option<HookSilencePaths>,
+    // c-ctxusage r5 item 6: cooperative close that wakes the loop even between
+    // poll ticks; the loop finalises its hydrator and signals `finalised` once
+    // that is done, so close never aborts a first-bind pump mid-`finish()`.
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    finalised: tokio::sync::oneshot::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
+    // Abort-path safety net: even if the task is aborted while a first-bind
+    // pump is still mapping a large transcript, the guard's Drop runs the
+    // mapper's synchronous `finish()` and best-effort delivers the
+    // observations via try_send before its sender drops. The variable is read
+    // only by its Drop impl.
+
+    let finalise_guard = FinaliseGuard {
+        hydrator: None,
+        events: events.clone(),
+        done: false,
+    };
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
         let mut hydrator: Option<Hydrator> = None;
@@ -839,9 +855,16 @@ pub(super) fn spawn(
         let mut last_silence: Option<Option<remuda_signal::hook_silence::HookSilenceReason>> = None;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut closing = false;
         loop {
-            tick.tick().await;
-            if state.closed.load(Ordering::SeqCst) || events.is_closed() {
+            tokio::select! {
+                // Wakes close between ticks; a tick still drives normal polls.
+                _ = shutdown.changed() => {
+                    closing = *shutdown.borrow_and_update();
+                }
+                _ = tick.tick() => {}
+            }
+            if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
                 break;
             }
             let Sample { rows, mut found } = sample(&state, table.as_ref(), alias.as_ref()).await;
@@ -1298,16 +1321,70 @@ pub(super) fn spawn(
                 }
                 _ => finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await,
             }
+            // c-ctxusage r5 item 6: close can land while this iteration's pump
+            // is still mapping. Check before waiting another tick so the final
+            // finalise runs now (close awaits it via `finalised`), never after
+            // a 2 s abort.
+            if state.closed.load(Ordering::SeqCst) || *shutdown.borrow() {
+                break;
+            }
             if events.is_closed() {
                 // Channel already gone: nothing can receive the finalise.
                 break;
             }
         }
-        // c-ctxusage r4 item 2: cooperative shutdown finalises the last
-        // assistant run (usage with no stop_reason) instead of dropping the
-        // hydrator on close/process exit.
+        // c-ctxusage r4 item 2 / r5 item 6: cooperative shutdown finalises the
+        // last assistant run (usage with no stop_reason) instead of dropping
+        // the hydrator on close/process exit. This awaits the current pump's
+        // completion first and must finish before close aborts the task.
         finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
+        // Hand the (now drained) hydrator to the guard and disarm it so the
+        // abort-path Drop does not finalise a second time.
+        finalise_guard.disarm(hydrator);
+        let _ = finalised.send(());
     })
+}
+
+/// Best-effort abort-path safety net for [`spawn`].
+///
+/// Normal shutdown runs `Hydrator::finalize` (async, ordered delivery) and
+/// marks `done`. If the runtime aborts the task before that — e.g. a wedged
+/// first-bind pump exceeding close's bounded wait — the guard's Drop still
+/// runs the mapper's synchronous `finish()` and tries to hand the
+/// observations to the still-held channel via `try_send`. Delivery is best
+/// effort, but the final usage mapping is never silently skipped.
+#[allow(dead_code)] // fields are consumed in Drop / disarm
+struct FinaliseGuard {
+    hydrator: Option<Hydrator>,
+    events: mpsc::Sender<Observation>,
+    done: bool,
+}
+
+impl FinaliseGuard {
+    /// Happy-path completion: the async finalise already ran, so just retain
+    /// the drained hydrator and suppress the Drop finalise.
+    fn disarm(mut self, hydrator: Option<Hydrator>) {
+        self.hydrator = hydrator;
+        self.done = true;
+    }
+}
+
+impl Drop for FinaliseGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Some(hydrator) = self.hydrator.as_mut()
+            && let Ok(observations) = hydrator.finish_sync()
+        {
+            for observation in observations {
+                // Best effort: a full/gone channel drops the observation.
+                if self.events.try_send(observation).is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// A shim records its exec PID before Claude can enter the foreground. Missing
@@ -1896,6 +1973,19 @@ impl Hydrator {
                 }
             }
         }
+    }
+
+    /// Synchronous finalise for the task-abort safety net (no async emit is
+    /// possible during Drop): one last tail read plus `mapper.finish()`,
+    /// returning the observations for the guard to best-effort `try_send`.
+    fn finish_sync(&mut self) -> DriverResult<Vec<Observation>> {
+        let lines = self.tail.poll().unwrap_or_default();
+        let mut observations = Vec::new();
+        for line in &lines {
+            observations.extend(self.mapper.map_line(line)?);
+        }
+        observations.extend(self.mapper.finish()?);
+        Ok(observations)
     }
 }
 

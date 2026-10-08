@@ -27,7 +27,9 @@ import { promisify } from "node:util";
 import { login } from "./hub-auth";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-const target = path.resolve(root, process.env.CARGO_TARGET_DIR ?? "target");
+const target = process.env.CARGO_TARGET_DIR
+  ? path.resolve(process.env.CARGO_TARGET_DIR)
+  : path.resolve(root, process.env.CARGO_TARGET_DIR_REL ?? "target");
 const remuda = process.env.HUB_E2E_REMUDA_BIN ?? path.join(target, "debug/remuda");
 const harness = process.env.HUB_E2E_FAKE_HARNESS_BIN ?? path.join(target, "debug/fake-harness");
 const nativeNode = process.env.HUB_E2E_NATIVE_NODE_BIN ?? path.join(target, "debug/examples/native_hub_e2e");

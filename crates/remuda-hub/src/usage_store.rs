@@ -2542,12 +2542,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            rollup.tpm_in_60s,
-            None,
+            rollup.tpm_in_60s, None,
             "c-ctxusage r5 item 7: an ingest-fallback row is not current throughput; \
              the real time is unknown until a native-timed observation repairs it"
         );
-        assert_eq!(rollup.session_input_tokens, Some(250), "totals still count ingest rows");
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(250),
+            "totals still count ingest rows"
+        );
 
         // Replay: identical counters, now with the real historical native time.
         let historical = scoped_record(

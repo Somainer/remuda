@@ -122,7 +122,9 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
     // a host without the sidecar).
     let trigger = remuda_testing::locate_workspace_bin("fake-harness");
     let Some(trigger) = trigger.filter(|path| path.is_file()) else {
-        eprintln!("skipping: fake-harness sidecar is not built (build remuda-testing --bin fake-harness)");
+        eprintln!(
+            "skipping: fake-harness sidecar is not built (build remuda-testing --bin fake-harness)"
+        );
         return;
     };
     // agent_pty_kind reads REMUDA_PTY_CARRIER from the process env, so re-exec

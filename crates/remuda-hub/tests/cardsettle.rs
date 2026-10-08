@@ -798,6 +798,44 @@ async fn hello_reconcile_exits_then_replayed_request_never_reopens_the_card() ->
         .await?;
     read_result(&mut reconnect, "jlate").await?;
 
+    // r8 item 5: after the second hello, nodes.insert routes instance RPCs to
+    // THIS reconnect socket, not the FakeNode's original one. Hand it a
+    // servicing watcher for the rest of the test that acks every request and
+    // records inbound methods, so the post-answer no-forward assertion below
+    // watches the socket the Hub would actually send interaction.answer on.
+    let reconnect_methods: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let reconnect_watch = {
+        let methods = Arc::clone(&reconnect_methods);
+        tokio::spawn(async move {
+            use futures::{SinkExt, StreamExt};
+            let (mut sink, mut stream) = reconnect.split();
+            while let Some(Ok(Message::Text(text))) =
+                tokio::time::timeout(Duration::from_secs(10), stream.next())
+                    .await
+                    .ok()
+                    .flatten()
+            {
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let Some(id) = frame.get("id").cloned() else {
+                    continue;
+                };
+                if let Some(method) = frame.get("method").and_then(Value::as_str) {
+                    methods.lock().unwrap().push(method.to_string());
+                }
+                let reply = json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } });
+                if sink
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
+
     // The settlement notice for the late card rides the dedicated settlement
     // bus — skip unrelated follow frames (journal events, host updates).
     let mut got_notice = false;
@@ -857,11 +895,25 @@ async fn hello_reconcile_exits_then_replayed_request_never_reopens_the_card() ->
     );
 
     // An answer now gets the existing not-pending rejection and never reaches
-    // the Node.
+    // the Node. r8 item 5: assert against the RECONNECT socket the Hub routes
+    // to after the second hello — watching the original FakeNode socket here
+    // was vacuous.
     let (status, answer_body) = post_answer(addr, &cookie, &late_id).await?;
     assert_eq!(status, 404, "late answer rejected: {answer_body}");
     tokio::time::sleep(NO_FORWARD_WINDOW).await;
     node.assert_no_answer_forwarded()?;
+    let forwarded_to_reconnect: Vec<String> = reconnect_methods
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|method| method.as_str() == "interaction.answer")
+        .cloned()
+        .collect();
+    assert!(
+        forwarded_to_reconnect.is_empty(),
+        "a 404 late answer must never be forwarded to the reconnected Node: {forwarded_to_reconnect:?}"
+    );
+    reconnect_watch.abort();
 
     hub.shutdown().await;
     Ok(())

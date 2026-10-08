@@ -83,10 +83,26 @@ async function createSession(page: Page, prompt: string): Promise<string> {
   await hostPicker.selectOption(host!);
   await page.getByTestId("new-session-prompt").fill(prompt);
   await expect(page.getByTestId("new-session-start")).toBeEnabled();
+  // r4 item 2: arm the response waiter BEFORE the click and register the new
+  // id for cleanup from the create RESPONSE, not only from the post-navigation
+  // URL. A slow navigation after start (waitForURL) used to leave the instance
+  // untracked and therefore undeleted when the test bailed here.
+  const creating = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" && new URL(response.url()).pathname === "/v1/instances",
+    { timeout: 20_000 },
+  );
   await page.getByTestId("new-session-start").click();
+  const response = await creating;
+  expect(response.ok(), `instance create failed: ${response.status()}`).toBe(true);
+  const body = (await response.json().catch(() => null)) as
+    | { instance?: { instanceId?: string; id?: string } }
+    | null;
+  const responseId = body?.instance?.instanceId ?? body?.instance?.id;
+  if (responseId && !created.includes(responseId)) created.push(responseId);
   await page.waitForURL(/\/s\//, { timeout: 20_000 });
   const id = new URL(page.url()).pathname.split("/").pop()!;
-  created.push(id);
+  if (!created.includes(id)) created.push(id);
   return id;
 }
 

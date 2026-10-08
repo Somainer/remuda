@@ -783,11 +783,9 @@ async fn drive_aliases(
     //     workspace C (archived tasks no longer count), then a
     //     component-equivalent spelling of its stored root (dot) must resolve
     //     through the production Node and SETTLE 200.
-    let (status, archived) = {
-        let _ = hub.test_finish_bound_task("tsk_alias_c").await;
-        (200, String::new())
-    };
-    assert_eq!(status, 200, "free workspace C: {archived}");
+    hub.test_finish_bound_task("tsk_alias_c")
+        .await
+        .expect("finish task C");
     async fn still_listed(
         addr: std::net::SocketAddr,
         cookie: &str,

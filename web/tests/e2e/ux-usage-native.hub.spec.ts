@@ -114,7 +114,7 @@ test("native transcript usage drives the context chip through the real rollup", 
   let instanceId: string | undefined;
   let nodeLog = "";
   try {
-    await Promise.all([mkdir(dataDir), mkdir(bin), mkdir(workspace), mkdir(claudeHome)]);
+    await Promise.all([mkdir(dataDir, { recursive: true }), mkdir(bin, { recursive: true }), mkdir(workspace, { recursive: true }), mkdir(claudeHome, { recursive: true })]);
     await copyFile(harness, path.join(bin, "claude"));
     await chmod(path.join(bin, "claude"), 0o700);
     await writeFile(

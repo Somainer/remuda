@@ -4926,6 +4926,9 @@ fn scripted_usage(prompt: &str, turn: u64) -> Option<Value> {
         "totalTokens": knowledge(total),
         "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
         "accounting": "estimated",
+        // c-ctxusage r5 item 7: the sentinel's usage is a live observation, so
+        // it carries a current nativeAt and enters the rate window.
+        "nativeAt": { "state": "known", "value": monotonic_effort_observed_at() },
         "nativeFieldsRef": null
     }))
 }

@@ -185,14 +185,16 @@ test("native transcript usage drives the context chip through the real rollup", 
 
     await page.goto(`/s/${id}`);
     await expect(page.getByTestId("session-page")).toHaveAttribute("data-lifecycle", "running", { timeout: 20_000 });
-    // Wait for control, then drive the turn whose transcript carries usage.
-    await expect.poll(async () => {
-      const response = await page.request.post(`/v1/instances/${id}/commands`, {
-        headers: { Origin: new URL(page.url()).origin },
-        data: { operation: "tty.write", payload: { dataBase64: Buffer.from("NATIVEUSAGE\n").toString("base64"), source: "ui" } },
-      });
-      return response.ok();
-    }, { timeout: 60_000 }).toBe(true);
+    // Drive the turn through the Hub command API (the production write path
+    // the promoter binds against), mirroring promoted-claude.hub.spec.ts.
+    const writeResponse = await page.request.post(`/v1/instances/${id}/commands`, {
+      headers: { Origin: new URL(page.url()).origin },
+      data: {
+        operation: "tty.write",
+        payload: { dataBase64: Buffer.from("NATIVEUSAGE\n").toString("base64"), source: "ui" },
+      },
+    });
+    expect(writeResponse.ok(), `tty.write ${writeResponse.status()}: ${await writeResponse.text()}`).toBe(true);
 
     // The chip renders the native transcript usage: 100k of 200k = 50%.
     await expect(page.getByTestId("context-chip")).toHaveText("50%", { timeout: 60_000 });

@@ -651,17 +651,35 @@ mod tests {
             .await
             .unwrap();
         store.ssh_status(id.clone(), "online", None).await.unwrap();
-        let instance = store
-            .insert_instance(
-                id.clone(),
-                None,
-                "claude".into(),
-                "claude-print".into(),
-                None,
-                json!({}),
-            )
-            .await
-            .unwrap();
+        // ma-lineage r6 item 3(c): host-lost sweeps only chapters that
+        // reached a live lifecycle; acknowledge this instance (ready).
+        let instance = {
+            let inserted = store
+                .insert_instance(
+                    id.clone(),
+                    None,
+                    "claude".into(),
+                    "claude-print".into(),
+                    None,
+                    json!({}),
+                )
+                .await
+                .unwrap();
+            store
+                .append_journal(
+                    id.clone(),
+                    inserted.instance_id.clone(),
+                    Some(1),
+                    json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+                )
+                .await
+                .unwrap();
+            store
+                .get_instance(inserted.instance_id)
+                .await
+                .unwrap()
+                .unwrap()
+        };
         let host_id = id.clone();
         store
             .run_named(

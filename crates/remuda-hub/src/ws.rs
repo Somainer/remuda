@@ -1013,6 +1013,7 @@ async fn reconcile_lost_instances(
             host_id.to_string(),
             reported,
             NODE_EPOCH_CHANGED.to_string(),
+            true,
         )
         .await?;
     // c-cardsettle: announce the invalidated cards the same transaction

@@ -204,11 +204,17 @@ it("a delivered row whose follow owner is rebound to another session still gets 
 });
 
 /**
- * c-reconnfu fix-5 item 2: ownership is decided when the queued drain job
- * RUNS. A send drains while live, its post-delivery job waits behind an
- * earlier slow catch-up J0, and the link flips live→recovering meanwhile; the
- * executing job reads the CURRENT recovering state (record debt, skip its own
- * REST) rather than a stale live decision.
+ * c-reconnfu fix-5 item 2 / gate 6 item 3 (deterministic): ownership is
+ * decided when the queued drain job RUNS. A send drains while live, its
+ * post-delivery job waits behind an earlier slow catch-up J0, and the link
+ * flips live→offline meanwhile; the executing job reads the CURRENT offline
+ * state (record debt, skip its own REST) rather than a stale live decision.
+ *
+ * Determinism: the machine's resume is pinned to a never-resolving promise
+ * BEFORE the socket closes, so no reconnect reopen can race the state back to
+ * live (the old ~1/10 flake). There are no wall-clock waits: completion is
+ * awaited via a sentinel job enqueued on the instance's own reconcile chain,
+ * which runs strictly after the drain's tail job.
  */
 it("decides follow ownership when the drain job runs, not when it was enqueued", async () => {
   const { api, hubStore, closeA } = await mountTwo();
@@ -224,9 +230,13 @@ it("decides follow ownership when the drain job runs, not when it was enqueued",
   await hubStore.send(A, "flip while queued");
   await vi.waitFor(() => expect(api.instanceSend).toHaveBeenCalledTimes(1));
 
-  // Flip live→offline (bound to A) BEFORE J0 / the drain tail job execute.
+  // Pin recovery FIRST, then close A: the machine settles offline and its
+  // reconnect attempt hangs forever, so the bound state cannot flip back.
+  internals.resumeConnection = () => new Promise<void>(() => {});
   closeA();
-  await vi.waitFor(() => expect(hubStore.connectionState).toBe("offline"));
+  await vi.waitFor(() =>
+    expect(["offline", "recovering"]).toContain(hubStore.connectionState),
+  );
 
   // Prove the drain would not itself run a REST resume even though the send
   // was enqueued while live.
@@ -235,12 +245,13 @@ it("decides follow ownership when the drain job runs, not when it was enqueued",
     .spyOn(JournalClient.prototype, "resumeAfterReconnect")
     .mockImplementation((async () => {}) as never);
 
-  // Release J0: the drain tail job executes and reads the CURRENT offline
-  // state (A's bound follow owns recovery) → records the debt, skips its own
-  // REST catch-up.
+  // Release J0, then await a sentinel on A's chain: it runs strictly AFTER
+  // the drain tail job whose decision this test asserts.
   j0.resolve();
-  await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(true), { timeout: 5_000 });
+  await internals.chainReconcile(A, async () => {});
+  expect(internals.reconcileOwed.has(A)).toBe(true);
   expect(resumeSpy).not.toHaveBeenCalled();
 
   hubStore.logout();
 });
+

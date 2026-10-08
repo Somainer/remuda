@@ -32,7 +32,7 @@ const remuda = process.env.HUB_E2E_REMUDA_BIN ?? path.join(target, "debug/remuda
 const harness = process.env.HUB_E2E_FAKE_HARNESS_BIN ?? path.join(target, "debug/fake-harness");
 const nativeNode = process.env.HUB_E2E_NATIVE_NODE_BIN ?? path.join(target, "debug/examples/native_hub_e2e");
 
-test.beforeAll(async (_unused, testInfo) => {
+test.beforeAll(async ({}, testInfo) => {
   testInfo.setTimeout(600_000);
   const args = ["build", "--locked"];
   if (!process.env.HUB_E2E_REMUDA_BIN) args.push("-p", "remuda", "--bin", "remuda");

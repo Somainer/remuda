@@ -167,31 +167,30 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 /// at one poll and then a later same-message-id record with different counters
 /// (c-ctxusage r3 item 1) replaces the provisional row with the final one.
 pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    match row.scope_id.as_deref() {
-        None => insert_row(conn, row),
-        Some(_) if row.scope == "turn" => upsert_turn_snapshot(conn, row),
-        Some(_) => insert_session_growth_point(conn, row),
+    match (row.scope.as_str(), row.scope_id.as_deref()) {
+        ("turn", Some(_)) => upsert_turn_snapshot(conn, row),
+        ("session", Some(_)) => insert_session_growth_point(conn, row),
+        ("session", None) => insert_legacy_session_point(conn, row),
+        (_, None) => insert_row(conn, row),
+        _ => insert_row(conn, row),
     }
 }
 
-/// Append a new cumulative-session growth point, freezing historical/duplicate
-/// replays (c-ctxusage r4 item 3).
-///
-/// The cumulative stock is monotonic by contract, so acceptance is content-
-/// based and independent of the restart-unsafe producer revision and ingest
-/// seq:
-/// - identical counters already recorded (a byte-0 re-hydration, or a
-///   consolidated restart replay) -> frozen;
-/// - any reported bucket smaller than the current stock -> frozen;
-/// - otherwise the point is appended.
-fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let incoming = SnapshotCounters::of(row);
+/// Query every cumulative session stock a new scoped point must not move
+/// backwards against: the point's OWN session id plus any LEGACY NULL-scope
+/// session rows (c-ctxusage r5 item 3B). A byte-0 restart replay cannot
+/// re-append a smaller stock than the old-format cumulative total.
+fn existing_session_floors(
+    conn: &Connection,
+    row: &UsageEventRow,
+) -> rusqlite::Result<Vec<SnapshotCounters>> {
     let mut stmt = conn.prepare(
         "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
          FROM usage_events
-         WHERE instance_id = ?1 AND scope = 'session' AND scope_id = ?2",
+         WHERE instance_id = ?1 AND scope = 'session'
+           AND (scope_id = ?2 OR scope_id IS NULL)",
     )?;
-    let existing: Vec<SnapshotCounters> = stmt
+    let floors = stmt
         .query_map(params![row.instance_id, row.scope_id], |r| {
             Ok(SnapshotCounters {
                 total: r.get(0)?,
@@ -202,16 +201,65 @@ fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqli
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for stored in &existing {
-        if incoming == *stored {
-            // An already-recorded identical stock: duplicate replay.
-            return Ok(false);
+    Ok(floors)
+}
+
+/// Content-ordered acceptance against a set of existing stocks.
+fn freezes_against(incoming: &SnapshotCounters, existing: &[SnapshotCounters]) -> bool {
+    for stored in existing {
+        if incoming == stored {
+            return true;
         }
         let (_grew, decreased) = incoming.growth_against(stored);
         if decreased {
-            // Historical smaller stock arriving after a larger current one.
-            return Ok(false);
+            return true;
         }
+    }
+    false
+}
+
+/// Append a new scoped cumulative-session growth point, freezing
+/// historical/duplicate replays (c-ctxusage r4 item 3 / r5 item 3B).
+///
+/// The cumulative stock is monotonic by contract, so acceptance is content-
+/// based and independent of the restart-unsafe producer revision and ingest
+/// seq:
+/// - identical counters already recorded for this session (or for a legacy
+///   NULL-scope row) -> frozen;
+/// - any reported bucket smaller than the current stock -> frozen;
+/// - otherwise the point is appended.
+fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let incoming = SnapshotCounters::of(row);
+    let floors = existing_session_floors(conn, row)?;
+    if freezes_against(&incoming, &floors) {
+        return Ok(false);
+    }
+    insert_row(conn, row)
+}
+
+/// Legacy (pre-`scopeId`) session row: content-ordered against other legacy
+/// rows only. Scoped points are the newer world and are summed separately in
+/// the rollup; legacy totals are read at all only while no scoped rows exist.
+fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let incoming = SnapshotCounters::of(row);
+    let mut stmt = conn.prepare(
+        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+         FROM usage_events
+         WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NULL",
+    )?;
+    let existing: Vec<SnapshotCounters> = stmt
+        .query_map(params![row.instance_id], |r| {
+            Ok(SnapshotCounters {
+                total: r.get(0)?,
+                input: r.get(1)?,
+                output: r.get(2)?,
+                cache_read: r.get(3)?,
+                cache_write: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if freezes_against(&incoming, &existing) {
+        return Ok(false);
     }
     insert_row(conn, row)
 }
@@ -734,25 +782,55 @@ fn session_stock_increments(
     conn: &Connection,
     instance_id: &str,
 ) -> rusqlite::Result<Vec<StockIncrement>> {
-    let mut stmt = conn.prepare(
-        "SELECT input_tokens, output_tokens, observed_at
-         FROM usage_events
-         WHERE instance_id = ?1 AND scope = 'session'
-         ORDER BY observed_at ASC, seq ASC",
-    )?;
-    let rows: Vec<(Option<i64>, Option<i64>, String)> = stmt
-        .query_map(params![instance_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Per scope id (c-ctxusage r5 item 3A): s1→s2 is a session boundary, not a
+    // reset-within-one-stock. Diff each session's ordered points independently,
+    // then collect the increments. Legacy NULL-scope points chain on their own.
+    let scoped = session_point_rows(conn, instance_id, true)?;
+    if scoped.is_empty() {
+        let legacy = session_point_rows(conn, instance_id, false)?;
+        return diff_rows(legacy);
+    }
+    diff_rows(scoped)
+}
 
+/// One ordered cumulative-session point: the two rate buckets, its native
+/// end time and the session scope id (NULL for legacy rows).
+type SessionPointRow = (Option<i64>, Option<i64>, String, Option<String>);
+
+/// Ordered session points; scoped or legacy NULL-scope only.
+fn session_point_rows(
+    conn: &Connection,
+    instance_id: &str,
+    scoped: bool,
+) -> rusqlite::Result<Vec<SessionPointRow>> {
+    let predicate = if scoped {
+        "scope_id IS NOT NULL"
+    } else {
+        "scope_id IS NULL"
+    };
+    let sql = format!(
+        "SELECT input_tokens, output_tokens, observed_at, scope_id
+         FROM usage_events
+         WHERE instance_id = ?1 AND scope = 'session' AND {predicate}
+         ORDER BY scope_id ASC, observed_at ASC, seq ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_map(params![instance_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })?
+    .collect()
+}
+
+/// Diff ordered points, restarting the chain at every scope boundary.
+fn diff_rows(rows: Vec<SessionPointRow>) -> rusqlite::Result<Vec<StockIncrement>> {
     let mut increments = Vec::new();
-    let mut previous: Option<(Option<i64>, Option<i64>)> = None;
-    for (input, output, end_at) in rows {
-        if let Some((prev_input, prev_output)) = previous {
-            // Per-bucket increment against the last cumulative position; a
-            // lower current is treated as a reset and the increment restarts
-            // at the current stock.
+    let mut previous: Option<(Option<String>, Option<i64>, Option<i64>)> = None;
+    for (input, output, end_at, scope_id) in rows {
+        let boundary = previous
+            .as_ref()
+            .map(|(prev_scope, _, _)| *prev_scope != scope_id)
+            .unwrap_or(true);
+        if !boundary && let Some((_, prev_input, prev_output)) = &previous {
             let bucket = |current: Option<i64>, previous: Option<i64>| -> Option<i64> {
                 match (current, previous) {
                     (Some(current), Some(previous)) => Some(if current < previous {
@@ -765,12 +843,12 @@ fn session_stock_increments(
                 }
             };
             increments.push(StockIncrement {
-                input: bucket(input, prev_input),
-                output: bucket(output, prev_output),
+                input: bucket(input, *prev_input),
+                output: bucket(output, *prev_output),
                 end_at,
             });
         }
-        previous = Some((input, output));
+        previous = Some((scope_id, input, output));
     }
     Ok(increments)
 }
@@ -803,10 +881,12 @@ fn sum_session_increments_since(
     Ok((input, output))
 }
 
-/// The latest cumulative session growth point (the current stock). Accepted
-/// points are non-decreasing in counters and historical replays are frozen, so
-/// the current stock is the newest point by native time, tie-broken by ingest
-/// seq — c-ctxusage r4 item 4, independent of ingestion order.
+/// One session's latest cumulative point: the four counters and its native
+/// time, one row per scope id.
+type LatestStockPoint = (Option<i64>, Option<i64>, Option<i64>, Option<i64>, String);
+
+/// The summed current cumulative stock across session ids, plus its newest
+/// native time.
 #[derive(Debug, Default, Clone)]
 struct SessionStock {
     input: Option<i64>,
@@ -816,23 +896,80 @@ struct SessionStock {
     observed_at: Option<String>,
 }
 
-fn latest_session_stock(conn: &Connection, instance_id: &str) -> rusqlite::Result<SessionStock> {
-    conn.query_row(
-        "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, observed_at
-         FROM usage_events
-         WHERE instance_id = ?1 AND scope = 'session'
-         ORDER BY observed_at DESC, seq DESC LIMIT 1",
-        params![instance_id],
-        |row| {
-            Ok(SessionStock {
-                input: row.get(0)?,
-                output: row.get(1)?,
-                cache_read: row.get(2)?,
-                cache_write: row.get(3)?,
-                observed_at: row.get(4)?,
-            })
-        },
-    )
+/// The latest cumulative session growth point for EACH scope id (c-ctxusage
+/// r5 item 3A): an instance can run codex session s1 and later s2, and totals
+/// must be the sum of both sessions' current stocks — never the newest row
+/// alone (which would make totals "drop" at the s1→s2 boundary).
+///
+/// When no scoped rows exist, the single newest LEGACY NULL-scope row is
+/// returned (pre-`scopeId` world).
+fn latest_session_stock(
+    conn: &Connection,
+    instance_id: &str,
+) -> rusqlite::Result<(SessionStock, bool)> {
+    // Newest point per scoped session id, in native time / seq order.
+    let mut stmt = conn.prepare(
+        "WITH ranked AS (
+            SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                   observed_at, scope_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY scope_id
+                       ORDER BY observed_at DESC, seq DESC
+                   ) AS rn
+            FROM usage_events
+            WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NOT NULL
+         )
+         SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, observed_at
+         FROM ranked WHERE rn = 1
+         ORDER BY observed_at DESC",
+    )?;
+    let points: Vec<LatestStockPoint> = stmt
+        .query_map(params![instance_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !points.is_empty() {
+        let mut stock = SessionStock::default();
+        for (input, output, cache_read, cache_write, observed_at) in &points {
+            stock.input = add_optional(stock.input, *input);
+            stock.output = add_optional(stock.output, *output);
+            stock.cache_read = add_optional(stock.cache_read, *cache_read);
+            stock.cache_write = add_optional(stock.cache_write, *cache_write);
+            stock.observed_at = Some(observed_at.clone());
+        }
+        // observed_at is the newest of the per-scope latest points.
+        stock.observed_at = points.into_iter().map(|(_, _, _, _, at)| at).max();
+        return Ok((stock, true));
+    }
+    // Legacy fallback: the newest NULL-scope row.
+    let stock = conn
+        .query_row(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, observed_at
+             FROM usage_events
+             WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NULL
+             ORDER BY observed_at DESC, seq DESC LIMIT 1",
+            params![instance_id],
+            |r| {
+                Ok(SessionStock {
+                    input: r.get(0)?,
+                    output: r.get(1)?,
+                    cache_read: r.get(2)?,
+                    cache_write: r.get(3)?,
+                    observed_at: r.get(4)?,
+                })
+            },
+        )
+        .unwrap_or_default();
+    Ok((stock, false))
+}
+
+fn add_optional(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 /// The newest per-call basket: fresh input plus every cached bucket of the
@@ -1086,10 +1223,10 @@ pub fn rollup_instance(
     }
 
     // The cumulative stock exists only for session-emitting harnesses.
-    let stock = if totals.has_session {
+    let (stock, _stock_scoped) = if totals.has_session {
         latest_session_stock(conn, instance_id)?
     } else {
-        SessionStock::default()
+        (SessionStock::default(), false)
     };
 
     // Totals: turn sums when they cover the authoritative stock in every
@@ -2745,42 +2882,44 @@ mod tests {
         );
         assert_eq!(rollup.session_input_tokens, Some(250), "counters unchanged");
     }
-}
+    /// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a
+    /// real migrated store TWICE must converge durably: the same 24 turn rows
+    /// with the same counters after each pass (the second pass is a
+    /// re-hydration — it projects and re-inserts, but nothing changes).
+    #[test]
+    fn real_fixture_double_replay_is_durable() {
+        use remuda_driver::TranscriptMapper;
+        use remuda_protocol::{
+            DriverKind, HostId, Id as PId, InstanceId, ObservationPayload, RunId,
+        };
+        use std::path::Path;
 
-/// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a
-/// real migrated store TWICE must converge durably: the same 24 turn rows
-/// with the same counters after each pass (the second pass is a
-/// re-hydration — it projects and re-inserts, but nothing changes).
-#[test]
-fn real_fixture_double_replay_is_durable() {
-    use remuda_driver::TranscriptMapper;
-    use remuda_protocol::{DriverKind, HostId, Id as PId, InstanceId, ObservationPayload, RunId};
-    use std::path::Path;
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../remuda-journal/tests/fixtures/effort-21289");
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&fixture_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+            .collect();
+        paths.sort();
 
-    let fixture_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../remuda-journal/tests/fixtures/effort-21289");
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&fixture_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .collect();
-    paths.sort();
-
-    let instance = "ins_double_replay";
-    let open_mapper = || {
-        TranscriptMapper::new(
-            DriverKind::ShellPty,
-            InstanceId::new(),
-            RunId::new(),
-            PId::new("obj").unwrap(),
-            HostId::new(),
-            "double-replay-session".into(),
-            "2.1.289".into(),
-        )
-    };
-    let one_pass =
-        |mapper: &mut TranscriptMapper, conn: &Connection, seq_start: i64| -> (i64, usize, i64) {
+        let instance = "ins_double_replay";
+        let open_mapper = || {
+            TranscriptMapper::new(
+                DriverKind::ShellPty,
+                InstanceId::new(),
+                RunId::new(),
+                PId::new("obj").unwrap(),
+                HostId::new(),
+                "double-replay-session".into(),
+                "2.1.289".into(),
+            )
+        };
+        let one_pass = |mapper: &mut TranscriptMapper,
+                        conn: &Connection,
+                        seq_start: i64|
+         -> (i64, usize, i64) {
             let mut emitted = 0usize;
             let mut seq = seq_start;
             for path in &paths {
@@ -2832,7 +2971,7 @@ fn real_fixture_double_replay_is_durable() {
             let input_sum: i64 = conn
                 .query_row(
                     "SELECT COALESCE(SUM(input_tokens),0) FROM usage_events
-                     WHERE instance_id=?1 AND scope='turn'",
+                         WHERE instance_id=?1 AND scope='turn'",
                     params![instance],
                     |r| r.get(0),
                 )
@@ -2840,36 +2979,164 @@ fn real_fixture_double_replay_is_durable() {
             (seq, emitted, turn_rows * 1000 + input_sum)
         };
 
-    let conn = Connection::open_in_memory().unwrap();
-    migrate(&conn).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
 
-    let mut mapper = open_mapper();
-    let (next_seq, emitted1, signature1) = one_pass(&mut mapper, &conn, 1);
-    assert_eq!(
-        signature1 / 1000,
-        24,
-        "pass 1 durably persists exactly 24 turn rows (emitted {emitted1} usage obs)"
-    );
+        let mut mapper = open_mapper();
+        let (next_seq, emitted1, signature1) = one_pass(&mut mapper, &conn, 1);
+        assert_eq!(
+            signature1 / 1000,
+            24,
+            "pass 1 durably persists exactly 24 turn rows (emitted {emitted1} usage obs)"
+        );
 
-    // Second fresh mapper pass: byte-0 re-hydration with its own seqs.
-    let mut mapper = open_mapper();
-    let (_seq, emitted2, signature2) = one_pass(&mut mapper, &conn, next_seq);
-    assert_eq!(
-        signature2, signature1,
-        "pass 2 leaves the SAME 24 rows and counters (emitted {emitted2} obs)"
-    );
+        // Second fresh mapper pass: byte-0 re-hydration with its own seqs.
+        let mut mapper = open_mapper();
+        let (_seq, emitted2, signature2) = one_pass(&mut mapper, &conn, next_seq);
+        assert_eq!(
+            signature2, signature1,
+            "pass 2 leaves the SAME 24 rows and counters (emitted {emitted2} obs)"
+        );
 
-    // Every durable row is native-timestamped, never the 2030 ingest value.
-    let bad_times: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM usage_events
-                 WHERE instance_id=?1 AND observed_at LIKE '2030-%'",
-            params![instance],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        bad_times, 0,
-        "nativeAt wins over the ingest fallback on replay"
-    );
+        // Every durable row is native-timestamped, never the 2030 ingest value.
+        let bad_times: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                     WHERE instance_id=?1 AND observed_at LIKE '2030-%'",
+                params![instance],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bad_times, 0,
+            "nativeAt wins over the ingest fallback on replay"
+        );
+    }
+
+    // --- c-ctxusage r5 item 3 ----------------------------------------------
+
+    fn legacy_session_row(
+        seq: i64,
+        instance: &str,
+        input: i64,
+        output: i64,
+        at: &str,
+    ) -> UsageEventRow {
+        UsageEventRow {
+            instance_id: instance.into(),
+            seq,
+            profile_id: None,
+            model: Some("codex".into()),
+            scope: "session".into(),
+            scope_id: None,
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            total_tokens: Some(input + output),
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: at.into(),
+            observed_at_source: "native".into(),
+        }
+    }
+
+    /// r5 item 3A: codex session s1 then s2 — summed current stocks, boundary
+    /// is not a reset increment.
+    #[test]
+    fn two_codex_sessions_stocks_are_summed_with_no_boundary_increment() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let s = |seq: i64,
+                 scope: &'static str,
+                 input: i64,
+                 output: i64,
+                 at: &'static str|
+         -> JournalRecord {
+            scoped_record(
+                seq,
+                "ins_3a",
+                "session",
+                Some(scope),
+                1,
+                input,
+                output,
+                0,
+                0,
+                Some(at),
+            )
+        };
+        // s1 grows 100 -> 300; s2 grows 50 -> 150 (interleaved native times).
+        assert!(insert(
+            &conn,
+            &s(1, "s1", 100, 10, "2020-01-01T00:00:00.000Z")
+        ));
+        assert!(insert(
+            &conn,
+            &s(2, "s2", 50, 5, "2020-01-01T00:00:10.000Z")
+        ));
+        assert!(insert(
+            &conn,
+            &s(3, "s1", 300, 30, "2020-01-01T00:00:20.000Z")
+        ));
+        assert!(insert(
+            &conn,
+            &s(4, "s2", 150, 15, "2020-01-01T00:00:30.000Z")
+        ));
+        let rollup = rollup_instance(&conn, "ins_3a", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        // Current stocks summed: 300 (s1) + 150 (s2), not "newest row = 150".
+        assert_eq!(rollup.session_input_tokens, Some(450));
+        assert_eq!(rollup.session_output_tokens, Some(45));
+        // Historical points: no current-throughput claim.
+        assert_eq!(rollup.tpm_in_60s, None);
+    }
+
+    /// r5 item 3B: legacy NULL-scope cumulative stock floors a restarted
+    /// scoped replay; a smaller historical stock is frozen, growth accepted.
+    #[test]
+    fn legacy_null_scope_stock_floors_a_restarted_scoped_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            insert_usage_event(
+                &conn,
+                &legacy_session_row(1, "ins_3b", 1000, 100, "2020-01-01T00:00:00.000Z")
+            )
+            .unwrap()
+        );
+        let replay_smaller =
+            scoped_record(10, "ins_3b", "session", Some("s1"), 1, 100, 10, 0, 0, None);
+        assert!(
+            !insert(&conn, &replay_smaller),
+            "a scoped stock below the legacy cumulative floor is frozen"
+        );
+        let current = scoped_record(
+            11,
+            "ins_3b",
+            "session",
+            Some("s1"),
+            1,
+            1200,
+            120,
+            0,
+            0,
+            None,
+        );
+        assert!(
+            insert(&conn, &current),
+            "growth above the legacy floor appends"
+        );
+        let rollup = rollup_instance(&conn, "ins_3b", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(1200),
+            "scoped world ignores the legacy row; the small replay never clobbered 1000"
+        );
+    }
 }

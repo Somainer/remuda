@@ -460,6 +460,11 @@ pub struct ShellPtyDriver {
     bindings: promotion::BindingHandle,
     /// Promotion poller, stopped on close.
     poller: Mutex<Option<JoinHandle<()>>>,
+    /// Cooperative-shutdown signal for the promotion poller and the channel its
+    /// `finish()` completes on (c-ctxusage r5 item 6): close waits for the last
+    /// hydrator finalise instead of aborting mid-pump.
+    poller_shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    poller_finalised: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     /// Exit waiter (§5.5), stopped on close.
     waiter: Mutex<Option<JoinHandle<()>>>,
     /// Process table behind detection; a fixture in tests.
@@ -523,6 +528,8 @@ impl ShellPtyDriver {
             status: Arc::new(std::sync::Mutex::new(None)),
             bindings: promotion::BindingHandle::empty(),
             poller: Mutex::new(None),
+            poller_shutdown: Mutex::new(None),
+            poller_finalised: Mutex::new(None),
             waiter: Mutex::new(None),
             table,
             fallbacks: crate::hook_answer::FallbackLedger::new(),
@@ -1285,6 +1292,11 @@ impl ShellPtyDriver {
                     socket: session.socket_path.clone(),
                 })
             });
+            // c-ctxusage r5 item 6: cooperative poller shutdown.
+            let (poller_tx, poller_rx) = tokio::sync::watch::channel(false);
+            let (finalised_tx, finalised_rx) = tokio::sync::oneshot::channel();
+            *self.poller_shutdown.lock().await = Some(poller_tx);
+            *self.poller_finalised.lock().await = Some(finalised_rx);
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
                 hook_ctx.clone(),
@@ -1320,6 +1332,8 @@ impl ShellPtyDriver {
                 // socket the poller probes when a quiet hook tier goes silent
                 // (captured above before `hooks` moved into the poller).
                 silence_paths,
+                poller_rx,
+                finalised_tx,
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -1652,6 +1666,8 @@ impl ShellPtyDriver {
         *self.inner.lock().await = resumed.inner.lock().await.take();
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
         *self.poller.lock().await = resumed.poller.lock().await.take();
+        *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
+        *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
         // §9.1: adopt the resumed run's switch coordination. Its worker and
         // mapper share a bridge, and its event sender is the live one. When a
@@ -2669,14 +2685,40 @@ impl Driver for ShellPtyDriver {
         if let Some(inner) = self.inner.lock().await.as_ref() {
             inner.closed.store(true, Ordering::SeqCst);
         }
+        // Wake the poller's select so a close between ticks is observed
+        // immediately, then await its finalise.
+        if let Some(shutdown) = self.poller_shutdown.lock().await.take() {
+            let _ = shutdown.send(true);
+        }
         if let Some(poller) = self.poller.lock().await.take() {
-            const PROMOTER_SHUTDOWN_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(2);
+            // c-ctxusage r5 item 6: the poller may be mid first-bind pump over a
+            // large transcript. It finalises the hydrator AFTER its current pump
+            // returns and signals once that is done; wait for that signal rather
+            // than aborting on a fixed 2 s deadline while `finish()` is running.
+            // 15 s only bounds a genuinely wedged pump; on timeout the abort is
+            // covered by the FinaliseGuard's synchronous best-effort finish.
+            const PROMOTER_FINALISE_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(15);
+            let finalised = self.poller_finalised.lock().await.take();
             let mut poller = poller;
-            if tokio::time::timeout(PROMOTER_SHUTDOWN_TIMEOUT, &mut poller)
+            let finished = if let Some(finalised) = finalised {
+                tokio::pin!(finalised);
+                tokio::time::timeout(PROMOTER_FINALISE_TIMEOUT, async {
+                    // The finalise signal wins; task completion covers the
+                    // no-hydrator / already-finished paths.
+                    tokio::select! {
+                        _ = &mut finalised => true,
+                        _ = &mut poller => true,
+                    }
+                })
                 .await
-                .is_err()
-            {
+                .is_ok()
+            } else {
+                tokio::time::timeout(PROMOTER_FINALISE_TIMEOUT, &mut poller)
+                    .await
+                    .is_ok()
+            };
+            if !finished {
                 poller.abort();
             }
         }

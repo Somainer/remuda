@@ -796,7 +796,23 @@ pub(super) fn spawn(
     // Per-instance hook relay/socket paths for the silence diagnostic; absent
     // on a launch with no hook tier.
     silence_paths: Option<HookSilencePaths>,
+    // c-ctxusage r5 item 6: cooperative close that wakes the loop even between
+    // poll ticks; the loop finalises its hydrator and signals `finalised` once
+    // that is done, so close never aborts a first-bind pump mid-`finish()`.
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    finalised: tokio::sync::oneshot::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
+    // Abort-path safety net: even if the task is aborted while a first-bind
+    // pump is still mapping a large transcript, the guard's Drop runs the
+    // mapper's synchronous `finish()` and best-effort delivers the
+    // observations via try_send before its sender drops. The variable is read
+    // only by its Drop impl.
+
+    let finalise_guard = FinaliseGuard {
+        hydrator: None,
+        events: events.clone(),
+        done: false,
+    };
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
         let mut hydrator: Option<Hydrator> = None;
@@ -839,9 +855,16 @@ pub(super) fn spawn(
         let mut last_silence: Option<Option<remuda_signal::hook_silence::HookSilenceReason>> = None;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut closing = false;
         loop {
-            tick.tick().await;
-            if state.closed.load(Ordering::SeqCst) || events.is_closed() {
+            tokio::select! {
+                // Wakes close between ticks; a tick still drives normal polls.
+                _ = shutdown.changed() => {
+                    closing = *shutdown.borrow_and_update();
+                }
+                _ = tick.tick() => {}
+            }
+            if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
                 break;
             }
             let Sample { rows, mut found } = sample(&state, table.as_ref(), alias.as_ref()).await;
@@ -1298,16 +1321,70 @@ pub(super) fn spawn(
                 }
                 _ => finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await,
             }
+            // c-ctxusage r5 item 6: close can land while this iteration's pump
+            // is still mapping. Check before waiting another tick so the final
+            // finalise runs now (close awaits it via `finalised`), never after
+            // a 2 s abort.
+            if state.closed.load(Ordering::SeqCst) || *shutdown.borrow() {
+                break;
+            }
             if events.is_closed() {
                 // Channel already gone: nothing can receive the finalise.
                 break;
             }
         }
-        // c-ctxusage r4 item 2: cooperative shutdown finalises the last
-        // assistant run (usage with no stop_reason) instead of dropping the
-        // hydrator on close/process exit.
+        // c-ctxusage r4 item 2 / r5 item 6: cooperative shutdown finalises the
+        // last assistant run (usage with no stop_reason) instead of dropping
+        // the hydrator on close/process exit. This awaits the current pump's
+        // completion first and must finish before close aborts the task.
         finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
+        // Hand the (now drained) hydrator to the guard and disarm it so the
+        // abort-path Drop does not finalise a second time.
+        finalise_guard.disarm(hydrator);
+        let _ = finalised.send(());
     })
+}
+
+/// Best-effort abort-path safety net for [`spawn`].
+///
+/// Normal shutdown runs `Hydrator::finalize` (async, ordered delivery) and
+/// marks `done`. If the runtime aborts the task before that — e.g. a wedged
+/// first-bind pump exceeding close's bounded wait — the guard's Drop still
+/// runs the mapper's synchronous `finish()` and tries to hand the
+/// observations to the still-held channel via `try_send`. Delivery is best
+/// effort, but the final usage mapping is never silently skipped.
+#[allow(dead_code)] // fields are consumed in Drop / disarm
+struct FinaliseGuard {
+    hydrator: Option<Hydrator>,
+    events: mpsc::Sender<Observation>,
+    done: bool,
+}
+
+impl FinaliseGuard {
+    /// Happy-path completion: the async finalise already ran, so just retain
+    /// the drained hydrator and suppress the Drop finalise.
+    fn disarm(mut self, hydrator: Option<Hydrator>) {
+        self.hydrator = hydrator;
+        self.done = true;
+    }
+}
+
+impl Drop for FinaliseGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Some(hydrator) = self.hydrator.as_mut()
+            && let Ok(observations) = hydrator.finish_sync()
+        {
+            for observation in observations {
+                // Best effort: a full/gone channel drops the observation.
+                if self.events.try_send(observation).is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// A shim records its exec PID before Claude can enter the foreground. Missing
@@ -1595,7 +1672,13 @@ async fn maintain_binding(
     // collision once records carrying a cwd have actually been written.
     if !bindings.content_cwd_check() {
         bindings.mark_degraded("transcript cwd does not match the promoted terminal");
-        finalize_hydrator(hydrator, events, seq, ctx).await;
+        // c-ctxusage r5 item 1: DISCARD, do not finalise. A final tail read here
+        // would journal exactly the mismatched-cwd records — messages, tool
+        // calls and usage of a transcript the driver just declared foreign — so
+        // the chip would show another session's context. Demote/promote/
+        // rebind/vanish/close keep their reading finalise; only the
+        // cwd-mismatch degrade drops the hydrator unread.
+        hydrator.take();
         let mut related = BTreeMap::from([
             ("sessionId".to_owned(), binding.session_id.clone()),
             ("source".to_owned(), binding.source.as_wire().to_owned()),
@@ -1890,6 +1973,19 @@ impl Hydrator {
                 }
             }
         }
+    }
+
+    /// Synchronous finalise for the task-abort safety net (no async emit is
+    /// possible during Drop): one last tail read plus `mapper.finish()`,
+    /// returning the observations for the guard to best-effort `try_send`.
+    fn finish_sync(&mut self) -> DriverResult<Vec<Observation>> {
+        let lines = self.tail.poll().unwrap_or_default();
+        let mut observations = Vec::new();
+        for line in &lines {
+            observations.extend(self.mapper.map_line(line)?);
+        }
+        observations.extend(self.mapper.finish()?);
+        Ok(observations)
     }
 }
 
@@ -2388,6 +2484,176 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_cwd_mismatch_degrade_discards_the_foreign_transcript_unread() {
+        // c-ctxusage r5 item 1: after a bind is established, the transcript
+        // grows a record whose top-level cwd is a DIFFERENT directory. The
+        // degrade must DISCARD the hydrator without a final read — the
+        // foreign record's Message/Usage must never reach this instance.
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("repo");
+        let foreign = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let session = "ffffffff-1111-4222-8333-ffffffffffff";
+
+        // Phase 1 record: assistant text+usage, NO stop_reason, no top-level cwd
+        // — the content check is still indeterminate, so the bind hydrates.
+        let first = serde_json::json!({
+            "type": "assistant",
+            "uuid": "msg-foreign-rec",
+            "timestamp": "2020-01-01T00:00:00.000Z",
+            "isSidechain": false,
+            "message": {
+                "id": "msg-own",
+                "role": "assistant",
+                "type": "message",
+                "model": "m",
+                "stop_reason": null,
+                "content": [{"type": "text", "text": "OWN"}],
+                "usage": {
+                    "input_tokens": 1,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 1
+                }
+            }
+        });
+        let path = slug_session(&home, &cwd, session, &format!("{}\n", first));
+
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&cwd, &home);
+        // Force the deterministic claim directly (the transcript slug is under
+        // the real cwd, so identity channels accept it; only its later content
+        // disagrees).
+        {
+            let mut slot = bindings
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.binding = Some(crate::claude_transcript::TranscriptBinding {
+                session_id: session.into(),
+                path: path.clone(),
+                cwd: cwd.clone(),
+                source: crate::claude_transcript::BindingSource::Hook,
+            });
+        }
+
+        let ctx = ctx_in(&cwd);
+        let found = detected_claude(42, Some(session));
+        let (tx, mut rx) = mpsc::channel::<Observation>(128);
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        maintain_binding(
+            &bindings,
+            &ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &tx,
+            &std::sync::atomic::AtomicU64::new(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !bindings.degraded(),
+            "still indeterminate: no cwd record yet"
+        );
+        assert!(hydrator.is_some(), "the hydrator opened against the claim");
+        // Phase 1 drains only content (no stop_reason -> no usage).
+        while let Ok(_obs) = rx.try_recv() {}
+
+        // Phase 2: a foreign-cwd user record, then a finalised assistant turn.
+        // Under r4 the reading finalise polled these exact records and
+        // journaled them; the fix must not.
+        use std::io::Write;
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open transcript");
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "user-foreign",
+                    "timestamp": "2020-01-01T00:00:01.000Z",
+                    "cwd": foreign.to_string_lossy(),
+                    "message": {"role": "user", "content": "go"}
+                })
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type": "assistant",
+                    "uuid": "msg-evil-rec",
+                    "timestamp": "2020-01-01T00:00:02.000Z",
+                    "isSidechain": false,
+                    "message": {
+                        "id": "msg-evil",
+                        "role": "assistant",
+                        "type": "message",
+                        "model": "m",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "EVIL_FOREIGN_CONTENT"}],
+                        "usage": {
+                            "input_tokens": 999,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                            "output_tokens": 999
+                        }
+                    }
+                })
+            )
+            .unwrap();
+        }
+
+        maintain_binding(
+            &bindings,
+            &ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &tx,
+            &std::sync::atomic::AtomicU64::new(0),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(bindings.degraded(), "the foreign cwd degrades the claim");
+        assert!(hydrator.is_none(), "the hydrator is discarded");
+
+        let mut saw_usage = false;
+        let mut saw_foreign_message = false;
+        while let Ok(obs) = rx.try_recv() {
+            match &obs.body {
+                ObservationPayload::Usage(_) => saw_usage = true,
+                ObservationPayload::Message(message) => {
+                    let rendered = serde_json::to_string(message).unwrap_or_default();
+                    if rendered.contains("EVIL_FOREIGN_CONTENT") || rendered.contains("msg-evil") {
+                        saw_foreign_message = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !saw_foreign_message,
+            "foreign content must never be journaled"
+        );
+        assert!(!saw_usage, "foreign usage must never reach usage_events");
     }
 
     // ----- deterministic binding, per epoch --------------------------------

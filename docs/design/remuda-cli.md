@@ -53,6 +53,61 @@ listener. Device/bootstrap credentials follow the existing CLI resolution;
 a configured Hub bootstrap secret is also supported. Use a device token or
 access-code/bootstrap file; do not place credentials in URLs.
 
+### Bootstrap access code lifetime (`remuda dev`)
+
+When the Hub starts under `remuda dev --access-code-file F` (or with
+`REMUDA_BOOTSTRAP_TOKEN` set), the provided code is persisted into the dev
+Hub data directory (`<data-dir>/dev-hub/bootstrap-token`) together with an
+issue timestamp, and a provenance marker
+(`bootstrap-token-source-explicit`) records that the code's source of truth is
+the file/env. `F` must be a separate operator-managed file: pointing
+`bootstrapToken = "file:…/bootstrap-token"` back at the Hub's own minted file
+marks it explicit and blocks `rotate-bootstrap` on the normal
+stop → rotate → start flow. It must also live **outside the Hub data
+directory** (a separate read-only secrets mount): a `cp -r`/`scp -r` restore
+of the data dir copies the access file with a fresh mtime newer than the
+restored issued stamp, which would revive an expired code once on the next
+start. In the m1 image the mount is `/data00/remuda/secrets` → `/secrets`,
+so the reference is `bootstrapToken = "file:/secrets/access-code"`.
+
+An explicit code does **not** skip the TTL. The code is trimmed of
+surrounding whitespace/newlines before use; an empty or whitespace-only value
+is refused before anything is written. On disk the issue stamp is written
+**before** the token (so a crash between the two leaves the old token with the
+new stamp and is repaired on retry). On a restart the stamp is re-written as
+follows:
+
+- **Fresh stamp (code considered newly issued)** only when the supplied code
+  differs from the persisted token, or — for a file source — the access-code
+  file's mtime is strictly newer than the parsed stamp (a redeploy that
+  touched it). There is deliberately no comparison against the token file's
+  own mtime: the token is written after the stamp on every healthy persist, so
+  it is normally fractionally newer, and reading that as "reissue" revived
+  expired codes on every restart.
+- **Backfill to "now"** on an otherwise unchanged code when there is no
+  *usable* stamp — a missing, empty, or whitespace-only
+  `bootstrap-issued-at` (a crash during the write, a pre-D-018 dir, or a
+  hand-provisioned token). A non-empty but malformed stamp is **not**
+  backfilled; it is treated as already expired.
+- Otherwise an untouched file or an unchanged env value leaves the stamp
+  byte-for-byte in place, so the code still expires after
+  `bootstrap_ttl_hours` (default **24**; set to `0` to disable expiry
+  entirely). Expiry is enforced at `/v1/login`; an expired code returns 401
+  until the operator replaces the source or rotates.
+
+`remuda hub rotate-bootstrap --data-dir D` detects the dev layout and writes
+to `D/dev-hub/` unless `--standalone` names `D` directly. If both
+`D/bootstrap-token` and `D/dev-hub/bootstrap-token` exist it refuses without
+`--dev` or `--standalone`, rather than guessing which Hub owns the code. It
+refuses (non-zero exit, token and stamp untouched) when the target directory
+has no persisted `bootstrap-token`, or when the explicit-source marker is
+present — in that case the running Hub uses an operator-supplied
+`--access-code-file` / env and rotation cannot change it: stop the Hub,
+replace the file/env, and restart. A hub-generated token — including a
+restored data dir with a token and no explicit source — rotates normally.
+Starting the Hub once with no explicit code removes the marker and adopts the
+persisted token as hub-generated.
+
 ## Live instances across hosts
 
 ```sh

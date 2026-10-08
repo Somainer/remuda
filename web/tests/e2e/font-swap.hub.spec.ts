@@ -734,7 +734,7 @@ async function savedPositionSurvivesSwap(
     // jumps to it so it is mounted.
     await page.getByTestId("transcript-search-open").click();
     const search = page.getByTestId("transcript-search-input");
-    await search.fill("font_swap_probe");
+    await search.fill("wrapping line");
     await search.press("Enter");
     await expect(page.getByTestId("transcript-search-count")).toHaveText(/^1\//);
     await page.getByTestId("transcript-search-close").click();

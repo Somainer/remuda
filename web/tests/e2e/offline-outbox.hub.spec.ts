@@ -903,7 +903,7 @@ test.describe("full offline SW restore (PNA/LNA loopback exemption for this harn
     await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
     const restored = page.locator(`[data-testid="optimistic-bubble"][data-command-id="${commandId}"]`);
     await expect(restored).toBeVisible();
-    expect(restored).toContainText("offline across a full offline reload");
+    await expect(restored).toContainText("offline across a full offline reload");
     await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
     await expect(restored).toContainText("待发送（离线）");
     // Still nothing at the Hub through the offline reload.

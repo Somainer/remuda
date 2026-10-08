@@ -684,6 +684,14 @@ class HubStore {
    * Cleared only after a catch-up actually succeeds and folds the journal.
    */
   private reconcileOwed = new Map<Id, { bindGen: number; attemptId: number | null }>();
+  /**
+   * Instances with an owed REST fallback currently running. Several triggers
+   * can fire for one instance while its bounded read is in flight (rebind,
+   * failed reopen, watchdog — and N drained rows); they must collapse into the
+   * ONE coalesced read the doc comment on runOwedReconcile promises instead of
+   * queueing N reads behind each other (c-reconnfu gate 6 item 4a).
+   */
+  private owedReconcileRunning = new Set<Id>();
   private outboxInit: Promise<boolean> | null = null;
 
   /**
@@ -1652,25 +1660,35 @@ class HubStore {
    */
   private runOwedReconcile(instanceId: Id) {
     if (!this.reconcileOwed.has(instanceId)) return;
+    // Coalesce: N drained rows / several failure triggers for one instance
+    // must collapse into ONE bounded read, not N jobs queued on the chain
+    // (gate 6 item 4a). The running read clears the debt on success; on
+    // failure the debt stays and the next trigger starts another read.
+    if (this.owedReconcileRunning.has(instanceId)) return;
+    this.owedReconcileRunning.add(instanceId);
     void this.chainReconcile(instanceId, async () => {
-      if (!this.reconcileOwed.has(instanceId)) return;
-      const instance =
-        this.state.instances.find((i) => i.id === instanceId) ??
-        (await api.instanceGet(instanceId).catch(() => null));
-      const client = instance ? this.journals.get(instance.journalId) : undefined;
-      if (!client) {
-        // Nothing mounted to fold; keep the debt for the mount/trigger that
-        // can actually catch this instance up.
-        return;
-      }
       try {
-        await client.resumeAfterReconnect();
-      } catch {
-        /* bounded REST catch-up failed: keep the debt for the next trigger */
-        return;
+        if (!this.reconcileOwed.has(instanceId)) return;
+        const instance =
+          this.state.instances.find((i) => i.id === instanceId) ??
+          (await api.instanceGet(instanceId).catch(() => null));
+        const client = instance ? this.journals.get(instance.journalId) : undefined;
+        if (!client) {
+          // Nothing mounted to fold; keep the debt for the mount/trigger that
+          // can actually catch this instance up.
+          return;
+        }
+        try {
+          await client.resumeAfterReconnect();
+        } catch {
+          /* bounded REST catch-up failed: keep the debt for the next trigger */
+          return;
+        }
+        this.reconcileOwed.delete(instanceId);
+        this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
+      } finally {
+        this.owedReconcileRunning.delete(instanceId);
       }
-      this.reconcileOwed.delete(instanceId);
-      this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
     });
   }
 
@@ -1746,7 +1764,17 @@ class HubStore {
       // cache: another tab can persist a row after this tab loaded, and a
       // cache-only enumeration would never even attempt its instance lock.
       const now = Date.now();
-      const durable = await box.refreshDurable();
+      let durable;
+      try {
+        durable = await box.refreshDurable();
+      } catch (err) {
+        // flushAllOutbox is fire-and-forget from many call sites; a rejected
+        // durable refresh must not become an unhandled rejection (gate 6 item
+        // 4c). Surface it and stop this pass — the retry timer / reconnect /
+        // next trigger re-runs the flush under the same command ids.
+        this.reconcileToast(err, "刷新待发队列");
+        return;
+      }
       const instances = [
         ...new Set(durable.filter((r) => isDeliverableOutbox(r, now)).map((r) => r.instanceId)),
       ];
@@ -1778,12 +1806,19 @@ class HubStore {
   /**
    * Deliver the first POSTable row of one lock turn, re-reading each mode from
    * the box so a just-landed steer promotion takes effect. Runs inside the
-   * single-deliverer lock. A candidate that is no longer deliverable or whose
-   * claim did not run a POST (retracted/deleted by another tab, a terminal
-   * done, an aborted claim, an exhausted retry window) is SKIPPED and the
-   * bounded drain continues to the NEXT candidate in the same turn — returning
-   * null for the skipped first row used to break the whole flush and strand
+   * single-deliverer lock.
+   *
+   * A genuinely gone/terminal candidate (retracted/deleted by another tab, a
+   * terminal done, an exhausted retry window) is SKIPPED and the bounded drain
+   * continues to the NEXT candidate — returning null for it used to strand
    * every later queued row of the instance with no retry timer.
+   *
+   * An ABORTED inflight CLAIM is different (gate 6 item 4b): the row is still
+   * first and still deliverable, but storage aborted or a foreign live lease
+   * owns it. Skipping it would POST a LATER row first and break FIFO. That
+   * result stops the whole turn (no POST at all this turn); the retry timer /
+   * next flush retries the first row under its same commandId.
+   *
    * Returns the POSTed row's commandId (added to the flush's attempted set)
    * or null when no candidate POSTed.
    */
@@ -1793,8 +1828,13 @@ class HubStore {
     for (const rec of deliverable) {
       const fresh = box.get(rec.commandId) ?? rec;
       if (!isDeliverableOutbox(fresh, Date.now())) continue;
-      const attemptedPost = await this.deliverOutboxRecord(fresh);
-      if (!attemptedPost) continue;
+      const outcome = await this.deliverOutboxRecord(fresh);
+      if (outcome === "claim-aborted") {
+        // FIFO: the first deliverable row could not claim; never POST a later
+        // row ahead of it. End the turn; the row keeps its place and retries.
+        return null;
+      }
+      if (!outcome) continue;
       // If that drained the instance, run the post-delivery resync/screen chain
       // exactly once.
       if (!box.pendingFor(instanceId).length) {
@@ -1995,9 +2035,16 @@ class HubStore {
    * lock). Claims a durable inflight lease before POSTing; a storage abort on
    * that claim means no POST and the row stays deliverable. "held" retries do
    * not spend the attempt budget; a queued-forwarded reconciling row is
-   * settled by GET under a bounded deadline. Returns true when a POST ran.
+   * settled by GET under a bounded deadline.
+   *
+   * Returns true when a POST ran, false when the row is gone/terminal (safe to
+   * skip), or `"claim-aborted"` when the first row still exists but could not
+   * be claimed this turn (storage abort, foreign live lease) — the caller must
+   * preserve FIFO and not POST a later row first (gate 6 item 4b).
    */
-  private async deliverOutboxRecord(current0: OutboxRecord): Promise<boolean> {
+  private async deliverOutboxRecord(
+    current0: OutboxRecord,
+  ): Promise<boolean | "claim-aborted"> {
     const box = this.outbox;
     if (!box) return false;
     const commandId = current0.commandId;
@@ -2014,22 +2061,28 @@ class HubStore {
     // journal-confirmed done: a stored done also means NO POST (the command
     // demonstrably executed; the Hub replay path would only be dead traffic).
     const isFreshAttempt = current0.state !== "held";
+    let claimed;
     try {
-      const claimed = await box.patch(commandId, {
+      claimed = await box.patch(commandId, {
         state: "inflight",
         attempts: isFreshAttempt ? current0.attempts + 1 : current0.attempts,
         lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS },
       });
-      // A null claim means the row vanished inside the claim transaction
-      // (another tab's retract deleted it — mergeUnlessDone resolves null
-      // for a missing row): there is nothing to POST. Also refuse a claim
-      // that did not come back with THIS tab's lease owner (a foreign
-      // live lease must never be POSTed under).
-      if (!claimed || claimed.lease?.owner !== box.ownerId) return false;
-      if (claimed.state === "done") return false;
     } catch {
-      return false;
+      // Storage aborted the claim: the first deliverable row is still first
+      // and deliverable. Signal FIFO stop so a later row is not POSTed ahead.
+      return "claim-aborted";
     }
+    // A null claim means the row vanished inside the claim transaction
+    // (another tab's retract deleted it — mergeUnlessDone resolves null
+    // for a missing row): genuinely gone, safe to skip past.
+    if (!claimed) return false;
+    // Refuse a claim that did not come back with THIS tab's lease owner: a
+    // foreign live lease is POSTing (or will POST) the row. Keep FIFO — do not
+    // send a later row first this turn.
+    if (claimed.lease?.owner !== box.ownerId) return "claim-aborted";
+    // A journal-confirmed terminal done: the command already executed.
+    if (claimed.state === "done") return false;
     this.syncBubbleFromOutbox(commandId);
 
     const finish = async (patch: Partial<OutboxRecord>) => {
@@ -2358,6 +2411,7 @@ class HubStore {
     this.connectionBoundJournal = null;
     this.connectionBindGen = 0;
     this.reconcileOwed.clear();
+    this.owedReconcileRunning.clear();
     this.followReadyState.clear();
     this.followFrameAt.clear();
     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);

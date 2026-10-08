@@ -218,3 +218,68 @@ it("a retracted first row does not strand the next queued row of the instance (d
   expect(send.mock.calls.some((c) => c[4] === "cmd_a_retracted")).toBe(false);
   hubStore.logout();
 });
+
+it("an aborted claim on the first queued row keeps FIFO: a later row is not POSTed first", async () => {
+  // c-reconnfu gate 6 item 4b: rows [A, B] are read deliverable in one lock
+  // turn. A's durable inflight claim TRANSACTION ABORTS (storage error) — A is
+  // still first and still deliverable, unlike a retracted (null) row. The
+  // drain must STOP the turn rather than POST B ahead of A; after storage
+  // recovers the next flush POSTs A first.
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore);
+
+  const base = Date.now();
+  localStorage.setItem(
+    OUTBOX_LS_KEY,
+    JSON.stringify([
+      row({ commandId: "cmd_a_abort", clientRequestId: "local_a", createdAt: base - 2_000 }),
+      row({ commandId: "cmd_b_wait", clientRequestId: "local_b", createdAt: base - 1_000 }),
+    ]),
+  );
+  const send = vi
+    .spyOn(api, "instanceSend")
+    .mockResolvedValue({
+      relatedCommandIds: [],
+      command: {
+        commandId: "cmd_ok",
+        id: "cmd_ok",
+        state: "accepted",
+        revision: "1",
+        dispatch: "native-acknowledged",
+        resolution: "clear",
+      } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
+    });
+
+  // A's claim aborts; B is never reached for a claim in this turn.
+  const box = (hubStore as unknown as { outbox: import("./outbox").Outbox }).outbox;
+  const realPatch = box.patch.bind(box);
+  const patchSpy = vi.spyOn(box, "patch");
+  patchSpy.mockImplementation(async (id, patch) => {
+    if (id === "cmd_a_abort" && patch.state === "inflight") {
+      throw new Error("IndexedDB transaction aborted");
+    }
+    return realPatch(id, patch);
+  });
+
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  // No POST at all this turn — B must not jump ahead of the still-pending A.
+  expect(send).not.toHaveBeenCalled();
+
+  // Storage recovers: the next flush claims A normally and POSTs it FIRST.
+  patchSpy.mockImplementation(realPatch);
+  send.mockImplementation((async (_iid, _prompt, _att, _mode, commandId) => ({
+    relatedCommandIds: [],
+    command: {
+      commandId,
+      id: commandId,
+      state: "accepted",
+      revision: "1",
+      dispatch: "native-acknowledged",
+      resolution: "clear",
+    } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
+  })) as Api["instanceSend"]);
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  await vi.waitFor(() => expect(send).toHaveBeenCalled());
+  expect(send.mock.calls[0]?.[4]).toBe("cmd_a_abort");
+  hubStore.logout();
+});

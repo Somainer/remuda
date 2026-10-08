@@ -585,6 +585,7 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
     )
     .unwrap();
 
+    let instance = remuda_protocol::InstanceId::new();
     let mut options = GenericPtyOptions {
         profile: profile(),
         launch_dir: launch,
@@ -600,7 +601,7 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: Some("^DONE".into()),
-        instance_id: Some(remuda_protocol::InstanceId::new()),
+        instance_id: Some(instance.clone()),
     };
     // OpenAI-shaped test profile; the grok usage counters are priced
     // independently, this only satisfies launch materialization.
@@ -618,23 +619,38 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
 
     // The file adapter polls every 250 ms; a Usage observation from the
     // seeded updates.jsonl must arrive on the same channel as the pane's own
-    // observations.
-    let mut saw_usage = false;
+    // observations. Two `turn_completed` frames stream in, so the last Session
+    // snapshot is cumulative for both (output 40 + 60 = 100); keep collecting
+    // briefly so the assertion reads the final revision, not the first.
+    let mut last_usage = None;
+    let mut stamped_instance = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(500), handle.recv()).await
         else {
+            if last_usage.is_some() {
+                break;
+            }
             continue;
         };
         if let ObservationPayload::Usage(payload) = &obs.body {
             assert_eq!(payload.scope, remuda_protocol::UsageScope::Session);
-            saw_usage = true;
-            break;
+            last_usage = Some(payload.clone());
+            stamped_instance = Some(obs.instance_id.clone());
         }
     }
-    assert!(
-        saw_usage,
-        "grok generic-pty launch must tail updates.jsonl and emit usage"
+    let payload =
+        last_usage.expect("grok generic-pty launch must tail updates.jsonl and emit usage");
+    // Both turns folded into one cumulative session snapshot.
+    let output = match &payload.output_tokens {
+        Knowledge::Known { value } => value.0,
+        other => panic!("expected known output tokens, got {other:?}"),
+    };
+    assert_eq!(output, 100, "cumulative session output across two turns");
+    assert_eq!(
+        stamped_instance.as_ref(),
+        Some(&instance),
+        "usage stamped with the Hub-issued instance id"
     );
 
     driver.close().await.expect("stop");

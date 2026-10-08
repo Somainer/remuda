@@ -3070,7 +3070,45 @@ impl Store {
         .await
     }
 
-    /// Permanently delete an Instance and everything the Hub keeps for it.
+    /// Delete an instance the Hub never accepted (a fenced/never-forwarded
+    /// `instance.create` row) and its Hub-side cascade, WITHOUT the
+    /// terminal-lifecycle/current-chapter gates [`Self::delete_instance`]
+    /// enforces. A never-forwarded create must leave no chapter behind:
+    /// no Node ever saw it, so no tombstone is written either (F only
+    /// tombstones chapters that actually existed on a Node).
+    pub async fn purge_requested_instance(
+        &self,
+        instance_id: String,
+    ) -> Result<(), StoreError> {
+        self.run_named("purge_requested_instance", move |conn| {
+            conn.execute(
+                "DELETE FROM journal WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            conn.execute(
+                "DELETE FROM commands WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            conn.execute(
+                "DELETE FROM interactions WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            conn.execute(
+                "DELETE FROM fleet_members WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            conn.execute(
+                "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
+                 WHERE holder_instance_id = ?1",
+                params![&instance_id, now_rfc3339()],
+            )?;
+            conn.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Delete an instance the Hub never accepted
     ///
     /// Only a stopped Instance can be deleted; the caller is responsible for
     /// stopping it first (`force`). Returns `false` when the row is already

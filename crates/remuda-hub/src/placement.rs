@@ -557,7 +557,7 @@ pub async fn spawn_on_host(
         initiator: request.initiator.clone(),
         device_id: request.initiator_device_id.clone(),
     };
-    let instance = state
+    let instance = match state
         .store
         .insert_instance_delegated(
             host.host_id.clone(),
@@ -570,14 +570,20 @@ pub async fn spawn_on_host(
             spawn_authority,
         )
         .await
-        .map_err(crate::http::map_store)?;
+    {
+        Ok(instance) => instance,
+        // D-057 §7.3: the fence landed at the create admission itself — the
+        // write rolled back, nothing to unwind.
+        Err(crate::store::StoreError::Fenced) => return Err(crate::http::map_store(crate::store::StoreError::Fenced)),
+        Err(error) => return Err(crate::http::map_store(error)),
+    };
     let payload = json!({
         "origin": request.spec.get("origin").cloned().unwrap_or(json!("agent")),
         "instanceId": instance.instance_id,
         "spec": request.spec,
         "initialInput": request.prompt.as_ref().map(|text| json!({ "type": "prompt", "text": text })),
     });
-    let (command, _) = state
+    let (command, _) = match state
         .store
         .queue_command(
             None,
@@ -589,7 +595,29 @@ pub async fn spawn_on_host(
             request.initiator,
             request.initiator_device_id,
         )
-        .await?;
+        .await
+    {
+        Ok(command) => command,
+        // D-057 §7.3: the fence landed between the instance insert and the
+        // create command admission — purge the never-accepted chapter so an
+        // orphaned row never lingers (the write never reached a Node, so no
+        // tombstone: F tombstones only chapters that existed on a Node).
+        Err(crate::store::StoreError::Fenced) => {
+            if let Err(error) = state
+                .store
+                .purge_requested_instance(instance.instance_id.clone())
+                .await
+            {
+                tracing::warn!(
+                    instance_id = %instance.instance_id,
+                    %error,
+                    "fenced create: instance row purge failed"
+                );
+            }
+            return Err(crate::http::map_store(crate::store::StoreError::Fenced));
+        }
+        Err(error) => return Err(crate::http::map_store(error)),
+    };
     let command = crate::http::forward_if_online(state, command, true).await?;
     // D-048: once the instance exists and create was forwarded, install the
     // egress context (credential, base URL, headers) on the proxy Node for a

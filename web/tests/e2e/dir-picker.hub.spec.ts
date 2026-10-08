@@ -203,10 +203,11 @@ test("adds a directory by browsing the host filesystem", async ({ page }) => {
   await browser.getByTestId("dir-browser-use").click();
   await expect(browser).toBeHidden();
 
+  const root = await fixtureRoot(page, host);
   const workspaces = await listWorkspaces(page, host);
-  // Find the alpha workspace by SUFFIX (the fixture reports the canonical
-  // root; do not guess /private/tmp — round 5 item 7).
-  const alpha = workspaces.find((row) => row.root.endsWith("/alpha"));
+  // Match the EXACT root+name bytes the Node reported (r8 item 5: the root is
+  // now a per-run directory, so a /alpha suffix match would be ambiguous).
+  const alpha = workspaces.find((row) => row.root === `${root}/alpha`);
   expect(alpha, JSON.stringify(workspaces)).toBeTruthy();
 
   // The new workspace is selected in the picker.
@@ -218,12 +219,12 @@ test("removes a directory after confirmation and refuses it while a session is l
   // The one fixture root, read from the Node's own listing (round 6 item 6).
   const root = await fixtureRoot(page, host);
   let workspaces = await listWorkspaces(page, host);
-  let beta = workspaces.find((row) => row.root.endsWith("/beta"));
+  let beta = workspaces.find((row) => row.root === `${root}/beta`);
   if (!beta) {
     // Register using the exact bytes the Node just reported; the returned row
     // stays authoritative for every later lookup.
     workspaces = await registerByPath(page, host, `${root}/beta`);
-    beta = workspaces.find((row) => row.root.endsWith("/beta"));
+    beta = workspaces.find((row) => row.root === `${root}/beta`);
   }
   expect(beta).toBeTruthy();
   // Every later lookup (row filter, aria name, DELETE body) uses the root the

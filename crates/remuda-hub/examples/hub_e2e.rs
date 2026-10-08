@@ -31,6 +31,14 @@ async fn main() -> Result<()> {
         .init();
 
     let dir = tempfile::tempdir().context("e2e data dir")?;
+    // r8 item 5: a per-run, owned browse root (never the shared /tmp path).
+    // Env-provided (caller-owned) or, by default, inside this run's TempDir so
+    // it is removed with the data dir; cleanup_dir_picker_fixtures also removes
+    // it on normal shutdown.
+    let dirpicker_root = std::env::var_os("HUB_E2E_DIR_PICKER_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.path().join("dirpicker-browse"));
+    set_dir_picker_root(dirpicker_root);
     let origins = std::env::var("HUB_E2E_ORIGINS").unwrap_or_else(|_| {
         "http://127.0.0.1:4179,http://localhost:4179,http://127.0.0.1:4177".into()
     });
@@ -169,6 +177,9 @@ async fn main() -> Result<()> {
         host_b.abort();
     }
     drop(hub);
+    // r8 item 5: remove the per-run browse tree (the owned TempDir would also
+    // remove the default root; this also clears an env-provided one).
+    cleanup_dir_picker_fixtures();
     Ok(())
 }
 
@@ -1002,9 +1013,7 @@ async fn fake_node(
                     let path = params.get("path").and_then(Value::as_str).unwrap_or("");
                     let resolved = (|| {
                         let canonical = std::fs::canonicalize(path).ok()?;
-                        if !canonical
-                            .starts_with(std::fs::canonicalize(DIRPICKER_BROWSE_ROOT).ok()?)
-                        {
+                        if !canonical.starts_with(std::fs::canonicalize(dir_picker_root()).ok()?) {
                             return None;
                         }
                         let root = canonical.display().to_string();
@@ -1038,7 +1047,7 @@ async fn fake_node(
                         .ok()
                         .filter(|path| {
                             path.starts_with(
-                                std::fs::canonicalize(DIRPICKER_BROWSE_ROOT).unwrap_or_default(),
+                                std::fs::canonicalize(dir_picker_root()).unwrap_or_default(),
                             )
                         })
                         .is_some();
@@ -3519,16 +3528,41 @@ fn dir_picker_enabled() -> bool {
     std::env::var("HUB_E2E_DIR_PICKER").as_deref() == Ok("1")
 }
 
-/// Browse allowlist root for the c-dirpicker spec.
-const DIRPICKER_BROWSE_ROOT: &str = "/tmp/remuda-dirpicker";
+/// Per-run browse allowlist root for the c-dirpicker spec (r8 item 5). It must
+/// NOT be a shared, hard-coded host `/tmp` path: every parallel worker would
+/// collide and nothing ever cleaned it. `main` sets this to an env-provided
+/// path (HUB_E2E_DIR_PICKER_ROOT, owned by the caller) or, by default, a
+/// directory inside the harness-owned per-run TempDir (auto-removed when the
+/// harness exits); `cleanup_dir_picker_fixtures` best-effort removes it on
+/// shutdown either way.
+static DIRPICKER_BROWSE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn set_dir_picker_root(path: std::path::PathBuf) {
+    let _ = DIRPICKER_BROWSE_ROOT.set(path);
+}
+
+fn dir_picker_root() -> &'static std::path::Path {
+    DIRPICKER_BROWSE_ROOT
+        .get()
+        .expect("dir-picker root initialised in main before the fake Node serves")
+}
 
 fn seed_dir_picker_fixtures() -> Result<()> {
-    let root = std::path::Path::new(DIRPICKER_BROWSE_ROOT);
+    let root = dir_picker_root();
     std::fs::create_dir_all(root.join("alpha/nested"))?;
     std::fs::create_dir_all(root.join("beta/nested"))?;
     std::fs::create_dir_all(root.join(".hidden"))?;
     std::fs::write(root.join("note.txt"), b"files are not directories\n")?;
     Ok(())
+}
+
+/// Best-effort removal of the browse tree on shutdown. The default root lives
+/// inside the harness TempDir (which also removes it); this additionally
+/// cleans an env-provided root so no per-run directory is left behind.
+fn cleanup_dir_picker_fixtures() {
+    if let Some(root) = DIRPICKER_BROWSE_ROOT.get() {
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// Build the workspace snapshot the Hub observes after each list/mutation.
@@ -3540,7 +3574,7 @@ fn workspace_snapshot(revision: u64, rows: &[Value]) -> Value {
 /// bounds: containment under one allowlist root, no symlink following, hidden
 /// dot-directories off by default, and a hard result cap.
 fn dirs_list_answer(params: &Value, registered_roots: &[String]) -> Result<Value> {
-    let root = std::fs::canonicalize(DIRPICKER_BROWSE_ROOT)?;
+    let root = std::fs::canonicalize(dir_picker_root())?;
     let requested = params.get("path").and_then(Value::as_str).unwrap_or("");
     let target = if requested.trim().is_empty() {
         root.clone()

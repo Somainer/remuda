@@ -1459,10 +1459,22 @@ async fn follow_session(
     let mut rx = state.bus.subscribe();
     // c-cardsettle: separate receiver on the dedicated settlement bus.
     let mut settlement_rx = state.settlement_bus.subscribe();
-    // c-cardsettle r5 item 6: this follower's durable delivery cursor — the
-    // updated_at of the newest settlement row already recovered to it. Lag
-    // pages strictly forward from it, bounded by SETTLEMENT_LAG_PAGE.
-    let mut settlement_cursor: Option<String> = None;
+    // c-cardsettle r8 item 3: seed the durable delivery cursor at the
+    // position committed at SUBSCRIBE time. The subscription above is taken
+    // FIRST, so a settlement committing around subscribe is delivered by the
+    // bus as well (client de-dupes); every older settlement is already in the
+    // client's initial list and the connect replay, and the backpressure lag
+    // drain must never walk the entire life-of-database history from a `None`
+    // cursor (which stalls the single writer with hundreds of windowless
+    // pages). Erroring closed here is correct: a follower that could not read
+    // its start position cannot safely de-dupe either.
+    let mut settlement_cursor: Option<String> = match state.store.max_settlement_cursor().await {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            tracing::error!(%error, "could not seed the settlement lag cursor; closing follower");
+            return;
+        }
+    };
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
     for id in &instance_ids {
         state.followers.watch(device_id.clone(), id.clone()).await;

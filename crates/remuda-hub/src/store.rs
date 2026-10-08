@@ -4960,6 +4960,39 @@ impl Store {
             .collect())
     }
 
+    /// c-cardsettle r8 item 3: the durable settlement position at follower
+    /// SUBSCRIBE time — the max `(updated_at, id)` over invalidated live rows
+    /// AND tombstones.
+    ///
+    /// A fresh inbox follower's lag cursor starts HERE, not at `None`:
+    /// historical settlement rows are already covered by the client's initial
+    /// interaction list and the connect-time recent-invalidations replay, so a
+    /// node-epoch reconcile that invalidates hundreds of cards can never make
+    /// the backpressure drain walk the ENTIRE history (every tombstone for the
+    /// life of the database) in 512-row windowless pages on the single writer.
+    /// The caller subscribes to the settlement bus BEFORE reading this so a
+    /// settlement committed around subscribe is delivered live as well; the
+    /// client de-dupes by interaction id.
+    pub async fn max_settlement_cursor(&self) -> Result<Option<String>, StoreError> {
+        self.run_named("max_settlement_cursor", |conn| {
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT updated_at, id FROM (
+                        SELECT updated_at, id FROM interactions WHERE state = 'invalidated'
+                        UNION ALL
+                        SELECT updated_at, id FROM interaction_tombstones WHERE state = 'invalidated'
+                     )
+                     ORDER BY updated_at DESC, id DESC
+                     LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            Ok(row.map(|(updated_at, id)| Self::settlement_cursor_of(&updated_at, &id)))
+        })
+        .await
+    }
+
     /// c-cardsettle r6 item 2: one BOUNDED page (at most
     /// [`SETTLEMENT_LAG_PAGE`] live rows + tombstones) of terminal
     /// interactions strictly after a per-follower delivery cursor, in
@@ -6178,6 +6211,14 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        -- c-cardsettle r8 item 3: the settlement lag drain filters
+        -- state='invalidated' AND (updated_at, id) > (?,?) with no window;
+        -- a composite index keeps a follower recovery from full-scanning the
+        -- (life-of-database) interactions and tombstones tables.
+        CREATE INDEX IF NOT EXISTS interactions_settlement_cursor
+            ON interactions(state, updated_at, id);
+        CREATE INDEX IF NOT EXISTS interaction_tombstones_settlement_cursor
+            ON interaction_tombstones(state, updated_at, id);
         CREATE TABLE IF NOT EXISTS provider_profiles (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -8751,6 +8792,111 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r8 item 3: a fresh follower seeds its lag cursor from the
+    /// durable max settlement position, so a pre-existing backlog (more rows
+    /// than one page, including old timestamps) is never replayed as "lag" —
+    /// only settlements committed AFTER subscribe drain.
+    #[tokio::test]
+    async fn seeded_settlement_cursor_skips_pre_existing_history() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r8-seed-cursor").await;
+
+        // Pre-populate MORE than one lag page of old settlements at an old
+        // timestamp (the life-of-database history the old None-cursor drain
+        // walked).
+        let old_count = (SETTLEMENT_LAG_PAGE as usize) + 32;
+        let mut newest_old_id = String::new();
+        let mut newest_old_ts = String::new();
+        for n in 0..old_count {
+            let instance = seed_acknowledged_instance(&store, &host).await;
+            let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+            store
+                .settle_instance_exited(instance.instance_id, "old-history".into())
+                .await
+                .expect("settle old");
+            // Backdate every old row a day, with a strictly increasing
+            // timestamp per row so the last inserted is the durable max.
+            let ts = format!("2000-01-01T00:00:{:02}.{:03}Z", n / 60, (n % 60) * 10);
+            store
+                .run_named("r8_backdate_old", {
+                    let int_id = int_id.clone();
+                    let ts = ts.clone();
+                    move |conn| {
+                        conn.execute(
+                            "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
+                            params![ts, int_id],
+                        )?;
+                        Ok(())
+                    }
+                })
+                .await
+                .expect("backdate old");
+            newest_old_id = int_id;
+            newest_old_ts = ts;
+        }
+
+        // Subscribe position: the durable max over the backlog.
+        let seed = store
+            .max_settlement_cursor()
+            .await
+            .expect("max settlement cursor")
+            .expect("a backlog exists");
+        assert_eq!(
+            seed,
+            Store::settlement_cursor_of(&newest_old_ts, &newest_old_id),
+            "the seed is the newest old (updated_at, id)"
+        );
+        // Draining from the seed immediately is empty — the history is covered
+        // by list + connect replay, never replayed as lag.
+        assert!(
+            store
+                .invalidated_interactions_after(Some(seed.clone()))
+                .await
+                .expect("drain from seed")
+                .is_empty(),
+            "no historical settlement drains past the seed"
+        );
+
+        // Settlements committed AFTER subscribe (a new sweep) DO drain, and
+        // none of the old backlog comes with them.
+        let mut new_ids = Vec::new();
+        for _ in 0..(SETTLEMENT_LAG_PAGE as usize + 5) {
+            let instance = seed_acknowledged_instance(&store, &host).await;
+            let pending = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+            store
+                .settle_instance_exited(instance.instance_id, "new-sweep".into())
+                .await
+                .expect("settle new");
+            new_ids.push(pending);
+        }
+        let mut drained_ids = Vec::new();
+        let mut cursor = Some(seed);
+        loop {
+            let page = store
+                .invalidated_interactions_after(cursor.clone())
+                .await
+                .expect("drain page");
+            if page.is_empty() {
+                break;
+            }
+            for (_, id, _, ts) in &page {
+                assert!(
+                    new_ids.iter().any(|want| want == id),
+                    "an OLD settlement drained past the seed: {id}"
+                );
+                drained_ids.push(id.clone());
+                cursor = Some(Store::settlement_max_cursor(cursor.as_deref(), ts, id));
+            }
+        }
+        drained_ids.sort();
+        let mut want = new_ids.clone();
+        want.sort();
+        assert_eq!(drained_ids, want, "exactly the post-subscribe sweep drains");
+        store.close().await;
+    }
+
     /// c-cardsettle r5 item 6: the lag recovery cursor replaces the fixed
     /// 5-minute window for a follower that MISSED notices. An older lost
     /// settlement (beyond the reconnect snapshot window) is still recovered on
@@ -10741,7 +10887,10 @@ mod tests {
         // The card is untouched: still pending, still blocking.
         let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "pending");
-        assert!(reason.is_none(), "no generation-ended resolution: {reason:?}");
+        assert!(
+            reason.is_none(),
+            "no generation-ended resolution: {reason:?}"
+        );
 
         // A same-epoch inventory reporting the instance live revives the row;
         // the pending card survives the revival too.
@@ -10759,7 +10908,10 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(row.lifecycle, "running");
-        assert!(row.last_error.is_none(), "revival clears host-lost: {row:?}");
+        assert!(
+            row.last_error.is_none(),
+            "revival clears host-lost: {row:?}"
+        );
         let (state, _reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "pending", "the card stays pending through revival");
         store.close().await;

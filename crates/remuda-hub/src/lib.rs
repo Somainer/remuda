@@ -562,6 +562,35 @@ impl RunningHub {
         crate::gatequeue::reconcile(&self.state).await;
     }
 
+    /// Test helper (c-cardsettle r8 item 3): backdate interactions'
+    /// `updated_at` to a fixed RFC3339 timestamp, so an integration test can
+    /// create settlement history outside the 5-minute connect-replay window
+    /// and prove the follower lag drain seeds at the durable max instead of
+    /// walking the whole history.
+    #[doc(hidden)]
+    pub async fn test_backdate_interactions(
+        &self,
+        interaction_ids: Vec<String>,
+        rfc3339: &str,
+    ) -> anyhow::Result<()> {
+        let Some(store) = self.store.as_ref() else {
+            anyhow::bail!("hub store already closed");
+        };
+        let ts = rfc3339.to_string();
+        store
+            .run_named("test_backdate_interactions", move |conn| {
+                for id in &interaction_ids {
+                    conn.execute(
+                        "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
+                        rusqlite::params![ts, id],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into

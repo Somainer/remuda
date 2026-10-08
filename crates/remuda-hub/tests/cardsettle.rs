@@ -25,6 +25,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const TIMEOUT: Duration = Duration::from_secs(8);
+/// The Hub's settlement broadcast ring capacity (settlement_bus).
+const SETTLEMENT_RING: usize = 64;
 /// Window over which EVERY Node frame is inspected after the late answer.
 const NO_FORWARD_WINDOW: Duration = Duration::from_millis(800);
 
@@ -1082,6 +1084,280 @@ async fn host_loss_sweep_keeps_cards_and_revives_a_live_inventory_row_on_reconne
     service_task.abort();
     hub.shutdown().await;
     Ok(())
+}
+
+/// r8 item 3: a follower that subscribes with a PRE-POPULATED settlement
+/// history (hundreds of invalidated rows for the life of the database) must
+/// not replay that history when its ring lags. Its lag cursor is seeded at
+/// the durable max at subscribe time; only settlements committed AFTER
+/// subscribe (the blocked sweep) are recovered before the gap.
+#[tokio::test]
+async fn follower_lag_never_replays_pre_subscribe_history() -> Result<()> {
+    let mut config = HubConfig::for_test(tempfile::tempdir()?.path().join("data"));
+    config.follow_buffer_events = 1;
+    let hub = spawn(config).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+
+    // Create an instance carrying many pending cards, then sweep them away with
+    // an epoch change BEFORE the follower connects — this is the pre-existing
+    // history a fresh inbox follower's initial list already reflects.
+    let (old_instance, old_cards) =
+        ready_instance_with_cards(&hub, &cookie, &node, &host_id, "r8-old", 700).await?;
+    let old_generation =
+        sweep_with_new_epoch(&addr, &node, &host_id, "cs-r8item3-old", json!([]), 1).await?;
+    assert!(
+        old_cards.len() > SETTLEMENT_RING,
+        "the pre-populated history must exceed the settlement ring"
+    );
+    // The old instance row is exited after the pre-subscribe sweep.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = http(
+            addr,
+            "GET",
+            &format!("/v1/instances/{old_instance}"),
+            &cookie,
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let row: Value = serde_json::from_str(&body)?;
+        if row["lifecycle"] == "exited" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "old row never exited: {row}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The bounded connect replay shows at most the 5 NEWEST old rows.
+    let snapshot_newest_old: std::collections::HashSet<String> =
+        old_cards.iter().rev().take(5).cloned().collect();
+
+    // Backdate the pre-populated settlements OUTSIDE the 5-minute connect
+    // replay window, so the only way they could reach this follower is the
+    // (cursed) None-cursor history walk. The seeded cursor must exclude them.
+    hub.test_backdate_interactions(old_cards.clone(), "2000-01-01T00:00:00.000Z")
+        .await?;
+
+    // A NEW instance with its own pending cards, the post-subscribe sweep.
+    let (new_instance, new_cards) =
+        ready_instance_with_cards(&hub, &cookie, &node, &host_id, "r8-new", 70).await?;
+
+    // Connect the follower with a tiny receive window and never read until the
+    // blocked state settles (same parking technique as the r7 lag-order test).
+    let mut follow_req = format!("ws://{addr}/v1/follow").into_client_request()?;
+    follow_req.headers_mut().insert("Cookie", cookie.parse()?);
+    let follow_tcp = tokio::net::TcpStream::connect(addr).await?;
+    #[cfg(unix)]
+    {
+        nix::sys::socket::setsockopt(&follow_tcp, nix::sys::socket::sockopt::RcvBuf, &256)?;
+    }
+    let (mut follow, _) = tokio_tungstenite::client_async(follow_req, follow_tcp).await?;
+    node.append(
+        "jpad-r8",
+        &new_instance,
+        json!({ "kind": "message", "payload": { "text": "x".repeat(16 * 1024) } }),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The post-subscribe sweep: new epoch, empty attested inventory.
+    let new_generation =
+        sweep_with_new_epoch(&addr, &node, &host_id, "cs-r8item3-new", json!([]), 2).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Unblock and read until the settlement-backpressure gap.
+    let mut got: Vec<String> = Vec::new();
+    let mut old_seen: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    'read: while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(next) = tokio::time::timeout(remaining, follow.next()).await.ok() else {
+            break 'read;
+        };
+        let Some(Ok(Message::Text(text))) = next else {
+            continue;
+        };
+        let frame: Value = serde_json::from_str(&text)?;
+        match frame.get("type").and_then(Value::as_str) {
+            Some("settlement") => {
+                let id = frame["interactionId"]
+                    .as_str()
+                    .context("settlement interactionId")?
+                    .to_string();
+                if old_cards.contains(&id) {
+                    old_seen.push(id.clone());
+                }
+                got.push(id);
+            }
+            Some("gap") if frame["reason"] == "settlement-backpressure" => break 'read,
+            _ => {}
+        }
+    }
+
+    assert!(
+        old_seen.is_empty() || old_seen.iter().all(|id| snapshot_newest_old.contains(id)),
+        "only the connect replay's few newest-old rows may arrive, never a lag drain of history: \
+         {old_seen:?}"
+    );
+    assert!(
+        old_seen.len() <= 5,
+        "the windowed connect replay is bounded to the newest few: {old_seen:?}"
+    );
+    assert_eq!(
+        got.len() - old_seen.len(),
+        new_cards.len(),
+        "exactly the post-subscribe sweep drains before the gap"
+    );
+    let mut want = new_cards.clone();
+    want.sort();
+    let mut sorted_got = got.clone();
+    sorted_got.sort();
+    assert_eq!(
+        sorted_got, want,
+        "the recovered ids are exactly the new sweep"
+    );
+
+    old_generation.abort();
+    new_generation.abort();
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// Create an instance, drive it ready, and append `card_count` pending
+/// approval cards over the fake Node socket. Returns `(instance_id, card_ids)`.
+async fn ready_instance_with_cards(
+    hub: &remuda_hub::RunningHub,
+    cookie: &str,
+    node: &FakeNode,
+    host_id: &HostId,
+    label: &str,
+    card_count: usize,
+) -> Result<(String, Vec<String>)> {
+    let addr = hub.addr;
+    let create_body = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "delegation": "none",
+        "permissionMode": "bypass",
+        "prompt": format!("cardsettle {label} lag seed"),
+    })
+    .to_string();
+    let (status, create_response) =
+        http(addr, "POST", "/v1/instances", cookie, Some(&create_body)).await?;
+    assert_eq!(status, 200, "create {create_response}");
+    let create_json: Value = serde_json::from_str(&create_response)?;
+    let instance_id = create_json["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+    node.append(
+        &format!("jready-{label}"),
+        &instance_id,
+        json!({ "kind": "lifecycle", "payload": {
+            "type": "entity", "entityType": "instance", "state": "ready"
+        }}),
+    )
+    .await?;
+    let mut card_ids = Vec::with_capacity(card_count);
+    for n in 0..card_count {
+        let id = format!("int_{label}_{n:05}");
+        node.append(
+            &format!("jreq-{label}-{n}"),
+            &instance_id,
+            approval_requested_event(&id),
+        )
+        .await?;
+        card_ids.push(id);
+    }
+    Ok((instance_id, card_ids))
+}
+
+/// Open a new node socket and send a same-host hello carrying a NEW node epoch
+/// (the reconcile sweeps the instances the inventory omits), reading the
+/// hello result. The returned task services the new generation socket (the
+/// Hub routes RPCs there after the hello) for the test's lifetime; abort it
+/// at teardown.
+async fn sweep_with_new_epoch(
+    addr: &std::net::SocketAddr,
+    node: &FakeNode,
+    host_id: &HostId,
+    epoch: &str,
+    instances: Value,
+    hello_seq: u8,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", node.node_token()).parse()?,
+    );
+    let (socket, _) = tokio_tungstenite::connect_async(req).await?;
+    let hello_id = format!("hello-sweep-{hello_seq}");
+    let (mut sink, mut stream) = socket.split();
+    sink.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": hello_id, "method": "node.hello",
+            "params": {
+                "hostId": host_id.as_id().as_str(),
+                "nodeVersion": "0.1.0",
+                "nodeEpoch": epoch,
+                "instanceStoreFound": true,
+                "instances": instances
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    // Read until the hello result, acking any interleaved RPC.
+    let mut got_result = false;
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(8), stream.next()).await
+    {
+        let Message::Text(text) = msg else { continue };
+        let frame: Value = serde_json::from_str(&text)?;
+        let Some(id) = frame.get("id").cloned() else {
+            continue;
+        };
+        if id == hello_id {
+            anyhow::ensure!(frame.get("result").is_some(), "sweep hello failed: {frame}");
+            got_result = true;
+            break;
+        }
+        let reply = json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } });
+        sink.send(Message::Text(reply.to_string().into())).await?;
+    }
+    anyhow::ensure!(got_result, "never got {hello_id} result");
+    // Keep the generation alive and service every further RPC until teardown —
+    // dropping this socket marks the host offline and blocks later creates.
+    let task = tokio::spawn(async move {
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_secs(60), stream.next()).await
+        {
+            let Message::Text(text) = msg else { continue };
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(id) = frame.get("id").cloned() else {
+                continue;
+            };
+            let reply = json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } });
+            if sink
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    Ok(task)
 }
 
 /// r7 item 3 (the r6 item 2 test as actually asked): a REAL follower through

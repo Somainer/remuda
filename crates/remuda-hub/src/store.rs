@@ -6380,10 +6380,13 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // `failed` row is NOT trusted — round 3 (OA6) failed can be a turn-level
     // error the process survived, and without the original event there is no
     // way to distinguish; leave its ended_at null rather than fabricate one.
+    // r8 OA6: a `last_error='host-lost'` exit is CONTACT loss and must not be
+    // retroactively stamped with process-end evidence either.
     conn.execute(
         "UPDATE instances SET ended_at = updated_at
          WHERE ended_at IS NULL
-           AND lifecycle IN ('exited', 'closed')",
+           AND lifecycle IN ('exited', 'closed')
+           AND COALESCE(last_error, '') != 'host-lost'",
         [],
     )?;
     // Rows written before the column existed are each their own lineage.

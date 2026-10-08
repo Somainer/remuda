@@ -848,6 +848,10 @@ pub(super) fn spawn(
         // used to clear the slot and the next tick immediately re-applied the
         // stale launch mode to the new session.
         let mut launch_mode = LaunchModeBinding::Unbound;
+        // r6 items 3/4: one boundary per (pid, session) measured at its
+        // SessionStart report. The first session reported per pid is the
+        // launched process's own; every later key is an in-TUI rebind.
+        let mut session_modes = SessionModeTable::default();
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -939,13 +943,15 @@ pub(super) fn spawn(
             // binding. Without this bridge only Claude's separate pid file
             // could hydrate, leaving a spurious manual picker over a hooked
             // session. begin_epoch must happen first so it cannot erase it.
-            // Item 2: when an authenticated SessionStart rebinds the
-            // foreground to another session, bound the NEW session from its
-            // OWN transcript snapshot at this instant (Fresh for an
-            // absent/empty file — a `/clear`; Unverified at current EOF
-            // otherwise — an in-TUI `/resume`). Never the launch argv, never
-            // byte 0.
-            let mut rebound_mode: Option<ResumeMode> = None;
+            //
+            // r6 items 3/4: the report's (pid, session) gets a boundary
+            // measured at THIS instant — absent/empty transcript → Fresh
+            // (`/clear` or a brand-new session whose file is created lazily),
+            // otherwise an unverified anchor at current EOF (`/resume` of an
+            // older session). It is stored once and applied on every bind of
+            // the session, including the first one, so a fresh launch with no
+            // transcript whose user /resume'd before typing is never tailed
+            // byte 0 as current.
             if let Some(hooks) = hooks.as_ref()
                 && let Some(binding) = hooks.binding()
                 && found.as_ref().is_some_and(|found| found.pid == binding.pid)
@@ -962,6 +968,17 @@ pub(super) fn spawn(
                         }
                     }
                 }
+                if session_modes
+                    .mode_for(binding.pid, &binding.session_id)
+                    .is_none()
+                {
+                    session_modes.record(
+                        binding.pid,
+                        &binding.session_id,
+                        binding.transcript_path.as_deref().map(std::path::Path::new),
+                        pre_resume_mode,
+                    );
+                }
                 if let Some(path) = binding.transcript_path {
                     let report = SessionStartReport {
                         session_id: binding.session_id,
@@ -969,13 +986,14 @@ pub(super) fn spawn(
                         cwd: None,
                         ppid: Some(i64::from(binding.pid)),
                     };
+                    // Tear the hydrator when an EXISTING binding flips to a new
+                    // session so it reopens against the new transcript. When no
+                    // prior binding exists (the lazy-create case) there is
+                    // nothing to tear; the sticky mode above already covers it.
                     if bindings.rebind_authenticated_start(
                         found.as_ref().expect("matched foreground"),
                         &report,
                     ) {
-                        rebound_mode = Some(crate::claude_transcript::ResumeMode::rebound_mode(
-                            std::path::Path::new(&report.transcript_path),
-                        ));
                         hydrator = None;
                         announced = None;
                     }
@@ -1306,7 +1324,13 @@ pub(super) fn spawn(
                     // a DIFFERENT session, or a pid change, kills it for the
                     // rest of the epoch; that new foreground agent is bounded
                     // from its own detected provenance instead.
-                    let mode = epoch_mode(&mut launch_mode, pre_resume_mode, rebound_mode, found);
+                    // The boundary measured at this session's SessionStart
+                    // report, if one has been ingested yet (items 3/4).
+                    let sticky = found
+                        .session_id
+                        .as_ref()
+                        .and_then(|session| session_modes.mode_for(found.pid, session));
+                    let mode = epoch_mode(&mut launch_mode, pre_resume_mode, sticky, found);
                     maintain_binding(
                         &bindings,
                         &ctx,
@@ -1530,32 +1554,128 @@ enum LaunchModeBinding {
     Dead(ResumeMode),
 }
 
-/// Decide one tick's epoch [`ResumeMode`] and advance the sticky
-/// [`LaunchModeBinding`].
+/// Boundary measured at the INSTANT an authenticated SessionStart report for
+/// `(pid, session_id)` arrived (r6 items 3/4).
 ///
-/// `rebound` carries the mode computed from the rebound session's OWN
-/// transcript when an authenticated SessionStart rebind happened this tick
-/// (see [`ResumeBoundary::rebound_mode`]); it is `None` on ordinary ticks.
-/// The pre-spawn mode applies only to the process it was captured for: it
-/// survives a session id simply becoming known for the same pid, dies on a
-/// rebind or pid change, and never revives. A login shell (no pre-spawn mode)
-/// is always bounded per detected provenance via [`shell_resume_mode`].
+/// The mode is snapshotted once per session and applied on EVERY bind of that
+/// session within the spawn — including the very first one (a fresh launch
+/// with no transcript yet whose user runs `/resume` before typing) and after a
+/// demote/re-promotion — so it never falls back to the launch argv or byte 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StickySessionMode {
+    /// ResumeMode measured for the session at its first SessionStart report.
+    mode: ResumeMode,
+    /// True for every session after the launched process's FIRST reported
+    /// session (an in-TUI `/resume` / `/clear`): the pre-spawn launch mode is
+    /// dead for it.
+    rebound: bool,
+}
+
+/// Per-spawn table of the boundary measured at each authenticated
+/// SessionStart report (r6 items 3/4). The first session reported per pid is
+/// the launched process's own (it keeps the pre-spawn mode when one exists);
+/// every later session for that pid is an in-TUI rebind bounded from its own
+/// transcript snapshot. Entries are recorded once and survive demotions,
+/// re-promotions and late binds (the lazy-create case where the user
+/// `/resume`s before the fresh transcript exists).
+#[derive(Debug, Default)]
+struct SessionModeTable {
+    modes: std::collections::HashMap<(i32, String), StickySessionMode>,
+    first_pid: std::collections::HashSet<i32>,
+}
+
+impl SessionModeTable {
+    /// Record the SessionStart for `(pid, session_id)` once and return its
+    /// sticky mode. `transcript_path` is the path the hook named at that
+    /// instant (may not exist yet — a lazily created fresh session).
+    fn record(
+        &mut self,
+        pid: i32,
+        session_id: &str,
+        transcript_path: Option<&std::path::Path>,
+        pre_resume_mode: Option<ResumeMode>,
+    ) -> StickySessionMode {
+        let key = (pid, session_id.to_owned());
+        if let Some(entry) = self.modes.get(&key) {
+            return *entry;
+        }
+        let at_report = transcript_path
+            .map(crate::claude_transcript::ResumeMode::rebound_mode)
+            .unwrap_or(ResumeMode::Fresh);
+        let first_for_pid = self.first_pid.insert(pid);
+        let (mode, rebound) = if first_for_pid {
+            (pre_resume_mode.unwrap_or(at_report), false)
+        } else {
+            (at_report, true)
+        };
+        let entry = StickySessionMode { mode, rebound };
+        self.modes.insert(key, entry);
+        entry
+    }
+
+    /// The recorded mode for `(pid, session_id)`, if a SessionStart for it has
+    /// been ingested this spawn.
+    fn mode_for(&self, pid: i32, session_id: &str) -> Option<StickySessionMode> {
+        self.modes.get(&(pid, session_id.to_owned())).copied()
+    }
+}
+/// Decide one tick's epoch [`ResumeMode`].
+///
+/// `sticky` is the boundary measured at this (pid, session)'s authenticated
+/// SessionStart report (r6 items 3/4): it exists for every hook-bound
+/// session, INCLUDING the first bind, so a fresh launch whose user
+/// `/resume`s before typing is bounded from the older session's own snapshot
+/// instead of byte 0. A sticky `rebound` session kills the pre-spawn launch
+/// mode; the launched process's own first session keeps the pre-spawn mode.
+/// Without a sticky report (pid-file/argv-only detection, no hook yet) the
+/// mode derives from the pre-spawn capture or the detected argv provenance.
 fn epoch_mode(
     binding: &mut LaunchModeBinding,
     pre_resume_mode: Option<ResumeMode>,
-    rebound: Option<ResumeMode>,
+    sticky: Option<StickySessionMode>,
     found: &Detected,
 ) -> ResumeMode {
-    let Some(mode) = pre_resume_mode else {
-        // A login shell rebind is bounded from the rebound transcript too.
-        return rebound.unwrap_or_else(|| shell_resume_mode(found));
-    };
     let (pid, session) = (found.pid, found.session_id.clone().unwrap_or_default());
-    // An authenticated rebind this tick always wins over the current slot.
-    if let Some(rebind_mode) = rebound {
-        *binding = LaunchModeBinding::Dead(rebind_mode);
-        return rebind_mode;
+    if let Some(sticky) = sticky {
+        if sticky.rebound {
+            // A later in-TUI session: the launch boundary can never prove it.
+            *binding = LaunchModeBinding::Dead(sticky.mode);
+            return sticky.mode;
+        }
+        // The launched process's own first reported session.
+        if let Some(pre) = pre_resume_mode {
+            return match *binding {
+                LaunchModeBinding::Bound(bound_pid, ref bound_session)
+                    if bound_pid == pid
+                        && (bound_session.is_empty()
+                            || session.is_empty()
+                            || bound_session == &session) =>
+                {
+                    if bound_session.is_empty() && !session.is_empty() {
+                        *binding = LaunchModeBinding::Bound(pid, session);
+                    }
+                    pre
+                }
+                LaunchModeBinding::Dead(dead_mode) => dead_mode,
+                _ => {
+                    *binding = LaunchModeBinding::Bound(pid, session);
+                    pre
+                }
+            };
+        }
+        // New launch / login shell: use the mode measured at SessionStart.
+        return match *binding {
+            LaunchModeBinding::Dead(dead_mode) => dead_mode,
+            _ => {
+                *binding = LaunchModeBinding::Bound(pid, session);
+                sticky.mode
+            }
+        };
     }
+    // No authenticated session report yet (pid-file/argv-only detection).
+    let Some(mode) = pre_resume_mode else {
+        return shell_resume_mode(found);
+    };
     match *binding {
         LaunchModeBinding::Unbound => {
             *binding = LaunchModeBinding::Bound(pid, session);
@@ -1575,7 +1695,7 @@ fn epoch_mode(
             }
             mode
         }
-        // The rebound session's stored mode stays in force on later ticks.
+        // A previously stored Dead mode stays in force on later ticks.
         LaunchModeBinding::Dead(dead_mode) => dead_mode,
         // A pid change or a known session id flipping without an authenticated
         // rebind: fall back to detected provenance and hold it.
@@ -2863,14 +2983,30 @@ mod tests {
         ResumeMode::Unverified
     }
 
+    /// A sticky entry for the launched process's OWN first session.
+    fn own_session(mode: ResumeMode) -> StickySessionMode {
+        StickySessionMode {
+            mode,
+            rebound: false,
+        }
+    }
+
+    /// A sticky entry for a later in-TUI session (`/resume` / `/clear`).
+    fn rebound_session(mode: ResumeMode) -> StickySessionMode {
+        StickySessionMode {
+            mode,
+            rebound: true,
+        }
+    }
+
     #[test]
     fn launch_mode_applies_once_and_refines_a_later_known_session() {
         let mut binding = LaunchModeBinding::Unbound;
-        // First sighting: ps gave no session id yet.
+        // First sighting with the launched session's own SessionStart mode.
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            None,
+            Some(own_session(boundary_mode())),
             &detected_claude(7, None),
         );
         assert_eq!(mode, boundary_mode());
@@ -2880,7 +3016,7 @@ mod tests {
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            None,
+            Some(own_session(boundary_mode())),
             &detected_claude(7, Some(CORRECT)),
         );
         assert_eq!(mode, boundary_mode());
@@ -2889,7 +3025,7 @@ mod tests {
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            None,
+            Some(own_session(boundary_mode())),
             &detected_claude(7, Some(CORRECT)),
         );
         assert_eq!(mode, boundary_mode());
@@ -2897,33 +3033,53 @@ mod tests {
 
     #[test]
     fn an_authenticated_rebind_binds_the_new_session_to_its_own_mode_stickily() {
-        // r5 item 2: the rebound session is bounded by the mode computed from
-        // ITS OWN transcript snapshot (passed in by the caller), never by the
-        // launch argv. A fresh `/clear` rebound is Fresh; a `/resume` rebound
-        // is its own unverified-EOF mode — and it sticks on later ticks.
-        let rebound_fresh = ResumeMode::Fresh;
-        let rebound_unverified = ResumeMode::Unverified;
+        // r5/r6 items 2/3: a later sticky session is bounded by the mode
+        // measured at ITS OWN SessionStart, never by the launch argv. A fresh
+        // `/clear` rebound is Fresh; a `/resume` rebound is its own
+        // unverified-EOF mode — and it sticks on later ticks (as Dead).
         let mut binding = LaunchModeBinding::Bound(7, CORRECT.to_owned());
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            Some(rebound_fresh),
+            Some(rebound_session(ResumeMode::Fresh)),
             &detected_claude(7, Some(LATE_STARTER)),
         );
         assert_eq!(mode, ResumeMode::Fresh);
         assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Fresh));
-        // Sticks on later ticks even though the argv Detected says resume.
+        // Sticks on later ticks: the same rebound entry plus an argv that says
+        // resume cannot change it.
         let mut found = detected_claude(7, Some(LATE_STARTER));
         found.resume = true;
-        let mode = epoch_mode(&mut binding, Some(boundary_mode()), None, &found);
-        assert_eq!(mode, ResumeMode::Fresh, "the rebound mode is sticky");
-        // A second rebind (e.g. then /resume again) replaces it with that
-        // session's own mode.
         let mode = epoch_mode(
             &mut binding,
             Some(boundary_mode()),
-            Some(rebound_unverified),
+            Some(rebound_session(ResumeMode::Fresh)),
             &found,
+        );
+        assert_eq!(mode, ResumeMode::Fresh, "the rebound mode is sticky");
+        // A second rebind replaces it with that session's own mode.
+        let mode = epoch_mode(
+            &mut binding,
+            Some(boundary_mode()),
+            Some(rebound_session(ResumeMode::Unverified)),
+            &found,
+        );
+        assert_eq!(mode, ResumeMode::Unverified);
+        assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Unverified));
+    }
+
+    #[test]
+    fn a_rebind_before_any_binding_never_falls_back_to_the_launch_argv() {
+        // r6 item 3 (the lazy-create case): a fresh launch (resume None) has
+        // no transcript and no binding when the user /resume's an older
+        // session; the older session's sticky rebound mode (Unverified at
+        // EOF) is applied on that FIRST bind instead of byte-0 Fresh.
+        let mut binding = LaunchModeBinding::Unbound;
+        let mode = epoch_mode(
+            &mut binding,
+            None,
+            Some(rebound_session(ResumeMode::Unverified)),
+            &detected_claude(7, Some(LATE_STARTER)),
         );
         assert_eq!(mode, ResumeMode::Unverified);
         assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Unverified));
@@ -2954,23 +3110,11 @@ mod tests {
     }
 
     #[test]
-    fn a_rebound_on_the_very_first_sighting_uses_the_rebound_mode() {
-        let mut binding = LaunchModeBinding::Unbound;
-        let mode = epoch_mode(
-            &mut binding,
-            Some(boundary_mode()),
-            Some(ResumeMode::Unverified),
-            &detected_claude(7, Some(LATE_STARTER)),
-        );
-        assert_eq!(mode, ResumeMode::Unverified);
-        assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Unverified));
-    }
-
-    #[test]
-    fn a_login_shell_uses_detected_provenance_or_the_rebound_mode_without_binding() {
+    fn a_login_shell_uses_detected_provenance_or_the_sticky_mode_without_binding() {
         let mut binding = LaunchModeBinding::Unbound;
         let mut found = detected_claude(7, Some(CORRECT));
         found.resume = true;
+        // No hook report yet: argv provenance.
         assert_eq!(
             epoch_mode(&mut binding, None, None, &found),
             ResumeMode::Unverified
@@ -2981,11 +3125,29 @@ mod tests {
             epoch_mode(&mut binding, None, None, &found),
             ResumeMode::Fresh
         );
-        // A login-shell rebind is bounded from the rebound transcript too.
+        // The launched session's own first report binds without Dead.
+        let mut binding = LaunchModeBinding::Unbound;
         assert_eq!(
-            epoch_mode(&mut binding, None, Some(ResumeMode::Unverified), &found),
+            epoch_mode(
+                &mut binding,
+                None,
+                Some(own_session(ResumeMode::Fresh)),
+                &found
+            ),
+            ResumeMode::Fresh
+        );
+        assert_eq!(binding, LaunchModeBinding::Bound(7, CORRECT.to_owned()));
+        // A later login-shell rebind is bounded from the rebound transcript.
+        assert_eq!(
+            epoch_mode(
+                &mut binding,
+                None,
+                Some(rebound_session(ResumeMode::Unverified)),
+                &found
+            ),
             ResumeMode::Unverified
         );
+        assert_eq!(binding, LaunchModeBinding::Dead(ResumeMode::Unverified));
     }
     // ----- items 1/2/5/6/7: the production promotion pump ------------------
 
@@ -3262,6 +3424,13 @@ mod tests {
             Some("dddddddd-2222-4333-8444-eeeeeeeeeeee")
         );
         assert!(is_resume);
+        // The production decision, built from the Detected the real detector
+        // produces on that argv: exec-keeps-pid can never be time-verified.
+        let found = Detected {
+            resume: is_resume,
+            ..detected_claude(7, session_id.as_deref())
+        };
+        assert_eq!(shell_resume_mode(&found), ResumeMode::Unverified);
         assert_unverified_pump_gates_history(
             &assistant_line(Some("high"), 1),
             &assistant_line(Some("max"), 2),
@@ -3270,20 +3439,46 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn item2_a_backward_clock_step_cannot_verify_a_resume_from_timestamps() {
-        // The history record claims a timestamp in the FUTURE relative to the
-        // process start — a backward clock step makes wall-clock reasoning
-        // lie. Timestamps alone never verify: the record stays gated history.
-        let tmp = tempfile::tempdir().expect("tmp");
-        let mut fx = pump_fixture(tmp.path(), "{}\n");
-        let mut hydrator = open_hydrator(&fx, ResumeMode::Unverified, None);
-        append_line(&fx.binding.path, &assistant_line(Some("high"), 1));
-        pump_once(&mut hydrator, &fx).await;
+    #[test]
+    fn item7_no_timestamp_or_pid_path_can_ever_produce_a_verified_resume() {
+        // r6 item 7: with at_process_start/process_started_at deleted, the
+        // ONLY way to a verified Boundary is a pre-exec EOF snapshot. Every
+        // argv-derived resume (uuid, latest, bare flag, --continue/-c) is
+        // Unverified through the production detector — a clock step has no
+        // code path it could influence.
+        for argv in [
+            "claude --resume dddddddd-2222-4333-8444-eeeeeeeeeeee",
+            "claude --resume latest",
+            "claude --resume",
+            "claude -r",
+            "claude --continue",
+            "claude -c",
+        ] {
+            let (_, is_resume) = crate::promote::resume_provenance(argv);
+            assert!(is_resume, "{argv} parses as a resume");
+            let rows = crate::promote::ProcessRow {
+                pid: 7,
+                args: argv.to_owned(),
+            };
+            let detected = crate::promote::detect(std::slice::from_ref(&rows), None)
+                .unwrap_or_else(|| panic!("{argv} detects as claude"));
+            assert_eq!(
+                shell_resume_mode(&detected),
+                ResumeMode::Unverified,
+                "{argv} must never be time-verified"
+            );
+        }
+        // The exec-via-node form only resolves with its LaunchAlias; its
+        // argv parser still sees the value-less resume.
+        let (_, is_resume) =
+            crate::promote::resume_provenance("node /opt/claude --continue fix the build");
         assert!(
-            effort_rows(&drain(&mut fx)).is_empty(),
-            "a future-timestamped history effort record never sets the gate"
+            is_resume,
+            "exec continue parses without consuming the prompt"
         );
+        // A non-resume argv stays Fresh (the only Fresh production path).
+        let (_, is_resume) = crate::promote::resume_provenance("claude");
+        assert!(!is_resume);
     }
 
     #[tokio::test]
@@ -3522,15 +3717,51 @@ mod tests {
         }
     }
 
-    /// r5 item 2(a): a FRESH launch argv that in-TUI `/resume <older-id>`
-    /// rebounds onto a transcript full of history. The rebound mode is taken
-    /// from the rebound session's OWN snapshot (Unverified at EOF), never from
-    /// the launch argv (Fresh/byte 0). The old records do not publish, and a
-    /// switch whose word matches a replayed slash+verdict never settles.
+    /// Unit: the SessionModeTable records one mode per (pid, session) at its
+    /// first SessionStart — launch session keeps the pre-spawn mode, later
+    /// sessions are rebounds, and the transcript presence at that instant
+    /// decides Fresh vs Unverified.
+    #[test]
+    fn session_mode_table_records_own_then_rebound_modes_once() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let older = slug_session(dir.path(), &cwd, LATE_STARTER, "{\"old\":true}\n");
+        let newer = slug_session(dir.path(), &cwd, BUSY_OTHER, "");
+        let mut table = SessionModeTable::default();
+        let pre = Some(ResumeMode::Unverified);
+        // First report for the pid = the launched session: keeps the
+        // pre-spawn mode, rebound=false.
+        let first = table.record(7, CORRECT, None, pre);
+        assert!(!first.rebound);
+        assert_eq!(first.mode, ResumeMode::Unverified);
+        // Idempotent: a repeat report cannot flip it.
+        assert_eq!(table.record(7, CORRECT, Some(&older), pre), first);
+        // A later /resume session with an existing transcript: Unverified
+        // EOF, rebound=true.
+        let rebound = table.record(7, LATE_STARTER, Some(&older), pre);
+        assert!(rebound.rebound);
+        assert!(
+            matches!(rebound.mode, ResumeMode::Boundary(b) if !b.verified),
+            "existing transcript -> unverified anchor: {:?}",
+            rebound.mode
+        );
+        // A later /clear session whose file is EMPTY at the report: Fresh.
+        let clear = table.record(7, BUSY_OTHER, Some(&newer), pre);
+        assert!(clear.rebound);
+        assert_eq!(clear.mode, ResumeMode::Fresh);
+        // Lookup.
+        assert!(table.mode_for(7, LATE_STARTER).is_some());
+        assert!(table.mode_for(8, LATE_STARTER).is_none());
+    }
+
+    /// r6 item 3 (the lazy-create case): a fresh launch has no transcript and
+    /// no binding yet; the user /resume's an older session before typing. The
+    /// session recorded SECOND for the pid is an unverified rebound: the older
+    /// history never replays as current and its old slash/verdict cannot
+    /// settle an armed switch.
     #[tokio::test]
-    async fn item2a_fresh_argv_rebound_onto_history_is_unverified_not_byte_zero() {
-        // The rebound transcript already carries the older session's effort
-        // history: a high assistant record and a complete slash→verdict max.
+    async fn item3_rebind_before_any_binding_is_unverified_via_the_hook_table() {
         let history = format!(
             "{}{}{}",
             assistant_line(Some("high"), 1),
@@ -3539,23 +3770,16 @@ mod tests {
         );
         let dir = tempfile::tempdir().expect("tmp");
         let mut fx = pump_fixture(dir.path(), &history);
-        // Simulate the authenticated rebind: the mode derives from the bound
-        // transcript at the rebind instant, not from the (fresh) launch argv.
-        let mode = crate::claude_transcript::ResumeMode::rebound_mode(&fx.binding.path);
-        assert!(
-            matches!(mode, crate::claude_transcript::ResumeMode::Boundary(b) if !b.verified),
-            "a history-bearing rebound is unverified-EOF, got {mode:?}"
-        );
+        // The poller's hook block: first SessionStart is the launched (new,
+        // transcript-less) session; the SECOND is the in-TUI /resume target.
+        let mut table = SessionModeTable::default();
+        let _launched = table.record(7, BUSY_OTHER, None, None);
+        let rebound = table.record(7, PUMP_SESSION, Some(&fx.binding.path), None);
+        assert!(rebound.rebound, "the bound session is a rebound");
         let bridge = std::sync::Arc::new(crate::effort::EffortBridge::new());
-        let mut hydrator = open_hydrator(&fx, mode, Some(&bridge));
-        // First poll: zero history replays (it would publish high/applied as
-        // current under the old Fresh/byte-0 behaviour).
+        let mut hydrator = open_hydrator(&fx, rebound.mode, Some(&bridge));
         pump_once(&mut hydrator, &fx).await;
-        assert!(drain(&mut fx).is_empty(), "no history replays on rebind");
-
-        // A Remuda-armed switch must not be settled by the rebound session's
-        // old (already-on-disk, but here simply not in-window) verdict nor by
-        // anything appended while the epoch is unverified.
+        assert!(drain(&mut fx).is_empty(), "no history replays as current");
         let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
         append_line(
             &fx.binding.path,
@@ -3566,48 +3790,37 @@ mod tests {
             ),
         );
         pump_once(&mut hydrator, &fx).await;
-        let observations = drain(&mut fx);
-        assert!(
-            effort_rows(&observations).is_empty(),
-            "the rebound epoch never opens the gate: {observations:?}"
-        );
+        assert!(effort_rows(&drain(&mut fx)).is_empty(), "gate stays closed");
         assert!(bridge.has_pending());
         assert!(
             bridge
                 .wait(generation, std::time::Duration::from_millis(150))
                 .await
                 .is_none(),
-            "a replayed/rebound verdict must not resolve Applied"
+            "replayed verdict must not settle Applied"
         );
-        // Conversation after the anchor still hydrates.
-        append_line(&fx.binding.path, &user_line(6, "question after rebind"));
+        append_line(&fx.binding.path, &user_line(6, "after rebind"));
         pump_once(&mut hydrator, &fx).await;
-        assert!(conversation_hydrated(
-            &drain(&mut fx),
-            "question after rebind"
-        ));
+        assert!(conversation_hydrated(&drain(&mut fx), "after rebind"));
     }
 
-    /// r5 item 2(b): a `--resume` launch followed by `/clear` rebounds onto a
-    /// brand-new (empty/absent) transcript. That new session is FRESH from its
-    /// own snapshot, not permanently Unverified from the launch — its own
-    /// later records are current and switch read-backs can settle.
+    /// r6 item 4: `/clear` reports a SessionStart while the new transcript is
+    /// ABSENT (lazy creation); the mode is Fresh. The file only APPEARS later,
+    /// already carrying the new session's first records — they are read from
+    /// byte 0 as Current and settle switches (the empty-file hand fixture in
+    /// r5 never exercised this production path).
     #[tokio::test]
-    async fn item2b_clear_rebound_is_fresh_and_its_new_records_are_current() {
+    async fn item4_clear_session_report_before_its_file_exists_is_fresh() {
         let dir = tempfile::tempdir().expect("tmp");
-        let mut fx = pump_fixture(dir.path(), "{}\n");
-        // `/clear` lands on an EMPTY new transcript: Fresh regardless of the
-        // original --resume launch mode.
-        std::fs::write(&fx.binding.path, "").expect("empty new session file");
-        let mode = crate::claude_transcript::ResumeMode::rebound_mode(&fx.binding.path);
-        assert_eq!(mode, crate::claude_transcript::ResumeMode::Fresh);
-        let bridge = std::sync::Arc::new(crate::effort::EffortBridge::new());
-        let mut hydrator = open_hydrator(&fx, mode, Some(&bridge));
-        pump_once(&mut hydrator, &fx).await;
-        assert!(drain(&mut fx).is_empty());
-        // The NEW session arms max and its own verdict lands: Fresh/Current,
-        // so the read-back opens the gate and settles the switch.
-        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        let mut fx = pump_fixture(dir.path(), "");
+        std::fs::remove_file(&fx.binding.path).expect("file does not exist at SessionStart");
+        let mut table = SessionModeTable::default();
+        // First report is the launched session; the second (same pid, new
+        // session id) is /clear, recorded while its file is absent.
+        let _launched = table.record(7, BUSY_OTHER, None, None);
+        let clear = table.record(7, PUMP_SESSION, Some(&fx.binding.path), None);
+        assert_eq!(clear.mode, ResumeMode::Fresh);
+        // The file then appears WITH content (Claude created it lazily).
         append_line(
             &fx.binding.path,
             &format!(
@@ -3617,19 +3830,54 @@ mod tests {
                 assistant_line(Some("max"), 3),
             ),
         );
+        let bridge = std::sync::Arc::new(crate::effort::EffortBridge::new());
+        let mut hydrator = open_hydrator(&fx, clear.mode, Some(&bridge));
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
         pump_once(&mut hydrator, &fx).await;
         let observations = drain(&mut fx);
         assert_eq!(
             effort_rows(&observations),
             vec![(Some(remuda_protocol::EffortName::Max), None)],
-            "the new session's own records are current: {observations:?}"
+            "records created after the absent-file report are current: {observations:?}"
         );
         assert!(
             bridge
                 .wait(generation, std::time::Duration::from_millis(150))
                 .await
                 .is_some(),
-            "the new session's verdict settles the switch"
+            "the new session settles its own switch"
+        );
+    }
+
+    /// r6 item 5: an unverified anchor captured at the SessionStart instant is
+    /// used AS-IS — records appended between that instant and the first pump
+    /// are read from the anchor and hydrated (Unverified), not skipped by a
+    /// second EOF snapshot.
+    #[tokio::test]
+    async fn item5_records_between_report_and_first_poll_hydrate_unverified() {
+        let history = "{\"before\":true}\n";
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), history);
+        // Capture the unverified boundary at THIS instant (EOF after history).
+        let anchor = crate::claude_transcript::ResumeBoundary::unverified_eof(&fx.binding.path)
+            .expect("anchor");
+        let anchored = crate::claude_transcript::ResumeMode::Boundary(anchor);
+        // A record arrives BEFORE the hydrator first polls (the promotion loop
+        // awaits between detection and maintain_binding).
+        append_line(
+            &fx.binding.path,
+            &user_line(1, "between report and first poll"),
+        );
+        let mut hydrator = open_hydrator(&fx, anchored, None);
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(
+            effort_rows(&observations).is_empty(),
+            "unverified records never open the gate"
+        );
+        assert!(
+            conversation_hydrated(&observations, "between report and first poll"),
+            "the between-instant record hydrates instead of being skipped: {observations:?}"
         );
     }
 }

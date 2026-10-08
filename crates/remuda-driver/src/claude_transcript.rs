@@ -780,13 +780,22 @@ impl ResumeMode {
     /// not exist yet returns `None` so the pump retries next tick (never a live
     /// byte-0 tail).
     #[must_use]
+    /// Open the tail for a bound transcript `path`.
+    ///
+    /// A captured unverified [`ResumeBoundary`] (r6 item 5) is used AS-IS: its
+    /// anchor start and head were measured at the SessionStart/detection
+    /// instant, so records appended between that instant and the first poll
+    /// are read from the anchor (Unverified) instead of being skipped by a
+    /// second EOF snapshot. A bare [`ResumeMode::Unverified`] (no captured
+    /// boundary) snapshots the current EOF now; if the file is still absent
+    /// the hydrator stays unbound and retries next tick (never byte 0).
     pub fn open_tail(&self, path: &Path) -> Option<TranscriptTail> {
         match self {
             ResumeMode::Fresh => Some(TranscriptTail::new(path.to_path_buf())),
-            ResumeMode::Boundary(boundary) if boundary.verified => {
+            ResumeMode::Boundary(boundary) => {
                 Some(TranscriptTail::resumed(path.to_path_buf(), *boundary))
             }
-            ResumeMode::Boundary(_) | ResumeMode::Unverified => {
+            ResumeMode::Unverified => {
                 let boundary = ResumeBoundary::unverified_eof(path)?;
                 Some(TranscriptTail::resumed(path.to_path_buf(), boundary))
             }
@@ -887,14 +896,16 @@ impl TranscriptTail {
 
         // A resume tail keeps the boundary honest.
         if let Some(state) = self.resume.as_mut() {
-            // An unverified resume (resume known, boundary never proven) reports
-            // every batch Unverified for the whole epoch, even with no shrink.
-            // A shrink/replacement/head-rewrite also invalidates a previously
-            // verified resume. Displacement is sticky but no longer tears down
-            // the hydrator.
+            // r6 item 5: being UNVERIFIED is NOT displacement. The captured
+            // boundary (anchor start + head fingerprint, possibly an
+            // unverified EOF from the SessionStart instant) is trusted as a
+            // position; bytes appended between capture and the first poll are
+            // read from the anchor and reported Unverified — they hydrate.
+            // Only an actual change to the tracked file displaces: a rewritten
+            // head, a different identity, or a shrink below the cursor.
             let identity = FileIdentity::from_metadata(&metadata);
             let head_intact = match state.head {
-                Some(probe) if !state.displaced => {
+                Some(probe) => {
                     use std::io::{Read, Seek, SeekFrom};
                     let mut buf = vec![0_u8; probe.len as usize];
                     file.seek(SeekFrom::Start(0))
@@ -902,20 +913,15 @@ impl TranscriptTail {
                         .and_then(|_| file.read_exact(&mut buf).ok())
                         .is_some_and(|()| fingerprint_bytes(&buf, probe.len) == probe)
                 }
-                _ => true,
+                None => true,
             };
-            if !state.displaced
-                && (!state.verified
-                    || !head_intact
-                    || identity != state.identity
-                    || len < self.offset)
+            if !state.displaced && (!head_intact || identity != state.identity || len < self.offset)
             {
-                // Boundary lost. Re-anchor at the present EOF so a recreated
-                // file's bytes are not replayed; from here appends hydrate
-                // conversation only. Adopt the replacement's identity/head so
-                // a later append is read as an append rather than as yet
-                // another replacement (the head is now shorter than the old
-                // probe after a shrink).
+                // Boundary genuinely lost. Re-anchor at the present EOF so a
+                // recreated file's bytes are not replayed; from here appends
+                // hydrate conversation only. Adopt the replacement's
+                // identity/head so a later append is read as an append rather
+                // than as yet another replacement.
                 state.displaced = true;
                 state.identity = identity;
                 state.head = hash_head(&self.path, len);

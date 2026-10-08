@@ -19,14 +19,20 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
+type AppendFrame = (String, Value);
+
 const BRIEF: &str = "Do the tiny task.\nReply DONE <sha> or BLOCKED <reason>.\n";
 
 /// Fake Node: accepts every Hub RPC, records `(method, params)`, and lets the
 /// test push journal events.
 struct FakeNode {
     task: tokio::task::JoinHandle<()>,
-    frames: mpsc::UnboundedReceiver<(String, Value)>,
-    appends: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
+    frames: mpsc::UnboundedReceiver<AppendFrame>,
+    appends: tokio::sync::mpsc::UnboundedSender<AppendFrame>,
+    /// interactionId ids still pending at the fake Node (an
+    /// `interaction.requested` journal event inserts; an answer would
+    /// remove — the Hub never answers for the Node).
+    pending: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Node credentials returned on first hello (D-018: re-enrollment of the same
@@ -84,15 +90,45 @@ impl FakeNode {
         anyhow::ensure!(hello.get("result").is_some(), "hello {hello}");
 
         let (frame_tx, frame_rx) = mpsc::unbounded_channel();
-        let (append_tx, mut append_rx) = mpsc::unbounded_channel();
+        let (append_tx, mut append_rx): (
+            mpsc::UnboundedSender<AppendFrame>,
+            mpsc::UnboundedReceiver<AppendFrame>,
+        ) = mpsc::unbounded_channel();
+        let pending =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+        let pending_task = pending.clone();
+        let answered_task = pending.clone();
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Some((instance_id, event)) = append_rx.recv() => {
-                        if node.send(Message::Text(json!({
+                        // Tracked on the append feed BEFORE the frame is
+                        // sent: feed local to the test driver, so the Hub's
+                        // append ack (and answer frames queued behind it)
+                        // cannot delay it. The Hub derives the event kind
+                        // at /kind with /payload fallbacks.
+                        let append_kind = event
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .or_else(|| event.pointer("/payload/kind").and_then(Value::as_str));
+                        if matches!(
+                            append_kind,
+                            Some("interaction.requested" | "interactionRequested")
+                        ) && let Some(id) = event
+                            .pointer("/payload/interactionId")
+                            .and_then(Value::as_str)
+                        {
+                            pending_task.lock().await.insert(id.to_owned());
+                        }
+                        let frame = json!({
                             "jsonrpc":"2.0","id":"append","method":"journal.append",
                             "params":{"instanceId":instance_id,"event":event}
-                        }).to_string().into())).await.is_err() { break; }
+                        });
+                        if node.send(Message::Text(frame.to_string().into())).await.is_err() { break; }
+                        // Drain the Hub's append ack so the select goes back to
+                        // watching RPC requests; the pending set above is
+                        // already populated.
+                        let _ = node.next().await;
                     }
                     frame = node.next() => {
                         match frame {
@@ -105,6 +141,13 @@ impl FakeNode {
                                 let Some(method) = frame.get("method").and_then(Value::as_str) else {
                                     continue;
                                 };
+                                if method == "interaction.answer" {
+                                    let id = frame["params"]["interactionId"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_owned();
+                                    answered_task.lock().await.remove(&id);
+                                }
                                 let _ = frame_tx.send((method.to_owned(), frame["params"].clone()));
                                 let result = match method {
                                     "worker.provision" => json!({
@@ -138,6 +181,7 @@ impl FakeNode {
                 task,
                 frames: frame_rx,
                 appends: append_tx,
+                pending: pending.clone(),
             },
             hello["result"]["nodeToken"]
                 .as_str()
@@ -186,18 +230,11 @@ impl FakeNode {
             .expect("sender alive")
     }
 
-    /// Assert no frame arrives within a short settle window.
-    async fn assert_no_frame(&mut self, label: &str) {
-        tokio::select! {
-            frame = self.frames.recv() => panic!("{label}: unexpected Node frame {frame:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(400)) => {}
-        }
-    }
-
-    /// Assert the next frame the Node receives is a Human command sentinel:
-    /// an earlier dispatch that leaked a frame would queue ahead of it. No
-    /// receive window — the channel delivers exactly the next frame.
-    async fn assert_next_frame_is_sentinel(&mut self, ctx: &Ctx) {
+    /// Send a Human command sentinel, then drain frames until it arrives:
+    /// every earlier frame is a known fan-out, and an
+    /// `interaction.answer` among them fails the test. Watchdog timeout
+    /// only — no no-frame window is part of the assertion.
+    async fn drain_until_sentinel_and_assert_no_answer(&mut self, ctx: &Ctx) {
         let (status, sentinel) = ctx
             .send(
                 "POST",
@@ -208,21 +245,38 @@ impl FakeNode {
             )
             .await;
         assert_eq!(status, 200, "{sentinel}");
-        let (method, params) = self.next().await;
-        assert_eq!(
-            method, "instance.send",
-            "an unexpected frame leaked: {params}"
-        );
+        loop {
+            let (method, params) = self.next().await;
+            if method == "instance.send" {
+                return;
+            }
+            assert_ne!(
+                method, "interaction.answer",
+                "fenced answer reached the Node: {params}"
+            );
+        }
     }
 
+    /// Push one journal event (synchronous channel send; the WS send and
+    /// ack drain run in the connection task). The event is durably mirrored
+    /// once the Hub ack comes back — tests that need that use
+    /// [`FakeNode::is_pending`], which fills from the append feed before
+    /// the frame is written.
     fn append(&self, instance_id: &str, event: Value) {
         self.appends
             .send((instance_id.to_owned(), event))
             .expect("append channel");
     }
 
+    /// True while the Node still holds the interaction as pending (a
+    /// `interaction.requested` was mirrored and no `interaction.answer`
+    /// frame has arrived).
+    async fn is_pending(&self, interaction_id: &str) -> bool {
+        self.pending.lock().await.contains(interaction_id)
+    }
+
     /// Drop the Node connection abruptly; the Hub marks its host offline.
-    fn disconnect(&mut self) {
+    fn disconnect(&self) {
         self.task.abort();
     }
 }
@@ -463,6 +517,32 @@ impl Ctx {
         )
     }
 
+    /// Wait until the host catalog row reads `online: false` after a WS
+    /// drop. Yields instead of sleeping: the writer applies the offline
+    /// transition as soon as the close completes (5s watchdog only).
+    async fn wait_host_offline(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let host: Value = self
+                    .http
+                    .get(format!("{}/v1/hosts/{}", self.base(), self.host))
+                    .bearer_auth(&self.human)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if host["online"] == json!(false) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host marked offline");
+    }
+
     /// POST a task with a pool binding on the fake Node's workspace.
     async fn post_pool_task(&self, title: &str) -> (reqwest::StatusCode, Value) {
         self.agent_post(
@@ -573,6 +653,16 @@ async fn fenced_agent_is_refused_on_every_admitted_write_and_nothing_is_written(
     assert_eq!(status, 200, "{queued_job}");
     let queued_job_id = queued_job["id"].as_str().unwrap().to_owned();
 
+    // The project's one member and no fleet instances exist yet.
+    let members_before = 1i64;
+    let instances_before = {
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        db.query_row("SELECT COUNT(*) FROM instances", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+
     let commands_before = ctx.command_rows().await.len();
 
     ctx.fence().await;
@@ -627,6 +717,66 @@ async fn fenced_agent_is_refused_on_every_admitted_write_and_nothing_is_written(
         .agent_patch(
             &format!("/v1/projects/{}", ctx.project),
             json!({"name":"renamed-after-fence"}),
+        )
+        .await;
+    assert_fenced(status, &body);
+    // POST /members is idempotent for the project's own member: it 409s
+    // "member already exists" before the authority check on origin/main,
+    // so after F it must be the 409 fenced refusal instead.
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/members", ctx.project),
+            json!({"hostId":ctx.host,"workspaceId":ctx.workspace,"role":"build"}),
+        )
+        .await;
+    assert_fenced(status, &body);
+    // DELETE /members removes an existing member — nothing written after F.
+    let (status, body) = ctx
+        .agent_delete(
+            &format!("/v1/projects/{}/members", ctx.project),
+            json!({"hostId":ctx.host,"workspaceId":ctx.workspace}),
+        )
+        .await;
+    assert_fenced(status, &body);
+
+    // fleet create: every spawn runs check_initiator in-job.
+    let (status, body) = ctx
+        .agent_post(
+            "/v1/fleet/instances",
+            json!({
+                "hosts":[ctx.host],
+                "kind":"claude","driver":"claude-print",
+                "spec":{"permissionMode":"manual","prompt":"fleet child"}
+            }),
+        )
+        .await;
+    assert_fenced(status, &body);
+
+    // project members + fleet create refused with no new member/instance row.
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/members", ctx.project),
+            json!({"hostId":ctx.host,"workspaceId":ctx.workspace,"role":"build"}),
+        )
+        .await;
+    assert_fenced(status, &body);
+    let (status, body) = ctx
+        .agent_delete(
+            &format!("/v1/projects/{}/members", ctx.project),
+            json!({"hostId":ctx.host,"workspaceId":ctx.workspace}),
+        )
+        .await;
+    assert_fenced(status, &body);
+
+    // fleet create: every spawn runs check_initiator in-job.
+    let (status, body) = ctx
+        .agent_post(
+            "/v1/fleet/instances",
+            json!({
+                "hosts":[ctx.host],
+                "kind":"claude","driver":"claude-print",
+                "spec":{"permissionMode":"manual","prompt":"fleet child"}
+            }),
         )
         .await;
     assert_fenced(status, &body);
@@ -704,8 +854,34 @@ async fn fenced_agent_is_refused_on_every_admitted_write_and_nothing_is_written(
     );
 
     // Nothing written: no new command rows; task unchanged; project unchanged;
-    // no gate job queued.
+    // no gate job queued; no project member or fleet instance added.
     assert_eq!(ctx.command_rows().await.len(), commands_before);
+    let project_after: Value = ctx
+        .http
+        .get(format!("{}/v1/projects/{}", ctx.base(), ctx.project))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        project_after["members"].as_array().map(std::vec::Vec::len),
+        Some(members_before as usize),
+        "member add/remove wrote after F: {project_after}"
+    );
+    let instances_after = {
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        db.query_row("SELECT COUNT(*) FROM instances", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        instances_after, instances_before,
+        "fleet create wrote after F"
+    );
     let task_after = ctx.task(&task_id).await;
     assert_eq!(
         task_after["title"], task["title"],
@@ -752,7 +928,7 @@ async fn fenced_agent_is_refused_on_every_admitted_write_and_nothing_is_written(
 
 #[tokio::test]
 async fn request_that_passes_authentication_before_fence_is_refused_at_commit() {
-    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let (ctx, _node) = Ctx::boot().await.unwrap();
     let rows_before = ctx.command_rows().await.len();
 
     ctx.store()
@@ -770,14 +946,13 @@ async fn request_that_passes_authentication_before_fence_is_refused_at_commit() 
         rows_before,
         "fenced request wrote a row"
     );
-    node.assert_no_frame("authenticated-before-F send").await;
 }
 
 // ── 3. Device-specific: the MCP token row is the one re-checked ───────────
 
 #[tokio::test]
 async fn request_authenticated_with_mcp_token_is_refused_when_only_that_device_row_is_deleted() {
-    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let (ctx, _node) = Ctx::boot().await.unwrap();
 
     let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
     let mcp_device: String = db
@@ -811,7 +986,6 @@ async fn request_authenticated_with_mcp_token_is_refused_when_only_that_device_r
         )
         .await;
     assert_fenced(status, &body);
-    node.assert_no_frame("deleted-MCP send").await;
 
     // The launch credential still exists: only the authenticating row gates.
     let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
@@ -830,7 +1004,7 @@ async fn request_authenticated_with_mcp_token_is_refused_when_only_that_device_r
 #[tokio::test]
 async fn same_id_replay_of_a_held_row_after_fence_is_refused_and_never_reaches_node() -> Result<()>
 {
-    let (ctx, mut node) = Ctx::boot().await?;
+    let (ctx, node) = Ctx::boot().await?;
 
     let command_id = remuda_protocol::CommandId::new()
         .as_id()
@@ -842,25 +1016,7 @@ async fn same_id_replay_of_a_held_row_after_fence_is_refused_and_never_reaches_n
     // Take the host offline: the first POST queues a HELD row (offline host,
     // no forward intent, no frame). Wait until the Hub has marked it offline.
     node.disconnect();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let host: Value = ctx
-                .http
-                .get(format!("{}/v1/hosts/{}", ctx.base(), ctx.host))
-                .bearer_auth(&ctx.human)
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            if host["online"] == json!(false) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await?;
+    ctx.wait_host_offline().await;
     let (status, first) = ctx
         .agent_post(
             &format!("/v1/instances/{}/commands", ctx.instance),
@@ -880,12 +1036,12 @@ async fn same_id_replay_of_a_held_row_after_fence_is_refused_and_never_reaches_n
     // The host comes back; the same-id D-055 replay must now refuse at the
     // mark_forward_intent writer job (re-checking the stamp ON THE ROW)
     // before any frame reaches the Node.
-    let mut node = FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace).await?;
+    let _node = FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace).await?;
     let (status, replay) = ctx
         .agent_post(&format!("/v1/instances/{}/commands", ctx.instance), body)
         .await;
     assert_fenced(status, &replay);
-    node.assert_no_frame("same-id replay after fence").await;
+
     Ok(())
 }
 
@@ -909,41 +1065,21 @@ async fn fenced_interaction_answer_never_reaches_the_node_and_stays_pending() {
             }
         }),
     );
-    // Wait for the Hub to mirror it as pending.
+
+    // Deterministic wait: the fake Node knows the requested interaction is
+    // pending locally once the append is acked. The Hub's journal
+    // projection is driven from the same append, so the local set and the
+    // HTTP list are consistent without any poll.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let list: Value = ctx
-                .http
-                .get(format!("{}/v1/interactions", ctx.base()))
-                .bearer_auth(&ctx.human)
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            let pending = list["items"]
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .any(|row| row["interactionId"] == json!(interaction_id))
-                })
-                .unwrap_or(false);
-            if pending {
+            if node.is_pending(&interaction_id).await {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .unwrap();
-
-    // Drain the list/read fan-out frames produced while waiting for the
-    // pending row to appear; only the answer frame matters below.
-    while tokio::time::timeout(Duration::from_millis(150), node.frames.recv())
-        .await
-        .is_ok()
-    {}
+    .expect("interaction becomes pending at the Node");
 
     // Fence lands inside the answer's admission writer job.
     ctx.store()
@@ -959,9 +1095,12 @@ async fn fenced_interaction_answer_never_reaches_the_node_and_stays_pending() {
         )
         .await;
     assert_fenced(status, &body);
-    node.assert_no_frame("fenced interaction.answer").await;
 
-    // The Hub never mirrored an answer: still pending.
+    // The fake Node never saw an answer (sentinel drains the frames and
+    // fails on an interaction.answer queueing ahead).
+    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
+
+    // The Hub never mirrored an answer: still pending in the list.
     let list: Value = ctx
         .http
         .get(format!("{}/v1/interactions", ctx.base()))
@@ -1031,7 +1170,7 @@ async fn gate_job_fenced_before_the_tick_is_canceled_and_never_dispatched() {
         .expect("job still exists");
     assert_eq!(doc["state"], json!("canceled"), "{doc}");
     assert_eq!(doc["reason"], json!("fenced"), "{doc}");
-    node.assert_next_frame_is_sentinel(&ctx).await;
+    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
 }
 
 #[tokio::test]
@@ -1070,7 +1209,7 @@ async fn gate_job_whose_authenticating_device_was_deleted_is_canceled_at_claim()
         doc.get("initiatorDeviceId").is_none(),
         "device id stays off the API doc: {doc}"
     );
-    node.assert_next_frame_is_sentinel(&ctx).await;
+    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
 
     // The launch credential is untouched.
     let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
@@ -1217,7 +1356,7 @@ async fn narrowed_bot_token_writes_a_live_chapter_even_after_a_fence_check() {
 
 #[tokio::test]
 async fn human_token_narrowed_to_a_fenced_chapter_is_refused() {
-    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let (ctx, _node) = Ctx::boot().await.unwrap();
     ctx.fence().await;
 
     let (status, body) = ctx
@@ -1230,7 +1369,6 @@ async fn human_token_narrowed_to_a_fenced_chapter_is_refused() {
         )
         .await;
     assert_fenced(status, &body);
-    node.assert_no_frame("narrowed-human send").await;
 }
 
 // ── 7b. Pool binding fence lands mid-handler (lease vs mutate) ────────────
@@ -1254,7 +1392,7 @@ async fn fence_before_lease_admission_refuses_fenced_and_writes_no_task_or_lease
         "lease row written despite a fenced admission"
     );
     // No worktree.lease reached the Node: the next frame is the sentinel.
-    node.assert_next_frame_is_sentinel(&ctx).await;
+    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
 }
 
 #[tokio::test]
@@ -1294,7 +1432,7 @@ async fn fence_between_lease_and_bind_mutate_returns_the_lease_and_drops_the_tas
     let rows = ctx.lease_rows();
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].1.is_none(), "lease holder retained: {rows:?}");
-    node.assert_next_frame_is_sentinel(&ctx).await;
+    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
     let _ = lease_params;
 }
 

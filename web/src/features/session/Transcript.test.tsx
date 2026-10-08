@@ -1477,6 +1477,8 @@ describe("font reflow compensator", () => {
     activeScroll = null;
     restoreNative();
     localStorage.clear();
+    // The held-probe test puts ?restoreProbe=1 on the real jsdom location.
+    window.history.replaceState({}, "", "/");
   });
 
   it("item 8: a row above the restored anchor grows -> scrollTop += delta", async () => {
@@ -1488,6 +1490,60 @@ describe("font reflow compensator", () => {
       geo.growById("obj_long_n_2", ROW + 40);
     });
     expect(geo.top(), "compensates for an above-row growth").toBe(before + 40);
+  });
+
+  it("item 3 mid: above-row growth while the held-probe restore is still ARMED is compensated", async () => {
+    // Hold the font (restore stays data-restore-active=1), converge on the
+    // fallback face, then grow an above row exactly like the mid font swap.
+    const geo = installGeo(40);
+    const fakeFonts = {
+      check: () => false,
+      load: async () => [] as FontFace[],
+      ready: Promise.resolve({} as FontFaceSet),
+      status: "loaded" as FontFaceSet["status"],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+      onloading: null,
+      onloadingdone: null,
+      onloadingerror: null,
+    } as unknown as FontFaceSet;
+    Object.defineProperty(document, "fonts", { configurable: true, get: () => fakeFonts });
+    // restoreProbe reads window.location.search (not the in-memory router), so
+    // put the query on the real jsdom location.
+    window.history.replaceState({}, "", "/s/insMid?restoreProbe=1");
+    (window as unknown as { __fontSwapRestoreProbeArmed?: boolean }).__fontSwapRestoreProbeArmed = true;
+    const events = buildLongObservations({
+      instanceId: "insMid" as Id,
+      journalId: "obj_insMid" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    localStorage.setItem(
+      "runtime.reading.v1.insMid",
+      JSON.stringify({ anchorId: "obj_long_n_5", offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insMid?restoreProbe=1"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    // Converge while held: restore stays active but the offset reaches target.
+    for (let i = 0; i < 30; i += 1) {
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        await Promise.resolve();
+      });
+    }
+    const active = screen.getByTestId("transcript-scroller").getAttribute("data-restore-active");
+    expect(active, "the probe keeps the restore armed").toBe("1");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    expect(geo.top(), "an armed mid-restore compensates an above-row growth").toBe(before + 40);
   });
 
   it("item 1: the restored row ITSELF grows -> its own top is held, no scroll jump", async () => {

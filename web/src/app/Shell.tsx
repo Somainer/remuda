@@ -69,6 +69,9 @@ export function shellChrome(pathname: string, mobile: boolean) {
 /** Test seam for the notification surfaces; mirrors `window.__ttyLab`. */
 type NotifyLabHandle = {
   notify: (input: NotifyInput) => string;
+  /** Raise through the legacy `hubStore.toast` bridge so the info strip the
+   *  Shell derives from it is mounted alongside a blocker. */
+  toast: (text: string) => void;
   dismissAllBlocking: () => void;
 };
 
@@ -110,7 +113,11 @@ export function ShellNotify() {
     // c-composerpop r2 item 4: the notification test seam exists only in e2e,
     // behind the explicit addInitScript marker — never in a production session.
     if (!e2eSeamsEnabled()) return;
-    window.__notifyLab = { notify, dismissAllBlocking: notifyStore.dismissAllBlocking };
+    window.__notifyLab = {
+      notify,
+      toast: (text: string) => hubStore.toast(text),
+      dismissAllBlocking: notifyStore.dismissAllBlocking,
+    };
     return () => {
       delete window.__notifyLab;
     };

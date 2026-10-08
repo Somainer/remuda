@@ -168,6 +168,34 @@ export function SessionPage({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [view, backTo, navigate]);
 
+  // c-composerpop r4 item 1: publish the session dock's measured height as a
+  // global custom property so the notify stack can anchor ABOVE the composer
+  // control bar on /s/:id. Shell renders ShellNotify as a sibling of <main>,
+  // so a value set on a SessionPage node would not inherit to the stack; ride
+  // documentElement (its common ancestor) instead, and clear it on unmount so
+  // non-session routes never see a stale dock height.
+  const [dockEl, setDockEl] = useState<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    if (!dockEl) {
+      root.style.removeProperty("--session-dock-h");
+      return;
+    }
+    const publish = () => {
+      root.style.setProperty("--session-dock-h", `${dockEl.offsetHeight}px`);
+    };
+    publish();
+    let observer: ResizeObserver | undefined;
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(publish);
+      observer.observe(dockEl);
+    }
+    return () => {
+      observer?.disconnect();
+      root.style.removeProperty("--session-dock-h");
+    };
+  }, [dockEl]);
+
   const events = hub.events[instanceId] ?? [];
   const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
   const status = instance ? projectStatus(instance) : "unknown";
@@ -721,7 +749,7 @@ export function SessionPage({
           />
         )}
       </div>
-      {resolvedView === "tty" || resolvedView === "events" ? null : <div className={session.dock} data-testid="session-dock">
+      {resolvedView === "tty" || resolvedView === "events" ? null : <div ref={setDockEl} className={session.dock} data-testid="session-dock">
         {/* Zero-flow floating chip row anchored at the dock top: it rests
             just above the composer (over the transcript edge) and never
             shrinks the session body's measured viewport share — visible

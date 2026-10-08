@@ -19,6 +19,7 @@ test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node"
 
 type NotifyLab = {
   notify: (input: { severity?: "info" | "blocking"; subject?: string; stage?: string; reason?: string }) => string;
+  toast: (text: string) => void;
   dismissAllBlocking: () => void;
 };
 
@@ -92,6 +93,48 @@ async function createSession(page: Page, prompt: string): Promise<string> {
 test.beforeEach(async ({ page }) => {
   await login(page);
 });
+
+// The fake Node parks a create-time approval; answering it lets the first turn
+// finish so the composer returns to the idle 发送 (composer-send) control.
+// Same answer shape and durability wait as effort-sync.hub.spec.ts.
+async function clearApprovals(page: Page, instanceId: string) {
+  await page.evaluate(async (id) => {
+    const listPending = async () => {
+      const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
+      return (body.items ?? []).filter(
+        (item: { instanceId?: string; state?: string }) =>
+          item.instanceId === id && item.state === "pending",
+      );
+    };
+    const deadline = Date.now() + 10_000;
+    let mine = await listPending();
+    while (mine.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      mine = await listPending();
+    }
+    for (const item of mine) {
+      const optionId = item.request?.options?.[0]?.id;
+      if (!optionId) continue;
+      await fetch(`/v1/interactions/${item.interactionId ?? item.id}/answer`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          answer: {
+            kind: "approval",
+            optionId,
+            inputDigest: item.request?.inputDigest ?? "",
+          },
+        }),
+      });
+    }
+    let remaining = await listPending();
+    while (remaining.length > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      remaining = await listPending();
+    }
+  }, instanceId);
+}
 
 test.describe("context chip does not close other menus (RC2)", () => {
   test("crossing the context chip keeps the permission menu open and topmost", async ({ page }) => {
@@ -330,14 +373,6 @@ test.describe("overlay z tiers keep the annotation dock under real scrims (r3 it
 
 
 test.describe("notification stack clears the phone home bar at 390 (r2/r3 item 2)", () => {
-  const raiseOne = (page: Page) =>
-    page.evaluate(() => {
-      (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab?.notify({
-        severity: "blocking",
-        subject: "standing one",
-        stage: "standing error",
-      });
-    });
   const clear = (page: Page) =>
     page.evaluate(() => {
       (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab?.dismissAllBlocking();
@@ -385,51 +420,109 @@ test.describe("notification stack clears the phone home bar at 390 (r2/r3 item 2
     await clear(page);
   });
 
-  test("on /s/:id the notice stays at safe-bottom + space-3 and never lifts over the composer dock", async ({ page }) => {
+  // r4 item 1: a legacy hubStore.toast (bridged to the info strip) raised
+  // FIRST, then a standing blocker — the taller stack the fix must keep clear
+  // of the whole session dock.
+  const raiseToastThenBlocker = (page: Page) =>
+    page.evaluate(() => {
+      const lab = (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab;
+      lab?.toast("已保存更改");
+      lab?.notify({ severity: "blocking", subject: "standing one", stage: "standing error" });
+    });
+
+  // The stack's clearance of the viewport bottom must equal the measured
+  // session-dock height plus the 12px gap (the shell pads no bottom safe area;
+  // the dock reaches the band edge). The dock's async strips
+  // (LiveStatusStrip/TaskTrack/notifications) can keep growing for a frame or
+  // two after mount, so poll until the ResizeObserver-published variable has
+  // converged with the laid-out dock AND the browser has placed the stack one
+  // gap above it — a one-shot read can see a stale variable mid-settle.
+  const expectStackClearsDock = async (page: Page) => {
+    await page.waitForFunction(
+      () => {
+        const stack = document.querySelector<HTMLElement>("[data-testid='blocking-errors']")?.parentElement;
+        const docks = document.querySelectorAll<HTMLElement>("[data-testid='session-dock']");
+        const dock = docks[0];
+        if (!stack || docks.length !== 1 || !dock) return false;
+        const bottom = Math.round(window.innerHeight - stack.getBoundingClientRect().bottom);
+        const dockH = Math.round(dock.offsetHeight);
+        const varVal =
+          parseFloat(
+            getComputedStyle(document.documentElement).getPropertyValue("--session-dock-h"),
+          ) || NaN;
+        return dockH > 0 && Math.abs(varVal - dockH) <= 1 && Math.abs(bottom - (dockH + 12)) <= 1;
+      },
+      null,
+      { timeout: 10_000 },
+    );
+  };
+
+  test("390 /s/:id: a blocking notice lifts over the whole dock, so options and send stay real-clickable", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
-    await createSession(page, "composer popover notify session");
-    // PhoneNav is not mounted on /s/*; the shell must not carry the lift
-    // attribute (r3 item 2: a viewport-only media query raised the notice
-    // 56px even on this route). waitForURL resolves on the history update,
-    // before React commits the new route, so wait on the auto-retrying
-    // locator assertion, not a one-shot element read.
+    const id = await createSession(page, "composer popover notify session");
+    // Clear the fake Node's create-time approval so the first turn ends and the
+    // primary returns to idle 发送 (composer-send, not 排队).
+    await clearApprovals(page, id);
+    // PhoneNav is not mounted on /s/* (r3 item 2) and the session layout owns
+    // the lift. waitForURL resolves on the history update before React commits
+    // the route, so assert on the auto-retrying locator, not a one-shot read.
     const shell = page.locator("[data-compact]");
     await expect(shell).not.toHaveAttribute("data-phone-nav", "1");
+    await expect(shell).toHaveAttribute("data-layout", "session");
     await expect(page.getByTestId("composer-input")).toBeVisible();
+    await expect(page.getByTestId("composer-send")).toBeVisible({ timeout: 20_000 });
 
-    await raiseOne(page);
+    // Raise the notice BEFORE touching any composer control (the r4 ordering).
+    await raiseToastThenBlocker(page);
     await expect(page.getByText("standing error")).toBeVisible();
+    await expectStackClearsDock(page);
 
-    // The stack's bottom edge is exactly safe-bottom (0 in headless) +
-    // space-3 (12px) — NOT 56+12.
-    const bottomOffset = await page.evaluate(() => {
-      const stack = document.querySelector<HTMLElement>("[data-testid='blocking-errors']")?.parentElement;
-      return stack ? window.innerHeight - stack.getBoundingClientRect().bottom : NaN;
-    });
-    expect(bottomOffset).toBeCloseTo(12, 0);
+    // A REAL tap on the collapsed options trigger opens the sheet — on the
+    // buggy build the blocker parked over this control and swallowed the tap.
+    await optionsTrigger(page).click({ trial: false });
+    await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("composer-options-sheet")).toHaveCount(0);
 
-    // Hit-test the input's TOP strip: the route-aware anchor leaves the
-    // notice one card-height + 12px from the bottom, which clears the upper
-    // input row; the extra 56px lift on the buggy build raised the card over
-    // exactly that strip (and the input center), parking on the dock.
-    const input = page.getByTestId("composer-input");
-    const box = (await input.boundingBox())!;
-    const point = { x: box.x + box.width / 2, y: box.y + 6 };
-    const probe = await page.evaluate((p) => {
-      const el = document.elementFromPoint(p.x, p.y);
-      const stackEl = document.querySelector<HTMLElement>("[data-testid='blocking-errors']")?.parentElement;
-      const sr = stackEl?.getBoundingClientRect();
-      return {
-        hit: el?.closest("[data-testid='composer-input']") != null,
-        hitTag: (el as HTMLElement | null)?.dataset.testid ?? el?.tagName,
-        stackTop: sr ? Math.round(sr.top) : null,
-        vh: window.innerHeight,
-      };
-    }, point);
-    expect(probe.hit, `top strip hit ${probe.hitTag}; stack top ${probe.stackTop}/${probe.vh}`).toBe(true);
+    // A REAL send: fill and tap the primary button; the instance.send command
+    // must be dispatched (the tap reached composer-send, not the blocker).
+    await page.getByTestId("composer-input").fill("notice up send");
+    const sent = page.waitForRequest(
+      (request) =>
+        request.method() === "POST" &&
+        request.url().endsWith(`/v1/instances/${id}/commands`) &&
+        request.postDataJSON()?.operation === "instance.send",
+      { timeout: 10_000 },
+    );
+    await page.getByTestId("composer-send").click();
+    await sent;
 
     if (process.env.REMUDA_EVIDENCE === "1") {
-      await page.screenshot({ path: "test-results/composerpop-r3-notify-session-390.png", animations: "disabled" });
+      await page.screenshot({ path: "test-results/composerpop-r4-notify-session-390.png", animations: "disabled" });
+    }
+    await clear(page);
+  });
+
+  test("1440 /s/:id: a blocking notice leaves the effort and permission chips real-clickable", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await createSession(page, "composer popover notify chips");
+    await expect(page.getByTestId("composer-input")).toBeVisible();
+
+    // Raise FIRST (toast + blocker), then open each menu — the r4 ordering.
+    await raiseToastThenBlocker(page);
+    await expect(page.getByText("standing error")).toBeVisible();
+    await expectStackClearsDock(page);
+
+    await page.getByTestId("permission-chip").click();
+    await expect(page.getByTestId("permission-menu")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("permission-menu")).toHaveCount(0);
+
+    await page.getByTestId("model-effort-chip").click();
+    await expect(page.getByTestId("effort-slider-panel")).toBeVisible();
+
+    if (process.env.REMUDA_EVIDENCE === "1") {
+      await page.screenshot({ path: "test-results/composerpop-r4-notify-chips-1440.png", animations: "disabled" });
     }
     await clear(page);
   });
@@ -544,7 +637,9 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     await clear(page);
     await page.keyboard.press("Escape");
 
-    // Effort panel overlaps the centered stack: open first, then raise.
+    // Effort panel. r4 item 1 anchors the stack ABOVE the session dock, so the
+    // panel (which pops up over the dock) and the centered stack no longer
+    // overlap by design — open first, then raise.
     await page.getByTestId("model-effort-chip").click();
     const sliderPanel = page.getByTestId("effort-slider-panel");
     await expect(sliderPanel).toBeVisible();
@@ -558,17 +653,35 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     expect(styles!.blockingPointerEvents).toBe("auto");
     expect(styles!.panelZ).toBeGreaterThan(styles!.stackZ);
 
-    // A REAL click in the menu∩stack overlap lands on the panel (not the
-    // standing error) and keeps the panel open.
-    const hit = await inertPoint("effort-slider-panel", true);
-    expect(hit.ok, hit.ok ? "" : hit.reason).toBe(true);
-    if (hit.ok) {
-      await page.mouse.click(hit.x!, hit.y!);
+    // The r4 item-1 lift separates the panel from the stack: with the blocker
+    // raised their rects must NOT intersect (the regression parked the stack
+    // across the chips/menus). Document the separation, then prove the panel is
+    // still fully interactive on its own: a REAL click on its chrome keeps it
+    // open while the standing error is up.
+    const separated = await page.evaluate(() => {
+      const rectOf = (el: Element) => {
+        const r = el.getBoundingClientRect();
+        return { x: r.x, y: r.y, w: r.width, h: r.height };
+      };
+      const panel = document.querySelector("[data-testid='effort-slider-panel']");
+      const blocker = document.querySelector("[data-testid='blocking-errors']");
+      if (!panel || !blocker) return false;
+      const a = rectOf(panel);
+      const b = rectOf(blocker);
+      const overlapX = a.x < b.x + b.w && a.x + a.w > b.x;
+      const overlapY = a.y < b.y + b.h && a.y + a.h > b.y;
+      return !(overlapX && overlapY);
+    });
+    expect(separated).toBe(true);
+    const effortPoint = await inertPoint("effort-slider-panel", false);
+    expect(effortPoint.ok, effortPoint.ok ? "" : effortPoint.reason).toBe(true);
+    if (effortPoint.ok) {
+      await page.mouse.click(effortPoint.x!, effortPoint.y!);
       await expect(sliderPanel).toBeVisible();
     }
     if (process.env.REMUDA_EVIDENCE === "1") {
       // 1440 desktop evidence paired with the 390 shots in the r3 item-1 suite.
-      await page.screenshot({ path: "test-results/composerpop-r3-menu-above-notify-1440.png", animations: "disabled" });
+      await page.screenshot({ path: "test-results/composerpop-r4-menu-above-notify-1440.png", animations: "disabled" });
     }
     await clear(page);
   });

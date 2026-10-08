@@ -32,6 +32,21 @@
   pointer-events: none;
 }
 
+/*
+ * c-composerpop r4 item 1: on a session route the dock (composer control bar
+ * with the options trigger, send button and the model/effort/permission
+ * chips) is the bottom-most surface — anchoring only by the home indicator
+ * parks a blocking error ON TOP of those controls, making them unreachable
+ * while the error stands. SessionPage measures its dock and publishes the
+ * height as --session-dock-h (ResizeObserver); lift the stack clear of it.
+ * The shell has no bottom safe-area padding (the dock reaches the band
+ * edge), so the measured height already spans to the bottom. /m uses
+ * PhoneShell, which never stamps data-layout="session", and keeps its anchor.
+ */
+:global([data-layout="session"]) .stack {
+  bottom: calc(var(--session-dock-h, 0px) + var(--space-3));
+}
+
 /* Transient confirmations, above the errors in the same stack. */
 .info {
   display: flex;

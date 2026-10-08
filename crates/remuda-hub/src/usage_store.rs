@@ -3040,6 +3040,7 @@ mod tests {
             accounting: "estimated".into(),
             observed_at: at.into(),
             observed_at_source: "native".into(),
+            native_context_window: None,
         }
     }
 
@@ -3085,9 +3086,18 @@ mod tests {
             &conn,
             &s(4, "s2", 150, 15, "2020-01-01T00:00:30.000Z")
         ));
-        let rollup = rollup_instance(&conn, "ins_3a", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_3a",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: Some("codex"),
+            },
+        )
+        .unwrap()
+        .unwrap();
         // Current stocks summed: 300 (s1) + 150 (s2), not "newest row = 150".
         assert_eq!(rollup.session_input_tokens, Some(450));
         assert_eq!(rollup.session_output_tokens, Some(45));
@@ -3130,9 +3140,18 @@ mod tests {
             insert(&conn, &current),
             "growth above the legacy floor appends"
         );
-        let rollup = rollup_instance(&conn, "ins_3b", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_3b",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: Some("codex"),
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.session_input_tokens,
             Some(1200),

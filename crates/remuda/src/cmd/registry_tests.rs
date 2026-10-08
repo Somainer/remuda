@@ -162,17 +162,17 @@ fn instance_create_declares_host_and_labels() {
     let Command::Instance(args) = cli.command else {
         panic!("instance command")
     };
-    let cmd::instance::InstanceCommand::Create { host, labels, .. } = args.command else {
+    let cmd::instance::InstanceCommand::Create(create) = args.command else {
         panic!("create")
     };
-    assert_eq!(host.as_deref(), Some("hst_1"));
-    assert!(labels.is_empty());
+    assert_eq!(create.host.as_deref(), Some("hst_1"));
+    assert!(create.labels.is_empty());
     let instance = Cli::command()
         .find_subcommand("instance")
         .expect("instance")
         .clone();
-    let create = instance.find_subcommand("create").expect("create");
-    let names: Vec<_> = create
+    let create_cmd = instance.find_subcommand("create").expect("create");
+    let names: Vec<_> = create_cmd
         .get_arguments()
         .map(|a| a.get_id().as_str().to_string())
         .collect();
@@ -181,6 +181,20 @@ fn instance_create_declares_host_and_labels() {
     assert!(names.iter().any(|n| n == "worktree"));
     assert!(names.iter().any(|n| n == "name"));
     assert!(names.iter().any(|n| n == "cwd"));
+    // D-057 §3.2 seating flags.
+    for flag in [
+        "role",
+        "grants",
+        "scope_project",
+        "scope_host",
+        "scope_workspace",
+        "project",
+        "permission_mode",
+        "model",
+        "restart",
+    ] {
+        assert!(names.iter().any(|n| n == flag), "create missing {flag}");
+    }
 }
 
 #[test]

@@ -720,12 +720,19 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
     assert_eq!(row["state"]["state"], "working");
     assert!(row["watch"]["observedAt"].is_string(), "{row}");
 
-    // The Hub instance row itself converged to failed from the journal.
+    // D-057 OA6 (ma-lineage round 3): a turn result error is turn-level, never
+    // process termination — the durable Hub row does NOT converge to failed
+    // from the turn error alone (the print/sdk driver emits a separate process
+    // exit event when the child actually ends). The watch-layer failed state
+    // above still classifies the turn.
     let (status, instance) = ctx
         .request("GET", &format!("/v1/instances/{instance_id}"), None)
         .await;
     assert_eq!(status, 200, "{instance}");
-    assert_eq!(instance["lifecycle"], "failed");
+    assert_ne!(
+        instance["lifecycle"], "failed",
+        "a turn result error must not fail the durable instance: {instance}"
+    );
 
     // Persisted on the roster, sticky on the next observation, with timestamp.
     let (_, roster) = ctx.request("GET", "/v1/workers", None).await;

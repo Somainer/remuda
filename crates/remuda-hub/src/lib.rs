@@ -130,6 +130,26 @@ impl AppState {
 /// Test-only constructors for types private modules would otherwise hide
 /// from integration tests. Not part of the supported API.
 #[doc(hidden)]
+pub mod usage_store_test_support {
+    use rusqlite::Connection;
+
+    pub use crate::store::JournalRecord;
+    pub use crate::usage_store::{
+        RollupRequest, insert_usage_event, project_usage_event, rollup_instance,
+    };
+
+    /// An in-memory, fully migrated Hub DB for projection/rollup tests that do
+    /// not need a running Hub or the writer/reader split.
+    pub fn migrated_memory() -> rusqlite::Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        crate::usage_store::migrate(&conn)?;
+        Ok(conn)
+    }
+}
+
+/// Test-only constructors for types private modules would otherwise hide
+/// from integration tests. Not part of the supported API.
+#[doc(hidden)]
 pub mod store_test_support {
     use std::path::Path;
     use std::time::Duration;

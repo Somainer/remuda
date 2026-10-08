@@ -256,20 +256,82 @@ test.describe("stacked mobile usage sheet closes with its parent (RC4)", () => {
     await expect(page.getByTestId("composer-options-sheet")).toHaveCount(0);
   });
 
-  test("390: the other option rows in the sheet stay usable (RC2 mobile regression)", async ({ page }) => {
+  test("390: after stacking usage, the permission, effort and model rows each still respond (RC2 mobile regression)", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
-    await createSession(page, "composer popover sheet rows");
+    const id = await createSession(page, "composer popover sheet rows");
+    // Apply the launch model catalog before opening the sheet (mirrors
+    // ux-modelsync): otherwise the gateway model rows are not in the list yet.
+    await page.reload();
+    await expect(page.getByTestId("composer-input")).toBeVisible({ timeout: 20_000 });
     await injectRollup(page);
-    await optionsTrigger(page).click();
-    const sheet = page.getByTestId("composer-options-sheet");
-    await expect(sheet).toBeVisible();
-    // The context row renders and stays reachable despite the hover plumbing.
-    await expect(sheet.getByTestId("context-chip")).toBeVisible();
-    // Stacking usage and closing it with the scrim leaves the sheet usable.
-    await sheet.getByTestId("context-chip").click();
-    await expect(page.getByTestId("context-usage-popover")).toBeVisible();
-    await sheetScrim(page).click({ position: { x: 6, y: 6 } });
-    await expect(page.getByTestId("context-usage-popover")).toHaveCount(0);
+
+    // Every option row dispatches instance.configure, with a different payload
+    // branch per row. Match the branch so a click on the wrong (or a dead) row
+    // can never satisfy the assertion.
+    const configure = (branch: (payload: { permissionMode?: unknown; effort?: unknown; model?: unknown }) => boolean) =>
+      page.waitForRequest((request) => {
+        if (
+          request.method() !== "POST" ||
+          !request.url().endsWith(`/v1/instances/${id}/commands`) ||
+          request.postDataJSON()?.operation !== "instance.configure"
+        ) {
+          return false;
+        }
+        return branch(request.postDataJSON()?.payload ?? {});
+      });
+
+    const openSheetAndStackUsage = async () => {
+      await optionsTrigger(page).click();
+      const sheet = page.getByTestId("composer-options-sheet");
+      await expect(sheet).toBeVisible();
+      // The context row renders despite the hover plumbing.
+      await expect(sheet.getByTestId("context-chip")).toBeVisible();
+      // Stack the usage card, then return to the sheet through the card's OWN
+      // close (it leaves the sheet open and returns focus to the context chip):
+      // the round-trip the RC2 regression left broken.
+      await sheet.getByTestId("context-chip").click();
+      await expect(page.getByTestId("context-usage-popover")).toBeVisible();
+      await page.getByTestId("context-usage-close").click();
+      await expect(page.getByTestId("context-usage-popover")).toHaveCount(0);
+      await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+      return page.getByTestId("composer-options-sheet");
+    };
+
+    // (1) Permission: a REAL pick on a live permission row posts the mode.
+    let sheet = await openSheetAndStackUsage();
+    const permReady = configure((payload) => payload.permissionMode != null);
+    const permRow = sheet.locator("[data-testid^='permission-option-']:not([disabled])").first();
+    await expect(permRow).toBeVisible();
+    await permRow.click();
+    await permReady;
+
+    // (2) Effort: reopen, open the tier list, pick a non-selected tier.
+    sheet = await openSheetAndStackUsage();
+    await sheet.getByTestId("effort-open-list").click();
+    await expect(sheet.getByTestId("effort-list")).toBeVisible();
+    const effortReady = configure((payload) => payload.effort != null && payload.model == null);
+    const tier = sheet
+      .getByTestId("effort-list")
+      .locator("[data-testid^='effort-tier-']:not([disabled])[data-selected='0']")
+      .first();
+    await expect(tier).toBeVisible();
+    await tier.click();
+    await effortReady;
+
+    // (3) Model: the tier pick only closed the inner list, the options SHEET
+    // is still open. Reopen the list and pick a gateway model row; it posts
+    // the model id and the click closes the list. Use a row other than auto.
+    await sheet.getByTestId("effort-open-list").click();
+    await expect(sheet.getByTestId("effort-list")).toBeVisible();
+    const modelReady = configure((payload) => typeof payload.model === "string" && payload.model.length > 0);
+    const modelRow = sheet
+      .getByTestId("effort-list")
+      .locator("[data-testid='model-option-fast']:not([disabled])")
+      .first();
+    await expect(modelRow).toBeVisible();
+    await modelRow.click();
+    await modelReady;
+    await expect(sheet.getByTestId("effort-list")).toHaveCount(0);
   });
 
   test("iPhone/WebKit: scrim tap dismisses the stacked usage sheet", async () => {

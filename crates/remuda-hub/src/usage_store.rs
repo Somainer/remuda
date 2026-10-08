@@ -1187,6 +1187,8 @@ mod tests {
     use super::*;
     use crate::store::JournalRecord;
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
     fn usage_record(seq: i64, total: u64, cost: Option<&str>) -> JournalRecord {
         JournalRecord {
@@ -2541,9 +2543,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             rollup.tpm_in_60s,
-            Some(250),
-            "sanity: the ingest fallback counts inside the current window"
+            None,
+            "c-ctxusage r5 item 7: an ingest-fallback row is not current throughput; \
+             the real time is unknown until a native-timed observation repairs it"
         );
+        assert_eq!(rollup.session_input_tokens, Some(250), "totals still count ingest rows");
 
         // Replay: identical counters, now with the real historical native time.
         let historical = scoped_record(
@@ -2624,7 +2628,7 @@ mod tests {
         let one_pass = |mapper: &mut TranscriptMapper,
                         conn: &Connection,
                         seq_start: i64|
-         -> (i64, usize, i64) {
+         -> (i64, usize, PerScopeCounters) {
             let mut emitted = 0usize;
             let mut seq = seq_start;
             for path in &paths {
@@ -2666,22 +2670,29 @@ mod tests {
                     seq += 1;
                 }
             }
-            let turn_rows: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM usage_events WHERE instance_id=?1 AND scope='turn'",
-                    params![instance],
-                    |r| r.get(0),
+            // Per-scope-id signature over ALL FOUR counters — a rewrite of
+            // cache_read/cache_write/output (c-ctxusage r5 item 4) can no
+            // longer slip through an input-only hash.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT scope_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                     FROM usage_events
+                     WHERE instance_id=?1 AND scope='turn'
+                     ORDER BY scope_id",
                 )
                 .unwrap();
-            let input_sum: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(input_tokens),0) FROM usage_events
-                         WHERE instance_id=?1 AND scope='turn'",
-                    params![instance],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            (seq, emitted, turn_rows * 1000 + input_sum)
+            let per_scope: BTreeMap<String, (i64, i64, i64, i64)> = stmt
+                .query_map(params![instance], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .unwrap()
+                .map(|row| {
+                    let (scope, input, output, cache_read, cache_write) = row.unwrap();
+                    (scope, (input, output, cache_read, cache_write))
+                })
+                .collect();
+            assert_eq!(per_scope.len(), 24, "exactly 24 durable turn rows");
+            (seq, emitted, per_scope)
         };
 
         let conn = Connection::open_in_memory().unwrap();
@@ -2690,9 +2701,17 @@ mod tests {
         let mut mapper = open_mapper();
         let (next_seq, emitted1, signature1) = one_pass(&mut mapper, &conn, 1);
         assert_eq!(
-            signature1 / 1000,
+            signature1.len(),
             24,
-            "pass 1 durably persists exactly 24 turn rows (emitted {emitted1} usage obs)"
+            "pass 1 durably persists 24 turn rows (emitted {emitted1} usage obs)"
+        );
+        // The durable counters equal the independently parsed LAST usage per
+        // message id from the raw fixture (c-ctxusage r5 item 4): all four
+        // buckets, every one of the 24 ids.
+        let expected = expected_usage_counters();
+        assert_eq!(
+            signature1, expected,
+            "pass 1 counters match the raw fixture per scope_id"
         );
 
         // Second fresh mapper pass: byte-0 re-hydration with its own seqs.
@@ -2700,7 +2719,7 @@ mod tests {
         let (_seq, emitted2, signature2) = one_pass(&mut mapper, &conn, next_seq);
         assert_eq!(
             signature2, signature1,
-            "pass 2 leaves the SAME 24 rows and counters (emitted {emitted2} obs)"
+            "pass 2 leaves the SAME 24 rows and four counters (emitted {emitted2} obs)"
         );
 
         // Every durable row is native-timestamped, never the 2030 ingest value.
@@ -2716,6 +2735,67 @@ mod tests {
             bad_times, 0,
             "nativeAt wins over the ingest fallback on replay"
         );
+    }
+
+    /// Durable counters per message id: (input, output, cacheRead, cacheWrite).
+    type PerScopeCounters = BTreeMap<String, (i64, i64, i64, i64)>;
+
+    /// Independently parse the raw 2.1.289 fixtures: last non-sidechain
+    /// assistant record per message id, with the 5m+1h cache-write split —
+    /// exactly the source of truth the driver test uses, duplicated here so the
+    /// hub's durable rows are compared against the raw file, not the mapper.
+    fn expected_usage_counters() -> BTreeMap<String, (i64, i64, i64, i64)> {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../remuda-journal/tests/fixtures/effort-21289");
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&fixture_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+            .collect();
+        paths.sort();
+        let mut expected: BTreeMap<String, (i64, i64, i64, i64)> = BTreeMap::new();
+        for path in paths {
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let Ok(record) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if record.get("type").and_then(Value::as_str) != Some("assistant")
+                    || record.get("isSidechain").and_then(Value::as_bool) == Some(true)
+                {
+                    continue;
+                }
+                let Some((id, usage)) = record
+                    .pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .zip(record.pointer("/message/usage"))
+                else {
+                    continue;
+                };
+                let get = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0);
+                let write = match (
+                    usage
+                        .pointer("/cache_creation/ephemeral_5m_input_tokens")
+                        .and_then(Value::as_i64),
+                    usage
+                        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+                        .and_then(Value::as_i64),
+                ) {
+                    (Some(a), Some(b)) => a + b,
+                    _ => get("cache_creation_input_tokens"),
+                };
+                expected.insert(
+                    id.to_owned(),
+                    (
+                        get("input_tokens"),
+                        get("output_tokens"),
+                        get("cache_read_input_tokens"),
+                        write,
+                    ),
+                );
+            }
+        }
+        expected
     }
 
     // --- c-ctxusage r5 item 3 ----------------------------------------------

@@ -16,7 +16,7 @@ function deferred<T>() {
 }
 
 type Internals = {
-  reconcileOwed: Set<string>;
+  reconcileOwed: Map<string, { bindGen: number; attemptId: number | null }>;
   flushAllOutbox: () => Promise<void>;
   resumeConnection: () => Promise<void>;
   outbox: { get: (id: string) => { state: string } | undefined; pendingFor: (id: string) => { commandId: string }[] };
@@ -255,3 +255,204 @@ it("decides follow ownership when the drain job runs, not when it was enqueued",
   hubStore.logout();
 });
 
+/**
+ * c-reconnfu gate 6 item 2, trigger 1: the bound follow's resume FAILS
+ * (openFollowSocket/resync rejects — the §5.6 upgrade-refused socket or a
+ * subscribe timeout). The drain recorded catch-up debt; resumeConnection's
+ * failure path must honour it with a REST fallback immediately, then clear
+ * the debt and fold the delivered row to done.
+ */
+it("a failed reopen honours the owed catch-up over REST and clears the debt", async () => {
+  const { api, hubStore, closeA, eventsRead, subscribe } = await mountTwo();
+  const internals = hubStore as unknown as Internals;
+  await hubStore.follow(A);
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"));
+
+  // Capture the REAL resume action, then pin the machine so its own retries
+  // cannot race us.
+  const realResume = internals.resumeConnection;
+  internals.resumeConnection = () => new Promise<void>(() => {});
+
+  closeA();
+  await vi.waitFor(() =>
+    expect(["offline", "recovering"]).toContain(hubStore.connectionState),
+  );
+
+  await hubStore.send(A, "owed then reopen fails");
+  void internals.flushAllOutbox();
+  await vi.waitFor(() => expect(api.instanceSend).toHaveBeenCalledTimes(1), { timeout: 2_000 });
+  await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(true), { timeout: 3_000 });
+  const cid = (api.instanceSend as unknown as { mock: { calls: unknown[][] } }).mock.calls[0]?.[4] as string;
+
+  // The REST fallback folds A's delivered user event contiguously.
+  const aFallback = vi.fn();
+  eventsRead.mockImplementation(
+    ((req: { journalId: string }) => {
+      if (req.journalId === JA) aFallback();
+      return Promise.resolve(
+        req.journalId === JA
+          ? {
+              events: [
+                {
+                  kind: "message",
+                  eventId: `${JA}/1`,
+                  journalId: JA,
+                  instanceId: A,
+                  seq: "1",
+                  payload: {
+                    nodeId: "u1",
+                    messageId: "u1",
+                    role: "user",
+                    phase: "input",
+                    revision: "1",
+                    baseRevision: null,
+                    operation: "replace",
+                    status: "complete",
+                    blocks: [{ type: "text", text: "owed then reopen fails" }],
+                    targetBlock: null,
+                    parentToolCallId: null,
+                    nativeOrigin: { state: "known", value: "user" },
+                    commandId: cid,
+                  },
+                },
+              ],
+              durableSeq: "1",
+              windowFromSeq: null,
+              reachedAfterSeq: true,
+            }
+          : { events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true },
+      );
+    }) as never,
+  );
+
+  // The follow now fails its reopen (proxy refusing the upgrade), exactly as
+  // the failed-resumeAttempt path does.
+  subscribe.mockImplementation(async () => {
+    throw new Error("upgrade refused");
+  });
+  await expect(realResume.call(hubStore)).rejects.toBeTruthy();
+
+  await vi.waitFor(() => expect(aFallback).toHaveBeenCalled(), { timeout: 3_000 });
+  await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(false), { timeout: 3_000 });
+  await vi.waitFor(() => expect(internals.outbox.get(cid)?.state).toBe("done"), { timeout: 3_000 });
+
+  hubStore.logout();
+});
+
+/**
+ * c-reconnfu gate 6 item 2, trigger 2: a HUNG resume whose 20 s watchdog
+ * fires honours the debt stamped to that attempt with a REST fallback —
+ * without waiting for the (never-resolving) follow.
+ */
+it("the resume watchdog honours the owed catch-up over REST", async () => {
+  const { api, hubStore, closeA, eventsRead } = await mountTwo();
+  const internals = hubStore as unknown as Internals;
+  await hubStore.follow(A);
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"));
+
+  vi.useFakeTimers();
+  try {
+    internals.resumeConnection = () => new Promise<void>(() => {});
+    closeA();
+    // Backoff (250 ms with random=0.5) begins the hung attempt: recovering +
+    // 20 s watchdog.
+    await vi.advanceTimersByTimeAsync(500);
+    expect(["offline", "recovering"]).toContain(hubStore.connectionState);
+
+    await hubStore.send(A, "owed then watchdog");
+    void internals.flushAllOutbox();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(api.instanceSend).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(internals.reconcileOwed.has(A)).toBe(true);
+    const cid = (api.instanceSend as unknown as { mock: { calls: unknown[][] } }).mock.calls[0]?.[4] as string;
+    expect(internals.reconcileOwed.get(A)?.attemptId).not.toBeNull();
+
+    const aFallback = vi.fn();
+    eventsRead.mockImplementation(
+      ((req: { journalId: string }) => {
+        if (req.journalId === JA) aFallback();
+        return Promise.resolve(
+          req.journalId === JA
+            ? {
+                events: [
+                  {
+                    kind: "message",
+                    eventId: `${JA}/1`,
+                    journalId: JA,
+                    instanceId: A,
+                    seq: "1",
+                    payload: {
+                      nodeId: "u1",
+                      messageId: "u1",
+                      role: "user",
+                      phase: "input",
+                      revision: "1",
+                      baseRevision: null,
+                      operation: "replace",
+                      status: "complete",
+                      blocks: [{ type: "text", text: "owed then watchdog" }],
+                      targetBlock: null,
+                      parentToolCallId: null,
+                      nativeOrigin: { state: "known", value: "user" },
+                      commandId: cid,
+                    },
+                  },
+                ],
+                durableSeq: "1",
+                windowFromSeq: null,
+                reachedAfterSeq: true,
+              }
+            : { events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true },
+        );
+      }) as never,
+    );
+
+    // The 20 s watchdog fires for the hung current-binding attempt (its
+    // reconnect backoff may already have armed another hung attempt — the
+    // watchdog FINISH callback is what this trigger asserts, not the transient
+    // offline state between them).
+    await vi.advanceTimersByTimeAsync(21_000);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(aFallback).toHaveBeenCalled();
+    expect(internals.reconcileOwed.has(A)).toBe(false);
+    expect(internals.outbox.get(cid)?.state).toBe("done");
+  } finally {
+    vi.useRealTimers();
+    hubStore.logout();
+  }
+});
+
+/**
+ * c-reconnfu gate 6 item 2: a REST fallback that itself fails KEEPS the debt
+ * for the next trigger instead of deleting it.
+ */
+it("a failed REST fallback keeps the owed debt for a later trigger", async () => {
+  const { api, hubStore, closeA, eventsRead, subscribe } = await mountTwo();
+  const internals = hubStore as unknown as Internals;
+  await hubStore.follow(A);
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"));
+
+  const realResume = internals.resumeConnection;
+  internals.resumeConnection = () => new Promise<void>(() => {});
+  closeA();
+  await vi.waitFor(() =>
+    expect(["offline", "recovering"]).toContain(hubStore.connectionState),
+  );
+  await hubStore.send(A, "owed then everything fails");
+  void internals.flushAllOutbox();
+  await vi.waitFor(() => expect(api.instanceSend).toHaveBeenCalledTimes(1), { timeout: 2_000 });
+  await vi.waitFor(() => expect(internals.reconcileOwed.has(A)).toBe(true), { timeout: 3_000 });
+
+  // Both channels fail: reopen refused and the REST resync read rejected.
+  subscribe.mockImplementation(async () => {
+    throw new Error("upgrade refused");
+  });
+  eventsRead.mockRejectedValue(new Error("resync read rejected"));
+  await expect(realResume.call(hubStore)).rejects.toBeTruthy();
+  await vi.waitFor(() => expect(eventsRead).toHaveBeenCalled(), { timeout: 3_000 });
+  // The debt survives: the next trigger retries.
+  expect(internals.reconcileOwed.has(A)).toBe(true);
+
+  hubStore.logout();
+});

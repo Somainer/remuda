@@ -45,6 +45,7 @@ function setup() {
   const probe = vi.fn(() => Promise.resolve(true));
   const isFollowLive = vi.fn(() => true);
   const onState = vi.fn();
+  const onAttemptFinish = vi.fn();
   const machine = new ConnectionMachine({
     resume,
     probe,
@@ -53,8 +54,9 @@ function setup() {
     cancel: clock.cancel,
     random: () => 0.5,
     onState,
+    onAttemptFinish,
   });
-  return { clock, resume, probe, onState, machine, isFollowLive };
+  return { clock, resume, probe, onState, onAttemptFinish, machine, isFollowLive };
 }
 
 describe("ConnectionMachine", () => {
@@ -471,5 +473,41 @@ describe("ConnectionMachine", () => {
     machine.followBound();
     expect(machine.state).toBe("recovering");
     expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("gate6 item2: onAttemptFinish reports ok/failed with the attempt ref", () => {
+    const { machine, onAttemptFinish } = setupTracked();
+    machine.bootstrapLive();
+    machine.noteBinding(3);
+    const id = machine.followAttemptBegin(3);
+    machine.followAttemptEnd(true, id, 3);
+    expect(onAttemptFinish).toHaveBeenCalledWith({ gen: 3, attemptId: id, why: "ok" });
+
+    const id2 = machine.followAttemptBegin(3);
+    machine.followAttemptEnd(false, id2, 3);
+    expect(onAttemptFinish).toHaveBeenCalledWith({ gen: 3, attemptId: id2, why: "failed" });
+  });
+
+  it("gate6 item2: the watchdog reports why=watchdog for a hung current-binding attempt", () => {
+    const { clock, machine, onAttemptFinish } = setupTracked();
+    machine.bootstrapLive();
+    machine.noteBinding(1);
+    const id = machine.followAttemptBegin(1);
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(machine.state).toBe("offline");
+    expect(onAttemptFinish).toHaveBeenCalledWith({ gen: 1, attemptId: id, why: "watchdog" });
+  });
+
+  it("gate6 item2: a superseded attempt's watchdog fires no finish callback", () => {
+    const { clock, machine, onAttemptFinish } = setupTracked();
+    machine.bootstrapLive();
+    machine.noteBinding(1);
+    const idA = machine.followAttemptBegin(1);
+    machine.noteBinding(2);
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(onAttemptFinish).not.toHaveBeenCalled();
+    // A late completion for the retired attempt is also silent.
+    machine.followAttemptEnd(false, idA, 1);
+    expect(onAttemptFinish).not.toHaveBeenCalled();
   });
 });

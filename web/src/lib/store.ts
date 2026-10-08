@@ -675,13 +675,15 @@ class HubStore {
   /**
    * Instances whose last drained send skipped the post-delivery REST
    * catch-up because THIS instance's follow owned recovery at that moment.
-   * The debt is honoured by the owning follow's resync; if that owner is
-   * rebound away (navigation to another session), fails, or is superseded
-   * before it catches up, one coalesced REST fallback is scheduled for the
-   * abandoned instance so its accepted row can still settle. Cleared once the
-   * instance has caught up and folded its journal.
+   * The debt is keyed to the bind generation and resume attempt owning it:
+   * the owning follow's successful resync honours it, while a failed reopen,
+   * a failed resume attempt, a watchdog timeout of the named attempt, or a
+   * bind-away navigation (the previous owner can never service it) schedules
+   * one coalesced REST fallback for the instance so its accepted row can
+   * still settle. A failed fallback KEEPS the debt for the next trigger.
+   * Cleared only after a catch-up actually succeeds and folds the journal.
    */
-  private reconcileOwed = new Set<Id>();
+  private reconcileOwed = new Map<Id, { bindGen: number; attemptId: number | null }>();
   private outboxInit: Promise<boolean> | null = null;
 
   /**
@@ -1237,6 +1239,21 @@ class HubStore {
         // A socket-level recovery is also a moment to deliver the queue.
         if (state === "live") void this.flushAllOutbox();
       },
+      onAttemptFinish: (info) => {
+        // gate 6 item 2: a hung resume the watchdog gave up on is a follow
+        // that will never honour its drained-row debt. The bound instance may
+        // still be reachable over REST, so fold it now rather than leaving the
+        // accepted row at 已受理 through the reconnect retries. A rejection
+        // ("failed") is handled where the resume action throws
+        // (resumeConnection's catch); a superseded attempt never reports here.
+        if (info.why !== "watchdog") return;
+        const instanceId = this.connectionBoundTo;
+        if (!instanceId) return;
+        const debt = this.reconcileOwed.get(instanceId);
+        if (debt && debt.bindGen === info.gen && (debt.attemptId === null || debt.attemptId === info.attemptId)) {
+          this.runOwedReconcile(instanceId);
+        }
+      },
     });
     this.connection = machine;
     // A successful REST bootstrap proves reachability, but on the list/new
@@ -1352,7 +1369,6 @@ class HubStore {
     }
     return this.connectionBindGen;
   }
-
   /**
    * Rebind to a journal ANOTHER mount already finished loading (navigation
    * back, or a racing same-journal mount whose seed won): its OPEN fresh
@@ -1566,12 +1582,24 @@ class HubStore {
     // reachable, and the machine re-flushes on the live transition regardless.
     const flushed = this.flushAllOutbox();
     void flushed.catch(() => undefined);
-    if (this.connectionBoundTo) {
-      // Throws on socket-open or catch-up failure → machine remains offline
-      // and retries; no toast-swallowing into false live. The journal chain
-      // never carries the Node-bound screen read, so this cannot stall behind
-      // a saturated Node.
-      await this.reopenFollow(this.connectionBoundTo);
+    try {
+      if (this.connectionBoundTo) {
+        // Throws on socket-open or catch-up failure → machine remains offline
+        // and retries; no toast-swallowing into false live. The journal chain
+        // never carries the Node-bound screen read, so this cannot stall behind
+        // a saturated Node.
+        await this.reopenFollow(this.connectionBoundTo);
+      }
+    } catch (err) {
+      // gate 6 item 2: the bound follow just failed while it owned a drained
+      // row's catch-up debt (proxy refusing the upgrade, subscribe timeout,
+      // resync rejection). REST still works — honour the debt NOW instead of
+      // leaving the row at 已受理 through every failed reopen. The machine
+      // still receives the rejection and stays offline/retrying.
+      if (this.connectionBoundTo && this.reconcileOwed.has(this.connectionBoundTo)) {
+        this.runOwedReconcile(this.connectionBoundTo);
+      }
+      throw err;
     }
     await Promise.all([this.refresh().catch(() => undefined), this.refreshHosts().catch(() => undefined)]);
   }
@@ -1594,22 +1622,52 @@ class HubStore {
   }
 
   /**
+   * Record post-delivery catch-up debt against the resume attempt CURRENTLY
+   * owning the bound instance (c-reconnfu gate 6 item 2). A debt stamped with
+   * the live attempt is honoured when THAT attempt fails or its watchdog
+   * fires; a null attempt id (recorded while offline between attempts) is
+   * honoured by any attempt-end for the binding.
+   */
+  private recordOwed(instanceId: Id) {
+    const ref = this.connection?.attemptRef() ?? null;
+    this.reconcileOwed.set(instanceId, {
+      bindGen: this.connectionBindGen,
+      attemptId: ref?.attemptId ?? null,
+    });
+  }
+
+  /**
    * Honour a post-delivery catch-up for an instance that NO follow currently
-   * owns (the binding moved to another session). One coalesced bounded REST
-   * resume per instance on its own journal chain; never drives the global
-   * connection machine (it is bound elsewhere). Idempotent — safe to call when
-   * a follow later takes over.
+   * owns (the binding moved to another session) or whose owning attempt just
+   * failed/timed out. One bounded REST resume per instance on its own journal
+   * chain; never drives the global connection machine (it is bound elsewhere
+   * or the follow was just judged dead). Idempotent — safe to call when a
+   * follow later takes over.
+   *
+   * The debt is deleted ONLY after a catch-up that actually reaches the
+   * journal whole (resumeAfterReconnect resolves): a read rejection /
+   * readonly-stale settlement keeps it so the next failure, watchdog, rebind
+   * or navigation trigger retries instead of leaving the accepted row stuck
+   * at 已受理 (c-reconnfu gate 6 item 2).
    */
   private runOwedReconcile(instanceId: Id) {
+    if (!this.reconcileOwed.has(instanceId)) return;
     void this.chainReconcile(instanceId, async () => {
+      if (!this.reconcileOwed.has(instanceId)) return;
       const instance =
         this.state.instances.find((i) => i.id === instanceId) ??
         (await api.instanceGet(instanceId).catch(() => null));
       const client = instance ? this.journals.get(instance.journalId) : undefined;
+      if (!client) {
+        // Nothing mounted to fold; keep the debt for the mount/trigger that
+        // can actually catch this instance up.
+        return;
+      }
       try {
-        await client?.resumeAfterReconnect();
+        await client.resumeAfterReconnect();
       } catch {
-        /* bounded REST catch-up; the row also converges on later polls */
+        /* bounded REST catch-up failed: keep the debt for the next trigger */
+        return;
       }
       this.reconcileOwed.delete(instanceId);
       this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
@@ -1629,11 +1687,17 @@ class HubStore {
         await this.openFollowSocket(instance, client, client.appliedSeq);
         await client.resumeAfterReconnect();
         // This follow just did the authoritative catch-up the drained send was
-        // waiting on; its debt is honoured. Fold the journal now.
+        // waiting on; its debt is honoured. Fold the journal now. A throw from
+        // either step skips the delete and rejects the job: resumeConnection's
+        // catch (gate 6 item 2) runs the REST fallback for the still-owed row.
         this.reconcileOwed.delete(instanceId);
         this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
       } else {
+        // A fresh follow mounts AND catches the journal up; reaching here means
+        // it certified — its debt is honoured too.
         await this.follow(instanceId);
+        this.reconcileOwed.delete(instanceId);
+        this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
       }
     });
   }
@@ -1745,15 +1809,20 @@ class HubStore {
           // (which would otherwise queue ahead of the socket reopen past the
           // 20 s watchdog). Otherwise run the bounded REST catch-up now.
           if (this.followOwnsCatchupNow(instanceId, drainJournalId)) {
-            this.reconcileOwed.add(instanceId);
+            this.recordOwed(instanceId);
           } else {
             const client = drainJournalId ? this.journals.get(drainJournalId) : undefined;
             try {
               await client?.resumeAfterReconnect();
+              // Successful catch-up honours any earlier debt this instance
+              // carried (e.g. a drained row from before it was rebound away).
+              this.reconcileOwed.delete(instanceId);
             } catch {
-              /* machine owns the failure */
+              // The REST catch-up failed while no follow owns recovery: stamp
+              // convergence debt so the next failure/rebind/navigation trigger
+              // retries instead of dropping it.
+              this.recordOwed(instanceId);
             }
-            this.reconcileOwed.delete(instanceId);
           }
           this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
         });

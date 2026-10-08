@@ -2057,11 +2057,14 @@ async fn sdk_failed_first_turn_keeps_child_and_card_until_the_driver_exit() {
     let transcript_dir = dir.path().join("transcripts");
     std::fs::create_dir_all(&transcript_dir).expect("transcript dir");
 
-    // The fake child's two-turn script. Turn 1: pending approval, then a
+    // The fake child's three-turn script. Turn 1: pending approval, then a
     // FAILED result and a turn barrier (the child keeps reading stdin — this
     // is the SDK carrier, it never exits on a result). Turn 2: one more turn
-    // after the retry prompt. No `expect`: the approval stays unanswered,
-    // exactly like an owner who never clicked.
+    // after the retry prompt. Turn 3: a final "closing" turn; once its steps
+    // are played the SCRIPT IS EXHAUSTED and the child exits on its own
+    // (FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE) without an instance.close. No
+    // `expect`: the approval stays unanswered, exactly like an owner who
+    // never clicked.
     let script_path = dir.path().join("failed-first-turn.jsonl");
     std::fs::write(
         &script_path,
@@ -2071,6 +2074,9 @@ async fn sdk_failed_first_turn_keeps_child_and_card_until_the_driver_exit() {
 {"turn":"end"}
 {"type":"assistant","message":{"id":"msg_r7_turn2","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Retried OK."}],"session_id":"__SESSION__","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3"}}
 {"type":"result","subtype":"success","is_error":false,"duration_ms":1,"duration_api_ms":1,"num_turns":2,"result":"Retried OK.","stop_reason":"end_turn","total_cost_usd":0,"usage":{"input_tokens":2,"output_tokens":2},"modelUsage":{},"permission_denials":[],"session_id":"__SESSION__","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4","result_index":1}
+{"turn":"end"}
+{"type":"assistant","message":{"id":"msg_r7_turn3","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Goodbye."}],"session_id":"__SESSION__","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5"}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1,"duration_api_ms":1,"num_turns":3,"result":"Goodbye.","stop_reason":"end_turn","total_cost_usd":0,"usage":{"input_tokens":3,"output_tokens":3},"modelUsage":{},"permission_denials":[],"session_id":"__SESSION__","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6","result_index":2}
 {"turn":"end"}
 "#,
     )
@@ -2095,6 +2101,16 @@ async fn sdk_failed_first_turn_keeps_child_and_card_until_the_driver_exit() {
         "FAKE_CLAUDE_TRANSCRIPT_DIR".into(),
         transcript_dir.to_string_lossy().into_owned(),
     );
+    // r8 item 1: the child exits ON ITS OWN after the scripted conversation is
+    // exhausted (a real process dying after its last turn). The test must not
+    // end it with instance.close: that command independently journals an
+    // explicit-close exited ENTITY, which terminal-settles the row even when
+    // the print/SDK reader's `session`/exited arm is deleted. With this knob
+    // the driver reader's stdout EOF -> emit_exit("exited") is the ONLY
+    // process-end evidence the Hub receives.
+    native
+        .extra_env
+        .insert("FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE".into(), "1".into());
     let node = compose(&ServeConfig {
         http: node_http,
         data_dir: dir.path().join("node"),
@@ -2360,25 +2376,36 @@ async fn sdk_failed_first_turn_keeps_child_and_card_until_the_driver_exit() {
         "the instance is still alive before its own exit: {before_exit}"
     );
 
-    // 5) The driver's OWN exit: close releases stdin; the fake child exits and
-    // print emit_exit("exited") is the only thing that ends the instance and
-    // invalidates the card.
-    let close = json!({ "operation": "instance.close", "payload": {} }).to_string();
+    // 5) The driver's OWN exit: no instance.close is ever sent. A third prompt
+    // plays the script's final turn; the fake child then ends itself
+    // (FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE). The SDK reader hits stdout EOF and
+    // emits its `topic=session nativeName=session status=exited` lifecycle.
+    // That print/SDK arm of the shared process-end classifier is the ONLY
+    // thing allowed to end the instance and invalidate the card — an
+    // explicit-close entity is never journaled here.
+    let goodbye_prompt = format!("r7 goodbye prompt {}", uuid::Uuid::now_v7());
+    let send_goodbye = json!({
+        "operation": "instance.send",
+        "payload": {
+            "input": { "type": "prompt", "mode": "new-turn", "text": goodbye_prompt }
+        }
+    })
+    .to_string();
     let (status, body) = http(
         hub.addr,
         "POST",
         &format!("{instance_path}/commands"),
         &[("Cookie", cookie.as_str())],
-        Some(&close),
+        Some(&send_goodbye),
     )
     .await;
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(status, 200, "the live child accepts the final turn: {body}");
 
     let exited = wait_for_instance(
         hub.addr,
         &cookie,
         &instance_path,
-        "the driver exit to reach Exited",
+        "the driver's own session exit to reach Exited",
         |v| v["lifecycle"].as_str() == Some("exited"),
     )
     .await;
@@ -2400,6 +2427,50 @@ async fn sdk_failed_first_turn_keeps_child_and_card_until_the_driver_exit() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // Read back the Hub journal and prove WHICH evidence drove the terminal
+    // transition: the driver's native `session`/exited lifecycle MUST be
+    // present, and no explicit-close entity (reasonCode "explicit-close",
+    // stamped only by finish_instance_operation(Close)) may be journaled at
+    // all — the child was never closed. The node's post-exit INSTANCE entity
+    // (reasonCode "exited") is expected and follows the native event.
+    let (status, journal_body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}/journal"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{journal_body}");
+    let journal: Value =
+        serde_json::from_str(journal_body.trim()).expect("journal json after exit");
+    let records = journal["events"].as_array().expect("journal events");
+    let driver_session_exit = records.iter().any(|record| {
+        let payload = &record["event"]["payload"];
+        payload["type"].as_str() == Some("native")
+            && payload["topic"].as_str() == Some("session")
+            && payload["nativeName"].as_str() == Some("session")
+            && payload
+                .pointer("/status/value")
+                .and_then(Value::as_str)
+                .or_else(|| payload["status"].as_str())
+                == Some("exited")
+    });
+    assert!(
+        driver_session_exit,
+        "the print/SDK reader's session/exited lifecycle must be in the journal: {journal}"
+    );
+    let explicit_close_entity = records.iter().any(|record| {
+        let payload = &record["event"]["payload"];
+        payload["entityType"].as_str() == Some("instance")
+            && payload["state"].as_str() == Some("exited")
+            && payload["reasonCode"].as_str() == Some("explicit-close")
+    });
+    assert!(
+        !explicit_close_entity,
+        "no instance.close was sent, so no explicit-close entity may be journaled: {journal}"
+    );
 
     let _ = hub.shutdown().await;
 }

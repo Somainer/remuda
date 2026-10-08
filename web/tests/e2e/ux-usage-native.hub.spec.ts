@@ -17,8 +17,10 @@ import {
   copyFile,
   mkdir,
   mkdtemp,
+  open,
   realpath,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
@@ -94,6 +96,14 @@ test("native transcript usage drives the context chip through the real rollup", 
   await mkdir(scratch, { recursive: true });
   const dir = await realpath(await mkdtemp(path.join(scratch, "usage-native-")));
   const dataDir = path.join(dir, "data");
+  await mkdir(dataDir);
+  // Linux uses the /proc/self/fd alias (same as promoted-claude.hub.spec.ts):
+  // the native_hub_e2e example canonicalizes paths and needs the handle kept.
+  const dataStat = await stat(dataDir);
+  const dataHandle = process.platform === "linux" ? await open(dataDir, "r") : undefined;
+  const dataPath = process.platform === "darwin"
+    ? `/.vol/${dataStat.dev}/${dataStat.ino}`
+    : dataHandle ? `/proc/${process.pid}/fd/${dataHandle.fd}` : dataDir;
   const bin = path.join(dir, "bin");
   const workspace = path.join(dir, "workspace");
   const claudeHome = path.join(dir, "claude-home");
@@ -129,11 +139,11 @@ test("native transcript usage drives the context chip through the real rollup", 
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
-        REMUDA_DATA_DIR: dataDir,
+        REMUDA_DATA_DIR: dataPath,
         HUB_E2E_NODE_HUB_URL: hub.toString(),
         HUB_E2E_NODE_TOKEN_FILE: tokenFile,
         HUB_E2E_NODE_WORKSPACE: workspace,
-        HUB_E2E_NODE_DATA_DIR: dataDir,
+        HUB_E2E_NODE_DATA_DIR: dataPath,
         HUB_E2E_REMUDA_BIN: remuda,
         REMUDA_PTY_EMULATOR: "1",
         REMUDA_PTY_HOOKS: "1",

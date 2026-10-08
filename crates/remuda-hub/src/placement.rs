@@ -574,7 +574,9 @@ pub async fn spawn_on_host(
         Ok(instance) => instance,
         // D-057 §7.3: the fence landed at the create admission itself — the
         // write rolled back, nothing to unwind.
-        Err(crate::store::StoreError::Fenced) => return Err(crate::http::map_store(crate::store::StoreError::Fenced)),
+        Err(crate::store::StoreError::Fenced) => {
+            return Err(crate::http::map_store(crate::store::StoreError::Fenced));
+        }
         Err(error) => return Err(crate::http::map_store(error)),
     };
     let payload = json!({

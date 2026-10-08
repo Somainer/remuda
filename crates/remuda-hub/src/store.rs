@@ -3076,10 +3076,7 @@ impl Store {
     /// enforces. A never-forwarded create must leave no chapter behind:
     /// no Node ever saw it, so no tombstone is written either (F only
     /// tombstones chapters that actually existed on a Node).
-    pub async fn purge_requested_instance(
-        &self,
-        instance_id: String,
-    ) -> Result<(), StoreError> {
+    pub async fn purge_requested_instance(&self, instance_id: String) -> Result<(), StoreError> {
         self.run_named("purge_requested_instance", move |conn| {
             conn.execute(
                 "DELETE FROM journal WHERE instance_id = ?1",

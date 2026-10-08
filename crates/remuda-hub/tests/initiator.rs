@@ -1504,6 +1504,39 @@ async fn human_requests_remain_unchanged_after_a_fence_and_carry_no_initiator() 
     assert!(params.get("initiator").is_none(), "{params}");
 }
 
+// ── 9. Fence between create admission and create command unwinds the row ─
+
+#[tokio::test]
+async fn fenced_instance_create_unwinds_the_instance_row_and_writes_nothing() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+
+    // The deterministic seam lands inside the create COMMAND writer job
+    // (after insert_instance_delegated, at its check_initiator): the
+    // exact post-admission F window.
+    ctx.store()
+        .test_arm_fence_before_queue(ctx.instance.clone());
+
+    let (status, body) = ctx
+        .agent_post(
+            "/v1/instances",
+            json!({"hostId":ctx.host,"kind":"claude","driver":"claude-print",
+                   "permissionMode":"manual","prompt":"fenced child"}),
+        )
+        .await;
+    assert_fenced(status, &body);
+
+    // No instance row at all survives: the insert ran, but the fence lands
+    // inside the create-command writer and the unwind deletes it.
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    let instance_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(instance_count, 1, "only the boot chapter survives: {body}");
+
+    // No frame reached the Node: the create command never admitted.
+    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
+}
+
 // ── 10. Worker routes stay 403 for Agents; the node_ops admission boundary ─
 //      still covers worker.provision at the helper/store level (ma-admission
 //      owns the route opening: main-agent.md §15 task 7). ───────────────────

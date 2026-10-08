@@ -1384,7 +1384,10 @@ describe("font reflow compensator", () => {
       return { top: 0, left: 0, right: 0, bottom: h, width: 0, height: h, x: 0, y: 0, toJSON() {} } as DOMRect;
     });
     class GeoRO {
-      constructor(private readonly cb: () => void) {}
+      private readonly cb: () => void;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
       observe(el: Element) {
         observerCbs.set(el, this.cb);
       }

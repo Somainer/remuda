@@ -1103,6 +1103,61 @@ async fn fenced_cancel_of_a_queued_or_running_gate_job_is_refused_before_the_nod
     assert_eq!(method, "instance.send", "a gate.cancel frame leaked");
 }
 
+// ── 6c. A narrowed Bot token acts for the live chapter (CLI path) ─────────
+
+#[tokio::test]
+async fn narrowed_bot_token_writes_a_live_chapter_even_after_a_fence_check() {
+    // caller() lets an unbound device narrow with x-remuda-instance-id; the
+    // CLI sets it from REMUDA_INSTANCE_ID. The device clause must accept ANY
+    // unbound device row (Human or Bot): only unbound devices can narrow, and
+    // a narrowed caller acts with the chapter's initiator (§7.1).
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let bot = ctx
+        .hub
+        .mint_bot_device_token("initiator-bot")
+        .await
+        .unwrap();
+
+    let (status, body) = ctx
+        .send(
+            "POST",
+            &format!("/v1/instances/{}/commands", ctx.instance),
+            &bot,
+            Some(&ctx.instance),
+            Some(Ctx::send_body("instance.send")),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "a narrowed Bot write on a live chapter: {status} {body}"
+    );
+    let (method, params) = node.next().await;
+    assert_eq!(method, "instance.send");
+    // A narrowed token IS an Agent caller for that chapter (§7.1 states it
+    // for Human; item 6 extends the unbound-device rule to Bot): the Hub
+    // stamps the chapter initiator, and the Hub-only device id never ships.
+    assert_eq!(
+        params["initiator"]["instanceId"],
+        json!(ctx.instance),
+        "the narrowed Bot acts with the chapter initiator: {params}"
+    );
+    assert!(params.get("initiatorDeviceId").is_none(), "{params}");
+
+    // Fencing the chapter does not widen the Bot: without the narrow header
+    // it is plain Bot (Human-equivalent) and still writes.
+    ctx.fence().await;
+    let (status, body) = ctx
+        .send(
+            "POST",
+            &format!("/v1/instances/{}/commands", ctx.instance),
+            &bot,
+            None,
+            Some(Ctx::send_body("instance.send")),
+        )
+        .await;
+    assert_eq!(status, 200, "plain Bot work is never fenced: {body}");
+}
+
 // ── 7. Human token narrowed to a fenced chapter ───────────────────────────
 
 #[tokio::test]

@@ -11951,8 +11951,12 @@ pub(crate) fn check_initiator(
         let device_ok = match device {
             // The launch credential or an MCP token bound to this instance.
             Some((_, Some(bound))) => bound == initiator.instance_id,
-            // The unbound Human device that narrowed with x-remuda-instance-id.
-            Some((kind, None)) => kind == "human",
+            // An UNBOUND device that narrowed with x-remuda-instance-id:
+            // caller() only allows narrowing when the presented token is not
+            // itself bound, so the row is Human or Bot (the CLI's
+            // REMUDA_INSTANCE_ID Bot path). Both may act for the chapter via
+            // narrowing; only an unbound device can narrow at all.
+            Some((_kind, None)) => true,
             None => false,
         };
         if !device_ok {

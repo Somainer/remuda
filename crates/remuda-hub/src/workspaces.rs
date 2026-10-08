@@ -556,6 +556,13 @@ async fn mutate(
         _ => (body.path.clone(), None),
     };
     let mut payload = json!({"path": node_path});
+    // r8 item 1: persist the resolved workspaceId in the command payload so a
+    // later reconnect abort sweep sends it on the abort frame. The frame only
+    // carried path before, so the sweep never reconstructed the id the Node
+    // verifies against (and tests had to inject one).
+    if let Some(workspace_id) = &node_workspace_id {
+        payload["workspaceId"] = json!(workspace_id);
+    }
     crate::agent_scope::stamp(&mut payload, &device);
     let (command, _) = state
         .store
@@ -744,6 +751,27 @@ async fn abort_unregister(
             );
         }
     }
+}
+
+/// c-dirpicker r8 item 1: spawn the post-`node.hello` abort sweep as its OWN
+/// task, after the new transport is registered and after the hello reply is
+/// queued (mirrors [`crate::ws::spawn_egress_reinstall`]).
+///
+/// Running the sweep inline in the hello handler can never work: it is called
+/// before `state.nodes.insert`, so `call_node` finds no link; a stale
+/// half-open slot would instead block the hello for the RPC timeout; and the
+/// hello handler runs inside the session read loop, so an inline RPC that
+/// waits for its own reply deadlocks. The spawned task queues its abort frames
+/// behind the hello reply on the bounded FIFO, and commands whose abort is not
+/// delivered stay `queued`/`accepted` and are retried by the sweep on the
+/// NEXT hello.
+pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = abort_unsettled_unregisters_on_reconnect(&state, &host_id).await {
+            tracing::warn!(%host_id, %error, "post-hello unregister abort sweep failed");
+        }
+    });
 }
 
 /// Reconcile unregister commands left unsettled across a Node (re)connect

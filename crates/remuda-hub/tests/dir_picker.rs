@@ -5,7 +5,8 @@
 //!   session uses the workspace, and the refusal reaches the Node never;
 //!   with no users the two-phase unregister settles normally.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use futures::{SinkExt, StreamExt};
 use remuda_hub::{HubConfig, NodeTransport, TransportKind, spawn};
 use remuda_protocol::HostId;
 use serde_json::{Value, json};
@@ -16,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 // Real branded-id spellings (project member validation parses them).
 const WORKSPACE: &str = "wsp_01993ab0-0000-7000-8000-0000000000a1";
@@ -1467,4 +1470,367 @@ mod abort {
         fixture.hub.shutdown().await;
         Ok(())
     }
+}
+
+// ===========================================================================
+// r8 item 1: the post-hello unregister abort sweep must run AFTER the new
+// transport is registered, on the REAL reconnect path. These helpers drive a
+// genuine /v1/node WebSocket (hello → frames → drop → re-hello), unlike the
+// in-process FakeNode harness above.
+// ===========================================================================
+
+type NodeWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+const WS_TIMEOUT: Duration = Duration::from_secs(8);
+
+async fn ws_connect(addr: SocketAddr, bearer: &str) -> Result<NodeWs> {
+    let mut request = format!("ws://{addr}/v1/node").into_client_request()?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {bearer}").parse().unwrap());
+    let (ws, _) = tokio::time::timeout(WS_TIMEOUT, tokio_tungstenite::connect_async(request))
+        .await
+        .map_err(|_| anyhow!("ws connect timeout"))??;
+    Ok(ws)
+}
+
+async fn ws_send(ws: &mut NodeWs, value: Value) -> Result<()> {
+    ws.send(WsMessage::Text(value.to_string().into())).await?;
+    Ok(())
+}
+
+async fn ws_recv_json(ws: &mut NodeWs) -> Result<Value> {
+    loop {
+        let message = tokio::time::timeout(WS_TIMEOUT, ws.next())
+            .await
+            .map_err(|_| anyhow!("ws read timeout"))?
+            .ok_or_else(|| anyhow!("ws closed"))??;
+        match message {
+            WsMessage::Text(text) => return Ok(serde_json::from_str(&text)?),
+            WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+            other => return Err(anyhow!("unexpected ws frame {other:?}")),
+        }
+    }
+}
+
+fn rpc_result(id: &Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn workspace_snapshot(rev: u64, host: &str, wsp: &str, root: &str) -> Value {
+    json!({
+        "workspaceRevision": rev,
+        "workspaces": [
+            {"workspaceId": wsp, "hostId": host, "root": root}
+        ]
+    })
+}
+
+/// First link: hello, answer list/resolve, answer `prepare`, then DROP the
+/// socket immediately — before the Hub's `commit` can land — exactly the
+/// "prepare landed, then the link dropped" wedge r8 item 1 fixes. Returns the
+/// enrolled node's reconnect token via `node_token` once the hello reply is
+/// read.
+async fn node_first_link(
+    addr: SocketAddr,
+    enroll: String,
+    host: String,
+    wsp: String,
+    root: String,
+    node_token: Arc<Mutex<Option<String>>>,
+) -> Result<()> {
+    let mut ws = ws_connect(addr, &enroll).await?;
+    ws_send(
+        &mut ws,
+        json!({
+            "jsonrpc": "2.0", "id": "hello1", "method": "node.hello",
+            "params": {"hostId": host, "nodeVersion": "0.1.0-dp-r8"}
+        }),
+    )
+    .await?;
+    let snap1 = workspace_snapshot(1, &host, &wsp, &root);
+    loop {
+        let frame = match ws_recv_json(&mut ws).await {
+            Ok(frame) => frame,
+            // Socket torn down: done.
+            Err(_) => return Ok(()),
+        };
+        let id = frame.get("id").cloned().unwrap_or(Value::Null);
+        if id == json!("hello1") {
+            if let Some(token) = frame["result"]["nodeToken"].as_str() {
+                *node_token.lock().unwrap() = Some(token.to_owned());
+            }
+            continue;
+        }
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = frame.get("params").cloned().unwrap_or(json!({}));
+        match method {
+            "workspace.list" => {
+                ws_send(&mut ws, rpc_result(&id, snap1.clone())).await?;
+            }
+            "workspace.resolve" => {
+                ws_send(
+                    &mut ws,
+                    rpc_result(&id, json!({"workspaceId": wsp, "canonicalRoot": root})),
+                )
+                .await?;
+            }
+            "workspace.unregister"
+                if params.get("phase").and_then(Value::as_str) == Some("prepare") =>
+            {
+                let mut result = snap1.clone();
+                result["workspaceId"] = json!(wsp);
+                result["commandId"] = params.get("commandId").cloned().unwrap_or(Value::Null);
+                result["phase"] = json!("prepared");
+                ws_send(&mut ws, rpc_result(&id, result)).await?;
+                // The prepare landed and (on the real Node) set the unbinding
+                // mark; drop the link at once so commit never arrives.
+                let _ = ws.close(None).await;
+                return Ok(());
+            }
+            _ => {
+                ws_send(&mut ws, rpc_result(&id, json!({"ok": true}))).await?;
+            }
+        }
+    }
+}
+
+/// Reconnect link: hello with the node token, then answer the Hub's post-hello
+/// abort (captured), and a subsequent fresh unregister prepare→commit (the
+/// membership is removed at revision 2).
+async fn node_second_link(
+    addr: SocketAddr,
+    token: String,
+    host: String,
+    wsp: String,
+    root: String,
+    aborts: Arc<Mutex<Vec<Value>>>,
+    abort_seen: Arc<tokio::sync::Notify>,
+) -> Result<()> {
+    let mut ws = ws_connect(addr, &token).await?;
+    ws_send(
+        &mut ws,
+        json!({
+            "jsonrpc": "2.0", "id": "hello2", "method": "node.hello",
+            "params": {"hostId": host, "nodeVersion": "0.1.0-dp-r8"}
+        }),
+    )
+    .await?;
+    let snap1 = workspace_snapshot(1, &host, &wsp, &root);
+    loop {
+        let frame = match ws_recv_json(&mut ws).await {
+            Ok(frame) => frame,
+            Err(_) => return Ok(()),
+        };
+        let id = frame.get("id").cloned().unwrap_or(Value::Null);
+        if id == json!("hello2") {
+            continue;
+        }
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = frame.get("params").cloned().unwrap_or(json!({}));
+        let command_id = params.get("commandId").cloned().unwrap_or(Value::Null);
+        match method {
+            "workspace.list" => {
+                ws_send(&mut ws, rpc_result(&id, snap1.clone())).await?;
+            }
+            "workspace.resolve" => {
+                ws_send(
+                    &mut ws,
+                    rpc_result(&id, json!({"workspaceId": wsp, "canonicalRoot": root})),
+                )
+                .await?;
+            }
+            "workspace.unregister" => {
+                let phase = params.get("phase").and_then(Value::as_str).unwrap_or("");
+                let phase = match phase {
+                    "abort" => {
+                        aborts.lock().unwrap().push(params.clone());
+                        abort_seen.notify_waiters();
+                        "aborted"
+                    }
+                    "prepare" => "prepared",
+                    _ => "settled",
+                };
+                // The abort/prepared replies carry revision 1 (membership
+                // intact); the fresh commit reports revision 2 (removed).
+                let mut result = if phase == "settled" {
+                    json!({"workspaceRevision": 2, "workspaces": Vec::<Value>::new()})
+                } else {
+                    snap1.clone()
+                };
+                result["workspaceId"] = json!(wsp);
+                result["commandId"] = command_id;
+                result["phase"] = json!(phase);
+                ws_send(&mut ws, rpc_result(&id, result)).await?;
+            }
+            _ => {
+                ws_send(&mut ws, rpc_result(&id, json!({"ok": true}))).await?;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reconnect_after_dropped_prepare_aborts_on_the_new_socket_and_unblocks_the_workspace()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = HubConfig::for_test(dir.path().join("data"));
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &bootstrap).await?;
+    let host = HostId::new().as_id().as_str().to_owned();
+
+    let (status, body) = json_request(
+        addr,
+        "POST",
+        "/v1/hosts/enroll-token",
+        &[("Cookie", &cookie)],
+        Some("{}"),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let enroll = serde_json::from_str::<Value>(body.trim())?["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    const WSP: &str = "wsp_01993ab0-0000-7000-8000-0000000000b1";
+    const ROOT: &str = "/srv/remuda-dp-r8/proj";
+
+    // --- First link: observe a workspace, start a DELETE, drop mid-flight. ---
+    let node_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let first = {
+        let node_token = node_token.clone();
+        tokio::spawn(node_first_link(
+            addr,
+            enroll,
+            host.clone(),
+            WSP.to_owned(),
+            ROOT.to_owned(),
+            node_token,
+        ))
+    };
+    // Wait for the first hello to complete.
+    tokio::time::timeout(WS_TIMEOUT, async {
+        while node_token.lock().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("first node never helloed"))?;
+
+    // Populate the observed snapshot through the real workspace.list frame.
+    let (status, body) = json_request(
+        addr,
+        "GET",
+        &format!("/v1/hosts/{host}/workspaces"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+
+    // The DELETE prepares but the link drops before commit — it must fail, not
+    // settle 200, and leave an unsettled command behind.
+    let (status, body) = json_request(
+        addr,
+        "DELETE",
+        &format!("/v1/hosts/{host}/workspaces"),
+        &[("Cookie", &cookie)],
+        Some(&json!({"path": ROOT}).to_string()),
+    )
+    .await?;
+    assert_ne!(
+        status, 200,
+        "the dropped-link DELETE must not settle: {body}"
+    );
+    first.await??;
+
+    let store = hub.store().expect("store");
+    let pending = store.list_unsettled_workspace_unregisters(&host).await?;
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let stuck_command = pending[0].command_id.clone();
+
+    // --- Reconnect through the REAL node.hello path on a fresh socket. The
+    // post-hello sweep (spawned after state.nodes.insert, queued after the
+    // hello reply) must deliver the abort over THIS socket. ---
+    let aborts: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let abort_seen = Arc::new(tokio::sync::Notify::new());
+    let token = node_token
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| anyhow!("no node token from first hello"))?;
+    let second = {
+        tokio::spawn(node_second_link(
+            addr,
+            token,
+            host.clone(),
+            WSP.to_owned(),
+            ROOT.to_owned(),
+            aborts.clone(),
+            abort_seen.clone(),
+        ))
+    };
+
+    tokio::time::timeout(WS_TIMEOUT, abort_seen.notified())
+        .await
+        .map_err(|_| anyhow!("the abort never arrived on the new socket"))?;
+    let captured = aborts.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1, "{captured:?}");
+    assert_eq!(captured[0]["phase"], json!("abort"));
+    assert_eq!(captured[0]["path"], json!(ROOT));
+    assert_eq!(captured[0]["workspaceId"], json!(WSP));
+    assert_eq!(captured[0]["commandId"], json!(stuck_command));
+
+    // The Hub settles the stuck command only after the Node acks the abort.
+    let row = tokio::time::timeout(WS_TIMEOUT, async {
+        loop {
+            let row = store
+                .get_command(stuck_command.clone())
+                .await?
+                .ok_or_else(|| anyhow!("command missing"))?;
+            if row.state == "settled" {
+                return Ok::<_, anyhow::Error>(row);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("stuck command never settled"))??;
+    assert_eq!(row.state, "settled");
+    assert_eq!(row.settlement_outcome.as_deref(), Some("rejected"));
+
+    // A following operation on the SAME workspace succeeds: a fresh unregister
+    // goes prepare→commit over the new socket and settles 200 (the stale
+    // command/mark no longer wedges it).
+    let (status, body) = json_request(
+        addr,
+        "DELETE",
+        &format!("/v1/hosts/{host}/workspaces"),
+        &[("Cookie", &cookie)],
+        Some(&json!({"path": ROOT}).to_string()),
+    )
+    .await?;
+    assert_eq!(
+        status, 200,
+        "fresh unregister after reconcile must settle: {body}"
+    );
+    let settled: Value = serde_json::from_str(body.trim())?;
+    let workspaces = settled["workspaces"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        workspaces
+            .iter()
+            .all(|row| row["workspaceId"].as_str() != Some(WSP)),
+        "the workspace was removed by the fresh settled unregister: {settled}"
+    );
+
+    second.abort();
+    hub.shutdown().await;
+    Ok(())
 }

@@ -341,7 +341,14 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                         if is_hello
                             && let Some(h) = host_id.clone()
                         {
-                            spawn_egress_reinstall(&state, h);
+                            spawn_egress_reinstall(&state, h.clone());
+                            // r8 item 1: abort unbinding marks a dead previous
+                            // link prepared. Must run in a spawned task AFTER
+                            // state.nodes.insert (done in the hello handler
+                            // before this reply) and after the reply is queued;
+                            // inline it would find no link / deadlock the read
+                            // loop on its own reply.
+                            crate::workspaces::spawn_unregister_abort_sweep(&state, h);
                         }
                     }
                     Ok(None) => {}
@@ -497,11 +504,12 @@ pub(crate) async fn handle_node_method(
                 )
                 .await?;
             crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
-            // c-dirpicker r7 item 1: release durable unbinding marks a dead
-            // connection left prepared; idempotent, safe before the transport
-            // is registered.
-            crate::workspaces::abort_unsettled_unregisters_on_reconnect(state, &host.host_id)
-                .await?;
+            // c-dirpicker r8 item 1: the abort sweep for unsettled unregisters
+            // now runs in a SPAWNED task after the transport is registered and
+            // the hello reply is queued (see the Ok(Some) arm in the read
+            // loop). Calling it here, before state.nodes.insert, meant
+            // call_node found no link (or blocked on a stale slot) and the
+            // Node never received the abort, so the unbinding mark wedged.
             if params["daemon"] == true {
                 state
                     .store

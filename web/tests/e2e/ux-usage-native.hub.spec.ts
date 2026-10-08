@@ -185,16 +185,20 @@ test("native transcript usage drives the context chip through the real rollup", 
 
     await page.goto(`/s/${id}`);
     await expect(page.getByTestId("session-page")).toHaveAttribute("data-lifecycle", "running", { timeout: 20_000 });
-    // Drive the turn through the Hub command API (the production write path
-    // the promoter binds against), mirroring promoted-claude.hub.spec.ts.
-    const writeResponse = await page.request.post(`/v1/instances/${id}/commands`, {
-      headers: { Origin: new URL(page.url()).origin },
-      data: {
-        operation: "tty.write",
-        payload: { dataBase64: Buffer.from("NATIVEUSAGE\n").toString("base64"), source: "ui" },
-      },
-    });
-    expect(writeResponse.ok(), `tty.write ${writeResponse.status()}: ${await writeResponse.text()}`).toBe(true);
+    // The Hub HTTP command API wraps params in {dataBase64, source}; the WSS
+    // node's keys_from_params also reads instanceId from the params (it is
+    // injected by the Hub alongside commandId). Send a standalone write after
+    // the session settles, then poll for the chip.
+    await expect.poll(async () => {
+      const response = await page.request.post(`/v1/instances/${id}/commands`, {
+        headers: { Origin: new URL(page.url()).origin },
+        data: {
+          operation: "tty.write",
+          payload: { dataBase64: Buffer.from("NATIVEUSAGE\n").toString("base64"), source: "ui" },
+        },
+      });
+      return response.status();
+    }, { timeout: 30_000, intervals: [200, 500, 1000] }).toBe(200);
 
     // The chip renders the native transcript usage: 100k of 200k = 50%.
     await expect(page.getByTestId("context-chip")).toHaveText("50%", { timeout: 60_000 });

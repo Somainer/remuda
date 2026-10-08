@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
@@ -26,6 +28,10 @@ pub struct Harness {
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn std::io::Write + Send>,
+    /// Set by the stdout drain thread when its read loop ends at child EOF —
+    /// the happens-after edge of every captured events-file byte (r8 item 3).
+    /// `None` on platforms without the drainer.
+    drainer_done: Option<Arc<AtomicBool>>,
     seen: usize,
     closed: bool,
     owns_home: bool,
@@ -143,17 +149,28 @@ impl HarnessBuilder {
         let writer = master.take_writer().expect("pty writer");
         // Drain screen bytes for the whole run so a filled PTY buffer can never
         // stall the binary's repaints; tests assert on artifacts/events.
+        //
+        // r8 item 3 (c-resumehome r7): set `drainer_done` when the read loop
+        // ends at child EOF. EOF (the child reaped) precedes the drainer's
+        // last read, so wait_exit/wait_event poll this flag after reaping
+        // before they read the events file — the capture can never miss its
+        // tail under load.
+        let drainer_done = Arc::new(AtomicBool::new(false));
         let drain_reader = master.try_clone_reader().expect("clone reader");
-        std::thread::spawn(move || {
-            let mut reader = drain_reader;
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+        {
+            let drainer_done = Arc::clone(&drainer_done);
+            std::thread::spawn(move || {
+                let mut reader = drain_reader;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
                 }
-            }
-        });
+                drainer_done.store(true, Ordering::SeqCst);
+            });
+        }
         Harness {
             kind: self.kind,
             home,
@@ -161,6 +178,7 @@ impl HarnessBuilder {
             child,
             master,
             writer,
+            drainer_done: Some(drainer_done),
             seen: 0,
             closed: false,
             owns_home,
@@ -290,6 +308,13 @@ impl Harness {
                 }
             }
             if Instant::now() >= deadline {
+                // r8 item 3: if the child has already exited, its stdout
+                // drainer may still hold the last lines — join before
+                // building the failure message so it is not a scheduling false
+                // negative.
+                if self.child.try_wait().expect("try_wait").is_some() {
+                    self.join_drainer_after_eof(deadline);
+                }
                 let body = std::fs::read_to_string(&self.events_path).unwrap_or_default();
                 let alive = self.child.try_wait().expect("try_wait").is_none();
                 panic!(
@@ -328,16 +353,48 @@ impl Harness {
     }
 
     /// Wait for the process to exit (scenarios with `quit_after_turns`).
+    ///
+    /// r8 item 3 (c-resumehome r7): EOF (the child reaped) happens BEFORE the
+    /// last bytes reach the events file — the binary writes while a background
+    /// thread drains PTY stdout into it. Reap the child first, then park until
+    /// its drainer thread itself has exited (its stdout handle is the last
+    /// thing closed on the way out), so a `wait_exit()`-then-read assertion can
+    /// never run against a capture still missing its tail.
     pub fn wait_exit(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
             if self.child.try_wait().expect("wait").is_some() {
+                self.join_drainer_after_eof(deadline);
                 return;
             }
             if Instant::now() >= deadline {
                 panic!("fake-harness ({}) did not exit", self.kind);
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Poll until the harness's stdout drainer thread has finished after the
+    /// child's EOF.
+    ///
+    /// The drainer closes its end of the captured-bytes pipe exactly when its
+    /// read loop ends, which is the happens-after edge of every captured
+    /// byte; the `drainer_done` flag is set right after that. Poll it before
+    /// reading the events file. Bounded by `deadline` so a wedged drainer
+    /// fails the test rather than this helper parking forever.
+    fn join_drainer_after_eof(&mut self, deadline: Instant) {
+        let Some(done) = self.drainer_done.take() else {
+            // No drainer was started, or a previous waiter already joined.
+            return;
+        };
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                panic!(
+                    "fake-harness ({}) stdout drainer did not finish after child EOF",
+                    self.kind
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 

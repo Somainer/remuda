@@ -69,10 +69,12 @@ export function effectiveFromRecord(value: unknown): EffortEffectiveView | null 
 export type EffortObservationResult = {
   /** The projected effective state, or null when still unknown. */
   effective: EffortEffectiveView | null;
-  /** True when this is the read-back-unavailable edge: the driver withdrew
-   *  the previous projection; consumers must clear it WITHOUT settling or
-   *  deleting a pending switch. */
+  /** True on the read-back-unavailable edge: the driver withdrew the previous
+   *  projection; consumers must clear it WITHOUT settling or deleting a
+   *  pending switch. */
   withdrawn: boolean;
+  /** Timestamp carried by a withdrawn edge, for stale/ordering checks. */
+  observedAt?: string;
   requested?: { name?: string; ultracode?: boolean };
 };
 
@@ -90,9 +92,14 @@ export function effectiveFromObservation(observation: unknown): EffortObservatio
   const withdrawn = readbackWithdrawn(effectiveRecord);
   const view = effectiveFromRecord(effectiveRecord);
   const requested = payload.payload.requested ?? undefined;
+  const withdrawnObservedAt =
+    typeof effectiveRecord.observedAt === "string"
+      ? (effectiveRecord.observedAt as string)
+      : undefined;
   return {
     effective: view,
     withdrawn,
+    ...(withdrawnObservedAt ? { observedAt: withdrawnObservedAt } : {}),
     ...(requested ? { requested } : {}),
   };
 }

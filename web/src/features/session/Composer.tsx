@@ -845,19 +845,30 @@ export function Composer({
   // with a 切换中 / 排队中 tag instead of going ambiguous.
   const effectiveUnknown = isEffortUnknown(effortEffective);
   const pendingLabel = effortPending?.word ?? null;
+  // r6 item 8(b): while a push-down is pending AND read-back has been
+  // withdrawn (no effective level), the chip renders "?" — not the pending
+  // word, which would imply the old level still holds.
+  const withdrawnPending = effectiveUnknown && Boolean(effortPending);
   const effectiveWord = pendingLabel ?? effectiveLabel(effortEffective);
-  const mismatch = caps.effort && !pendingLabel
+  // The chip word: "?" while read-back is withdrawn during a push-down,
+  // otherwise the pending word, "?" when unknown, or the effective level.
+  const chipWord = withdrawnPending
+    ? "?"
+    : pendingLabel ?? (effectiveUnknown ? "?" : effectiveWord);
+  const mismatch = caps.effort && !pendingLabel && !withdrawnPending
     ? effortMismatch(effortWire, ultraOn, effortEffective)
     : null;
-  const effortChipTitle = pendingLabel
-    ? effortPending?.queued
-      ? `排队中：${pendingLabel} 将在本回合结束后生效`
-      : `切换中：${pendingLabel}`
-    : effectiveUnknown
-      ? "实际档位：等待会话回读（？）"
-      : mismatch
-        ? `请求 ${mismatch.requested} → 实际 ${mismatch.effective}`
-        : `实际档位 ${effectiveWord}（来源 ${effortEffective?.source ?? "unknown"}）`;
+  const effortChipTitle = withdrawnPending
+    ? "回读不可用：实际档位未知（？），切换结果等待本次 configure"
+    : pendingLabel
+      ? effortPending?.queued
+        ? `排队中：${pendingLabel} 将在本回合结束后生效`
+        : `切换中：${pendingLabel}`
+      : effectiveUnknown
+        ? "实际档位：等待会话回读（？）"
+        : mismatch
+          ? `请求 ${mismatch.requested} → 实际 ${mismatch.effective}`
+          : `实际档位 ${effectiveWord}（来源 ${effortEffective?.source ?? "unknown"}）`;
   const primaryLabel = sending ? "发送中" : controls.primary.label;
   const primaryTestId =
     controls.primary.kind === "queue" ? "composer-queue" : "composer-send";
@@ -1004,7 +1015,7 @@ export function Composer({
   const effortWordNode = (
     <>
       <span className={css.chipModel} data-testid="model-effort-chip-label">
-        {pendingLabel ?? (effectiveUnknown ? "?" : effectiveWord)}
+        {chipWord}
       </span>
       {pendingLabel ? (
         <span className={css.chipEffortPendingTag} data-testid="model-effort-pending">
@@ -1110,7 +1121,15 @@ export function Composer({
         data-permission={caps.permission ? liveMode : undefined}
         data-permission-danger={caps.permission && permDanger ? "1" : "0"}
         data-effort-effective={
-          caps.effort ? (pendingLabel ? "pending" : effectiveUnknown ? "unknown" : effectiveWord) : undefined
+          caps.effort
+            ? withdrawnPending
+              ? "unknown"
+              : pendingLabel
+                ? "pending"
+                : effectiveUnknown
+                  ? "unknown"
+                  : effectiveWord
+            : undefined
         }
         data-effort-pending={caps.effort && pendingLabel ? (effortPending?.queued ? "queued" : "switching") : "0"}
         data-effort-source={caps.effort ? effortEffective?.source ?? "unknown" : undefined}
@@ -1416,13 +1435,13 @@ export function Composer({
                 className={`${css.chip} ${ember ? css.ember : ""} ${pendingLabel ? css.chipEffortPending : ""}`}
                 data-testid="model-effort-chip"
                 data-ember={ember ? "1" : "0"}
-                data-effort-effective={pendingLabel ? "pending" : effectiveUnknown ? "unknown" : effectiveWord}
+                data-effort-effective={withdrawnPending ? "unknown" : pendingLabel ? "pending" : effectiveUnknown ? "unknown" : effectiveWord}
                 data-effort-pending={pendingLabel ? (effortPending?.queued ? "queued" : "switching") : "0"}
                 data-effort-source={effortEffective?.source ?? "unknown"}
                 data-effort-mismatch={mismatch ? "1" : "0"}
                 aria-expanded={menu === "effort"}
                 aria-haspopup="dialog"
-                aria-label={`Select effort, ${effortChipLabel}; effective ${pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
+                aria-label={`Select effort, ${effortChipLabel}; effective ${withdrawnPending ? "unknown" : pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
                 title={effortChipTitle}
                 onClick={() => toggle("effort")}
               >

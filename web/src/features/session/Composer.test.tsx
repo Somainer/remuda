@@ -935,3 +935,43 @@ describe("Composer Sheet confirms replace window.confirm (D-042)", () => {
     expect(screen.getByTestId("composer-steer")).toHaveFocus();
   });
 });
+
+it("shows ? while an effort switch is pending and read-back has been withdrawn", () => {
+  render(
+    <Composer
+      instanceId="ins_withdrawn_pending"
+      mobile={false}
+      onSend={vi.fn()}
+      kind="claude"
+      model="opus"
+      effort={effortAt("claude", 4, false)}
+      effortEffective={null}
+      effortPending={{ word: "max", queued: false }}
+      onEffort={vi.fn()}
+    />,
+  );
+  const chip = screen.getByTestId("model-effort-chip");
+  expect(chip).toHaveAttribute("data-effort-effective", "unknown");
+  expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("?");
+  // The pending tag is still rendered (the switch outcome is awaited).
+  expect(screen.getByTestId("model-effort-pending")).toHaveTextContent("切换中");
+});
+
+it("shows the pending word when read-back is still available during a switch", () => {
+  render(
+    <Composer
+      instanceId="ins_normal_pending"
+      mobile={false}
+      onSend={vi.fn()}
+      kind="claude"
+      model="opus"
+      effort={effortAt("claude", 4, false)}
+      effortEffective={{ name: "high", ultracode: false, source: "remuda", observedAt: "2026-10-08T00:00:00Z" }}
+      effortPending={{ word: "max", queued: false }}
+      onEffort={vi.fn()}
+    />,
+  );
+  const chip = screen.getByTestId("model-effort-chip");
+  expect(chip).toHaveAttribute("data-effort-effective", "pending");
+  expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("max");
+});

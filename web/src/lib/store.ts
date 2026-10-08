@@ -624,6 +624,14 @@ class HubStore {
    * terminal-side switch that would fold the slider to the clamped level.
    */
   private settledEffortPushdown = new Map<Id, string>();
+  /**
+   * The effortEffective each instance carried on the LAST Hub poll (null =
+   * polled but absent, absent from the map = never polled). r6 item 6: a poll
+   * withdraws the live projection only when a previously seen HUB record
+   * becomes null — an unrelated lifecycle write that advances updatedAt while
+   * the Hub never projected effort must not make the chip render "?".
+   */
+  private polledEffort = new Map<Id, EffortEffectiveView | null>();
   private bootGen = 0;
   /**
    * List-fetch sequencing: every refresh() takes a monotonically increasing
@@ -735,35 +743,39 @@ class HubStore {
     let effectiveUpdated = false;
     let pendingSettled = false;
     for (const instance of instances) {
+      const id = instance.id;
       const view = effectiveFromRecord(instance.effortEffective);
+      const previousPoll = this.polledEffort.get(id);
+      this.polledEffort.set(id, view);
       if (!view) {
-        // D-056 (4): the Hub nulls effortEffective on the
-        // read-back-unavailable edge. When the record is newer than the
-        // projection the client still holds, withdraw it here too (a gapped
-        // follow / late attach). A pending switch is left intact — the
-        // configure outcome or its timeout owns it. An instance that has
-        // simply never observed a level does not clear anything.
-        const held = next[instance.id];
-        if (held && instance.updatedAt && instance.updatedAt > held.observedAt) {
-          delete next[instance.id];
+        // r6 item 6: withdraw on poll ONLY when the Hub record goes from a
+        // previously projected non-null effortEffective to null (the Hub
+        // applied the read-back-unavailable edge). A null from an instance the
+        // Hub has never projected effort for — however new its updatedAt from
+        // an unrelated lifecycle write — must not erase a live follow edge.
+        if (previousPoll) {
+          delete next[id];
           effectiveUpdated = true;
         }
         continue;
       }
-      const current = next[instance.id];
-      if (!current || view.observedAt >= current.observedAt) {
-        next[instance.id] = view;
+      const current = next[id];
+      // Compare PARSED instants: a same-second write with a different
+      // fractional-second spelling must not look older or newer by string.
+      if (!current || Date.parse(view.observedAt) >= Date.parse(current.observedAt)) {
+        next[id] = view;
         effectiveUpdated = true;
-        const pending = this.state.effortPending[instance.id];
+        const pending = this.state.effortPending[id];
         if (
           pending
-          && (!pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt)
+          && (!pending.baselineObservedAt
+            || Date.parse(view.observedAt) > Date.parse(pending.baselineObservedAt))
         ) {
-          delete pendingNext[instance.id];
+          delete pendingNext[id];
           pendingSettled = true;
           // Remember the read-back that settled it so the same edge arriving
           // later on the live socket is not mistaken for a terminal switch.
-          this.settledEffortPushdown.set(instance.id, view.observedAt);
+          this.settledEffortPushdown.set(id, view.observedAt);
         }
       }
     }
@@ -941,7 +953,17 @@ class HubStore {
     // pending switch and do not move the optimistic slider — the configure
     // outcome (or its bounded timeout) owns the pending indicator.
     if (parsed.withdrawn) {
-      if (!this.state.effortEffective[instanceId]) return true;
+      const held = this.state.effortEffective[instanceId];
+      if (!held) return true;
+      // r6 item 8(a): a withdrawal arriving out of order (e.g. via
+      // "Load earlier" AFTER a later valid edge M) is older history and must
+      // not delete the newer projection.
+      if (
+        parsed.observedAt
+        && Date.parse(parsed.observedAt) < Date.parse(held.observedAt)
+      ) {
+        return false;
+      }
       const effortEffective = { ...this.state.effortEffective };
       delete effortEffective[instanceId];
       this.emit({ effortEffective });
@@ -2007,6 +2029,7 @@ class HubStore {
     // it in its finally.
     ++this.bootGen;
     this.pinnedCreates.clear();
+    this.polledEffort.clear();
     // Tear down the connection machine and its browser listeners (init
     // recreates them at the next bootstrap); the durable outbox itself stays.
     this.connection?.dispose();

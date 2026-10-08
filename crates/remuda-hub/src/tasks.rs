@@ -397,8 +397,8 @@ async fn create_task(
     // rolled back and the refusal is returned (D-035).
     let sharing = if let Some(request) = binding_request.as_ref() {
         match bind_task_directory(&state, &body.project_id, &task, request, &authority).await {
-            Ok((binding, sharing)) => {
-                let updated = state
+            Ok((binding, sharing, acquired_lease)) => {
+                let bind_result = state
                     .store
                     .mutate_task(
                         task.meta.id.as_id().to_string(),
@@ -408,9 +408,23 @@ async fn create_task(
                         },
                         authority.clone(),
                     )
-                    .await
-                    .map_err(map_store)?
-                    .unwrap_or(task.clone());
+                    .await;
+                let updated = match bind_result {
+                    Ok(updated) => updated.unwrap_or(task.clone()),
+                    // D-057 §7.3: a fence landed after the lease did. The
+                    // write never happened; return the worktree internally
+                    // and delete the task row so neither slot nor task
+                    // lingers, then surface the 409 fenced refusal.
+                    Err(crate::store::StoreError::Fenced) => {
+                        return_acquired_lease(&state, &acquired_lease).await;
+                        let _ = state
+                            .store
+                            .delete_task_cascade(task.meta.id.as_id().to_string())
+                            .await;
+                        return Err(HubError::Fenced);
+                    }
+                    Err(error) => return Err(map_store(error)),
+                };
                 state
                     .store
                     .append_audit(
@@ -471,7 +485,7 @@ async fn bind_task_directory(
     task: &Task,
     request: &BindingBody,
     authority: &crate::agent_scope::CallerAuthority,
-) -> Result<(TaskSpaceBinding, Value), HubError> {
+) -> Result<(TaskSpaceBinding, Value, AcquiredLease), HubError> {
     let mode = match request.mode.as_str() {
         "reuse" => TaskBindingMode::Reuse,
         "pool" => TaskBindingMode::Pool,
@@ -588,37 +602,15 @@ async fn bind_task_directory(
     // failure: a reuse return is a zero-op on disk (catalog refcount only),
     // so rollback can never disturb the directory. An offline Node is left
     // for reconnect reconciliation; the Hub row is always released.
-    let roll_back_lease = |dir_key: String| async move {
-        let return_params = json!({
-            "hostId": member.host_id.as_id().as_str(),
-            "workspaceId": member.workspace_id.as_id().as_str(),
-            "name": path_name,
-            "taskId": task.meta.id.as_id().as_str(),
-        });
-        if let Err(error) = crate::http::call_node(
-            state,
-            member.host_id.as_id().as_str(),
-            "worktree.return",
-            return_params,
-        )
-        .await
-        {
-            tracing::warn!(%error, "binding rollback: Node worktree.return failed; catalog reconciles on reconnect");
-        }
-        if let Err(error) = state
-            .store
-            .release_worktree_lease(
-                member.host_id.as_id().to_string(),
-                member.workspace_id.as_id().to_string(),
-                dir_key,
-                task.meta.id.as_id().to_string(),
-                "free".into(),
-                None,
-            )
-            .await
-        {
-            tracing::warn!(%error, "binding rollback: Hub lease release failed");
-        }
+    let roll_back_lease = |dir_key: String| {
+        let lease = AcquiredLease {
+            host_id: member.host_id.as_id().to_string(),
+            workspace_id: member.workspace_id.as_id().to_string(),
+            path_name: path_name.to_string(),
+            dir_key,
+            task_id: task.meta.id.as_id().to_string(),
+        };
+        async move { return_acquired_lease(state, &lease).await }
     };
     // The Node decides mode from the catalog record, not the request: a pool
     // name that collides with an operator's standalone worktree comes back as
@@ -672,7 +664,58 @@ async fn bind_task_directory(
             .cloned()
             .unwrap_or(Value::Null),
     });
-    Ok((binding, sharing))
+    let acquired = AcquiredLease {
+        host_id: member.host_id.as_id().to_string(),
+        workspace_id: member.workspace_id.as_id().to_string(),
+        path_name: path_name.to_string(),
+        dir_key: outcome.row.dir_key.clone(),
+        task_id: task.meta.id.as_id().to_string(),
+    };
+    Ok((binding, sharing, acquired))
+}
+
+/// One worktree lease a task binding acquired, with everything the
+/// post-lease unwind needs to return it on the Node and release the
+/// Hub-side catalog row.
+struct AcquiredLease {
+    host_id: String,
+    workspace_id: String,
+    path_name: String,
+    dir_key: String,
+    task_id: String,
+}
+
+/// Hub-internal unwind of an acquired binding lease: the
+/// `worktree.return` is initiator-less Hub cleanup (main-agent.md
+/// §7.1), and the catalog row is always released. A failure on either
+/// side is logged (the catalog reconciles on Node reconnect); it never
+/// replaces the error the caller is already returning.
+async fn return_acquired_lease(state: &AppState, lease: &AcquiredLease) {
+    let return_params = json!({
+        "hostId": lease.host_id,
+        "workspaceId": lease.workspace_id,
+        "name": lease.path_name,
+        "taskId": lease.task_id,
+    });
+    if let Err(error) =
+        crate::http::call_node(state, &lease.host_id, "worktree.return", return_params).await
+    {
+        tracing::warn!(%error, "binding rollback: Node worktree.return failed; catalog reconciles on reconnect");
+    }
+    if let Err(error) = state
+        .store
+        .release_worktree_lease(
+            lease.host_id.clone(),
+            lease.workspace_id.clone(),
+            lease.dir_key.clone(),
+            lease.task_id.clone(),
+            "free".into(),
+            None,
+        )
+        .await
+    {
+        tracing::warn!(%error, "binding rollback: Hub lease release failed");
+    }
 }
 
 /// Structural admission for a binding worktree name; mirrors
@@ -1451,7 +1494,12 @@ impl Store {
     where
         F: FnOnce(&mut Task, &mut Connection) -> Result<(), StoreError> + Send + 'static,
     {
+        let task_id = task_id.clone();
+        let armed_fence = self.take_test_task_mutate_fence();
         self.run_named("mutate_task", move |conn| {
+            if let Some(fenced_instance) = armed_fence {
+                crate::store::test_apply_fence(conn, &fenced_instance)?;
+            }
             let (initiator, device_id) = authority.as_check();
             crate::store::check_initiator(conn, initiator, device_id)?;
             let Some(mut task) = load_task(conn, &task_id)? else {

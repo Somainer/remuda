@@ -226,6 +226,9 @@ pub struct Store {
     /// Test-only seam shared by gate-claim and node-op admission: arm a fence
     /// applied at the top of the NEXT such writer job.
     test_fence_before_authority: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: arm a fence applied at the top of the NEXT
+    /// `mutate_task` writer job only (task bind post-lease commit race).
+    test_fence_before_task_mutate: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Result of presenting a Node enroll or host token.
@@ -2206,6 +2209,7 @@ impl Store {
             test_fence_before_queue: Arc::new(std::sync::Mutex::new(None)),
             test_delete_device_before_queue: Arc::new(std::sync::Mutex::new(None)),
             test_fence_before_authority: Arc::new(std::sync::Mutex::new(None)),
+            test_fence_before_task_mutate: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -2309,6 +2313,24 @@ impl Store {
         self.test_fence_before_authority
             .lock()
             .expect("authority seam lock")
+            .take()
+    }
+
+    /// Test-only: arm a fence that the NEXT `mutate_task` writer job applies
+    /// immediately before its authority check (task bind post-lease race).
+    #[doc(hidden)]
+    pub fn test_arm_fence_before_task_mutate(&self, instance_id: String) {
+        *self
+            .test_fence_before_task_mutate
+            .lock()
+            .expect("task mutate seam lock") = Some(instance_id);
+    }
+
+    /// Test-only: drain (at most) the armed task-mutate fence.
+    pub(crate) fn take_test_task_mutate_fence(&self) -> Option<String> {
+        self.test_fence_before_task_mutate
+            .lock()
+            .expect("task mutate seam lock")
             .take()
     }
 

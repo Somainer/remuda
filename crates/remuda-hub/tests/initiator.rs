@@ -353,9 +353,10 @@ impl Ctx {
         narrow: Option<&str>,
         body: Option<Value>,
     ) -> (reqwest::StatusCode, Value) {
+        let target = format!("{}{}", self.base(), path);
         let mut builder = self
             .http
-            .request(method.parse().unwrap(), format!("{}{}", self.base(), path))
+            .request(method.parse().unwrap(), target.clone())
             .bearer_auth(token);
         if let Some(instance) = narrow {
             builder = builder.header("x-remuda-instance-id", instance);
@@ -363,7 +364,10 @@ impl Ctx {
         if let Some(body) = body {
             builder = builder.json(&body);
         }
-        let response = builder.send().await.unwrap();
+        let response = builder
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("send {target}: {err}"));
         let status = response.status();
         let value = response.json().await.unwrap_or(json!(null));
         (status, value)
@@ -457,6 +461,57 @@ impl Ctx {
             },
             device_id,
         )
+    }
+
+    /// POST a task with a pool binding on the fake Node's workspace.
+    async fn post_pool_task(&self, title: &str) -> (reqwest::StatusCode, Value) {
+        self.agent_post(
+            "/v1/tasks",
+            json!({
+                "projectId": self.project,
+                "title": title,
+                "intent": "bind and fence",
+                "workspaceBinding": {
+                    "mode": "pool",
+                    "hostId": self.host,
+                    "workspaceId": self.workspace,
+                    "worktreeName": "p"
+                }
+            }),
+        )
+        .await
+    }
+
+    /// Task rows listed for the project.
+    async fn task_list(&self) -> Vec<Value> {
+        let (status, body) = self
+            .send(
+                "GET",
+                &format!("/v1/tasks?project={}", self.project),
+                &self.human,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        body["items"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// Hub-side lease rows (state, holder) for the test's host/workspace.
+    fn lease_rows(&self) -> Vec<(String, Option<String>)> {
+        let db = rusqlite::Connection::open(self.db_path()).unwrap();
+        let mut stmt = db
+            .prepare(
+                "SELECT state, holder_instance_id FROM worktree_leases
+                  WHERE host_id = ?1 AND workspace_id = ?2",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params![self.host, self.workspace], |row| {
+            Ok((row.get::<_, String>(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
     }
 
     /// Configure one gate lane on the connected fake Node. Deliberately a
@@ -1176,6 +1231,71 @@ async fn human_token_narrowed_to_a_fenced_chapter_is_refused() {
         .await;
     assert_fenced(status, &body);
     node.assert_no_frame("narrowed-human send").await;
+}
+
+// ── 7b. Pool binding fence lands mid-handler (lease vs mutate) ────────────
+
+#[tokio::test]
+async fn fence_before_lease_admission_refuses_fenced_and_writes_no_task_or_lease() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+
+    // F before the request: admit_node_op (worktree.lease) refuses inside
+    // the handler; lease_refusal must keep the 409 `fenced` shape instead
+    // of remapping it to a directory-binding CONFLICT.
+    ctx.fence().await;
+    let (status, body) = ctx.post_pool_task("fence-before-lease").await;
+    assert_fenced(status, &body);
+    assert!(
+        ctx.task_list().await.is_empty(),
+        "task row survived a pre-lease fence: {body}"
+    );
+    assert!(
+        ctx.lease_rows().is_empty(),
+        "lease row written despite a fenced admission"
+    );
+    // No worktree.lease reached the Node: the next frame is the sentinel.
+    node.assert_next_frame_is_sentinel(&ctx).await;
+}
+
+#[tokio::test]
+async fn fence_between_lease_and_bind_mutate_returns_the_lease_and_drops_the_task() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+
+    // Deterministic seam: the fence applies inside the NEXT mutate_task
+    // writer job — i.e. after worktree.lease returned and before the
+    // binding commits. The lease admission (its own writer) is unaffected.
+    ctx.store()
+        .test_arm_fence_before_task_mutate(ctx.instance.clone());
+    let (status, body) = ctx.post_pool_task("fence-between-lease-and-mutate").await;
+    assert_fenced(status, &body);
+
+    // The task row was cascaded away.
+    assert!(
+        ctx.task_list().await.is_empty(),
+        "task row survived a fenced bind mutate: {body}"
+    );
+
+    // The Hub unwound the lease internally: worktree.lease was sent, then
+    // worktree.return (initiator-less Hub cleanup), and nothing else.
+    let (method, lease_params) = node.next().await;
+    assert_eq!(method, "worktree.lease");
+    let (method, return_params) = node.next().await;
+    assert_eq!(
+        method, "worktree.return",
+        "expected internal worktree.return"
+    );
+    assert!(
+        return_params.get("initiator").is_none(),
+        "Hub-internal cleanup carries no initiator: {return_params}"
+    );
+    // The Hub released its catalog claim: no task holder remains on the row
+    // (the pool slot's state stays `leased` until worktree.remove confirms
+    // parking — this internal unwind never sends that, by design).
+    let rows = ctx.lease_rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].1.is_none(), "lease holder retained: {rows:?}");
+    node.assert_next_frame_is_sentinel(&ctx).await;
+    let _ = lease_params;
 }
 
 // ── 8. Body-supplied initiator/actor are ignored ──────────────────────────

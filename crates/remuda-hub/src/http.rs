@@ -3548,6 +3548,9 @@ pub(crate) async fn lease_on_host(
 pub(crate) fn lease_refusal(error: HubError) -> HubError {
     match error {
         HubError::SupplyDeferred { .. } => error,
+        // D-057 §7.3: a fence landing before lease admission is an authority
+        // refusal, not a directory conflict — keep the 409 `fenced` shape.
+        HubError::Fenced => error,
         other => HubError::Conflict(format!("directory binding blocked: {other}")),
     }
 }

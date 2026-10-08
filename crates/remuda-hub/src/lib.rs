@@ -652,6 +652,50 @@ impl RunningHub {
             .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
+    /// Test-only: drive one admitted direct RPC through the full §7.5
+    /// boundary (admit → send-intent → call → settle). Returns `true` when a
+    /// frame was written, `false` when the host was not connected.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn test_call_node_op(
+        &self,
+        host_id: &str,
+        method: &'static str,
+        op_id: String,
+        initiator: Option<remuda_protocol::Initiator>,
+        device_id: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let frame = crate::node_ops::call_admitted_frame(
+            &self.state,
+            host_id,
+            method,
+            None,
+            op_id.clone(),
+            serde_json::json!({}),
+            std::time::Duration::from_secs(5),
+            &crate::node_ops::NodeOpAuth {
+                initiator,
+                device_id,
+            },
+        )
+        .await?;
+        Ok(frame.is_some())
+    }
+
+    /// Test-only: read a node_ops row's (state, outcome_json) pair.
+    #[doc(hidden)]
+    pub async fn test_node_op_state(
+        &self,
+        op_id: &str,
+        host_id: &str,
+    ) -> anyhow::Result<Option<(String, Option<String>)>> {
+        self.store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .test_get_node_op(op_id.to_owned(), host_id.to_owned())
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into

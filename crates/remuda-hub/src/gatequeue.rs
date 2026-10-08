@@ -89,7 +89,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // column — GateJob.initiator_device_id is skip_serializing in the doc,
     // so a doc-only store would always claim with None and skip the device
     // clause. API responses keep skipping the field.
-    crate::store::ensure_column(&conn, "gate_jobs", "initiator_device_id", "TEXT")?;
+    crate::store::ensure_column(conn, "gate_jobs", "initiator_device_id", "TEXT")?;
     Ok(())
 }
 
@@ -376,10 +376,7 @@ async fn cancel_project_job(
         drop_job_refs(&state, &updated).await;
         return Ok(Json(json!(updated)));
     }
-    if !matches!(
-        job.state,
-        GateJobState::Running | GateJobState::Canceling
-    ) {
+    if !matches!(job.state, GateJobState::Running | GateJobState::Canceling) {
         return Err(HubError::Conflict(format!(
             "job already {}",
             job.state.as_str()
@@ -1649,7 +1646,17 @@ impl Store {
                     (id, project_id, state, lane_id, queued_at, doc_json, revision,
                      created_by, created_at, updated_at, initiator_device_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?8, ?9)",
-                params![id, project_id, state, lane, queued, doc, "", created, job_device_id],
+                params![
+                    id,
+                    project_id,
+                    state,
+                    lane,
+                    queued,
+                    doc,
+                    "",
+                    created,
+                    job_device_id
+                ],
             )?;
             Ok(())
         })

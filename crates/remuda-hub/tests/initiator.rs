@@ -209,7 +209,10 @@ impl FakeNode {
             .await;
         assert_eq!(status, 200, "{sentinel}");
         let (method, params) = self.next().await;
-        assert_eq!(method, "instance.send", "an unexpected frame leaked: {params}");
+        assert_eq!(
+            method, "instance.send",
+            "an unexpected frame leaked: {params}"
+        );
     }
 
     fn append(&self, instance_id: &str, event: Value) {
@@ -428,6 +431,32 @@ impl Ctx {
 
     fn send_body(operation: &str) -> Value {
         json!({"operation":operation,"payload":{"input":{"type":"prompt","text":"hi"}}})
+    }
+
+    /// The agent chapter's live initiator and its MCP device id, read
+    /// straight from the Hub DB.
+    fn agent_authority(&self) -> (remuda_protocol::Initiator, String) {
+        let db = rusqlite::Connection::open(self.db_path()).unwrap();
+        let (lineage_id, generation, device_id): (String, i64, String) = db
+            .query_row(
+                "SELECT i.lineage_id, COALESCE(l.generation, i.generation), d.id
+                   FROM instances i
+                   LEFT JOIN lineages l ON l.lineage_id = i.lineage_id
+                   JOIN devices d ON d.instance_id = i.id
+                  WHERE i.id = ?1
+                  ORDER BY d.created_at DESC LIMIT 1",
+                rusqlite::params![self.instance],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        (
+            remuda_protocol::Initiator {
+                instance_id: self.instance.clone(),
+                lineage_id,
+                generation,
+            },
+            device_id,
+        )
     }
 
     /// Configure one gate lane on the connected fake Node. Deliberately a
@@ -967,11 +996,8 @@ async fn gate_job_whose_authenticating_device_was_deleted_is_canceled_at_claim()
                 |row| row.get(0),
             )
             .unwrap();
-        db.execute(
-            "DELETE FROM devices WHERE id = ?1",
-            rusqlite::params![id],
-        )
-        .unwrap();
+        db.execute("DELETE FROM devices WHERE id = ?1", rusqlite::params![id])
+            .unwrap();
         id
     };
     ctx.configure_gate_lane().await;
@@ -1047,10 +1073,7 @@ async fn fenced_cancel_of_a_queued_or_running_gate_job_is_refused_before_the_nod
     for job_id in &job_ids {
         let (status, body) = ctx
             .agent_post(
-                &format!(
-                    "/v1/projects/{}/gate/jobs/{job_id}/cancel",
-                    ctx.project
-                ),
+                &format!("/v1/projects/{}/gate/jobs/{job_id}/cancel", ctx.project),
                 json!({}),
             )
             .await;
@@ -1232,29 +1255,7 @@ async fn agent_worker_routes_are_forbidden_and_provision_admission_is_fence_chec
 
     // The §7.5 admission boundary itself stays: a worker.provision op for a
     // fenced initiator is refused at the helper/store level with nothing sent.
-    let (lineage_id, generation): (String, i64) = {
-        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
-        db.query_row(
-            "SELECT lineage_id, generation FROM instances WHERE id = ?1",
-            rusqlite::params![ctx.instance],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap()
-    };
-    let initiator = remuda_protocol::Initiator {
-        instance_id: ctx.instance.clone(),
-        lineage_id,
-        generation,
-    };
-    let device_id = {
-        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
-        db.query_row(
-            "SELECT id FROM devices WHERE instance_id = ?1 ORDER BY created_at DESC LIMIT 1",
-            rusqlite::params![ctx.instance],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap()
-    };
+    let (initiator, device_id) = ctx.agent_authority();
     ctx.hub
         .test_admit_node_op(
             format!("wpr_{}", uuid::Uuid::now_v7()),
@@ -1282,6 +1283,84 @@ async fn agent_worker_routes_are_forbidden_and_provision_admission_is_fence_chec
     assert!(
         format!("{err:#}").to_lowercase().contains("fenced"),
         "{err:#}"
+    );
+}
+
+// ── 10b. node_ops: send intent precedes the wire; no host ⇒ not sent ──────
+
+#[tokio::test]
+async fn node_op_send_intent_precedes_the_call_and_a_missing_host_is_not_sent() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (initiator, device_id) = ctx.agent_authority();
+
+    // Connected host: admitted → sent intent → Node reply → settled.
+    let op_sent = format!("nop_{}", uuid::Uuid::now_v7());
+    let reached = ctx
+        .hub
+        .test_call_node_op(
+            &ctx.host,
+            "worker.provision",
+            op_sent.clone(),
+            Some(initiator.clone()),
+            Some(device_id.clone()),
+        )
+        .await
+        .unwrap();
+    assert!(reached, "the connected fake Node must answer");
+    let (state, _outcome) = ctx
+        .hub
+        .test_node_op_state(&op_sent, &ctx.host)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state, "settled");
+
+    // A host that exists in the catalog but holds no live Node session:
+    // nodes.call writes nothing and returns Ok(None) deterministically —
+    // no disconnect, no timing. The row must return to `admitted`/notSent,
+    // never stay `sent`, which ma-fence step 7 would read as "possibly
+    // executed".
+    let offline_host = format!("hst_{}", uuid::Uuid::now_v7());
+    {
+        // Clone the enrolled host's catalog row under a fresh id via a temp
+        // table (column list follows the live migration); no Node is (or
+        // ever was) connected with it.
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        db.execute_batch(&format!(
+            "CREATE TEMP TABLE host_clone AS SELECT * FROM hosts WHERE id = '{}';
+             UPDATE host_clone
+                SET id = '{offline_host}',
+                    token_hash = 'offline-{offline_host}',
+                    token_prefix = 'pfxoffline{tag}';
+             INSERT INTO hosts SELECT * FROM host_clone;",
+            ctx.host,
+            tag = uuid::Uuid::now_v7().simple()
+        ))
+        .unwrap();
+    }
+    let op_unsent = format!("nop_{}", uuid::Uuid::now_v7());
+    let reached = ctx
+        .hub
+        .test_call_node_op(
+            &offline_host,
+            "worker.provision",
+            op_unsent.clone(),
+            Some(initiator),
+            Some(device_id),
+        )
+        .await
+        .unwrap();
+    assert!(!reached, "no frame can be written without a live session");
+    let (state, outcome) = ctx
+        .hub
+        .test_node_op_state(&op_unsent, &offline_host)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state, "admitted", "an unwritten op must not read sent");
+    assert!(
+        outcome.unwrap().contains("notSent"),
+        "outcome must record notSent"
     );
 }
 

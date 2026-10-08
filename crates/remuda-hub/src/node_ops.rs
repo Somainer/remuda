@@ -19,7 +19,7 @@
 use crate::error::HubError;
 use crate::http::map_store;
 use crate::store::{Store, StoreError};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
 /// Admission lifecycle of one direct RPC. `Canceled` is set by ma-fence's
@@ -163,7 +163,11 @@ impl Store {
         .await
     }
 
-    /// Mark an admitted op `sent` (the frame was written to the Node link).
+    /// Mark an admitted op `sent` (send intent) — committed BEFORE the frame
+    /// is written to the Node link (main-agent.md §7.4/§7.5). Up to the RPC
+    /// timeout the row therefore reads `sent` *while the frame is on the
+    /// wire*, never `admitted`, so ma-fence step 7 cannot record an op that
+    /// actually ran as "admitted but not sent → cancelled".
     pub(crate) async fn mark_node_op_sent(
         &self,
         op_id: String,
@@ -171,6 +175,34 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.node_op_set_state(op_id, host_id, NodeOpState::Sent, None)
             .await
+    }
+
+    /// A `nodes.call` that produced no frame (`Ok(None)`: the host is not
+    /// connected): record truthfully that the op was admitted but NOT sent.
+    /// The row returns to `admitted` with a `notSent` outcome, so it stays
+    /// in F's "admitted but not sent → cancelled" class rather than the
+    /// "possibly executed" class. A call that errored AFTER the send intent
+    /// is deliberately left `sent`: the frame may have reached the wire and
+    /// its execution is unknown (§7.4 never infers "did not run").
+    pub(crate) async fn mark_node_op_not_sent(
+        &self,
+        op_id: String,
+        host_id: String,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let outcome_json =
+            serde_json::to_string(&serde_json::json!({ "notSent": true, "reason": reason }))?;
+        self.run_named("mark_node_op_not_sent", move |conn| {
+            let now = crate::config::now_rfc3339();
+            conn.execute(
+                "UPDATE node_ops
+                    SET state = 'admitted', outcome_json = ?3, updated_at = ?4
+                  WHERE op_id = ?1 AND host_id = ?2",
+                params![op_id, host_id, outcome_json, now],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Mark an op `settled` with the Node's result (or failure summary).
@@ -204,6 +236,30 @@ impl Store {
                 params![op_id, host_id, state.as_str(), outcome_json, now],
             )?;
             Ok(())
+        })
+        .await
+    }
+    /// Test-only: read one node_ops row's state and serialized outcome.
+    #[doc(hidden)]
+    pub async fn test_get_node_op(
+        &self,
+        op_id: String,
+        host_id: String,
+    ) -> Result<Option<(String, Option<String>)>, StoreError> {
+        self.run_named("test_get_node_op", move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT state, outcome_json FROM node_ops
+                      WHERE op_id = ?1 AND host_id = ?2",
+                    params![op_id, host_id],
+                    |row| {
+                        let state: String = row.get(0)?;
+                        let outcome: Option<String> = row.get(1)?;
+                        Ok((state, outcome))
+                    },
+                )
+                .optional()?;
+            Ok(row)
         })
         .await
     }
@@ -265,26 +321,44 @@ pub(crate) async fn call_admitted_frame(
             .admit_node_op(op_id.clone(), host_id.to_owned(), method, subject, auth)
             .await
             .map_err(map_store)?;
-    }
-    let params = auth.stamp_params(params, &op_id);
-    let reply = state.nodes.call(host_id, method, params, timeout).await;
-    if auth.initiator.is_some() {
+        // Send intent commits BEFORE the frame is written: while the RPC is
+        // outstanding (up to the timeout) the row already reads `sent`, so a
+        // fence landing in that window classifies the op truthfully.
         state
             .store
             .mark_node_op_sent(op_id.clone(), host_id.to_owned())
             .await
             .map_err(map_store)?;
     }
-    let reply = reply?;
+    let params = auth.stamp_params(params, &op_id);
+    let reply = state.nodes.call(host_id, method, params, timeout).await;
     if auth.initiator.is_some() {
-        let outcome = reply
-            .as_ref()
-            .map(|frame| frame.get("result").cloned().unwrap_or(Value::Null));
-        state
-            .store
-            .settle_node_op(op_id, host_id.to_owned(), outcome)
-            .await
-            .map_err(map_store)?;
+        match &reply {
+            // The Node took the frame: settle with its result.
+            Ok(Some(frame)) => {
+                let outcome = frame.get("result").cloned().unwrap_or(Value::Null);
+                state
+                    .store
+                    .settle_node_op(op_id, host_id.to_owned(), Some(outcome))
+                    .await
+                    .map_err(map_store)?;
+            }
+            // Nothing was written to any link: not sent, not unknown.
+            Ok(None) => {
+                state
+                    .store
+                    .mark_node_op_not_sent(
+                        op_id,
+                        host_id.to_owned(),
+                        "host not connected; no frame written",
+                    )
+                    .await
+                    .map_err(map_store)?;
+            }
+            // The send intent was already committed and the error cannot
+            // establish non-delivery: leave the row `sent` (unknown).
+            Err(_) => {}
+        }
     }
-    Ok(reply)
+    reply
 }

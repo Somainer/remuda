@@ -754,7 +754,8 @@ fn sum_turn_tokens_since(
     conn.query_row(
         "SELECT SUM(input_tokens), SUM(output_tokens)
          FROM usage_events
-         WHERE instance_id = ?1 AND scope = 'turn' AND observed_at >= ?2",
+         WHERE instance_id = ?1 AND scope = 'turn' AND observed_at >= ?2
+           AND observed_at_source = 'native'",
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -1048,7 +1049,7 @@ pub fn rollup_instance(
             SUM(CASE WHEN scope='turn' THEN cache_write_tokens END),
             COUNT(CASE WHEN scope='session' THEN 1 END),
             COUNT(*),
-            MAX(CASE WHEN scope='turn' THEN observed_at END)
+            MAX(CASE WHEN scope='turn' AND observed_at_source='native' THEN observed_at END)
          FROM usage_events WHERE instance_id = ?1",
         params![instance_id],
         |row| {
@@ -2842,5 +2843,109 @@ mod tests {
             Some(1200),
             "scoped world ignores the legacy row; the small replay never clobbered 1000"
         );
+    }
+
+    /// r5 item 7: a bulk codex replay with NO native timestamps (ingest
+    /// fallback rows) must not be read as current throughput — an
+    /// hours-old rollout bound at t=now stays out of the 60 s window and has
+    /// no lastTurnAt; a later turn carrying a native timestamp then enters
+    /// the window normally.
+    #[test]
+    fn ingest_stamped_codex_replay_stays_out_of_rate_windows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Two turn rows stamped "now" as ingest fallback (project sets source
+        // to 'ingest' when no nativeAt is present).
+        let now = {
+            let t = time::OffsetDateTime::now_utc();
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second(),
+                t.millisecond()
+            )
+        };
+        let ingest_turn = |seq: i64, input: i64, output: i64| JournalRecord {
+            instance_id: "ins_r57".into(),
+            seq,
+            event_id: format!("evt7_{seq}"),
+            event: json!({
+                "kind": "usage",
+                "payload": {
+                    "scope": "turn",
+                    "mode": "snapshot",
+                    "scopeId": format!("ing-{seq}"),
+                    "metricRevision": "1",
+                    "inputTokens": { "state": "known", "value": input.to_string() },
+                    "outputTokens": { "state": "known", "value": output.to_string() },
+                    "cacheReadTokens": { "state": "known", "value": "0" },
+                    "cacheWriteTokens": { "state": "known", "value": "0" },
+                    "cost": { "state": "unknown", "reason": "u", "evidenceEventIds": [] },
+                    "accounting": "estimated"
+                }
+            }),
+            observed_at: now.clone(),
+        };
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project_usage_event(&ingest_turn(1, 100, 10), None, None).unwrap()
+            )
+            .unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project_usage_event(&ingest_turn(2, 200, 20), None, None).unwrap()
+            )
+            .unwrap()
+        );
+
+        let rollup = rollup_instance(&conn, "ins_r57", "codex", None)
+            .unwrap()
+            .unwrap();
+        // Totals still count; current windows and lastTurnAt do not.
+        assert_eq!(rollup.session_input_tokens, Some(300));
+        assert_eq!(rollup.session_output_tokens, Some(30));
+        assert_eq!(
+            rollup.tpm_in_60s, None,
+            "ingest replay is not current throughput"
+        );
+        assert_eq!(rollup.tpm_in_5m, None);
+        assert_eq!(
+            rollup.last_turn_at, None,
+            "no trustworthy lastTurnAt without native time"
+        );
+
+        // A later real turn with a native timestamp is window-eligible.
+        let native = scoped_record(
+            3,
+            "ins_r57",
+            "turn",
+            Some("real-1"),
+            1,
+            40,
+            4,
+            0,
+            0,
+            Some(&now), // scoped_record marks nativeAt -> source native
+        );
+        assert!(insert(&conn, &native));
+        let rollup = rollup_instance(&conn, "ins_r57", "codex", None)
+            .unwrap()
+            .unwrap();
+        // Only the native 40 is in-window; the ingest rows still count totals.
+        assert_eq!(
+            rollup.tpm_in_60s,
+            Some(40),
+            "only the native turn enters the window"
+        );
+        assert_eq!(rollup.tpm_out_60s, Some(4));
+        assert_eq!(rollup.session_input_tokens, Some(340));
+        assert_eq!(rollup.last_turn_at.as_deref(), Some(now.as_str()));
     }
 }

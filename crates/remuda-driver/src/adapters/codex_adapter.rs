@@ -33,7 +33,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use remuda_protocol::{AgentKind, Id, ObservationPayload, ToolOutcome, UsageScope};
+use remuda_protocol::{AgentKind, Id, ObservationPayload, Timestamp, ToolOutcome, UsageScope};
+
+use crate::adapters::native_timestamp;
 use serde_json::Value;
 
 use crate::adapters::{
@@ -197,6 +199,7 @@ impl CodexAdapter {
                 turn_id.as_deref(),
                 "task_complete",
                 last_agent_message.clone(),
+                native_timestamp(record.timestamp.as_deref()),
             ),
             CodexRolloutEvent::ItemCompleted { turn_id, item } => {
                 self.on_completed_item(turn_id.clone(), item)
@@ -258,7 +261,12 @@ impl CodexAdapter {
             // "interrupted").
             CodexRolloutEvent::TurnAborted { turn_id, reason } => {
                 if reason.as_deref() == Some("interrupted") {
-                    self.end_turn(turn_id.as_deref(), "turn_aborted", None)
+                    self.end_turn(
+                        turn_id.as_deref(),
+                        "turn_aborted",
+                        None,
+                        native_timestamp(record.timestamp.as_deref()),
+                    )
                 } else {
                     Vec::new()
                 }
@@ -365,6 +373,7 @@ impl CodexAdapter {
         turn_id: Option<&str>,
         name: &'static str,
         last_message: Option<String>,
+        native_at: Option<Timestamp>,
     ) -> Vec<AdapterObservation> {
         let Some(turn_id) = turn_id else {
             return Vec::new();
@@ -403,7 +412,8 @@ impl CodexAdapter {
             let payload = to_usage_payload(UsageScope::Turn, turn_id.to_owned(), revision, totals);
             out.push(
                 AdapterObservation::structured(ObservationPayload::Usage(Box::new(payload)))
-                    .with_turn(turn_id),
+                    .with_turn(turn_id)
+                    .with_native_at(native_at.clone()),
             );
         }
         // Session snapshot each turn end as well (monotonic revision).
@@ -417,9 +427,10 @@ impl CodexAdapter {
             self.session_usage_revision,
             self.usage_totals.session(),
         );
-        out.push(AdapterObservation::structured(ObservationPayload::Usage(
-            Box::new(payload),
-        )));
+        out.push(
+            AdapterObservation::structured(ObservationPayload::Usage(Box::new(payload)))
+                .with_native_at(native_at),
+        );
         out
     }
 }

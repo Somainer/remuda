@@ -1241,4 +1241,168 @@ secret_refs = { token = "env:UNREAD_TEST_SECRET" }
             "Secret([redacted])"
         );
     }
+
+    /// c-bootstrap-dev round 2 (item 2): SecretRef::resolve normalises
+    /// trailing whitespace/newlines from the referenced secret.
+    #[test]
+    fn secret_ref_resolve_trims_trailing_whitespace() {
+        let fixture = Fixture::new("");
+        let path = fixture.0.join("access-code");
+        std::fs::write(&path, "  the-code-with-padding  \n\n").expect("write file");
+        let resolved = SecretRef::File(path).resolve().expect("file resolves");
+        assert_eq!(resolved.into_string(), "the-code-with-padding");
+        // Debug of a reference never prints the resolved value.
+        assert_eq!(
+            format!("{:?}", Secret("private".into())),
+            "Secret([redacted])"
+        );
+    }
+
+    /// c-bootstrap-dev round 2 (item 2): whitespace-only/empty referenced
+    /// secrets are rejected, not treated as empty-but-valid (covers the shared
+    /// trim+empty path used by BOTH file and env resolution).
+    #[test]
+    fn secret_ref_resolve_rejects_empty_after_trim() {
+        let fixture = Fixture::new("");
+        let path = fixture.0.join("empty-code");
+        std::fs::write(&path, "  \n\t ").expect("write blank file");
+        let err = SecretRef::File(path)
+            .resolve()
+            .expect_err("blank file rejected");
+        assert!(format!("{err}").contains("empty"), "got: {err}");
+    }
+
+    /// c-bootstrap-dev round 2 (item 2): a missing env var surfaces an error
+    /// that names only the variable — never a value — so a non-UTF-8 or secret
+    /// env value cannot leak into an error string (std::env::var's VarError is
+    /// discarded, only the reference name is formatted).
+    #[test]
+    fn secret_ref_missing_env_error_names_only_the_variable() {
+        let key = "REMUDA_TEST_SECRET_DEFINITELY_UNSET_42";
+        // Ensure unset (read is safe; no write needed).
+        let err = SecretRef::Env(key.into())
+            .resolve()
+            .expect_err("unset env rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains(key), "error names the var: {msg}");
+        // No assignment operator / value payload.
+        assert!(!msg.contains('='), "error carries no value: {msg}");
+    }
+
+    // c-bootstrap-dev round 3 (item 4): positive env resolution needs a real
+    // setenv, and the workspace forbids unsafe code (`env::set_var` is unsafe
+    // on edition 2024). The cases that set an env value therefore run in a
+    // child process fed through Command::env, mirroring remuda-signal tests.
+    const SECRET_CHILD_ENV: &str = "REMUDA_TEST_SECRET_CHILD";
+    const SECRET_MARKER_ENV: &str = "REMUDA_TEST_SECRET_MARKER";
+    const SECRET_VALUE_ENV: &str = "REMUDA_TEST_SECRET_VALUE";
+
+    fn run_secret_child(name: &str, value: std::ffi::OsString) -> std::process::Output {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", name, "--nocapture"])
+            .env(SECRET_CHILD_ENV, "1")
+            .env(SECRET_VALUE_ENV, value)
+            .output()
+            .expect("spawn child");
+        assert!(
+            output.status.success(),
+            "child {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// An env value carrying leading/trailing spaces and newlines is trimmed
+    /// to the inner secret on resolve.
+    #[test]
+    fn secret_ref_env_value_with_spaces_and_newline_is_trimmed() {
+        // Child marker doubles as the return channel: the child writes the
+        // resolved secret into it.
+        if std::env::var_os(SECRET_CHILD_ENV).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("resolved");
+        let value = std::ffi::OsString::from("  \ns3cret-value-with-padding\n\t \n");
+        std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "config::tests::secret_ref_env_value_trims_child",
+                "--nocapture",
+            ])
+            .env(SECRET_CHILD_ENV, "1")
+            .env(SECRET_VALUE_ENV, value)
+            .env(SECRET_MARKER_ENV, &marker)
+            .status()
+            .expect("spawn child");
+        let resolved = std::fs::read_to_string(&marker).expect("child result");
+        assert_eq!(resolved, "s3cret-value-with-padding");
+    }
+
+    #[test]
+    fn secret_ref_env_value_trims_child() {
+        if std::env::var_os(SECRET_CHILD_ENV).is_none() {
+            return;
+        }
+        let secret = SecretRef::Env(SECRET_VALUE_ENV.into())
+            .resolve()
+            .expect("padded env value resolves");
+        let marker =
+            std::path::PathBuf::from(std::env::var_os(SECRET_MARKER_ENV).expect("marker path"));
+        std::fs::write(marker, secret.into_string()).expect("write marker");
+    }
+
+    /// On Unix a non-UTF-8 env value yields an error whose rendering does not
+    /// carry the offending bytes OR their ASCII neighbours. The payload is
+    /// distinctive (`LEAKME` + 0xFF) so a leak of either the raw byte or a
+    /// lossy replacement is caught, under both the `{:#}` context chain and the
+    /// `{:?}` Debug rendering (a plain `{}` on an anyhow error hides the
+    /// chain and cannot hold 0xFF in a String anyway, so it could never fail).
+    #[cfg(unix)]
+    #[test]
+    fn secret_ref_non_utf8_env_error_does_not_contain_the_byte() {
+        if std::env::var_os(SECRET_CHILD_ENV).is_some() {
+            return;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"LEAKME\xFF").to_owned();
+        let output = run_secret_child("config::tests::secret_ref_non_utf8_env_error_child", bad);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("CHILD-OK"),
+            "child did not confirm a value-free error: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_ref_non_utf8_env_error_child() {
+        if std::env::var_os(SECRET_CHILD_ENV).is_none() {
+            return;
+        }
+        let err = SecretRef::Env(SECRET_VALUE_ENV.into())
+            .resolve()
+            .expect_err("non-UTF-8 env value must not resolve");
+        // Every rendering callers actually use when surfacing startup errors.
+        for rendered in [format!("{err:#}"), format!("{err:?}")] {
+            let bytes = rendered.as_bytes();
+            assert!(
+                !bytes.contains(&0xFF),
+                "error rendering leaks the raw secret byte: {rendered}"
+            );
+            assert!(
+                !rendered.contains('\u{FFFD}'),
+                "error rendering leaks a lossy replacement of the secret: {rendered}"
+            );
+            assert!(
+                !rendered.contains("LEAKME"),
+                "error rendering leaks the secret's ASCII payload: {rendered}"
+            );
+        }
+        assert!(
+            format!("{err}").contains(SECRET_VALUE_ENV),
+            "error names the var, never its value"
+        );
+        println!("CHILD-OK");
+    }
 }

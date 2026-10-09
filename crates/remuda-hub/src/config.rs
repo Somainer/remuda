@@ -18,6 +18,38 @@ pub const DEFAULT_ENROLL_TOKEN_TTL_MINUTES: u64 = 60;
 /// Default per-file attachment staging ceiling (D-027b): 25 MiB.
 pub const DEFAULT_ATTACHMENT_MAX_BYTES: usize = 25 * 1024 * 1024;
 
+/// Provenance of the configured bootstrap access code (c-bootstrap-dev).
+///
+/// Controls whether the Hub may mint/rotate the persisted token. Serialises as
+/// a simple tag so a config dump stays debuggable; the file path inside
+/// [`BootstrapSource::ExplicitFile`] is not persisted here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BootstrapSource {
+    /// Hub-owned: the token field is empty and the Hub mints the code itself
+    /// (or is about to). A non-empty token with this source is a startup
+    /// error; callers supplying a fixed code use an explicit source. Rotation
+    /// is allowed.
+    #[default]
+    Generated,
+    /// Resolved state: a no-source start loaded a persisted token and adopted
+    /// it. Rotation is allowed. Set only by `resolve_bootstrap`.
+    Adopted,
+    /// Operator-supplied via `--access-code-file PATH`; the path is retained
+    /// for the startup mtime check. Rotation is refused.
+    ExplicitFile(std::path::PathBuf),
+    /// Operator-supplied via `REMUDA_BOOTSTRAP_TOKEN`. Rotation is refused.
+    ExplicitEnv,
+}
+
+impl BootstrapSource {
+    /// True for the two explicit operator sources.
+    #[must_use]
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, Self::ExplicitFile(_) | Self::ExplicitEnv)
+    }
+}
+
 /// How Hub binds and authenticates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +63,20 @@ pub struct HubConfig {
     pub listen: SocketAddr,
     /// Device pairing access code. Empty means generate. Never enrolls a Node (D-018).
     pub bootstrap_token: String,
+    /// Where the bootstrap code comes from / who is allowed to mint over it.
+    ///
+    /// Provenance is explicit so a caller cannot hand in a token and silently
+    /// gain rotation authority. A non-empty [`Self::bootstrap_token`] requires
+    /// an explicit source — `resolve_bootstrap` rejects it otherwise.
+    /// * [`BootstrapSource::Generated`] — the token field is empty and the Hub
+    ///   is allowed to mint a code itself; rotation allowed.
+    /// * [`BootstrapSource::Adopted`] — set by `resolve_bootstrap` when a
+    ///   no-source start loads a persisted token it now owns; rotation allowed.
+    /// * [`BootstrapSource::ExplicitFile`] / [`BootstrapSource::ExplicitEnv`] —
+    ///   an operator-supplied code the Hub must never mint over; rotation is
+    ///   refused until a later start adopts it by running with no source.
+    #[serde(default)]
+    pub bootstrap_source: BootstrapSource,
     /// Bootstrap access-code lifetime in hours; `0` disables expiry.
     #[serde(default = "default_bootstrap_ttl_hours")]
     pub bootstrap_ttl_hours: u64,
@@ -191,6 +237,7 @@ impl Default for HubConfig {
             data_dir: PathBuf::from("./data"),
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             bootstrap_token: String::new(),
+            bootstrap_source: BootstrapSource::Generated,
             bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
             enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: true,
@@ -218,13 +265,22 @@ impl Default for HubConfig {
 }
 
 impl HubConfig {
-    /// Test helper: insecure cookie, generated bootstrap, caller-supplied data dir.
+    /// Test helper: insecure cookie, a FIXED random code with explicit
+    /// operator provenance, caller-supplied data dir.
+    ///
+    /// c-bootstrap-dev round 4: production startup rejects a non-empty
+    /// `bootstrap_token` without an explicit [`BootstrapSource`]; tests and
+    /// the hub_e2e example need a known login code, so they run as an explicit
+    /// source (the provenance marker is written and rotation is refused —
+    /// tests that rotate build their own hub-owned dir via
+    /// [`crate::auth::persist_bootstrap`]).
     pub fn for_test(data_dir: PathBuf) -> Self {
         Self {
             ssh_hosts: crate::ssh_hosts::SshHostOptions::default(),
             data_dir,
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             bootstrap_token: format!("boot-{}", Uuid::new_v4().simple()),
+            bootstrap_source: BootstrapSource::ExplicitEnv,
             bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
             enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: false,

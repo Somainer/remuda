@@ -3581,11 +3581,8 @@ impl Store {
                     params![&reason, &now, id],
                 )?;
             }
-            // A generation that ended owns no still-answerable request —
-            // but a node-epoch reconcile is an interruption, so a card with
-            // a known future deadline stays pending for its deadline
-            // (c-ghostbadge).
-            let settlement = settle_interactions_after_reconcile(&tx, &lost, &now)?;
+            // A generation that ended owns no still-answerable request.
+            let settlement = settle_instance_interactions(&tx, &lost, &now)?;
             tx.commit()?;
             Ok((lost, settlement))
         })
@@ -8903,79 +8900,6 @@ mod tests {
         store.close().await;
     }
 
-    /// c-cardsettle r8 (c-ghostbadge split): the node-epoch reconcile is an
-    /// interruption. A pending card with a KNOWN deadline still in the future
-    /// is deadline-owned and STAYS pending through the reconcile (the shared
-    /// deadline projection retires it in place); a card with no deadline is
-    /// invalidated generation-ended as before.
-    #[tokio::test]
-    async fn reconcile_keeps_open_deadline_cards_but_invalidates_deadlineless() {
-        let dir = tempfile::tempdir().expect("dir");
-        let store = Store::open(dir.path()).expect("store");
-        let host = new_id("hst").expect("host");
-        enroll_labeled(&store, host.clone(), "r8-deadline").await;
-
-        let open_deadline = seed_acknowledged_instance(&store, &host).await;
-        let no_deadline = seed_acknowledged_instance(&store, &host).await;
-        let open_card = seed_pending_interaction(&store, &host, &open_deadline.instance_id).await;
-        let plain_card = seed_pending_interaction(&store, &host, &no_deadline.instance_id).await;
-        // Attach a known future deadline to one card.
-        store
-            .run_named("r8_set_open_deadline", {
-                let open_card = open_card.clone();
-                move |conn| {
-                    conn.execute(
-                        r#"UPDATE interactions
-                             SET payload_json = json_set(payload_json,
-                                 '$.interaction.deadline',
-                                 json('{"state":"known","value":"2999-01-01T00:00:00.000Z"}'))
-                           WHERE id = ?1"#,
-                        params![open_card],
-                    )?;
-                    Ok(())
-                }
-            })
-            .await
-            .expect("set deadline");
-
-        // A new epoch reports neither instance: the reconcile settles the
-        // generation but respects the open deadline.
-        let (_lost, settlement) = store
-            .reconcile_reported_instances(host, vec![], "node-epoch-changed".to_string())
-            .await
-            .expect("reconcile");
-
-        let state_of = |id: String| {
-            let store = store.clone();
-            async move {
-                store
-                    .run_named("r8_read_card", move |conn| {
-                        let (state, blocking): (String, i64) = conn.query_row(
-                            "SELECT state, blocking FROM interactions WHERE id = ?1",
-                            params![id],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )?;
-                        Ok((state, blocking))
-                    })
-                    .await
-                    .expect("read card")
-            }
-        };
-        let (open_state, open_blocking) = state_of(open_card.clone()).await;
-        assert_eq!((open_state.as_str(), open_blocking), ("pending", 1));
-        let (plain_state, plain_blocking) = state_of(plain_card.clone()).await;
-        assert_eq!((plain_state.as_str(), plain_blocking), ("invalidated", 0));
-        // Only the deadlineless card is announced as a settlement.
-        let settled: Vec<String> = settlement
-            .interactions
-            .iter()
-            .map(|s| s.interaction_id.clone())
-            .collect();
-        assert!(settled.contains(&plain_card));
-        assert!(!settled.contains(&open_card));
-        store.close().await;
-    }
-
     /// c-cardsettle r5 item 6: the lag recovery cursor replaces the fixed
     /// 5-minute window for a follower that MISSED notices. An older lost
     /// settlement (beyond the reconnect snapshot window) is still recovered on
@@ -12329,11 +12253,7 @@ fn apply_interaction_event(
         // return a settlement notice so ws broadcasts it exactly like every
         // other terminal path. A non-terminal owner keeps the pending +
         // blocked behaviour below.
-        //
-        // c-ghostbadge exception: a card with a KNOWN deadline still open is
-        // deadline-owned (see interaction_deadline_is_open); it survives the
-        // ended owner so the deadline projection can retire it in place.
-        if !interaction_deadline_is_open(event, &now) && owner_instance_ended(conn, instance_id)? {
+        if owner_instance_ended(conn, instance_id)? {
             let prior_state: Option<String> = conn
                 .query_row(
                     "SELECT state FROM interactions WHERE id = ?1",
@@ -12505,31 +12425,6 @@ pub(crate) fn lifecycle_has_process_end_evidence(
 /// the `exited`/host-lost sweep marker with no `ended_at` — is NOT an ended
 /// owner: the process behind the lost contact may still run and the row is
 /// revived on a same-epoch reconnect.
-/// c-ghostbadge: a pending interaction carrying a KNOWN deadline still in the
-/// future is retired by the shared deadline projection, NOT by instance
-/// lifecycle settlement. It survives a node-epoch reconcile (an interruption
-/// whose process may resume) and a journal replay after one, so the badge can
-/// flip 1 -> 0 in place when the deadline crosses. Cards with no deadline, an
-/// UNKNOWN deadline, or an already-past deadline follow the normal
-/// generation-ended settlement.
-fn interaction_deadline_is_open(event: &Value, now: &str) -> bool {
-    let deadline = event
-        .pointer("/interaction/deadline")
-        .or_else(|| event.get("deadline"))
-        .or_else(|| event.pointer("/payload/interaction/deadline"))
-        .or_else(|| event.pointer("/payload/deadline"));
-    let Some(deadline) = deadline else {
-        return false;
-    };
-    if deadline.get("state").and_then(Value::as_str) != Some("known") {
-        return false;
-    }
-    deadline
-        .get("value")
-        .and_then(Value::as_str)
-        .is_some_and(|value| value > now)
-}
-
 fn owner_instance_ended(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
     let row: Option<(String, Option<String>, Option<String>)> = conn
         .query_row(
@@ -12580,28 +12475,6 @@ pub(crate) fn settle_instance_interactions(
     instance_ids: &[String],
     now: &str,
 ) -> Result<Settlement, StoreError> {
-    // Every lifecycle terminal write settles cards regardless of their own
-    // deadline, EXCEPT a node-epoch reconcile, which is an interruption:
-    // known-future-deadline cards there are deadline-owned (c-ghostbadge).
-    settle_instance_interactions_inner(conn, instance_ids, now, false)
-}
-
-/// Node-epoch reconcile variant: pending cards with a KNOWN deadline still in
-/// the future stay pending and are retired by the deadline projection.
-pub(crate) fn settle_interactions_after_reconcile(
-    conn: &Connection,
-    instance_ids: &[String],
-    now: &str,
-) -> Result<Settlement, StoreError> {
-    settle_instance_interactions_inner(conn, instance_ids, now, true)
-}
-
-fn settle_instance_interactions_inner(
-    conn: &Connection,
-    instance_ids: &[String],
-    now: &str,
-    respect_open_deadline: bool,
-) -> Result<Settlement, StoreError> {
     if instance_ids.is_empty() {
         return Ok(Settlement::default());
     }
@@ -12636,14 +12509,6 @@ fn settle_instance_interactions_inner(
     };
     let mut settlement = Settlement::default();
     for (id, owner_instance_id, payload_json) in pending {
-        if respect_open_deadline {
-            let card: Value = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
-            if interaction_deadline_is_open(&card, now) {
-                // Deadline-owned: leave the row pending for the shared
-                // deadline projection to retire.
-                continue;
-            }
-        }
         let mut event: Value = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
         invalidate_interaction_payload(&mut event, now);
         let changed = conn.execute(

@@ -9665,6 +9665,70 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r9 item 1 (coordinator decision): terminal-transition
+    /// settlement is UNCONDITIONAL. A pending card carrying a KNOWN deadline
+    /// still in the future — the shape EVERY real Claude hook approval has
+    /// (Known{now+15 min}) — is still invalidated when a new Node epoch omits
+    /// its instance. The Hub has no deadline sweeper, so an exemption would
+    /// leave the row pending, counted by the badge and still answerable until
+    /// the deadline and forever afterwards. This is the regression efb15f28
+    /// introduced and 870cf11c reverted.
+    #[tokio::test]
+    async fn node_epoch_reconcile_settles_a_pending_card_with_a_known_future_deadline() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r9-known-deadline-reconcile").await;
+        let lost = seed_acknowledged_instance(&store, &host).await;
+        let card = seed_pending_interaction(&store, &host, &lost.instance_id).await;
+        store
+            .run_named("r9_set_future_deadline", {
+                let card = card.clone();
+                move |conn| {
+                    conn.execute(
+                        r#"UPDATE interactions
+                             SET payload_json = json_set(payload_json,
+                                 '$.payload.interaction.deadline',
+                                 json('{"state":"known","value":"2999-01-01T00:00:00.000Z"}'))
+                           WHERE id = ?1"#,
+                        params![card],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("set known future deadline");
+
+        let (reconciled, settlement) = store
+            .reconcile_reported_instances(host, vec![], "node-epoch-changed".to_string())
+            .await
+            .expect("reconcile");
+        assert_eq!(reconciled, vec![lost.instance_id.clone()]);
+        let settled: Vec<String> = settlement
+            .interactions
+            .iter()
+            .map(|s| s.interaction_id.clone())
+            .collect();
+        assert_eq!(
+            settled,
+            vec![card.clone()],
+            "the known-open-deadline card is settled with the instance"
+        );
+
+        let (state, reason) = interaction_state_and_reason(&store, &card).await;
+        assert_eq!(state, "invalidated", "it never stays pending");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        let pending: Vec<_> = store
+            .list_interactions(None, None, None, true)
+            .await
+            .expect("pending list")
+            .into_iter()
+            .map(|r| r.interaction_id)
+            .collect();
+        assert!(!pending.contains(&card), "the badge never counts it");
+        store.close().await;
+    }
+
     /// c-cardsettle: reconcile is idempotent — a second reconcile touches
     /// neither the already-terminal instance nor the settled card, and no
     /// settlement is returned.
@@ -9917,6 +9981,99 @@ mod tests {
         );
         let (state, _) = interaction_state_and_reason(&store, &late_id).await;
         assert_eq!(state, "invalidated");
+        store.close().await;
+    }
+
+    /// c-cardsettle r9 item 1: the ended-owner INSERT gate is
+    /// owner-instance-ended ALONE. A replayed `interaction.requested` that
+    /// carries a KNOWN deadline still in the future (every real hook approval
+    /// has one) for an owner the hello reconcile already marked exited is
+    /// invalidated in the insert transaction — never inserted pending, never
+    /// re-blocking the exited instance. efb15f28 exempted open-deadline cards
+    /// here too, reopening the owner's bug on the replay path.
+    #[tokio::test]
+    async fn replayed_request_with_a_known_future_deadline_for_ended_owner_is_invalidated() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r9-known-deadline-replay").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+
+        // A new Node epoch omits the instance: the reconcile ends it first,
+        // exactly like the real reconnect ordering.
+        let (_, reconcile_settlement) = store
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into())
+            .await
+            .expect("reconcile");
+        assert!(reconcile_settlement.is_empty(), "no card existed yet");
+        let owner = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("owner")
+            .expect("row");
+        assert_eq!(owner.lifecycle, "exited");
+        let activity_before = owner.activity.clone();
+
+        // The journal catch-up replays the approval — with a KNOWN deadline
+        // still 15 minutes in the future, as the hook driver journals it.
+        let late_id = new_id("int").expect("late interaction id");
+        let appended = store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": late_id,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "deadline": {
+                                "state": "known",
+                                "value": "2999-01-01T00:00:00.000Z"
+                            },
+                            "resolution": { "state": "unknown" },
+                            "request": {
+                                "kind": "approval",
+                                "title": "Bash",
+                                "description": "journaled while the hub link was down",
+                                "options": []
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("replay late request with open deadline");
+        assert_eq!(appended.settlement.interactions.len(), 1);
+        assert_eq!(appended.settlement.interactions[0].interaction_id, late_id);
+
+        let (state, reason) = interaction_state_and_reason(&store, &late_id).await;
+        assert_eq!(state, "invalidated", "never inserted pending");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+
+        let owner_after = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("owner after")
+            .expect("row");
+        assert_eq!(
+            owner_after.activity, activity_before,
+            "the exited instance is never set back to blocked"
+        );
+        assert_ne!(owner_after.activity, "blocked");
+        let pending: Vec<_> = store
+            .list_interactions(None, None, None, true)
+            .await
+            .expect("pending list")
+            .into_iter()
+            .map(|r| r.interaction_id)
+            .collect();
+        assert!(!pending.contains(&late_id), "the badge never counts it");
         store.close().await;
     }
 

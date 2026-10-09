@@ -29,6 +29,9 @@ mod interactions;
 /// Test-only seam for the D-051 delegated-decisions feature switch.
 #[doc(hidden)]
 pub use interactions::delegated_decisions_test_support;
+/// Test-only seam for the D-057 continuation-resume race.
+#[doc(hidden)]
+pub use store::lineage_test_support;
 mod inventory;
 mod maintenance;
 mod model_catalog;
@@ -62,7 +65,9 @@ mod workspaces;
 mod ws;
 
 use crate::alerts::{BlockedWatch, Followers};
-use crate::auth::{persist_listen, resolve_bootstrap};
+use crate::auth::{
+    BootstrapResolution, adopt_bootstrap_after_bind, persist_listen, resolve_bootstrap,
+};
 use crate::store::Store;
 use crate::ws::Bus;
 use axum::Router;
@@ -79,10 +84,11 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub use agent_scope::instance_token;
-pub use auth::{bootstrap_issued_at, rotate_bootstrap};
+pub use auth::{bootstrap_issued_at, persist_bootstrap, rotate_bootstrap};
 pub use config::{
-    DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_BOOTSTRAP_TTL_HOURS, DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
-    DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS,
+    BootstrapSource, DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_BOOTSTRAP_TTL_HOURS,
+    DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS, DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig,
+    MIN_CREATE_SETTLE_TIMEOUT_MS,
 };
 pub use error::HubError;
 pub use maintenance::migrate;
@@ -137,6 +143,9 @@ pub mod store_test_support {
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
 
+    /// D-057 continuation-resume inputs/outcomes for the race suite.
+    pub use crate::store::{ContinuationResumeRequest, ContinuationResumeResult};
+
     /// A leaf-worker delegation scoped to one project.
     pub fn leaf_delegation(project_id: &str) -> Result<InstanceDelegation, String> {
         let project = remuda_protocol::ProjectId::try_from(project_id.to_string())
@@ -150,6 +159,7 @@ pub mod store_test_support {
             grants: Vec::new(),
             task_id: None,
             enforce_tree: true,
+            restart: None,
         })
     }
 
@@ -683,7 +693,7 @@ async fn spawn_inner(
     supervise::mark_started();
     proxy::configure_public_origin(&mut config)?;
     std::fs::create_dir_all(&config.data_dir)?;
-    resolve_bootstrap(&mut config)?;
+    let bootstrap_resolution = resolve_bootstrap(&mut config)?;
     let bootstrap_token = config.bootstrap_token.clone();
     let store = Store::open(&config.data_dir)?;
     store
@@ -738,6 +748,13 @@ async fn spawn_inner(
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     persist_listen(&config.data_dir, addr)?;
+    // Bind established: a no-source start may now adopt an explicit-marker'd
+    // persisted token, or commit the in-memory mint of a token-less recovery
+    // path. A failed bind above aborts before this, leaving the provenance
+    // marker (and rotation refusal) intact.
+    if bootstrap_resolution == BootstrapResolution::AdoptAfterBind {
+        adopt_bootstrap_after_bind(&config.data_dir, &config.bootstrap_token)?;
+    }
     let (tx, rx) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         let shutdown = async {

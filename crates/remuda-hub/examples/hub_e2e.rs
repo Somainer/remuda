@@ -40,6 +40,8 @@ async fn main() -> Result<()> {
         .parse::<SocketAddr>()
         .context("listen addr")?;
     config.web_root = std::env::var_os("REMUDA_WEB_ROOT").map(Into::into);
+    // Fixed e2e login code; for_test already tags it ExplicitEnv so the fixed
+    // code has provenance (round 4: a sourceless non-empty token is refused).
     config.bootstrap_token = BOOTSTRAP.into();
     config.cookie_secure = false;
     config.allowed_origins = origins

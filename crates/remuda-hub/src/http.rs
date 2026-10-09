@@ -329,6 +329,13 @@ pub async fn login(
     Json(body): Json<LoginBody>,
 ) -> Result<Response, HubError> {
     require_origin(&headers, &state.config)?;
+    // Round 6 item 2: never accept an EMPTY presented code. A crash could once
+    // leave the configured token empty (secret_eq("", "") would then mint a
+    // device token unauthenticated); reject before any comparison, regardless
+    // of provenance.
+    if body.bootstrap_token.is_empty() {
+        return Err(HubError::Unauthenticated);
+    }
     if !crate::config::secret_eq(&body.bootstrap_token, &state.config.bootstrap_token) {
         return Err(HubError::Unauthenticated);
     }

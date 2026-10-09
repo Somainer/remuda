@@ -18,6 +18,11 @@ services:
     tmpfs: [/tmp]
     volumes:
       - /data00/remuda/hub:/data
+      # Separate read-only secrets mount for an operator-pinned access code
+      # (bootstrapToken = "file:/secrets/access-code"). Kept OUTSIDE the
+      # writable data dir so a cp -r restore cannot carry a newer-mtime access
+      # file over the restored stamp. Create the host dir 0700 (see m1 README).
+      - /data00/remuda/secrets:/secrets:ro
       - ./hub.toml:/etc/remuda/hub.toml:ro
     environment:
       REMUDA_DATA_DIR: /data

@@ -476,70 +476,11 @@ fn a_later_turn_workflow_intermediate_with_nonzero_index_does_not_settle() {
     assert!(settles_root_turn(&results[2]));
 }
 
-/// r3 item 4: an older buffered result mapped AFTER a newer turn_started was
-/// published must settle the OLDER outstanding turn, not the newer input.
-///
-/// The mapper tracks locally-written turns as a FIFO: the first result pops
-/// the front turn and settles the root only when NO newer turn remains
-/// outstanding. Here two prompts are written (A then B), the result for A is
-/// mapped after B's turn_started: it cannot idle B; B's own result then
-/// settles.
-#[test]
-fn an_older_buffered_result_cannot_settle_a_newer_outstanding_input() {
-    let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
-    let _started_a = mapper.turn_started().expect("turn A started");
-    let _started_b = mapper.turn_started().expect("turn B started");
-
-    // A result line for turn A mapped from the reader NOW — after B's start
-    // was published (the buffer/reorder race).
-    let result_a = serde_json::json!({
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-        "result": "A done",
-        "stop_reason": "end_turn",
-        "session_id": SESSION,
-        "result_index": 0,
-    });
-    let obs_a = mapper.map(result_a).expect("map result A");
-    let native_a = obs_a
-        .iter()
-        .find_map(|o| match &o.body {
-            ObservationPayload::Lifecycle(p) => match p.as_ref() {
-                LifecyclePayload::Native(n) if n.native_name == "result" => Some(n),
-                _ => None,
-            },
-            _ => None,
-        })
-        .expect("result lifecycle A");
-    assert!(
-        !settles_root_turn(native_a),
-        "turn B is still outstanding: A's result must not idle the root"
-    );
-
-    // B's own result settles.
-    let result_b = serde_json::json!({
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-        "result": "B done",
-        "stop_reason": "end_turn",
-        "session_id": SESSION,
-        "result_index": 1,
-    });
-    let obs_b = mapper.map(result_b).expect("map result B");
-    let settles_b = obs_b.iter().any(|o| match &o.body {
-        ObservationPayload::Lifecycle(p) => match p.as_ref() {
-            LifecyclePayload::Native(n) => {
-                n.native_name == "result"
-                    && n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true")
-            }
-            _ => false,
-        },
-        _ => false,
-    });
-    assert!(
-        settles_b,
-        "the last outstanding turn's result settles the root"
-    );
-}
+// NOTE ma-sdk-state r5 item 1: the former hand-mapped
+// `an_older_buffered_result_cannot_settle_a_newer_outstanding_input` lived
+// here and drove `StdoutMapper` directly, so it could not exercise the
+// publication ordering that actually prevents an older buffered result from
+// settling a newer turn. It was replaced by a test through the REAL
+// publication task:
+// `an_older_buffered_result_cannot_settle_a_newer_outstanding_input_through_the_publication_task`
+// in tests/claude_sdk_process.rs.

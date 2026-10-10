@@ -21,6 +21,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// The driver's write-commit barrier is a single process-global slot, so tests
+/// that arm it must not run concurrently with each other in this binary.
+static BARRIER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn ensure_fake_claude() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
@@ -114,13 +118,17 @@ fn process_alive(pid: &str) -> bool {
 }
 
 fn prompt(text: &str) -> DriverInput {
+    prompt_id(text, "msg-1")
+}
+
+fn prompt_id(text: &str, native_client_message_id: &str) -> DriverInput {
     DriverInput::Prompt(Box::new(PromptInput {
         mode: PromptMode::NewTurn,
         blocks: vec![ContentBlock::Text(Box::new(TextBlock {
             text: text.into(),
         }))],
         origin: InputOrigin::Human,
-        native_client_message_id: "msg-1".into(),
+        native_client_message_id: native_client_message_id.into(),
     }))
 }
 
@@ -786,20 +794,25 @@ async fn close_returns_when_stdin_is_not_drained_and_the_writer_is_saturated() {
     );
 }
 
-/// r3 item 5: a blocked SEND cannot gate close, and stdout must keep draining
-/// under bidirectional pipe pressure.
+/// r3 item 5 + ma-sdk-state r5 item 1: a blocked SEND cannot gate close, and
+/// the child's stdout must keep being DRAINED under bidirectional pipe
+/// pressure.
 ///
 /// The fake stops reading stdin AND floods stdout forever. A prompt bigger
 /// than a pipe buffer blocks in the writer task. Pre-r3 `send` held the
 /// `live` (and turn-order) lock across that write, so a concurrent `close`
-/// could not start its ladder and the process hung. Here we:
+/// could not start its ladder and the process hung. r5 parks the publication
+/// worker at the turn's in-queue reservation ticket while the write is
+/// blocked: the reader task keeps draining the child's stdout into the
+/// unbounded queue (so the OS pipe never fills and close is not gated), but
+/// frames behind the ticket are not EMITTED until the write resolves. Here we:
 ///  1. start a large send and prove it is parked on the blocked pipe;
-///  2. prove stdout frames keep arriving (the reader is not starved by the
-///     blocked write);
+///  2. prove emission is gated at the ticket while the reader still drains
+///     (no pipe deadlock);
 ///  3. close concurrently — it must reach the ladder, reap the child within
 ///     its bound, and release the parked send (with an error, not a success).
 #[tokio::test]
-async fn a_blocked_send_cannot_gate_close_and_stdout_keeps_draining() {
+async fn a_blocked_send_cannot_gate_close_and_emission_gates_at_the_ticket_without_deadlock() {
     let mut env = BTreeMap::new();
     env.insert("FAKE_CLAUDE_STOP_READING".into(), "1".into());
     env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
@@ -815,21 +828,23 @@ async fn a_blocked_send_cannot_gate_close_and_stdout_keeps_draining() {
         "the send must stay parked while the child does not drain stdin"
     );
 
-    // 2. Bidirectional pressure: stdout frames keep being mapped and delivered
-    // while the write is blocked. The flood emits assistant frames every
-    // ~500us; collect a handful from the RunHandle channel.
-    let mut drained = 0usize;
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while drained < 5 && tokio::time::Instant::now() < drain_deadline {
-        match tokio::time::timeout(Duration::from_millis(500), handle.recv()).await {
-            Ok(Some(_)) => drained += 1,
-            Ok(None) => break,
-            Err(_) => break,
+    // 2. The flood (~one frame every 500us, i.e. thousands over the window if
+    // it flowed) must NOT be emitted while the worker holds the reservation
+    // ticket. Only the few frames enqueued ahead of the ticket can be
+    // delivered before the worker parks; a free-running drain would deliver
+    // orders of magnitude more. The reader still drains the child's stdout
+    // into the unbounded queue, so the OS pipe never fills (no close deadlock).
+    let mut emitted = 0usize;
+    let gate_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < gate_deadline {
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(100), handle.recv()).await {
+            emitted += 1;
         }
     }
     assert!(
-        drained >= 5,
-        "stdout must keep draining behind a blocked write; got {drained} observations"
+        emitted < 100,
+        "frames behind the parked reservation must not be emitted; got {emitted} \
+         (a free-running 2 kHz flood delivers thousands over the window)"
     );
 
     // 3. close must start immediately (no `live` held by the blocked send),
@@ -929,6 +944,7 @@ async fn a_send_after_the_child_stdin_closed_is_an_error_not_written() {
 /// reserved turn's start must still be published before ITS result.
 #[tokio::test]
 async fn a_result_queued_during_the_write_window_starts_then_results() {
+    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
     let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let mut handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
@@ -1230,6 +1246,120 @@ async fn buffered_result_a_then_published_b_sets_activity_per_turn_through_the_p
         turn_done_count(&second),
         1,
         "only B's result completes here"
+    );
+
+    let pid = handle.ack().native_ids.get("pid").cloned().expect("pid");
+    assert!(process_alive(&pid), "the sdk child survives both turns");
+    driver.close().await.expect("close");
+}
+
+/// ma-sdk-state r5 item 1 (replaces the old hand-mapped
+/// `an_older_buffered_result_cannot_settle_a_newer_outstanding_input`): drive
+/// two turns through the REAL publication task with turn A's ticket parked
+/// while B is registered, so B's book is open before the worker maps A's
+/// buffered result. Two invariants are checked on the published stream:
+/// (1) ORDER — start_A < result_A < start_B < result_B, so no result ever
+/// precedes its own turn_started (the in-queue ticket makes this structural);
+/// (2) ATTRIBUTION — A's result is mapped while turn B is outstanding, so it
+/// carries no settledRootTurn and cannot settle the root; only B's result
+/// settles. The raw turn lifecycle still goes working → turn_done → working →
+/// turn_done, and the child survives.
+#[tokio::test]
+async fn an_older_buffered_result_cannot_settle_a_newer_outstanding_input_through_the_publication_task()
+ {
+    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    // One task owns the driver: send A (which commits while the worker is held
+    // at its ticket) then send B, whose book is opened before the worker maps
+    // A's buffered result.
+    let send_both = tokio::spawn(async move {
+        driver.send(prompt_id("first", "msg-a")).await?;
+        driver.send(prompt_id("second", "msg-b")).await?;
+        Ok::<ClaudeSdkDriver, DriverError>(driver)
+    });
+    // Wait until the worker holds turn A's ticket and the write has acked.
+    barrier
+        .wait_until_reserve_parked(Duration::from_secs(5))
+        .await;
+    // Release the SEND only: A commits, the worker publishes start_A then
+    // stays parked at the ticket (worker gate still shut).
+    barrier.release_send();
+    // Wait until B's reservation is enqueued — B's book is now open, in the
+    // queue behind A's buffered result.
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+    // Now let the worker map. It maps A's result with turn B outstanding.
+    barrier.resume_worker();
+    let send_both = send_both.await.expect("send task");
+    let driver = send_both.as_ref().expect("both prompt writes ack");
+
+    // Drain BOTH turns in one pass — no draining between the two sends, so this
+    // is the unfiltered publication order.
+    let all = collect_until(&mut handle, Duration::from_secs(8), |obs| {
+        let starts = obs
+            .iter()
+            .filter(|o| lifecycle_named(o) == Some("turn_started"))
+            .count();
+        starts >= 2 && turn_done_count(obs) >= 2
+    })
+    .await;
+
+    let positions = |name: &str| {
+        all.iter()
+            .enumerate()
+            .filter_map(|(i, o)| (lifecycle_named(o) == Some(name)).then_some(i))
+            .collect::<Vec<_>>()
+    };
+    let starts = positions("turn_started");
+    let results = positions("result");
+    assert_eq!(starts.len(), 2, "two turn_started: {all:?}");
+    assert_eq!(results.len(), 2, "two results: {all:?}");
+    // The invariant: each turn's start precedes its OWN result, and the older
+    // turn's result is fully published BEFORE the newer turn starts.
+    assert!(
+        starts[0] < results[0] && results[0] < starts[1] && starts[1] < results[1],
+        "expected start_A < result_A < start_B < result_B, got starts={starts:?} results={results:?}"
+    );
+
+    // Per-turn attribution (the claim the old hand-mapped test made): A's
+    // result is mapped while B's turn is already open, so it must NOT carry
+    // settledRootTurn — it cannot settle the root a newer turn owns. Only B's
+    // result, with no turn outstanding behind it, settles.
+    let settles_at = |pos: usize| {
+        matches!(&all[pos].body,
+            ObservationPayload::Lifecycle(p) if matches!(p.as_ref(),
+                LifecyclePayload::Native(n) if n.native_name == "result"
+                    && n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true")))
+    };
+    assert!(
+        !settles_at(results[0]),
+        "the older buffered result A must not settle while turn B is outstanding"
+    );
+    assert!(
+        settles_at(results[1]),
+        "the last outstanding turn B's result settles the root"
+    );
+
+    // Raw turn lifecycle still runs working → turn_done → working → turn_done:
+    // A's end-of-turn result is published (turn_done) without idling the root,
+    // and B re-enters working at its own start. (The Node engine keeps the row
+    // working through A because A's result lacks settledRootTurn, and derives
+    // idle only from B's settling result.)
+    let mut edges: Vec<&str> = Vec::new();
+    for status in all.iter().filter_map(lifecycle_status) {
+        if edges.last() != Some(&status) && matches!(status, "working" | "turn_done") {
+            edges.push(status);
+        }
+    }
+    assert_eq!(
+        edges,
+        vec!["working", "turn_done", "working", "turn_done"],
+        "per-turn working/turn_done edges: {edges:?}"
     );
 
     let pid = handle.ack().native_ids.get("pid").cloned().expect("pid");

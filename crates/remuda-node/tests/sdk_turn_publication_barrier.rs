@@ -27,6 +27,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// The driver's write-commit barrier is a single process-global slot, so the
+/// tests that arm it must not run concurrently with each other in this binary.
+static BARRIER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn ensure_fake_claude() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
@@ -69,14 +73,44 @@ fn spec(tmp: &std::path::Path) -> InstanceSpec {
 }
 
 fn prompt(text: &str) -> remuda_protocol::DriverInput {
+    prompt_id(text, "msg-barrier-1")
+}
+
+fn prompt_id(text: &str, client_message_id: &str) -> remuda_protocol::DriverInput {
     remuda_protocol::DriverInput::Prompt(Box::new(PromptInput {
         mode: PromptMode::NewTurn,
         blocks: vec![ContentBlock::Text(Box::new(TextBlock {
             text: text.into(),
         }))],
         origin: InputOrigin::Human,
-        native_client_message_id: "msg-barrier-1".into(),
+        native_client_message_id: client_message_id.into(),
     }))
+}
+
+/// Launch the REAL sdk driver against a fake-claude playing `kind`.
+async fn launch(
+    kind: ScriptKind,
+) -> (tempfile::TempDir, ClaudeSdkDriver, remuda_driver::RunHandle) {
+    let tmp = tempfile::tempdir().unwrap();
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&launch).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut extra = BTreeMap::new();
+    extra.insert(
+        "FAKE_CLAUDE_SCRIPT".into(),
+        script_path(kind).to_string_lossy().into_owned(),
+    );
+    let mut options =
+        ClaudeSdkOptions::new(profile(), launch, home, BinarySource::Pinned(pin_fake()));
+    options.origin = InputOrigin::Human;
+    options.extra_env = extra;
+    options.handshake_timeout = Duration::from_secs(5);
+    options.close_timeout = Duration::from_secs(3);
+    let driver = ClaudeSdkDriver::new(options);
+    let handle = driver.start(spec(tmp.path())).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+    (tmp, driver, handle)
 }
 
 fn is_turn(obs: &Observation, name: &str) -> bool {
@@ -108,6 +142,7 @@ async fn collect_until_result(handle: &mut remuda_driver::RunHandle) -> Vec<Obse
 
 #[tokio::test]
 async fn write_window_race_publishes_start_first_and_both_projections_settle_idle() {
+    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let launch = tmp.path().join("launch");
     let home = tmp.path().join("home");
@@ -232,4 +267,217 @@ async fn write_window_race_publishes_start_first_and_both_projections_settle_idl
         "a turn result never ends the sdk process"
     );
     store.close().await;
+}
+
+/// Collect until exactly `n` turn `result` observations have been seen.
+async fn collect_n_results(handle: &mut remuda_driver::RunHandle, n: usize) -> Vec<Observation> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    let mut results = 0usize;
+    while results < n {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(obs) = tokio::time::timeout(remaining, handle.recv())
+            .await
+            .expect("timed out waiting for turn results")
+        else {
+            panic!("stream closed after {results}/{n} results: {out:?}");
+        };
+        if is_turn(&obs, "result") {
+            results += 1;
+        }
+        out.push(obs);
+    }
+    out
+}
+
+/// Fold the emitted observations through a real Hub Store and assert the
+/// durable row passes through working, ends idle, and is never idle before the
+/// first start. Returns the final activity.
+async fn assert_store_working_then_idle(observations: &[Observation], label: &str) {
+    let hub_dir = tempfile::tempdir().unwrap();
+    let (store, host_id) = store_test_support::open_with_host(hub_dir.path(), label)
+        .await
+        .expect("hub store + host");
+    let instance_id = observations
+        .first()
+        .expect("at least one observation")
+        .instance_id
+        .as_id()
+        .to_string();
+    store
+        .ensure_instance(host_id.clone(), instance_id.clone())
+        .await
+        .expect("ensure instance");
+
+    let first_start = observations
+        .iter()
+        .position(|o| is_turn(o, "turn_started"))
+        .expect("a turn_started exists");
+    let mut saw_working = false;
+    for (index, mut observation) in observations.iter().cloned().enumerate() {
+        observation.instance_id =
+            remuda_protocol::InstanceId::try_from(instance_id.clone()).unwrap();
+        let event = serde_json::to_value(JournalEvent::Instance(Box::new(observation)))
+            .expect("observation serializes as a journal event");
+        store
+            .append_journal(host_id.clone(), instance_id.clone(), None, event)
+            .await
+            .expect("append");
+        let row = store
+            .get_instance(instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        if row.activity == "working" {
+            saw_working = true;
+        }
+        if index < first_start {
+            assert_ne!(
+                row.activity, "idle",
+                "[{label}] idle before the first start"
+            );
+        }
+    }
+    assert!(
+        saw_working,
+        "[{label}] the durable row passed through working"
+    );
+    let row = store
+        .get_instance(instance_id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(
+        row.activity, "idle",
+        "[{label}] final durable activity is idle"
+    );
+    assert_eq!(
+        row.lifecycle, "running",
+        "[{label}] results never end the sdk process"
+    );
+    store.close().await;
+}
+
+/// Variant: the send commits while the worker is parked at the turn's Reserve
+/// ticket but BEFORE the child's result frame is queued (the common,
+/// non-racing path). The worker still publishes turn_started before the result
+/// it maps afterwards — start-first must not depend on the result winning the
+/// race.
+#[tokio::test]
+async fn send_commits_before_the_result_is_mapped_still_publishes_start_first() {
+    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
+    let (_tmp, driver, mut handle) = launch(ScriptKind::Ok).await;
+
+    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    let send_task = tokio::spawn(async move {
+        let result = driver.send(prompt("commit-first prompt")).await;
+        (driver, result)
+    });
+    // Release as soon as the worker holds the ticket — do not wait for the
+    // child's result to be enqueued.
+    barrier
+        .wait_until_reserve_parked(Duration::from_secs(5))
+        .await;
+    barrier.release();
+    let (driver, result) = send_task.await.expect("send task");
+    result.expect("the prompt write acked");
+
+    let observations = collect_until_result(&mut handle).await;
+    driver.close().await.expect("close");
+
+    let start_pos = observations
+        .iter()
+        .position(|o| is_turn(o, "turn_started"))
+        .expect("turn_started emitted");
+    let result_pos = observations
+        .iter()
+        .position(|o| is_turn(o, "result"))
+        .expect("result emitted");
+    assert!(
+        start_pos < result_pos,
+        "start {start_pos} precedes result {result_pos}"
+    );
+
+    let engine: Vec<Activity> = observations
+        .iter()
+        .filter_map(engine_turn_activity)
+        .collect();
+    assert_eq!(engine.first(), Some(&Activity::Working));
+    assert_eq!(engine.last(), Some(&Activity::Idle));
+    assert_store_working_then_idle(&observations, "r5-commit-first").await;
+}
+
+/// Two-turn variant (turn N result vs turn N+1 reservation): across two
+/// prompts on the long-lived sdk child, EACH turn's start precedes that same
+/// turn's result and the two results stay attributed per turn (result_index 0
+/// then 1). Turn A is held behind its ticket; the moment A commits, B is
+/// sent so its reservation registers adjacent to A's result — the in-queue
+/// ticket makes start-before-result structural for both turns.
+#[tokio::test]
+async fn two_turns_publish_each_start_before_its_own_result_with_per_turn_attribution() {
+    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
+    let (_tmp, driver, mut handle) = launch(ScriptKind::TwoTurn).await;
+
+    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    let send_a = tokio::spawn(async move {
+        let result = driver.send(prompt_id("first", "msg-barrier-a")).await;
+        (driver, result)
+    });
+    // A's worker is parked at its ticket; commit it and immediately register B
+    // so B's reservation is in the publication queue next to A's result.
+    barrier
+        .wait_until_reserve_parked(Duration::from_secs(5))
+        .await;
+    barrier.release();
+    let (driver, result_a) = send_a.await.expect("send A");
+    result_a.expect("first send");
+    driver
+        .send(prompt_id("second", "msg-barrier-b"))
+        .await
+        .expect("second send");
+
+    let observations = collect_n_results(&mut handle, 2).await;
+    driver.close().await.expect("close");
+
+    let starts: Vec<usize> = observations
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| is_turn(o, "turn_started").then_some(i))
+        .collect();
+    let results: Vec<usize> = observations
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| is_turn(o, "result").then_some(i))
+        .collect();
+    assert_eq!(starts.len(), 2, "two turn_started: {starts:?}");
+    assert_eq!(results.len(), 2, "two results: {results:?}");
+    // Each turn's start precedes that same turn's result, in turn order.
+    assert!(starts[0] < results[0], "start A before result A");
+    assert!(starts[1] < results[1], "start B before result B");
+
+    // Per-turn attribution: the results arrive with process-global indices 0
+    // then 1, in that order.
+    let indices: Vec<i64> = observations
+        .iter()
+        .filter_map(|o| match &o.body {
+            ObservationPayload::Lifecycle(p) => match p.as_ref() {
+                LifecyclePayload::Native(n) if n.native_name == "result" => n
+                    .related_ids
+                    .get("resultIndex")
+                    .and_then(|v| v.parse().ok()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(indices, vec![0, 1], "results attributed per turn, in order");
+
+    // The engine is working at the first start, idle only at the final result.
+    let engine: Vec<Activity> = observations
+        .iter()
+        .filter_map(engine_turn_activity)
+        .collect();
+    assert_eq!(engine.first(), Some(&Activity::Working), "starts working");
+    assert_eq!(engine.last(), Some(&Activity::Idle), "settles idle last");
+    assert_store_working_then_idle(&observations, "r5-two-turn").await;
 }

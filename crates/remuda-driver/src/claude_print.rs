@@ -178,15 +178,13 @@ struct TurnBook {
     /// Workflows seen with no locally-known owning turn (replay bucket).
     implicit_workflows: HashSet<String>,
     /// Seq of the turn whose prompt write is in flight (book opened before
-    /// the write, ma-sdk-state r4 item 1). A result that settles THIS seq while
-    /// the reservation is held must wait for the write and then publish the
-    /// turn_started first; a result settling an OLDER seq must never wait on
-    /// it. Cleared when the write fails.
+    /// the write, ma-sdk-state r5 item 1). The reservation lives IN the
+    /// publication queue as a `PublishJob::Reserve` ticket enqueued before
+    /// the write: the worker parks at that ticket's position and emits the
+    /// turn_started there, so every frame enqueued after it (the turn's own
+    /// result included) is published behind its start. `None` once the write
+    /// commits or is rolled back.
     reserved: Option<u64>,
-    /// Set by [`Self::result_settles_root`] when the result it just handled
-    /// consumed the currently-reserved turn; consumed by the publication
-    /// worker once per mapped batch.
-    last_consumed_reserved: bool,
     next_seq: u64,
 }
 
@@ -195,17 +193,17 @@ impl TurnBook {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.reserved = Some(seq);
-        self.last_consumed_reserved = false;
         self.outstanding.push_back(RootTurn {
             seq,
             open_workflows: HashSet::new(),
         });
     }
 
-    /// Whether the just-mapped result consumed the turn whose prompt write is
-    /// still in flight. Read once per mapped batch.
-    fn take_last_consumed_reserved(&mut self) -> bool {
-        std::mem::take(&mut self.last_consumed_reserved)
+    /// The reserved turn's write committed. Clears `reserved` AT commit (the
+    /// worker clears it from the ticket's queue position) so a later turn can
+    /// never read a stale reservation for a turn already started.
+    fn turn_committed(&mut self) {
+        self.reserved = None;
     }
 
     /// Roll back the reservation opened by [`Self::begin_turn`] when its prompt
@@ -225,7 +223,6 @@ impl TurnBook {
             }
         }
         self.reserved = None;
-        self.last_consumed_reserved = false;
     }
 
     /// Track a freshly-opened background workflow against the root turn the
@@ -283,11 +280,7 @@ impl TurnBook {
         if front_open {
             return false;
         }
-        if let Some(front) = self.outstanding.pop_front() {
-            // r4 item 1: record whether THIS result consumed the turn whose
-            // write is still in flight, so the publication worker can park it
-            // and publish turn_started first.
-            self.last_consumed_reserved = self.reserved == Some(front.seq);
+        if self.outstanding.pop_front().is_some() {
             // Defense in depth: workflows observed before any locally-written
             // turn (pure replay/hydration) live in the implicit bucket; they
             // still gate settlement even when a synthetic turn is popped.
@@ -456,23 +449,19 @@ struct Inner {
     live: Mutex<Option<Live>>,
     mapper: Mutex<Mapper>,
     /// D-057 OA6 r3: publication FIFO. Every stdout frame's map+emit and every
-    /// locally-written turn's `turn_started` map+emit goes through ONE unbounded
-    /// queue drained by a single worker, so the published order is the causal
-    /// order (a turn's frames can never precede its start) while neither task
-    /// holds a lock across the other's work. In particular a blocked stdin write
-    /// on the send task never stalls stdout draining, and `close`/`cancel`
-    /// stay reachable (neither needs this queue to make progress).
+    /// locally-written turn's reservation ticket + `turn_started` map+emit goes
+    /// through ONE unbounded queue drained by a single worker, so the
+    /// published order is the causal order (a turn's frames can never precede
+    /// its start) while neither task holds a lock across the other's work. The
+    /// reader always keeps draining stdout into the unbounded queue even while
+    /// a stdin write is blocked, and `close`/`cancel` stay reachable (neither
+    /// needs this queue to make progress).
     publish: Mutex<Option<mpsc::UnboundedSender<PublishJob>>>,
-    /// ma-sdk-state r4 item 1: the current prompt write's turn reservation,
-    /// present from before the write blocks until it commits/cancels. A
-    /// mapped result parks on it (see [`TurnReservation`]); it also carries
-    /// the id used to pre-open the mapper book. One at a time under
-    /// [`Inner::write_seq`].
-    pending_turn: Mutex<Option<Arc<TurnReservation>>>,
-    /// Serializes prompt sends from enqueue through write completion to
-    /// enqueueing the matching `turn_started`, so two concurrent prompts both
-    /// write and start in FIFO order. Held across the write await by design;
-    /// `close`/`cancel` do not take it, so a blocked prompt cannot gate them.
+    /// Serializes prompt sends: each send enqueues its reservation ticket,
+    /// opens the mapper book, awaits its write, and commits strictly one after
+    /// another, so two concurrent prompts reserve, write and start in FIFO
+    /// order. Held across the write await by design; `close`/`cancel` do not
+    /// take it, so a blocked prompt cannot gate them.
     write_seq: tokio::sync::Mutex<()>,
     policy: Mutex<PermissionPolicy>,
     events: Mutex<Option<mpsc::Sender<Observation>>>,
@@ -576,7 +565,6 @@ impl ClaudePrintDriver {
                     turns: TurnBook::default(),
                 }),
                 publish: Mutex::new(None),
-                pending_turn: Mutex::new(None),
                 write_seq: tokio::sync::Mutex::new(()),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
@@ -919,53 +907,66 @@ impl Driver for ClaudePrintDriver {
                     };
                     live.process.writer()
                 };
-                // Concurrent prompts must write AND start in FIFO; write_seq
-                // spans the reservation + write + commit. close/cancel never
-                // take it, so they remain reachable while a prompt is blocked.
+                // Concurrent prompts must reserve, write and start in FIFO;
+                // write_seq spans the ticket enqueue + write + commit.
+                // close/cancel never take it, so they remain reachable while a
+                // prompt is blocked.
                 let _seq = self.inner.write_seq.lock().await;
-                let client_message_id = prompt.native_client_message_id.clone();
-                // ma-sdk-state r4 item 1: reserve the turn BEFORE awaiting the
-                // write. Open the mapper book synchronously (so a result the
-                // child emits while the write is in flight maps intermediate,
-                // never early-idle) and register the reservation a racing
-                // result batch parks on. The turn_started OBSERVATION is
-                // emitted only after the write acks (commit): by the
-                // TurnStarted job, or prepended by a racing result.
-                let reservation = TurnReservation::shared(client_message_id.clone());
+                // ma-sdk-state r5 item 1: the turn ticket lives IN the
+                // publication ordering, not a side slot. Open the mapper book
+                // synchronously (a result the child emits while the write is
+                // in flight maps against the pre-opened turn, never early-idle)
+                // and enqueue a Reserve ticket BEFORE awaiting the write. The
+                // worker parks at that ticket's queue position until the write
+                // resolves and emits turn_started there, so every frame the
+                // turn produces — enqueued only after the child receives the
+                // prompt — is published strictly behind its start.
+                let reservation = TurnReservation::shared(prompt.native_client_message_id.clone());
                 {
                     let mut mapper = self.inner.mapper.lock().await;
                     mapper.begin_turn_reservation();
-                    *self.inner.pending_turn.lock().await = Some(reservation.clone());
                 }
+                let publisher = self.inner.publish.lock().await.clone();
+                if let Some(publisher) = publisher.as_ref()
+                    && publisher
+                        .send(PublishJob::Reserve {
+                            reservation: reservation.clone(),
+                        })
+                        .is_err()
+                {
+                    // Publication worker gone (session closing): no start can
+                    // ever be emitted, so roll the empty book back and fail.
+                    reservation.cancel();
+                    let mut mapper = self.inner.mapper.lock().await;
+                    mapper.cancel_turn_reservation();
+                    return Err(DriverError::ControlUnavailable);
+                }
+                // test-stub only: record that this turn's ticket is in the
+                // publication queue (its book was opened just above).
+                #[cfg(feature = "test-stub")]
+                test_barrier::note_reserve_enqueued();
                 let write = writer.send_user(prompt_content(&prompt.blocks)?).await;
                 match write {
                     Ok(()) => {
                         // test-stub only: deterministically park HERE (write
-                        // acked, turn_started not yet enqueued) so a test can
-                        // deliver the child's result into the race window.
+                        // acked, reservation not yet committed) so a test can
+                        // deliver the child's result behind the parked ticket.
                         #[cfg(feature = "test-stub")]
                         test_barrier::hold_write_commit().await;
+                        // Unparks the worker at the ticket; it clears the
+                        // reservation and emits turn_started in queue order.
                         reservation.commit();
-                        *self.inner.pending_turn.lock().await = None;
-                        let publisher = self.inner.publish.lock().await.clone();
-                        if let Some(publisher) = publisher {
-                            // No-op if a racing result already emitted start.
-                            let _ = publisher.send(PublishJob::TurnStarted {
-                                reservation: reservation.clone(),
-                            });
-                        }
                         Ok(DriverAck::transport_written())
                     }
                     Err(error) => {
-                        // Cancel: no turn_started is ever emitted for an
-                        // unwritten prompt; frames queued behind it flow
-                        // unchanged and map against the pre-opened (but
-                        // unstarted) book, which the next successful turn's
-                        // FIFO ordering supersedes.
+                        // Cancel: the parked ticket resumes without a start and
+                        // no turn_started is ever emitted for the unwritten
+                        // prompt. Frames queued behind it flow unchanged and
+                        // map against the pre-opened (then removed) book, which
+                        // the next successful turn's FIFO ordering supersedes.
                         reservation.cancel();
                         let mut mapper = self.inner.mapper.lock().await;
                         mapper.cancel_turn_reservation();
-                        *self.inner.pending_turn.lock().await = None;
                         Err(map_wire(error))
                     }
                 }
@@ -1310,6 +1311,10 @@ async fn map_loop(
         if publisher.send(PublishJob::Frame(Box::new(frame))).is_err() {
             break;
         }
+        // test-stub only: record that a frame now sits behind any parked
+        // Reserve ticket (the armed race's queued result).
+        #[cfg(feature = "test-stub")]
+        test_barrier::note_frame_enqueued();
     }
     // Child stdout reached EOF. Enqueue the exit BEHIND every already-queued
     // frame so `exited` is always the last published observation; the worker
@@ -1323,23 +1328,26 @@ enum PublishJob {
     /// Boxed: `Outbound` is ~1 KiB while the other jobs are tiny, and this job
     /// already crosses the unbounded queue boundary.
     Frame(Box<Outbound>),
-    /// Emit the turn_started for a turn whose write committed (a no-op when a
-    /// racing result batch already emitted it through the reservation gate).
-    TurnStarted { reservation: Arc<TurnReservation> },
+    /// A turn's publication ticket, enqueued by the send task BEFORE its prompt
+    /// write. It occupies the turn's exact FIFO position: the worker parks here
+    /// until the write resolves, then on commit clears the mapper reservation
+    /// and emits `turn_started` AT THIS POSITION (no-op start on cancel). Every
+    /// frame enqueued after it — including the turn's own result — is therefore
+    /// published behind its start.
+    Reserve { reservation: Arc<TurnReservation> },
     /// The child's stdout closed; emit exactly one `exited` (deduped).
     StdoutEof,
 }
 
-/// A prompt write's publication reservation (ma-sdk-state r4 item 1).
+/// A prompt write's turn ticket (ma-sdk-state r5 item 1).
 ///
-/// Held in [`Inner::pending_turn`] across the write await. The mapper book is
-/// opened (`begin_turn`) BEFORE the write, so a result the child emits while
-/// the write is still in flight maps as an INTERMEDIATE result and can never
-/// project idle before the turn starts. A mapped result batch parks on
-/// [`TurnReservation::committed`] until the write acks; on commit it emits
-/// turn_started ahead of the result. Non-result frames (assistant text,
-/// keepalives, a stdout flood under a blocked write) never park and keep
-/// draining.
+/// It lives in the publication queue as a [`PublishJob::Reserve`] job, never
+/// in a side slot. The mapper book is opened (`begin_turn`) BEFORE the write,
+/// so a result the child emits while the write is still in flight maps against
+/// the pre-opened turn and can never project idle before the turn starts. The
+/// worker parks on [`TurnReservation::committed`] at the ticket's queue
+/// position; on commit it emits turn_started there, ahead of every frame that
+/// follows the ticket. On cancel it resumes without emitting a start.
 struct TurnReservation {
     client_message_id: String,
     committed: tokio::sync::Notify,
@@ -1389,8 +1397,8 @@ impl TurnReservation {
     }
 
     /// Claim the right to emit this turn's turn_started observation. Returns
-    /// true exactly once (the racing result batch or the TurnStarted job);
-    /// the caller then builds the observation through the mapper.
+    /// true exactly once; a single Reserve ticket calls it, so the claim is a
+    /// defensive dedupe against a duplicate/direct ticket.
     fn claim_start(&self) -> bool {
         !self
             .start_emitted
@@ -1400,16 +1408,17 @@ impl TurnReservation {
 
 /// Test-only publication barrier (feature `test-stub`).
 ///
-/// Deterministically recreates the r4-item-1 race: a prompt write has acked
-/// but the send task has not committed the reservation/enqueued
-/// `turn_started`, while the reader has already mapped and queued the child's
-/// result. Without this hook the window is scheduler luck; with it a test can
-/// park the send, wait until the result batch is queued in the worker, then
-/// release and assert start-before-result.
+/// Deterministically recreates the turn-order race with the ticket IN the
+/// publication queue (r5 item 1): a prompt write has acked but the send task
+/// has not committed its reservation, while (a) the publication worker is
+/// parked at that turn's `Reserve` ticket and (b) the reader has already
+/// enqueued the child's result frame BEHIND the ticket. Without this hook the
+/// window is scheduler luck; with it a test parks the send, waits until both
+/// conditions hold, then releases and asserts start-before-result.
 ///
 /// One barrier per process is sufficient (each test binary runs the race
 /// alone); [`Drop`] releases and disarms so a failed assertion can never hang
-/// the send task forever.
+/// the send task or the worker forever.
 #[cfg(feature = "test-stub")]
 pub mod test_barrier {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1418,9 +1427,22 @@ pub mod test_barrier {
 
     struct State {
         write_reached: AtomicBool,
-        result_parked: AtomicBool,
-        released: AtomicBool,
-        release: tokio::sync::Notify,
+        /// The worker dequeued the turn's Reserve ticket and is parked on the
+        /// not-yet-committed write.
+        reserve_parked: AtomicBool,
+        /// The reader enqueued a frame (the child's result) behind the parked
+        /// ticket.
+        result_queued: AtomicBool,
+        /// Number of Reserve tickets the send task has enqueued.
+        reserve_enqueued: std::sync::atomic::AtomicUsize,
+        /// Gates the SEND task parked in `hold_write_commit`.
+        send_released: AtomicBool,
+        send_release: tokio::sync::Notify,
+        /// Gates the WORKER just after it emits the parked turn's start, so a
+        /// test can register a second turn's reservation before the worker maps
+        /// the first turn's buffered result.
+        worker_released: AtomicBool,
+        worker_resume: tokio::sync::Notify,
     }
 
     static BARRIER: OnceLock<Mutex<Option<Arc<State>>>> = OnceLock::new();
@@ -1439,68 +1461,172 @@ pub mod test_barrier {
     pub fn arm() -> WriteCommitBarrier {
         let state = Arc::new(State {
             write_reached: AtomicBool::new(false),
-            result_parked: AtomicBool::new(false),
-            released: AtomicBool::new(false),
-            release: tokio::sync::Notify::new(),
+            reserve_parked: AtomicBool::new(false),
+            result_queued: AtomicBool::new(false),
+            reserve_enqueued: std::sync::atomic::AtomicUsize::new(0),
+            send_released: AtomicBool::new(false),
+            send_release: tokio::sync::Notify::new(),
+            worker_released: AtomicBool::new(false),
+            worker_resume: tokio::sync::Notify::new(),
         });
         *slot().lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
     }
 
-    /// Send-task hook: after the write ack, block until the test releases.
+    /// Send-task hook: after the write ack, block until the test releases the
+    /// send gate.
     pub(super) async fn hold_write_commit() {
         let state = slot().lock().expect("barrier lock").clone();
         let Some(state) = state else {
             return;
         };
         state.write_reached.store(true, Ordering::Release);
-        if state.released.load(Ordering::Acquire) {
+        if state.send_released.load(Ordering::Acquire) {
             return;
         }
-        let notified = state.release.notified();
-        if state.released.load(Ordering::Acquire) {
+        let notified = state.send_release.notified();
+        if state.send_released.load(Ordering::Acquire) {
             return;
         }
         notified.await;
     }
 
-    /// Worker hook: the racing result batch is queued and about to park on the
-    /// reservation's commit.
-    pub(super) fn note_result_parked() {
+    /// Send-task hook: a Reserve ticket was just enqueued (the turn book was
+    /// opened immediately before this).
+    pub(super) fn note_reserve_enqueued() {
         if let Some(state) = slot().lock().expect("barrier lock").clone() {
-            state.result_parked.store(true, Ordering::Release);
+            state.reserve_enqueued.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Worker hook: reached the Reserve ticket and is about to await the
+    /// write's commit/cancel.
+    pub(super) fn note_reserve_parked() {
+        if let Some(state) = slot().lock().expect("barrier lock").clone() {
+            state.reserve_parked.store(true, Ordering::Release);
+        }
+    }
+
+    /// Worker hook: AFTER emitting the parked turn's `turn_started`, optionally
+    /// hold the worker (still at that ticket's position) so a test can register
+    /// the next turn before this turn's buffered result is mapped. Returns
+    /// immediately when no barrier is armed or the worker gate is open.
+    pub(super) async fn hold_worker_after_start() {
+        let state = slot().lock().expect("barrier lock").clone();
+        let Some(state) = state else {
+            return;
+        };
+        if state.worker_released.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = state.worker_resume.notified();
+        if state.worker_released.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    /// Reader hook: a frame was enqueued behind the (possibly parked) ticket.
+    /// While a barrier is armed the harness child only emits its turn result in
+    /// this window, so this marks that result as queued.
+    pub(super) fn note_frame_enqueued() {
+        if let Some(state) = slot().lock().expect("barrier lock").clone() {
+            state.result_queued.store(true, Ordering::Release);
         }
     }
 
     impl WriteCommitBarrier {
-        /// Block until the send has parked post-write AND the reader's result
-        /// batch is queued in the worker — i.e. the race window is provably
-        /// occupied.
+        /// Block until the send has parked post-write, the worker is parked at
+        /// the turn's Reserve ticket, AND the reader's result frame is queued
+        /// behind it — i.e. the race window is provably occupied.
         pub async fn wait_until_result_parked(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 if self.state.write_reached.load(Ordering::Acquire)
-                    && self.state.result_parked.load(Ordering::Acquire)
+                    && self.state.reserve_parked.load(Ordering::Acquire)
+                    && self.state.result_queued.load(Ordering::Acquire)
                 {
                     return;
                 }
                 if tokio::time::Instant::now() >= deadline {
                     panic!(
                         "write_commit barrier: timed out waiting for the race \
-                         (write_reached={}, result_parked={})",
+                         (write_reached={}, reserve_parked={}, result_queued={})",
                         self.state.write_reached.load(Ordering::Acquire),
-                        self.state.result_parked.load(Ordering::Acquire)
+                        self.state.reserve_parked.load(Ordering::Acquire),
+                        self.state.result_queued.load(Ordering::Acquire)
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
 
-        /// Let the send task commit and enqueue `turn_started`.
-        pub fn release(&self) {
-            if !self.state.released.swap(true, Ordering::AcqRel) {
-                self.state.release.notify_waiters();
+        /// Block until the send parked post-write AND the worker parked at the
+        /// turn's Reserve ticket, WITHOUT requiring the child's result to be
+        /// queued yet — the commit-first variant releases here and lets the
+        /// worker map the result after the write committed.
+        pub async fn wait_until_reserve_parked(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.write_reached.load(Ordering::Acquire)
+                    && self.state.reserve_parked.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for the ticket \
+                         (write_reached={}, reserve_parked={})",
+                        self.state.write_reached.load(Ordering::Acquire),
+                        self.state.reserve_parked.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
+        }
+
+        /// Block until `n` Reserve tickets have been enqueued — i.e. the send
+        /// task has opened that many turn books. Used to prove the second turn
+        /// is registered before the parked worker maps the first result.
+        pub async fn wait_until_reserves_enqueued(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.reserve_enqueued.load(Ordering::Acquire) >= n {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for {n} reservations \
+                         (enqueued={})",
+                        self.state.reserve_enqueued.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// Release ONLY the send gate: the write commits and the parked worker
+        /// emits turn_started, then stays at the ticket (worker gate still
+        /// shut) so a further turn can register before this result is mapped.
+        pub fn release_send(&self) {
+            if !self.state.send_released.swap(true, Ordering::AcqRel) {
+                self.state.send_release.notify_waiters();
+            }
+        }
+
+        /// Release ONLY the worker gate: it resumes from the parked ticket and
+        /// maps the buffered result.
+        pub fn resume_worker(&self) {
+            if !self.state.worker_released.swap(true, Ordering::AcqRel) {
+                self.state.worker_resume.notify_waiters();
+            }
+        }
+
+        /// Release both gates at once (send commits and the worker proceeds
+        /// without an extra hold). Preserves the r4 single-gate behaviour.
+        pub fn release(&self) {
+            self.release_send();
+            self.resume_worker();
         }
     }
 
@@ -1523,55 +1649,43 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                     {
                         return handle_can_use_tool(&inner, env, req).await;
                     }
-                    let (mut observations, consumed_reservation) = {
+                    // No per-frame reservation wait: ordering is guaranteed by
+                    // the Reserve ticket ahead of this frame in the queue. A
+                    // turn's result is enqueued only after the child received
+                    // the prompt, i.e. always behind that turn's ticket, so its
+                    // turn_started is already published by the time we map here.
+                    let observations = {
                         let mut mapper = inner.mapper.lock().await;
-                        let observations = map_outbound(&mut mapper, &frame)?;
-                        // r4 item 1: true only when THIS batch's result settled
-                        // the very turn whose prompt write is in flight (the
-                        // mapper decides by book identity, not by frame shape,
-                        // so a result for an OLDER outstanding turn never parks
-                        // on the new reservation).
-                        let consumed = mapper.take_last_consumed_reserved();
-                        (observations, consumed)
+                        map_outbound(&mut mapper, &frame)?
                     };
-                    // ma-sdk-state r4 item 1: the reserved turn's result parks
-                    // here until the write acks, then publishes turn_started
-                    // FIRST. Everything else (older-turn results, messages,
-                    // flood frames) drains without waiting, so stdout never
-                    // stalls on a blocked write.
-                    if consumed_reservation {
-                        let reservation = inner.pending_turn.lock().await.clone();
-                        if let Some(reservation) = reservation {
-                            // test-stub only: the result is queued ahead of the
-                            // not-yet-enqueued turn_started and is about to park
-                            // on the write ack.
-                            #[cfg(feature = "test-stub")]
-                            test_barrier::note_result_parked();
-                            if reservation.wait_for_commit().await && reservation.claim_start() {
-                                let start = {
-                                    let mut mapper = inner.mapper.lock().await;
-                                    mapper
-                                        .turn_started_observation(&reservation.client_message_id)?
-                                };
-                                observations.insert(0, start);
-                            }
-                        }
-                    }
                     emit_all(&inner, observations).await
                 }
                 .await
             }
-            PublishJob::TurnStarted { reservation } => {
+            PublishJob::Reserve { reservation } => {
                 async {
-                    // Normal (non-racing) path: the write committed before any
-                    // result was mapped. No-op if a racing result already claimed
-                    // the start.
-                    if reservation.claim_start() {
+                    // test-stub only: the worker has reached the turn's ticket
+                    // and is about to park on the not-yet-committed write.
+                    #[cfg(feature = "test-stub")]
+                    test_barrier::note_reserve_parked();
+                    // Park the whole publication pipeline at this position until
+                    // the write resolves. Frames already queued ahead have
+                    // drained; every frame behind waits here, so the start is
+                    // emitted before any of this turn's frames.
+                    if reservation.wait_for_commit().await && reservation.claim_start() {
                         let start = {
                             let mut mapper = inner.mapper.lock().await;
+                            mapper.commit_turn_reservation();
                             mapper.turn_started_observation(&reservation.client_message_id)?
                         };
-                        emit_all(&inner, vec![start]).await
+                        emit_all(&inner, vec![start]).await?;
+                        // test-stub only: hold the worker AT the ticket after
+                        // publishing the start, so a test can open the next
+                        // turn's book before this turn's buffered result maps.
+                        // A no-op unless the worker gate is deliberately shut.
+                        #[cfg(feature = "test-stub")]
+                        test_barrier::hold_worker_after_start().await;
+                        Ok(())
                     } else {
                         Ok(())
                     }
@@ -2556,15 +2670,16 @@ impl Mapper {
     /// native client message id (echoed by the harness on its `user` record) is
     /// carried so a later fold can join the two.
     /// Open the settlement book for a new root turn BEFORE its prompt write
-    /// blocks (ma-sdk-state r4 item 1), emitting nothing.
+    /// blocks (ma-sdk-state r5 item 1), emitting nothing.
     fn begin_turn_reservation(&mut self) {
         self.turns.begin_turn();
     }
 
-    /// Whether the last mapped batch's result consumed the reserved turn
-    /// (whose write may still be in flight).
-    fn take_last_consumed_reserved(&mut self) -> bool {
-        self.turns.take_last_consumed_reserved()
+    /// The reserved turn's write committed; clear the in-flight reservation so
+    /// no later turn reads a stale one. Called by the publication worker from
+    /// the reservation ticket's queue position.
+    fn commit_turn_reservation(&mut self) {
+        self.turns.turn_committed();
     }
 
     /// Roll back the latest turn reservation when its write fails.
@@ -2593,6 +2708,9 @@ impl Mapper {
 
     fn turn_started(&mut self, client_message_id: &str) -> DriverResult<Observation> {
         self.turns.begin_turn();
+        // A start derived directly from the stream (replay/hydration) has no
+        // in-flight write, so it holds no reservation.
+        self.turns.turn_committed();
         self.turn_started_observation(client_message_id)
     }
 

@@ -178,11 +178,11 @@ fn read_persisted_token(path: &Path) -> Result<Option<String>, HubError> {
 ///            adopted at a no-source start) and rotation is allowed.
 const BOOTSTRAP_EXPLICIT_MARKER: &str = "bootstrap-token-source-explicit";
 
-/// Test-only: when armed ON THE TEST THREAD, `write_private` fails for a file
-/// whose name contains the needle. Thread-local so parallel auth tests each
-/// call resolve_bootstrap on their own thread and never see another test's
-/// fault (production write_private runs synchronously on the caller thread).
-/// c-bootstrap-dev r8 item 3.
+// Test-only: when armed ON THE TEST THREAD, `write_private` fails for a file
+// whose name contains the needle. Thread-local so parallel auth tests each
+// call resolve_bootstrap on their own thread and never see another test's
+// fault (production write_private runs synchronously on the caller thread).
+// c-bootstrap-dev r8 item 3.
 #[cfg(test)]
 thread_local! {
     static WRITE_FAULT_NEEDLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };

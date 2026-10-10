@@ -62,4 +62,35 @@ describe("mapInstance version gate uses the reported binaryVersion", () => {
     const mapped = mapInstance(wireRecord({ capabilities: { binaryVersion: "2.1.277" } } as never));
     expect(mapped.capabilities?.binaryVersion).toBe("2.1.277");
   });
+
+  it("item 12a: a non-PTY instance's synthesized snapshot is blank unless the record reports", () => {
+    // claude-print/sdk used to inherit the hardcoded static "2.1.268" gate.
+    const print = wireRecord({ driver: "claude-print" });
+    expect(gateFor(print)).toBe("unknown");
+    expect(mapInstance(print).capabilities?.binaryVersion).toBe("");
+    // A reported value is still stamped verbatim.
+    const reported = wireRecord({
+      driver: "claude-print",
+      capabilities: { binaryVersion: "2.1.289" } as never,
+    });
+    expect(mapInstance(reported).capabilities?.binaryVersion).toBe("2.1.289");
+  });
+
+  it("item 12a: one instance's reported version never leaks onto another non-PTY instance", () => {
+    const first = mapInstance(
+      wireRecord({
+        instanceId: "ins_ver_a",
+        driver: "claude-sdk",
+        capabilities: { binaryVersion: "2.1.289" } as never,
+      }),
+    );
+    expect(first.capabilities?.binaryVersion).toBe("2.1.289");
+    // A second, unrelated non-PTY instance with no reported version must not
+    // see 2.1.289 (the shared module-level snapshot used to be mutated).
+    const second = mapInstance(
+      wireRecord({ instanceId: "ins_ver_b", driver: "claude-print" }),
+    );
+    expect(second.capabilities?.binaryVersion).toBe("");
+    expect(gateFor(wireRecord({ instanceId: "ins_ver_c", driver: "claude-print" }))).toBe("unknown");
+  });
 });

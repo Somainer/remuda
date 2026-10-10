@@ -381,9 +381,10 @@ export function NewSessionPage() {
       ? effort
       : mapEffort(effort, activeKind as EffortKind)
     : (activeKind as string) === "claude"
-      ? // The operator's device Settings default (settings-effort-*) wins over
-        // the per-model catalog default for the unpinned slider.
-        effortAt("claude", device.defaultEffortIndex ?? modelDefault?.index ?? 2, false)
+      ? // c-effortui r3 item 12c: the per-MODEL catalog default wins; the
+        // operator's device Settings default is only its fallback (the old
+        // order put the device number first and made modelDefault dead code).
+        effortAt("claude", modelDefault?.index ?? device.defaultEffortIndex ?? 2, false)
       : effortAt(activeKind as EffortKind, defaultEffortIndex(activeKind));
   // What the form shows/sends: a pinned draft, else the model default
   // (unpinned — no effort fields on create).

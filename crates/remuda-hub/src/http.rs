@@ -615,12 +615,20 @@ pub async fn delete_instance(
     // lease this task holds on the host before any Node reclaim. Pool slots
     // park warm; reuse dirs are untouched. Best effort like the purge below —
     // an offline Node reconciles on reconnect, and the delete transaction
-    // clears holder_instance_id regardless.
+    // clears holder_instance_id regardless. Every chapter of the lineage
+    // copied the task, so walk each (host, task) pair exactly once.
     let mut lease_returns = Vec::new();
-    if let Some(task_id) = instance.task_id.as_deref() {
+    let mut lease_keys_seen = std::collections::HashSet::new();
+    for chapter in &chapters {
+        let Some(task_id) = chapter.task_id.as_deref() else {
+            continue;
+        };
+        if !lease_keys_seen.insert((chapter.host_id.clone(), task_id.to_owned())) {
+            continue;
+        }
         let held = state
             .store
-            .active_worktree_leases_for_task(instance.host_id.clone(), task_id.to_string())
+            .active_worktree_leases_for_task(chapter.host_id.clone(), task_id.to_string())
             .await
             .map_err(map_store)?;
         for lease in held {
@@ -678,51 +686,78 @@ pub async fn delete_instance(
         }
     }
 
-    // Ask the Node to drop its own copy first. A Node that is offline or has
-    // never heard of the instance must not block the delete: the Hub row is
-    // what the user asked to remove, and the Node reconciles on reconnect.
-    let purge = match state
-        .nodes
-        .call(
-            &instance.host_id,
-            "instance.purge",
-            json!({ "instanceId": instance_id }),
-            // The Node waits for a just-closed driver to finish exiting before
-            // it can remove the directory, so allow more than an RPC round trip.
-            Duration::from_secs(10),
-        )
-        .await
-    {
-        Ok(Some(response)) if response.get("error").is_some() => {
-            tracing::warn!(
-                %instance_id,
-                host_id = %instance.host_id,
-                response = %response,
-                "node rejected instance.purge; deleting the hub record anyway"
-            );
-            "node-rejected"
-        }
-        Ok(Some(_)) => "purged",
-        Ok(None) => {
-            tracing::info!(
-                %instance_id,
-                host_id = %instance.host_id,
-                "node offline at delete; its instance directory is purged on reconnect"
-            );
-            "node-offline"
-        }
-        Err(error) => {
-            tracing::warn!(
-                %instance_id,
-                host_id = %instance.host_id,
-                %error,
-                "instance.purge failed; deleting the hub record anyway"
-            );
-            "purge-failed"
-        }
-    };
+    // Ask EVERY chapter's Node to drop its own copy (ma-lineage r7 item 2):
+    // the store transaction removes every chapter row, so purging only the
+    // addressed/current one would orphan its predecessors' data directories
+    // for good. A Node that is offline or has never heard of the instance
+    // must not block the delete: the Hub row is what the user asked to
+    // remove, and the Node reconciles on reconnect.
+    let mut purge_outcomes = serde_json::Map::new();
+    for chapter in &chapters {
+        let outcome = match state
+            .nodes
+            .call(
+                &chapter.host_id,
+                "instance.purge",
+                json!({ "instanceId": chapter.instance_id }),
+                // The Node waits for a just-closed driver to finish exiting
+                // before it can remove the directory, so allow more than an
+                // RPC round trip.
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            Ok(Some(response)) if response.get("error").is_some() => {
+                tracing::warn!(
+                    instance_id = %chapter.instance_id,
+                    host_id = %chapter.host_id,
+                    response = %response,
+                    "node rejected instance.purge; deleting the hub record anyway"
+                );
+                "node-rejected"
+            }
+            Ok(Some(_)) => "purged",
+            Ok(None) => {
+                tracing::info!(
+                    instance_id = %chapter.instance_id,
+                    host_id = %chapter.host_id,
+                    "node offline at delete; its instance directory is purged on reconnect"
+                );
+                "node-offline"
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    instance_id = %chapter.instance_id,
+                    host_id = %chapter.host_id,
+                    "instance.purge failed; deleting the hub record anyway"
+                );
+                "purge-failed"
+            }
+        };
+        purge_outcomes.insert(chapter.instance_id.clone(), json!(outcome));
+    }
+    // Backwards-compatible scalar for the addressed chapter.
+    let purge = purge_outcomes
+        .get(&instance_id)
+        .and_then(Value::as_str)
+        .unwrap_or("purged")
+        .to_string();
 
     // The audit row outlives the journal it describes, so write it first.
+    // ma-lineage r7 item 2: record EVERY deleted chapter, not only the
+    // addressed one — the audit must account for all rows the transaction
+    // removes.
+    let chapter_details: Vec<Value> = chapters
+        .iter()
+        .map(|chapter| {
+            json!({
+                "instanceId": chapter.instance_id,
+                "hostId": chapter.host_id,
+                "lifecycle": chapter.lifecycle,
+            })
+        })
+        .collect();
     state
         .store
         .append_audit(
@@ -734,6 +769,9 @@ pub async fn delete_instance(
                 "lifecycle": instance.lifecycle,
                 "forced": force,
                 "nodePurge": purge,
+                "lineageId": instance.lineage_id,
+                "chapters": chapter_details,
+                "chapterPurges": Value::Object(purge_outcomes.clone()),
             }),
         )
         .await
@@ -747,11 +785,19 @@ pub async fn delete_instance(
     if !deleted {
         return Err(HubError::NotFound);
     }
-    tracing::info!(%instance_id, device_id = %device.id, forced = force, "instance deleted");
+    tracing::info!(
+        %instance_id,
+        device_id = %device.id,
+        forced = force,
+        chapters = chapters.len(),
+        "instance lineage deleted"
+    );
     Ok(Json(json!({
         "deleted": true,
         "instanceId": instance_id,
         "nodePurge": purge,
+        "chapterPurges": Value::Object(purge_outcomes),
+        "chapterIds": chapters.iter().map(|chapter| json!(chapter.instance_id)).collect::<Vec<_>>(),
         "leaseReturns": lease_returns,
     })))
 }

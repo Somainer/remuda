@@ -1406,6 +1406,105 @@ async fn force_deleting_a_lineage_with_a_live_predecessor_refuses_without_frames
     Ok(())
 }
 
+/// ma-lineage r7 item 2: deleting the CURRENT chapter removes the WHOLE
+/// lineage, so the Hub must ask the Node to purge EVERY chapter's data
+/// directory (not only the current one) and the audit must list every
+/// deleted chapter.
+#[tokio::test]
+async fn whole_lineage_delete_purges_and_audits_every_chapter() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, true).await?;
+
+    // Continue X → Y (X terminal). Y is still requested.
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    let delete_y = ctx
+        .http
+        .delete(format!("{}/v1/instances/{y}?force=1", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .error_for_status()?;
+    let body: Value = delete_y.json().await?;
+    let chapter_ids = body["chapterIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        chapter_ids,
+        [x.clone(), y.clone()].into_iter().collect(),
+        "the response names every removed chapter: {body}"
+    );
+
+    // The only live chapter was Y (requested): force stops it first, then the
+    // Node is asked to purge BOTH X and Y (in either order).
+    let (method, close_params) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    assert_eq!(close_params["instanceId"], json!(y));
+    let mut purged = std::collections::BTreeSet::new();
+    while let Ok(Ok((method, params))) =
+        tokio::time::timeout(Duration::from_millis(500), node.next_frame()).await
+    {
+        assert_eq!(
+            method, "instance.purge",
+            "after the stop only purge frames remain, got {method}"
+        );
+        purged.insert(params["instanceId"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(
+        purged,
+        [x.clone(), y.clone()].into_iter().collect(),
+        "every chapter's Node directory is purged"
+    );
+
+    // Both rows and the lineage row are gone.
+    assert!(ctx.instance_is_gone(&x).await?);
+    assert!(ctx.instance_is_gone(&y).await?);
+    let lineage_status = ctx
+        .http
+        .get(format!("{}/v1/lineages/{x}", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?
+        .status();
+    assert_eq!(lineage_status, 404);
+
+    // The audit records the whole-lineage delete with every chapter.
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    let detail: String = db.query_row(
+        "SELECT detail_json FROM audit_log
+         WHERE action = 'instance.delete' AND subject = ?1
+         ORDER BY id DESC LIMIT 1",
+        rusqlite::params![y],
+        |row| row.get(0),
+    )?;
+    let detail: Value = serde_json::from_str(&detail)?;
+    let audited = detail["chapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|chapter| chapter["instanceId"].as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        audited,
+        [x, y].into_iter().collect(),
+        "the audit lists every deleted chapter: {detail}"
+    );
+    Ok(())
+}
+
 // --- 7. Ambiguous failed rows keep occupying seat/fan-out (ma-lineage r5) -
 
 /// Mark `id` failed with no ended_at and a plain turn/configure error — the

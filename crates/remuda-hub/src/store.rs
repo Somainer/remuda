@@ -806,12 +806,14 @@ pub struct LineageChapter {
 }
 
 /// One chapter [`Store::deletion_plan`] reports: what a delete would remove,
-/// where its Node data lives, and the lifecycle the pre-check must gate on.
+/// where its Node data lives, the lifecycle the pre-check must gate on, and
+/// the task whose worktree leases the handler must return.
 #[derive(Clone, Debug)]
 pub struct DeleteChapter {
     pub instance_id: String,
     pub host_id: String,
     pub lifecycle: String,
+    pub task_id: Option<String>,
 }
 
 /// The outcome of the HTTP delete handler's side-effect-free pre-check
@@ -4370,6 +4372,7 @@ impl Store {
                     instance_id: instance.instance_id.clone(),
                     host_id: instance.host_id.clone(),
                     lifecycle: instance.lifecycle.clone(),
+                    task_id: instance.task_id.clone(),
                 }));
             }
             let is_current = conn
@@ -4385,7 +4388,7 @@ impl Store {
                 return Ok(DeletionScope::NonCurrent);
             }
             let mut stmt = conn.prepare(
-                "SELECT id, host_id, lifecycle FROM instances
+                "SELECT id, host_id, lifecycle, task_id FROM instances
                  WHERE lineage_id = ?1 ORDER BY generation ASC, created_at ASC",
             )?;
             let chapters = stmt
@@ -4394,6 +4397,7 @@ impl Store {
                         instance_id: row.get(0)?,
                         host_id: row.get(1)?,
                         lifecycle: row.get(2)?,
+                        task_id: row.get(3)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

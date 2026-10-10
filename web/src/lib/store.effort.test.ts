@@ -898,6 +898,46 @@ function pinGate(ctx: { instance: Instance }, version: string) {
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
 }
 
+it("item 9: create seeds the orthogonal ultracode flag from the spec", async () => {
+  const ctx = await startFollowing("create-ultra");
+  const baseInstance = {
+    ...ctx.instance,
+    id: "ins_create_ultra",
+    journalId: "obj_create_ultra",
+    effortName: "xhigh",
+    effortIndex: 3,
+    effortUltracode: true,
+  };
+  vi.spyOn(api, "instanceCreate").mockResolvedValue({ instance: baseInstance } as never);
+
+  await hubStore.create({
+    kind: "claude",
+    effortName: "xhigh",
+    effortIndex: 3,
+    effortUltracode: true,
+  } as never);
+
+  // The fresh page shows the switch ON before any read-back; a later slider
+  // drag starts from {xhigh,true}, never from {xhigh,false}.
+  const seeded = hubStore.effortOf(baseInstance.id, "claude");
+  expect(seeded).toMatchObject({ name: "xhigh", index: 3, ultracode: true });
+
+  // And a flag-OFF launch seeds false explicitly.
+  vi.spyOn(api, "instanceCreate").mockResolvedValue({
+    instance: { ...baseInstance, id: "ins_create_off", effortName: "high", effortIndex: 2, effortUltracode: false },
+  } as never);
+  await hubStore.create({
+    kind: "claude",
+    effortName: "high",
+    effortIndex: 2,
+    effortUltracode: false,
+  } as never);
+  expect(hubStore.effortOf("ins_create_off", "claude")).toMatchObject({
+    name: "high",
+    ultracode: false,
+  });
+});
+
 it("item 2 coupled: turning the switch on moves the slider to xhigh and posts {xhigh,on}", async () => {
   const ctx = await startFollowing("coupled-on");
   await pinGate(ctx, "2.1.277");

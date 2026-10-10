@@ -61,7 +61,12 @@ SG x86_64，并用明确 tag 或摘要标识实际部署构建。
    （compose `user: "65532:65532"`，distroless nonroot）：secrets 目录
    `/data00/remuda/secrets` 必须属主为 `65532:65532`、模式 `0700`，access-code
    文件属主同为 `65532:65532`、模式 `0600`——root 属主的 0700 目录对 65532 是
-   EACCES。完整权限矩阵见 [m1/README.md A2](../../../deploy/m1/README.md)。
+   EACCES。完整权限矩阵见 [m1/README.md A2](../../deploy/m1/README.md)。
+   该非 root 要求只适用于 **m1 compose**（distroless nonroot，固定
+   `user: "65532:65532"`，且挂载 `/secrets`）；本 INTRANET runbook 使用的
+   `deploy/intranet/compose.hub.yml` 以
+   `${HUB_UID:-65532}:${HUB_GID:-65532}` 运行、默认不挂载 `/secrets`，
+   只需保证 access-code 文件本身可被该 uid 读取（0600 且属主匹配）。
 
 主机上的脚本名为 `~/astergate/deploy/remuda-caddy-change.py`。私有设置文件
 `.remuda-caddy-change.json` 使用 0600，包含 `gateway_health_url`、`hub_health_url`、

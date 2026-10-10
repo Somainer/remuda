@@ -390,6 +390,25 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("model-effort-chip")).toBeVisible();
     expect(screen.getByTestId("context-chip")).toBeVisible();
   });
+
+  it("item 7: a read-only codex `never` chip keeps the danger treatment", () => {
+    render(
+      <Composer
+        instanceId="ins_codex_never"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="codex"
+        model="gpt"
+        effort={{ index: 1, name: "medium", kind: "codex" }}
+        permissionMode="never"
+      />,
+    );
+    const chip = screen.getByTestId("permission-chip");
+    expect(chip).toHaveAttribute("data-readonly", "1");
+    expect(chip).toHaveAttribute("data-permission-danger", "1");
+    expect(chip).toHaveTextContent("never");
+  });
+
 });
 
 describe("Composer context usage chip", () => {

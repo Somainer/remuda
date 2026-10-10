@@ -20,7 +20,6 @@ import {
   codexSandboxTable,
   defaultPermissionForKind,
   launchPermissionTable,
-  structuredPermissionTable,
   normalizePermissionMode,
   type PermissionOption,
 } from "../features/session/permissions";
@@ -309,13 +308,11 @@ export function NewSessionPage() {
     ? kind
     : (KINDS.find((item) => kindEnabled(item.id))?.id ?? "claude");
 
-  // The launch table for the active harness; terminal has none.
+  // The launch table for the active harness: every mode the CLI accepts at
+  // launch (Claude includes plan and the launch-only dontAsk; the live wheel
+  // is the separate runtime table in the Composer). Terminal has none.
   const permissionTable: PermissionOption[] =
-    activeKind === "terminal"
-      ? []
-      : activeKind === "codex"
-        ? launchPermissionTable("codex")
-        : structuredPermissionTable(activeKind);
+    activeKind === "terminal" ? [] : launchPermissionTable(activeKind);
   // The dangerous/yolo row varies per harness and gates the ack checkbox.
   const dangerPermission = permissionTable.find((option) => option.danger);
   const yoloModeActive = Boolean(dangerPermission && permissionMode === dangerPermission.id);

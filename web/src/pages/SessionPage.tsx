@@ -38,6 +38,7 @@ import { apiRouteClause, apiRouteKind, routeDownMessage } from "../lib/apiRoute"
 import { projectCommandStatus } from "../lib/commandStatus";
 import { endReason } from "../lib/endReason";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
+import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import type { ResumeMode } from "../lib/api";
 import { hubStore, useHub } from "../lib/store";
 import { e2eSeamsEnabled } from "../lib/e2eSeams";
@@ -873,10 +874,12 @@ export function SessionPage({
           onSteerHeld={(id) => hubStore.steerHeld(instance.id, id)}
           onFlushHeld={() => hubStore.flushHeld(instance.id)}
           onInterrupt={() => hubStore.cancel(instance.id)}
-          permissionMode={hubStore.permissionModeOf(instance.id)}
-          launchPermissionMode={hubStore.launchPermissionModeOf(instance.id)}
-          permissionEffective={hubStore.permissionEffectiveOf(instance.id)}
-          permissionPending={hubStore.permissionPendingOf(instance.id)}
+          permissionMode={
+            genericPty ? ptyYoloChipLabel(instance.kind) : hubStore.permissionModeOf(instance.id)
+          }
+          launchPermissionMode={genericPty ? undefined : hubStore.launchPermissionModeOf(instance.id)}
+          permissionEffective={genericPty ? null : hubStore.permissionEffectiveOf(instance.id)}
+          permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}
           kind={instance.kind}
           model={hubStore.modelOf(instance.id, instance.kind)}
           launchModel={instance.model ?? null}
@@ -911,26 +914,21 @@ export function SessionPage({
             return pct == null ? null : `${pct}%`;
           })()}
           usageRollup={hubStore.usageRollupOf(instance.id)}
-          // Every structured agent (claude/grok/agy — not a raw terminal)
-          // gets the unified four-row permission menu; its native wire id is
-          // mapped by the driver/materializer. The print/generic-pty fixture
-          // drives the same menu (composer-effort e2e contract).
+          // Only the Claude PTY implements the live permission wheel today;
+          // a generic-pty and every non-Claude harness gets a read-only chip
+          // (its launch mode / the Node yolo preset), terminals none.
           onPermission={
-            instance.kind === "terminal"
+            genericPty || instance.kind !== "claude"
               ? undefined
               : (mode) => {
                   void hubStore.setPermission(instance.id, mode);
                 }
           }
           effortDisabled={status === "exited" || instance.ownership === "observed-only"}
-          // D-056 live configure is the STRUCTURED two-axis wire
-          // ({name, ultracode}) — the slider and switch stay orthogonal on
-          // every build that exposes the switch (legacy/unknown builds lock
-          // it inside the slider). The argv coupling (`--effort ultracode`
-          // ⇒ xhigh) is a LAUNCH-only materializer limit handled in New
-          // Session; a live session can post max+ultracode, which the driver
-          // accepts while it clamps plain max. Return the promise (the store
-          // owns failure: it rolls back and toasts; it never rejects).
+          // D-056 live configure is the two-axis wire ({name, ultracode});
+          // gateLiveEffort in the store applies the coupled xhigh linkage and
+          // the legacy/unknown fail-closed before the optimistic emit and the
+          // post (c-effortui r3 item 2).
           onEffort={(next) => hubStore.setEffort(instance.id, next)}
           onUltracode={(on) => hubStore.setUltracode(instance.id, on)}
           // The store owns the failure mouth: it reverts modelPending and

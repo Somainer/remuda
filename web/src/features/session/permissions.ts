@@ -120,29 +120,7 @@ const AGY_PERMS: PermissionOption[] = [
 
 const EMPTY: PermissionOption[] = [];
 
-/**
- * The four-row permission menu used by the STRUCTURED composer across agent
- * harnesses (New Session launch row + the live in-session wheel). The axes
- * are semantic and harness-agnostic — the native wire id rides the configure
- * payload and the materializer maps it per CLI; the label carries the native
- * word as a sub-label. Exactly four chips (incl. the danger bypass row), which
- * is the e2e contract at 390 and 1440. Codex keeps its separate policy +
- * sandbox axes via {@link launchPermissionTable}.
- */
-const STRUCTURED_PERMS: PermissionOption[] = [
-  CLAUDE_PERMS[0], // manual · 询问 (default)
-  CLAUDE_PERMS[1], // acceptEdits · 可改文件
-  CLAUDE_PERMS[3], // auto · 自动判断
-  CLAUDE_PERMS[4], // bypassPermissions · 绕过全部 (danger)
-];
-
-/** Permission menu rows for a structured agent session (4 semantic rows for
- *  claude/grok/agy; codex keeps its native two-axis launch table). */
-export function structuredPermissionTable(kind: PermissionKind | string): PermissionOption[] {
-  if (kind === "codex") return [CODEX_POLICIES[0], CODEX_POLICIES[1], CODEX_SANDBOX[1], CODEX_SANDBOX[2]];
-  return STRUCTURED_PERMS;
-}
-
+/** Launch-time table for a harness: every mode the CLI accepts. */
 export function launchPermissionTable(kind: PermissionKind | string): PermissionOption[] {
   if (kind === "claude") return CLAUDE_PERMS;
   if (kind === "grok") return GROK_PERMS;

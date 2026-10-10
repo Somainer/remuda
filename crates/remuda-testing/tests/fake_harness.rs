@@ -842,6 +842,7 @@ fn p6_codex_adapter_lifecycle_messages_tools_and_usage_from_a_live_fake() {
         home: h.home().to_path_buf(),
         cwd: h.home().to_path_buf(),
         pid: Some(h.pid()),
+        launched_at: None,
     });
     let observed = adapter.poll().expect("adapter poll");
     assert!(
@@ -902,6 +903,7 @@ fn p6_codex_adapter_records_an_interrupted_turn_from_a_live_fake() {
         home: h.home().to_path_buf(),
         cwd: h.home().to_path_buf(),
         pid: Some(h.pid()),
+        launched_at: None,
     });
     let observed = adapter.poll().expect("poll");
     assert!(
@@ -930,6 +932,7 @@ fn p6_grok_adapter_chunks_turns_and_tools_from_a_live_fake() {
         home: h.home().to_path_buf(),
         cwd: h.home().to_path_buf(),
         pid: Some(h.pid()),
+        launched_at: None,
     });
     let deadline = std::time::Instant::now() + WAIT;
     let mut observed = Vec::new();

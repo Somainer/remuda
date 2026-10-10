@@ -43,6 +43,7 @@ fn run_codex_adapter(dir: &Path) -> Vec<AdapterObservation> {
         home,
         cwd: dir.to_path_buf(),
         pid: None,
+        launched_at: None,
     });
     // Files are fully present: discovery on the first poll, the complete read on
     // the next; keep polling until a tick yields nothing.

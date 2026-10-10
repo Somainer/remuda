@@ -1408,6 +1408,9 @@ impl ShellPtyDriver {
             home: shadow.home.clone(),
             cwd: PathBuf::from(cwd),
             pid: pid.filter(|pid| *pid > 0).map(|pid| pid as u32),
+            // Hook-confirmed shadow-home launch: discovery is proven by the
+            // hook channel (tier 1), so it needs no launch floor.
+            launched_at: None,
         };
         let stamp = crate::adapters::supervisor::stamp_ctx(
             ctx.instance_id.clone(),

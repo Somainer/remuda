@@ -122,6 +122,14 @@ pub struct AdapterHome {
     /// Agent process pid when known (launch child, or promoted foreground
     /// leader). Grok's `active_sessions.json` matches on it.
     pub pid: Option<u32>,
+    /// When THIS driver launched the agent (generic-pty dispatch: no hooks, no
+    /// child pid), the wall-clock floor for file discovery. A native session
+    /// may bind only if its `session_meta.timestamp` is at/after it and its
+    /// cwd matches — without the floor, an unconfirmed adapter could bind an
+    /// older, unrelated session sharing the operator's real harness home
+    /// (c-usagefu r3 item 1). `None` for a promoted/foreign-launched process,
+    /// whose session legitimately predates our attachment.
+    pub launched_at: Option<time::OffsetDateTime>,
 }
 
 /// A session the adapter should follow.

@@ -215,7 +215,15 @@ pub fn promoted_home(kind: AgentKind, cwd: PathBuf, pid: Option<u32>) -> Option<
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(dot)))?;
-    Some(AdapterHome { home, cwd, pid })
+    Some(AdapterHome {
+        home,
+        cwd,
+        pid,
+        // A promoted session was launched by the operator before we attached;
+        // there is no launch floor, so its adapter keeps the name-index
+        // discovery path. Only a driver launch (generic_pty) supplies one.
+        launched_at: None,
+    })
 }
 
 /// The session id a file adapter should follow given a hook-confirmed binding.

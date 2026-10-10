@@ -25,6 +25,7 @@ fn adapter_with_rollout(dir: &Path, session_id: &str) -> CodexAdapter {
         home: dir.to_path_buf(),
         cwd: dir.to_path_buf(),
         pid: None,
+        launched_at: None,
     });
     adapter.confirm_session(session_id);
     assert!(adapter.discover().unwrap());
@@ -107,6 +108,7 @@ fn interrupted_turn_comes_back_idle_not_failed() {
         home: tempfile::tempdir().unwrap().path().to_path_buf(),
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
+        launched_at: None,
     });
     let observed = feed(&mut adapter, lines);
     let aborted = observed
@@ -145,6 +147,7 @@ fn a_foreign_abort_reason_does_not_end_the_turn() {
         home: tempfile::tempdir().unwrap().path().to_path_buf(),
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
+        launched_at: None,
     });
     let observed = feed(&mut adapter, lines);
     assert!(
@@ -166,6 +169,7 @@ fn completed_items_map_messages_and_a_late_tool_result_keeps_the_old_turn() {
         home: tempfile::tempdir().unwrap().path().to_path_buf(),
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
+        launched_at: None,
     });
     let observed = feed(&mut adapter, lines);
     // The late result carries the OLD turn id t1 (evidence ordinal 86).
@@ -204,6 +208,7 @@ fn duplicate_representations_do_not_double_journal() {
         home: tempfile::tempdir().unwrap().path().to_path_buf(),
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
+        launched_at: None,
     });
     let observed = feed(&mut adapter, lines);
     let messages = observed
@@ -229,6 +234,7 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
         home: tempfile::tempdir().unwrap().path().to_path_buf(),
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
+        launched_at: None,
     });
     let observed = feed(&mut adapter, lines);
     let usages: Vec<_> = observed
@@ -293,6 +299,7 @@ fn discovery_refuses_to_invent_a_session_when_the_index_is_empty() {
         home: dir.path().to_path_buf(),
         cwd: dir.path().to_path_buf(),
         pid: None,
+        launched_at: None,
     });
     assert!(adapter.poll().unwrap().is_empty());
     assert!(adapter.binding().is_none());
@@ -319,6 +326,7 @@ fn a_newline_terminated_partial_line_is_held_until_complete() {
         home: dir.path().to_path_buf(),
         cwd: dir.path().to_path_buf(),
         pid: None,
+        launched_at: None,
     });
     adapter.confirm_session(session);
     assert!(adapter.poll().unwrap().is_empty(), "partial line held");
@@ -345,4 +353,171 @@ fn native_timestamp_parses_rollout_record_time() {
     assert!(value.is_some(), "rfc3339 ms parses");
     let none = remuda_driver::adapters::native_timestamp(None);
     assert!(none.is_none());
+}
+
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+/// Write one active rollout with a session_meta header carrying the thread id,
+/// working directory and session-start time, under a date-sharded dir.
+fn write_rollout(home: &Path, date: &str, id: &str, cwd: &str, started: &str) {
+    let session_dir = home.join("sessions").join(date);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let path = session_dir.join(format!("rollout-{id}.jsonl"));
+    std::fs::write(
+        path,
+        format!(
+            "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"session_id\":\"{id}\",\"cwd\":\"{cwd}\",\"timestamp\":\"{started}\"}}}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// The c-usagefu r3 item 1 regression: on generic-pty the adapter tails the
+/// operator's REAL codex home (shared with every project), has no hooks and no
+/// child pid. The last entry in `session_index.jsonl` is simply the thread the
+/// operator renamed last — possibly in another project — and must never be
+/// bound. Only a unique same-cwd session started at/after our launch binds.
+#[test]
+fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = Path::new("/projects/alpha");
+    // Relative times: floor ten seconds ago keeps the 120 s discovery window
+    // open for the test's duration.
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(10);
+    let rfc = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+
+    // The operator's pre-existing sessions: one in ANOTHER cwd that started
+    // after our floor (cwd filter), one in our cwd that started BEFORE the
+    // launch (time filter). The name index's last line points at the foreign
+    // thread — under the old code that was exactly what got bound.
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "foreign-other-cwd",
+        "/projects/beta",
+        &rfc(now - time::Duration::seconds(1)),
+    );
+    write_rollout(
+        home.path(),
+        "2026/09/13",
+        "foreign-same-cwd-old",
+        "/projects/alpha",
+        &rfc(now - time::Duration::seconds(600)),
+    );
+    std::fs::write(
+        home.path().join("session_index.jsonl"),
+        "{\"id\":\"foreign-same-cwd-old\"}\n{\"id\":\"foreign-other-cwd\"}\n",
+    )
+    .unwrap();
+
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        pid: None,
+        launched_at: Some(floor),
+    });
+
+    assert!(adapter.poll().unwrap().is_empty());
+    let bound = adapter.binding().map(|binding| binding.session_id.clone());
+    assert!(
+        bound.is_none(),
+        "no foreign session may bind, got {bound:?}"
+    );
+
+    // The pane's own session registers shortly after launch.
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "own-session",
+        "/projects/alpha",
+        &rfc(now - time::Duration::seconds(2)),
+    );
+    assert!(adapter.discover().unwrap());
+    assert_eq!(
+        adapter.binding().map(|binding| binding.session_id.as_str()),
+        Some("own-session"),
+        "only the unique post-launch same-cwd rollout binds"
+    );
+}
+
+/// Two same-cwd sessions inside the launch window is unprovable ownership:
+/// fail closed permanently, even after one of them goes away.
+#[test]
+fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = Path::new("/projects/alpha");
+    // Keep the discovery window open so this exercises the Ambiguous branch,
+    // not the deadline branch.
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(10);
+    let rfc = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "one",
+        "/projects/alpha",
+        &rfc(now - time::Duration::seconds(5)),
+    );
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "two",
+        "/projects/alpha",
+        &rfc(now - time::Duration::seconds(1)),
+    );
+
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        pid: None,
+        launched_at: Some(floor),
+    });
+    assert!(!adapter.discover().unwrap(), "ambiguous binds nothing");
+    assert!(adapter.binding().is_none());
+
+    // Remove one candidate so a unique match would now exist; the ambiguity
+    // decision stands and the home is not rescanned forever.
+    std::fs::remove_file(
+        home.path()
+            .join("sessions/2026/09/14")
+            .join("rollout-two.jsonl"),
+    )
+    .unwrap();
+    assert!(!adapter.discover().unwrap());
+    assert!(adapter.binding().is_none());
+}
+
+/// Past the discovery window with no unique match, the adapter stops scanning
+/// the home: a same-cwd rollout appearing afterwards never binds and never
+/// restarts the per-tick directory walk.
+#[test]
+fn after_the_discovery_window_a_late_rollout_never_binds() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = Path::new("/projects/alpha");
+    // Floor 200 s ago: the 120 s discovery window has already elapsed.
+    let floor = OffsetDateTime::now_utc() - time::Duration::seconds(200);
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        pid: None,
+        launched_at: Some(floor),
+    });
+    assert!(!adapter.discover().unwrap());
+    assert!(adapter.binding().is_none());
+
+    let started = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "late",
+        "/projects/alpha",
+        &started,
+    );
+    assert!(
+        !adapter.discover().unwrap(),
+        "the deadline decision is final"
+    );
+    assert!(adapter.binding().is_none());
 }

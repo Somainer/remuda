@@ -411,3 +411,137 @@ pub fn locate_rollout_in(codex_home: &Path, session_id: &str) -> Option<PathBuf>
     }
     None
 }
+
+/// Discovery result for a driver-launched (generic-pty) codex session that has
+/// no hook channel and no child pid: matching by cwd + launch time is the only
+/// ownership evidence available.
+#[derive(Debug)]
+pub enum CwdRollout {
+    /// Nothing matches yet; the launched session may simply not have
+    /// registered. The caller should keep polling until its discovery
+    /// deadline.
+    NotYet,
+    /// Exactly one rollout matches: its thread id and file.
+    Found {
+        /// `session_meta.id` of the matching rollout.
+        id: String,
+        /// Rollout JSONL file.
+        path: PathBuf,
+    },
+    /// More than one rollout matches cwd + launch window. Never guess which is
+    /// ours: the caller must stop discovering rather than bind one.
+    Ambiguous,
+}
+
+/// Clock slack between "we dispatched the launch" and codex writing the
+/// session's first `session_meta` line. The two clocks are the same host, but
+/// the dispatch RPC can return a hair after the pane's process started.
+pub const LAUNCH_TIME_SLACK: time::Duration = time::Duration::seconds(5);
+
+/// Locate the rollout of the codex session WE launched in `cwd` at/after
+/// `launched_at`. Only the active `sessions/` tree is scanned (a fresh session
+/// is never archived), symlinks are not followed, and each file's identity is
+/// its first-line `session_meta` (id + cwd + timestamp). Zero matches is
+/// [`CwdRollout::NotYet`] (the TUI has not registered yet); two or more is
+/// [`CwdRollout::Ambiguous`] (fail closed).
+#[must_use]
+pub fn locate_rollout_by_cwd(
+    codex_home: &Path,
+    cwd: &Path,
+    launched_at: time::OffsetDateTime,
+) -> CwdRollout {
+    let floor = launched_at - LAUNCH_TIME_SLACK;
+    let mut matches: Vec<(String, PathBuf)> = Vec::new();
+    let mut pending = vec![codex_home.join("sessions")];
+    while let Some(dir) = pending.pop() {
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut paths = entries.flatten().collect::<Vec<_>>();
+        paths.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in paths {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(entry.path());
+            }
+            if !kind.is_file()
+                || entry
+                    .path()
+                    .extension()
+                    .is_none_or(|value| value != "jsonl")
+            {
+                continue;
+            }
+            let Ok(file) = std::fs::File::open(entry.path()) else {
+                continue;
+            };
+            let mut first = String::new();
+            if std::io::BufReader::new(file)
+                .take(1024 * 1024)
+                .read_line(&mut first)
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(CodexRolloutRecord {
+                event: CodexRolloutEvent::SessionMeta { metadata, .. },
+                ..
+            }) = parse_rollout_line(&first)
+            else {
+                continue;
+            };
+            let Some(id) = metadata["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if !cwd_matches(metadata["cwd"].as_str(), cwd) {
+                continue;
+            }
+            // The session must have started at/after our launch. A missing or
+            // unparseable timestamp never qualifies: ownership would then be
+            // unprovable.
+            let Some(started) = metadata["timestamp"].as_str().and_then(|raw| {
+                time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            }) else {
+                continue;
+            };
+            if started >= floor {
+                matches.push((id.to_owned(), entry.path()));
+            }
+        }
+    }
+    match matches.len() {
+        0 => CwdRollout::NotYet,
+        1 => {
+            let (id, path) = matches.remove(0);
+            CwdRollout::Found { id, path }
+        }
+        _ => CwdRollout::Ambiguous,
+    }
+}
+
+/// Compare a rollout's `session_meta.cwd` with the launch cwd. A literal match
+/// wins; when both paths exist, compare canonical forms so filesystem aliases
+/// (symlink prefixes, `/tmp` vs `/private/tmp`) agree. Failure to canonicalize
+/// never upgrades a non-matching string into a match.
+fn cwd_matches(rollout_cwd: Option<&str>, launch_cwd: &Path) -> bool {
+    let Some(rollout_cwd) = rollout_cwd.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let rollout_path = Path::new(rollout_cwd);
+    if rollout_path == launch_cwd {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(rollout_path),
+        std::fs::canonicalize(launch_cwd),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}

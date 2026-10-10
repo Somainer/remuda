@@ -534,13 +534,17 @@ impl GenericPtyDriver {
     /// operator's login), so the harness reads and writes its REAL home — the
     /// same environment resolution the promoted-hand-typed path uses
     /// (`CODEX_HOME`/`GROK_HOME`, else `$HOME/.codex`/`$HOME/.grok`). The
-    /// adapter tails that home and binds by cwd registry match (the herdr pane
-    /// reports no child pid); an ambiguous cwd match makes discovery fail
-    /// closed rather than attach to another instance's session. A tail that
+    /// adapter tails that real home, which is shared with every other project
+    /// the operator runs, so binding must be proven rather than guessed:
+    /// grok matches its pid/cwd registry and rejects ambiguity (the herdr pane
+    /// reports no child pid); codex (r3 item 1) binds only a UNIQUE rollout
+    /// whose cwd is this launch cwd and whose session started at/after THIS
+    /// launch — a same-cwd collision fails closed, and the `session_index`
+    /// "newest renamed thread anywhere" guess is never used. A tail that
     /// cannot start yet (the session has not registered) keeps retrying on its
-    /// poll tick. Failure to spawn degrades silently, like the
-    /// promoted-adapter watch — losing the file channel never fails the
-    /// launch.
+    /// poll tick until the adapter's short discovery window elapses. Failure
+    /// to spawn degrades silently, like the promoted-adapter watch — losing
+    /// the file channel never fails the launch.
     fn spawn_file_tail_adapters(
         &self,
         spec: &InstanceSpec,
@@ -552,6 +556,10 @@ impl GenericPtyDriver {
             AgentKind::Codex | AgentKind::Grok => spec.kind,
             _ => return None,
         };
+        // Discovery floor: the pane's agent.start was dispatched just above,
+        // so the native session this adapter is allowed to bind cannot have
+        // started before now (a small clock slack lives in the locator).
+        let launched_at = time::OffsetDateTime::now_utc();
         // The Node and the herdr daemon share the operator's login
         // environment, so resolving the harness home from this process gives
         // the same home the pane's harness process resolves. Tests inject the
@@ -565,6 +573,7 @@ impl GenericPtyDriver {
             home: home_path,
             cwd: PathBuf::from(&recipe.cwd),
             pid: None,
+            launched_at: Some(launched_at),
         };
         let stamp = crate::adapters::supervisor::stamp_ctx(
             self.options.instance_id.clone().unwrap_or_default(),

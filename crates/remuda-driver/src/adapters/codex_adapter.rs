@@ -43,7 +43,8 @@ use crate::adapters::{
     thought_payload, tool_call_payload, tool_result_payload, turn_lifecycle,
 };
 use crate::codex_rollout::{
-    CodexRolloutEvent, RolloutTail, locate_rollout_in, parse_rollout_line_at,
+    CodexRolloutEvent, CwdRollout, RolloutTail, locate_rollout_by_cwd, locate_rollout_in,
+    parse_rollout_line_at,
 };
 use crate::error::DriverResult;
 use crate::usage::codex::CodexUsage;
@@ -76,7 +77,20 @@ pub struct CodexAdapter {
     usage_totals: UsageAggregator,
     /// Optional fallback model for usage records whose turn had no context.
     fallback_model: Option<String>,
+    /// Discovery was proven impossible for this launch: two same-cwd sessions
+    /// appeared in the launch window (ambiguous, fail closed), or the deadline
+    /// passed with no matching rollout. When set, the poller stops scanning
+    /// the home so an unbound adapter does not walk `sessions/` every tick for
+    /// the instance's whole life.
+    discovery_gave_up: bool,
 }
+
+/// How long after a driver launch (generic-pty: no hooks, no child pid) the
+/// adapter keeps looking for a same-cwd rollout that started at/after launch.
+/// The codex TUI writes `session_meta` within seconds of pane start; once this
+/// window elapses with no unique match, no session is ever coming — stop the
+/// 250 ms directory rescans rather than continuing for the instance's life.
+const LAUNCH_DISCOVERY_WINDOW: time::Duration = time::Duration::seconds(120);
 
 impl CodexAdapter {
     /// Create an unbound adapter for a shadow `CODEX_HOME`.
@@ -97,6 +111,7 @@ impl CodexAdapter {
             usage: CodexUsage::new(),
             usage_totals: UsageAggregator::new(),
             fallback_model: None,
+            discovery_gave_up: false,
         }
     }
 
@@ -143,21 +158,64 @@ impl CodexAdapter {
 
     /// Find the session's rollout.
     ///
-    /// Preference order: the hook-confirmed id (P1 channel A), then the newest
-    /// `session_index.jsonl` name entry. `locate_rollout_in` then verifies the
-    /// file's `session_meta.id` and refuses ambiguous matches — the index is a
-    /// name index, not a PID registry (§A4 [V]).
+    /// Three evidence tiers:
+    ///
+    /// 1. **Hook-confirmed id** (channel A): the supervisor hands this only to
+    ///    an adapter whose agent pid matches, so the file for exactly that id
+    ///    may bind; a missing file means "wait", never "guess".
+    /// 2. **Driver launch with a launch floor** (generic-pty: no hooks, no
+    ///    child pid, real operator home): the ONLY acceptable match is a
+    ///    unique rollout whose `session_meta.cwd` is the launch cwd and whose
+    ///    session started at/after launch. Zero matches keeps polling (the TUI
+    ///    has not registered yet, until [`LAUNCH_DISCOVERY_WINDOW`]); two or
+    ///    more fail closed forever. The `session_index.jsonl` recency guess is
+    ///    deliberately NOT used here: it is a name index over EVERY project
+    ///    and its last line is whatever thread the operator renamed last,
+    ///    anywhere — binding that journals a foreign project's transcript,
+    ///    tool calls, usage and cost under this instance (c-usagefu r3 item 1).
+    /// 3. **Promoted/foreign-launched attach** (no launch floor): the session
+    ///    predates us, so the name-index recency guess remains the last
+    ///    resort, exactly as before.
     fn discover(&mut self) -> DriverResult<bool> {
-        if let Some(id) = self
-            .confirmed
-            .clone()
-            .or_else(|| newest_indexed(&self.home.home))
-            && let Some(path) = locate_rollout_in(&self.home.home, &id)
-        {
-            self.bind(id, path);
-            return Ok(true);
+        // A prior poll already proved binding impossible (ambiguity, or the
+        // window elapsed): never rescan and never reverse that decision.
+        if self.discovery_gave_up {
+            return Ok(false);
         }
-        Ok(false)
+        if let Some(id) = self.confirmed.clone() {
+            if let Some(path) = locate_rollout_in(&self.home.home, &id) {
+                self.bind(id, path);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let Some(launched_at) = self.home.launched_at else {
+            if let Some(id) = newest_indexed(&self.home.home)
+                && let Some(path) = locate_rollout_in(&self.home.home, &id)
+            {
+                self.bind(id, path);
+                return Ok(true);
+            }
+            return Ok(false);
+        };
+        if time::OffsetDateTime::now_utc() > launched_at + LAUNCH_DISCOVERY_WINDOW {
+            self.discovery_gave_up = true;
+            return Ok(false);
+        }
+        match locate_rollout_by_cwd(&self.home.home, &self.home.cwd, launched_at) {
+            CwdRollout::Found { id, path } => {
+                self.confirmed = Some(id.clone());
+                self.bind(id, path);
+                Ok(true)
+            }
+            // Two same-cwd sessions started within the launch window: ownership
+            // is unprovable, never pick one and never reconsider.
+            CwdRollout::Ambiguous => {
+                self.discovery_gave_up = true;
+                Ok(false)
+            }
+            CwdRollout::NotYet => Ok(false),
+        }
     }
 
     /// Map one parsed rollout line to zero or more observations.

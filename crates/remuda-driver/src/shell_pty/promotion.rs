@@ -262,6 +262,36 @@ impl BindingHandle {
         true
     }
 
+    /// Bind an authenticated SessionStart report on an epoch's FIRST claim
+    /// when no binding exists yet.
+    ///
+    /// The argv session id is stale the moment the user runs `/resume` or
+    /// `/clear` in the TUI (the process argv never changes), and with the
+    /// transcript created lazily the hook report can arrive before any other
+    /// channel binds: without this, `resolve`'s argv arm would lock the OLD
+    /// launch session while the live session is the one the authenticated
+    /// report names. The same cwd/pid gates as a rebind apply; the epoch is
+    /// NOT bumped (this is its first claim).
+    fn bind_authenticated_report(&self, found: &Detected, report: &SessionStartReport) -> bool {
+        let Ok(mut slot) = self.inner.lock() else {
+            return false;
+        };
+        if slot.binding.is_some() {
+            return false;
+        }
+        let Some(candidate) = report.bind(found.pid) else {
+            return false;
+        };
+        if !transcript_belongs_to_cwd(&slot.claude_home, &slot.cwd, &candidate.path) {
+            return false;
+        }
+        slot.binding = Some(candidate);
+        slot.degraded = false;
+        slot.degraded_reason.clear();
+        slot.cwd_checked = false;
+        true
+    }
+
     /// Current locked binding, if any.
     fn binding(&self) -> Option<TranscriptBinding> {
         self.inner.lock().ok().and_then(|slot| slot.binding.clone())
@@ -986,14 +1016,28 @@ pub(super) fn spawn(
                         cwd: None,
                         ppid: Some(i64::from(binding.pid)),
                     };
-                    // Tear the hydrator when an EXISTING binding flips to a new
-                    // session so it reopens against the new transcript. When no
-                    // prior binding exists (the lazy-create case) there is
-                    // nothing to tear; the sticky mode above already covers it.
-                    if bindings.rebind_authenticated_start(
+                    // r7 item 1: the authenticated report names the session
+                    // ACTUALLY live in this pid. It governs both when an
+                    // existing binding flips (/resume, /clear after the launch
+                    // session was bound) and when NOTHING is bound yet (the
+                    // lazy-create case: argv still names the launch session
+                    // while its stale file would otherwise win resolve's argv
+                    // channel). Either way the hydrator reopens against the
+                    // reported session and its sticky boundary.
+                    let rebound = bindings.rebind_authenticated_start(
                         found.as_ref().expect("matched foreground"),
                         &report,
-                    ) {
+                    );
+                    let first_claim = !rebound
+                        && bindings.binding().is_none()
+                        && found.as_ref().is_some_and(|found| {
+                            found.session_id.as_deref() != Some(report.session_id.as_str())
+                        })
+                        && bindings.bind_authenticated_report(
+                            found.as_ref().expect("matched foreground"),
+                            &report,
+                        );
+                    if rebound || first_claim {
                         hydrator = None;
                         announced = None;
                     }
@@ -1319,18 +1363,6 @@ pub(super) fn spawn(
             match (&promote.kind, &found) {
                 // Claude is the only kind that hydrates a transcript in the MVP.
                 (Some(AgentKind::Claude), Some(found)) if found.hydrates_transcript => {
-                    // Item 4: the pre-spawn launch mode belongs to the
-                    // Remuda-launched (pid, session). A SessionStart rebind to
-                    // a DIFFERENT session, or a pid change, kills it for the
-                    // rest of the epoch; that new foreground agent is bounded
-                    // from its own detected provenance instead.
-                    // The boundary measured at this session's SessionStart
-                    // report, if one has been ingested yet (items 3/4).
-                    let sticky = found
-                        .session_id
-                        .as_ref()
-                        .and_then(|session| session_modes.mode_for(found.pid, session));
-                    let mode = epoch_mode(&mut launch_mode, pre_resume_mode, sticky, found);
                     maintain_binding(
                         &bindings,
                         &ctx,
@@ -1344,7 +1376,9 @@ pub(super) fn spawn(
                         model.as_ref(),
                         permission_bridge.as_ref(),
                         launch_permission,
-                        mode,
+                        &mut session_modes,
+                        &mut launch_mode,
+                        pre_resume_mode,
                     )
                     .await;
                 }
@@ -1600,7 +1634,7 @@ impl SessionModeTable {
             return *entry;
         }
         let at_report = transcript_path
-            .map(crate::claude_transcript::ResumeMode::rebound_mode)
+            .map(ResumeMode::rebound_mode)
             .unwrap_or(ResumeMode::Fresh);
         let first_for_pid = self.first_pid.insert(pid);
         let (mode, rebound) = if first_for_pid {
@@ -1738,7 +1772,9 @@ async fn maintain_binding(
     model: Option<&ModelSync>,
     permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
-    mode: ResumeMode,
+    session_modes: &mut SessionModeTable,
+    launch_mode: &mut LaunchModeBinding,
+    pre_resume_mode: Option<ResumeMode>,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -1854,6 +1890,16 @@ async fn maintain_binding(
     }
 
     if hydrator.is_none() {
+        // r7 item 1: the sticky boundary is keyed by the session ACTUALLY
+        // BOUND this tick — not by the argv session id, which stays the launch
+        // session after an in-TUI /resume or /clear and is absent altogether
+        // for a hand-typed claude. A session without a recorded SessionStart
+        // (pid-file/argv-only detection) falls back to epoch_mode's detected
+        // provenance.
+        let sticky = session_modes.mode_for(found.pid, &binding.session_id);
+        let mut bound_found = found.clone();
+        bound_found.session_id = Some(binding.session_id.clone());
+        let mode = epoch_mode(launch_mode, pre_resume_mode, sticky, &bound_found);
         *hydrator = Hydrator::open(
             ctx,
             &binding,
@@ -2716,6 +2762,50 @@ mod tests {
         std::fs::write(&report.transcript_path, "{}\n").unwrap();
         assert!(!bindings.rebind_authenticated_start(&found, &report));
         assert_eq!(bindings.binding().unwrap().session_id, LATE_STARTER);
+    }
+
+    #[test]
+    fn an_authenticated_report_binds_the_first_claim_over_a_stale_argv_session() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&cwd, tmp.path());
+        // The launch argv still names S1 and S1's file now exists, but the
+        // authenticated report says the live session is LATE_STARTER.
+        slug_session(tmp.path(), &cwd, CORRECT, "{}\n");
+        slug_session(tmp.path(), &cwd, LATE_STARTER, "{}\n");
+        let found = detected_claude(7, Some(CORRECT));
+        let report = SessionStartReport {
+            session_id: LATE_STARTER.into(),
+            transcript_path: crate::claude_transcript::project_dir(tmp.path(), &cwd)
+                .join(format!("{LATE_STARTER}.jsonl")),
+            cwd: None,
+            ppid: Some(7),
+        };
+        // No binding yet: the report takes the first claim.
+        assert!(bindings.bind_authenticated_report(&found, &report));
+        assert_eq!(bindings.binding().unwrap().session_id, LATE_STARTER);
+        // Once bound it never overrides an existing claim.
+        assert!(!bindings.bind_authenticated_report(&found, &report));
+        // A wrong-pid report does not bind an empty epoch.
+        bindings.demobilize();
+        let foreign = detected_claude(8, Some(CORRECT));
+        assert!(!bindings.bind_authenticated_report(&foreign, &report));
+        assert!(bindings.binding().is_none());
+        // A transcript outside the promoted cwd is refused.
+        let other_cwd = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&other_cwd).unwrap();
+        let stray = other_cwd.join("stray.jsonl");
+        std::fs::write(&stray, "{}\n").unwrap();
+        let stray_report = SessionStartReport {
+            session_id: "stray-session".into(),
+            transcript_path: stray,
+            cwd: None,
+            ppid: Some(7),
+        };
+        assert!(!bindings.bind_authenticated_report(&found, &stray_report));
+        assert!(bindings.binding().is_none());
     }
 
     #[test]

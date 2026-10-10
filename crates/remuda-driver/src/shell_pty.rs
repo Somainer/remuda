@@ -5105,4 +5105,409 @@ mod tests {
             "the promotion pump published the journal-derived effort id on its real channel"
         );
     }
+
+    // ----- c-effortread r7 item 1: sticky boundary by the BOUND session -----
+
+    /// One fixture table: the live pgid is always a `claude` whose args the
+    /// test swaps between polls (the process argv never changes on an
+    /// in-TUI /resume, so the test deliberately keeps it on the OLD flag).
+    #[derive(Clone)]
+    struct ScriptedClaudeTable {
+        args: Arc<std::sync::Mutex<String>>,
+    }
+
+    impl crate::promote::ProcessTable for ScriptedClaudeTable {
+        fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+            if pgid <= 0 {
+                return Vec::new();
+            }
+            vec![crate::promote::ProcessRow {
+                pid: pgid,
+                args: self.args.lock().unwrap().clone(),
+            }]
+        }
+    }
+
+    const R7_S1: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+    const R7_X: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+    const R7_Y: &str = "dddddddd-4444-4444-8444-dddddddddddd";
+    const R7_Z: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+    fn r7_record(session: &str, mut record: serde_json::Value) -> String {
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("sessionId".into(), serde_json::json!(session));
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("version".into(), serde_json::json!("2.1.289"));
+        let mut line = record.to_string();
+        line.push('\n');
+        line
+    }
+
+    fn r7_user(session: &str, uuid: &str, text: &str) -> String {
+        r7_record(
+            session,
+            serde_json::json!({
+                "type": "user",
+                "uuid": uuid,
+                "message": {"role": "user", "content": text},
+            }),
+        )
+    }
+
+    fn r7_slash(session: &str, uuid: &str, args: &str) -> String {
+        r7_record(
+            session,
+            serde_json::json!({
+                "type": "user",
+                "uuid": uuid,
+                "message": {
+                    "role": "user",
+                    "content": format!(
+                        "<command-name>/effort</command-name>\n\
+                         <command-message>effort</command-message>\n\
+                         <command-args>{args}</command-args>"
+                    ),
+                },
+            }),
+        )
+    }
+
+    fn r7_verdict(session: &str, uuid: &str, text: &str) -> String {
+        r7_user(
+            session,
+            uuid,
+            &format!("<local-command-stdout>{text}</local-command-stdout>"),
+        )
+    }
+
+    fn r7_assistant(session: &str, uuid: &str, effort: Option<&str>) -> String {
+        let mut record = serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {
+                "id": uuid,
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": format!("reply {uuid}")}],
+                "stop_reason": "end_turn",
+            },
+            "perTurnEffort": null,
+        });
+        if let Some(level) = effort {
+            record
+                .as_object_mut()
+                .unwrap()
+                .insert("effort".into(), serde_json::json!(level));
+        }
+        r7_record(session, record)
+    }
+
+    fn r7_effort_names(
+        observations: &[remuda_protocol::Observation],
+    ) -> Vec<Option<remuda_protocol::EffortName>> {
+        observations
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                remuda_protocol::ObservationPayload::Effort(payload) => {
+                    Some(payload.effective.name)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn r7_conversation_has(observations: &[remuda_protocol::Observation], needle: &str) -> bool {
+        observations.iter().any(|observation| {
+            matches!(
+                observation.body,
+                remuda_protocol::ObservationPayload::Message(_)
+                    | remuda_protocol::ObservationPayload::Thought(_)
+                    | remuda_protocol::ObservationPayload::ToolCall(_)
+                    | remuda_protocol::ObservationPayload::ToolResult(_)
+            ) && serde_json::to_string(&observation.body).is_ok_and(|body| body.contains(needle))
+        })
+    }
+
+    async fn r7_collect(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        dur: std::time::Duration,
+    ) -> Vec<remuda_protocol::Observation> {
+        let mut out = Vec::new();
+        let until = std::time::Instant::now() + dur;
+        while std::time::Instant::now() < until {
+            if let Ok(Some(observation)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await
+            {
+                out.push(observation);
+            }
+        }
+        out
+    }
+
+    async fn r7_send_session_start(
+        hooks: &crate::launch::HookSession,
+        pid: i32,
+        session_id: &str,
+        path: &std::path::Path,
+    ) {
+        let reply = remuda_signal::send_event(
+            &hooks.socket_path,
+            &remuda_signal::HookEnvelope {
+                credential: hooks.child_env("")["REMUDA_HOOK_CREDENTIAL"].clone(),
+                event: "SessionStart".into(),
+                ppid: pid,
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "transcript_path": path.to_string_lossy(),
+                }),
+            },
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(reply.to_hook_json(), serde_json::json!({}));
+    }
+
+    fn r7_login_driver(
+        dir: &std::path::Path,
+        home: &std::path::Path,
+        args: Arc<std::sync::Mutex<String>>,
+    ) -> ShellPtyDriver {
+        let mut options = ShellPtyOptions::login(dir.to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()];
+        options.promote = true;
+        options.claude_home = Some(home.to_path_buf());
+        options.hooks = Some(HookConfig {
+            instance_dir: dir.join("instance"),
+            relay_binary: std::path::PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        ShellPtyDriver::with_process_table(
+            options,
+            Arc::new(ScriptedClaudeTable { args }) as Arc<dyn crate::promote::ProcessTable>,
+        )
+    }
+
+    /// r7 item 1: a fresh launch argv keeps `--session-id S1` after the user
+    /// runs `/resume Y` in the TUI. The poller must bound Y from Y's OWN
+    /// SessionStart snapshot (unverified EOF anchor): Y's history (a high
+    /// read-back plus a max slash/verdict) neither publishes an effort edge
+    /// nor settles an armed switch, while conversation appended afterwards
+    /// still hydrates.
+    #[tokio::test]
+    async fn item1_resume_after_launch_uses_the_bound_session_not_the_argv_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {R7_S1}"
+        )));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // First tick promotes. S1's authenticated SessionStart fires at TUI
+        // boot, BEFORE the first prompt lazily creates the transcript, so the
+        // sticky entry for S1 is measured while the file is absent.
+        let s1_path = slug.join(format!("{R7_S1}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_S1, &s1_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1000)).await;
+        // The prompt then creates S1.jsonl; the next poll binds it Fresh.
+        std::fs::write(&s1_path, r7_user(R7_S1, "s1-prompt", "first prompt")).unwrap();
+        r7_collect(&mut events, std::time::Duration::from_millis(1600)).await;
+
+        // Arm before the rebind: Y's replayed verdict must never settle it.
+        let bridge = driver.effort_bridge.lock().await.clone();
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+
+        // In-TUI /resume Y; argv still says S1. Y carries history with a
+        // high read-back and the exact max slash+verdict that WOULD settle
+        // the armed switch were Y tailed from byte 0 as current.
+        let y_history = format!(
+            "{}{}{}",
+            r7_assistant(R7_Y, "y-old-assistant", Some("high")),
+            r7_slash(R7_Y, "y-old-slash", "max"),
+            r7_verdict(R7_Y, "y-old-verdict", "Set effort level to max"),
+        );
+        let y_path = slug.join(format!("{R7_Y}.jsonl"));
+        std::fs::write(&y_path, y_history).unwrap();
+        r7_send_session_start(&hooks, pgid, R7_Y, &y_path).await;
+        let rebound = r7_collect(&mut events, std::time::Duration::from_millis(2400)).await;
+        assert!(
+            r7_effort_names(&rebound).is_empty(),
+            "Y history must not publish an effort edge: {rebound:?}"
+        );
+        assert!(bridge.has_pending());
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the replayed verdict must not resolve Applied"
+        );
+
+        // Bytes appended AFTER Y's anchor hydrate as conversation only.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&y_path)
+            .unwrap()
+            .write_all(r7_user(R7_Y, "y-new-prompt", "after the resume").as_bytes())
+            .unwrap();
+        let after = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            r7_effort_names(&after).is_empty(),
+            "the gate never opens for Y this epoch: {after:?}"
+        );
+        assert!(r7_conversation_has(&after, "after the resume"));
+        assert!(bridge.has_pending());
+
+        Driver::close(&driver).await.unwrap();
+    }
+
+    /// r7 item 1, lazy-create arm: the user /resume's BEFORE ever sending a
+    /// prompt, so the launch session S1 never gets a transcript and no
+    /// binding exists when Y's authenticated SessionStart arrives. The
+    /// argv channel would keep looking for the (still absent) S1 file; the
+    /// hook report must bind Y directly and its history must stay gated.
+    #[tokio::test]
+    async fn item1_resume_before_any_binding_binds_the_reported_session_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {R7_S1}"
+        )));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // S1 reports at boot but its file is never created (no prompt).
+        let s1_path = slug.join(format!("{R7_S1}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_S1, &s1_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1000)).await;
+        // Still no binding: the /resume target Y reports with history.
+        let bridge = driver.effort_bridge.lock().await.clone();
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        let y_path = slug.join(format!("{R7_Y}.jsonl"));
+        std::fs::write(
+            &y_path,
+            format!(
+                "{}{}{}",
+                r7_assistant(R7_Y, "y-old-assistant", Some("high")),
+                r7_slash(R7_Y, "y-old-slash", "max"),
+                r7_verdict(R7_Y, "y-old-verdict", "Set effort level to max"),
+            ),
+        )
+        .unwrap();
+        r7_send_session_start(&hooks, pgid, R7_Y, &y_path).await;
+        let rebound = r7_collect(&mut events, std::time::Duration::from_millis(2400)).await;
+        assert!(
+            r7_effort_names(&rebound).is_empty(),
+            "Y binds directly but its history stays gated: {rebound:?}"
+        );
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the replayed verdict must not resolve Applied"
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&y_path)
+            .unwrap()
+            .write_all(r7_user(R7_Y, "y-new-prompt", "late resume prompt").as_bytes())
+            .unwrap();
+        let after = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(r7_effort_names(&after).is_empty(), "{after:?}");
+        assert!(r7_conversation_has(&after, "late resume prompt"));
+
+        Driver::close(&driver).await.unwrap();
+    }
+
+    /// r7 item 1(b): `claude --resume X` (hand-typed; the poller only has the
+    /// argv) followed by `/clear` to Z. X stays an unverified resume, and Z
+    /// is Fresh from its own absent-file SessionStart: once Z's transcript
+    /// appears its records are current, the effort edge publishes and an
+    /// armed switch settles — X history never leaks.
+    #[tokio::test]
+    async fn item1_resume_then_clear_binds_z_fresh_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!("claude --resume {R7_X}")));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        let x_history = format!(
+            "{}{}{}",
+            r7_assistant(R7_X, "x-old-assistant", Some("high")),
+            r7_slash(R7_X, "x-old-slash", "max"),
+            r7_verdict(R7_X, "x-old-verdict", "Set effort level to max"),
+        );
+        let x_path = slug.join(format!("{R7_X}.jsonl"));
+        std::fs::write(&x_path, x_history).unwrap();
+        r7_send_session_start(&hooks, pgid, R7_X, &x_path).await;
+        let x_phase = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            r7_effort_names(&x_phase).is_empty(),
+            "X is an unverified resume: no history edge: {x_phase:?}"
+        );
+
+        let bridge = driver.effort_bridge.lock().await.clone();
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+
+        // /clear: the SessionStart arrives while Z's file is still absent
+        // (lazy creation). The sticky mode is Fresh at that instant.
+        let z_path = slug.join(format!("{R7_Z}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_Z, &z_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1200)).await;
+        // Z then appears with its own first turn: the slash settles its own
+        // switch and the assistant's max read-back publishes.
+        std::fs::write(
+            &z_path,
+            format!(
+                "{}{}{}",
+                r7_slash(R7_Z, "z-slash", "max"),
+                r7_verdict(R7_Z, "z-verdict", "Set effort level to max"),
+                r7_assistant(R7_Z, "z-assistant", Some("max")),
+            ),
+        )
+        .unwrap();
+        let z_phase = r7_collect(&mut events, std::time::Duration::from_millis(3000)).await;
+        let names = r7_effort_names(&z_phase);
+        assert!(
+            names.contains(&Some(remuda_protocol::EffortName::Max)),
+            "Z is Fresh: its max read-back must publish: {names:?}"
+        );
+        assert!(
+            !names.contains(&Some(remuda_protocol::EffortName::High)),
+            "X's high history must never publish: {names:?}"
+        );
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_secs(2))
+                .await
+                .is_some(),
+            "Z's own verdict settles the armed switch Applied"
+        );
+
+        Driver::close(&driver).await.unwrap();
+    }
 }

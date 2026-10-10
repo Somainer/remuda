@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -920,6 +920,28 @@ fn land_child(ctx: &QueueCtx, idx: usize, base: &str, merge: &str) -> Result<Lan
     }
 }
 
+/// One locked lane-exit poll. `try_wait` and the reaped flag share one
+/// critical section: once this observes a terminated child the pid is reaped
+/// HERE and the flag is set in the same instant, so a kill path holding the
+/// lock can never signal the pid after the kernel is free to recycle it.
+/// Returns true once the child is terminated.
+fn poll_lane_exit(child: &mut Child, reaped: &Mutex<bool>) -> bool {
+    let mut reaped_guard = reaped.lock().unwrap_or_else(|poison| poison.into_inner());
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            *reaped_guard = true;
+            true
+        }
+        Ok(None) => false,
+        // ECHILD: another thread in this process already reaped the lane;
+        // record that so no signal follows.
+        Err(_) => {
+            *reaped_guard = true;
+            true
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_verify(
     args: &MergeArgs,
@@ -994,30 +1016,10 @@ fn spawn_verify(
                     merge: preparing.merged,
                 });
             }
-            // try_wait and the reaped flag share one critical section: once
-            // this observes a terminated child the pid is reaped HERE and the
-            // flag is set in the same instant, so a kill path holding the
-            // lock can never signal the pid after the kernel is free to
-            // recycle it.
-            let terminated = {
-                let mut reaped_guard = monitor_reaped
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        *reaped_guard = true;
-                        true
-                    }
-                    Ok(None) => false,
-                    // ECHILD: another thread in this process already reaped
-                    // the lane; record that so no signal follows.
-                    Err(_) => {
-                        *reaped_guard = true;
-                        true
-                    }
-                }
-            };
-            if terminated {
+            // try_wait and the reaped flag share one critical section (see
+            // poll_lane_exit): a kill path holding the lock can never signal
+            // the pid after the kernel is free to recycle it.
+            if poll_lane_exit(&mut child, &monitor_reaped) {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(25));
@@ -1228,10 +1230,12 @@ fn kill_lane_group(pid: u32) {
     }
 }
 
-/// Best-effort direct reap (only works if this thread is the parent, which
-/// it is not in normal operation; harmless ECHILD otherwise). Returns true
-/// once the child is definitely reaped (a terminal WaitStatus, or ECHILD
-/// meaning another thread reaped it).
+/// Best-effort direct reap. `waitpid` may be issued from ANY thread of the
+/// parent process (not only the thread that called spawn), so in normal
+/// operation the monitor thread usually wins and this returns ECHILD. The
+/// watchdog calls it only past the grace period. Returns true once the child
+/// is definitely reaped (a terminal WaitStatus, or ECHILD meaning another
+/// thread reaped it).
 fn reap_pid(pid: u32) -> bool {
     match waitpid(
         Pid::from_raw(i32::try_from(pid).unwrap_or(0)),
@@ -1310,11 +1314,17 @@ fn wait_event(
         if let Some(idx) = overdue
             && let Some(lane) = active.get(&idx)
         {
-            if reap_pid(lane.pid) {
-                *lane
+            // Reap and flag under the same lock the monitor's poll uses, so
+            // the two can never both observe the child and then disagree on
+            // whether a signal may still follow. WNOHANG never blocks.
+            {
+                let mut guard = lane
                     .reaped
                     .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = true;
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if !*guard && reap_pid(lane.pid) {
+                    *guard = true;
+                }
             }
             let detail =
                 "lane process was gone or killed past the grace period and its monitor never reported"
@@ -1783,5 +1793,39 @@ mod tests {
             !pid_running(live_pid),
             "the unreaped live lane group must be gone"
         );
+    }
+
+    /// The locked poll reaps the child and sets the reaped flag in the same
+    /// critical section: once `poll_lane_exit` reports termination the pid is
+    /// already reaped, the flag reads true, and `kill_lane_if_alive` must
+    /// refuse the signal (the pid is free for the kernel to recycle).
+    #[test]
+    fn poll_lane_exit_sets_reaped_inside_the_poll_lock() {
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let reaped = Arc::new(Mutex::new(false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !poll_lane_exit(&mut child, &reaped) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a `true` child must exit and be polled within the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            *reaped.lock().unwrap_or_else(|poison| poison.into_inner()),
+            "the reaped flag must be set together with the successful try_wait"
+        );
+        assert!(
+            !kill_lane_if_alive(pid, &reaped),
+            "a freshly reaped lane must refuse the signal"
+        );
+        // try_wait already reaped the child; wait just reads the cached status.
+        let _ = child.wait();
     }
 }

@@ -1997,6 +1997,21 @@ pub struct Settlement {
     pub interactions: Vec<SettledInteraction>,
 }
 
+/// Result of [`Store::reconcile_reported_instances`] (c-cardsettle r10 item
+/// 4(c)).
+#[derive(Debug)]
+pub struct ReconcileOutcome {
+    /// Chapters THIS reconcile ended and which get the full per-row side
+    /// effects (diagnostic, egress revocation, worker failure).
+    pub lost: Vec<String>,
+    /// LEGACY host-lost rows (pre-contact-loss marker) already exited on an
+    /// upgraded database: dated from their own `updated_at`, kept as-is, and
+    /// given NO new diagnostic — only their pending cards are settled.
+    pub legacy_exited: Vec<String>,
+    /// Settlement covering the pending cards of both groups.
+    pub settlement: Settlement,
+}
+
 /// One interaction a terminal transaction settled. `seq` is the per-Hub
 /// monotonic settlement sequence assigned in the SAME transaction
 /// (c-cardsettle r9 item 3); it is the follower delivery cursor key.
@@ -3714,13 +3729,18 @@ impl Store {
     /// lost — settling it here would kill a create that may yet land. Those
     /// rows have their own, age-bounded reaper:
     /// [`Store::expire_stale_requested`].
+    /// `[`Store::reconcile_reported_instances`]` result: the chapters THIS
+    /// reconcile ended (full per-row side effects: diagnostics, egress
+    /// revocation, worker failure), the LEGACY host-lost rows on upgraded
+    /// databases that were already exited and only had their cards settled
+    /// (r10 item 4(c): no new diagnostic for old news), and the settlement.
     pub async fn reconcile_reported_instances(
         &self,
         host_id: String,
         reported: Vec<String>,
         reason: String,
         epoch_changed: bool,
-    ) -> Result<(Vec<String>, Settlement), StoreError> {
+    ) -> Result<ReconcileOutcome, StoreError> {
         self.run_named("reconcile_reported_instances", move |conn| {
             // The instance settlement and the interaction invalidation
             // (c-cardsettle) commit in ONE transaction: an inbox must never
@@ -3744,81 +3764,109 @@ impl Store {
                  WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed', 'requested', 'closed')"
             };
             let mut stmt = tx.prepare(candidate_sql)?;
-            let live: Vec<String> = stmt
+            let candidates: Vec<String> = stmt
                 .query_map(params![&host_id], |row| row.get(0))?
                 .collect::<Result<_, _>>()?;
             drop(stmt);
-            let lost: Vec<String> = live
+            let candidates: Vec<String> = candidates
                 .into_iter()
                 .filter(|id| !reported.iter().any(|seen| seen == id))
                 .collect();
             let now = now_rfc3339();
-            for id in &lost {
-                if epoch_changed {
-                    // The node epoch changed: the old process is provably
-                    // gone — stamp ended_at so the row releases its seat/
-                    // fan-out, preserving the reason as context.
-                    //
-                    // ma-lineage r7 item 4: a chapter that was LIVE when the
-                    // Node restarted gets last_error = `node-epoch-changed`
-                    // UNCONDITIONALLY, even when a stale entity error is still
-                    // on the row (the projection keeps a non-null last_error
-                    // via COALESCE after the chapter returned to ready). The
-                    // web keys its "Node restarted" end reason and Resume
-                    // affordance on that exact spelling, so the old error must
-                    // not leak.
-                    //
-                    // Merge with c-cardsettle r9 item 2 / r10 item 4(c): the
-                    // sweep marker decides which already-exited row is which:
-                    // a NEW contact-loss marker (HOST_LOST_MARKER, no
-                    // ended_at) is the potentially-live shape — the chapter
-                    // was live when contact vanished, so the omission rewrites
-                    // its error like any live row. A LEGACY marker (the
-                    // pre-contact-loss spelling) is a GENUINE end on upgraded
-                    // databases: keep last_error and updated_at, date the end
-                    // from updated_at rather than this reconcile clock, and
-                    // only settle its cards.
-                    let prev: (String, Option<String>, Option<String>, String) = tx
-                        .query_row(
-                            "SELECT lifecycle, last_error, ended_at, updated_at
-                             FROM instances WHERE id = ?1",
-                            [id],
-                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                        )?;
-                    let (prev_lifecycle, prev_error, _prev_ended, prev_updated) = prev;
-                    let rewrite_error = !matches!(prev_lifecycle.as_str(), "exited" | "failed")
-                        || prev_error.as_deref() == Some(HOST_LOST_MARKER);
-                    let legacy_end = prev_error.as_deref() == Some(LEGACY_HOST_LOST_MARKER);
-                    tx.execute(
-                        "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                            ended_at = CASE WHEN ?5 THEN COALESCE(ended_at, ?6)
-                                            ELSE COALESCE(ended_at, ?1) END,
-                            last_error = CASE WHEN ?4 THEN ?2
-                                              ELSE COALESCE(last_error, ?2) END,
-                            updated_at = CASE WHEN ?5 THEN updated_at ELSE ?1 END
-                         WHERE id = ?3",
-                        params![
-                            &now,
-                            &reason,
-                            id,
-                            rewrite_error,
-                            legacy_end,
-                            &prev_updated
-                        ],
+            let mut lost: Vec<String> = Vec::new();
+            let mut legacy_exited: Vec<String> = Vec::new();
+            for id in &candidates {
+                // Read the candidate's own shape so an EVIDENCE-LESS terminal
+                // row (the epoch SQL includes every ended_at-null exited/failed
+                // row) is classified by its marker, not assumed newly lost.
+                let prev: (String, Option<String>, Option<String>, String) = tx
+                    .query_row(
+                        "SELECT lifecycle, last_error, ended_at, updated_at
+                         FROM instances WHERE id = ?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )?;
-                } else {
+                let (prev_lifecycle, prev_error, prev_ended, prev_updated) = prev;
+                let already_terminal =
+                    matches!(prev_lifecycle.as_str(), "exited" | "failed" | "closed");
+                let legacy_end = prev_error.as_deref() == Some(LEGACY_HOST_LOST_MARKER);
+                if epoch_changed && already_terminal {
+                    if !legacy_end {
+                        // A non-legacy evidence-less terminal row the inventory
+                        // omits: the new epoch attests the end; it is treated
+                        // as lost below (new marker rows included — omission
+                        // proves their process is gone, so rewrite the marker).
+                        lost.push(id.clone());
+                    } else {
+                        // r10 item 4(c): a genuine end recorded by pre-upgrade
+                        // code. Its cards settle below, but the row itself is
+                        // old news and gets no new per-row diagnostic.
+                        legacy_exited.push(id.clone());
+                    }
+                } else if !already_terminal {
+                    lost.push(id.clone());
+                }
+                if !epoch_changed {
                     tx.execute(
                         "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                             last_error = ?1, updated_at = ?2
                          WHERE id = ?3 AND ended_at IS NULL",
                         params![&reason, &now, id],
                     )?;
+                    continue;
                 }
+                // Epoch changed: the node epoch change is provable loss —
+                // stamp ended_at so the row releases its seat/fan-out,
+                // preserving the reason as context.
+                //
+                // ma-lineage r7 item 4: a chapter that was LIVE when the Node
+                // restarted gets last_error = `node-epoch-changed`
+                // UNCONDITIONALLY, even when a stale entity error is still on
+                // the row (the projection keeps a non-null last_error via
+                // COALESCE after the chapter returned to ready). The web keys
+                // its "Node restarted" end reason and Resume affordance on
+                // that exact spelling, so the old error must not leak.
+                //
+                // c-cardsettle r9 item 2 / r10 item 4(c): the sweep marker
+                // decides which already-exited row is which: a NEW
+                // contact-loss marker (HOST_LOST_MARKER, no ended_at) is
+                // potentially-live and the omission rewrites it like any live
+                // row; a LEGACY marker is a genuine end on upgraded databases
+                // — keep last_error and updated_at, date the end from
+                // updated_at rather than this reconcile clock.
+                let rewrite_error =
+                    !already_terminal || prev_error.as_deref() == Some(HOST_LOST_MARKER);
+                tx.execute(
+                    "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
+                        ended_at = CASE WHEN ?5 THEN COALESCE(ended_at, ?6)
+                                        ELSE COALESCE(ended_at, ?1) END,
+                        last_error = CASE WHEN ?4 THEN ?2
+                                          ELSE COALESCE(last_error, ?2) END,
+                        updated_at = CASE WHEN ?5 THEN updated_at ELSE ?1 END
+                     WHERE id = ?3",
+                    params![
+                        &now,
+                        &reason,
+                        id,
+                        rewrite_error,
+                        legacy_end,
+                        &prev_updated
+                    ],
+                )?;
+                let _ = prev_ended;
             }
-            // A generation that ended owns no still-answerable request.
-            let settlement = settle_instance_interactions(&tx, &lost, &now)?;
+            // A generation that ended owns no still-answerable request. The
+            // legacy already-exited rows settle their cards too (r10 item
+            // 4(c)) but are reported separately so ws skips their diagnostics.
+            let mut settle_ids = lost.clone();
+            settle_ids.extend(legacy_exited.iter().cloned());
+            let settlement = settle_instance_interactions(&tx, &settle_ids, &now)?;
             tx.commit()?;
-            Ok((lost, settlement))
+            Ok(ReconcileOutcome {
+                lost,
+                legacy_exited,
+                settlement,
+            })
         })
         .await
     }
@@ -9946,7 +9994,7 @@ mod tests {
         // in that window says nothing about whether it was lost. Its own
         // age-bounded reaper is what eventually settles it.
         let in_flight = seed_instance(&store, &host).await;
-        let (reconciled, _settlement) = store
+        let reconciled = store
             .reconcile_reported_instances(
                 host.clone(),
                 vec![kept.instance_id.clone()],
@@ -9954,7 +10002,8 @@ mod tests {
                 true,
             )
             .await
-            .expect("reconcile");
+            .expect("reconcile")
+            .lost;
         assert_eq!(
             reconciled,
             vec![lost.instance_id.clone()],
@@ -10020,7 +10069,7 @@ mod tests {
         drop(db);
 
         // Same-epoch (non-epoch) reconcile must NOT stamp end evidence.
-        let (_, _) = store
+        let _ = store
             .reconcile_reported_instances(host.clone(), vec![], "reconnect".into(), false)
             .await
             .unwrap();
@@ -10048,10 +10097,11 @@ mod tests {
             .record_node_epoch(host.clone(), Some("b".into()))
             .await
             .unwrap();
-        let (lost, _) = store
+        let lost = store
             .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
-            .unwrap();
+            .unwrap()
+            .lost;
         assert_eq!(lost.len(), 2, "both evidence-less terminal rows reconciled");
         for id in [&host_lost.instance_id, &ambiguous.instance_id] {
             assert!(
@@ -10102,10 +10152,11 @@ mod tests {
             .record_node_epoch(host.clone(), Some("b".into()))
             .await
             .unwrap();
-        let (lost, _) = store
+        let lost = store
             .reconcile_reported_instances(host, vec![], "node-epoch-changed".into(), true)
             .await
-            .unwrap();
+            .unwrap()
+            .lost;
         assert_eq!(lost.len(), 2);
 
         let recovered = store
@@ -10541,7 +10592,7 @@ mod tests {
         let kept_int = seed_pending_interaction(&store, &host, &kept.instance_id).await;
         let lost_int = seed_pending_interaction(&store, &host, &lost.instance_id).await;
 
-        let (reconciled, settlement) = store
+        let outcome = store
             .reconcile_reported_instances(
                 host.clone(),
                 vec![kept.instance_id.clone()],
@@ -10550,6 +10601,8 @@ mod tests {
             )
             .await
             .expect("reconcile");
+        let reconciled = outcome.lost;
+        let settlement = outcome.settlement;
         assert_eq!(reconciled, vec![lost.instance_id.clone()]);
         // The settlement returned to callers names exactly the lost card.
         let lost_settled: Vec<(String, String)> = settlement
@@ -10642,10 +10695,12 @@ mod tests {
             .await
             .expect("set known future deadline");
 
-        let (reconciled, settlement) = store
+        let outcome = store
             .reconcile_reported_instances(host, vec![], "node-epoch-changed".to_string(), true)
             .await
             .expect("reconcile");
+        let reconciled = outcome.lost;
+        let settlement = outcome.settlement;
         assert_eq!(reconciled, vec![lost.instance_id.clone()]);
         let settled: Vec<String> = settlement
             .interactions
@@ -10684,20 +10739,20 @@ mod tests {
         let lost = seed_acknowledged_instance(&store, &host).await;
         let int_id = seed_pending_interaction(&store, &host, &lost.instance_id).await;
 
-        let (lost_first, first) = store
+        let first = store
             .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
             .expect("first reconcile");
-        assert_eq!(lost_first, vec![lost.instance_id.clone()]);
-        assert_eq!(first.interactions.len(), 1);
+        assert_eq!(first.lost, vec![lost.instance_id.clone()]);
+        assert_eq!(first.settlement.interactions.len(), 1);
         // Second reconcile: the instance is already exited, returns no new lost
         // rows, no settlement, and does not error on the terminal interaction.
-        let (again, second) = store
+        let second = store
             .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
             .expect("second reconcile");
-        assert!(again.is_empty());
-        assert!(second.is_empty(), "no card is settled twice");
+        assert!(second.lost.is_empty());
+        assert!(second.settlement.is_empty(), "no card is settled twice");
         let (state, _) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "invalidated");
         store.close().await;
@@ -10944,10 +10999,11 @@ mod tests {
 
         // A new Node epoch omits the instance: the reconcile ends it first,
         // exactly like the real reconnect ordering.
-        let (_, reconcile_settlement) = store
+        let reconcile_settlement = store
             .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
-            .expect("reconcile");
+            .expect("reconcile")
+            .settlement;
         assert!(reconcile_settlement.is_empty(), "no card existed yet");
         let owner = store
             .get_instance(instance.instance_id.clone())
@@ -12412,7 +12468,7 @@ mod tests {
 
         // The Node comes back under a NEW epoch and holds nothing for this
         // instance (empty attested inventory).
-        let (lost, settlement) = store
+        let outcome = store
             .reconcile_reported_instances(
                 host.clone(),
                 vec![],
@@ -12421,6 +12477,8 @@ mod tests {
             )
             .await
             .expect("new-epoch reconcile");
+        let lost = outcome.lost;
+        let settlement = outcome.settlement;
         assert_eq!(lost, vec![instance.instance_id.clone()]);
         assert_eq!(
             settlement
@@ -12449,8 +12507,89 @@ mod tests {
         store.close().await;
     }
 
-    /// c-cardsettle r9 item 2 (b): after the contact-loss sweep, a SAME-epoch
-    /// reconnect whose journal catch-up carries the REAL exit (an entity
+    /// c-cardsettle r10 item 4(c): on an upgraded database a LEGACY
+    /// host-lost row (the pre-contact-loss `host-lost` marker, genuine end
+    /// semantics) the new epoch omits is re-swept GENTLY: ended_at is dated
+    /// from its own `updated_at`, last_error/updated_at are preserved, only
+    /// its cards settle, and it is NOT reported as newly lost (so ws emits no
+    /// second node_epoch_changed diagnostic for old news).
+    #[tokio::test]
+    async fn new_epoch_reconcile_resweeps_a_legacy_host_lost_row_without_touching_its_evidence() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-legacy-hostlost").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        // Simulate a row an older binary swept: legacy marker, no ended_at,
+        // and a fixed past updated_at the end must be dated from.
+        let past = "2026-08-01T00:00:00.000Z";
+        {
+            let id = instance.instance_id.clone();
+            store
+                .run_named("r10_seed_legacy_row", move |conn| {
+                    conn.execute(
+                        "UPDATE instances
+                            SET lifecycle = 'exited', activity = 'idle',
+                                last_error = 'host-lost', ended_at = NULL,
+                                updated_at = ?2
+                          WHERE id = ?1",
+                        params![&id, past],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("seed legacy row");
+        }
+
+        let outcome = store
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
+            .await
+            .expect("legacy reconcile");
+        assert!(
+            !outcome.lost.iter().any(|id| id == &instance.instance_id),
+            "a legacy row is not reported as newly lost: {:?}",
+            outcome.lost
+        );
+        assert_eq!(
+            outcome.legacy_exited,
+            vec![instance.instance_id.clone()],
+            "the legacy row is reported in legacy_exited"
+        );
+        // Its pending card DID settle, with a notice.
+        assert_eq!(
+            outcome
+                .settlement
+                .interactions
+                .iter()
+                .map(|s| s.interaction_id.clone())
+                .collect::<Vec<_>>(),
+            vec![int_id.clone()]
+        );
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("host-lost"),
+            "the legacy marker is preserved"
+        );
+        assert_eq!(
+            ended_at_of(&store, &instance.instance_id).await.as_deref(),
+            Some(past),
+            "ended_at comes from the row's own updated_at, not the reconcile clock"
+        );
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
     /// exited event) settles the card. The row already reads `exited`, so a
     /// lifecycle-only "previous terminal" guard made this a no-op forever.
     #[tokio::test]

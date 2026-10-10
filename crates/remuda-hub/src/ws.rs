@@ -1032,20 +1032,39 @@ async fn reconcile_lost_instances(
                 .map(str::to_string)
         })
         .collect();
-    let lost = state
-        .publish_settlement(state.store.reconcile_reported_instances(
-            host_id.to_string(),
-            reported,
-            NODE_EPOCH_CHANGED.to_string(),
-            true,
-        ))
+    let (lost, legacy_exited) = state
+        .publish_settlement(async {
+            state
+                .store
+                .reconcile_reported_instances(
+                    host_id.to_string(),
+                    reported,
+                    NODE_EPOCH_CHANGED.to_string(),
+                    true,
+                )
+                .await
+                .map(|outcome| ((outcome.lost, outcome.legacy_exited), outcome.settlement))
+        })
         .await?;
+    for legacy_id in &legacy_exited {
+        tracing::info!(
+            %host_id,
+            instance_id = %legacy_id,
+            "new epoch re-swept a legacy host-lost row on an upgraded database; \
+             settled its cards without a new diagnostic"
+        );
+    }
     // c-cardsettle r10 item 1 (OA6): a NEW Node epoch that LISTS a swept,
     // still-pending instance as live is liveness evidence from the new
     // process itself (a herdr-adopted chapter is normally listed starting or
-    // ready). Revive such rows BEFORE the lost side effects run; cards the
+    // ready). Revive such rows BEFORE the lost side effects run — they were
+    // excluded from `lost` by the inventory, but the rank-held row is still
+    // the sweep's exited/host-lost shape until revived here. Cards the
     // chapter still owns stay pending and answerable.
     revive_live_inventory(state, host_id, params).await?;
+    // r10 item 4(c): legacy already-exited rows on upgraded databases only
+    // had their cards settled (the settlement above covered them); they are
+    // old news and get no diagnostic/egress/worker side effects.
     for instance_id in lost {
         tracing::warn!(
             %host_id,

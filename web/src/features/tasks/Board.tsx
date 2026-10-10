@@ -11,7 +11,10 @@ import { buildTaskGroups, taskCardSignal } from "./taskRows";
 import { TaskDetailPanel } from "./TaskDetailPanel";
 import { boardPath, useProjectFilter, useProjects } from "./ProjectSwitcher";
 import { PageHeader } from "../../components/PageHeader";
-import { profilingEnabled, reportProbe } from "../../lib/profileFlags";
+import { profilingEnabled, profileRegion, reportProbe } from "../../lib/profileFlags";
+import { structuralEqual } from "../../lib/structuralEqual";
+import { useNowTick } from "../../lib/useNowTick";
+import { CommitProbe } from "../../components/CommitProbe";
 import {
   BOARD_WORK_COLUMNS,
   buildBoardModel,
@@ -57,13 +60,20 @@ function useBoardView(projectId: string | null): {
   const [view, setView] = useState<BoardView | null>(null);
   const path = boardPath(projectId);
 
+  // The projection is rebuilt server-side on every poll. Keep the previous
+  // object when the JSON content is equal: an unchanged 5 s tick must not
+  // rebuild the model or re-render the board (c-perffu).
+  const setIfChanged = useCallback((next: BoardView) => {
+    setView((prev) => (prev && structuralEqual(prev, next) ? prev : next));
+  }, []);
+
   const reload = useCallback(async () => {
     try {
-      setView(await fetchBoard(path));
+      setIfChanged(await fetchBoard(path));
     } catch {
       /* Keep the last good projection; AuthGate handles 401. */
     }
-  }, [path]);
+  }, [path, setIfChanged]);
 
   useEffect(() => {
     let cancelled = false;
@@ -71,7 +81,7 @@ function useBoardView(projectId: string | null): {
     const tick = async () => {
       try {
         const next = await fetchBoard(path);
-        if (!cancelled) setView(next);
+        if (!cancelled) setIfChanged(next);
       } catch {
         /* Stale projection stays on screen while the fetch fails. */
       }
@@ -82,7 +92,7 @@ function useBoardView(projectId: string | null): {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [path]);
+  }, [path, setIfChanged]);
 
   return { view, reload };
 }
@@ -100,14 +110,14 @@ function moveErrorMessage(err: unknown): string {
 
 // ── Card ──────────────────────────────────────────────────────────────────
 
-function SessionLine({ session, onNavigate }: { session: CardSession; onNavigate?: () => void }) {
+function SessionLine({ session, nowMs, onNavigate }: { session: CardSession; nowMs: number; onNavigate?: () => void }) {
   return (
     <Link
       className={css.sessionLine}
       to={`/s/${session.id}`}
       data-testid="board-session"
       data-lifecycle={session.lifecycle ?? "unknown"}
-      title={`${session.name || session.id} · ${formatListTime(session.updatedAt)}`}
+      title={`${session.name || session.id} · ${formatListTime(session.updatedAt, nowMs)}`}
       onClick={(event) => {
         event.stopPropagation();
         onNavigate?.();
@@ -115,7 +125,7 @@ function SessionLine({ session, onNavigate }: { session: CardSession; onNavigate
     >
       <HarnessGlyph kind={session.kind ?? "generic"} />
       <span className={css.sessionName}>{session.name || session.id}</span>
-      <span className={css.sessionTime}>{formatListTime(session.updatedAt)}</span>
+      <span className={css.sessionTime}>{formatListTime(session.updatedAt, nowMs)}</span>
     </Link>
   );
 }
@@ -165,6 +175,9 @@ function CardSignal({ card }: { card: BoardCard }) {
 
 type CardProps = {
   card: BoardCard;
+  /** Display clock; deliberately NOT part of the memo comparison — an equal
+   *  card.sig already proves the rendered time bucket is unchanged. */
+  nowMs: number;
   selected: boolean;
   busy: boolean;
   onSelect: (id: string) => void;
@@ -180,7 +193,7 @@ type CardProps = {
  * (`commit:BoardCard`, perf scenario E).
  */
 const BoardCardView = memo(
-  function BoardCardView({ card, selected, busy, onSelect, onArchive, onDragStart, onDragEnd }: CardProps) {
+  function BoardCardView({ card, nowMs, selected, busy, onSelect, onArchive, onDragStart, onDragEnd }: CardProps) {
     // Terminal (done/failed) and archived cards compute zero legal drops, so
     // they are not draggable at all rather than offering a move every column
     // must refuse.
@@ -249,7 +262,9 @@ const BoardCardView = memo(
 
           <div className={css.cardSessions} data-testid="board-card-sessions">
             {shownSessions.length > 0 ? (
-              shownSessions.map((session) => <SessionLine key={session.id} session={session} />)
+              shownSessions.map((session) => (
+                <SessionLine key={session.id} session={session} nowMs={nowMs} />
+              ))
             ) : (
               <p className={css.cardNoSession}>还没有会话</p>
             )}
@@ -303,6 +318,7 @@ function BoardColumnView({
   column,
   label,
   cards,
+  nowMs,
   selectedId,
   draggedCard,
   over,
@@ -318,6 +334,7 @@ function BoardColumnView({
   column: WorkColumn;
   label: string;
   cards: BoardCard[];
+  nowMs: number;
   selectedId: string | null;
   draggedCard: BoardCard | null;
   over: boolean;
@@ -360,6 +377,7 @@ function BoardColumnView({
           <BoardCardView
             key={card.id}
             card={card}
+            nowMs={nowMs}
             selected={selectedId === card.id}
             busy={busyId === card.id}
             onSelect={onSelect}
@@ -405,6 +423,11 @@ export function BoardPage() {
   const switcherProject = useProjectFilter();
   const projectId = params.get("project") ?? switcherProject;
   const { view, reload } = useBoardView(projectId);
+  // Relative-time labels keep advancing on an idle board where every poll
+  // payload is equal (and thus no store emission fires): this display-only
+  // clock is the only re-derivation trigger, and cardSignature means only
+  // cards whose label actually crossed commit.
+  const nowMs = useNowTick();
   // The Shell already loads the project directory once per mount; reuse it
   // for rail group names instead of polling /v1/projects from this surface.
   const { projects } = useProjects();
@@ -443,7 +466,7 @@ export function BoardPage() {
   );
 
   const spaces = useMemo(
-    () => buildSpaces(hub.workspaces, hub.instances, prefs),
+    () => profileRegion("board.buildSpaces", () => buildSpaces(hub.workspaces, hub.instances, prefs)),
     [hub.workspaces, hub.instances, prefs],
   );
   const { branchOf } = useLiveBranches(spaces);
@@ -451,36 +474,49 @@ export function BoardPage() {
   // One Set per hub snapshot, shared by the board model and nothing else.
   const pendingByInstance = useMemo(
     () =>
-      new Set(
-        hub.interactions
-          .filter((interaction) => interaction.state === "pending")
-          .map((interaction) => interaction.instanceId),
+      profileRegion(
+        "board.pendingSet",
+        () =>
+          new Set(
+            hub.interactions
+              .filter((interaction) => interaction.state === "pending")
+              .map((interaction) => interaction.instanceId),
+          ),
       ),
     [hub.interactions],
   );
 
   const model = useMemo(
     () =>
-      buildBoardModel({
-        view,
-        instances: hub.instances as readonly CardSession[],
-        pendingInstanceIds: pendingByInstance,
-        query,
-      }),
-    [view, hub.instances, pendingByInstance, query],
+      profileRegion(
+        "board.buildModel",
+        () =>
+          buildBoardModel({
+            view,
+            instances: hub.instances as readonly CardSession[],
+            pendingInstanceIds: pendingByInstance,
+            nowMs,
+            query,
+          }),
+      ),
+    [view, hub.instances, pendingByInstance, nowMs, query],
   );
 
   const groups = useMemo(
     () =>
-      buildTaskGroups({
-        tasks: items,
-        instances: hub.instances,
-        interactions: hub.interactions,
-        spaces,
-        projectName,
-        branchOfSpace: branchOf,
-        query,
-      }),
+      profileRegion(
+        "board.buildGroups",
+        () =>
+          buildTaskGroups({
+            tasks: items,
+            instances: hub.instances,
+            interactions: hub.interactions,
+            spaces,
+            projectName,
+            branchOfSpace: branchOf,
+            query,
+          }),
+      ),
     [items, hub.instances, hub.interactions, spaces, projectName, branchOf, query],
   );
 
@@ -665,6 +701,7 @@ export function BoardPage() {
   const scopeTitle = projectId ? (projectName(projectId) ?? projectId) : "全局";
 
   return (
+    <CommitProbe name="BoardPage">
     <div className={css.page} data-testid="board-page" onKeyDown={onPageKeyDown}>
       {indexOpen ? (
         <div
@@ -699,12 +736,14 @@ export function BoardPage() {
             aria-label="搜索看板任务"
           />
         </div>
-        <TaskGroups
-          groups={groups}
-          variant="desktop"
-          selectedId={selectedId}
-          onSelect={onSelectRail}
-        />
+        <CommitProbe name="BoardRail">
+          <TaskGroups
+            groups={groups}
+            variant="desktop"
+            selectedId={selectedId}
+            onSelect={onSelectRail}
+          />
+        </CommitProbe>
       </aside>
 
       <main className={css.boardMain}>
@@ -753,13 +792,15 @@ export function BoardPage() {
             </p>
           ) : null}
 
-          <div className={css.columns} data-testid="board-columns">
+          <CommitProbe name="BoardColumns">
+            <div className={css.columns} data-testid="board-columns">
             {BOARD_WORK_COLUMNS.map((column) => (
               <BoardColumnView
                 key={column}
                 column={column}
                 label={model.columns.find((entry) => entry.column === column)?.label ?? ""}
                 cards={model.columns.find((entry) => entry.column === column)?.cards ?? []}
+                nowMs={nowMs}
                 selectedId={selectedId}
                 draggedCard={draggedCard}
                 over={overColumn === column}
@@ -773,7 +814,8 @@ export function BoardPage() {
                 onColumnDrop={onColumnDrop}
               />
             ))}
-          </div>
+            </div>
+          </CommitProbe>
 
           {showArchived ? (
             <section className={css.archiveFold} data-testid="board-archive-fold">
@@ -789,6 +831,7 @@ export function BoardPage() {
                     <BoardCardView
                       key={card.id}
                       card={card}
+                      nowMs={nowMs}
                       selected={selectedId === card.id}
                       busy={busyId === card.id}
                       onSelect={onSelectCard}
@@ -839,5 +882,6 @@ export function BoardPage() {
         ) : null}
       </main>
     </div>
+    </CommitProbe>
   );
 }

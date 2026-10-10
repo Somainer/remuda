@@ -27,10 +27,6 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// The driver's write-commit barrier is a single process-global slot, so the
-/// tests that arm it must not run concurrently with each other in this binary.
-static BARRIER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn ensure_fake_claude() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
@@ -142,7 +138,6 @@ async fn collect_until_result(handle: &mut remuda_driver::RunHandle) -> Vec<Obse
 
 #[tokio::test]
 async fn write_window_race_publishes_start_first_and_both_projections_settle_idle() {
-    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let launch = tmp.path().join("launch");
     let home = tmp.path().join("home");
@@ -164,7 +159,7 @@ async fn write_window_race_publishes_start_first_and_both_projections_settle_idl
     let mut handle = driver.start(spec(tmp.path())).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
-    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    let barrier = driver.arm_write_commit_barrier();
     let send_task = tokio::spawn(async move {
         let result = driver.send(prompt("race prompt")).await;
         (driver, result)
@@ -365,10 +360,9 @@ async fn assert_store_working_then_idle(observations: &[Observation], label: &st
 /// race.
 #[tokio::test]
 async fn send_commits_before_the_result_is_mapped_still_publishes_start_first() {
-    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
     let (_tmp, driver, mut handle) = launch(ScriptKind::Ok).await;
 
-    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    let barrier = driver.arm_write_commit_barrier();
     let send_task = tokio::spawn(async move {
         let result = driver.send(prompt("commit-first prompt")).await;
         (driver, result)
@@ -415,10 +409,9 @@ async fn send_commits_before_the_result_is_mapped_still_publishes_start_first() 
 /// ticket makes start-before-result structural for both turns.
 #[tokio::test]
 async fn two_turns_publish_each_start_before_its_own_result_with_per_turn_attribution() {
-    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
     let (_tmp, driver, mut handle) = launch(ScriptKind::TwoTurn).await;
 
-    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    let barrier = driver.arm_write_commit_barrier();
     let send_a = tokio::spawn(async move {
         let result = driver.send(prompt_id("first", "msg-barrier-a")).await;
         (driver, result)
@@ -491,10 +484,9 @@ async fn two_turns_publish_each_start_before_its_own_result_with_per_turn_attrib
 /// A's result (resultIndex 0) is observed, before B's result (resultIndex 1).
 #[tokio::test]
 async fn buffered_turn_a_result_keeps_the_row_working_until_turn_b_settles() {
-    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
     let (_tmp, driver, mut handle) = launch(ScriptKind::TwoTurn).await;
 
-    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    let barrier = driver.arm_write_commit_barrier();
     let send_both = tokio::spawn(async move {
         driver.send(prompt_id("first", "msg-5a-a")).await?;
         driver.send(prompt_id("second", "msg-5a-b")).await?;

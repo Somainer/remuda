@@ -72,6 +72,15 @@ impl ClaudeSdkDriver {
     pub async fn publication_is_saturated(&self) -> bool {
         self.inner.publication_is_saturated().await
     }
+
+    /// Test-only (`test-stub`): arm the per-driver write-commit barrier.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn arm_write_commit_barrier(
+        &self,
+    ) -> crate::claude_print::test_barrier::WriteCommitBarrier {
+        self.inner.arm_write_commit_barrier()
+    }
 }
 
 #[async_trait]

@@ -488,6 +488,10 @@ struct Inner {
     /// does not read this.
     #[cfg(any(test, feature = "test-stub"))]
     child_exit_status: Mutex<Option<std::process::ExitStatus>>,
+    /// ma-sdk-state r6 item 2: per-DRIVER write-commit barrier slot, so two
+    /// tests driving different children in one process never share a barrier.
+    #[cfg(feature = "test-stub")]
+    barrier: test_barrier::Slot,
 }
 
 /// Native Claude print driver (`claude -p` stream-json).
@@ -519,6 +523,16 @@ impl ClaudePrintDriver {
             return false;
         };
         tx.capacity() == 0
+    }
+
+    /// Test-only (`test-stub`): arm the write-commit publication barrier on
+    /// THIS driver. The barrier is scoped to the driver's own publication slot,
+    /// so tests driving separate children in one binary never interfere
+    /// (ma-sdk-state r6 item 2).
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn arm_write_commit_barrier(&self) -> test_barrier::WriteCommitBarrier {
+        test_barrier::arm(&self.inner.barrier)
     }
 
     /// Build a driver from explicit options.
@@ -579,6 +593,8 @@ impl ClaudePrintDriver {
                 last_spec: Mutex::new(None),
                 #[cfg(any(test, feature = "test-stub"))]
                 child_exit_status: Mutex::new(None),
+                #[cfg(feature = "test-stub")]
+                barrier: std::sync::Mutex::new(None),
             }),
             reader: Mutex::new(None),
             publisher: Mutex::new(None),
@@ -957,7 +973,7 @@ impl Driver for ClaudePrintDriver {
                 // test-stub only: record that this turn's ticket is in the
                 // publication queue (its book was opened just above).
                 #[cfg(feature = "test-stub")]
-                test_barrier::note_reserve_enqueued();
+                test_barrier::note_reserve_enqueued(&self.inner.barrier);
                 let write = writer.send_user(content).await;
                 match write {
                     Ok(()) => {
@@ -965,7 +981,7 @@ impl Driver for ClaudePrintDriver {
                         // acked, reservation not yet committed) so a test can
                         // deliver the child's result behind the parked ticket.
                         #[cfg(feature = "test-stub")]
-                        test_barrier::hold_write_commit().await;
+                        test_barrier::hold_write_commit(&self.inner.barrier).await;
                         // Unparks the worker at the ticket; it clears the
                         // reservation and emits turn_started in queue order.
                         guard.commit();
@@ -1325,7 +1341,7 @@ async fn map_loop(
         // test-stub only: record that a frame now sits behind any parked
         // Reserve ticket (the armed race's queued result).
         #[cfg(feature = "test-stub")]
-        test_barrier::note_frame_enqueued();
+        test_barrier::note_frame_enqueued(&inner.barrier);
     }
     // Child stdout reached EOF. Enqueue the exit BEHIND every already-queued
     // frame so `exited` is always the last published observation; the worker
@@ -1490,20 +1506,22 @@ impl Drop for ReservationGuard {
 /// publication queue (r5 item 1): a prompt write has acked but the send task
 /// has not committed its reservation, while (a) the publication worker is
 /// parked at that turn's `Reserve` ticket and (b) the reader has already
-/// enqueued the child's result frame BEHIND the ticket. Without this hook the
-/// window is scheduler luck; with it a test parks the send, waits until both
-/// conditions hold, then releases and asserts start-before-result.
+/// enqueued the child's result frame BEHIND the ticket.
 ///
-/// One barrier per process is sufficient (each test binary runs the race
-/// alone); [`Drop`] releases and disarms so a failed assertion can never hang
-/// the send task or the worker forever.
+/// ma-sdk-state r6 item 2: the barrier is scoped to ONE driver via its
+/// [`Inner`] slot, not a process-global, so tests that arm it run safely in the
+/// same binary alongside other tests driving their own children. [`Drop`]
+/// releases the gates so a failed assertion never hangs the send/worker.
 #[cfg(feature = "test-stub")]
 pub mod test_barrier {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    struct State {
+    /// Per-driver slot holding the currently armed barrier, if any.
+    pub(super) type Slot = Mutex<Option<Arc<State>>>;
+
+    pub(super) struct State {
         write_reached: AtomicBool,
         /// The worker dequeued the turn's Reserve ticket and is parked on the
         /// not-yet-committed write.
@@ -1512,7 +1530,7 @@ pub mod test_barrier {
         /// ticket.
         result_queued: AtomicBool,
         /// Number of Reserve tickets the send task has enqueued.
-        reserve_enqueued: std::sync::atomic::AtomicUsize,
+        reserve_enqueued: AtomicUsize,
         /// Gates the SEND task parked in `hold_write_commit`.
         send_released: AtomicBool,
         send_release: tokio::sync::Notify,
@@ -1523,39 +1541,36 @@ pub mod test_barrier {
         worker_resume: tokio::sync::Notify,
     }
 
-    static BARRIER: OnceLock<Mutex<Option<Arc<State>>>> = OnceLock::new();
-
-    fn slot() -> &'static Mutex<Option<Arc<State>>> {
-        BARRIER.get_or_init(|| Mutex::new(None))
-    }
-
-    /// An armed write-commit barrier. Disarms and releases on drop.
+    /// An armed write-commit barrier. Releases on drop.
     pub struct WriteCommitBarrier {
         state: Arc<State>,
     }
 
-    /// Arm the barrier for the next successful prompt write.
+    /// Arm the barrier on one driver's slot.
     #[must_use]
-    pub fn arm() -> WriteCommitBarrier {
+    pub(super) fn arm(slot: &Slot) -> WriteCommitBarrier {
         let state = Arc::new(State {
             write_reached: AtomicBool::new(false),
             reserve_parked: AtomicBool::new(false),
             result_queued: AtomicBool::new(false),
-            reserve_enqueued: std::sync::atomic::AtomicUsize::new(0),
+            reserve_enqueued: AtomicUsize::new(0),
             send_released: AtomicBool::new(false),
             send_release: tokio::sync::Notify::new(),
             worker_released: AtomicBool::new(false),
             worker_resume: tokio::sync::Notify::new(),
         });
-        *slot().lock().expect("barrier lock") = Some(state.clone());
+        *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
+    }
+
+    fn current(slot: &Slot) -> Option<Arc<State>> {
+        slot.lock().expect("barrier lock").clone()
     }
 
     /// Send-task hook: after the write ack, block until the test releases the
     /// send gate.
-    pub(super) async fn hold_write_commit() {
-        let state = slot().lock().expect("barrier lock").clone();
-        let Some(state) = state else {
+    pub(super) async fn hold_write_commit(slot: &Slot) {
+        let Some(state) = current(slot) else {
             return;
         };
         state.write_reached.store(true, Ordering::Release);
@@ -1571,16 +1586,16 @@ pub mod test_barrier {
 
     /// Send-task hook: a Reserve ticket was just enqueued (the turn book was
     /// opened immediately before this).
-    pub(super) fn note_reserve_enqueued() {
-        if let Some(state) = slot().lock().expect("barrier lock").clone() {
+    pub(super) fn note_reserve_enqueued(slot: &Slot) {
+        if let Some(state) = current(slot) {
             state.reserve_enqueued.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     /// Worker hook: reached the Reserve ticket and is about to await the
     /// write's commit/cancel.
-    pub(super) fn note_reserve_parked() {
-        if let Some(state) = slot().lock().expect("barrier lock").clone() {
+    pub(super) fn note_reserve_parked(slot: &Slot) {
+        if let Some(state) = current(slot) {
             state.reserve_parked.store(true, Ordering::Release);
         }
     }
@@ -1589,9 +1604,8 @@ pub mod test_barrier {
     /// hold the worker (still at that ticket's position) so a test can register
     /// the next turn before this turn's buffered result is mapped. Returns
     /// immediately when no barrier is armed or the worker gate is open.
-    pub(super) async fn hold_worker_after_start() {
-        let state = slot().lock().expect("barrier lock").clone();
-        let Some(state) = state else {
+    pub(super) async fn hold_worker_after_start(slot: &Slot) {
+        let Some(state) = current(slot) else {
             return;
         };
         if state.worker_released.load(Ordering::Acquire) {
@@ -1607,8 +1621,8 @@ pub mod test_barrier {
     /// Reader hook: a frame was enqueued behind the (possibly parked) ticket.
     /// While a barrier is armed the harness child only emits its turn result in
     /// this window, so this marks that result as queued.
-    pub(super) fn note_frame_enqueued() {
-        if let Some(state) = slot().lock().expect("barrier lock").clone() {
+    pub(super) fn note_frame_enqueued(slot: &Slot) {
+        if let Some(state) = current(slot) {
             state.result_queued.store(true, Ordering::Release);
         }
     }
@@ -1710,8 +1724,10 @@ pub mod test_barrier {
 
     impl Drop for WriteCommitBarrier {
         fn drop(&mut self) {
+            // Release the gates so a failed assertion cannot hang the send or
+            // the worker. The slot is per-driver and is overwritten by the next
+            // arm (or dies with the Inner), so it needs no global clearing.
             self.release();
-            *slot().lock().expect("barrier lock") = None;
         }
     }
 }
@@ -1745,7 +1761,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                     // test-stub only: the worker has reached the turn's ticket
                     // and is about to park on the not-yet-committed write.
                     #[cfg(feature = "test-stub")]
-                    test_barrier::note_reserve_parked();
+                    test_barrier::note_reserve_parked(&inner.barrier);
                     // Park the whole publication pipeline at this position until
                     // the write resolves. Frames already queued ahead have
                     // drained; every frame behind waits here, so the start is
@@ -1762,7 +1778,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                         // turn's book before this turn's buffered result maps.
                         // A no-op unless the worker gate is deliberately shut.
                         #[cfg(feature = "test-stub")]
-                        test_barrier::hold_worker_after_start().await;
+                        test_barrier::hold_worker_after_start(&inner.barrier).await;
                         Ok(())
                     } else {
                         Ok(())

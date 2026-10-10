@@ -21,10 +21,6 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// The driver's write-commit barrier is a single process-global slot, so tests
-/// that arm it must not run concurrently with each other in this binary.
-static BARRIER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn ensure_fake_claude() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
@@ -944,12 +940,11 @@ async fn a_send_after_the_child_stdin_closed_is_an_error_not_written() {
 /// reserved turn's start must still be published before ITS result.
 #[tokio::test]
 async fn a_result_queued_during_the_write_window_starts_then_results() {
-    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
     let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let mut handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
-    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    let barrier = driver.arm_write_commit_barrier();
     let send_task = tokio::spawn(async move {
         let result = driver.send(prompt("race prompt")).await;
         (driver, result)
@@ -1227,12 +1222,12 @@ async fn a_permission_response_is_written_before_a_later_prompt_on_one_fifo() {
 #[tokio::test]
 async fn an_older_buffered_result_cannot_settle_a_newer_outstanding_input_through_the_publication_task()
  {
-    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
     let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
     let mut handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
-    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    // Arm the per-driver barrier BEFORE moving the driver into the send task.
+    let barrier = driver.arm_write_commit_barrier();
     // One task owns the driver: send A (which commits while the worker is held
     // at its ticket) then send B, whose book is opened before the worker maps
     // A's buffered result.

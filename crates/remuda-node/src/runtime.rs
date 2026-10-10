@@ -2853,15 +2853,23 @@ fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Opt
         .related_ids
         .get("outcome")
         .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"));
-    // ma-sdk-state r4 item 2: an UNSETTLED result error frees the composer
-    // only for the one-shot print shape that explicitly claims
-    // affects_completion (the final, unqueued result). A queued/intermediate
-    // (open-workflow) result carries no claim and keeps the turn working;
-    // settled results are handled by `engine_turn_activity` before this
-    // fallback runs.
+    // ma-sdk-state r5 item 2: `affects_completion` is the one-shot PRINT
+    // process-completion heuristic the mapper derives from the process-global
+    // result_index (index>0 && queued==0). That index is meaningless on the
+    // long-lived sdk child — an is_error result with index 1 while a workflow
+    // is open would otherwise idle here — and it is redundant for print too:
+    // claude-sdk/claude-print results always carry the explicit
+    // `settledRootTurn` decision, which `engine_turn_activity` handles before
+    // this fallback. So honor the index heuristic only for OTHER sources
+    // (legacy journals / mapper-bypassed shapes).
+    let index_heuristic_source = !matches!(
+        observation.source.driver_kind,
+        remuda_protocol::DriverKind::ClaudeSdk | remuda_protocol::DriverKind::ClaudePrint
+    );
     let result_error = native.native_name == "result"
         && matches!(&native.status, remuda_protocol::Knowledge::Known { value } if value == "error")
-        && native.affects_completion;
+        && native.affects_completion
+        && index_heuristic_source;
     let stop_failure = native.native_name == "StopFailure" && outcome_failed;
     (result_error || stop_failure).then_some(Activity::Idle)
 }
@@ -3695,12 +3703,18 @@ mod tests {
 
         // 3b) A failed first TURN (the print mapper's exact result-error
         // frame on stdout): composer idles but the process stays alive — it
-        // must accept the next prompt rather than being marked ended.
+        // must accept the next prompt rather than being marked ended. The
+        // final result carries the explicit settledRootTurn decision (r5 item
+        // 2: the index heuristic alone no longer idles print/sdk).
         tx.send(native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,
             "result",
             "sess-1",
-            &[("resultIndex", "1"), ("numTurns", "1")],
+            &[
+                ("resultIndex", "1"),
+                ("numTurns", "1"),
+                ("settledRootTurn", "true"),
+            ],
             remuda_protocol::Severity::Error,
             true,
             "error",
@@ -3845,14 +3859,20 @@ mod tests {
         assert!(native_exit(&obs).is_none());
     }
 
-    /// c-cardsettle r5 item 4: the channel-agnostic root turn-failure edge
-    /// frees the composer for print/SDK Runtime/Stdout channels, but does NOT
-    /// attribute an UNBOUND shell-pty hook (the promoted-hook fold verifies
-    /// ownership itself); subagent/configure stay own-scope.
+    /// c-cardsettle r5 item 4 / ma-sdk-state r5 item 2: the channel-agnostic
+    /// root turn-failure edge frees the composer, but for claude-print/sdk a
+    /// result error must be attributed ONLY by the explicit settledRootTurn
+    /// decision (engine_turn_activity), never by the process-global index
+    /// heuristic. An UNSETTLED print/sdk result error therefore returns None
+    /// here; the index heuristic still idles OTHER (legacy) sources, and an
+    /// unbound shell-pty hook as well as subagent/configure stay own-scope.
     #[test]
     fn root_turn_failure_activity_is_scoped_like_the_hub_projection() {
         use remuda_protocol::{DriverKind, SourceChannel};
-        // Root result error on the print/SDK (Runtime) channel → idle.
+        // A print/SDK result error carrying ONLY the index heuristic (no
+        // settledRootTurn — e.g. an is_error result with index 1 while a
+        // workflow is open) must NOT idle: those carriers always settle via the
+        // explicit flag, which engine_turn_activity handles.
         let runtime_result = native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,
             "result",
@@ -3862,8 +3882,22 @@ mod tests {
             true,
             "error",
         );
+        assert_eq!(root_turn_failure_activity(&runtime_result), None);
+
+        // The SAME observation from a legacy/non-structured source still idles
+        // through the index heuristic (older journals / other carriers).
+        let mut legacy_result = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1"), ("numTurns", "1")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        );
+        legacy_result.source.driver_kind = DriverKind::ClaudePty;
         assert_eq!(
-            root_turn_failure_activity(&runtime_result),
+            root_turn_failure_activity(&legacy_result),
             Some(Activity::Idle)
         );
 
@@ -3919,6 +3953,55 @@ mod tests {
             "turn_done",
         );
         assert_eq!(root_turn_failure_activity(&turn_done), None);
+    }
+
+    /// ma-sdk-state r5 item 2: on the long-lived sdk child an is_error result
+    /// can carry the process-global result_index 1 (and the print-derived
+    /// affects_completion) WHILE A WORKFLOW IS STILL OPEN. The mapper therefore
+    /// omits settledRootTurn. Neither the engine fold nor the failure fallback
+    /// may idle the turn — the row must stay working until the workflow's own
+    /// terminal notification settles it.
+    #[test]
+    fn an_sdk_result_error_while_a_workflow_is_open_never_idles() {
+        use remuda_protocol::DriverKind;
+        // index 1 + no queued field is exactly what made the print heuristic
+        // stamp affects_completion=true; the open workflow is represented by
+        // the absence of settledRootTurn.
+        let mut open_workflow_error = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        );
+        open_workflow_error.source.driver_kind = DriverKind::ClaudeSdk;
+        assert_eq!(
+            crate::signal::engine_turn_activity(&open_workflow_error),
+            None,
+            "the engine fold idles only on settledRootTurn"
+        );
+        assert_eq!(
+            root_turn_failure_activity(&open_workflow_error),
+            None,
+            "the index heuristic must not idle an open-workflow sdk result"
+        );
+
+        // Once the workflow closes, the real mapper settles the turn and the
+        // same result carries the flag → idle.
+        let mut settled_error = open_workflow_error.clone();
+        if let remuda_protocol::ObservationPayload::Lifecycle(payload) = &mut settled_error.body
+            && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_mut()
+        {
+            native
+                .related_ids
+                .insert("settledRootTurn".to_owned(), "true".to_owned());
+        }
+        assert_eq!(
+            crate::signal::engine_turn_activity(&settled_error),
+            Some(Activity::Idle)
+        );
     }
 
     /// c-cardsettle r3 item 8: any hook/turn/session observation carrying a
@@ -4370,14 +4453,21 @@ mod tests {
             row.lifecycle
         );
 
-        // r4 item 2: a failed turn (topic=turn result error, even the final
-        // result) does NOT end a LIVE child — the child accepts another
-        // prompt and cards stay pending until a real topic=session exit.
+        // r4 item 2 / r5 item 2: a failed turn (topic=turn result error, even
+        // the final result) does NOT end a LIVE child — the child accepts
+        // another prompt and cards stay pending until a real topic=session
+        // exit. The FINAL print result settles via the explicit settledRootTurn
+        // decision (NOT the process-global index heuristic), so the observation
+        // carries the flag the real mapper emits.
         tx.send(native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,
             "result",
             "not-applicable",
-            &[("resultIndex", "1"), ("outcome", "failed")],
+            &[
+                ("resultIndex", "1"),
+                ("outcome", "failed"),
+                ("settledRootTurn", "true"),
+            ],
             remuda_protocol::Severity::Error,
             true,
             "error",

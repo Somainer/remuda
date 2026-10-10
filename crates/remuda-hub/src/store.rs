@@ -11867,7 +11867,95 @@ mod tests {
         store.close().await;
     }
 
-    /// c-cardsettle r5 item 1 (the owner's bug): feed the REAL
+    /// ma-sdk-state r5 item 2: on the long-lived claude-sdk child a turn result
+    /// can be an is_error with the process-global resultIndex 1 and the
+    /// print-derived affectsCompletion=true WHILE A WORKFLOW IS STILL OPEN. The
+    /// mapper then omits settledRootTurn. The Hub projection must NOT idle the
+    /// row on the index heuristic for a claude-sdk/claude-print source; the same
+    /// observation from a legacy/other source still idles (older journals).
+    #[tokio::test]
+    async fn an_sdk_open_workflow_result_error_never_idles_unlike_a_legacy_source() {
+        let open_workflow_result = json!({
+            "type":"native","topic":"turn","nativeName":"result",
+            "severity":"info",
+            "nativeId":{"state":"known","value":"sess-1"},
+            "status":{"state":"known","value":"error"},
+            "affectsCompletion":true,
+            // No settledRootTurn: the owning turn still has an open workflow;
+            // result_index is process-global (1 = second result of the child).
+            "relatedIds":{"resultIndex":"1","numTurns":"1"}});
+
+        // claude-sdk: stays working.
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r5-sdk-open-workflow").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle",
+                    "source":{"driverKind":"claude-sdk","channel":"stdout"},
+                    "payload":{"type":"native","topic":"turn","nativeName":"agent_status",
+                        "status":{"state":"known","value":"working"}}}),
+            )
+            .await
+            .expect("seed sdk working");
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle",
+                    "source":{"driverKind":"claude-sdk","channel":"stdout"},
+                    "payload": open_workflow_result}),
+            )
+            .await
+            .expect("append open-workflow sdk result error");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.lifecycle, "running",
+            "an open-workflow sdk result is not terminal"
+        );
+        assert_eq!(
+            row.activity, "working",
+            "the index heuristic must not idle an open-workflow claude-sdk turn"
+        );
+
+        // Same payload, legacy/other source: the index heuristic still idles.
+        let (lifecycle, activity) = crate::store::derive_instance_state(&json!({
+            "source":{"driverKind":"claude-pty","channel":"stdout"},
+            "payload":{"type":"native","topic":"turn","nativeName":"result",
+                "status":{"state":"known","value":"error"},
+                "affectsCompletion":true,
+                "relatedIds":{"resultIndex":"1","numTurns":"1"}}}));
+        assert_eq!(
+            (lifecycle, activity),
+            (Some("running"), Some("idle")),
+            "a legacy source keeps the affectsCompletion fallback"
+        );
+
+        // And once the workflow closes the real mapper settles the sdk turn:
+        // the same result carrying settledRootTurn idles.
+        let (lifecycle, activity) = crate::store::derive_instance_state(&json!({
+            "source":{"driverKind":"claude-sdk","channel":"stdout"},
+            "payload":{"type":"native","topic":"turn","nativeName":"result",
+                "status":{"state":"known","value":"error"},
+                "affectsCompletion":true,
+                "relatedIds":{"resultIndex":"1","numTurns":"1","settledRootTurn":"true"}}}));
+        assert_eq!(
+            (lifecycle, activity),
+            (Some("running"), Some("idle")),
+            "a settled sdk result idles through settledRootTurn"
+        );
+        store.close().await;
+    }
     /// WorkflowJournalTailer agent_failed output through the Hub — both the
     /// synthesized `workflow.member` observation (kind=workflow.member,
     /// payload.state=failed) and, defensively, the same fact carried as a
@@ -14513,6 +14601,17 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
     let affects_completion = payload.get("affectsCompletion").and_then(Value::as_str)
         == Some("true")
         || payload.get("affectsCompletion").and_then(Value::as_bool) == Some(true);
+    // ma-sdk-state r5 item 2: affectsCompletion is the mapper's one-shot
+    // process-completion heuristic derived from the process-global result_index
+    // (index>0 && queued==0). It is meaningless on the long-lived sdk child —
+    // an is_error result with index 1 while a workflow is open must not idle —
+    // and is redundant for print: claude-sdk/claude-print results always carry
+    // the explicit settledRootTurn decision handled above. Only honor the index
+    // heuristic for OTHER sources (legacy journals / mapper-bypassed shapes).
+    let index_heuristic_source = !matches!(
+        event.pointer("/source/driverKind").and_then(Value::as_str),
+        Some("claude-sdk" | "claude-print")
+    );
     if payload_type == "native" && topic == "turn" && !subagent_scoped {
         if (native_name, status) == ("turn_started", Some("working")) {
             return (Some("running"), Some("working"));
@@ -14530,7 +14629,10 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
             // claims affectsCompletion (final result, no queued turn): that
             // still frees the composer. Intermediate index-0 / queued results
             // never carry the claim, so they keep the row working.
-            if affects_completion && root_turn_failed(payload, native_name, status) {
+            if affects_completion
+                && index_heuristic_source
+                && root_turn_failed(payload, native_name, status)
+            {
                 return (Some("running"), Some("idle"));
             }
             return (None, None);

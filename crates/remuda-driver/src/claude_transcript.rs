@@ -766,6 +766,48 @@ fn crash_after_stage_seam() -> bool {
         || std::env::var_os(CRASH_AFTER_STAGE_SEAM_ENV).is_some()
 }
 
+// Round 7 item 5 test seam: run a hook INSIDE the window between transcript
+// publication (a held-fd renameat, or a KeepExisting decision) and the final
+// pathname re-resolution. A regression uses it to swap another single-link
+// file into the destination name during that window and asserts the launch
+// refuses instead of authorising the planted inode forever. The hook receives
+// the logical destination dir and the transcript name; it is a `FnOnce` taken
+// from a thread-local, so it needs no `unsafe` (the workspace forbids
+// `env::set_var`).
+#[cfg(test)]
+type PublishWindowHook = Box<dyn FnOnce(&Path, &str)>;
+
+#[cfg(test)]
+thread_local! {
+    static PUBLISH_WINDOW_HOOK: std::cell::RefCell<Option<PublishWindowHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the publication-window hook installed; the hook is cleared
+/// afterwards even if `f` panics.
+#[cfg(test)]
+fn with_publish_window_hook<R>(hook: PublishWindowHook, f: impl FnOnce() -> R) -> R {
+    PUBLISH_WINDOW_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PUBLISH_WINDOW_HOOK.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+    let _guard = Guard;
+    f()
+}
+
+#[cfg(test)]
+fn run_publish_window_hook(dest_dir: &Path, transcript_name: &str) {
+    if let Some(hook) = PUBLISH_WINDOW_HOOK.with(|cell| cell.borrow_mut().take()) {
+        hook(dest_dir, transcript_name);
+    }
+}
+
+#[cfg(not(test))]
+fn run_publish_window_hook(_dest_dir: &Path, _transcript_name: &str) {}
+
 /// Provenance recorded next to a staged transcript (review item 4). The sha is
 /// computed over the bytes actually streamed into the child home (round 3
 /// item 3), never re-read from the source path.
@@ -776,6 +818,13 @@ fn crash_after_stage_seam() -> bool {
 /// resume re-verifies that identity (plus the staged prefix's size/hash)
 /// against the OPENED destination fd before keeping anything. The child's own
 /// appended turns survive: only the staged prefix is content-checked.
+///
+/// Round 7 item 5: `(dev, ino)` alone is recyclable — an unlinked inode number
+/// can be handed to a freshly created file — so the marker also records the
+/// inode's birth time (statx btime / st_birthtime), which a recycled inode
+/// cannot replay. On a filesystem that reports no birth time the field is
+/// `None` on both sides and the staged-prefix hash is the documented-only
+/// guarantee for that file.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StagingProvenance {
     /// Marker format version.
@@ -790,6 +839,45 @@ struct StagingProvenance {
     inode_dev: u64,
     /// `st_ino` of that published inode.
     inode_ino: u64,
+    /// Birth time of that published inode as epoch nanoseconds, when the
+    /// filesystem reports one. `#[serde(default)]` so a pre-birthtime marker
+    /// parses as `None`; on a birth-time-capable filesystem such a marker can
+    /// never match a live inode (it fails closed into the replace/refuse path).
+    #[serde(default)]
+    inode_birth_nanos: Option<i128>,
+}
+
+/// The full non-recyclable identity of a transcript inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InodeIdentity {
+    dev: u64,
+    ino: u64,
+    birth_nanos: Option<i128>,
+}
+
+impl InodeIdentity {
+    /// Read the identity of an OPENED leaf straight from its fds.
+    fn of(leaf: &OpenedLeaf) -> std::io::Result<Self> {
+        let (dev, ino) = leaf.identity()?;
+        let birth_nanos = leaf
+            .birthtime()?
+            .map(system_time_to_epoch_nanos)
+            .transpose()?;
+        Ok(Self {
+            dev,
+            ino,
+            birth_nanos,
+        })
+    }
+}
+
+/// Encode a [`std::time::SystemTime`] as signed epoch nanoseconds.
+fn system_time_to_epoch_nanos(time: std::time::SystemTime) -> std::io::Result<i128> {
+    use std::time::UNIX_EPOCH;
+    let duration = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| std::io::Error::other(format!("birth time before the epoch: {error}")))?;
+    Ok(i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos()))
 }
 
 impl StagingProvenance {
@@ -797,15 +885,16 @@ impl StagingProvenance {
         source: &Path,
         source_size: u64,
         source_sha256: &str,
-        published_identity: (u64, u64),
+        published_identity: InodeIdentity,
     ) -> Self {
         Self {
             version: MARKER_VERSION,
             source: source.display().to_string(),
             source_size,
             source_sha256: source_sha256.to_owned(),
-            inode_dev: published_identity.0,
-            inode_ino: published_identity.1,
+            inode_dev: published_identity.dev,
+            inode_ino: published_identity.ino,
+            inode_birth_nanos: published_identity.birth_nanos,
         }
     }
 
@@ -820,8 +909,12 @@ impl StagingProvenance {
     }
 
     /// The inode identity recorded at publish time.
-    fn published_identity(&self) -> (u64, u64) {
-        (self.inode_dev, self.inode_ino)
+    fn published_identity(&self) -> InodeIdentity {
+        InodeIdentity {
+            dev: self.inode_dev,
+            ino: self.inode_ino,
+            birth_nanos: self.inode_birth_nanos,
+        }
     }
 }
 
@@ -1101,7 +1194,12 @@ fn build_verify_and_publish(
     )?;
     let transcript_sha = streamed.sha256;
     budget.charge_bytes(streamed.bytes, limits)?;
-    drop(transcript_tmp);
+    // Round 7 item 5: the O_EXCL staged descriptor is NOT dropped before the
+    // rename. It stays open through publication and the marker write, so the
+    // identity recorded in the marker comes from the inode THIS launch
+    // actually published — a name swap in the renameat→marker window cannot
+    // authorise a planted file forever.
+    let staged_transcript_file = transcript_tmp;
     seeds.push(ManifestEntry {
         rel: transcript_name.to_owned(),
         size: streamed.bytes,
@@ -1204,13 +1302,18 @@ fn build_verify_and_publish(
     // prefix match on the authorised inode keeps the file. Anything unproven
     // is refused (foreign bytes) or replaced by the staged copy (foreign inode
     // carrying exactly the staged bytes).
+    //
+    // Round 7 item 5: the inode leg includes the non-recyclable birth time,
+    // and a KeepExisting verdict keeps its authorised descriptor OPEN for the
+    // marker write below.
     #[derive(PartialEq, Eq)]
     enum TranscriptPublish {
         RenameOver,
         KeepExisting,
     }
-    let transcript_publish = if !retained {
-        TranscriptPublish::RenameOver
+    let (transcript_publish, retained_leaf): (TranscriptPublish, Option<OpenedLeaf>) = if !retained
+    {
+        (TranscriptPublish::RenameOver, None)
     } else {
         let published_size = seeds
             .iter()
@@ -1234,19 +1337,21 @@ fn build_verify_and_publish(
                         published_size
                     )));
                 }
-                let identity = dest_leaf.identity()?;
+                let identity = InodeIdentity::of(&dest_leaf)?;
                 let nlink = dest_leaf.nlink()?;
                 let inode_authorised = identity == marker.published_identity() && nlink == 1;
                 if inode_authorised {
                     // (b) The published inode, independently linked, prefix
                     // intact: any bytes past the prefix are this child's own
-                    // appended turns — keep them.
-                    TranscriptPublish::KeepExisting
+                    // appended turns — keep them, and keep THIS fd open so the
+                    // marker is recorded over the exact live inode.
+                    (TranscriptPublish::KeepExisting, Some(dest_leaf))
                 } else if dest_leaf.len == published_size {
                     // Foreign inode (replaced file, hardlink to the source or
-                    // to an outside file) but EXACTLY the staged bytes and
-                    // nothing after them: nothing to lose, publish our copy.
-                    TranscriptPublish::RenameOver
+                    // to an outside file, or a recycled inode whose birth time
+                    // does not match) but EXACTLY the staged bytes and nothing
+                    // after them: nothing to lose, publish our copy.
+                    (TranscriptPublish::RenameOver, None)
                 } else {
                     return Err(invalid_input(format!(
                         "resume destination {} has a matching marker but its inode is not the one \
@@ -1288,7 +1393,7 @@ fn build_verify_and_publish(
                         source = source_transcript.display()
                     )));
                 }
-                TranscriptPublish::RenameOver
+                (TranscriptPublish::RenameOver, None)
             }
         }
     };
@@ -1314,27 +1419,44 @@ fn build_verify_and_publish(
     // retained independent file (valid marker, nlink==1, not the source inode)
     // keeps its bytes (it may carry this child's appended turns) and drops the
     // staged copy.
-    if transcript_publish == TranscriptPublish::RenameOver
-        && !retained
-        && dest_dir_fd
-            .classify_leaf(transcript_name.as_bytes())?
-            .is_some()
-    {
-        return Err(invalid_input(format!(
-            "resume destination {} appeared during staging without provenance; refusing to \
-             overwrite",
-            dest_dir.join(transcript_name).display()
-        )));
-    }
-    if transcript_publish == TranscriptPublish::RenameOver {
+    //
+    // Round 7 item 5: either way the AUTHORISED descriptor — the O_EXCL staged
+    // file held open across the rename, or the retained leaf provenanced in
+    // step (4) — is what survives to the marker write below. The final name is
+    // never trusted on its own.
+    let authorised_leaf = if transcript_publish == TranscriptPublish::RenameOver {
+        if !retained
+            && dest_dir_fd
+                .classify_leaf(transcript_name.as_bytes())?
+                .is_some()
+        {
+            return Err(invalid_input(format!(
+                "resume destination {} appeared during staging without provenance; refusing to \
+                 overwrite",
+                dest_dir.join(transcript_name).display()
+            )));
+        }
+        // Rename WHILE holding the staged fd: afterwards this very descriptor
+        // is the live file at the final name, even if the name is then swapped.
+        let staged_leaf = OpenedLeaf::from_file(staged_transcript_file)?;
         temp_fd.rename(
             transcript_name.as_bytes(),
             dest_dir_fd,
             transcript_name.as_bytes(),
         )?;
+        staged_leaf
     } else {
+        // Keep the retained inode; the staged temp copy is unlinked (its open
+        // descriptor closes with the binding).
         let _ = temp_fd.unlink_file(transcript_name.as_bytes());
-    }
+        drop(staged_transcript_file);
+        retained_leaf.expect("a KeepExisting verdict carries its authorised fd")
+    };
+
+    // Round 7 item 5 test seam: act INSIDE the renameat→marker window. In
+    // production the hook is a no-op; a regression swaps the destination name
+    // here and the held-fd identity check below must refuse the planted file.
+    run_publish_window_hook(dest_dir, transcript_name);
 
     // Test seam: simulate a crash AFTER the transcript (and sidecars) are
     // published but BEFORE the provenance marker is written. The transcript is
@@ -1354,26 +1476,48 @@ fn build_verify_and_publish(
         .iter()
         .find(|seed| seed.rel == transcript_name)
         .map_or(source_size, |seed| seed.size);
-    // Re-open the FINAL destination and verify the staged prefix on that fd
-    // before recording its identity in the marker. Never write a marker over
-    // an inode we did not just prove: it must be a single-link regular file
-    // whose staged prefix hashes to the streamed bytes.
-    let final_leaf = dest_dir_fd.open_regular_leaf(transcript_name.as_bytes())?;
-    if final_leaf.nlink()? != 1 {
+    // Round 7 item 5: re-resolve the final NAME and require it to be the EXACT
+    // live inode the held authorised descriptor points at. Between the
+    // renameat (or the KeepExisting decision) and this point the directory is
+    // shared with the rest of the process tree; a file swapped into the name
+    // during that window — a single-link file with the staged prefix plus
+    // foreign turns — must not be authorised forever by a marker naming it.
+    let name_leaf = dest_dir_fd.open_regular_leaf(transcript_name.as_bytes())?;
+    // The identity comes from the HELD descriptor (the O_EXCL staged fd carried
+    // across renameat, or the already-provenanced retained fd); the name only
+    // confirms it still resolves to that exact live inode. Equality FIRST:
+    // - it makes the read-only name fd a safe handle for the content check;
+    // - it is the actual swap verdict (a replanted name also makes the held
+    //   inode's link count drop to 0, so the link check on its own would
+    //   mislabel a swap as a hardlink).
+    let authorised_identity = InodeIdentity::of(&authorised_leaf)?;
+    let name_identity = InodeIdentity::of(&name_leaf)?;
+    if authorised_identity != name_identity {
+        return Err(invalid_input(format!(
+            "resume destination {} was swapped during publication: the final pathname is not the \
+             inode this launch published; refusing to record provenance",
+            dest_dir.join(transcript_name).display()
+        )));
+    }
+    // Same inode, hence one shared link count: require a single link so the
+    // published inode cannot also be reachable through another directory entry.
+    if name_leaf.nlink()? != 1 {
         return Err(invalid_input(format!(
             "resume destination {} is hard-linked after publish; refusing to record provenance for \
              a shared inode",
             dest_dir.join(transcript_name).display()
         )));
     }
-    if !destination_prefix_matches(&mut &final_leaf.file, published_size, &transcript_sha)? {
+    // Verify the staged prefix on the (read-only) name fd: identity equality
+    // above proves it is the held inode, so a swap cannot slip foreign bytes
+    // past this check.
+    if !destination_prefix_matches(&mut &name_leaf.file, published_size, &transcript_sha)? {
         return Err(invalid_input(format!(
             "resume destination {} failed final staged-prefix verification; refusing to record \
              provenance",
             dest_dir.join(transcript_name).display()
         )));
     }
-    let final_identity = final_leaf.identity()?;
     write_staging_provenance(
         dest_dir_fd,
         transcript_name,
@@ -1381,10 +1525,12 @@ fn build_verify_and_publish(
             source_transcript,
             published_size,
             &transcript_sha,
-            final_identity,
+            authorised_identity,
         ),
     )?;
 
+    // Close only after the marker is down.
+    drop(authorised_leaf);
     Ok(published_roots)
 }
 
@@ -4417,6 +4563,199 @@ mod tests {
             std::fs::read_to_string(&foreign).unwrap(),
             "pre-existing real sidecar\n",
             "the real destination-only file is validated and kept"
+        );
+    }
+
+    /// Round 7 item 5(a): a file swapped into the destination NAME in the
+    /// renameat→marker window — a single-link file carrying the staged prefix
+    /// plus foreign turns — must not be authorised forever. The launch holds
+    /// the O_EXCL staged descriptor across the rename; the final name must
+    /// resolve to that exact live inode.
+    #[cfg(unix)]
+    #[test]
+    fn r7_marker_publication_window_swap_is_refused() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("workspace");
+        let session = "01993ab0-0000-7000-8000-0000000000e7";
+        let old_home = tmp.path().join("old");
+        let source = transcript_layout(&old_home, &ws, session);
+        let prefix = "window-swap-prefix\n";
+        write_file(&source, prefix);
+        let new_home = tmp.path().join("new");
+
+        let result = with_publish_window_hook(
+            Box::new(|dest_dir: &std::path::Path, name: &str| {
+                let dest = dest_dir.join(name);
+                // The just-published file holds exactly the staged prefix;
+                // read it, unlink the name (the launch's held fd keeps the
+                // real inode alive), and replant a DIFFERENT single-link file
+                // with the same prefix plus foreign turns.
+                let current = std::fs::read(&dest).expect("read published file");
+                let prefix_len = current
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(current.len(), |index| index + 1);
+                let mut planted = current[..prefix_len].to_vec();
+                planted.extend_from_slice(b"FOREIGN TURNS PLANTED IN THE WINDOW\n");
+                std::fs::remove_file(&dest).expect("unlink the published name");
+                std::fs::write(&dest, planted).expect("plant the swapped file");
+            }),
+            || stage_for_resume(&source, &new_home, &ws, session),
+        );
+        let error = result.expect_err("a swap in the publication window is refused");
+        assert!(
+            error.to_string().contains("swapped during publication"),
+            "{error}"
+        );
+        let dest = transcript_layout(&new_home, &ws, session);
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            format!("{prefix}FOREIGN TURNS PLANTED IN THE WINDOW\n"),
+            "the planted bytes are left untouched by the refusal"
+        );
+        let marker = dest
+            .parent()
+            .unwrap()
+            .join(STAGING_MARKER_DIR)
+            .join(format!("{session}.json"));
+        assert!(
+            !marker.exists(),
+            "no provenance marker is written for the planted inode"
+        );
+    }
+
+    /// Round 7 item 5(a) companion: the same window after a KeepExisting
+    /// decision. The already-authorised retained descriptor stays open; a swap
+    /// after the decision must be caught against THAT live inode.
+    #[cfg(unix)]
+    #[test]
+    fn r7_keep_existing_window_swap_is_refused() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("workspace");
+        let session = "01993ab0-0000-7000-8000-0000000000e8";
+        let old_home = tmp.path().join("old");
+        let source = transcript_layout(&old_home, &ws, session);
+        let prefix = "keep-window-prefix\n";
+        write_file(&source, prefix);
+        let new_home = tmp.path().join("new");
+        stage_for_resume(&source, &new_home, &ws, session).expect("first stage");
+        let dest = transcript_layout(&new_home, &ws, session);
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&dest)
+            .expect("open append")
+            .write_all(b"a real child turn\n")
+            .expect("child append");
+
+        let result = with_publish_window_hook(
+            Box::new(|dest_dir: &std::path::Path, name: &str| {
+                let target = dest_dir.join(name);
+                // The current file is prefix + a real child turn; replant the
+                // staged FIRST LINE plus a foreign turn under a new inode.
+                let current = std::fs::read(&target).expect("read retained file");
+                let prefix_len = current
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(current.len(), |index| index + 1);
+                let mut planted = current[..prefix_len].to_vec();
+                planted.extend_from_slice(b"foreign turn planted after decision\n");
+                std::fs::remove_file(&target).expect("unlink after the keep decision");
+                std::fs::write(&target, planted).expect("plant after decision");
+            }),
+            || stage_for_resume(&source, &new_home, &ws, session),
+        );
+        let error = result.expect_err("a swap after a KeepExisting decision is refused");
+        assert!(
+            error.to_string().contains("swapped during publication"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            format!("{prefix}foreign turn planted after decision\n"),
+            "the planted file is not overwritten or authorised"
+        );
+    }
+
+    /// Round 7 item 5(b): an unlinked-and-recreated destination whose
+    /// `(dev, ino)` is reused must NOT be kept as "child-appended turns".
+    /// Unlike the round-6 swap test, the original inode is NEVER held open, so
+    /// this exercises pure identity reuse; the marker's birth-time leg is what
+    /// distinguishes the fresh inode. Phase 2 pins that leg: even with the
+    /// marker's `(dev, ino)` rewritten to the new file (the exact state an
+    /// untouched marker has when the kernel recycles the number), the stale
+    /// birth time refuses the foreign suffix.
+    #[cfg(unix)]
+    #[test]
+    fn r7_recycled_inode_without_a_held_fd_is_refused_by_birthtime() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("workspace");
+        let session = "01993ab0-0000-7000-8000-0000000000e9";
+        let old_home = tmp.path().join("old");
+        let source = transcript_layout(&old_home, &ws, session);
+        let prefix = "recycle-prefix\n";
+        write_file(&source, prefix);
+        let new_home = tmp.path().join("new");
+        stage_for_resume(&source, &new_home, &ws, session).expect("first stage");
+        let dest = transcript_layout(&new_home, &ws, session);
+        let marker_path = dest
+            .parent()
+            .unwrap()
+            .join(STAGING_MARKER_DIR)
+            .join(format!("{session}.json"));
+        let original_marker: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker_path).expect("marker"))
+                .expect("marker json");
+        assert!(
+            original_marker
+                .get("inode_birth_nanos")
+                .and_then(serde_json::Value::as_i64)
+                .is_some(),
+            "a birth-time-capable filesystem records the published birth time"
+        );
+
+        // Replace the destination WITHOUT holding the original inode open: the
+        // number is free for the kernel to recycle.
+        std::fs::remove_file(&dest).expect("unlink, no fd held");
+        let foreign = format!("{prefix}foreign turns on a fresh inode\n");
+        std::fs::write(&dest, &foreign).expect("recreate at the same name");
+
+        // Phase 1: the untouched marker refuses regardless of whether the
+        // number was recycled (dev+ino) or merely replaced (birth time).
+        stage_for_resume(&source, &new_home, &ws, session)
+            .expect_err("an unlinked/recreated destination is never kept");
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            foreign,
+            "phase 1 leaves the foreign bytes untouched"
+        );
+
+        // Phase 2: rewrite ONLY dev/ino to the new file, keeping the recorded
+        // birth time — the precise identity an untouched marker presents when
+        // the inode number is recycled. The birth-time leg must refuse.
+        let new_meta = std::fs::symlink_metadata(&dest).expect("new metadata");
+        let mut patched = original_marker;
+        patched["inode_dev"] = serde_json::json!(new_meta.dev());
+        patched["inode_ino"] = serde_json::json!(new_meta.ino());
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&patched).expect("json"),
+        )
+        .expect("patch marker dev/ino");
+        let error = stage_for_resume(&source, &new_home, &ws, session)
+            .expect_err("a recycled (dev,ino) with a stale birth time is refused");
+        assert!(
+            error.to_string().contains("not the one Remuda published"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            foreign,
+            "the foreign suffix is not adopted as child turns"
         );
     }
 }

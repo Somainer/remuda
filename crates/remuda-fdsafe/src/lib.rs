@@ -95,6 +95,23 @@ pub struct OpenedLeaf {
 }
 
 impl OpenedLeaf {
+    /// Classify an ALREADY-OPEN regular file descriptor (post-open `fstat`,
+    /// exact type check). Used to keep an authorised descriptor — an O_EXCL
+    /// staged file or a retained leaf that already passed provenance — live
+    /// across a `renameat` and then take the identity of THAT exact inode,
+    /// instead of re-resolving the pathname (round 7 item 5's swap seam).
+    pub fn from_file(file: File) -> Result<Self, FdError> {
+        let stat = fstat_fd(file.as_raw_fd())?;
+        let (kind, len) = classify(&stat);
+        if kind != LeafKind::Regular {
+            return Err(FdError::new(
+                "opened fd",
+                FdErrorKind::Other("not a regular file".into()),
+            ));
+        }
+        Ok(Self { file, kind, len })
+    }
+
     /// The `(st_dev, st_ino, st_nlink)` triple of the opened file description.
     /// Two leaves are the same on-disk file iff dev+ino match — read from the
     /// opened fds, so a symlink swap after opening cannot change the verdict.
@@ -110,6 +127,29 @@ impl OpenedLeaf {
         let stat = fstat_fd(self.file.as_raw_fd())?;
         #[allow(clippy::unnecessary_cast)]
         Ok(stat.st_nlink as u64)
+    }
+
+    /// File birth (creation) time of the opened fd — `statx` `btime` on Linux,
+    /// `st_birthtime` on macOS — read through [`std::fs::Metadata::created`].
+    ///
+    /// Round 7 item 5: `(dev, ino)` is recyclable — an unlinked inode number
+    /// can be handed to a brand-new file on the next create — so dev+ino alone
+    /// cannot distinguish a published inode from a freshly created one that
+    /// happened to reuse the number. The birth time is a non-recyclable leg:
+    /// the new inode gets a LATER birth time even when the number matches.
+    /// `None` means this filesystem reports no birth time; callers then rely
+    /// on their content hash as the documented-only guarantee.
+    pub fn birthtime(&self) -> Result<Option<std::time::SystemTime>, FdError> {
+        match self.file.metadata().and_then(|metadata| metadata.created()) {
+            Ok(time) => Ok(Some(time)),
+            // std reports an unsupported birth time as an Unsupported error
+            // (e.g. a filesystem whose statx mask omits STATX_BTIME).
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(None),
+            Err(error) => Err(FdError::new(
+                "birthtime",
+                FdErrorKind::Other(error.to_string()),
+            )),
+        }
     }
 }
 

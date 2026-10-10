@@ -408,6 +408,7 @@ describe("Composer shortcuts", () => {
     expect(chip).toHaveAttribute("data-permission-danger", "1");
     expect(chip).toHaveTextContent("never");
   });
+
   it("item 5: the live wheel walks the CLI order and keeps dontAsk out", () => {
     render(
       <Composer
@@ -429,7 +430,6 @@ describe("Composer shortcuts", () => {
     expect(screen.queryByTestId("permission-option-dontAsk")).toBeNull();
     expect(screen.queryByTestId("permission-option-bypassPermissions")).toBeNull();
   });
-
 });
 
 describe("Composer context usage chip", () => {
@@ -1296,7 +1296,7 @@ it("shows ? while an effort switch is pending and read-back has been withdrawn",
       effort={effortAt("claude", 4, false)}
       effortEffective={null}
       effortReadbackWithdrawn
-      effortPending={{ word: "max", queued: false }}
+      effortPending={{ name: "max", ultracode: false, queued: false }}
       onEffort={vi.fn()}
     />,
   );
@@ -1322,7 +1322,7 @@ it("shows the pending word when a pending switch has simply never read back", ()
       model="opus"
       effort={effortAt("claude", 4, false)}
       effortEffective={null}
-      effortPending={{ word: "max", queued: false }}
+      effortPending={{ name: "max", ultracode: false, queued: false }}
       onEffort={vi.fn()}
     />,
   );
@@ -1342,7 +1342,7 @@ it("shows the pending word when read-back is still available during a switch", (
       model="opus"
       effort={effortAt("claude", 4, false)}
       effortEffective={{ name: "high", ultracode: false, source: "remuda", observedAt: "2026-10-08T00:00:00Z" }}
-      effortPending={{ word: "max", queued: false }}
+      effortPending={{ name: "max", ultracode: false, queued: false }}
       onEffort={vi.fn()}
     />,
   );

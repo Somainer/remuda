@@ -899,6 +899,7 @@ it("r2 item 1: the version gate prefers the snapshot version, then the host's pi
     instances: [legacyInstance],
   });
   expect(hubStore.effortVersionGate(legacyInstance.id)).toBe("legacy");
+});
 
 /** Pin the followed test instance's reported Claude binary version (gate).
  *  Also serves the pinned row from polls, so the post-configure refresh does
@@ -1069,7 +1070,7 @@ it("a read-back-unavailable edge clears the projection but keeps the pending swi
     kind: "claude",
     ultracode: false,
   });
-  expect(hubStore.effortPendingOf(ctx.instance.id)?.word).toBe("max");
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
 
   // The transcript is replaced: the driver withdraws read-back (name/flag
   // null, readbackAvailable false).
@@ -1097,7 +1098,7 @@ it("a read-back-unavailable edge clears the projection but keeps the pending swi
   // Projected state is withdrawn -> the chip renders ? ...
   expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
   // ... but the pending switch is neither settled nor rejected.
-  expect(hubStore.effortPendingOf(ctx.instance.id)?.word).toBe("max");
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
 });
 
 it("r6 item 6: a poll with no Hub effort projection never erases a live-only edge", async () => {

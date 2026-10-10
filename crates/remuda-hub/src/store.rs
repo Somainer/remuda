@@ -3885,7 +3885,16 @@ impl Store {
                 let (prev_lifecycle, prev_error, prev_ended, prev_updated) = prev;
                 let already_terminal =
                     matches!(prev_lifecycle.as_str(), "exited" | "failed" | "closed");
-                let legacy_end = prev_error.as_deref() == Some(LEGACY_HOST_LOST_MARKER);
+                // c-cardsettle r11 item 4: the gentle legacy treatment (date
+                // the end from the row's own updated_at, never advance it)
+                // applies ONLY to an already-terminal legacy row. A LIVE
+                // running/ready row whose last_error still carries the
+                // pre-upgrade 'host-lost' marker after a pre-upgrade flap is
+                // a chapter the new epoch omits: it is a fresh loss here, so
+                // it gets node-epoch-changed and a current timestamp, not the
+                // stale legacy treatment.
+                let legacy_end =
+                    already_terminal && prev_error.as_deref() == Some(LEGACY_HOST_LOST_MARKER);
                 if epoch_changed && already_terminal {
                     if !legacy_end {
                         // A non-legacy evidence-less terminal row the inventory
@@ -12817,6 +12826,93 @@ mod tests {
         let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "invalidated");
         assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
+    /// c-cardsettle r11 item 4: a LIVE row whose last_error still carries the
+    /// legacy 'host-lost' marker after a pre-upgrade flap is a fresh loss when
+    /// a new epoch omits it — it must NOT get the gentle legacy treatment
+    /// (which would date ended_at from a stale updated_at and freeze
+    /// updated_at); it is reported as lost and stamped like any other new
+    /// epoch loss.
+    #[tokio::test]
+    async fn new_epoch_loss_on_a_live_row_carrying_the_legacy_marker_is_not_legacy_treated() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r11-live-legacy-marker").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        // A LIVE running row (a pre-upgrade flap left the stale legacy marker
+        // and an old updated_at).
+        let past = "2026-08-01T00:00:00.000Z";
+        {
+            let id = instance.instance_id.clone();
+            store
+                .run_named("r11_seed_live_legacy_marker", move |conn| {
+                    conn.execute(
+                        "UPDATE instances
+                            SET lifecycle = 'running', activity = 'idle',
+                                last_error = 'host-lost', ended_at = NULL,
+                                updated_at = ?2
+                          WHERE id = ?1",
+                        params![&id, past],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("seed live legacy-marker row");
+        }
+
+        let outcome = store
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
+            .await
+            .expect("reconcile");
+        assert_eq!(
+            outcome.lost,
+            vec![instance.instance_id.clone()],
+            "a live row omitted by the new epoch is a fresh loss"
+        );
+        assert!(
+            !outcome
+                .legacy_exited
+                .iter()
+                .any(|id| id == &instance.instance_id),
+            "a live row is never in legacy_exited"
+        );
+        assert_eq!(
+            outcome
+                .settlement
+                .interactions
+                .iter()
+                .map(|s| s.interaction_id.clone())
+                .collect::<Vec<_>>(),
+            vec![int_id.clone()],
+            "its card still settles"
+        );
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("node-epoch-changed"),
+            "a fresh loss rewrites the stale legacy marker"
+        );
+        assert_ne!(
+            row.updated_at, past,
+            "a fresh loss advances updated_at (legacy rows alone keep it)"
+        );
+        let ended = ended_at_of(&store, &instance.instance_id).await;
+        let ended = ended.as_deref().expect("a fresh loss stamps ended_at");
+        assert_ne!(
+            ended, past,
+            "ended_at is the reconcile clock, not the stale updated_at"
+        );
         store.close().await;
     }
 

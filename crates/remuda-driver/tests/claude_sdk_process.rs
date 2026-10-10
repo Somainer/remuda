@@ -1370,3 +1370,71 @@ async fn process_gone_is_true_through_the_driver_trait_after_the_child_exits() {
         "process_gone must forward the inner driver's end evidence"
     );
 }
+
+/// ma-sdk-state r6 item 1: a prompt whose staged image cannot be read returns
+/// Err from content resolution BEFORE any turn book/ticket exists. The next
+/// normal prompt must still publish turn_started and its result — the failed
+/// (or here, never-opened) reservation must neither park the publication
+/// worker nor leave an empty outstanding turn that blocks the later settle.
+#[tokio::test]
+async fn a_missing_image_send_errors_and_the_next_turn_still_starts_and_results() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let id = remuda_protocol::Id::new("obj").expect("object id");
+    let missing_image = DriverInput::Prompt(Box::new(PromptInput {
+        mode: PromptMode::NewTurn,
+        blocks: vec![
+            ContentBlock::Image(Box::new(remuda_protocol::MediaBlock {
+                object_id: id.clone(),
+                media_type: "image/png".into(),
+                name: Some("shot.png".into()),
+                anchor: None,
+                size: None,
+            })),
+            ContentBlock::Resource(Box::new(remuda_protocol::ResourceBlock {
+                uri: "file:///nonexistent/r6-missing-shot.png".into(),
+                media_type: Knowledge::Known {
+                    value: "image/png".into(),
+                },
+                object_id: Some(id),
+            })),
+            ContentBlock::Text(Box::new(TextBlock {
+                text: "describe the missing image".into(),
+            })),
+        ],
+        origin: InputOrigin::Human,
+        native_client_message_id: "msg-r6-missing".into(),
+    }));
+    let failed = driver.send(missing_image).await;
+    assert!(
+        failed.is_err(),
+        "an unreadable staged image must fail the send: {failed:?}"
+    );
+
+    // The very next prompt goes through the full publication pipeline.
+    driver
+        .send(prompt("after the failed image"))
+        .await
+        .expect("the next prompt must still send after a content-resolution failure");
+    let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+            && turn_done_count(seen) >= 1
+    })
+    .await;
+    assert!(
+        obs.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started")),
+        "turn_started is still published after the failed image send"
+    );
+    assert_eq!(
+        turn_started_count(&obs),
+        1,
+        "the failed image send leaked no turn_started"
+    );
+    assert!(turn_done_count(&obs) >= 1, "the result is still published");
+
+    driver.close().await.expect("close");
+}

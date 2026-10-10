@@ -211,23 +211,23 @@ impl TurnBook {
         }
     }
 
-    /// Roll back the reservation opened by [`Self::begin_turn`] when its prompt
-    /// write failed. The prompt never reached the child, so the back turn —
-    /// always the reserved one, and always still empty (no frame for it can
-    /// exist before the write lands) — is removed; an OLDER outstanding turn
-    /// must be left untouched.
-    fn cancel_latest_turn(&mut self) {
-        if self
-            .outstanding
-            .back()
-            .is_some_and(|turn| self.reserved == Some(turn.seq))
+    /// Roll back the reservation for turn `seq` when its prompt write failed
+    /// (ma-sdk-state r6 item 1). The prompt never reached the child, so that
+    /// turn is still empty; remove it only when it is the back turn AND carries
+    /// `seq`, and clear `reserved` only when it names `seq`. Keying on the seq
+    /// means a rollback for an older/dropped reservation can never remove a
+    /// NEWER turn a concurrent send already began.
+    fn cancel_turn(&mut self, seq: u64) {
+        if self.outstanding.back().is_some_and(|turn| turn.seq == seq)
             && let Some(turn) = self.outstanding.pop_back()
         {
             for id in turn.open_workflows {
                 self.workflow_owner.remove(&id);
             }
         }
-        self.reserved = None;
+        if self.reserved == Some(seq) {
+            self.reserved = None;
+        }
     }
 
     /// Track a freshly-opened background workflow against the root turn the
@@ -899,6 +899,12 @@ impl Driver for ClaudePrintDriver {
         }
         match input {
             DriverInput::Prompt(prompt) => {
+                // ma-sdk-state r6 item 1: resolve ALL fallible prompt content
+                // (notably reading a staged image attachment) BEFORE opening the
+                // turn book or enqueuing its ticket. A `?` here must leave no
+                // reservation parked in the publication worker and no empty
+                // outstanding turn.
+                let content = prompt_content(&prompt.blocks)?;
                 // D-057 OA6 r3 item 5: never hold `live` across the write
                 // await. A child that stopped draining stdin blocks the pipe
                 // for as long as it likes; holding the process lock over that
@@ -931,6 +937,11 @@ impl Driver for ClaudePrintDriver {
                     let seq = mapper.begin_turn_reservation();
                     TurnReservation::shared(seq, prompt.native_client_message_id.clone())
                 };
+                // From here on an early return (a failed ticket enqueue) or a
+                // dropped future must cancel the ticket and roll the empty book
+                // back; the guard does it on drop, keyed to this turn's seq so a
+                // newer begin is never clobbered.
+                let guard = ReservationGuard::new(self.inner.clone(), reservation.clone());
                 let publisher = self.inner.publish.lock().await.clone();
                 if let Some(publisher) = publisher.as_ref()
                     && publisher
@@ -939,18 +950,15 @@ impl Driver for ClaudePrintDriver {
                         })
                         .is_err()
                 {
-                    // Publication worker gone (session closing): no start can
-                    // ever be emitted, so roll the empty book back and fail.
-                    reservation.cancel();
-                    let mut mapper = self.inner.mapper.lock().await;
-                    mapper.cancel_turn_reservation();
+                    // Publication worker gone (session closing): the guard rolls
+                    // the empty book back and unblocks any waiter.
                     return Err(DriverError::ControlUnavailable);
                 }
                 // test-stub only: record that this turn's ticket is in the
                 // publication queue (its book was opened just above).
                 #[cfg(feature = "test-stub")]
                 test_barrier::note_reserve_enqueued();
-                let write = writer.send_user(prompt_content(&prompt.blocks)?).await;
+                let write = writer.send_user(content).await;
                 match write {
                     Ok(()) => {
                         // test-stub only: deterministically park HERE (write
@@ -960,18 +968,16 @@ impl Driver for ClaudePrintDriver {
                         test_barrier::hold_write_commit().await;
                         // Unparks the worker at the ticket; it clears the
                         // reservation and emits turn_started in queue order.
-                        reservation.commit();
+                        guard.commit();
                         Ok(DriverAck::transport_written())
                     }
                     Err(error) => {
-                        // Cancel: the parked ticket resumes without a start and
-                        // no turn_started is ever emitted for the unwritten
-                        // prompt. Frames queued behind it flow unchanged and
-                        // map against the pre-opened (then removed) book, which
-                        // the next successful turn's FIFO ordering supersedes.
-                        reservation.cancel();
-                        let mut mapper = self.inner.mapper.lock().await;
-                        mapper.cancel_turn_reservation();
+                        // The guard's Drop cancels the parked ticket (no
+                        // turn_started is ever emitted for the unwritten prompt)
+                        // and rolls the empty book back, keyed to this seq.
+                        // Frames queued behind it flow unchanged and map against
+                        // the pre-opened (then removed) book, which the next
+                        // successful turn's FIFO ordering supersedes.
                         Err(map_wire(error))
                     }
                 }
@@ -1424,6 +1430,57 @@ impl TurnReservation {
         !self
             .start_emitted
             .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+/// Owns one turn's [`TurnReservation`] for the lifetime of a prompt send
+/// (ma-sdk-state r6 item 1). `commit` is called only on a successful write; if
+/// the future is dropped for ANY other reason — a failed ticket enqueue, a
+/// write error, an early `return`, or a panic — `Drop` cancels the ticket
+/// synchronously (a worker parked in `wait_for_commit` is released at once and
+/// no turn_started is emitted) and rolls the empty pre-opened book back, keyed
+/// to the reservation's seq so a NEWER concurrent turn is never touched.
+struct ReservationGuard {
+    inner: Arc<Inner>,
+    reservation: Arc<TurnReservation>,
+    committed: bool,
+}
+
+impl ReservationGuard {
+    fn new(inner: Arc<Inner>, reservation: Arc<TurnReservation>) -> Self {
+        Self {
+            inner,
+            reservation,
+            committed: false,
+        }
+    }
+
+    /// The write succeeded: keep the reservation (the worker emits the start);
+    /// the matching `Drop` is then a no-op.
+    fn commit(mut self) {
+        self.committed = true;
+        self.reservation.commit();
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Wake any parked worker BEFORE returning from drop so the publication
+        // pipeline cannot stay wedged.
+        self.reservation.cancel();
+        // The mapper lock is async, so run the seq-keyed rollback as a task.
+        // cancel_turn(seq) pops the book only if it is still the back turn, so
+        // a newer turn that already began is left intact.
+        let inner = self.inner.clone();
+        let seq = self.reservation.seq;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                inner.mapper.lock().await.cancel_turn_reservation(seq);
+            });
+        }
     }
 }
 
@@ -2712,9 +2769,9 @@ impl Mapper {
         self.turns.turn_committed(seq);
     }
 
-    /// Roll back the latest turn reservation when its write fails.
-    fn cancel_turn_reservation(&mut self) {
-        self.turns.cancel_latest_turn();
+    /// Roll back the reservation for `seq` when its write fails.
+    fn cancel_turn_reservation(&mut self, seq: u64) {
+        self.turns.cancel_turn(seq);
     }
 
     /// Build the turn_started observation WITHOUT touching the book — used
@@ -3474,9 +3531,13 @@ impl StdoutMapper {
         self.mapper.begin_turn_reservation();
     }
 
-    /// Roll back a [`Self::begin_turn`] when the prompt write fails.
+    /// Roll back the most recently opened turn when its prompt write fails
+    /// (replay/test helper). Seq-safe: it cancels exactly the current back.
     pub fn cancel_turn(&mut self) {
-        self.mapper.cancel_turn_reservation();
+        let seq = self.mapper.turns.outstanding.back().map(|turn| turn.seq);
+        if let Some(seq) = seq {
+            self.mapper.cancel_turn_reservation(seq);
+        }
     }
 
     /// Build the turn_started observation for an already-reserved turn.
@@ -5239,7 +5300,7 @@ mod turn_book_reserved_seq_tests {
 
         // A failed write for B must still be able to roll B back (back turn is
         // the reserved one).
-        book.cancel_latest_turn();
+        book.cancel_turn(b);
         // B removed; A still outstanding, reserved cleared.
         assert_eq!(book.reserved, None);
         assert!(book.outstanding.iter().any(|turn| turn.seq == a));

@@ -612,7 +612,8 @@ async fn explicit_file_at_the_hub_token_path_pins_and_blocks_regen() -> Result<(
         let minted = std::fs::read_to_string(&token_path)?;
         assert!(!minted.trim().is_empty(), "first start mints a token");
         assert_ne!(minted.trim(), OPERATOR_CODE);
-        // Rotation works while hub-owned.
+        // The hub-minted code logs in; it stays rotateable below until the
+        // operator pins an explicit source.
         login(hub.addr, minted.trim()).await?;
         hub.shutdown().await;
     }
@@ -646,6 +647,56 @@ async fn explicit_file_at_the_hub_token_path_pins_and_blocks_regen() -> Result<(
             rotated.is_err(),
             "restart {restart}: rotate-bootstrap must refuse the explicit precedence"
         );
+        hub.shutdown().await;
+    }
+
+    // c-bootstrap-dev r8 item 1 (pinning freezes issued-at): age the stamp
+    // past the TTL while the source still points at the Hub's own token file.
+    // An unchanged code is NOT revived (no mtime rule for the self file,
+    // content identical), and re-writing the SAME code doesn't help either.
+    let stamp_path = hub_data.join("bootstrap-issued-at");
+    std::fs::write(&stamp_path, EXPIRED_STAMP)?;
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            token_path.clone(),
+            OPERATOR_CODE,
+        ))
+        .await?;
+        assert_eq!(login_status(hub.addr, OPERATOR_CODE).await?, 401);
+        // The stamp is left exactly as the operator set it.
+        assert_eq!(std::fs::read_to_string(&stamp_path)?.trim(), EXPIRED_STAMP);
+        hub.shutdown().await;
+    }
+
+    // Recovery (1) documented in remuda-cli.md: write a DIFFERENT code to the
+    // same self-referential source — a genuine content change re-stamps.
+    const NEW_PINNED_CODE: &str = "operator-pinned-code-two-at-least-16-xx";
+    write_code_file(&token_path, NEW_PINNED_CODE)?;
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            token_path.clone(),
+            NEW_PINNED_CODE,
+        ))
+        .await?;
+        login(hub.addr, NEW_PINNED_CODE).await?;
+        assert_ne!(std::fs::read_to_string(&stamp_path)?.trim(), EXPIRED_STAMP);
+        hub.shutdown().await;
+    }
+
+    // Recovery (2): deleting the stamp with the code unchanged backfills it.
+    std::fs::write(&stamp_path, EXPIRED_STAMP)?;
+    std::fs::remove_file(&stamp_path)?;
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            token_path.clone(),
+            NEW_PINNED_CODE,
+        ))
+        .await?;
+        login(hub.addr, NEW_PINNED_CODE).await?;
+        assert!(stamp_path.is_file());
         hub.shutdown().await;
     }
 

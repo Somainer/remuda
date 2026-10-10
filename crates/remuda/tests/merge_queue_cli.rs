@@ -176,6 +176,9 @@ impl QueueRepo {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("TMPDIR", &self.tmp)
+            .env_remove("HUB_E2E_LISTEN")
+            .env_remove("HUB_E2E_WEB_PORT")
+            .env_remove("HUB_E2E_UPSTREAM_LISTEN")
             .env("REMUDA_MERGE_GATE_COMMAND", self.stub_path())
             .env("REMUDA_MERGE_BIN", env!("CARGO_BIN_EXE_remuda"))
             .env("REMUDA_TEST_GATE_TRACE", &self.trace);
@@ -519,6 +522,15 @@ fn queue_verifies_lane_two_on_main_plus_b1_and_lands_both() {
         .collect();
     assert!(hub_ports.contains(&"127.0.0.1:58980".to_owned()));
     assert!(hub_ports.contains(&"127.0.0.1:58990".to_owned()));
+    // Each lane also gets its own upstream: the default 58881 must never be
+    // shared by two gates in one queue.
+    let upstream_ports: Vec<String> = repo
+        .trace()
+        .iter()
+        .map(|event| event["upstreamListen"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(upstream_ports.contains(&"127.0.0.1:58981".to_owned()));
+    assert!(upstream_ports.contains(&"127.0.0.1:58991".to_owned()));
     // No merge pins linger after every branch has settled.
     let pins = git(&repo.root, &["for-each-ref", "refs/remuda/merge/"]);
     assert!(pins.is_empty(), "leftover merge pins: {pins}");

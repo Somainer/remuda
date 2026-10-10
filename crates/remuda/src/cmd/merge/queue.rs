@@ -947,7 +947,7 @@ fn spawn_verify(
         .arg("--e2e-lane")
         .arg(lane.to_string())
         .arg("--e2e-port-base")
-        .arg(args.e2e_port_base.to_string())
+        .arg(super::e2e_port_base(args).to_string())
         .arg("--e2e-lock")
         .arg(&lock_str)
         // The parent holds the repository lock for the whole queue; the lane

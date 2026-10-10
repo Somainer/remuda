@@ -32,6 +32,7 @@ with trace.open("a", encoding="utf-8") as output:
         "incremental": os.environ.get("CARGO_INCREMENTAL"),
         "hubListen": os.environ.get("HUB_E2E_LISTEN"),
         "webPort": os.environ.get("HUB_E2E_WEB_PORT"),
+        "upstreamListen": os.environ.get("HUB_E2E_UPSTREAM_LISTEN"),
     }) + "\n")
 
 if step == "cargo-test":

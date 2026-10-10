@@ -167,6 +167,9 @@ impl Repo {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("TMPDIR", &self.tmp)
+            .env_remove("HUB_E2E_LISTEN")
+            .env_remove("HUB_E2E_WEB_PORT")
+            .env_remove("HUB_E2E_UPSTREAM_LISTEN")
             .env("REMUDA_MERGE_GATE_COMMAND", &self.stub)
             .env("REMUDA_TEST_GATE_TRACE", &self.trace)
             // Merge must ignore the worker's inherited Cargo target.
@@ -773,6 +776,82 @@ fn gate_cannot_publish_a_tree_it_mutated() {
     assert_eq!(step(&report, "verify-tree")["status"], "failed");
     assert_eq!(repo.main(), repo.base);
     repo.assert_cleaned();
+}
+
+#[test]
+fn gate_e2e_ports_prefer_the_flag_and_otherwise_keep_inherited_env() {
+    fn port_trace(repo: &Repo, flags: &[&str], env: &[(&str, &str)]) -> Vec<(String, String, String)> {
+        let (output, report) = repo.merge(flags, env);
+        assert_exit(&output, &report, 0);
+        repo.trace()
+            .iter()
+            .map(|event| {
+                (
+                    event["hubListen"].as_str().unwrap().to_owned(),
+                    event["webPort"].as_str().unwrap().to_owned(),
+                    event["upstreamListen"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    // No flag, no env: the documented default block, including the upstream
+    // pair (previously the upstream default 58881 was never exported).
+    let repo = Repo::new();
+    commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let ports = port_trace(&repo, &["--gate", "--no-push"], &[]);
+    assert!(
+        ports
+            .iter()
+            .all(|(hub, web, upstream)| hub == "127.0.0.1:58980"
+                && web == "58989"
+                && upstream == "127.0.0.1:58981"),
+        "{ports:?}"
+    );
+
+    // No flag but inherited HUB_E2E_*: the merge keeps the inherited values
+    // instead of forcing its defaults.
+    let repo = Repo::new();
+    commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let ports = port_trace(
+        &repo,
+        &["--gate", "--no-push"],
+        &[
+            ("HUB_E2E_LISTEN", "127.0.0.1:59040"),
+            ("HUB_E2E_WEB_PORT", "59049"),
+            ("HUB_E2E_UPSTREAM_LISTEN", "127.0.0.1:59041"),
+        ],
+    );
+    assert!(
+        ports
+            .iter()
+            .all(|(hub, web, upstream)| hub == "127.0.0.1:59040"
+                && web == "59049"
+                && upstream == "127.0.0.1:59041"),
+        "{ports:?}"
+    );
+
+    // The explicit flag wins over every inherited value and derives the
+    // whole lane block from it.
+    let repo = Repo::new();
+    commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let ports = port_trace(
+        &repo,
+        &["--gate", "--no-push", "--e2e-port-base", "59100"],
+        &[
+            ("HUB_E2E_LISTEN", "127.0.0.1:59040"),
+            ("HUB_E2E_WEB_PORT", "59049"),
+            ("HUB_E2E_UPSTREAM_LISTEN", "127.0.0.1:59041"),
+        ],
+    );
+    assert!(
+        ports
+            .iter()
+            .all(|(hub, web, upstream)| hub == "127.0.0.1:59100"
+                && web == "59109"
+                && upstream == "127.0.0.1:59101"),
+        "{ports:?}"
+    );
 }
 
 #[test]

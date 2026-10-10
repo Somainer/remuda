@@ -554,10 +554,12 @@ impl GateRunTable {
 /// Hub converges even if this RPC reply is lost (the same dual verdict a
 /// finished run carries).
 fn canceled_before_run(registry: &GateRegistry, job_id: &str) -> GateRunResult {
+    let why = "canceled before the run registered";
     let result = GateRunResult {
         job_id: job_id.to_owned(),
         status: "canceled".into(),
-        reason: Some("canceled before the run registered".into()),
+        error: Some(why.to_owned()),
+        reason: Some(why.to_owned()),
         ..Default::default()
     };
     let _ = registry.events.send(GateEventParams {

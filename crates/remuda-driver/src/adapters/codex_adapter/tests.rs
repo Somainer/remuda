@@ -223,7 +223,7 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
 {"ordinal":2,"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
 {"ordinal":3,"type":"token_usage_record","payload":{"turn_id":"t1","response_id":"r1","usage":{"input_tokens":100,"cached_input_tokens":10,"cache_write_input_tokens":0,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120}}}
 {"ordinal":4,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":10,"cache_write_input_tokens":0,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120}}}}
-{"ordinal":5,"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}
+{"ordinal":5,"timestamp":"2026-09-13T18:21:45.380Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}
 "#;
     let mut adapter = CodexAdapter::new(AdapterHome {
         home: tempfile::tempdir().unwrap().path().to_path_buf(),
@@ -233,10 +233,7 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
     let observed = feed(&mut adapter, lines);
     let usages: Vec<_> = observed
         .iter()
-        .filter_map(|o| match &o.payload {
-            ObservationPayload::Usage(usage) => Some(usage),
-            _ => None,
-        })
+        .filter(|o| matches!(o.payload, ObservationPayload::Usage(_)))
         .collect();
     // c-usagefu (b): one per-response Message snapshot, then the end-of-turn
     // Turn snapshot and the cumulative Session snapshot.
@@ -249,14 +246,36 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
     // Turn and Session rows carry the per-turn / cumulative counters; the
     // per-request Message row is the context basket source.
     assert_eq!(usages[1].scope_id, "t1");
+    let turn = match &usages[1].payload {
+        ObservationPayload::Usage(usage) => usage,
+        _ => unreachable!(),
+    };
+    let session = match &usages[2].payload {
+        ObservationPayload::Usage(usage) => usage,
+        _ => unreachable!(),
+    };
+    // c-ctxusage r5 item 7: the Turn/Session rows carry the rollout record's
+    // own timestamp, so a byte-0 replay is historical evidence, not
+    // ingest-time throughput. The task_complete record stamps ...:45.380Z.
+    for observation in &usages[1..] {
+        let value = observation
+            .native_at
+            .as_ref()
+            .expect("usage carries the rollout record timestamp");
+        assert_eq!(
+            String::from(value.clone()),
+            "2026-09-13T18:21:45.380Z",
+            "native_at is the task_complete record time"
+        );
+    }
     // Both estimated; cumulative token_count did not double the tokens.
-    for payload in &usages {
+    for payload in [turn, session] {
         assert_eq!(payload.accounting, remuda_protocol::Accounting::Estimated);
     }
     // Total spans every bucket: 90 uncached input + 10 cache read + 20 output
     // (the same definition usage::tests locks in).
     assert_eq!(
-        usages[1].total_tokens,
+        session.total_tokens,
         remuda_protocol::Knowledge::Known {
             value: remuda_protocol::U64(120)
         }
@@ -314,4 +333,12 @@ fn a_newline_terminated_partial_line_is_held_until_complete() {
                 remuda_protocol::LifecyclePayload::Native(n)
                     if n.native_name == "task_started")
     )));
+}
+
+#[test]
+fn native_timestamp_parses_rollout_record_time() {
+    let value = remuda_driver::adapters::native_timestamp(Some("2026-09-13T18:21:45.380Z"));
+    assert!(value.is_some(), "rfc3339 ms parses");
+    let none = remuda_driver::adapters::native_timestamp(None);
+    assert!(none.is_none());
 }

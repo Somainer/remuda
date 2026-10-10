@@ -4194,6 +4194,7 @@ fn node_accepted(response: &Value, command_id: &str) -> bool {
         result.pointer("/command/state").and_then(Value::as_str),
         Some("accepted" | "settled")
     ) || result.get("accepted").and_then(Value::as_bool) == Some(true)
+        || result.get("accepted").and_then(Value::as_str).is_some()
 }
 
 fn schedule_create_settlement_watch(state: &AppState, command: &CommandRecord) {

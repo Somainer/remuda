@@ -1655,7 +1655,7 @@ async fn fake_node(
                     // prompt appends one full protocol usage observation (each
                     // position `-` = the channel was not reported, exercising the
                     // Hub rollup's unknown-not-zero rule), then ends the turn.
-                    if let Some(usage) = scripted_usage(prompt, append_n) {
+                    if let Some(mut usage) = scripted_usage(prompt, append_n) {
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_command_user(
                             &mut ws,
@@ -1666,15 +1666,32 @@ async fn fake_node(
                             command_id,
                         )
                         .await?;
-                        append_n = append_event(
-                            &mut ws,
-                            &mut frame_queue,
-                            &instance_id,
-                            append_n,
-                            "usage",
-                            usage,
-                        )
-                        .await?;
+                        // c-ctxusage r5 item 7: the Hub projection reads
+                        // nativeAt at the EVENT level (event.nativeAt), not
+                        // inside payload. Lift it so the sentinel is a live
+                        // observation that enters the rate window.
+                        let native_at =
+                            usage.as_object_mut().and_then(|obj| obj.remove("nativeAt"));
+                        if let Some(native_at) = native_at {
+                            append_n = append_full_event(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                json!({ "kind": "usage", "payload": usage, "nativeAt": native_at }),
+                            )
+                            .await?;
+                        } else {
+                            append_n = append_event(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                "usage",
+                                usage,
+                            )
+                            .await?;
+                        }
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -4928,6 +4945,9 @@ fn scripted_usage(prompt: &str, turn: u64) -> Option<Value> {
         "totalTokens": knowledge(total),
         "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
         "accounting": "estimated",
+        // c-ctxusage r5 item 7: the sentinel's usage is a live observation, so
+        // it carries a current nativeAt and enters the rate window.
+        "nativeAt": { "state": "known", "value": monotonic_effort_observed_at() },
         "nativeFieldsRef": null
     }))
 }

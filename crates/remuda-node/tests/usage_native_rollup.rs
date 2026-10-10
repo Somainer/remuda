@@ -2,6 +2,22 @@
 //! harness through the REAL Hub HTTP API emits usage from its transcript, so
 //! `GET /v1/instances` carries a non-null `usageRollup` (turns ≥ 1 and a
 //! context percentage). This is the native path — not the `usage:` sentinel.
+//!
+//! Why this does not use `crates/remuda-node/examples/native_hub_e2e.rs`
+//! (c-ctxusage r5 item 5a): that file is a standalone fixture BINARY
+//! (`fn main`, examples/native_hub_e2e.rs:36) — env-driven
+//! (`HUB_E2E_NODE_*` / `REMUDA_CLAUDE_*`), signal-driven lifecycle, host
+//! label `e2e-native-hooks` — designed to be spawned as a child process by
+//! the Playwright specs (see web/tests/e2e/promoted-claude.hub.spec.ts). It
+//! exposes no reusable library entry (examples are not linked into
+//! integration tests; its internals are not `pub`). This test composes the
+//! SAME production pieces the example composes at its lines 111-127
+//! (`NativeDriverConfig::{new,with_claude_binary,with_claude_native_home}`,
+//! `pty_hooks`/`promote_terminal_agents`/`relay_binary`,
+//! `compose(LocalDrivers::Native)`) in-process against the real Hub HTTP API
+//! and a real PTY/relay/fake-harness — which for a Rust test is the stronger
+//! harness (no WebSocket/signal/process wrapper). The Playwright-only path
+//! through the example binary is covered by ux-usage native-transcript spec.
 
 use remuda_hub::HubConfig;
 use remuda_node::{DevNode, DevServerConfig, NativeDriverConfig, WssConfig, WssLink};
@@ -99,13 +115,18 @@ const HOOKS_ENV: &str = "REMUDA_PTY_HOOKS";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
-    // Self-skip when the fake-harness trigger is missing instead of failing
-    // deep in the launch (c-ctxusage r4 item 7c).
-    let trigger = remuda_testing::ensure_workspace_bin("fake-harness");
-    if !trigger.is_file() {
-        eprintln!("skipping: fake-harness not built at {}", trigger.display());
+    // c-ctxusage r5 item 5a: a REAL self-skip. `ensure_workspace_bin` never
+    // returns missing — it builds or panics — so this checks the existing
+    // binary WITHOUT triggering a build and skips when the test was launched
+    // without the fixture compiled (e.g. `cargo test -p remuda-node --lib` on
+    // a host without the sidecar).
+    let trigger = remuda_testing::locate_workspace_bin("fake-harness");
+    let Some(trigger) = trigger.filter(|path| path.is_file()) else {
+        eprintln!(
+            "skipping: fake-harness sidecar is not built (build remuda-testing --bin fake-harness)"
+        );
         return;
-    }
+    };
     // agent_pty_kind reads REMUDA_PTY_CARRIER from the process env, so re-exec
     // under the native-carrier flags like the other shell-pty e2es.
     if std::env::var(RUN_MARKER).is_err() {
@@ -144,7 +165,9 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
 
     // The fake harness stands in for claude 2.1.x: it runs the one-turn
     // `ok.json` scenario and writes an assistant block carrying message.usage.
-    let source = remuda_testing::ensure_workspace_bin("fake-harness");
+    // `trigger` was located without building in the self-skip above; the
+    // re-exec child rebuilds it if the sidecar is stale.
+    let source = trigger;
     let dest = root.join("bin").join("claude");
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::fs::copy(&source, &dest).expect("copy fake claude");

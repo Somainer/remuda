@@ -192,11 +192,45 @@ fn later_blocks_of_one_message_survive_the_poll_between_records() {
                 && text == "tool:Bash"),
         "record B's tool_use must OPEN and CLOSE after the poll split: {after_sig:?}"
     );
+    // c-ctxusage r5 item 4: the ToolResult must carry the SAME node id as the
+    // closed Bash ToolCall (pairing proven by id, not just by the text).
+    let bash_call_id = after
+        .iter()
+        .find_map(|obs| match &obs.body {
+            ObservationPayload::ToolCall(call)
+                if call.tool_name
+                    == remuda_protocol::Knowledge::Known {
+                        value: "Bash".to_string(),
+                    }
+                    && call.mutation.operation == remuda_protocol::MutationOperation::Close =>
+            {
+                Some(call.tool_call_id.clone())
+            }
+            _ => None,
+        })
+        .expect("a closed Bash ToolCall node");
+    let paired_result = after
+        .iter()
+        .find(|obs| match &obs.body {
+            ObservationPayload::ToolResult(result) => {
+                result.tool_call_id.as_str() == bash_call_id.as_str()
+            }
+            _ => false,
+        })
+        .expect("a ToolResult paired with the Bash call node");
+    let blocks = match &paired_result.body {
+        ObservationPayload::ToolResult(result) => &result.blocks,
+        _ => unreachable!(),
+    };
     assert!(
-        after_sig
+        blocks
             .iter()
-            .any(|(kind, _, text)| *kind == ObservationKind::ToolResult && text == "hi"),
-        "the later tool_result must be mapped and pair with the call"
+            .filter_map(|block| match block {
+                remuda_protocol::ContentBlock::Text(block) => Some(block.text.clone()),
+                _ => None,
+            })
+            .any(|value| value == "hi"),
+        "the ToolResult on the Bash node id carries the tool's output: {blocks:?}"
     );
     assert_eq!(
         closed_texts(&after, "PLAN_TEXT"),

@@ -754,7 +754,8 @@ fn sum_turn_tokens_since(
     conn.query_row(
         "SELECT SUM(input_tokens), SUM(output_tokens)
          FROM usage_events
-         WHERE instance_id = ?1 AND scope = 'turn' AND observed_at >= ?2",
+         WHERE instance_id = ?1 AND scope = 'turn' AND observed_at >= ?2
+           AND observed_at_source = 'native'",
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -1201,7 +1202,7 @@ pub fn rollup_instance(
             SUM(CASE WHEN scope='turn' THEN cache_write_tokens END),
             COUNT(CASE WHEN scope='session' THEN 1 END),
             COUNT(*),
-            MAX(CASE WHEN scope='turn' THEN observed_at END)
+            MAX(CASE WHEN scope='turn' AND observed_at_source='native' THEN observed_at END)
          FROM usage_events WHERE instance_id = ?1",
         params![instance_id],
         |row| {
@@ -1346,6 +1347,8 @@ mod tests {
     use super::*;
     use crate::store::JournalRecord;
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
     fn usage_record(seq: i64, total: u64, cost: Option<&str>) -> JournalRecord {
         JournalRecord {
@@ -2835,9 +2838,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            rollup.tpm_in_60s,
+            rollup.tpm_in_60s, None,
+            "c-ctxusage r5 item 7: an ingest-fallback row is not current throughput; \
+             the real time is unknown until a native-timed observation repairs it"
+        );
+        assert_eq!(
+            rollup.session_input_tokens,
             Some(250),
-            "sanity: the ingest fallback counts inside the current window"
+            "totals still count ingest rows"
         );
 
         // Replay: identical counters, now with the real historical native time.
@@ -2919,7 +2927,7 @@ mod tests {
         let one_pass = |mapper: &mut TranscriptMapper,
                         conn: &Connection,
                         seq_start: i64|
-         -> (i64, usize, i64) {
+         -> (i64, usize, PerScopeCounters) {
             let mut emitted = 0usize;
             let mut seq = seq_start;
             for path in &paths {
@@ -2961,22 +2969,29 @@ mod tests {
                     seq += 1;
                 }
             }
-            let turn_rows: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM usage_events WHERE instance_id=?1 AND scope='turn'",
-                    params![instance],
-                    |r| r.get(0),
+            // Per-scope-id signature over ALL FOUR counters — a rewrite of
+            // cache_read/cache_write/output (c-ctxusage r5 item 4) can no
+            // longer slip through an input-only hash.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT scope_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                     FROM usage_events
+                     WHERE instance_id=?1 AND scope='turn'
+                     ORDER BY scope_id",
                 )
                 .unwrap();
-            let input_sum: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(input_tokens),0) FROM usage_events
-                         WHERE instance_id=?1 AND scope='turn'",
-                    params![instance],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            (seq, emitted, turn_rows * 1000 + input_sum)
+            let per_scope: BTreeMap<String, (i64, i64, i64, i64)> = stmt
+                .query_map(params![instance], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .unwrap()
+                .map(|row| {
+                    let (scope, input, output, cache_read, cache_write) = row.unwrap();
+                    (scope, (input, output, cache_read, cache_write))
+                })
+                .collect();
+            assert_eq!(per_scope.len(), 24, "exactly 24 durable turn rows");
+            (seq, emitted, per_scope)
         };
 
         let conn = Connection::open_in_memory().unwrap();
@@ -2985,9 +3000,17 @@ mod tests {
         let mut mapper = open_mapper();
         let (next_seq, emitted1, signature1) = one_pass(&mut mapper, &conn, 1);
         assert_eq!(
-            signature1 / 1000,
+            signature1.len(),
             24,
-            "pass 1 durably persists exactly 24 turn rows (emitted {emitted1} usage obs)"
+            "pass 1 durably persists 24 turn rows (emitted {emitted1} usage obs)"
+        );
+        // The durable counters equal the independently parsed LAST usage per
+        // message id from the raw fixture (c-ctxusage r5 item 4): all four
+        // buckets, every one of the 24 ids.
+        let expected = expected_usage_counters();
+        assert_eq!(
+            signature1, expected,
+            "pass 1 counters match the raw fixture per scope_id"
         );
 
         // Second fresh mapper pass: byte-0 re-hydration with its own seqs.
@@ -2995,7 +3018,7 @@ mod tests {
         let (_seq, emitted2, signature2) = one_pass(&mut mapper, &conn, next_seq);
         assert_eq!(
             signature2, signature1,
-            "pass 2 leaves the SAME 24 rows and counters (emitted {emitted2} obs)"
+            "pass 2 leaves the SAME 24 rows and four counters (emitted {emitted2} obs)"
         );
 
         // Every durable row is native-timestamped, never the 2030 ingest value.
@@ -3011,6 +3034,67 @@ mod tests {
             bad_times, 0,
             "nativeAt wins over the ingest fallback on replay"
         );
+    }
+
+    /// Durable counters per message id: (input, output, cacheRead, cacheWrite).
+    type PerScopeCounters = BTreeMap<String, (i64, i64, i64, i64)>;
+
+    /// Independently parse the raw 2.1.289 fixtures: last non-sidechain
+    /// assistant record per message id, with the 5m+1h cache-write split —
+    /// exactly the source of truth the driver test uses, duplicated here so the
+    /// hub's durable rows are compared against the raw file, not the mapper.
+    fn expected_usage_counters() -> BTreeMap<String, (i64, i64, i64, i64)> {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../remuda-journal/tests/fixtures/effort-21289");
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&fixture_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+            .collect();
+        paths.sort();
+        let mut expected: BTreeMap<String, (i64, i64, i64, i64)> = BTreeMap::new();
+        for path in paths {
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let Ok(record) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if record.get("type").and_then(Value::as_str) != Some("assistant")
+                    || record.get("isSidechain").and_then(Value::as_bool) == Some(true)
+                {
+                    continue;
+                }
+                let Some((id, usage)) = record
+                    .pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .zip(record.pointer("/message/usage"))
+                else {
+                    continue;
+                };
+                let get = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0);
+                let write = match (
+                    usage
+                        .pointer("/cache_creation/ephemeral_5m_input_tokens")
+                        .and_then(Value::as_i64),
+                    usage
+                        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+                        .and_then(Value::as_i64),
+                ) {
+                    (Some(a), Some(b)) => a + b,
+                    _ => get("cache_creation_input_tokens"),
+                };
+                expected.insert(
+                    id.to_owned(),
+                    (
+                        get("input_tokens"),
+                        get("output_tokens"),
+                        get("cache_read_input_tokens"),
+                        write,
+                    ),
+                );
+            }
+        }
+        expected
     }
 
     // --- c-ctxusage r5 item 3 ----------------------------------------------
@@ -3157,5 +3241,109 @@ mod tests {
             Some(1200),
             "scoped world ignores the legacy row; the small replay never clobbered 1000"
         );
+    }
+
+    /// r5 item 7: a bulk codex replay with NO native timestamps (ingest
+    /// fallback rows) must not be read as current throughput — an
+    /// hours-old rollout bound at t=now stays out of the 60 s window and has
+    /// no lastTurnAt; a later turn carrying a native timestamp then enters
+    /// the window normally.
+    #[test]
+    fn ingest_stamped_codex_replay_stays_out_of_rate_windows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Two turn rows stamped "now" as ingest fallback (project sets source
+        // to 'ingest' when no nativeAt is present).
+        let now = {
+            let t = time::OffsetDateTime::now_utc();
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second(),
+                t.millisecond()
+            )
+        };
+        let ingest_turn = |seq: i64, input: i64, output: i64| JournalRecord {
+            instance_id: "ins_r57".into(),
+            seq,
+            event_id: format!("evt7_{seq}"),
+            event: json!({
+                "kind": "usage",
+                "payload": {
+                    "scope": "turn",
+                    "mode": "snapshot",
+                    "scopeId": format!("ing-{seq}"),
+                    "metricRevision": "1",
+                    "inputTokens": { "state": "known", "value": input.to_string() },
+                    "outputTokens": { "state": "known", "value": output.to_string() },
+                    "cacheReadTokens": { "state": "known", "value": "0" },
+                    "cacheWriteTokens": { "state": "known", "value": "0" },
+                    "cost": { "state": "unknown", "reason": "u", "evidenceEventIds": [] },
+                    "accounting": "estimated"
+                }
+            }),
+            observed_at: now.clone(),
+        };
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project_usage_event(&ingest_turn(1, 100, 10), None, None).unwrap()
+            )
+            .unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project_usage_event(&ingest_turn(2, 200, 20), None, None).unwrap()
+            )
+            .unwrap()
+        );
+
+        let rollup = rollup_instance(&conn, "ins_r57", "codex", None)
+            .unwrap()
+            .unwrap();
+        // Totals still count; current windows and lastTurnAt do not.
+        assert_eq!(rollup.session_input_tokens, Some(300));
+        assert_eq!(rollup.session_output_tokens, Some(30));
+        assert_eq!(
+            rollup.tpm_in_60s, None,
+            "ingest replay is not current throughput"
+        );
+        assert_eq!(rollup.tpm_in_5m, None);
+        assert_eq!(
+            rollup.last_turn_at, None,
+            "no trustworthy lastTurnAt without native time"
+        );
+
+        // A later real turn with a native timestamp is window-eligible.
+        let native = scoped_record(
+            3,
+            "ins_r57",
+            "turn",
+            Some("real-1"),
+            1,
+            40,
+            4,
+            0,
+            0,
+            Some(&now), // scoped_record marks nativeAt -> source native
+        );
+        assert!(insert(&conn, &native));
+        let rollup = rollup_instance(&conn, "ins_r57", "codex", None)
+            .unwrap()
+            .unwrap();
+        // Only the native 40 is in-window; the ingest rows still count totals.
+        assert_eq!(
+            rollup.tpm_in_60s,
+            Some(40),
+            "only the native turn enters the window"
+        );
+        assert_eq!(rollup.tpm_out_60s, Some(4));
+        assert_eq!(rollup.session_input_tokens, Some(340));
+        assert_eq!(rollup.last_turn_at.as_deref(), Some(now.as_str()));
     }
 }

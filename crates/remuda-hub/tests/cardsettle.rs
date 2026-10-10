@@ -2254,11 +2254,20 @@ async fn same_epoch_hello_revives_swept_rows_for_every_mapped_lifecycle() -> Res
     Ok(())
 }
 
-/// r11 item 3: a /v1/follow follower receives the settlement frame for a
-/// card invalidated by a force DELETE (the delete broadcast now runs inside
-/// settlement_publish_lock, so the frame is ordered and never silently lost).
+/// r11 item 3 / r12 item 2: a /v1/follow follower receives the settlement
+/// frame for a card invalidated INSIDE the delete transaction (r10 item
+/// 4(d)), with the broadcast ordered under settlement_publish_lock (r11
+/// item 3).
+///
+/// The instance is swept to the host-contact-lost pseudo-terminal FIRST
+/// (mark_host_offline + expire_lost_hosts): the row reads `exited` but
+/// carries NO process-end evidence and its card is still pending. DELETE
+/// WITHOUT force therefore skips stop_before_delete (the chapter is not
+/// live), so the only settlement that can produce this frame is the delete
+/// transaction itself — a ready/force=1 delete would settle the card earlier
+/// in stop_before_delete and prove nothing about the delete broadcast.
 #[tokio::test]
-async fn follower_receives_the_settlement_frame_after_a_force_delete() -> Result<()> {
+async fn follower_receives_the_delete_transaction_settlement_frame_after_sweep() -> Result<()> {
     let r11_tmp = tempfile::tempdir()?;
     let hub = spawn(HubConfig::for_test(r11_tmp.path().join("data"))).await?;
     let addr = hub.addr;
@@ -2266,32 +2275,49 @@ async fn follower_receives_the_settlement_frame_after_a_force_delete() -> Result
     let enroll = enroll_token(addr, &cookie).await?;
     let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
     let (instance_id, interaction_id) =
-        seed_live_card(addr, &cookie, &node, &host_id, "r11 delete frame").await?;
+        seed_live_card(addr, &cookie, &node, &host_id, "r12 delete-tx frame").await?;
+    let store = hub.store().expect("in-process store exposed to tests");
 
-    // Follower subscribes before the delete.
-    let mut follow_req = format!("ws://{addr}/v1/follow").into_client_request()?;
-    follow_req.headers_mut().insert("Cookie", cookie.parse()?);
-    let follow_tcp = tokio::net::TcpStream::connect(addr).await?;
-    let (mut follow, _) = tokio_tungstenite::client_async(follow_req, follow_tcp).await?;
-    // Drain one frame so the pump is subscribed before the delete.
-    let _ = tokio::time::timeout(Duration::from_secs(5), follow.next())
-        .await
-        .ok();
+    // Contact loss past grace: pseudo-terminal row, card still pending, no
+    // settlement from the sweep.
+    store
+        .mark_host_offline(host_id.as_id().as_str().to_string())
+        .await?;
+    let (swept, sweep_settlement) = store.expire_lost_hosts(0).await?;
+    assert_eq!(swept, 1, "the row is marked host-contact-lost");
+    assert!(
+        sweep_settlement.interactions.is_empty(),
+        "the sweep itself must not settle the card"
+    );
+    let row = store
+        .get_instance(instance_id.clone())
+        .await?
+        .expect("swept row");
+    assert_eq!(row.lifecycle, "exited");
+    assert_eq!(row.last_error.as_deref(), Some("host-contact-lost"));
 
-    // Force delete without an explicit close settlement first — the card is
-    // settled INSIDE the delete transaction (r10 item 4(d)) and the frame is
-    // published under the publication lock (r11 item 3).
+    // Follower subscribes after the sweep but before the delete — the card is
+    // still pending, so the upcoming frame can only come from the delete. The
+    // sentinel connect-replay proves seeding+subscription (r12 item 5: no
+    // fixed 5 s drain).
+    let (mut follow, _sentinel) =
+        connect_follower_proven_seeded(addr, &cookie, &node, &host_id, "r12-delete").await?;
+
+    // Plain DELETE (no force): the swept row is already `exited`, so
+    // stop_before_delete never runs — the delete transaction settles the
+    // still-pending card before writing its tombstone and the handler
+    // broadcasts that settlement under the publication lock.
     let (status, body) = http(
         addr,
         "DELETE",
-        &format!("/v1/instances/{instance_id}?force=1"),
+        &format!("/v1/instances/{instance_id}"),
         &cookie,
         None,
     )
     .await?;
     assert!(
         status == 200 || status == 204,
-        "force delete: {status} {body}"
+        "plain delete of a swept exited row: {status} {body}"
     );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2317,7 +2343,7 @@ async fn follower_receives_the_settlement_frame_after_a_force_delete() -> Result
     }
     assert!(
         got,
-        "the follower received the delete transaction's settlement frame"
+        "the follower received the frame for the card settled INSIDE the delete transaction"
     );
 
     hub.shutdown().await;

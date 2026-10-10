@@ -2146,6 +2146,10 @@ struct Hydrator {
     mapper: TranscriptMapper,
     /// Launch-time observations (model snapshot) emitted on the first pump.
     pending: Vec<Observation>,
+    /// Test-only abort seam: when present next to the transcript, the first
+    /// blocking `collect_pump` parks (before tail.poll) until this file is
+    /// removed. `None` in production.
+    test_collect_gate: Option<PathBuf>,
 }
 
 impl Hydrator {
@@ -2193,10 +2197,16 @@ impl Hydrator {
         if let Some(bridge) = permission_bridge {
             mapper = mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
         }
+        // Test-only seam: gate file lives next to the transcript.
+        let test_collect_gate = {
+            let candidate = binding.path.with_file_name(".remuda-test-collect-gate");
+            candidate.exists().then_some(candidate)
+        };
         Some(Self {
             mapper,
             tail: binding.tail(),
             pending,
+            test_collect_gate,
         })
     }
 
@@ -2229,6 +2239,18 @@ impl Hydrator {
         parked: &PendingEmissions,
         notify: &Notify,
     ) -> std::io::Result<Vec<Observation>> {
+        // Test-only abort seam: park the first-bind blocking collect (before
+        // tail.poll) until the test removes the gate file. The collect has
+        // already taken the hydrator and set collect_in_flight, so close()
+        // deterministically aborts the promoter task inside the map.
+        if let Some(gate) = self.test_collect_gate.take() {
+            for _ in 0..120_000 {
+                if !gate.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         let launch = std::mem::take(&mut self.pending);
         let lines = self.tail.poll()?;
         // The mapper buffers an assistant run until something supersedes it, so
@@ -2323,6 +2345,24 @@ async fn finalize_hydrator(
     ctx: &PromoteCtx,
 ) {
     if slot_lock(slot).is_none() {
+        return;
+    }
+    // Test-only seam: a `.remuda-test-skip-coop-finalise` sibling makes the
+    // cooperative reading finalise a no-op, so the abort test exercises ONLY
+    // the FinaliseGuard (models close aborting past its bound).
+    let skip_coop = {
+        let guard = slot_lock(slot);
+        guard
+            .as_ref()
+            .map(|h| {
+                h.tail
+                    .path()
+                    .with_file_name(".remuda-test-skip-coop-finalise")
+                    .exists()
+            })
+            .unwrap_or(false)
+    };
+    if skip_coop {
         return;
     }
     let collected = blocking_collect(Arc::clone(slot), Arc::clone(in_flight), |hydrator| {

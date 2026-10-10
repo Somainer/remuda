@@ -3889,4 +3889,81 @@ describe("font reflow compensator", () => {
     expect(geo.top(), "the row's RO delivery double-counted the drift the streamed commit held").toBe(before + 40);
   });
 
+  // UO-6a round 8 item 1: the reflow anchor armed by a restore lives only
+  // until the reader moves. The clear must happen on the UNAMBIGUOUS input
+  // paths even when they never dispatch a scroll event (a clamped wheel, a
+  // programmatic navigation whose write is unchanged): otherwise a row growing
+  // ABOVE the stale saved anchor later counter-scrolls the view even though
+  // the reader already owns a different row.
+  it("r8 item 1: a wheel gesture with no scroll event retires the restore's reflow anchor", async () => {
+    const geo = installGeo(40);
+    renderRestored("insWheelClear", 5);
+    await settle(geo, "insWheelClear");
+    const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold");
+    expect(hold()).toBe("1");
+    // A genuine wheel that the harness does NOT turn into a scroll event
+    // (clamped / coalesced away in the browser): the gesture listener must
+    // retire the anchor without waiting for onScroll.
+    act(() => {
+      fireEvent.wheel(geo.scroller(), { deltaY: 120 });
+    });
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(hold(), "the wheel gesture left the restore reflow anchor armed").toBe("0");
+  });
+
+  it("r8 item 1: an unchanged programmatic navigation retires the anchor; a card between rows does not jump", async () => {
+    // Restore n_35 to sit 192px below the viewport top (saved offset 192 -> top
+    // 3264-192 = 3072 in a 60-row list): the topmost visible row is n_33, and
+    // n_34 sits BETWEEN n_33 and the saved n_35. Growing n_34 must NOT scroll
+    // — it is below the reader's topmost anchor.
+    const geo = installGeo(60);
+    const events = buildLongObservations({
+      instanceId: "insNavClear" as Id,
+      journalId: "obj_insNavClear" as Id,
+      hostId: "hst_1" as Id,
+      count: 60,
+    });
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insNavClear",
+      JSON.stringify({ anchorId: "obj_long_n_35", offset: 192, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/s/insNavClear"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insNavClear");
+    expect(geo.top()).toBe(3072);
+    const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold");
+    expect(hold()).toBe("1");
+    // Navigate to a hit that lands at the SAME scrollTop (n_33 base is exactly
+    // 3072): the write is unchanged and dispatches no scroll event, so only the
+    // synchronous non-restore clear retires the stale anchor.
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "prompt 33");
+    await user.keyboard("[Enter]");
+    expect(geo.top()).toBe(3072);
+    expect(hold(), "the unchanged navigation left the restore reflow anchor armed").toBe("0");
+    // Grow the card between the topmost reader row (n_33) and the old saved
+    // anchor (n_35). First report samples the generic anchor onto n_33; a
+    // second measurement pass then evaluates the hold.
+    await act(async () => {
+      geo.growById("obj_long_n_34", ROW + 40);
+    });
+    await act(async () => {
+      geo.fireMeasure("obj_long_n_33");
+      await geo.nextFrame();
+    });
+    expect(
+      geo.top(),
+      "the stale reflow anchor counter-scrolled a card the reader expanded below their anchor",
+    ).toBe(3072);
+  });
+
 });

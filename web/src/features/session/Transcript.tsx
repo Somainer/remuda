@@ -452,6 +452,13 @@ function TranscriptInner({
     const el = scrollerRef.current;
     if (el) el.setAttribute("data-restore-active", restoringRef.current ? "1" : "0");
   };
+  // The reflow-hold observability attribute is render-time on every scroll, but
+  // a gesture/navigation clear can happen with NO scroll event (a clamped wheel,
+  // an unchanged programmatic write): write it imperatively there too.
+  const setReflowHoldAttr = () => {
+    const el = scrollerRef.current;
+    if (el) el.setAttribute("data-reflow-hold", reflowAnchorRef.current ? "1" : "0");
+  };
   // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
   // click on a held transcript row posts exactly once.
   const steeringRef = useRef<Set<string>>(new Set());
@@ -590,6 +597,12 @@ function TranscriptInner({
         cancelLoadRestoreRef.current();
         restoreEchoRef.current = null;
         reflowOwnScrollRef.current = false;
+        // Intentional navigation (j/k, a search hit, 跳到最新) owns the place:
+        // retire the restore's reflow anchor synchronously — the write below
+        // can be clamped/unchanged and dispatch NO scroll event, so relying on
+        // onScroll would leave the stale anchor holding across the navigation.
+        reflowAnchorRef.current = null;
+        setReflowHoldAttr();
         el.scrollTop = top;
       }
       scrollTopRef.current = el.scrollTop;
@@ -676,6 +689,12 @@ function TranscriptInner({
       " ",
     ]);
     const gesture = () => {
+      // Any genuine input also retires the reflow anchor a restore left
+      // armed: it is allowed to live only until the reader moves. Clearing
+      // here (not only in onScroll) covers a gesture whose scroll is clamped
+      // or coalesced away so no scroll event ever fires.
+      reflowAnchorRef.current = null;
+      setReflowHoldAttr();
       cancelLoadRestoreRef.current();
       // Re-sample the reader anchor at the current position so subsequent
       // growth holds the post-gesture row (cancelLoadRestore nulls the stale
@@ -1001,10 +1020,13 @@ function TranscriptInner({
     }
     const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) < 1) return;
-    // Internal growth-anchor write, not a reader scroll: keep reflowAnchorRef.
-    ownScrollWrite(el.scrollTop + delta);
+    // Internal growth-anchor write, not a reader scroll or an intentional
+    // navigation: fromRestore marks it so its coalesced echo neither cancels
+    // an armed load-earlier restore nor retires the reflow anchor (and it
+    // must not run the non-restore branch's synchronous cancel).
+    programmaticScroll(el, el.scrollTop + delta, true);
     held.top = el.scrollTop;
-  }, [sampleReadingAnchor, ownScrollWrite]);
+  }, [sampleReadingAnchor, programmaticScroll]);
 
   // Stable per-row size reporter keyed by node id. The identity MUST stay
   // constant across parent re-renders (scroll fires setScrollTop on every

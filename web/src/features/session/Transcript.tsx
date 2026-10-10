@@ -499,6 +499,22 @@ function TranscriptInner({
     }
   }, [instanceId, loadingEarlier, canLoadEarlier, range.start]);
 
+  // Programmatic write made by the re-anchor machinery (a growth counter-scroll
+  // or a pending-restore correction). Browsers dispatch NO scroll event when a
+  // write leaves scrollTop unchanged (already at the target, or clamped), so
+  // arming reflowOwnScrollRef unconditionally would leave it latched: the
+  // reader's NEXT real scroll would then be mistaken for this own write and
+  // fail to retire reflowAnchorRef. Arm the latch ONLY when the write actually
+  // moved scrollTop (and therefore a coalesced scroll event really is coming).
+  const ownScrollWrite = useCallback((next: number) => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const before = el.scrollTop;
+    el.scrollTop = next;
+    reflowOwnScrollRef.current = el.scrollTop !== before;
+    scrollTopRef.current = el.scrollTop;
+  }, []);
+
   // Reading anchor: the first row in view, its offset from the scroller top,
   // and the scrollTop it was sampled at (on every scroll). A row above it that
   // grows after first paint (a late result, an image, a padTop re-estimate)
@@ -538,11 +554,9 @@ function TranscriptInner({
     const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) < 1) return;
     // Internal growth-anchor write, not a reader scroll: keep reflowAnchorRef.
-    reflowOwnScrollRef.current = true;
-    el.scrollTop += delta;
-    scrollTopRef.current = el.scrollTop;
+    ownScrollWrite(el.scrollTop + delta);
     held.top = el.scrollTop;
-  }, [sampleReadingAnchor]);
+  }, [sampleReadingAnchor, ownScrollWrite]);
 
   // Stable per-row size reporter keyed by node id. The identity MUST stay
   // constant across parent re-renders (scroll fires setScrollTop on every
@@ -597,10 +611,10 @@ function TranscriptInner({
     if (reanchor && selfDelta !== 0 && el) {
       // This write is the compensator's OWN re-anchor, not a reader scroll:
       // keep reflowAnchorRef across its coalesced scroll event (see the
-      // own-scroll flag consumed in onScroll).
-      reflowOwnScrollRef.current = true;
-      el.scrollTop += selfDelta;
-      scrollTopRef.current = el.scrollTop;
+      // own-scroll flag consumed in onScroll). The latch arms only if the
+      // write moves scrollTop (ownScrollWrite), so a clamped no-op cannot
+      // leave it stuck to swallow the reader's next real scroll.
+      ownScrollWrite(el.scrollTop + selfDelta);
       const held = readingAnchorRef.current;
       if (held) held.top = el.scrollTop;
       // Align the generic reading anchor with the post-correction restored row
@@ -639,7 +653,7 @@ function TranscriptInner({
       rowHeightsRef.current = next;
       setRowHeights(next);
     }
-  }, [holdReadingAnchor]);
+  }, [holdReadingAnchor, ownScrollWrite]);
 
   // Converge the unmeasured-row estimate on this visit's real average so
   // offsets outside the window (search hits, saved position) stop drifting.
@@ -810,9 +824,7 @@ function TranscriptInner({
         // finalizing at an unfinished position; finalize only at |delta| <= 2.
         if (reflowCorrected && Math.abs(delta) > 2) {
           // Own restore write: its scroll event must not retire reflowAnchorRef.
-          reflowOwnScrollRef.current = true;
-          el.scrollTop += delta;
-          scrollTopRef.current = el.scrollTop;
+          ownScrollWrite(el.scrollTop + delta);
           pending.tries += 1;
           return;
         }
@@ -821,17 +833,13 @@ function TranscriptInner({
           finalizeRestore();
           return;
         }
-        reflowOwnScrollRef.current = true;
-        el.scrollTop += delta;
-        scrollTopRef.current = el.scrollTop;
+        ownScrollWrite(el.scrollTop + delta);
       } else {
         const index = nodesRef.current.findIndex((n) => n.id === pending.anchorId);
         if (index >= 0) {
           const { offsets } = rowOffsets(nodesRef.current.length, sizesHold.current, estimateRef.current);
           const top = Math.round((offsets[index] ?? 0) + pending.offset);
-          reflowOwnScrollRef.current = true;
-          el.scrollTop = top;
-          scrollTopRef.current = top;
+          ownScrollWrite(top);
         }
       }
       pending.tries += 1;
@@ -849,7 +857,7 @@ function TranscriptInner({
       return;
     }
     pending.tries += 1;
-  }, [sizes, nodes, estimate, applyOffset, restoreProbe]);
+  }, [sizes, nodes, estimate, applyOffset, restoreProbe, ownScrollWrite]);
 
   // A commit that moves rows above the anchor (padTop re-estimated, a row
   // inserted above) holds the reader the same way a measured growth does. A
@@ -865,7 +873,11 @@ function TranscriptInner({
     const el = scrollerRef.current;
     if (!el || !pinRef.current) return;
     el.scrollTop = el.scrollHeight;
-    scrollTopRef.current = el.scrollHeight;
+    // Record the CLAMPED actual position, not scrollHeight: scrollTop is capped
+    // at scrollHeight - clientHeight, so persisting scrollHeight could save a
+    // top past the max and make the next restore estimate drift. Mirrors the
+    // size-commit re-pin effect below.
+    scrollTopRef.current = el.scrollTop;
   }, [nodes.length]);
 
   // A measured row height change (the web-font swap) re-pins the pinned

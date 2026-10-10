@@ -512,12 +512,69 @@ fn current_step(trace: &Arc<std::sync::Mutex<RunTrace>>) -> Option<String> {
         .clone()
 }
 
+/// How long a cancel-before-registration tombstone lingers. It only has to
+/// outlive the gap between the Hub's `gate.cancel` ack and the `gate.run`
+/// frame already serialized behind it on the carrier (Hub dispatch is
+/// between the claim commit and the send), but this is generous under load.
+/// A same-jobId run after the TTL is a fresh Hub dispatch that legitimately
+/// runs; the tombstone is also consumed on first hit.
+const CANCEL_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+
+/// Live runs and the short-lived cancel tombstones, behind ONE lock: the
+/// "is this job running?" check in `gate.cancel` and the "may this run
+/// register?" check in `gate.run` must be one atomic decision. Otherwise a
+/// cancel can land strictly between the run's lane-slot acquisition and its
+/// registration and be answered `ok:true` while the run still executes.
+pub(crate) struct GateRunTable {
+    /// jobId -> live run handle.
+    runs: BTreeMap<String, Arc<LiveRun>>,
+    /// jobId -> instant its `gate.cancel` was acked while no run was
+    /// registered. The matching `gate.run` answers `canceled` without
+    /// executing.
+    tombstones: BTreeMap<String, Instant>,
+}
+
+impl GateRunTable {
+    fn new() -> Self {
+        Self {
+            runs: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+        }
+    }
+
+    /// Drop tombstones older than [`CANCEL_TOMBSTONE_TTL`].
+    fn prune_tombstones(&mut self, now: Instant) {
+        self.tombstones
+            .retain(|_, at| now.duration_since(*at) < CANCEL_TOMBSTONE_TTL);
+    }
+}
+
+/// Build the verdict for a `gate.run` whose `gate.cancel` was acked before
+/// the run could register, and publish its terminal `finished` event so the
+/// Hub converges even if this RPC reply is lost (the same dual verdict a
+/// finished run carries).
+fn canceled_before_run(registry: &GateRegistry, job_id: &str) -> GateRunResult {
+    let result = GateRunResult {
+        job_id: job_id.to_owned(),
+        status: "canceled".into(),
+        reason: Some("canceled before the run registered".into()),
+        ..Default::default()
+    };
+    let _ = registry.events.send(GateEventParams {
+        job_id: job_id.to_owned(),
+        kind: GateEventKind::Finished {
+            result: Box::new(result.clone()),
+        },
+    });
+    result
+}
+
 /// Lane locks, running jobs and the per-Node event uplink.
 pub(crate) struct GateRegistry {
     /// laneId → one slot; a held slot rejects a second run (`lane-busy`).
     lanes: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
-    /// jobId → live run handle.
-    runs: Mutex<BTreeMap<String, Arc<LiveRun>>>,
+    /// Live runs plus cancel-before-registration tombstones (one lock).
+    runs: Mutex<GateRunTable>,
     events: tokio::sync::broadcast::Sender<GateEventParams>,
 }
 
@@ -526,7 +583,7 @@ impl GateRegistry {
         let (events, _) = tokio::sync::broadcast::channel(512);
         Self {
             lanes: Mutex::new(BTreeMap::new()),
-            runs: Mutex::new(BTreeMap::new()),
+            runs: Mutex::new(GateRunTable::new()),
             events,
         }
     }
@@ -575,14 +632,22 @@ impl DevNode {
             serde_json::from_value(params.clone()).map_err(|error| {
                 NodeError::InvalidRequest(format!("invalid gate.cancel params: {error}"))
             })?;
-        let runs = self.gate_registry().runs.lock().await;
-        if let Some(run) = runs.get(&request.job_id) {
+        let mut table = self.gate_registry().runs.lock().await;
+        if let Some(run) = table.runs.get(&request.job_id) {
             run.cancel.send(true).ok();
             if let Some(pgid) = *run.pgid.lock().unwrap_or_else(|poison| poison.into_inner()) {
                 kill_group(pgid);
             }
+        } else {
+            // The gate.run frame is still in flight (a cancel that overtook
+            // dispatch): tombstone the job so the run refuses instead of
+            // executing after its cancel was already acked. Atomic with the
+            // run's check-and-register below.
+            let now = Instant::now();
+            table.prune_tombstones(now);
+            table.tombstones.insert(request.job_id.clone(), now);
         }
-        drop(runs);
+        drop(table);
         Ok(serde_json::json!({ "ok": true, "jobId": request.job_id }))
     }
 
@@ -660,6 +725,19 @@ impl DevNode {
 
     async fn run_gate_typed(&self, request: GateRunParams) -> Result<GateRunResult, NodeError> {
         let registry = self.gate_registry();
+        // A gate.cancel that overtook dispatch and was acked while no run was
+        // registered left a tombstone. Check it before touching the lane so a
+        // canceled job never reports lane-busy; the decisive re-check below
+        // (atomically with registration) closes the cancel-during-acquire
+        // window.
+        let tombstoned = {
+            let mut table = registry.runs.lock().await;
+            table.prune_tombstones(Instant::now());
+            table.tombstones.remove(&request.job_id).is_some()
+        };
+        if tombstoned {
+            return Ok(canceled_before_run(registry, &request.job_id));
+        }
         // One running job per lane (Node-side backstop; the Hub queue is the
         // authority).
         let slot = {
@@ -687,21 +765,28 @@ impl DevNode {
             pgid: std::sync::Mutex::new(None),
         });
         {
-            let mut runs = registry.runs.lock().await;
-            if runs.contains_key(&request.job_id) {
+            let mut table = registry.runs.lock().await;
+            // A cancel that landed while this frame was acquiring the lane
+            // slot: the same atomic decision as cancel_gate's check.
+            if table.tombstones.remove(&request.job_id).is_some() {
+                drop(table);
+                drop(lane_guard);
+                return Ok(canceled_before_run(registry, &request.job_id));
+            }
+            if table.runs.contains_key(&request.job_id) {
                 return Err(NodeError::InvalidRequest(format!(
                     "gate job {} is already running",
                     request.job_id
                 )));
             }
-            runs.insert(request.job_id.clone(), live.clone());
+            table.runs.insert(request.job_id.clone(), live.clone());
         }
 
         let outcome = self.execute_gate(&request, live.clone(), cancel_rx).await;
 
         {
-            let mut runs = registry.runs.lock().await;
-            runs.remove(&request.job_id);
+            let mut table = registry.runs.lock().await;
+            table.runs.remove(&request.job_id);
         }
         drop(lane_guard);
 

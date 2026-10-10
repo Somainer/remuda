@@ -1439,7 +1439,21 @@ describe("font reflow compensator", () => {
     };
     const nextFrame = () =>
       new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-    return { scroller, readerScroll, growById, top: () => top, nextFrame, setTotal: (n: number) => (dynamicTotal = n) };
+    // Set scrollTop WITHOUT dispatching a scroll event: models a geometry the
+    // restore has not yet corrected (an estimate miss), with no reader input.
+    const quietTop = (value: number) => {
+      const max = Math.max(0, dynamicTotal * ROW - VIEW);
+      top = Math.max(0, Math.min(value, max));
+    };
+    return {
+      scroller,
+      readerScroll,
+      growById,
+      quietTop,
+      top: () => top,
+      nextFrame,
+      setTotal: (n: number) => (dynamicTotal = n),
+    };
   }
 
   /** Render a non-follow transcript restored to anchor node N (1-based) at 0 offset. */
@@ -1545,6 +1559,91 @@ describe("font reflow compensator", () => {
     });
     expect(geo.top(), "an armed mid-restore compensates an above-row growth").toBe(before + 40);
   });
+
+  it("item 3 mid (below-anchor growth): a mid-restore reflow must not finalize while the anchor is still off its saved offset", async () => {
+    // The growing row is strictly ABOVE the held restore anchor and the anchor
+    // is still 30px short of its saved offset when the font lands (the bounded
+    // long-journal mid arm: saved anchor is a burst row below the wrap block).
+    // The reflow counter-scroll holds the anchor across the above row's growth,
+    // but that MUST NOT finalize the restore at the unfinished spot. The pending
+    // offset correction has to run first; the restore finalizes only once the
+    // anchor actually reaches its saved offset.
+    const geo = installGeo(40);
+    let fontReady = false;
+    const fakeFonts = {
+      check: () => fontReady,
+      load: async () => [] as FontFace[],
+      ready: Promise.resolve({} as FontFaceSet),
+      status: "loaded" as FontFaceSet["status"],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+      onloading: null,
+      onloadingdone: null,
+      onloadingerror: null,
+    } as unknown as FontFaceSet;
+    Object.defineProperty(document, "fonts", { configurable: true, get: () => fakeFonts });
+    window.history.replaceState({}, "", "/s/insMidBelow?restoreProbe=1");
+    (window as unknown as { __fontSwapRestoreProbeArmed?: boolean }).__fontSwapRestoreProbeArmed = true;
+    const events = buildLongObservations({
+      instanceId: "insMidBelow" as Id,
+      journalId: "obj_insMidBelow" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    const SAVED_OFFSET = 60;
+    localStorage.setItem(
+      "runtime.reading.v1.insMidBelow",
+      JSON.stringify({ anchorId: "obj_long_n_5", offset: SAVED_OFFSET, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insMidBelow?restoreProbe=1"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const scrollerEl = () => screen.getByTestId("transcript-scroller");
+    const active = () => scrollerEl().getAttribute("data-restore-active");
+    const anchorOffset = () => {
+      const row = scrollerEl().querySelector<HTMLElement>('[data-anchor="obj_long_n_5"]');
+      if (!row) return NaN;
+      return row.getBoundingClientRect().top - scrollerEl().getBoundingClientRect().top;
+    };
+    const tick = () =>
+      act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        await Promise.resolve();
+      });
+    // Converge on the fallback face while the probe font stays held: the
+    // anchor reaches the saved offset but the restore stays armed.
+    for (let i = 0; i < 30; i += 1) await tick();
+    expect(active(), "the probe keeps the restore armed before release").toBe("1");
+    expect(Math.abs(anchorOffset() - SAVED_OFFSET)).toBeLessThanOrEqual(2);
+    // Release the held font at the same moment the anchor is 30px BELOW its
+    // saved offset (an estimate miss) and a row strictly above it grows.
+    fontReady = true;
+    await act(async () => {
+      geo.quietTop(geo.top() - 30);
+      expect(anchorOffset() - SAVED_OFFSET).toBeGreaterThan(2);
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    // The restore may not finalize while the anchor is still off: it is either
+    // still armed (correcting) or has already reached the saved offset.
+    expect(
+      active() === "1" || Math.abs(anchorOffset() - SAVED_OFFSET) <= 2,
+      "the reflow correction finalized the restore at an unfinished offset",
+    ).toBe(true);
+    // It then runs the pending offset correction and finalizes AT the saved
+    // offset — not 30px short of it (the pre-e6dc324d behaviour).
+    for (let i = 0; i < 30; i += 1) await tick();
+    expect(active(), "the restore finalizes once the saved offset is reached").toBe("0");
+    expect(
+      Math.abs(anchorOffset() - SAVED_OFFSET),
+      "mid-restore reflow finalized away from the saved offset",
+    ).toBeLessThanOrEqual(2);
+  });
+
 
   it("item 1: the restored row ITSELF grows -> its own top is held, no scroll jump", async () => {
     const geo = installGeo(40);

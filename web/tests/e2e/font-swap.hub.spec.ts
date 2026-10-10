@@ -964,6 +964,17 @@ test("a saved position in a bounded long journal survives a late monospace swap"
   await savedPositionSurvivesSwap(page, LONG_BURST, "late");
 });
 
+test("a saved position in a bounded long journal survives a monospace swap landing mid-restore", async ({ page }) => {
+  // The gap-16 park (longBurst>0) saves a burst row strictly BELOW the growing
+  // wrap block, so unlike the short mid arm (whose saved anchor IS the wrap
+  // row) a broken mid-restore re-anchor makes THIS anchor drift by the block's
+  // growth. This is the arm that proves the mid-restore correction, not merely
+  // the anchor row's own top.
+  test.setTimeout(240_000);
+  await savedPositionSurvivesSwap(page, LONG_BURST, "first");
+});
+
+
 test("a pinned transcript stays pinned through a late monospace swap", async ({ page }) => {
   test.setTimeout(120_000);
   await page.setViewportSize({ width: 390, height: 844 });

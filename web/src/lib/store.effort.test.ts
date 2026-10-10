@@ -95,7 +95,10 @@ async function startFollowing(
     instance,
     receive: (observation: Observation) => {
       delivered += 1;
-      deliver({ ...observation, seq: String(delivered), observedAt: tsFor(delivered) });
+      // Keep an explicit envelope observedAt (effort/lifecycle payloads share
+      // one host clock in production); only synthesize one when absent.
+      const observedAt = observation.observedAt ?? tsFor(delivered);
+      deliver({ ...observation, seq: String(delivered), observedAt });
     },
   };
   return ctx;
@@ -125,13 +128,13 @@ function effortEvent(seq: number, name: string, ultracode: boolean | null, sourc
   } as unknown as Observation;
 }
 
-function configureLifecycle(seq: number, status: string, instanceId = "x"): Observation {
+function configureLifecycle(seq: number, status: string, instanceId = "x", observedAt?: string): Observation {
   return {
     eventId: `evt_cfg_${seq}_${status}`,
     instanceId,
     journalId: "x",
     seq: String(seq),
-    observedAt: `2026-09-16T00:1${seq}:00.000Z`,
+    observedAt: observedAt ?? `2026-09-16T00:1${seq}:00.000Z`,
     kind: "lifecycle",
     source: { channel: "runtime" },
     payload: {
@@ -245,7 +248,9 @@ it("while queued the entry shows queued until a strictly newer read-back", async
   // leaves the level axis unproven.
   ctx.receive(effortEvent(1, "high", false, "slash", "2026-09-16T00:05:00.000Z"));
   await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
-  const lifecycle = configureLifecycle(3, "effort-queued:max");
+  // The queued edge is THIS request's own threshold (after the 00:05
+  // projection, before the 00:06 read-back).
+  const lifecycle = configureLifecycle(3, "effort-queued:max", "x", "2026-09-16T00:05:30.000Z");
   ctx.receive(lifecycle);
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
   // An older-than-threshold read-back must not settle a queued request.
@@ -268,6 +273,96 @@ it("a stale queued lifecycle for a replaced request is dropped (A→B race)", as
   const after = hubStore.effortPendingOf(ctx.instance.id);
   expect(after?.name).toBe("max");
   expect(after?.queued).toBe(false);
+});
+
+it("item 3: request A's read-back never settles B — queued threshold and the requested echo", async () => {
+  const ctx = await startFollowing("ab-readback", { state: "known", value: "working" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  // A switches to xhigh while the agent works.
+  await hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
+  ctx.receive(configureLifecycle(2, "effort-queued:xhigh", "x", "2026-10-08T12:00:01.000Z"));
+  // B replaces A before the idle point.
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  ctx.receive(configureLifecycle(3, "effort-queued:max", "x", "2026-10-08T12:00:03.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({ name: "max", queued: true });
+
+  // A's verdict lands at 12:00:02 — BEFORE B's own queued edge — and echoes
+  // A's axes. It updates the projection but must not settle B's indicator.
+  ctx.receive({
+    eventId: "evt_a_readback",
+    instanceId: "x",
+    journalId: "x",
+    seq: "4",
+    observedAt: "2026-10-08T12:00:02.000Z",
+    kind: "effort",
+    source: { channel: "transcript" },
+    payload: {
+      kind: "effort",
+      payload: {
+        requested: { name: "xhigh", ultracode: false },
+        effective: {
+          name: "xhigh",
+          ultracode: false,
+          source: "remuda",
+          observedAt: "2026-10-08T12:00:02.000Z",
+        },
+        raw: "xhigh",
+      },
+    },
+  } as unknown as Observation);
+  const pendingAfterA = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pendingAfterA?.name, "B keeps its own indicator through A's read-back").toBe("max");
+  expect(pendingAfterA?.levelSettled).not.toBe(true);
+
+  // B's own verdict (echoes B's axes, newer than B's queued edge) settles.
+  ctx.receive({
+    eventId: "evt_b_readback",
+    instanceId: "x",
+    journalId: "x",
+    seq: "5",
+    observedAt: "2026-10-08T12:00:04.000Z",
+    kind: "effort",
+    source: { channel: "transcript" },
+    payload: {
+      kind: "effort",
+      payload: {
+        requested: { name: "max", ultracode: false },
+        effective: {
+          name: "max",
+          ultracode: false,
+          source: "remuda",
+          observedAt: "2026-10-08T12:00:04.000Z",
+        },
+        raw: "max",
+      },
+    },
+  } as unknown as Observation);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("item 3: A's degraded LEVEL word never rolls back B's in-flight ultracode request", async () => {
+  const ctx = await startFollowing("ab-degrade-flag", { state: "known", value: "working" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const toast = vi.spyOn(hubStore, "toast");
+
+  // A: plain xhigh while working.
+  await hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
+  ctx.receive(configureLifecycle(2, "effort-queued:xhigh", "x", "2026-10-08T12:01:01.000Z"));
+  // B: flip the switch on at xhigh before A's verdict arrives.
+  await hubStore.setUltracode(ctx.instance.id, true);
+  ctx.receive(configureLifecycle(3, "effort-queued:ultracode on", "x", "2026-10-08T12:01:03.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({ name: "xhigh", ultracode: true });
+
+  // A's late level degradation names xhigh — the old flag-ignoring matcher
+  // treated it as B's verdict and cleared/reverted B. It must be dropped:
+  // a level word cannot name a flag-on request.
+  ctx.receive(configureLifecycle(4, "effort-degraded:xhigh:dialog-kept", "x", "2026-10-08T12:01:04.000Z"));
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending, "B's 切换中 indicator survives A's degraded verdict").not.toBeNull();
+  expect(pending).toMatchObject({ name: "xhigh", ultracode: true });
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({ name: "xhigh", ultracode: true });
+  expect(toast, "no refusal toast for a verdict that belongs to A").not.toHaveBeenCalled();
 });
 
 it("a rejected switch reverts and records the model-scoped refusal", async () => {

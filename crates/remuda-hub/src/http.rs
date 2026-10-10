@@ -541,16 +541,79 @@ pub async fn delete_instance(
         .await?
         .ok_or(HubError::NotFound)?;
     let force = query.force == Some(1);
-    let live = !matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed");
-
-    if live {
+    let chapter_is_live = |lifecycle: &str| !matches!(lifecycle, "exited" | "failed" | "closed");
+    // ma-lineage r6/r7 items 1-2: one side-effect-free pre-check decides
+    // everything the delete touches — whether the chapter is deletable at all
+    // (a closed predecessor chapter is not), and EVERY chapter row a
+    // whole-lineage delete would remove with host/lifecycle/task. No stop,
+    // lease return, purge or audit may run before this gate; the store
+    // transaction re-checks the same facts as a backstop.
+    let resolve_plan = || state.store.deletion_plan(&instance_id);
+    let mut chapters = match resolve_plan().await.map_err(map_store)? {
+        crate::store::DeletionScope::NonCurrent => {
+            return Err(HubError::Conflict(format!(
+                "instance {instance_id} is a closed predecessor chapter; only the lineage's current \
+                 chapter can be deleted (its successors resolve ownership through it)"
+            )));
+        }
+        crate::store::DeletionScope::Plain(chapter) => vec![chapter],
+        crate::store::DeletionScope::Current(chapters) => chapters,
+    };
+    let live: Vec<&crate::store::DeleteChapter> = chapters
+        .iter()
+        .filter(|chapter| chapter_is_live(&chapter.lifecycle))
+        .collect();
+    if !live.is_empty() {
+        // `?force=1` stops the ADDRESSED chapter only. When a WHOLE lineage is
+        // being deleted and some OTHER chapter (typically a predecessor whose
+        // exit never arrived after the continuation close) is still live, the
+        // request refuses here — BEFORE the addressed chapter is stopped and
+        // before any lease return, purge or audit (ma-lineage r7 item 1). The
+        // caller must settle every chapter first; the store transaction
+        // re-checks as a backstop and returns the same 409.
+        let only_addressed_live = live.len() == 1 && live[0].instance_id == instance_id;
         if !force {
             return Err(HubError::Conflict(format!(
                 "instance is {}; stop it first or retry with ?force=1",
                 instance.lifecycle
             )));
         }
+        if !only_addressed_live {
+            let offenders: Vec<String> = live
+                .iter()
+                .filter(|chapter| chapter.instance_id != instance_id)
+                .map(|chapter| format!("{} ({})", chapter.instance_id, chapter.lifecycle))
+                .collect();
+            return Err(HubError::Conflict(format!(
+                "refusing to delete the lineage: chapter(s) still live: {}; \
+                 ?force=1 only stops the addressed chapter — stop every chapter first",
+                offenders.join(", ")
+            )));
+        }
         stop_before_delete(&state, &instance).await?;
+        // The close can be ignored by a gone/closed link, so re-plan and
+        // refuse with 409 BEFORE any lease return, purge or audit rather than
+        // discovering a live chapter inside the delete transaction after the
+        // side effects ran.
+        chapters = match resolve_plan().await.map_err(map_store)? {
+            crate::store::DeletionScope::NonCurrent => {
+                return Err(HubError::Conflict(format!(
+                    "instance {instance_id} is a closed predecessor chapter; only the lineage's \
+                     current chapter can be deleted"
+                )));
+            }
+            crate::store::DeletionScope::Plain(chapter) => vec![chapter],
+            crate::store::DeletionScope::Current(chapters) => chapters,
+        };
+        if let Some(still_live) = chapters
+            .iter()
+            .find(|chapter| chapter_is_live(&chapter.lifecycle))
+        {
+            return Err(HubError::Conflict(format!(
+                "chapter {} is still {} after the stop; refusing to delete the lineage",
+                still_live.instance_id, still_live.lifecycle
+            )));
+        }
     }
 
     // t-pool: a deleted session must not leave its worktree lease pinned.
@@ -559,12 +622,20 @@ pub async fn delete_instance(
     // lease this task holds on the host before any Node reclaim. Pool slots
     // park warm; reuse dirs are untouched. Best effort like the purge below —
     // an offline Node reconciles on reconnect, and the delete transaction
-    // clears holder_instance_id regardless.
+    // clears holder_instance_id regardless. Every chapter of the lineage
+    // copied the task, so walk each (host, task) pair exactly once.
     let mut lease_returns = Vec::new();
-    if let Some(task_id) = instance.task_id.as_deref() {
+    let mut lease_keys_seen = std::collections::HashSet::new();
+    for chapter in &chapters {
+        let Some(task_id) = chapter.task_id.as_deref() else {
+            continue;
+        };
+        if !lease_keys_seen.insert((chapter.host_id.clone(), task_id.to_owned())) {
+            continue;
+        }
         let held = state
             .store
-            .active_worktree_leases_for_task(instance.host_id.clone(), task_id.to_string())
+            .active_worktree_leases_for_task(chapter.host_id.clone(), task_id.to_string())
             .await
             .map_err(map_store)?;
         for lease in held {
@@ -622,51 +693,78 @@ pub async fn delete_instance(
         }
     }
 
-    // Ask the Node to drop its own copy first. A Node that is offline or has
-    // never heard of the instance must not block the delete: the Hub row is
-    // what the user asked to remove, and the Node reconciles on reconnect.
-    let purge = match state
-        .nodes
-        .call(
-            &instance.host_id,
-            "instance.purge",
-            json!({ "instanceId": instance_id }),
-            // The Node waits for a just-closed driver to finish exiting before
-            // it can remove the directory, so allow more than an RPC round trip.
-            Duration::from_secs(10),
-        )
-        .await
-    {
-        Ok(Some(response)) if response.get("error").is_some() => {
-            tracing::warn!(
-                %instance_id,
-                host_id = %instance.host_id,
-                response = %response,
-                "node rejected instance.purge; deleting the hub record anyway"
-            );
-            "node-rejected"
-        }
-        Ok(Some(_)) => "purged",
-        Ok(None) => {
-            tracing::info!(
-                %instance_id,
-                host_id = %instance.host_id,
-                "node offline at delete; its instance directory is purged on reconnect"
-            );
-            "node-offline"
-        }
-        Err(error) => {
-            tracing::warn!(
-                %instance_id,
-                host_id = %instance.host_id,
-                %error,
-                "instance.purge failed; deleting the hub record anyway"
-            );
-            "purge-failed"
-        }
-    };
+    // Ask EVERY chapter's Node to drop its own copy (ma-lineage r7 item 2):
+    // the store transaction removes every chapter row, so purging only the
+    // addressed/current one would orphan its predecessors' data directories
+    // for good. A Node that is offline or has never heard of the instance
+    // must not block the delete: the Hub row is what the user asked to
+    // remove, and the Node reconciles on reconnect.
+    let mut purge_outcomes = serde_json::Map::new();
+    for chapter in &chapters {
+        let outcome = match state
+            .nodes
+            .call(
+                &chapter.host_id,
+                "instance.purge",
+                json!({ "instanceId": chapter.instance_id }),
+                // The Node waits for a just-closed driver to finish exiting
+                // before it can remove the directory, so allow more than an
+                // RPC round trip.
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            Ok(Some(response)) if response.get("error").is_some() => {
+                tracing::warn!(
+                    instance_id = %chapter.instance_id,
+                    host_id = %chapter.host_id,
+                    response = %response,
+                    "node rejected instance.purge; deleting the hub record anyway"
+                );
+                "node-rejected"
+            }
+            Ok(Some(_)) => "purged",
+            Ok(None) => {
+                tracing::info!(
+                    instance_id = %chapter.instance_id,
+                    host_id = %chapter.host_id,
+                    "node offline at delete; its instance directory is purged on reconnect"
+                );
+                "node-offline"
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    instance_id = %chapter.instance_id,
+                    host_id = %chapter.host_id,
+                    "instance.purge failed; deleting the hub record anyway"
+                );
+                "purge-failed"
+            }
+        };
+        purge_outcomes.insert(chapter.instance_id.clone(), json!(outcome));
+    }
+    // Backwards-compatible scalar for the addressed chapter.
+    let purge = purge_outcomes
+        .get(&instance_id)
+        .and_then(Value::as_str)
+        .unwrap_or("purged")
+        .to_string();
 
     // The audit row outlives the journal it describes, so write it first.
+    // ma-lineage r7 item 2: record EVERY deleted chapter, not only the
+    // addressed one — the audit must account for all rows the transaction
+    // removes.
+    let chapter_details: Vec<Value> = chapters
+        .iter()
+        .map(|chapter| {
+            json!({
+                "instanceId": chapter.instance_id,
+                "hostId": chapter.host_id,
+                "lifecycle": chapter.lifecycle,
+            })
+        })
+        .collect();
     state
         .store
         .append_audit(
@@ -678,6 +776,9 @@ pub async fn delete_instance(
                 "lifecycle": instance.lifecycle,
                 "forced": force,
                 "nodePurge": purge,
+                "lineageId": instance.lineage_id,
+                "chapters": chapter_details,
+                "chapterPurges": Value::Object(purge_outcomes.clone()),
             }),
         )
         .await
@@ -691,11 +792,19 @@ pub async fn delete_instance(
     if !deleted {
         return Err(HubError::NotFound);
     }
-    tracing::info!(%instance_id, device_id = %device.id, forced = force, "instance deleted");
+    tracing::info!(
+        %instance_id,
+        device_id = %device.id,
+        forced = force,
+        chapters = chapters.len(),
+        "instance lineage deleted"
+    );
     Ok(Json(json!({
         "deleted": true,
         "instanceId": instance_id,
         "nodePurge": purge,
+        "chapterPurges": Value::Object(purge_outcomes),
+        "chapterIds": chapters.iter().map(|chapter| json!(chapter.instance_id)).collect::<Vec<_>>(),
         "leaseReturns": lease_returns,
     })))
 }
@@ -1921,36 +2030,33 @@ async fn resume_lineage(
         .get_instance_read(lineage.current_instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
-    // ma-lineage round 3 item 4 + round 5 item 2: the owner may address an
-    // OLDER chapter.
+    // ma-lineage rounds 3-6: decide whether to replay the current chapter or
+    // continue it.
     //
-    // * If the lineage's CURRENT chapter is still LIVE (requested/starting/
-    //   running), the addressed chapter's continuation already happened —
-    //   resolve that idempotent replay here, before any launch validation, and
-    //   never mint a fourth chapter for a live one.
-    // * If the CURRENT chapter has itself ENDED with process-end evidence, a
-    //   replay would hand back a dead lineage with no new chapter. Instead
-    //   retarget the continuation at the current chapter so the transactional
-    //   flow below fences it and mints the next one (Z from ended Y), no
-    //   matter which older chapter (X) the client happened to address.
-    if addressed.instance_id != current.instance_id {
-        if state
-            .store
-            .instance_has_process_end_evidence(&current)
-            .await?
-        {
-            // Retarget at the current chapter; `current` is still needed below
-            // for host id / predecessor bookkeeping.
-            addressed = current.clone();
-        } else {
-            return Ok(Json(json!({
-                "instance": current,
-                "hostId": current.host_id,
-                "mode": mode.as_str(),
-                "replayed": true
-            })));
-        }
+    // * Replay (idempotent, no new chapter) only while the lineage's CURRENT
+    //   chapter is genuinely LIVE (requested/starting/running) AND the owner
+    //   addressed an older chapter (the current chapter already represents
+    //   that continuation).
+    // * Otherwise continue the current chapter into a NEW one:
+    //   - the current chapter has process-end evidence (r5 item 2), OR
+    //   - it is host-lost / ambiguous-failed with NO end evidence (r6 item 4):
+    //     the process may still be alive, so continuation must run and the
+    //     post-commit close reaches it; a replay would strand the live process
+    //     forever and never close it.
+    //   - the owner addressed the current chapter itself (normal resume).
+    if addressed.instance_id != current.instance_id
+        && crate::store::current_chapter_is_live(&current)
+    {
+        return Ok(Json(json!({
+            "instance": current,
+            "hostId": current.host_id,
+            "mode": mode.as_str(),
+            "replayed": true
+        })));
     }
+    // Continue the current chapter (retarget when an older one was
+    // addressed); `current` is still needed below for host id / bookkeeping.
+    addressed = current.clone();
     let host = state
         .store
         .get_host(current.host_id.clone())
@@ -2018,8 +2124,11 @@ async fn resume_lineage(
             let mut spec = current.spec_for_resume();
             if let Some(object) = spec.as_object_mut() {
                 // A continuation keeps the same carrier (claude-sdk resumes as
-                // claude-sdk; ResumeMode no longer downgrades it).
-                object.insert("driver".into(), json!(current.driver));
+                // claude-sdk; ma-lineage r6 item 5: honour the requested resume
+                // mode's driver when it differs, rather than forcing the
+                // structured/SDK driver for a {mode:"terminal"} continuation).
+                let driver = mode.driver(&current.driver);
+                object.insert("driver".into(), json!(driver));
                 object.insert("resumeSessionId".into(), json!(session_id));
                 object.insert("resumedFrom".into(), json!(current.instance_id));
                 object.insert("parentInstanceId".into(), json!(current.parent_instance_id));
@@ -2263,13 +2372,34 @@ pub async fn get_lineage(
     } else if let Some(current) = &current {
         let host_live = state.nodes.kind_of(&current.host_id).await.is_some();
         let chapter_running = matches!(current.lifecycle.as_str(), "ready" | "running");
+        // ma-lineage r6 item 5: a terminal chapter WITHOUT process-end
+        // evidence (host-lost contact loss / ambiguous failed) is still a
+        // possibly-alive process, so when its host is down it derives
+        // host-offline too — not the stored `starting`/exited state.
+        let chapter_ambiguously_terminal =
+            matches!(current.lifecycle.as_str(), "exited" | "failed")
+                && !state
+                    .store
+                    .instance_has_process_end_evidence(current)
+                    .await
+                    .unwrap_or(false);
         lineage_state = if chapter_running && host_live {
             "running".into()
-        } else if chapter_running {
-            // D-057 §5 derived state: the chapter was running but its host
-            // link is gone. It is not `starting` — the process may be alive
-            // (D-019); report it truthfully as running with an offline host.
-            "host-offline".into()
+        } else if chapter_running || chapter_ambiguously_terminal {
+            if host_live {
+                // Running with a live link; an ambiguous terminal on a live
+                // link is being reconciled/continued — show starting.
+                if chapter_running {
+                    "running".into()
+                } else {
+                    "starting".into()
+                }
+            } else {
+                // The chapter was/possibly-is running but its host link is
+                // gone. It is not a clean terminal — the process may be alive
+                // (D-019); report it truthfully as host-offline.
+                "host-offline".into()
+            }
         } else {
             "starting".into()
         };

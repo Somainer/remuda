@@ -2389,7 +2389,7 @@ export interface components {
             /** @description Why this chapter exists; null on the first chapter. */
             chapterCause?: string | null;
             createdAt: string;
-            /** @description Last update once the chapter reached an ended lifecycle (exited/failed/closed); null while live. */
+            /** @description Timestamp of the chapter's process-end evidence (the observedAt of the classified end event or a by-construction scheduler end), stamped once and immutable; null while live or when no end evidence is recorded (host loss and ambiguous legacy failures leave it null). */
             endedAt?: string | null;
             /** @description When authority moved to the successor; null while current. */
             fencedAt?: string | null;

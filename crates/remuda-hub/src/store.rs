@@ -12,7 +12,7 @@
 use crate::config::{new_id, now_rfc3339};
 use crate::provider_models::{self, ProviderModel};
 use remuda_protocol::SettlementOutcome;
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -229,6 +229,61 @@ pub struct Store {
     /// Test-only seam: arm a fence applied at the top of the NEXT
     /// `mutate_task` writer job only (task bind post-lease commit race).
     test_fence_before_task_mutate: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Delete one chapter's rows and write its interaction tombstones /
+/// deleted-instance marker. Caller owns the transaction and chapter-lifecycle
+/// precondition.
+fn delete_instance_rows(tx: &Transaction, instance_id: &str) -> Result<(), StoreError> {
+    // c-cardsettle r2 item 2: retain the terminal state of this instance's
+    // interactions before their rows are deleted, so a late answer after the
+    // delete gets the state-derived rejection instead of fanning out.
+    tx.execute(
+        "INSERT OR IGNORE INTO interaction_tombstones
+            (id, instance_id, host_id, state, reason, created_at, updated_at)
+         SELECT id, instance_id, host_id, state,
+                COALESCE(
+                    json_extract(payload_json, '$.payload.reasonCode'),
+                    json_extract(payload_json,
+                        '$.payload.entity.resolution.value.reason'),
+                    json_extract(payload_json,
+                        '$.payload.interaction.resolution.value.reason'),
+                    'generation-ended'),
+                created_at, updated_at
+         FROM interactions WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    tx.execute(
+        "DELETE FROM journal WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    tx.execute(
+        "DELETE FROM commands WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    tx.execute(
+        "DELETE FROM interactions WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    tx.execute(
+        "DELETE FROM fleet_members WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    // t-pool: a deleted instance must not keep holding an attach lock.
+    tx.execute(
+        "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
+         WHERE holder_instance_id = ?1",
+        params![instance_id, now_rfc3339()],
+    )?;
+    // Tombstone: a Node command still draining keeps appending for this id;
+    // ensure_instance must not recreate it.
+    tx.execute(
+        "INSERT OR REPLACE INTO deleted_instances (instance_id, deleted_at)
+         VALUES (?1, ?2)",
+        params![instance_id, now_rfc3339()],
+    )?;
+    tx.execute("DELETE FROM instances WHERE id = ?1", params![instance_id])?;
+    Ok(())
 }
 
 /// Result of presenting a Node enroll or host token.
@@ -769,6 +824,31 @@ pub struct LineageChapter {
     /// When authority moved to the successor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fenced_at: Option<String>,
+}
+
+/// One chapter [`Store::deletion_plan`] reports: what a delete would remove,
+/// where its Node data lives, the lifecycle the pre-check must gate on, and
+/// the task whose worktree leases the handler must return.
+#[derive(Clone, Debug)]
+pub struct DeleteChapter {
+    pub instance_id: String,
+    pub host_id: String,
+    pub lifecycle: String,
+    pub task_id: Option<String>,
+}
+
+/// The outcome of the HTTP delete handler's side-effect-free pre-check
+/// (ma-lineage r7 items 1-2).
+#[derive(Clone, Debug)]
+pub enum DeletionScope {
+    /// A plain instance with no lineage row: the sole deletable row.
+    Plain(DeleteChapter),
+    /// A closed predecessor chapter: never deletable; its successors resolve
+    /// ownership through the row.
+    NonCurrent,
+    /// A lineage's CURRENT chapter: deleting it removes EVERY chapter listed
+    /// (plus the lineage row) in one transaction.
+    Current(Vec<DeleteChapter>),
 }
 
 /// Raw `lineages` columns, in SELECT order.
@@ -2818,10 +2898,19 @@ impl Store {
             // Find the rows this sweep is about to end so their pending
             // interactions are invalidated in the SAME transaction
             // (c-cardsettle).
+            //
+            // ma-lineage r6 item 3(c): ONLY a chapter that actually reached a
+            // LIVE lifecycle may become host-lost. `requested` rows belong to
+            // expire_stale_requested (they keep their attested
+            // create-never-acknowledged marker and fresh-recovery path), and a
+            // terminal `failed` row (an attested launch failure) is left alone
+            // — rewriting either to exited/host-lost would destroy the
+            // evidence and block the seat and fresh recovery forever.
             let lost: Vec<String> = {
                 let mut stmt = tx.prepare(
                     "SELECT id FROM instances
-                     WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
+                     WHERE lifecycle IN ('starting','preparing','ready','running','closing','reconciling')
+                       AND host_id IN (
                         SELECT id FROM hosts WHERE state != 'online' AND
                         (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
                         (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
@@ -2830,17 +2919,17 @@ impl Store {
                 let rows = stmt.query_map(params![&now, grace], |row| row.get::<_, String>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            // ma-lineage r5 item 1: host loss is CONTACT loss, never process
-            // end (D-019) — do NOT stamp ended_at. The row is exited +
-            // host-lost with no end time, so continuation treats it as
-            // potentially live and closes the possibly-alive predecessor
-            // before resuming; a same-epoch daemon reconcile reporting running
-            // clears the exit.
+            // ma-lineage r5/r6 item 1+3: host loss is CONTACT loss, not process
+            // end (D-019) — no ended_at. r6 uses a NEW marker constant
+            // (HOST_LOST_MARKER) distinct from any legacy value, so rows
+            // written before this change keep their old ended meaning; the
+            // backfill stamps end evidence for those.
             let changed = tx.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                     connectivity = 'disconnected', last_error = ?3,
                     updated_at = ?1
-                 WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
+                 WHERE lifecycle IN ('starting','preparing','ready','running','closing','reconciling')
+                   AND host_id IN (
                     SELECT id FROM hosts WHERE state != 'online' AND
                     (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
                     (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
@@ -3156,65 +3245,54 @@ impl Store {
                     .is_some();
             if !is_current {
                 return Err(StoreError::Conflict(format!(
-                    "instance {instance_id} is a closed predecessor chapter; only the lineage's                      current chapter can be deleted (its successors resolve ownership through it)"
+                    "instance {instance_id} is a closed predecessor chapter; only the lineage's \
+                     current chapter can be deleted (its successors resolve ownership through it)"
                 )));
             }
+            // ma-lineage r6 item 2: deleting the CURRENT chapter deletes the
+            // WHOLE lineage (every chapter + the lineage row) in one
+            // transaction. Otherwise the older chapters would be stranded — a
+            // lineages row still naming a deleted current chapter, 409 on
+            // deleting the predecessors forever, and 404 on resume. A plain
+            // instance has no lineage row and is the sole member.
+            let chapter_ids: Vec<String> = if lineage_exists {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM instances
+                      WHERE lineage_id = ?1 ORDER BY generation ASC",
+                )?;
+                let rows =
+                    stmt.query_map(params![&instance.lineage_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                vec![instance_id.clone()]
+            };
+            // Refuse if ANY chapter is still live: the HTTP handler stops the
+            // current one before calling, but predecessors could still be live
+            // in unusual states; require all terminal for a whole-lineage
+            // delete.
+            for chapter_id in &chapter_ids {
+                let lifecycle: String = conn.query_row(
+                    "SELECT lifecycle FROM instances WHERE id = ?1",
+                    params![chapter_id],
+                    |row| row.get(0),
+                )?;
+                if !matches!(lifecycle.as_str(), "exited" | "failed" | "closed") {
+                    return Err(StoreError::Conflict(format!(
+                        "chapter {chapter_id} is {lifecycle}; stop every chapter before deleting \
+                         the lineage"
+                    )));
+                }
+            }
             let tx = conn.transaction()?;
-            // c-cardsettle r2 item 2: retain the terminal state of this
-            // instance's interactions before their rows are deleted, so a late
-            // answer after the delete gets the state-derived rejection instead
-            // of fanning out to all connected Nodes.
-            tx.execute(
-                "INSERT OR IGNORE INTO interaction_tombstones
-                    (id, instance_id, host_id, state, reason, created_at, updated_at)
-                 SELECT id, instance_id, host_id, state,
-                        COALESCE(
-                            json_extract(payload_json, '$.payload.reasonCode'),
-                            json_extract(payload_json,
-                                '$.payload.entity.resolution.value.reason'),
-                            json_extract(payload_json,
-                                '$.payload.interaction.resolution.value.reason'),
-                            'generation-ended'),
-                        created_at, updated_at
-                 FROM interactions WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute(
-                "DELETE FROM journal WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute(
-                "DELETE FROM commands WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute(
-                "DELETE FROM interactions WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute(
-                "DELETE FROM fleet_members WHERE instance_id = ?1",
-                params![&instance_id],
-            )?;
-            tx.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
-            // t-pool: a deleted instance must not keep holding an attach lock.
-            // The lease row itself is retained (it tracks the *directory* and
-            // its tasks; worktree reclaim is a separate, lease-aware path), but
-            // holder_instance_id is cleared here so a later lease is not blocked
-            // by a session that no longer exists.
-            tx.execute(
-                "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
-                 WHERE holder_instance_id = ?1",
-                params![&instance_id, now_rfc3339()],
-            )?;
-            // Tombstone: a Node command that is still draining will keep
-            // appending journal events for this id, and `ensure_instance`
-            // would happily recreate the row. A deleted session must stay
-            // deleted, so the id is refused from here on.
-            tx.execute(
-                "INSERT OR REPLACE INTO deleted_instances (instance_id, deleted_at)
-                 VALUES (?1, ?2)",
-                params![&instance_id, now_rfc3339()],
-            )?;
+            for chapter_id in &chapter_ids {
+                delete_instance_rows(&tx, chapter_id)?;
+            }
+            if lineage_exists {
+                tx.execute(
+                    "DELETE FROM lineages WHERE lineage_id = ?1",
+                    params![&instance.lineage_id],
+                )?;
+            }
             tx.commit()?;
             Ok(true)
         })
@@ -3781,16 +3859,31 @@ impl Store {
         host_id: String,
         reported: Vec<String>,
         reason: String,
+        epoch_changed: bool,
     ) -> Result<(Vec<String>, Settlement), StoreError> {
         self.run_named("reconcile_reported_instances", move |conn| {
             // The instance settlement and the interaction invalidation
             // (c-cardsettle) commit in ONE transaction: an inbox must never
             // observe an exited instance whose card is still actionable.
             let tx = immediate_tx(conn)?;
-            let mut stmt = tx.prepare(
+            // Normally only live chapters are reconciled against the Node's
+            // inventory. ma-lineage r6 item 3(a): on a NODE EPOCH CHANGE the
+            // old process is gone, so evidence-less host-lost/ambiguous
+            // terminal rows the new Node does not report are ALSO reconciled
+            // and stamped with process-end evidence. Rows that already carry
+            // ended_at (genuine ends) and unacked `requested` rows stay out.
+            let candidate_sql = if epoch_changed {
                 "SELECT id FROM instances
-                 WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed', 'requested')",
-            )?;
+                 WHERE host_id = ?1
+                   AND (
+                        lifecycle NOT IN ('exited', 'failed', 'requested', 'closed')
+                        OR (lifecycle IN ('exited', 'failed') AND ended_at IS NULL)
+                   )"
+            } else {
+                "SELECT id FROM instances
+                 WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed', 'requested', 'closed')"
+            };
+            let mut stmt = tx.prepare(candidate_sql)?;
             let live: Vec<String> = stmt
                 .query_map(params![&host_id], |row| row.get(0))?
                 .collect::<Result<_, _>>()?;
@@ -3801,12 +3894,26 @@ impl Store {
                 .collect();
             let now = now_rfc3339();
             for id in &lost {
-                tx.execute(
-                    "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                        last_error = ?1, updated_at = ?2, ended_at = COALESCE(ended_at, ?2)
-                     WHERE id = ?3",
-                    params![&reason, &now, id],
-                )?;
+                if epoch_changed {
+                    // The node epoch changed: the old process is provably
+                    // gone — stamp ended_at so the row releases its seat/
+                    // fan-out, preserving the reason as context.
+                    tx.execute(
+                        "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
+                            ended_at = COALESCE(ended_at, ?1),
+                            last_error = CASE WHEN last_error IS NULL THEN ?2 ELSE last_error END,
+                            updated_at = ?1
+                         WHERE id = ?3",
+                        params![&now, &reason, id],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
+                            last_error = ?1, updated_at = ?2
+                         WHERE id = ?3 AND ended_at IS NULL",
+                        params![&reason, &now, id],
+                    )?;
+                }
             }
             // A generation that ended owns no still-answerable request.
             let settlement = settle_instance_interactions(&tx, &lost, &now)?;
@@ -4396,7 +4503,67 @@ impl Store {
         ))
     }
 
-    /// D-057 §5: async edge used by `owns()`, the D-051 route and the
+    /// ma-lineage r7 item 1: the HTTP delete handler's side-effect-free
+    /// pre-check / work plan. It answers in ONE read:
+    ///
+    /// * whether the addressed chapter may be deleted at all (a closed
+    ///   predecessor chapter may not — [`DeletionScope::NonCurrent`]);
+    /// * every chapter row a delete would remove, each with host and
+    ///   lifecycle, so the handler can refuse while ANY chapter is still live
+    ///   (before stop/lease/purge/audit) and purge EVERY chapter's Node data.
+    pub async fn deletion_plan(&self, instance_id: &str) -> Result<DeletionScope, StoreError> {
+        let instance_id = instance_id.to_owned();
+        self.run_named("deletion_plan", move |conn| {
+            let instance = load_instance(conn, &instance_id)?
+                .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM lineages WHERE lineage_id = ?1",
+                    params![&instance.lineage_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                return Ok(DeletionScope::Plain(DeleteChapter {
+                    instance_id: instance.instance_id.clone(),
+                    host_id: instance.host_id.clone(),
+                    lifecycle: instance.lifecycle.clone(),
+                    task_id: instance.task_id.clone(),
+                }));
+            }
+            let is_current = conn
+                .query_row(
+                    "SELECT 1 FROM lineages WHERE lineage_id = ?2
+                        AND current_instance_id = ?1",
+                    params![&instance_id, &instance.lineage_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !is_current {
+                return Ok(DeletionScope::NonCurrent);
+            }
+            let mut stmt = conn.prepare(
+                "SELECT id, host_id, lifecycle, task_id FROM instances
+                 WHERE lineage_id = ?1 ORDER BY generation ASC, created_at ASC",
+            )?;
+            let chapters = stmt
+                .query_map(params![&instance.lineage_id], |row| {
+                    Ok(DeleteChapter {
+                        instance_id: row.get(0)?,
+                        host_id: row.get(1)?,
+                        lifecycle: row.get(2)?,
+                        task_id: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(DeletionScope::Current(chapters))
+        })
+        .await
+    }
+
+    /// D-057 §5: lineage edge used by `owns()`, the D-051 route and the
     /// `GET /v1/lineages/{id}` read predicate. See [`lineage_owns_conn`].
     pub async fn lineage_owns(
         &self,
@@ -6594,12 +6761,48 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // event (a transition into exited/failed/closed), kept separate from the
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
     ensure_column(&conn, "instances", "ended_at", "TEXT")?;
-    // ma-lineage r4 item 3: backfill `ended_at` ONLY from durable,
-    // classifier-qualified process-end EVENTS in each row's journal — never
-    // blindly from updated_at. A later return-to-live event after the end
-    // vetoes the backfill; a row with no qualifying event (including an
-    // ambiguous legacy `failed` a configure/turn error produced while the
-    // process was alive) keeps ended_at NULL.
+    // ma-lineage r4 item 3 + r6 item 7: the ended_at backfill runs ONCE,
+    // guarded by a schema PRAGMA marker, not on every Store::open for every
+    // evidence-less terminal row (that set only grows).
+    let backfill_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap_or(0);
+    if backfill_version < 2 {
+        // r6 item 3(b) ONE-TIME legacy fallback (guarded by PRAGMA
+        // user_version): evidence-less historical rows that already reached a
+        // live lifecycle, and old 'host-lost'-marked rows, are stamped from
+        // updated_at — they are genuinely dead historical rows from before
+        // the host-lost-is-contact-loss semantics. The new r6 marker keeps
+        // later host-lost rows potentially-live until a nodeEpoch change.
+        // Rows that never reached live (requested / attested launch failures)
+        // stay NULL. (The journal-event backfill below stays unguarded: it
+        // only ever stamps rows WITH a qualifying end event and must still see
+        // journal events written after an earlier open — r6 item 7.)
+        conn.execute(
+            "UPDATE instances SET ended_at = updated_at
+             WHERE ended_at IS NULL
+               AND lifecycle IN ('exited', 'failed')
+               AND (
+                    last_error = 'host-lost'
+                    OR (last_error IS NULL
+                        AND lifecycle = 'exited'
+                        AND EXISTS (
+                            SELECT 1 FROM journal
+                             WHERE journal.instance_id = instances.id
+                               AND json_extract(journal.payload_json,
+                                   '$.payload.state') IN ('ready','running')
+                        ))
+               )",
+            [],
+        )?;
+        conn.execute_batch("PRAGMA user_version = 2;")?;
+    }
+    // ma-lineage r4 item 3: backfill `ended_at` from durable, classifier-
+    // qualified process-end EVENTS in each row's journal — never blindly from
+    // updated_at. A later return-to-live event after the end vetoes it; a row
+    // with no qualifying event keeps NULL. Idempotent and evidence-only, so it
+    // safely re-runs (it can stamp a journal end written after an earlier
+    // open); only the legacy fallback above is one-time (r6 item 7).
     backfill_ended_at_from_journal(&conn)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     // Rows written before the column existed are each their own lineage.
@@ -7524,17 +7727,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let instance = store
-            .insert_instance(
-                host.clone(),
-                None,
-                "claude".into(),
-                "generic-pty".into(),
-                None,
-                json!({}),
-            )
-            .await
-            .unwrap();
+        // ma-lineage r6 item 3(c): only a chapter that REACHED a live
+        // lifecycle may become host-lost. Acknowledge the instance (ready) so
+        // it is the sweep's target; unacked requested rows belong to
+        // expire_stale_requested instead.
+        let instance = seed_acknowledged_instance(&store, &host).await;
         assert_eq!(
             store.expire_lost_hosts(0).await.unwrap().0,
             0,
@@ -9581,6 +9778,7 @@ mod tests {
                 host.clone(),
                 vec![kept.instance_id.clone()],
                 "node-epoch-changed".into(),
+                true,
             )
             .await
             .expect("reconcile");
@@ -9617,6 +9815,142 @@ mod tests {
         store.close().await;
     }
 
+    /// ma-lineage r6 item 3(a): on a nodeEpoch change an evidence-less
+    /// host-lost/ambiguous terminal row the new Node does not report is
+    /// reconciled to exited WITH ended_at (process-end evidence), releasing
+    /// its seat/fan-out forever. A non-epoch reconcile leaves it potentially
+    /// live (no ended_at).
+    #[tokio::test]
+    async fn epoch_change_stamps_end_evidence_on_unreported_host_lost_rows() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "epoch-hostlost").await;
+
+        let host_lost = seed_acknowledged_instance(&store, &host).await;
+        let ambiguous = seed_acknowledged_instance(&store, &host).await;
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute(
+            "UPDATE instances
+                SET lifecycle='exited', ended_at=NULL, last_error='host-lost'
+              WHERE id=?1",
+            rusqlite::params![host_lost.instance_id],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE instances
+                SET lifecycle='failed', ended_at=NULL, last_error='api-error: 429'
+              WHERE id=?1",
+            rusqlite::params![ambiguous.instance_id],
+        )
+        .unwrap();
+        drop(db);
+
+        // Same-epoch (non-epoch) reconcile must NOT stamp end evidence.
+        let (_, _) = store
+            .reconcile_reported_instances(host.clone(), vec![], "reconnect".into(), false)
+            .await
+            .unwrap();
+        let db_path = dir.path().join("hub.sqlite");
+        let read_ended = |path: &std::path::Path, id: &str| -> Option<String> {
+            let db = rusqlite::Connection::open(path).unwrap();
+            db.query_row(
+                "SELECT ended_at FROM instances WHERE id=?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            read_ended(&db_path, &host_lost.instance_id).is_none(),
+            "non-epoch reconcile leaves host-lost row without end evidence"
+        );
+
+        // Epoch change + not reported: stamp ended_at on both.
+        store
+            .record_node_epoch(host.clone(), Some("a".into()))
+            .await
+            .unwrap();
+        store
+            .record_node_epoch(host.clone(), Some("b".into()))
+            .await
+            .unwrap();
+        let (lost, _) = store
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(lost.len(), 2, "both evidence-less terminal rows reconciled");
+        for id in [&host_lost.instance_id, &ambiguous.instance_id] {
+            assert!(
+                read_ended(&db_path, id).is_some(),
+                "epoch change stamps end evidence for {id}"
+            );
+        }
+        store.close().await;
+    }
+
+    /// ma-lineage r6 item 3(c): the host-lost sweep only touches chapters that
+    /// reached a live lifecycle — a `requested` row is left to the stale-create
+    /// reaper with its attested marker intact, and an attested failed row is
+    /// left alone.
+    #[tokio::test]
+    async fn host_lost_sweep_skips_requested_and_attested_failed_rows() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "hostlost-skip").await;
+        store
+            .run_named("hostlost-setoffline", {
+                let host = host.clone();
+                move |conn| {
+                    conn.execute(
+                        "UPDATE hosts SET state='unreachable', offline_since='2000-01-01T00:00:00Z'
+                         WHERE id=?1",
+                        [host.as_str()],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+
+        let requested = seed_instance(&store, &host).await;
+        let attested = seed_acknowledged_instance(&store, &host).await;
+        let db_path = dir.path().join("hub.sqlite");
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.execute(
+            "UPDATE instances SET lifecycle='failed', ended_at=NULL,
+                last_error='create-never-acknowledged' WHERE id=?1",
+            rusqlite::params![attested.instance_id],
+        )
+        .unwrap();
+        drop(db);
+
+        let changed = store.expire_lost_hosts(0).await.unwrap().0;
+        assert_eq!(
+            changed, 0,
+            "requested and attested-failed rows are not swept"
+        );
+
+        let req = store
+            .get_instance(requested.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.lifecycle, "requested", "requested row untouched");
+        let failed = store
+            .get_instance(attested.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.lifecycle, "failed");
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("create-never-acknowledged")
+        );
+        store.close().await;
+    }
+
     // ----- c-cardsettle: settle a session's pending cards when it ends -----
 
     /// c-cardsettle (Node epoch change / restart reconcile): the lost
@@ -9648,6 +9982,7 @@ mod tests {
                 host.clone(),
                 vec![kept.instance_id.clone()],
                 "node-epoch-changed".into(),
+                true,
             )
             .await
             .expect("reconcile");
@@ -9722,7 +10057,7 @@ mod tests {
         let int_id = seed_pending_interaction(&store, &host, &lost.instance_id).await;
 
         let (lost_first, first) = store
-            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into())
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
             .expect("first reconcile");
         assert_eq!(lost_first, vec![lost.instance_id.clone()]);
@@ -9730,7 +10065,7 @@ mod tests {
         // Second reconcile: the instance is already exited, returns no new lost
         // rows, no settlement, and does not error on the terminal interaction.
         let (again, second) = store
-            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into())
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
             .expect("second reconcile");
         assert!(again.is_empty());
@@ -12361,6 +12696,18 @@ fn is_attested_launch_failure_marker(last_error: &str) -> bool {
 /// was alive) is treated as POTENTIALLY LIVE: it does NOT satisfy this
 /// predicate, so a sessionless continuation keeps its 409 and a live-host
 /// successor still closes the predecessor.
+/// Whether `record` is a LIVE current chapter whose addressed older chapter
+/// should resolve as an idempotent replay (ma-lineage r6 item 4): requested/
+/// starting/ready/running. A host-lost/ambiguous terminal chapter is NOT live
+/// — it must be continued (and the possibly-alive predecessor closed), never
+/// replayed.
+pub(crate) fn current_chapter_is_live(record: &InstanceRecord) -> bool {
+    matches!(
+        record.lifecycle.as_str(),
+        "requested" | "preparing" | "starting" | "ready" | "running"
+    )
+}
+
 pub(crate) fn lifecycle_has_process_end_evidence(
     lifecycle: &str,
     last_error: Option<&str>,

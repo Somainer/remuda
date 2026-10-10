@@ -316,48 +316,43 @@ impl EffortRequest {
     /// Build the in-session request for a LIVE configure from the two D-056
     /// axes (`{name, ultracode}`) and the reported build semantics.
     ///
+    /// Classification (c-effortui r4 item 2) is against the driver's latest
+    /// OBSERVED effective selection (`current`): that is real read-back state
+    /// shared from the transcript mapper, so a terminal-typed `/effort`, a
+    /// resume and an unpinned launch are all reflected. The launch-only
+    /// `requested` provenance is consulted only when there is NO read-back
+    /// yet, and only to keep the very first cold-start toggle working.
+    ///
     /// - Coupled (2.1.203–2.1.283): a flag-on request is the single bare
     ///   `/effort ultracode` — on those builds that word IS the xhigh-tier
     ///   command; anything else is a plain level word. The UI guarantees it
     ///   never asks for `{non-xhigh, true}`.
-    /// - Decoupled (≥2.1.284): when the tier is unchanged versus the last
-    ///   requested selection this is the orthogonal toggle
-    ///   (`/effort ultracode on|off`); when the tier moves, the flag is
-    ///   genuinely orthogonal and a plain `/effort <level>` leaves it as is.
-    ///   With no prior selection, a flag-ON request can only be the first
-    ///   switch flip (a flag-on drag rides an already-on flag, so a prior
-    ///   request must exist) and is typed `ultracode on` at the carried tier;
-    ///   flag-off with no provenance stays a plain level word rather than
-    ///   guessing at a live flag.
+    /// - Decoupled (≥2.1.284): same tier as observed → the orthogonal toggle
+    ///   (`/effort ultracode on|off`); a different tier is a level move and a
+    ///   plain `/effort <level>` (the ortho flag stays where read-back puts
+    ///   it). With NO observed/requested state, a flag-on at the carried tier
+    ///   is the cold-start toggle; flag-off with no provenance is a level.
     /// - Legacy/unknown: a flag-on request is rejected by the caller's version
     ///   gate; here only plain level words are produced.
     pub(crate) fn for_configure(
         level: &str,
         ultracode: Option<bool>,
         semantics: remuda_protocol::EffortSemantics,
-        current: Option<EffortRequest>,
+        observed: Option<ObservedSelection>,
     ) -> Option<Self> {
         let normalized = level.trim().to_ascii_lowercase();
         if semantics == remuda_protocol::EffortSemantics::Coupled && ultracode == Some(true) {
             return Self::from_level("ultracode");
         }
         if semantics == remuda_protocol::EffortSemantics::Decoupled {
-            let same_tier = current
-                .map(|request| {
-                    EffortSelection {
-                        name: request.name,
-                        ultracode: request.ultracode,
-                    }
-                    .level_name()
-                        == normalized.as_str()
-                })
-                .unwrap_or(false);
-            if let Some(current) = current.filter(|_| same_tier) {
-                // Carry the ACTUAL tier (the flag-only request name must not
-                // collapse to xhigh), so the next same-tier toggle keeps
-                // comparing against the right level.
+            let target_name = parse_plain_effort_name(&normalized);
+            // Same OBSERVED tier: the only possible axis change is the flag,
+            // so type the explicit toggle (the level itself does not move).
+            if let Some(name) =
+                target_name.filter(|name| observed.is_some_and(|obs| obs.name == *name))
+            {
                 return Some(Self {
-                    name: current.name,
+                    name,
                     ultracode: ultracode == Some(true),
                     word: if ultracode == Some(true) {
                         "ultracode on"
@@ -366,22 +361,15 @@ impl EffortRequest {
                     },
                 });
             }
-            // No provenance: a first flag-on at this carried tier is the
-            // toggle; resolve the tier from the level word so later
-            // same-tier requests compare correctly.
-            if current.is_none() && ultracode == Some(true) {
-                let name = match normalized.as_str() {
-                    "low" => EffortName::Low,
-                    "medium" => EffortName::Medium,
-                    "high" => EffortName::High,
-                    "xhigh" => EffortName::Xhigh,
-                    "max" => EffortName::Max,
-                    other => {
-                        // Unknown/non-Claude tier with a flag: never guess a
-                        // toggle; let from_level produce the honest None.
-                        return Self::from_level(other);
-                    }
-                };
+            // Tier move (observed tier differs, or never read back with a
+            // launch/requested tier of a DIFFERENT name): a plain level word,
+            // which leaves the ortho flag untouched. Only the true cold start
+            // — no observation AND no requested provenance, flag asked on at
+            // the carried tier — is the first toggle.
+            if observed.is_none()
+                && ultracode == Some(true)
+                && let Some(name) = target_name
+            {
                 return Some(Self {
                     name,
                     ultracode: true,
@@ -432,6 +420,19 @@ impl EffortRequest {
         semantics: remuda_protocol::EffortSemantics,
     ) -> Option<EffortName> {
         (!self.is_flag_only(semantics)).then_some(self.name)
+    }
+}
+
+/// Parse just the five plain Claude tier names (no `ultracode` alias, no
+/// toggle words) into an `EffortName`. c-effortui r4 item 2.
+pub(crate) fn parse_plain_effort_name(word: &str) -> Option<EffortName> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(EffortName::Low),
+        "medium" => Some(EffortName::Medium),
+        "high" => Some(EffortName::High),
+        "xhigh" => Some(EffortName::Xhigh),
+        "max" => Some(EffortName::Max),
+        _ => None,
     }
 }
 
@@ -486,6 +487,14 @@ pub enum Readback {
 /// for the next turn's assistant record. The bridge is that rendezvous. A
 /// much later natural change to the same level is not mis-attributed: the
 /// generation only resolves on the verdict of its own command.
+/// Latest OBSERVED effective selection used to classify a live configure
+/// (c-effortui r4 item 2). Unlike [`EffortRequest`] the flag is tri-state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservedSelection {
+    pub(crate) name: EffortName,
+    pub(crate) ultracode: Option<bool>,
+}
+
 pub(crate) struct EffortBridge {
     state: Mutex<BridgeState>,
     notify: Notify,
@@ -500,6 +509,15 @@ struct BridgeState {
     verdict: Option<Readback>,
     /// The latest thing any side asked for (payload `requested` field).
     requested: Option<EffortRequest>,
+    /// c-effortui r4 item 2: the latest OBSERVED effective selection (from
+    /// transcript read-back — verdicts, assistant records, attachments). The
+    /// live configure path classifies a new configure against THIS, not
+    /// against `requested` (which only arm/note_launch_request write and goes
+    /// stale across a terminal-typed /effort, a resume, or an unpinned
+    /// launch). None until the first read-back of the current process. The
+    /// flag stays tri-state (None = never observed in this process), so a
+    /// tier move against a flag-unknown session is not mistaken for a toggle.
+    observed: Option<ObservedSelection>,
     generation: u64,
 }
 
@@ -552,6 +570,22 @@ impl EffortBridge {
         self.lock().requested
     }
 
+    /// c-effortui r4 item 2: latest OBSERVED effective selection (read-back),
+    /// which the live configure path uses to tell a flag toggle from a tier
+    /// move. Updated by the mapper from every settled effort edge.
+    pub(crate) fn observed(&self) -> Option<ObservedSelection> {
+        self.lock().observed
+    }
+
+    /// Mapper side: record the latest effective selection observed in the
+    /// CURRENT process (a /effort verdict, assistant record or attachment).
+    pub(crate) fn note_observed(&self, observed: remuda_protocol::ObservedEffort) {
+        self.lock().observed = Some(ObservedSelection {
+            name: observed.name,
+            ultracode: observed.ultracode,
+        });
+    }
+
     /// Mapper side: the command verdict `generation` was waiting for arrived.
     pub(crate) fn resolve(&self, generation: u64, observed: remuda_protocol::ObservedEffort) {
         {
@@ -561,6 +595,10 @@ impl EffortBridge {
             {
                 state.pending = None;
             }
+            state.observed = Some(ObservedSelection {
+                name: observed.name,
+                ultracode: observed.ultracode,
+            });
             state.verdict = Some(Readback::Applied(observed));
             state.verdict_gen = generation;
         }
@@ -1220,7 +1258,6 @@ mod sync_tests {
     #[test]
     fn live_configure_picks_the_command_word_for_each_gate() {
         use remuda_protocol::EffortSemantics::{Coupled, Decoupled, Unknown};
-        let sel = |name: EffortName, ultracode: bool| EffortSelection { name, ultracode };
 
         // Coupled: {xhigh,true} is the single bare word.
         let coupled_on = EffortRequest::for_configure("xhigh", Some(true), Coupled, None).unwrap();
@@ -1240,9 +1277,12 @@ mod sync_tests {
         assert_eq!(cold_on.command_word(), "ultracode on");
         assert_eq!(cold_on.name, EffortName::High);
 
-        // Decoupled, same tier as the last request: the flag toggle words.
-        let current_high = EffortRequest::from_selection(sel(EffortName::High, false));
-        let on = EffortRequest::for_configure("high", Some(true), Decoupled, Some(current_high))
+        // Decoupled, same tier as the OBSERVED selection: the flag toggle words.
+        let obs_high_off = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(false),
+        };
+        let on = EffortRequest::for_configure("high", Some(true), Decoupled, Some(obs_high_off))
             .unwrap();
         assert_eq!(on.command_word(), "ultracode on");
         assert_eq!(
@@ -1250,16 +1290,23 @@ mod sync_tests {
             EffortName::High,
             "the flag toggle keeps the real tier"
         );
-        let off = EffortRequest::for_configure("high", Some(false), Decoupled, Some(on)).unwrap();
+        let obs_high_on = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        };
+        let off = EffortRequest::for_configure("high", Some(false), Decoupled, Some(obs_high_on))
+            .unwrap();
         assert_eq!(off.command_word(), "ultracode off");
         assert_eq!(off.name, EffortName::High);
 
         // Decoupled, tier moves while the flag rides along: plain level word,
         // flag stays where it was on an orthogonal build.
-        let current_high_on = EffortRequest::from_selection(sel(EffortName::High, true));
+        let obs_high_on = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        };
         let drag =
-            EffortRequest::for_configure("max", Some(true), Decoupled, Some(current_high_on))
-                .unwrap();
+            EffortRequest::for_configure("max", Some(true), Decoupled, Some(obs_high_on)).unwrap();
         assert_eq!(drag.command_word(), "max");
         assert_eq!(drag.name, EffortName::Max);
 
@@ -1271,6 +1318,90 @@ mod sync_tests {
             "xhigh"
         );
         assert!(EffortRequest::for_configure("bogus", None, Coupled, None).is_none());
+    }
+
+    /// c-effortui r4 item 2 trigger A: Remuda drags high→max; the USER then
+    /// types `/effort max` in the terminal (observed becomes {max,false}),
+    /// after which Remuda drags BACK to high posting {high,false}. Against
+    /// stale requested "high" that looked like a same-tier toggle; against the
+    /// OBSERVED {max} it is a tier move → plain `/effort high`, never
+    /// `ultracode off`.
+    #[test]
+    fn r4_trigger_a_terminal_max_then_remuda_drag_back_to_high_is_a_level_word() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let observed = ObservedSelection {
+            name: EffortName::Max,
+            ultracode: Some(false),
+        };
+        let req =
+            EffortRequest::for_configure("high", Some(false), Decoupled, Some(observed)).unwrap();
+        assert_eq!(req.command_word(), "high");
+        assert_eq!(req.name, EffortName::High);
+        assert!(!req.ultracode);
+    }
+
+    /// c-effortui r4 item 2 trigger B: an unpinned decoupled launch with the
+    /// flag already on, then a drag to max posts {max,true}. With no
+    /// read-back yet the observed slot is None; the launch-requested
+    /// provenance is a DIFFERENT tier (high), so this is a tier move, not the
+    /// cold-start toggle → plain `/effort max` (flag stays on, untouched),
+    /// never `ultracode on`.
+    #[test]
+    fn r4_trigger_b_unpinned_flag_on_launch_drag_to_max_is_a_level_word() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        // Simulate the caller fallback: observed None, requested {high,true}.
+        let requested = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        };
+        let req =
+            EffortRequest::for_configure("max", Some(true), Decoupled, Some(requested)).unwrap();
+        assert_eq!(req.command_word(), "max");
+        assert_eq!(req.name, EffortName::Max);
+    }
+
+    /// c-effortui r4 item 2 trigger C: observed high with flag on; the live
+    /// terminal is actually at max (a tier moved terminal-side but the
+    /// observed record is stale high). User flips the switch on posting
+    /// {max,true}: different tier → plain `/effort max` is correct HERE, but
+    /// this test pins that observed-high NEVER produces a toggle for a max
+    /// request (the real fix is read-back freshness: observed updates from
+    /// every edge, so once max is observed the toggle target is max).
+    #[test]
+    fn r4_trigger_c_flag_on_at_a_different_observed_tier_is_a_level_word() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let observed = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(false),
+        };
+        let req =
+            EffortRequest::for_configure("max", Some(true), Decoupled, Some(observed)).unwrap();
+        assert_eq!(req.command_word(), "max");
+        assert_eq!(req.name, EffortName::Max);
+    }
+
+    /// c-effortui r4 item 2: the bridge records observed selections from
+    /// mapper read-back, and observed wins over requested when both exist.
+    #[test]
+    fn r4_bridge_observed_outranks_requested_for_classification() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let bridge = EffortBridge::new();
+        bridge.note_launch_request(EffortRequest::from_selection(EffortSelection {
+            name: EffortName::High,
+            ultracode: false,
+        }));
+        // A terminal /effort max settles read-back at {max,false}.
+        bridge.note_observed(remuda_protocol::ObservedEffort {
+            name: EffortName::Max,
+            ultracode: Some(false),
+        });
+        let observed = bridge.observed().expect("observed recorded");
+        assert_eq!(observed.name, EffortName::Max);
+        // A subsequent {high,false} configure is a tier move vs the observed
+        // max even though the launch requested was high.
+        let req =
+            EffortRequest::for_configure("high", Some(false), Decoupled, Some(observed)).unwrap();
+        assert_eq!(req.command_word(), "high");
     }
 
     #[tokio::test]

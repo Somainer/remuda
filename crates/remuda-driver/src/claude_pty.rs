@@ -766,12 +766,20 @@ impl ClaudePtyDriver {
                     live.recipe.binary.version,
                 )));
             }
-            let Some(request) = crate::effort::EffortRequest::for_configure(
-                level,
-                ultracode,
-                semantics,
-                live.effort_bridge.requested(),
-            ) else {
+            // c-effortui r4 item 2: classify against the latest OBSERVED
+            // effective selection (read-back); fall back to launch/requested
+            // provenance only before any read-back exists.
+            let current = live.effort_bridge.observed().or_else(|| {
+                live.effort_bridge
+                    .requested()
+                    .map(|request| crate::effort::ObservedSelection {
+                        name: request.name,
+                        ultracode: Some(request.ultracode),
+                    })
+            });
+            let Some(request) =
+                crate::effort::EffortRequest::for_configure(level, ultracode, semantics, current)
+            else {
                 // An honest refusal for a word the in-session command does not
                 // take (`auto` is a mode, and an unknown future name must not
                 // be typed and hoped about). The Node surfaces the rejection in

@@ -3138,6 +3138,13 @@ impl TranscriptMapper {
             self.mapper
                 .observation(Completeness::Structured, NativeRequestKey::None, payload)?;
         obs.event_id = self.effort_event_id(value, observed.name, native_label);
+        // c-effortui r4 item 2: every settled effective edge (verdict or
+        // assistant record) refreshes the bridge's OBSERVED selection, so the
+        // next live configure classifies toggle-vs-tier-move against
+        // read-back — including after a terminal-typed /effort or a resume.
+        if let Some(bridge) = &self.effort_bridge {
+            bridge.note_observed(observed);
+        }
         Ok(vec![obs])
     }
 

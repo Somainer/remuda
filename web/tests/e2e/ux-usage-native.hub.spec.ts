@@ -187,7 +187,6 @@ test("native transcript usage drives the context chip through the real promoted 
     await mkdtemp(path.join(scratch, "usage-native-")),
   );
   const dataDir = path.join(dir, "data");
-  await mkdir(dataDir, { recursive: true });
   const workspace = path.join(dir, "workspace");
   const bin = path.join(dir, "bin");
   const claudeHome = path.join(dir, "claude-home");
@@ -195,11 +194,12 @@ test("native transcript usage drives the context chip through the real promoted 
   const eventsFile = path.join(dir, "native-events.jsonl");
   const tokenFile = path.join(dir, "enroll-token");
   const shell = path.join(bin, "test-shell");
+  // data/ is created by the node itself (REMUDA_DATA_DIR); pre-making it
+  // races the node's own mkdir under the /proc/fd alias.
   await Promise.all([
-    mkdir(dataDir),
-    mkdir(workspace),
-    mkdir(bin),
-    mkdir(claudeHome),
+    mkdir(workspace, { recursive: true }),
+    mkdir(bin, { recursive: true }),
+    mkdir(claudeHome, { recursive: true }),
   ]);
   await copyFile(harness, path.join(bin, "claude"));
   await chmod(path.join(bin, "claude"), 0o700);

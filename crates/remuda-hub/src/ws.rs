@@ -58,6 +58,74 @@ pub struct SettlementNotice {
     pub seq: i64,
 }
 
+/// Test-only park seam for a follower's settlement pump (c-cardsettle r11
+/// item 1). Production builds contain no seam: every call site and the
+/// [`AppState`](crate::AppState) field are gated behind
+/// `cfg(any(test, feature = "test-faults"))`.
+///
+/// Unlike shrinking the client socket SO_RCVBUF (which the Hub's ~16 KiB
+/// send buffer defeats: batch A can sit in the kernel buffer with the pump
+/// already at A's END), this parks the PUMP itself deterministically after
+/// it processes the live notice whose seq is `after_seq`, so the follower's
+/// durable delivery cursor provably sits mid-batch before the next batch
+/// is published.
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Default, Clone)]
+pub(crate) struct FollowParks {
+    slot: Arc<tokio::sync::Mutex<Option<FollowParkSlot>>>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+struct FollowParkSlot {
+    /// Park once the pump processes a notice with exactly this seq.
+    after_seq: i64,
+    /// The pump sends back the seq it parked at (the test asserts it equals
+    /// the armed K).
+    reached: tokio::sync::oneshot::Sender<i64>,
+    /// The pump waits on this until the test releases it.
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl FollowParks {
+    /// Arm a one-shot park at `after_seq`. Returns `(reached, release)`:
+    /// `reached` resolves with the seq the pump parked at; sending on
+    /// `release` lets the pump continue.
+    pub(crate) async fn arm(
+        &self,
+        after_seq: i64,
+    ) -> (
+        tokio::sync::oneshot::Receiver<i64>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.slot.lock().await = Some(FollowParkSlot {
+            after_seq,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    /// If the pump just processed the armed seq, report it and park until
+    /// released. One-shot: the slot is removed on entry. A dropped release
+    /// sender (test aborted) closes the channel and the pump proceeds.
+    pub(crate) async fn park_if_reached(&self, seq: i64) {
+        let slot = self.slot.lock().await.take();
+        if let Some(slot) = slot {
+            if slot.after_seq == seq {
+                let _ = slot.reached.send(seq);
+                let _ = slot.release.await;
+            } else {
+                // Not this notice: re-arm so a later notice in the same pump
+                // can still hit the park point.
+                *self.slot.lock().await = Some(slot);
+            }
+        }
+    }
+}
+
 /// Live event for `/v1/follow`.
 #[derive(Clone, Debug)]
 pub struct FollowEvent {
@@ -1769,6 +1837,13 @@ async fn follow_session(
                                 settlement_cursor.as_deref(),
                                 notice.seq,
                             ));
+                            // c-cardsettle r11 item 1: deterministic test
+                            // park AFTER the live notice advanced the cursor
+                            // (no-op unless armed; outside the per-instance
+                            // filter so the seq contract holds for any
+                            // follower).
+                            #[cfg(any(test, feature = "test-faults"))]
+                            state.follow_parks.park_if_reached(notice.seq).await;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             // c-cardsettle r4 item 6 / r6 item 2: drain every

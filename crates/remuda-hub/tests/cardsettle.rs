@@ -1783,285 +1783,440 @@ async fn follower_lag_drains_a_large_single_sweep_before_the_gap() -> Result<()>
     Ok(())
 }
 
-/// r10 item 2 (the r9 item 3 test as actually asked): a REAL follower over
-/// `/v1/follow` receives PART of a first settlement batch live — its durable
-/// cursor ends MID that batch through the production bus path, not a
-/// hand-built cursor — is then blocked by socket backpressure while a LARGER
-/// second batch overruns the 64-notice ring, and on unblock the durable lag
-/// drain recovers every missing settlement from the cursor, tail-of-A then
-/// all of B in monotonic `settlement_events.seq` order, each exactly once,
-/// before the single `settlement-backpressure` gap.
+/// r11 item 1/2: the REAL follower's pump is parked by a deterministic test
+/// seam (FollowParks / test_arm_follow_park) after it processes the K-th
+/// LIVE settlement notice — not by shrinking SO_RCVBUF (which the Hub's send
+/// buffer defeats: batch A could sit in the kernel buffer with the pump
+/// already at A's END).
+///
+/// Shape: a sentinel settlement committed BEFORE connect proves (via its
+/// connect-replay frame) that the follower seeded its cursor and subscribed;
+/// batch A (40 rows) is then published live, the pump parks after live
+/// notice K=3 with its cursor genuinely mid-A (the seam reports that seq
+/// back), batch B (120 > the 64-notice ring) is published while parked,
+/// release makes the pump observe Lagged and drain from K+1: the 37-row
+/// tail of A then all of B, in settlement_events.seq order. A's card ids
+/// are all lexically GREATER than B's (zzz_… vs aaa_…), so at the A->B
+/// boundary ascending seq crosses DESCENDING ids — a timestamp+id cursor
+/// could not express this order.
 #[tokio::test]
-async fn follower_blocked_mid_batch_recovers_a_larger_later_batch_in_order() -> Result<()> {
-    let mut config = HubConfig::for_test(tempfile::tempdir()?.path().join("data"));
-    // A 1-deep pump→writer queue so a backed-up socket parks the pump fast.
-    config.follow_buffer_events = 1;
-    let hub = spawn(config).await?;
+async fn follower_parked_after_kth_live_notice_drains_the_tail_of_a_then_b_in_seq_order()
+-> Result<()> {
+    let r11_tmp = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(r11_tmp.path().join("data"))).await?;
     let addr = hub.addr;
     let cookie = login(addr, &hub.bootstrap_token).await?;
     let enroll = enroll_token(addr, &cookie).await?;
     let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
-
-    // Two ready instances: A carries the first (smaller) batch, B the larger
-    // batch that later overruns the ring.
-    async fn ready_instance(
-        addr: std::net::SocketAddr,
-        cookie: &str,
-        host_id: &HostId,
-        label: &str,
-        card_count: usize,
-        node: &FakeNode,
-    ) -> Result<(String, Vec<String>)> {
-        let create_body = json!({
-            "hostId": host_id.as_id().as_str(),
-            "kind": "claude",
-            "driver": "claude-print",
-            "delegation": "none",
-            "permissionMode": "bypass",
-            "prompt": label,
-        })
-        .to_string();
-        let (status, body) =
-            http(addr, "POST", "/v1/instances", cookie, Some(&create_body)).await?;
-        assert_eq!(status, 200, "create {body}");
-        let created: Value = serde_json::from_str(&body)?;
-        let instance_id = created["instance"]["instanceId"]
-            .as_str()
-            .context("instanceId")?
-            .to_string();
-        node.append(
-            "jready",
-            &instance_id,
-            json!({ "kind": "lifecycle", "payload": {
-                "type": "entity", "entityType": "instance", "state": "ready"
-            }}),
-        )
-        .await?;
-        let mut ids = Vec::with_capacity(card_count);
-        for n in 0..card_count {
-            let id = format!("{label}_{n:05}");
-            node.append(
-                &format!("jreq-{label}-{n}"),
-                &instance_id,
-                approval_requested_event(&id),
-            )
-            .await?;
-            ids.push(id);
-        }
-        Ok((instance_id, ids))
-    }
-
-    // A's batch must overrun the shrunken 4 KiB receive window on its own
-    // (~250 B/frame), so the follower provably parks with the cursor INSIDE
-    // A; B is the larger batch that overruns the 64-notice ring.
-    const A_CARDS: usize = 40;
-    const B_CARDS: usize = 120;
-    let (inst_a, cards_a) =
-        ready_instance(addr, &cookie, &host_id, "int_r9mid_a", A_CARDS, &node).await?;
-    let (inst_b, cards_b) =
-        ready_instance(addr, &cookie, &host_id, "int_r9mid_b", B_CARDS, &node).await?;
-
-    // Raw node sockets for the two epoch reconciles. A node.hello completes a
-    // socket's handshake exactly once ("hello already completed" on a second
-    // hello), so each epoch gets its OWN socket: socket A's hello lists B live
-    // so ONLY A is lost (batch one); socket B lists nothing and loses B
-    // (batch two).
-    use futures::SinkExt;
-    macro_rules! connect_node {
-        () => {{
-            let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
-            req.headers_mut().insert(
-                "Authorization",
-                format!("Bearer {}", node.node_token()).parse()?,
-            );
-            let (socket, _) = tokio_tungstenite::connect_async(req).await?;
-            anyhow::Ok(socket)
-        }};
-    }
-    let hello = |epoch: &'static str, inventory: Value| {
-        json!({
-            "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
-            "params": {
-                "hostId": host_id.as_id().as_str(),
-                "nodeVersion": "0.1.0",
-                "nodeEpoch": epoch,
-                "instanceStoreFound": true,
-                "instances": inventory
-            }
-        })
+    let store = hub.store().expect("in-process store").clone();
+    let seq_of = |interaction_id: &str, page: Vec<(String, String, String, String)>| -> i64 {
+        page.into_iter()
+            .find(|(_, id, _, _)| id == interaction_id)
+            .and_then(|(_, _, _, seq)| seq.parse().ok())
+            .expect("settlement event exists for the interaction")
     };
-    // Service a raw node socket until the result frame with `want_id` lands
-    // (asserting it is a result, not an RPC error), or the deadline expires.
-    async fn await_result_frame<S>(socket: &mut S, want_id: &str, label: &str) -> Result<()>
-    where
-        S: std::marker::Unpin
-            + futures::Stream<
-                Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
-            >,
-    {
-        use futures::StreamExt;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-        while tokio::time::Instant::now() < deadline {
-            let Ok(Some(Ok(Message::Text(text)))) =
-                tokio::time::timeout(Duration::from_millis(500), socket.next()).await
-            else {
-                continue;
-            };
-            let frame: Value = serde_json::from_str(&text)?;
-            if frame.get("id").and_then(Value::as_str) == Some(want_id) {
-                assert!(frame.get("result").is_some(), "{label}: {frame}");
-                return Ok(());
-            }
-        }
-        anyhow::bail!("{label} result never arrived")
-    }
-    let mut socket_a = connect_node!()?;
 
-    // The REAL follower, unfiltered, on a tiny receive window. It connects
-    // BEFORE either batch settles, so its seed cursor precedes batch A — A's
-    // notices genuinely arrive through the live settlement bus (connect
-    // replay is empty at seed), and reading only the first three leaves its
-    // production cursor MID batch A.
+    // ── Sentinel: one settled card committed BEFORE the follower connects.
+    let (sentinel_inst, sentinel_cards) =
+        ready_instance_with_cards(&hub, &cookie, &node, &host_id, "r11sentinel", 1).await?;
+    let epoch1 =
+        sweep_with_new_epoch(&addr, &node, &host_id, "cs-r11-epoch-1", json!([]), 0).await?;
+    let sentinel_page = store.invalidated_interactions_after(None).await?;
+    let sentinel_seq = seq_of(&sentinel_cards[0], sentinel_page);
+    assert!(sentinel_seq >= 1);
+
+    // ── Real unfiltered follower; normal socket buffers (the seam parks the
+    // pump itself, so kernel buffers cannot mask the mid-batch cursor).
     let mut follow_req = format!("ws://{addr}/v1/follow").into_client_request()?;
     follow_req.headers_mut().insert("Cookie", cookie.parse()?);
     let follow_tcp = tokio::net::TcpStream::connect(addr).await?;
-    #[cfg(unix)]
-    {
-        nix::sys::socket::setsockopt(&follow_tcp, nix::sys::socket::sockopt::RcvBuf, &256)?;
-    }
     let (mut follow, _) = tokio_tungstenite::client_async(follow_req, follow_tcp).await?;
-    // Give the follower pump time to seed its cursor and subscribe to the
-    // settlement bus before batch A is committed.
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Batch one: B is reported live, so only A's 40 cards settle.
-    socket_a
-        .send(Message::Text(
-            serde_json::to_string(&hello(
-                "cs-r9mid-epoch-2",
-                json!([{
-                    "id": inst_b,
-                    "hostId": host_id.as_id().as_str(),
-                    "lifecycle": "running",
-                    "activity": "idle"
-                }]),
-            ))?
-            .into(),
-        ))
-        .await?;
-    await_result_frame(&mut socket_a, "hello", "epoch-2 hello").await?;
-
-    // Read the follower until THREE batch-A settlements have arrived live,
-    // then park the writer with an over-window journal frame and stop reading.
-    let mut live: Vec<String> = Vec::new();
-    let park_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    use futures::StreamExt;
-    'park: while tokio::time::Instant::now() < park_deadline {
-        let remaining = park_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let Ok(Some(Ok(Message::Text(text)))) =
-            tokio::time::timeout(remaining, follow.next()).await
-        else {
-            break 'park;
-        };
+    // The connect-replay frame for the sentinel proves the follower seeded
+    // its cursor AND subscribed before any later batch is published (this
+    // replaces the old 300 ms sleep).
+    let mut saw_sentinel_replay = false;
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(10), follow.next()).await
+    {
+        let Message::Text(text) = msg else { continue };
         let frame: Value = serde_json::from_str(&text)?;
-        if frame.get("type").and_then(Value::as_str) == Some("settlement")
-            && frame["instanceId"] == json!(inst_a)
+        if frame.get("type") == Some(&json!("settlement"))
+            && frame["interactionId"] == json!(sentinel_cards[0])
         {
-            live.push(frame["interactionId"].as_str().unwrap().to_string());
-            if live.len() == 3 {
-                break 'park;
-            }
+            saw_sentinel_replay = true;
+            break;
         }
     }
-    assert_eq!(live.len(), 3, "the follower receives part of batch A live");
-    // One over-window journal frame jams the tiny socket's writer; the pump
-    // stops polling the settlement ring while we never read. It rides the
-    // CURRENT generation owner (socket A, epoch-2).
-    socket_a
-        .send(Message::Text(
-            serde_json::to_string(&json!({
-                "jsonrpc": "2.0", "id": "jpad-r9mid", "method": "journal.append",
-                "params": {
-                    "instanceId": inst_b,
-                    "event": { "kind": "message",
-                               "payload": { "text": "x".repeat(16 * 1024) } }
-                }
-            }))?
-            .into(),
-        ))
-        .await?;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        saw_sentinel_replay,
+        "the follower replayed the pre-connect sentinel settlement (seeded + subscribed)"
+    );
 
-    // Batch two on a FRESH socket (the handshake is one hello per socket):
-    // empty attested inventory loses B (and re-sweeps nothing new of A, whose
-    // cards are already invalidated).
-    let mut socket_b = connect_node!()?;
-    socket_b
-        .send(Message::Text(
-            serde_json::to_string(&hello("cs-r9mid-epoch-3", json!([])))?.into(),
-        ))
-        .await?;
-    await_result_frame(&mut socket_b, "hello", "epoch-3 hello").await?;
-    // socket B owns the generation now; keep socket A open so its (now
-    // displaced) task cannot race a disconnect reconcile while we drain.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Arm the park at the K-th LIVE notice after the sentinel.
+    const K: i64 = 3;
+    let (mut reached, release) = hub.test_arm_follow_park(sentinel_seq + K).await;
 
-    // UNBLOCK: drain the real follower until its settlement-backpressure gap.
+    // ── Batch A (40 cards, LARGE ids) then settle it on a NEW epoch while
+    // listing B's (still empty of cards) instance live.
+    let (inst_a, cards_a) =
+        ready_instance_with_cards(&hub, &cookie, &node, &host_id, "zzz-r11-a", 40).await?;
+    let (inst_b, cards_b) =
+        ready_instance_with_cards(&hub, &cookie, &node, &host_id, "aaa-r11-b", 120).await?;
+    let epoch2 = sweep_with_new_epoch(
+        &addr,
+        &node,
+        &host_id,
+        "cs-r11-epoch-2",
+        json!([{
+            "id": inst_b,
+            "hostId": host_id.as_id().as_str(),
+            "lifecycle": "running",
+            "activity": "idle"
+        }]),
+        1,
+    )
+    .await?;
+
+    // The pump parks at exactly the armed seq after K live A notices.
+    let parked_at = tokio::time::timeout(Duration::from_secs(15), &mut reached)
+        .await
+        .map_err(|_| anyhow::anyhow!("pump never reached the K-th live A notice"))?
+        .expect("reached channel closed");
+    assert_eq!(
+        parked_at,
+        sentinel_seq + K,
+        "the pump parked MID batch A at the K-th live notice's seq"
+    );
+
+    // ── Batch B (120 cards, SMALL ids) on another new epoch, while parked —
+    // 120 >> the 64-notice ring, so a parked follower overruns it.
+    // inst_a/inst_b are both unreported so BOTH instances settle, but the
+    // follower already took batch A's first three live rows before B commits;
+    // only rows it never consumed are drained.
+    let epoch3 =
+        sweep_with_new_epoch(&addr, &node, &host_id, "cs-r11-epoch-3", json!([]), 2).await?;
+
+    // Release the park: the pump's next bus poll observes Lagged and drains.
+    release
+        .send(())
+        .expect("releasing the parked follower pump");
+
+    // Read until the settlement-backpressure gap. Three A frames were live
+    // before the park; every other row arrives via the durable drain.
+    let mut live_a: Vec<String> = Vec::new();
     let mut drained: Vec<String> = Vec::new();
     let mut settlement_gaps = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-    'read: while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let Some(next) = tokio::time::timeout(remaining, follow.next()).await.ok() else {
-            break 'read;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let Some(Ok(msg)) = tokio::time::timeout_at(deadline, follow.next())
+            .await
+            .ok()
+            .flatten()
+        else {
+            break;
         };
-        let Some(Ok(Message::Text(text))) = next else {
-            continue;
-        };
+        let Message::Text(text) = msg else { continue };
         let frame: Value = serde_json::from_str(&text)?;
         match frame.get("type").and_then(Value::as_str) {
             Some("settlement") => {
-                drained.push(
-                    frame["interactionId"]
-                        .as_str()
-                        .context("settlement interactionId")?
-                        .to_string(),
-                );
+                let id = frame["interactionId"].as_str().unwrap().to_string();
+                if id.starts_with("int_zzz-r11-a") {
+                    // First K A rows are live (frames already buffered by the
+                    // pump before it parked); classify by count, not timing.
+                    if live_a.len() < K as usize {
+                        live_a.push(id);
+                    } else {
+                        drained.push(id);
+                    }
+                } else if id.starts_with("int_aaa-r11-b") {
+                    drained.push(id);
+                }
             }
-            Some("gap") if frame["reason"] == "settlement-backpressure" => {
+            Some("gap") if frame["reason"] == json!("settlement-backpressure") => {
                 settlement_gaps += 1;
-                break 'read;
+                break;
             }
             _ => {}
         }
     }
 
-    // The drained tail is itself strictly ascending (tail of A, then B)…
-    let mut sorted_drained = drained.clone();
-    sorted_drained.sort();
-    assert_eq!(drained, sorted_drained, "the drain stays in seq order");
-    // …and together with the live prefix covers all 160 settlements exactly
-    // once, in one global order.
-    let mut all = live.clone();
-    all.extend(drained);
+    // Exactly K live A notices.
     assert_eq!(
-        all.len(),
-        A_CARDS + B_CARDS,
-        "every lost settlement is recovered: {} of {}",
-        all.len(),
-        A_CARDS + B_CARDS
+        live_a.len(),
+        K as usize,
+        "exactly K batch-A notices were delivered live"
     );
-    let mut unique = all.clone();
-    unique.sort();
-    unique.dedup();
-    assert_eq!(unique.len(), all.len(), "no settlement is delivered twice");
-    let mut want = cards_a;
-    want.extend(cards_b);
-    want.sort();
-    all.sort();
-    assert_eq!(all, want, "recovered ids are exactly batch A then batch B");
-    assert_eq!(settlement_gaps, 1, "one settlement gap closes the recovery");
+    let mut want_live: Vec<String> = (0..K).map(|n| format!("int_zzz-r11-a_{n:05}")).collect();
+    want_live.sort();
+    live_a.sort();
+    assert_eq!(live_a, want_live, "the live notices are the first K A rows");
+
+    // The drain is exactly the 37-row tail of A then the 120 B rows.
+    let mut want_drain: Vec<String> = Vec::new();
+    for n in K..40 {
+        want_drain.push(format!("int_zzz-r11-a_{n:05}"));
+    }
+    for n in 0..120 {
+        want_drain.push(format!("int_aaa-r11-b_{n:05}"));
+    }
+    assert_eq!(
+        drained.len(),
+        want_drain.len(),
+        "tail of A (37) then B (120) = 157"
+    );
+    assert_eq!(
+        drained, want_drain,
+        "the drain delivers tail-of-A then B in settlement_events.seq order"
+    );
+    // At the A->B boundary seq keeps ascending while ids DESCEND — the order
+    // is expressible only by the monotonic seq cursor, not timestamp+id.
+    assert!(
+        drained[36] > drained[37],
+        "A's last id is lexically greater than B's first while seq order continues"
+    );
+    assert_eq!(
+        settlement_gaps, 1,
+        "one settlement-backpressure gap closes recovery"
+    );
+
+    // The B cards are durably invalidated with the generation-ended reason.
+    let b_rows = store
+        .list_interactions(None, Some(inst_b.clone()), None, false)
+        .await?;
+    let b_row = b_rows
+        .iter()
+        .find(|r| r.interaction_id == cards_b[0])
+        .expect("the B interaction row survives");
+    assert_eq!(b_row.state, "invalidated");
+    let b_reason = b_row
+        .payload
+        .pointer("/payload/interaction/resolution/value/reason")
+        .and_then(Value::as_str);
+    assert_eq!(b_reason, Some("generation-ended"));
+    let _ = (sentinel_inst, cards_a, epoch1, epoch2, epoch3);
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// r11 item 6: the settlement frame a REAL /v1/follow follower receives after
+/// a transcript-picker demotion carries `reason:"agent-demoted"` — not the
+/// generation-ended value a hard-coded broadcast would send. Drives the real
+/// journal projection (shell_pty retire_payload shape), not just the
+/// in-process Settlement struct.
+#[tokio::test]
+async fn follower_frame_after_a_demotion_carries_agent_demoted_reason() -> Result<()> {
+    let r11_tmp = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(r11_tmp.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+
+    let (instance_id, int_id) =
+        seed_live_card(addr, &cookie, &node, &host_id, "r11 demotion frame").await?;
+
+    // Follower connects BEFORE the demotion so it takes the live bus frame.
+    let mut follow_req = format!("ws://{addr}/v1/follow").into_client_request()?;
+    follow_req.headers_mut().insert("Cookie", cookie.parse()?);
+    let follow_tcp = tokio::net::TcpStream::connect(addr).await?;
+    let (mut follow, _) = tokio_tungstenite::client_async(follow_req, follow_tcp).await?;
+    // Pump the initial snapshot/handshake out of the socket until the
+    // follower pump is subscribed (the first text frame proves the socket is
+    // live; a tiny settle window is enough).
+    // Drain any immediate frame (snapshot/replay) so the pump is subscribed.
+    let _ = tokio::time::timeout(Duration::from_secs(5), follow.next())
+        .await
+        .ok();
+
+    // The exact shell_pty retire_payload("invalidated", "agent-demoted")
+    // entity event.
+    node.append(
+        "jdemote-r11",
+        &instance_id,
+        json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "entity",
+                "entityType": "interaction",
+                "entityId": int_id,
+                "revision": "3",
+                "previousState": "pending",
+                "state": "invalidated",
+                "reasonCode": "agent-demoted",
+                "evidenceEventIds": [],
+                "entity": {
+                    "id": int_id,
+                    "state": "invalidated",
+                    "blocking": false,
+                    "answerable": false,
+                    "resolution": { "state": "unknown" }
+                }
+            }
+        }),
+    )
+    .await?;
+
+    // Read frames until the settlement frame for this interaction arrives.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut frame_reason = None;
+    while tokio::time::Instant::now() < deadline {
+        let Some(Ok(msg)) = tokio::time::timeout_at(deadline, follow.next())
+            .await
+            .ok()
+            .flatten()
+        else {
+            break;
+        };
+        let Message::Text(text) = msg else { continue };
+        let frame: Value = serde_json::from_str(&text)?;
+        if frame.get("type") == Some(&json!("settlement"))
+            && frame["interactionId"] == json!(int_id)
+        {
+            frame_reason = frame["reason"].as_str().map(str::to_string);
+            assert_eq!(frame["state"], json!("invalidated"));
+            break;
+        }
+    }
+    assert_eq!(
+        frame_reason.as_deref(),
+        Some("agent-demoted"),
+        "the live follow frame carries the real demotion reason, not generation-ended"
+    );
 
     hub.shutdown().await;
+    Ok(())
+}
+
+/// r11 item 6: same-epoch hellos reporting a swept host-lost instance with
+/// lifecycles OTHER than ready/running still revive it through the ws
+/// inventory mapping (starting/closing/""/unknown/reconciling), each landing
+/// the row on the mapped Hub lifecycle with the contact-loss marker cleared
+/// and the pending card untouched.
+#[tokio::test]
+async fn same_epoch_hello_revives_swept_rows_for_every_mapped_lifecycle() -> Result<()> {
+    // (reported lifecycle, expected Hub lifecycle)
+    for (reported, expected_life) in [
+        ("starting", "starting"),
+        ("preparing", "starting"),
+        ("closing", "closing"),
+        ("reconciling", "running"),
+        ("unknown", "running"),
+        ("", "running"),
+    ] {
+        let hub = spawn(HubConfig::for_test(
+            tempfile::tempdir()?.path().join("data"),
+        ))
+        .await?;
+        let addr = hub.addr;
+        let cookie = login(addr, &hub.bootstrap_token).await?;
+        let enroll = enroll_token(addr, &cookie).await?;
+        let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+        let (instance_id, card) =
+            seed_live_card(addr, &cookie, &node, &host_id, "r11 revive lifecycle").await?;
+
+        // Contact loss past grace: host-lost pseudo-terminal, card pending.
+        let store = hub.store().expect("hub store exposed to tests");
+        store
+            .mark_host_offline(host_id.as_id().as_str().to_string())
+            .await?;
+        let (swept, settlement) = store.expire_lost_hosts(0).await?;
+        assert_eq!(swept, 1, "the row is swept for reported={reported:?}");
+        assert!(settlement.interactions.is_empty());
+
+        // A fresh socket sends a SAME-epoch hello (the spawn hello used
+        // cs-fake-epoch-1) listing the instance with this lifecycle.
+        let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+        req.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", node.node_token()).parse()?,
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(req).await?;
+        let instances = if reported.is_empty() {
+            json!([{
+                "id": instance_id,
+                "hostId": host_id.as_id().as_str(),
+                "activity": "idle"
+            }])
+        } else {
+            json!([{
+                "id": instance_id,
+                "hostId": host_id.as_id().as_str(),
+                "lifecycle": reported,
+                "activity": "idle"
+            }])
+        };
+        socket
+            .send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0", "id": "hello-same", "method": "node.hello",
+                    "params": {
+                        "hostId": host_id.as_id().as_str(),
+                        "nodeVersion": "0.1.0",
+                        "nodeEpoch": "cs-fake-epoch-1",
+                        "instanceStoreFound": true,
+                        "instances": instances
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+        use futures::StreamExt;
+        let mut saw_result = false;
+        while let Ok(Some(Ok(frame))) =
+            tokio::time::timeout(Duration::from_secs(8), socket.next()).await
+        {
+            let Message::Text(text) = frame else { continue };
+            let frame: Value = serde_json::from_str(&text)?;
+            if frame.get("id") == Some(&json!("hello-same")) {
+                assert!(
+                    frame.get("result").is_some(),
+                    "hello failed for {reported:?}: {frame}"
+                );
+                saw_result = true;
+                break;
+            }
+        }
+        assert!(saw_result, "no hello result for reported={reported:?}");
+
+        // The row revived to the MAPPED lifecycle with the marker cleared.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (status, body) = http(
+                addr,
+                "GET",
+                &format!("/v1/instances/{instance_id}"),
+                &cookie,
+                None,
+            )
+            .await?;
+            assert_eq!(status, 200, "{body}");
+            let row: Value = serde_json::from_str(&body)?;
+            if row["lifecycle"] == json!(expected_life) {
+                assert!(
+                    row.get("lastError").is_none() || row["lastError"].is_null(),
+                    "revive clears the contact-loss marker for {reported:?}: {row}"
+                );
+                assert!(
+                    row.get("endedAt").is_none() || row["endedAt"].is_null(),
+                    "revive carries no end evidence for {reported:?}: {row}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "row never reached {expected_life}: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // The card survived the whole revive and is still answerable.
+        assert_eq!(
+            poll_card_state(addr, &cookie, &instance_id).await?,
+            "pending",
+            "the card stays pending after a {reported:?} revive"
+        );
+
+        hub.shutdown().await;
+    }
     Ok(())
 }

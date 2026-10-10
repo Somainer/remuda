@@ -126,6 +126,10 @@ pub struct AppState {
     /// bus send is synchronous (it never awaits a reader), so the section
     /// only serialises two settling writers for the duration of the send.
     settlement_publish: Arc<tokio::sync::Mutex<()>>,
+    /// c-cardsettle r11 item 1: test-only park seam for a follower's
+    /// settlement pump; always present but never armed in production.
+    #[cfg(any(test, feature = "test-faults"))]
+    follow_parks: crate::ws::FollowParks,
     tty: crate::ws::TtyRelay,
     /// D-048 relay stream registry (per-Hub-process).
     api_relay: crate::api_relay::ApiRelay,
@@ -728,6 +732,23 @@ impl RunningHub {
         (reached, release_tx)
     }
 
+    /// c-cardsettle r11 item 1: arm a park on the REAL `/v1/follow`
+    /// settlement pump, after it processes the live notice with seq
+    /// `after_seq`. `reached` resolves with the seq the pump parked at
+    /// (assert it equals `after_seq`); dropping/sending on `release` lets
+    /// the pump continue.
+    #[cfg(any(test, feature = "test-faults"))]
+    #[doc(hidden)]
+    pub async fn test_arm_follow_park(
+        &self,
+        after_seq: i64,
+    ) -> (
+        tokio::sync::oneshot::Receiver<i64>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.state.follow_parks.arm(after_seq).await
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into
@@ -1054,6 +1075,8 @@ async fn spawn_inner(
             tx
         },
         settlement_publish: Arc::new(tokio::sync::Mutex::const_new(())),
+        #[cfg(any(test, feature = "test-faults"))]
+        follow_parks: crate::ws::FollowParks::default(),
         tty: crate::ws::TtyRelay::default(),
         api_relay: crate::api_relay::ApiRelay::new(),
         push,

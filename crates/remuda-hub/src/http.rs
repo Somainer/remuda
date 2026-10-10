@@ -459,10 +459,16 @@ pub async fn list_instances(
     let mut items = state.store.list_instances(query.host_id).await?;
     items.retain(|instance| {
         // A contact-loss row is hidden from the default list (shown via
-        // include_history); the legacy "host-lost" spelling keeps its old
-        // ended meaning and is not filtered.
-        let mut keep = instance.last_error.as_deref() != Some(crate::store::HOST_LOST_MARKER)
-            || query.include_history;
+        // include_history). r8 item 1: BOTH the new "host-contact-lost"
+        // marker and the pre-r7 "host-lost" spelling stay hidden — the legacy
+        // rows are the same settled, host-gone sessions main always hid, and
+        // filtering only the new spelling brought them all back into the PWA
+        // list after the upgrade.
+        let host_lost = matches!(
+            instance.last_error.as_deref(),
+            Some(crate::store::HOST_LOST_MARKER | crate::store::LEGACY_HOST_LOST_MARKER)
+        );
+        let mut keep = !host_lost || query.include_history;
         if agent {
             let caller_id = device.instance_id.as_deref();
             let in_subtree = caller_id.is_some_and(|id| {

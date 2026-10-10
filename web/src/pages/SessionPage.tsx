@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -354,15 +355,21 @@ function SessionPageBody({
   // interactive surface on /s/:id. Shell renders ShellNotify as a sibling of
   // <main>, so a value set on a SessionPage node would not inherit to the
   // stack; ride documentElement (its common ancestor). The structured views
-  // render the session dock (composer control bar); the tty view renders no
-  // dock, so TerminalView hands up its bottom chrome (local input dock +
-  // phone key bar, + the byte-route note on desktop). Exactly one is mounted
-  // at a time and SessionPage is the single writer — two writers would race
-  // on the same property across the tty/structured switch. The hook clears
-  // the value with no element so non-session routes never see a stale height.
+  // render the session dock (composer control bar); the tty view renders its
+  // bottom chrome (local input dock + phone key bar, + the byte-route note on
+  // desktop) via TerminalView. On an ENDED tty session BOTH the tty chrome and
+  // the endedDock (Resume) mount, so their heights are summed rather than one
+  // hiding the other. SessionPage is the single writer; the hook clears the
+  // value with no element so non-session routes never see a stale height.
   const [dockEl, setDockEl] = useState<HTMLDivElement | null>(null);
   const [ttyChromeEl, setTtyChromeEl] = useState<HTMLDivElement | null>(null);
-  usePublishedElementHeight(dockEl ?? ttyChromeEl, "--session-dock-h");
+  // Stable identity: the hook observes every listed element, so a fresh array
+  // literal each render would re-subscribe constantly.
+  const bottomChromeEls = useMemo(
+    () => [dockEl, ttyChromeEl].filter((el): el is HTMLDivElement => el !== null),
+    [dockEl, ttyChromeEl],
+  );
+  usePublishedElementHeight(bottomChromeEls, "--session-dock-h");
   // Durable-lifecycle end state (a failed process is red; a Node restart is
   // toned — only a failed ending is ever painted red). It reads the durable
   // lifecycle only: the Hub marks an ended row disconnected (a Node restart

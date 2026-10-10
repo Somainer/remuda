@@ -52,6 +52,7 @@ test_command += [arg for name in crates for arg in ["-p", name]] if args.affecte
 definitions = [
     ("secret-scan", ["./scripts/ci/secret-scan.sh"], ".", 1),
     ("no-tunnel-scan", ["./scripts/ci/no-tunnel-scan.sh"], ".", 1),
+    ("no-host-wide-kills", ["./scripts/ci/no-host-wide-kills.sh"], ".", 1),
     ("cargo-fmt", ["cargo", "fmt", "--all", "--check"], ".", 1),
     ("cargo-check", ["cargo", "check", "--workspace", "--all-targets", "--locked"], ".", 1),
     ("cargo-clippy", ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"], ".", 1),

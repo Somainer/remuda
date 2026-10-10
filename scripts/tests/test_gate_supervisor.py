@@ -212,6 +212,12 @@ class GateDriverEndToEndTests(unittest.TestCase):
             pid = None
         if pid is not None:
             for sig in (signal.SIGTERM, signal.SIGKILL):
+                # Re-check visibility before EACH signal: once SIGTERM makes
+                # the pid disappear it may already be recycled, so the SIGKILL
+                # escalation must never reach a process this test did not
+                # start.
+                if not supervisor.pid_visible(pid):
+                    break
                 try:
                     os.kill(pid, sig)
                 except OSError:

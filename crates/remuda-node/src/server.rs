@@ -1096,6 +1096,7 @@ async fn dispatch_rpc(
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                        effort_ultracode: None,
                         permission_mode: None,
                     },
                 )
@@ -1166,6 +1167,7 @@ async fn submit_rpc_command(
                 model: None,
                 effort_name: None,
                 effort_index: None,
+                effort_ultracode: None,
                 permission_mode: None,
             },
         )

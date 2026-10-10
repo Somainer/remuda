@@ -715,6 +715,121 @@ it("r2 item 1: the version gate prefers the snapshot version, then the host's pi
   });
   expect(hubStore.effortVersionGate(legacyInstance.id)).toBe("legacy");
 
+/** Pin the followed test instance's reported Claude binary version (gate).
+ *  Also serves the pinned row from polls, so the post-configure refresh does
+ *  not drop the followed instance and regress the gate to unknown. */
+function pinGate(ctx: { instance: Instance }, version: string) {
+  const row: Instance = {
+    ...ctx.instance,
+    durableSeq: "99",
+    capabilities: { ...ctx.instance.capabilities, binaryVersion: version },
+  };
+  hubStore["emit"]({ instances: [row] });
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [row] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+}
+
+it("item 2 coupled: turning the switch on moves the slider to xhigh and posts {xhigh,on}", async () => {
+  const ctx = await startFollowing("coupled-on");
+  await pinGate(ctx, "2.1.277");
+  const posts: { name?: string; ultracode?: boolean; index?: number }[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  // Start at max, switch off.
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  posts.length = 0;
+  // Flip the switch on — the slider must jump to xhigh.
+  await hubStore.setUltracode(ctx.instance.id, true);
+  expect(posts).toHaveLength(1);
+  expect(posts[0]).toMatchObject({ name: "xhigh", ultracode: true });
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({
+    name: "xhigh",
+    index: 3,
+    ultracode: true,
+  });
+});
+
+it("item 2 coupled: sliding away from xhigh turns the switch off and never posts {non-xhigh,on}", async () => {
+  const ctx = await startFollowing("coupled-slide-away");
+  await pinGate(ctx, "2.1.277");
+  const posts: { name?: string; ultracode?: boolean }[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  // Switch on first (slider parks on xhigh).
+  await hubStore.setUltracode(ctx.instance.id, true);
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({ name: "xhigh", ultracode: true });
+  posts.length = 0;
+  // Drag the slider from xhigh down to high — exactly what the slider emits
+  // (the current flag rides along).
+  await hubStore.setEffort(ctx.instance.id, { index: 2, name: "high", kind: "claude", ultracode: true });
+  expect(posts).toHaveLength(1);
+  expect(posts[0]).toMatchObject({ name: "high", ultracode: false });
+  expect(posts.some((p) => p.ultracode === true && p.name !== "xhigh")).toBe(false);
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({ name: "high", ultracode: false });
+});
+
+it("item 2 coupled: a defensive {non-xhigh,on} drag from xhigh is clamped before the post", async () => {
+  const ctx = await startFollowing("coupled-clamp");
+  await pinGate(ctx, "2.1.277");
+  const posts: { name?: string; ultracode?: boolean }[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  // The switch is on at xhigh (the coupled parked state).
+  await hubStore.setUltracode(ctx.instance.id, true);
+  posts.length = 0;
+  // A slider drag emits the CURRENT flag with the new tier — {max,true} must
+  // never be posted on a coupled session.
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: true });
+  expect(posts).toHaveLength(1);
+  expect(posts[0]).toMatchObject({ name: "max", ultracode: false });
+});
+
+it("item 2 decoupled: a flip keeps the tier and posts the flag; a drag carries the flag", async () => {
+  const ctx = await startFollowing("decoupled-flag");
+  await pinGate(ctx, "2.1.289");
+  const posts: { name?: string; ultracode?: boolean }[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  // Flag on at high: the slider must NOT move to xhigh.
+  await hubStore.setEffort(ctx.instance.id, { index: 2, name: "high", kind: "claude", ultracode: false });
+  await hubStore.setUltracode(ctx.instance.id, true);
+  const onPost = posts.at(-1)!;
+  expect(onPost).toMatchObject({ name: "high", ultracode: true });
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({ name: "high", ultracode: true });
+  // Drag to max with the flag on: the boolean rides along unchanged.
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: true });
+  expect(posts.at(-1)).toMatchObject({ name: "max", ultracode: true });
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({ name: "max", ultracode: true });
+  // Flag off is a {max,false} flag-only post.
+  await hubStore.setUltracode(ctx.instance.id, false);
+  expect(posts.at(-1)).toMatchObject({ name: "max", ultracode: false });
+});
+
+it("item 2 legacy/unknown: the boolean fails closed even if a client posts it", async () => {
+  for (const version of ["2.1.180", ""]) {
+    const ctx = await startFollowing(version ? "legacy-flag" : "unknown-flag");
+    await pinGate(ctx, version);
+    const posts: { name?: string; ultracode?: boolean }[] = [];
+    vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+      posts.push(extras?.effort ?? {});
+      return {} as never;
+    });
+    await hubStore.setUltracode(ctx.instance.id, true);
+    expect(posts.at(-1)?.ultracode).toBe(false);
+    expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(false);
+    hubStore.logout();
+    vi.restoreAllMocks();
+  }
+});
+
 it("a read-back-unavailable edge clears the projection but keeps the pending switch (D-056 (4))", async () => {
   const ctx = await startFollowing("withdrawn");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);

@@ -32,7 +32,9 @@ import {
   type ServerRequestOptions,
 } from "./passkeys";
 import {
+  CLAUDE_XHIGH_INDEX,
   DEFAULT_EFFORT_INDEX,
+  coupledSelection,
   effortAt,
   effortFromRecord,
   claudeVersionGate,
@@ -3702,7 +3704,42 @@ class HubStore {
     return pending ?? null;
   }
 
-  async setEffort(instanceId: Id, effort: EffortSelection) {
+  /**
+   * Apply the live-session version gate to a requested selection BEFORE it is
+   * shown or posted (D-056 §3/§5):
+   *  - coupled (2.1.203–2.1.283): a flag-only switch ON (same tier) forces the
+   *    slider to xhigh and posts one `/effort ultracode`; a tier drag that
+   *    leaves xhigh switches the flag OFF, and `{non-xhigh, true}` is therefore
+   *    never produced.
+   *  - legacy/unknown: the boolean fails closed (the switch is locked in the
+   *    UI; never post true on the strength of an unreported version).
+   *  - decoupled (≥2.1.284): the two axes stay orthogonal.
+   */
+  private gateLiveEffort(instanceId: Id, requested: EffortSelection): EffortSelection {
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    if ((instance?.kind ?? "claude") !== "claude") return requested;
+    const gate = this.effortVersionGate(instanceId);
+    if (gate === "coupled") {
+      const current = this.state.effort[instanceId];
+      // Same tier as the current optimistic selection (or no tier yet) with
+      // the flag on = the switch itself was flipped → link it to xhigh.
+      if (requested.ultracode === true && (!current || current.name === requested.name)) {
+        return coupledSelection(requested);
+      }
+      // A tier move: the coupled flag exists only at xhigh.
+      if (requested.name !== "xhigh" || requested.index !== CLAUDE_XHIGH_INDEX) {
+        return requested.ultracode === true ? { ...requested, ultracode: false } : requested;
+      }
+      return requested;
+    }
+    if ((gate === "legacy" || gate === "unknown") && requested.ultracode === true) {
+      return { ...requested, ultracode: false };
+    }
+    return requested;
+  }
+
+  async setEffort(instanceId: Id, effortIn: EffortSelection) {
+    const effort = this.gateLiveEffort(instanceId, effortIn);
     const instance = this.state.instances.find((row) => row.id === instanceId);
     const busy =
       instance?.activity?.state === "known" ? instance.activity.value === "working" : false;
@@ -3787,9 +3824,10 @@ class HubStore {
   }
 
   /**
-   * Flip ONLY the ultracode switch axis, leaving the tier untouched (D-056
-   * decoupled ≥2.1.284). The caller applies the coupled-build linkage (on →
-   * xhigh) before calling, based on the session's version gate.
+   * Flip ONLY the ultracode switch axis, leaving the tier untouched on
+   * decoupled builds (D-056 ≥2.1.284). On coupled builds the gate linkage in
+   * {@link gateLiveEffort} moves the slider to xhigh when the switch turns on
+   * (one `/effort ultracode`); on legacy/unknown builds the flag fails closed.
    */
   async setUltracode(instanceId: Id, ultracode: boolean) {
     const current = this.effortOf(instanceId);

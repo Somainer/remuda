@@ -2780,6 +2780,7 @@ fn command_parts(
                 model: request.model.clone(),
                 effort: request.effort_name.clone(),
                 effort_index: request.effort_index,
+                effort_ultracode: request.effort_ultracode,
                 permission_mode: request.permission_mode.clone(),
             },
             false,
@@ -4078,7 +4079,7 @@ mod tests {
                 "instanceId": created.instance.meta.id,
                 "origin": "human",
                 "model": "opus",
-                "effort": { "index": 3, "name": "ultracode", "kind": "claude" }
+                "effort": { "index": 3, "name": "xhigh", "ultracode": true, "kind": "claude" }
             }),
         )
         .await
@@ -4140,7 +4141,10 @@ mod tests {
                     native.native_name == "instance.configure"
                         && native.status
                             == Knowledge::Known {
-                                value: "applied model=opus effort=ultracode index=3 permission=-"
+                                // D-056: the orthogonal boolean reaches the
+                                // driver alongside the level (xhigh), never as
+                                // the legacy "ultracode" level name.
+                                value: "applied model=opus effort=xhigh index=3 ultracode=true permission=-"
                                     .into(),
                             }
                 });

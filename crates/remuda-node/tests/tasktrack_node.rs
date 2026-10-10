@@ -217,6 +217,7 @@ impl Run {
                     model: None,
                     effort_name: None,
                     effort_index: None,
+                    effort_ultracode: None,
                     permission_mode: None,
                 },
             )

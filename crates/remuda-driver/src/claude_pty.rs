@@ -745,24 +745,42 @@ impl ClaudePtyDriver {
 }
 
 impl ClaudePtyDriver {
-    /// §9.1: type `/effort <level>` and let the transcript pump prove it.
-    async fn switch_effort(&self, level: &str) -> DriverResult<DriverAck> {
-        let Some(request) = crate::effort::EffortRequest::from_level(level) else {
-            // An honest refusal for a word the in-session command does not take
-            // (`auto` is a mode, and an unknown future name must not be typed
-            // and hoped about). The Node surfaces the rejection in the UI.
-            return Err(DriverError::CapabilityUnsupported(format!(
-                "claude /effort does not accept {level:?} in-session; \
-                 valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
-            )));
-        };
-        let (pane_id, session_id, queue, ready, io) = {
+    /// §9.1: type `/effort <level>` (plus the D-056 ultracode axis) and let
+    /// the transcript pump prove it.
+    async fn switch_effort(&self, level: &str, ultracode: Option<bool>) -> DriverResult<DriverAck> {
+        let (pane_id, session_id, queue, ready, io, request) = {
             let inner = self.inner.lock().await;
             let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
             if live.closed {
                 return Err(DriverError::ControlUnavailable);
             }
             require_session_start(live)?;
+            // D-056: the exact command word depends on the REPORTED build:
+            // coupled builds take one bare `ultracode`, decoupled builds take
+            // `ultracode on|off` for a same-tier toggle.
+            let semantics = remuda_protocol::parse_effort_version(&live.recipe.binary.version)
+                .unwrap_or(remuda_protocol::EffortSemantics::Unknown);
+            if ultracode == Some(true) && !remuda_protocol::ultracode_supported(semantics) {
+                return Err(DriverError::CapabilityUnsupported(format!(
+                    "ultracode requires Claude Code >= 2.1.203; this session reports {semantics:?} ({})",
+                    live.recipe.binary.version,
+                )));
+            }
+            let Some(request) = crate::effort::EffortRequest::for_configure(
+                level,
+                ultracode,
+                semantics,
+                live.effort_bridge.requested(),
+            ) else {
+                // An honest refusal for a word the in-session command does not
+                // take (`auto` is a mode, and an unknown future name must not
+                // be typed and hoped about). The Node surfaces the rejection in
+                // the UI.
+                return Err(DriverError::CapabilityUnsupported(format!(
+                    "claude /effort does not accept {level:?} in-session; \
+                     valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
+                )));
+            };
             let ready = crate::pty_interaction::prompt_ready(&live.client, &live.pane_id)
                 .await
                 .is_ok();
@@ -779,6 +797,7 @@ impl ClaudePtyDriver {
                 Arc::clone(&live.effort_queue),
                 ready,
                 Arc::new(io) as Arc<dyn crate::effort::EffortSwitchIo>,
+                request,
             )
         };
 
@@ -1046,7 +1065,7 @@ impl Driver for ClaudePtyDriver {
             && !level.is_empty()
             && switch.model_id.is_empty()
         {
-            return self.switch_effort(level).await;
+            return self.switch_effort(level, switch.effort_ultracode).await;
         }
         // §9.1: a model switch is `/model <id>` typed into the composer and
         // proven by the transcript verdict. (A combined model+effort configure

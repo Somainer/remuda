@@ -414,6 +414,9 @@ pub struct InstanceCommandRequest {
     /// Native effort index for `instance.configure`.
     #[serde(default)]
     pub effort_index: Option<u32>,
+    /// D-056 orthogonal ultracode flag for `instance.configure`.
+    #[serde(default)]
+    pub effort_ultracode: Option<bool>,
     /// Native permission-mode word for `instance.configure`.
     #[serde(default)]
     pub permission_mode: Option<String>,
@@ -437,6 +440,9 @@ impl InstanceCommandRequest {
                 .get("index")
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as u32);
+            // D-056: the orthogonal flag rides with the level; the driver picks
+            // the exact in-session word from the reported Claude version.
+            self.effort_ultracode = effort.get("ultracode").and_then(serde_json::Value::as_bool);
         }
         self.permission_mode = params
             .get("permissionMode")
@@ -481,5 +487,33 @@ mod tests {
             assert_eq!(request.effort_name.as_deref(), Some(name));
             assert_eq!(request.effort_index, Some(index));
         }
+    }
+
+    #[test]
+    fn configure_forwards_the_orthogonal_ultracode_boolean() {
+        // D-056: the flag rides with the level all the way to the driver,
+        // which picks the in-session word from the reported binary version.
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "xhigh", "ultracode": true, "index": 3, "kind": "claude" }
+        }));
+        assert_eq!(request.effort_name.as_deref(), Some("xhigh"));
+        assert_eq!(request.effort_ultracode, Some(true));
+
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "max", "ultracode": false, "index": 4, "kind": "claude" }
+        }));
+        assert_eq!(request.effort_name.as_deref(), Some("max"));
+        assert_eq!(request.effort_ultracode, Some(false));
+
+        // An omitted flag stays None (codex/grok level-only configure).
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request =
+            request.with_configure(&json!({ "effort": { "name": "high", "kind": "grok" } }));
+        assert_eq!(request.effort_ultracode, None);
     }
 }

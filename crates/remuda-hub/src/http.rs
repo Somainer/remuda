@@ -814,10 +814,10 @@ pub async fn delete_instance(
             }
             Ok(Some(_)) => "purged",
             Ok(None) => {
-                tracing::info!(
+                tracing::warn!(
                     instance_id = %chapter.instance_id,
                     host_id = %chapter.host_id,
-                    "node offline at delete; its instance directory is purged on reconnect"
+                    "node offline at delete; its instance directory is left behind — no purge-on-reconnect exists"
                 );
                 "node-offline"
             }
@@ -845,9 +845,11 @@ pub async fn delete_instance(
     // leaves no false "deleted" record) so it carries the real per-chapter
     // purge outcomes: `nodePurge` for the addressed chapter and, per r7
     // item 2 / r9 item 2, `chapterPurges` naming EVERY chapter — this is
-    // the durable record of which Nodes' data was not purged
-    // ("node-offline" is reconciled on reconnect; "purge-failed" needs
-    // manual attention). A failure here is logged, never a 500 (r9 item 1).
+    // the durable record of which Nodes' data was not purged. A
+    // `node-offline` / `purge-failed` outcome means the Node's per-instance
+    // data directory was NOT removed; there is deliberately no
+    // purge-on-reconnect (r10 item 3), so both outcomes are retained for
+    // manual follow-up. A failure here is logged, never a 500 (r9 item 1).
     state
         .store
         .append_audit(

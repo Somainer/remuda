@@ -356,6 +356,9 @@ impl Session {
             match ty {
                 "keep_alive" | "control_cancel_request" => continue,
                 "control_request" => {
+                    if let Ok(path) = std::env::var("FAKE_CLAUDE_STDIN_FILE") {
+                        record_stdin_marker(&path, &incoming);
+                    }
                     let subtype = incoming
                         .pointer("/request/subtype")
                         .and_then(Value::as_str)
@@ -372,6 +375,12 @@ impl Session {
                     self.handle_control_request(&incoming)?;
                 }
                 "control_response" => {
+                    // The response bypasses the main loop's marker; record it
+                    // here too so FIFO order tests see it (ma-sdk-state r4
+                    // item 5c).
+                    if let Ok(path) = std::env::var("FAKE_CLAUDE_STDIN_FILE") {
+                        record_stdin_marker(&path, &incoming);
+                    }
                     let echoed = incoming
                         .pointer("/response/request_id")
                         .and_then(Value::as_str)
@@ -466,6 +475,7 @@ fn record_stdin_marker(path: &str, incoming: &Value) {
     };
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{marker}");
+        let _ = file.sync_all();
     }
 }
 

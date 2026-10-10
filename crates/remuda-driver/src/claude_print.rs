@@ -311,7 +311,6 @@ fn workflow_status_is_terminal(status: &str) -> bool {
 
 struct Live {
     process: ClaudeProcess,
-    inbound: mpsc::Sender<Inbound>,
     pending: HashMap<InteractionId, PendingTool>,
     pending_by_native: HashMap<String, InteractionId>,
     recipe: LaunchRecipe,
@@ -661,7 +660,7 @@ impl ClaudePrintDriver {
             self.options.inherit_default_config,
         );
 
-        let (inbound, outbound, process) = ClaudeProcess::spawn_command(
+        let (_inbound, outbound, process) = ClaudeProcess::spawn_command(
             command,
             Path::new(&recipe.binary.abs_path),
             InitializeRequest::default(),
@@ -719,7 +718,6 @@ impl ClaudePrintDriver {
 
         *self.inner.live.lock().await = Some(Live {
             process,
-            inbound,
             pending: HashMap::new(),
             pending_by_native: HashMap::new(),
             recipe: recipe.clone(),
@@ -1027,9 +1025,11 @@ impl Driver for ClaudePrintDriver {
         id: InteractionId,
         answer: InteractionAnswer,
     ) -> DriverResult<DriverAck> {
-        // Mutate pending state under the lock, but do the stdin enqueue after
-        // the guard is released (r3 item 5).
-        let (inbound, payload) = {
+        // Mutate pending state under the lock and clone the ProcessWriter;
+        // the stdin enqueue happens after the guard is released (r3 item 5).
+        // r4 item 5(c): the response rides the SAME writer FIFO as prompts,
+        // so a later prompt/EOF can never overtake it.
+        let (writer, request_id, payload) = {
             let mut live = self.inner.live.lock().await;
             let Some(live) = live.as_mut() else {
                 return Err(DriverError::ControlUnavailable);
@@ -1040,12 +1040,12 @@ impl Driver for ClaudePrintDriver {
                 .ok_or(DriverError::ControlUnavailable)?;
             live.pending_by_native.remove(&pending.request_id);
             let payload = permission_from_answer(&pending.input, &answer)?;
-            (live.inbound.clone(), (pending.request_id, payload))
+            (live.process.writer(), pending.request_id, payload)
         };
-        inbound
-            .send(Inbound::control_success(payload.0, payload.1))
+        writer
+            .respond_control(request_id, payload)
             .await
-            .map_err(|_| DriverError::ControlUnavailable)?;
+            .map_err(map_wire)?;
         Ok(DriverAck::transport_written())
     }
 
@@ -1766,20 +1766,24 @@ async fn send_control(
     request_id: &str,
     payload: ControlSuccessPayload,
 ) -> DriverResult<()> {
-    // Clone the channel under the lock, then await the enqueue lock-free: an
-    // auto-allow response must not hold `live` across a potentially blocked
-    // write (r3 item 5: close/cancel always stay reachable).
-    let inbound = {
+    // ma-sdk-state r4 item 5(c): permission responses ride the SAME
+    // ProcessWriter FIFO queue as prompts, not the asynchronous inbound
+    // bridge (pub_in_tx -> inbound_forward task -> writer_tx). The bridge's
+    // extra enqueue hop let a prompt enqueued afterwards overtake an earlier
+    // response; the direct writer queue gives strict prompt/control order.
+    // Clone the writer under the lock, then await the enqueue lock-free so a
+    // blocked pipe never holds `live` (close/cancel stay reachable).
+    let writer = {
         let live = inner.live.lock().await;
         let Some(live) = live.as_ref() else {
             return Err(DriverError::ControlUnavailable);
         };
-        live.inbound.clone()
+        live.process.writer()
     };
-    inbound
-        .send(Inbound::control_success(request_id, payload))
+    writer
+        .respond_control(request_id, payload)
         .await
-        .map_err(|_| DriverError::ControlUnavailable)
+        .map_err(map_wire)
 }
 
 async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult<()> {

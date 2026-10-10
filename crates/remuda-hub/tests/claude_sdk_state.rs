@@ -829,3 +829,45 @@ async fn recorded_fixtures_fold_to_the_right_activity_per_result() -> Result<()>
     assert_eq!(node.task_error().await, None, "fake-node task panicked");
     Ok(())
 }
+
+/// ma-sdk-state r4 item 5(b): a LOCALLY-WRITTEN root turn opened with the
+/// REAL mapper (`begin_turn` + `turn_started_observation`, exactly as the
+/// live send path does before the write) folds through the Hub store:
+/// turn_started projects working, then the turn's settled result idles —
+/// no hand-made start fixture.
+#[tokio::test]
+async fn a_replay_local_root_turn_from_the_real_mapper_projects_working_then_idle() -> Result<()> {
+    use remuda_driver::{DriverKind, StdoutMapper};
+
+    let ctx = Ctx::boot().await;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await;
+    let id = ctx.create_holder(&mut node).await;
+    node.append(&id, session_started(SESSION));
+    ctx.wait_until(&id, |v| v["lifecycle"] == json!("running"))
+        .await;
+
+    // Open the settlement book and build the start exactly like the live
+    // publication path (not a hand-made lifecycle).
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
+    mapper.begin_turn();
+    let started = mapper
+        .turn_started_observation("msg-local-replay")
+        .expect("turn_started observation");
+    let start_event = serde_json::to_value(&started).expect("serialize");
+    let seq0 = ctx.durable_seq(&id).await;
+    node.append(&id, start_event);
+    ctx.after_append(&id, seq0).await;
+    assert_eq!(
+        ctx.get_instance(&id).await["activity"],
+        json!("working"),
+        "a real-mapper local turn start projects working"
+    );
+
+    // The settled first-turn result for the opened book idles.
+    node.append(&id, first_turn_result("turn_done", None));
+    ctx.wait_until(&id, |v| v["activity"] == json!("idle"))
+        .await;
+    let view = ctx.get_instance(&id).await;
+    assert_eq!(view["lifecycle"], json!("running"), "process still live");
+    Ok(())
+}

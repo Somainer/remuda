@@ -85,3 +85,37 @@ fn later_turn_workflow_intermediate_with_nonzero_index_keeps_working() {
         ]
     );
 }
+
+/// ma-sdk-state r4 item 5(b): a locally-written root turn opened with the
+/// REAL mapper (begin_turn + turn_started_observation, no process) drives
+/// engine_turn_activity Working, and its settled result drives Idle —
+/// mirroring the Hub replay ownership case.
+#[test]
+fn engine_activity_follows_a_real_mapper_local_root_turn() {
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
+    mapper.begin_turn();
+    let started = mapper.turn_started_observation("msg-local").expect("start");
+    assert_eq!(
+        engine_turn_activity(&started),
+        Some(Activity::Working),
+        "the real-mapper local turn start drives working"
+    );
+
+    let result = mapper
+        .map(serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result_index": 0,
+            "queued_turn_count": 0,
+            "num_turns": 1,
+            "session_id": SESSION,
+        }))
+        .expect("map result");
+    let result = result.into_iter().next().expect("one result observation");
+    assert_eq!(
+        engine_turn_activity(&result),
+        Some(Activity::Idle),
+        "the settled result for the locally-opened book idles"
+    );
+}

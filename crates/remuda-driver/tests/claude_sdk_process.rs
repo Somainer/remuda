@@ -1094,3 +1094,96 @@ async fn close_under_output_pressure_still_delivers_exactly_one_terminal_exit() 
          channel + aborted worker"
     );
 }
+
+/// ma-sdk-state r4 item 5(c): a host permission response must ride the SAME
+/// FIFO stdin queue as prompts. It used to go through the inbound bridge
+/// (pub_in_tx -> a forward task -> writer_tx), so a prompt enqueued
+/// afterwards could be written first. Record the child's actual stdin order
+/// and prove the `control_response` precedes the following `user` frame.
+#[tokio::test]
+async fn a_permission_response_is_written_before_a_later_prompt_on_one_fifo() {
+    let order = std::env::temp_dir().join(format!(
+        "sdk-fifo-{}.txt",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (_tmp, driver, spec) = driver_with_env(
+        ScriptKind::Approval,
+        BTreeMap::from([(
+            "FAKE_CLAUDE_STDIN_FILE".into(),
+            order.to_string_lossy().into_owned(),
+        )]),
+    );
+    let mut handle = driver.start(spec).await.expect("start");
+    driver.send(prompt("touch")).await.expect("send");
+    let events = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        obs.iter()
+            .any(|o| matches!(o.body, ObservationPayload::InteractionRequested(_)))
+    })
+    .await;
+
+    let interaction = events
+        .iter()
+        .find_map(|o| match &o.body {
+            ObservationPayload::InteractionRequested(payload) => Some(payload.interaction.clone()),
+            _ => None,
+        })
+        .expect("approval interaction");
+
+    // Respond to the approval, then enqueue ANOTHER prompt. Both now go
+    // through the single ProcessWriter FIFO.
+    driver
+        .respond_interaction(
+            interaction.meta.id.clone(),
+            remuda_protocol::InteractionAnswer::Approval(Box::new(
+                remuda_protocol::ApprovalAnswer {
+                    option_id: "allow".into(),
+                    input_digest: {
+                        use remuda_protocol::InteractionRequest;
+                        match interaction.request.clone() {
+                            InteractionRequest::Approval(req) => req.input_digest,
+                            _ => dummy_digest(),
+                        }
+                    },
+                },
+            )),
+        )
+        .await
+        .expect("respond");
+    // Distinct client id so the second prompt is not deduped.
+    let mut second = prompt("after approval");
+    if let DriverInput::Prompt(p) = &mut second {
+        p.native_client_message_id = "msg-2".into();
+    }
+    driver.send(second).await.expect("second send");
+
+    // Wait for the writer to flush and the fake to read both frames. Poll
+    // until both markers appear (the first `user` is only recorded when the
+    // fake plays the turn; the control_response marker is recorded inside
+    // the fake's wait loop).
+    let text = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let text = std::fs::read_to_string(&order).unwrap_or_default();
+            let lines = text.lines().collect::<Vec<_>>();
+            if lines.contains(&"control_response")
+                && lines.iter().filter(|l| **l == "user").count() >= 2
+            {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("both frames never recorded");
+    let markers: Vec<String> = text.lines().map(str::to_owned).collect();
+    let response_at = markers.iter().position(|l| l == "control_response");
+    let user_at = markers.iter().rposition(|l| l == "user");
+    assert!(
+        response_at < user_at,
+        "permission response must precede the later prompt on the wire: {markers:?}"
+    );
+
+    driver.close().await.expect("close");
+}

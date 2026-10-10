@@ -1858,7 +1858,7 @@ async fn follower_parked_after_kth_live_notice_drains_the_tail_of_a_then_b_in_se
 
     // ── Batch A (40 cards, LARGE ids) then settle it on a NEW epoch while
     // listing B's (still empty of cards) instance live.
-    let (inst_a, cards_a) =
+    let (_inst_a, cards_a) =
         ready_instance_with_cards(&hub, &cookie, &node, &host_id, "zzz-r11-a", 40).await?;
     let (inst_b, cards_b) =
         ready_instance_with_cards(&hub, &cookie, &node, &host_id, "aaa-r11-b", 120).await?;
@@ -1993,7 +1993,7 @@ async fn follower_parked_after_kth_live_notice_drains_the_tail_of_a_then_b_in_se
         .pointer("/payload/interaction/resolution/value/reason")
         .and_then(Value::as_str);
     assert_eq!(b_reason, Some("generation-ended"));
-    let _ = (sentinel_inst, cards_a, epoch1, epoch2, epoch3);
+    let _ = (sentinel_inst, _inst_a, cards_a, epoch1, epoch2, epoch3);
     hub.shutdown().await;
     Ok(())
 }
@@ -2103,15 +2103,15 @@ async fn same_epoch_hello_revives_swept_rows_for_every_mapped_lifecycle() -> Res
         ("unknown", "running"),
         ("", "running"),
     ] {
-        let hub = spawn(HubConfig::for_test(
-            tempfile::tempdir()?.path().join("data"),
-        ))
-        .await?;
+        // Bound to the loop iteration so the TempDir stays alive until the
+        // hub for this lifecycle is shut down at the iteration's end.
+        let r11_lifecycle_tmp = tempfile::tempdir()?;
+        let hub = spawn(HubConfig::for_test(r11_lifecycle_tmp.path().join("data"))).await?;
         let addr = hub.addr;
         let cookie = login(addr, &hub.bootstrap_token).await?;
         let enroll = enroll_token(addr, &cookie).await?;
         let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
-        let (instance_id, card) =
+        let (instance_id, _card) =
             seed_live_card(addr, &cookie, &node, &host_id, "r11 revive lifecycle").await?;
 
         // Contact loss past grace: host-lost pseudo-terminal, card pending.
@@ -2241,7 +2241,9 @@ async fn follower_receives_the_settlement_frame_after_a_force_delete() -> Result
     let follow_tcp = tokio::net::TcpStream::connect(addr).await?;
     let (mut follow, _) = tokio_tungstenite::client_async(follow_req, follow_tcp).await?;
     // Drain one frame so the pump is subscribed before the delete.
-    let _ = tokio::time::timeout(Duration::from_secs(5), follow.next()).await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(5), follow.next())
+        .await
+        .ok();
 
     // Force delete without an explicit close settlement first — the card is
     // settled INSIDE the delete transaction (r10 item 4(d)) and the frame is
@@ -2262,7 +2264,10 @@ async fn follower_receives_the_settlement_frame_after_a_force_delete() -> Result
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut got = false;
     while tokio::time::Instant::now() < deadline {
-        let Some(Ok(msg)) = tokio::time::timeout_at(deadline, follow.next()).await.ok().flatten()
+        let Some(Ok(msg)) = tokio::time::timeout_at(deadline, follow.next())
+            .await
+            .ok()
+            .flatten()
         else {
             break;
         };
@@ -2277,7 +2282,10 @@ async fn follower_receives_the_settlement_frame_after_a_force_delete() -> Result
             break;
         }
     }
-    assert!(got, "the follower received the delete transaction's settlement frame");
+    assert!(
+        got,
+        "the follower received the delete transaction's settlement frame"
+    );
 
     hub.shutdown().await;
     Ok(())

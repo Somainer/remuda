@@ -354,6 +354,14 @@ export type HubState = {
   interactionsHydrated: boolean;
   events: Record<string, Observation[]>;
   journalStatus: Record<string, JournalClient["status"]>;
+  /**
+   * Lowest LOADED (retained) journal seq per instance, mirrored from the
+   * JournalClient's descending pager. The transcript's load-earlier button
+   * points at THIS floor rather than the min event seq: a reconnect snapshot
+   * re-anchors the server window above manually paged rows, which stay held.
+   * "1" (or absent for an unfollowed instance) hides the button.
+   */
+  journalFloors: Record<string, string>;
   bubbles: LocalBubble[];
   permissionMode: Record<string, string>;
   effort: Record<string, EffortSelection>;
@@ -406,6 +414,7 @@ const initial: HubState = {
   interactionsHydrated: false,
   events: {},
   journalStatus: {},
+  journalFloors: {},
   bubbles: [],
   permissionMode: {},
   effort: {},
@@ -2494,6 +2503,7 @@ class HubStore {
         this.emit({
           instances: applyInstanceActivity(this.state.instances, fresh),
           events: { ...this.state.events, [instanceId]: merged },
+          journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq },
         });
       },
       onStatus: (status) => {
@@ -2510,6 +2520,10 @@ class HubStore {
       },
     });
     this.journals.set(instance.journalId, client);
+    // The seed rows crossed the events READ, not the follow socket: register
+    // them so a descending load-earlier window overlapping the seed counts as
+    // duplicate-only (advancing the cursor) rather than a false prepend.
+    client.noteHistory(history);
     client.applySnapshot({
       projectionVersion: "v1",
       projectionEpoch: id("epoch_"),
@@ -2525,6 +2539,7 @@ class HubStore {
       // load-earlier anchor and live-batch stale check).
       history: { earliestRetainedSeq: seed.windowFromSeq ?? "1", complete: seed.reachedAfterSeq },
     });
+    this.emit({ journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq } });
     await this.openFollowSocket(instance, client, last, {
       earliestRetainedSeq: seed.windowFromSeq ?? "1",
       complete: seed.reachedAfterSeq,
@@ -2611,13 +2626,21 @@ class HubStore {
     }
   }
 
-  /** Fetch one window of older history for the transcript's load-earlier row. */
+  /**
+   * Fetch one window of older history for the transcript's load-earlier row.
+   * Returns whether rows were prepended and whether the retained end was
+   * reached (null when the instance/journal is not followed here).
+   */
   async loadEarlier(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId);
     if (!instance) return null;
     const client = this.journals.get(instance.journalId);
     if (!client) return null;
-    return client.loadEarlier();
+    const result = await client.loadEarlier();
+    // Duplicate-only pages fire no onPrepend, so emit the (possibly advanced)
+    // retained floor here: the button must stay visible while history remains.
+    this.emit({ journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq } });
+    return result;
   }
 
   /**

@@ -759,16 +759,13 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
   }
 
   /** Non-essential chrome mounted before the keyboard must be display:none after. */
-  async function assertChromeCollapsed(
-    page: Page,
-    strip: ReturnType<Page["locator"]>,
-  ) {
+  async function assertChromeCollapsed(page: Page) {
     for (const testid of [
       "install-bar",
       "update-bar",
-      "resume-row",
       "run-details",
-      "annotation-dock",
+      "live-status-strip",
+      "annotation-badge-row",
       "task-track",
       "session-notifications",
       "transcript-toolbar",
@@ -776,10 +773,10 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       const locator = page.getByTestId(testid);
       if ((await locator.count()) > 0) await expect(locator).toBeHidden();
     }
-    await expect(strip).toBeVisible();
-    const stripBox = await strip.boundingBox();
-    expect(stripBox).toBeTruthy();
-    expect(stripBox!.height).toBeLessThanOrEqual(34);
+    // ui-spec §2 keyboard band: the live row folds away too (an ended
+    // session never mounts it) — the header's title block keeps the status
+    // dot and word.
+    await expect(page.getByTestId("session-status-label").first()).toBeVisible();
   }
 
   /**
@@ -818,6 +815,19 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
         band.bottom + 1,
       );
       expect(box!.height, `${name} height`).toBeGreaterThan(0);
+    }
+  }
+
+  /** An ended session has no composer: its EndedBar and Resume hold the band instead. */
+  async function assertEndedBarInBand(page: Page, band: Band) {
+    for (const testid of ["ended-bar", "resume-control"]) {
+      const box = await bandRect(page, `[data-testid='${testid}']`);
+      expect(box, `${testid} mounted`).not.toBeNull();
+      expect(box!.top, `${testid} top`).toBeGreaterThanOrEqual(band.top - 1);
+      expect(box!.bottom, `${testid} bottom`).toBeLessThanOrEqual(
+        band.bottom + 1,
+      );
+      expect(box!.height, `${testid} height`).toBeGreaterThan(0);
     }
   }
 
@@ -908,8 +918,9 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
   }
 
   async function assertChromeReturns(page: Page, installRequired: boolean) {
-    await expect(page.getByTestId("run-details")).toBeVisible();
-    await expect(page.getByTestId("resume-row")).toBeVisible();
+    // 运行详情 is a ⋯ item now (D-053); the header's ⋯ is the chrome that returns.
+    await expect(page.getByTestId("session-more-open")).toBeVisible();
+    await expect(page.getByTestId("ended-bar")).toBeVisible();
     if (installRequired)
       await expect(page.getByTestId("install-bar")).toBeVisible();
   }
@@ -935,9 +946,10 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
     test(`geometry — exited full-chrome session, ${label} ${width}x${height} / ${kb}px keyboard`, async ({
       page,
     }, testInfo) => {
-      // Geometry-only case by design: the owner's session was EXITED, so its
-      // composer is disabled and force-click only exercises the tap, not
-      // focus. Focus is covered by the enabled-composer case below.
+      // Geometry-only case by design: the owner's session was EXITED, so it
+      // has no composer (UO-6a: the EndedBar takes its place) and the keyboard
+      // band is raised mechanically. Focus is covered by the enabled-composer
+      // case below.
       if (!(await fakeHostId(page)))
         test.skip(true, "fake Node not registered");
       // Set the exact device viewport BEFORE login/navigation (the shared
@@ -957,14 +969,14 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
 
       // Trigger exists → missing chrome here is a real failure.
       await expect(sessionPage).toHaveAttribute("data-status", "exited");
-      await expect(page.getByTestId("resume-row")).toBeVisible();
-      await expect(page.getByTestId("run-details")).toBeVisible();
-      const strip = page.getByTestId("live-status-strip");
-      await expect(strip).toBeVisible();
-      // UO-6b: an EXITED session settles the strip — the final fixture event
-      // is the entity("exited") record, so the stale tool-started latch and
-      // its stall note no longer survive on a session that has ended.
-      await expect(strip).toHaveAttribute("data-phase", "turn-ended");
+      await expect(page.getByTestId("ended-bar")).toBeVisible();
+      // UO-6a: an ended session mounts the EndedBar in the composer's place.
+      await expect(page.getByTestId("composer-input")).toHaveCount(0);
+      await expect(page.getByTestId("session-more-open")).toBeVisible();
+      // UO-6a round 2: an ended SESSION says so once, in the EndedBar — the
+      // live strip (and its 「回合结束」, with any stale tool latch or stall
+      // note) is not mounted at all.
+      await expect(page.getByTestId("live-status-strip")).toHaveCount(0);
       await expect(page.getByTestId("live-health-hook")).toHaveCount(0);
       // The undismissed install offer the acceptance runs on iOS/WebKit must
       // show; on engines that never surface an offer the whole case skips
@@ -986,14 +998,13 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
         "AskUserQuestion",
       );
 
-      await page.getByTestId("composer-input").click({ force: true });
       if (evidence && width === 393)
         await shot(page, "m-realdevice-5-chrome-keyboard-down-390.png");
       await raiseKeyboardIosExact(page, kb);
       const band = await currentBand(page, height, kb);
 
-      await assertChromeCollapsed(page, strip);
-      await assertComposerInBand(page, band);
+      await assertChromeCollapsed(page);
+      await assertEndedBarInBand(page, band);
       // The combo fixture deliberately overflows the band: the pin must hold
       // the exact latest (running AskUserQuestion) row at the bottom edge.
       await assertScrollerInBand(page, band, true);

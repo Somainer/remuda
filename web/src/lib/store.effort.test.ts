@@ -463,9 +463,12 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   // The queued lifecycle has not been replayed yet.
   expect(hubStore.effortPendingOf(id)).toBeNull();
 
-  // Real load-earlier: floor 5 -> beforeSeq must be "4".
-  const floor = await hubStore.loadEarlier(id);
-  expect(floor).toBe("1");
+  // Real load-earlier: floor 5 -> beforeSeq must be "4". loadEarlier returns
+  // the bounded-read descriptor {prepended,end,floor} (UO-6a load-earlier).
+  const result = await hubStore.loadEarlier(id);
+  expect(result).not.toBeNull();
+  expect(result).toMatchObject({ prepended: true, end: true, floor: "1" });
+  expect(result!.floor).toBe("1");
   expect(olderRequests).toHaveLength(1);
   expect((olderRequests[0] as { beforeSeq?: string }).beforeSeq).toBe("4");
 

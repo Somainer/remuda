@@ -890,6 +890,27 @@ mod tests {
         from_node: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     }
+
+    impl NodeTransport for ScriptedStdio {
+        async fn send_json(&mut self, value: &Value) -> std::result::Result<(), remuda_ssh::Error> {
+            self.to_node
+                .send(value.clone())
+                .map_err(|_| remuda_ssh::Error::Disconnected)
+        }
+
+        async fn recv_json(&mut self) -> std::result::Result<Option<Value>, remuda_ssh::Error> {
+            let mut rx = self.from_node.lock().await;
+            tokio::select! {
+                frame = rx.recv() => Ok(frame),
+                _ = self.shutdown.wait_for(|stop| *stop) => Ok(None),
+            }
+        }
+
+        async fn close(&mut self) -> std::result::Result<(), remuda_ssh::Error> {
+            Ok(())
+        }
+    }
+
     /// c-dirpicker r9 item 1: the SSH-stdio carrier must run the SAME
     /// post-hello unregister abort sweep as the outbound WSS carrier. Drives
     /// the real `bridge_stdio_session` post-hello path with an unsettled

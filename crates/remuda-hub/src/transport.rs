@@ -453,8 +453,47 @@ impl NodeTransport for StdioTransport {
 }
 
 struct NodeSlot {
+    /// Registry session generation: bumped on every `insert`, used to retire a
+    /// stale WS session in `remove_generation`.
     generation: u64,
+    /// c-dirpicker r11 item 2: the durable per-host link generation the
+    /// adopting `node.hello` stamped in the hosts table when it registered
+    /// this transport. A forwarding attempt pins this value together with the
+    /// transport, so the generation it stamps on the command is the link the
+    /// prepare/commit actually ride.
+    link_generation: i64,
     link: Arc<dyn NodeTransport>,
+}
+
+/// A live (transport, durable link generation) pair pinned at the start of one
+/// forwarding attempt. The stamp, prepare and commit all go through THIS
+/// handle: with a half-open previous link still registered when the new
+/// hello's bump lands, pinning each separately could send a prepare on one
+/// link stamped for the other (r11 item 2).
+#[derive(Clone)]
+pub struct PinnedNodeCall {
+    #[allow(dead_code)] // retained so the pin is self-describing in debuggers
+    session_generation: u64,
+    /// The host link generation to stamp on commands forwarded on this pin.
+    link_generation: i64,
+    link: Arc<dyn NodeTransport>,
+}
+
+impl PinnedNodeCall {
+    /// The durable link generation this pin carries.
+    pub fn link_generation(&self) -> i64 {
+        self.link_generation
+    }
+
+    /// Send one JSON-RPC call on the pinned transport.
+    pub async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Option<Value>, HubError> {
+        self.link.call(method, params, timeout).await
+    }
 }
 
 /// Connected Node transports, keyed by host id.
@@ -472,16 +511,10 @@ impl ConnectedNodes {
         params: Value,
         timeout: Duration,
     ) -> Result<Option<Value>, HubError> {
-        let Some(link) = self
-            .inner
-            .lock()
-            .await
-            .get(host_id)
-            .map(|slot| slot.link.clone())
-        else {
-            return Ok(None);
-        };
-        link.call(method, params, timeout).await
+        match self.pin(host_id).await {
+            Some(pin) => pin.call(method, params, timeout).await,
+            None => Ok(None),
+        }
     }
 
     /// Send a notification (no `id`, no pending slot) to a connected Node.
@@ -492,26 +525,57 @@ impl ConnectedNodes {
         method: &str,
         params: Value,
     ) -> Result<bool, HubError> {
-        let Some(link) = self
-            .inner
+        let Some(pin) = self.pin(host_id).await else {
+            return Ok(false);
+        };
+        pin.link.notify(method, params).await
+    }
+
+    /// Pin the host's CURRENT (transport, durable link generation) atomically
+    /// under the registry lock. A forwarding attempt uses the returned handle
+    /// for every frame so a reconnect between frames cannot move one of them
+    /// onto a different link. `None` = no live session.
+    pub async fn pin(&self, host_id: &str) -> Option<PinnedNodeCall> {
+        self.inner
             .lock()
             .await
             .get(host_id)
-            .map(|slot| slot.link.clone())
-        else {
-            return Ok(false);
-        };
-        link.notify(method, params).await
+            .map(|slot| PinnedNodeCall {
+                session_generation: slot.generation,
+                link_generation: slot.link_generation,
+                link: slot.link.clone(),
+            })
     }
 
     /// Record a live session. Returns a generation used to retire only this session.
     pub async fn insert(&self, host_id: String, link: Arc<dyn NodeTransport>) -> u64 {
+        // Test seam: no real hello bumped a durable generation for a directly
+        // mounted scripted transport, so the slot carries 0.
+        self.insert_with_generation(host_id, link, 0).await
+    }
+
+    /// Record a live session together with the durable per-host link generation
+    /// the adopting hello just stamped (c-dirpicker r11 item 2). Returns the
+    /// registry SESSION generation used to retire this exact WS session.
+    pub async fn insert_with_generation(
+        &self,
+        host_id: String,
+        link: Arc<dyn NodeTransport>,
+        link_generation: i64,
+    ) -> u64 {
         let mut inner = self.inner.lock().await;
         let generation = inner
             .get(&host_id)
             .map(|slot| slot.generation.wrapping_add(1))
             .unwrap_or(1);
-        inner.insert(host_id, NodeSlot { generation, link });
+        inner.insert(
+            host_id,
+            NodeSlot {
+                generation,
+                link_generation,
+                link,
+            },
+        );
         generation
     }
 

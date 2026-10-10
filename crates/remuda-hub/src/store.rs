@@ -805,6 +805,29 @@ pub struct LineageChapter {
     pub fenced_at: Option<String>,
 }
 
+/// One chapter [`Store::deletion_plan`] reports: what a delete would remove,
+/// where its Node data lives, and the lifecycle the pre-check must gate on.
+#[derive(Clone, Debug)]
+pub struct DeleteChapter {
+    pub instance_id: String,
+    pub host_id: String,
+    pub lifecycle: String,
+}
+
+/// The outcome of the HTTP delete handler's side-effect-free pre-check
+/// (ma-lineage r7 items 1-2).
+#[derive(Clone, Debug)]
+pub enum DeletionScope {
+    /// A plain instance with no lineage row: the sole deletable row.
+    Plain(DeleteChapter),
+    /// A closed predecessor chapter: never deletable; its successors resolve
+    /// ownership through the row.
+    NonCurrent,
+    /// A lineage's CURRENT chapter: deleting it removes EVERY chapter listed
+    /// (plus the lineage row) in one transaction.
+    Current(Vec<DeleteChapter>),
+}
+
 /// Raw `lineages` columns, in SELECT order.
 type LineageRow = (
     String,
@@ -3103,7 +3126,7 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if !matches!(lifecycle.as_str(), "exited" | "failed" | "closed") {
-                    return Err(StoreError::Id(format!(
+                    return Err(StoreError::Conflict(format!(
                         "chapter {chapter_id} is {lifecycle}; stop every chapter before deleting \
                          the lineage"
                     )));
@@ -4321,13 +4344,17 @@ impl Store {
         ))
     }
 
-    /// Whether `instance_id` is its lineage's CURRENT chapter (ma-lineage r6
-    /// item 1): the HTTP delete handler checks this BEFORE any stop/lease/
-    /// purge/audit side effect. A plain instance with no `lineages` row is
-    /// always current.
-    pub async fn is_lineage_current_chapter(&self, instance_id: &str) -> Result<bool, StoreError> {
+    /// ma-lineage r7 item 1: the HTTP delete handler's side-effect-free
+    /// pre-check / work plan. It answers in ONE read:
+    ///
+    /// * whether the addressed chapter may be deleted at all (a closed
+    ///   predecessor chapter may not — [`DeletionScope::NonCurrent`]);
+    /// * every chapter row a delete would remove, each with host and
+    ///   lifecycle, so the handler can refuse while ANY chapter is still live
+    ///   (before stop/lease/purge/audit) and purge EVERY chapter's Node data.
+    pub async fn deletion_plan(&self, instance_id: &str) -> Result<DeletionScope, StoreError> {
         let instance_id = instance_id.to_owned();
-        self.run_named("is_lineage_current_chapter", move |conn| {
+        self.run_named("deletion_plan", move |conn| {
             let instance = load_instance(conn, &instance_id)?
                 .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
             let exists: bool = conn
@@ -4339,9 +4366,13 @@ impl Store {
                 .optional()?
                 .is_some();
             if !exists {
-                return Ok(true);
+                return Ok(DeletionScope::Plain(DeleteChapter {
+                    instance_id: instance.instance_id.clone(),
+                    host_id: instance.host_id.clone(),
+                    lifecycle: instance.lifecycle.clone(),
+                }));
             }
-            let current: bool = conn
+            let is_current = conn
                 .query_row(
                     "SELECT 1 FROM lineages WHERE lineage_id = ?2
                         AND current_instance_id = ?1",
@@ -4350,12 +4381,28 @@ impl Store {
                 )
                 .optional()?
                 .is_some();
-            Ok(current)
+            if !is_current {
+                return Ok(DeletionScope::NonCurrent);
+            }
+            let mut stmt = conn.prepare(
+                "SELECT id, host_id, lifecycle FROM instances
+                 WHERE lineage_id = ?1 ORDER BY generation ASC, created_at ASC",
+            )?;
+            let chapters = stmt
+                .query_map(params![&instance.lineage_id], |row| {
+                    Ok(DeleteChapter {
+                        instance_id: row.get(0)?,
+                        host_id: row.get(1)?,
+                        lifecycle: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(DeletionScope::Current(chapters))
         })
         .await
     }
 
-    /// D-057 §5: async edge used by `owns()`, the D-051 route and the
+    /// D-057 §5: lineage edge used by `owns()`, the D-051 route and the
     /// `GET /v1/lineages/{id}` read predicate. See [`lineage_owns_conn`].
     pub async fn lineage_owns(
         &self,

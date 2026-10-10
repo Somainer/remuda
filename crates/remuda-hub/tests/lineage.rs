@@ -1352,6 +1352,60 @@ async fn deleting_a_non_current_live_chapter_refuses_before_any_stop() -> Result
     Ok(())
 }
 
+/// ma-lineage r7 item 1: X was continued into Y while X is STILL `running`
+/// (the continuation close was accepted but the exit never arrived). A
+/// whole-lineage `DELETE Y?force=1` must refuse with 409 in the HTTP
+/// pre-check — `?force=1` stops only the addressed chapter, never the other
+/// chapters — and must send NOTHING first: no stop for Y, no worktree
+/// return, no instance.purge, and no delete audit row.
+#[tokio::test]
+async fn force_deleting_a_lineage_with_a_live_predecessor_refuses_without_frames() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // Continue X → Y while X stays live (no exit event is appended).
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    let delete_y = ctx
+        .http
+        .delete(format!("{}/v1/instances/{y}?force=1", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?;
+    assert_eq!(
+        delete_y.status(),
+        409,
+        "a lineage with a live predecessor refuses even with force=1"
+    );
+    assert!(
+        node.has_no_pending_frames().await,
+        "the refusal runs no stop/return/purge side effects"
+    );
+    // Both rows survive and no delete was audited.
+    assert!(ctx.get_instance(&x, &ctx.human).await?.is_object());
+    assert!(ctx.get_instance(&y, &ctx.human).await?.is_object());
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    let audits: i64 = db.query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'instance.delete'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(audits, 0, "a refused delete writes no audit row");
+    Ok(())
+}
+
 // --- 7. Ambiguous failed rows keep occupying seat/fan-out (ma-lineage r5) -
 
 /// Mark `id` failed with no ended_at and a plain turn/configure error — the

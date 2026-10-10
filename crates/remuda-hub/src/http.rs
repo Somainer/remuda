@@ -533,32 +533,80 @@ pub async fn delete_instance(
         .get_instance(instance_id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
-    // ma-lineage r6 item 1: refuse BEFORE any side effect (stop, worktree
-    // return, purge, audit) when this is a non-current continuity chapter —
-    // deleting it would orphan its successors. The store re-checks inside the
-    // delete transaction as a backstop.
-    if !state
-        .store
-        .is_lineage_current_chapter(&instance_id)
-        .await
-        .map_err(map_store)?
-    {
-        return Err(HubError::Conflict(format!(
-            "instance {instance_id} is a closed predecessor chapter; only the lineage's current \
-             chapter can be deleted (its successors resolve ownership through it)"
-        )));
-    }
     let force = query.force == Some(1);
-    let live = !matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed");
-
-    if live {
+    let chapter_is_live = |lifecycle: &str| !matches!(lifecycle, "exited" | "failed" | "closed");
+    // ma-lineage r6/r7 items 1-2: one side-effect-free pre-check decides
+    // everything the delete touches — whether the chapter is deletable at all
+    // (a closed predecessor chapter is not), and EVERY chapter row a
+    // whole-lineage delete would remove with host/lifecycle/task. No stop,
+    // lease return, purge or audit may run before this gate; the store
+    // transaction re-checks the same facts as a backstop.
+    let resolve_plan = || state.store.deletion_plan(&instance_id);
+    let mut chapters = match resolve_plan().await.map_err(map_store)? {
+        crate::store::DeletionScope::NonCurrent => {
+            return Err(HubError::Conflict(format!(
+                "instance {instance_id} is a closed predecessor chapter; only the lineage's current \
+                 chapter can be deleted (its successors resolve ownership through it)"
+            )));
+        }
+        crate::store::DeletionScope::Plain(chapter) => vec![chapter],
+        crate::store::DeletionScope::Current(chapters) => chapters,
+    };
+    let live: Vec<&crate::store::DeleteChapter> = chapters
+        .iter()
+        .filter(|chapter| chapter_is_live(&chapter.lifecycle))
+        .collect();
+    if !live.is_empty() {
+        // `?force=1` stops the ADDRESSED chapter only. When a WHOLE lineage is
+        // being deleted and some OTHER chapter (typically a predecessor whose
+        // exit never arrived after the continuation close) is still live, the
+        // request refuses here — BEFORE the addressed chapter is stopped and
+        // before any lease return, purge or audit (ma-lineage r7 item 1). The
+        // caller must settle every chapter first; the store transaction
+        // re-checks as a backstop and returns the same 409.
+        let only_addressed_live = live.len() == 1 && live[0].instance_id == instance_id;
         if !force {
             return Err(HubError::Conflict(format!(
                 "instance is {}; stop it first or retry with ?force=1",
                 instance.lifecycle
             )));
         }
+        if !only_addressed_live {
+            let offenders: Vec<String> = live
+                .iter()
+                .filter(|chapter| chapter.instance_id != instance_id)
+                .map(|chapter| format!("{} ({})", chapter.instance_id, chapter.lifecycle))
+                .collect();
+            return Err(HubError::Conflict(format!(
+                "refusing to delete the lineage: chapter(s) still live: {}; \
+                 ?force=1 only stops the addressed chapter — stop every chapter first",
+                offenders.join(", ")
+            )));
+        }
         stop_before_delete(&state, &instance).await?;
+        // The close can be ignored by a gone/closed link, so re-plan and
+        // refuse with 409 BEFORE any lease return, purge or audit rather than
+        // discovering a live chapter inside the delete transaction after the
+        // side effects ran.
+        chapters = match resolve_plan().await.map_err(map_store)? {
+            crate::store::DeletionScope::NonCurrent => {
+                return Err(HubError::Conflict(format!(
+                    "instance {instance_id} is a closed predecessor chapter; only the lineage's \
+                     current chapter can be deleted"
+                )));
+            }
+            crate::store::DeletionScope::Plain(chapter) => vec![chapter],
+            crate::store::DeletionScope::Current(chapters) => chapters,
+        };
+        if let Some(still_live) = chapters
+            .iter()
+            .find(|chapter| chapter_is_live(&chapter.lifecycle))
+        {
+            return Err(HubError::Conflict(format!(
+                "chapter {} is still {} after the stop; refusing to delete the lineage",
+                still_live.instance_id, still_live.lifecycle
+            )));
+        }
     }
 
     // t-pool: a deleted session must not leave its worktree lease pinned.

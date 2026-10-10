@@ -2554,7 +2554,6 @@ async fn a_live_child_with_closed_stdin_rejects_the_send_without_failing_the_ins
 
     // Wait for the live session (the child completed initialize, then closed
     // its stdin), giving that close a deterministic window.
-    let journal_path = format!("/v1/instances/{instance_id}/journal");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // The write fails: HTTP accepts the async command…
@@ -2572,29 +2571,43 @@ async fn a_live_child_with_closed_stdin_rejects_the_send_without_failing_the_ins
     )
     .await;
     assert_eq!(status, 200, "{body}");
+    let send_resp: Value = serde_json::from_str(body.trim()).expect("send json");
+    let command_id = send_resp["command"]["commandId"]
+        .as_str()
+        .expect("commandId on the accepted send")
+        .to_owned();
 
-    // …and the rejection becomes durable in the mirrored journal.
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    let mut journal = String::new();
-    while tokio::time::Instant::now() < deadline {
-        let (jstatus, body) = http(
-            hub.addr,
-            "GET",
-            &journal_path,
-            &[("Cookie", cookie.as_str())],
-            None,
-        )
-        .await;
-        assert_eq!(jstatus, 200, "{body}");
-        journal = body;
-        if journal.contains("rejected") {
-            break;
+    // Wait for the COMMAND's own settled record — not a raw "rejected" string:
+    // on a failed write the Node appends the `fake-driver-error` "rejected: …"
+    // diagnostic BEFORE the process_gone/record_task_exit branch settles the
+    // command (r5 item 4). Asserting on the early diagnostic raced the
+    // lifecycle and 409 checks; the settled record is the point after which the
+    // process-loss classification has run.
+    let journal_path = format!("/v1/instances/{instance_id}/journal");
+    let journal = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (jstatus, body) = http(
+                hub.addr,
+                "GET",
+                &journal_path,
+                &[("Cookie", cookie.as_str())],
+                None,
+            )
+            .await;
+            assert_eq!(jstatus, 200, "{body}");
+            let journal: Value = serde_json::from_str(body.trim()).expect("journal json");
+            if journal_has_command_state(&journal, &command_id, "settled") {
+                break serde_json::to_string(&journal).expect("journal");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await
+    .expect("the failed send command settles within the timeout");
+
     assert!(
         journal.contains("rejected"),
-        "the failed write must settle the command rejected: {journal}"
+        "the failed write settles the command rejected: {journal}"
     );
     assert!(
         !journal.contains("turn_started"),

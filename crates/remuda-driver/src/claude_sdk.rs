@@ -124,6 +124,15 @@ impl Driver for ClaudeSdkDriver {
         self.inner.close().await
     }
 
+    /// Forward the inner claude-print driver's own process-end evidence
+    /// (ma-sdk-state r5 item 4): without this the trait default always answers
+    /// false, so the Node treated a failed write against a live-but-gone child
+    /// as a control error rather than task loss and the claude_print override
+    /// was unreachable through the SDK carrier.
+    async fn process_gone(&self) -> bool {
+        self.inner.process_gone().await
+    }
+
     /// Resume is a **new** process with `--resume <id>` ([D-026]); the exited
     /// child is never resurrected and `--continue` is never passed.
     ///

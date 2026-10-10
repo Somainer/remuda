@@ -1366,3 +1366,47 @@ async fn an_older_buffered_result_cannot_settle_a_newer_outstanding_input_throug
     assert!(process_alive(&pid), "the sdk child survives both turns");
     driver.close().await.expect("close");
 }
+
+/// ma-sdk-state r5 item 4: once the sdk child has really exited (the reader
+/// emitted its terminal lifecycle), `process_gone` through the `Driver` trait
+/// must report true. Before forwarding, `ClaudeSdkDriver` fell back to the
+/// trait default (always false), so the inner claude-print evidence was
+/// unreachable and a failed write to a dead child was misread as a control
+/// error.
+#[tokio::test]
+async fn process_gone_is_true_through_the_driver_trait_after_the_child_exits() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    let as_driver: &dyn Driver = &driver;
+    assert!(
+        !as_driver.process_gone().await,
+        "a freshly launched live child is not gone"
+    );
+    driver.send(prompt("hi")).await.expect("send");
+    let _ = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+
+    driver.close().await.expect("close");
+    // Drain the terminal exit so the reader flips exit_emitted.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_exit = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), handle.recv()).await {
+            Ok(Some(obs)) => {
+                if lifecycle_named(&obs) == Some("session")
+                    && lifecycle_status(&obs) == Some("exited")
+                {
+                    saw_exit = true;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_exit, "the child emitted one session exited lifecycle");
+    assert!(
+        as_driver.process_gone().await,
+        "process_gone must forward the inner driver's end evidence"
+    );
+}

@@ -5107,6 +5107,75 @@ impl Store {
             .await
     }
 
+    /// c-dirpicker r7 item 1: settle a `queued`/`accepted` workspace mutation
+    /// command as `rejected` after the Node acked an abort. Unlike
+    /// [`Self::reject_command`] this also moves an `accepted` row (prepare
+    /// landed, commit never did) — the abort is positive evidence the unbind
+    /// did not execute.
+    pub async fn settle_workspace_command_aborted(
+        &self,
+        command_id: String,
+        reason: String,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        self.run_named("settle_workspace_command_aborted", move |conn| {
+            let now = now_rfc3339();
+            let changed = conn.execute(
+                "UPDATE commands
+                 SET state = 'settled', resolution = 'clear',
+                     settlement_outcome = 'rejected', settlement_reason = ?1,
+                     updated_at = ?2
+                 WHERE id = ?3 AND state IN ('queued', 'accepted')",
+                params![reason, now, command_id],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            load_command(conn, &command_id)
+        })
+        .await
+    }
+
+    /// c-dirpicker r7 item 1: `workspace.unregister` commands for a host that
+    /// never reached `settled` (prepare landed but commit did not, or the
+    /// frame was queued when a link died). The hello reconnect path aborts
+    /// them so the Node's durable unbinding mark is released.
+    ///
+    /// r9 item 2: only rows created strictly before `created_before` (the new
+    /// link's hello instant). A DELETE accepted on the NEW link is created at
+    /// or after that instant; aborting it would kill an in-flight removal the
+    /// operator just issued. Timestamps are fixed-width millisecond UTC
+    /// RFC3339 (see [`crate::config::now_rfc3339`]), so the lexical SQL
+    /// comparison is chronological.
+    pub async fn list_unsettled_workspace_unregisters(
+        &self,
+        host_id: &str,
+        created_before: &str,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        let host = host_id.to_owned();
+        let cutoff = created_before.to_owned();
+        self.run_named("list_unsettled_workspace_unregisters", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
+                        payload_json, idempotency_key, created_at, updated_at,
+                        settlement_outcome, settlement_reason,
+                        settlement_http_status, settlement_http_body,
+                        initiator_instance_id, initiator_lineage_id, initiator_generation,
+                        initiator_device_id
+                 FROM commands
+                 WHERE host_id = ?1
+                   AND operation = 'workspace.unregister'
+                   AND state IN ('queued', 'accepted')
+                   AND created_at < ?2
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![host, cutoff], command_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Recent commands for one instance, newest first, bounded by `limit`.
     ///
     /// Backs `GET /v1/instances/{id}/commands`: each row carries operation,

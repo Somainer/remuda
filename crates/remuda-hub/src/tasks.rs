@@ -367,6 +367,28 @@ async fn create_task(
     let budget = budget_from(body.budget);
     let class = class_from(body.class.as_deref())?;
     let binding_request = body.workspace_binding;
+    // c-dirpicker round 4 item 5: validate the binding ids (and mode) BEFORE
+    // the task row is created, so a malformed binding returns 400 without
+    // leaving a task behind (no rollback needed).
+    let admission_target: Option<(HostId, WorkspaceId)> = match binding_request.as_ref() {
+        Some(request) => {
+            if request.mode.as_str() != "reuse" && request.mode.as_str() != "pool" {
+                return Err(HubError::BadRequest(format!(
+                    "workspaceBinding.mode must be `reuse` or `pool` (got {:?})",
+                    request.mode
+                )));
+            }
+            let host_id = HostId::try_from(request.host_id.clone()).map_err(|error| {
+                HubError::BadRequest(format!("workspaceBinding.hostId: {error}"))
+            })?;
+            let workspace_id =
+                WorkspaceId::try_from(request.workspace_id.clone()).map_err(|error| {
+                    HubError::BadRequest(format!("workspaceBinding.workspaceId: {error}"))
+                })?;
+            Some((host_id, workspace_id))
+        }
+        None => None,
+    };
     let task = state
         .store
         .create_task(
@@ -395,6 +417,64 @@ async fn create_task(
     // A lease refusal (pool full → 429, dirty tree/branch conflict → 409) never
     // silently creates the task on another directory: the half-written row is
     // rolled back and the refusal is returned (D-035).
+    //
+    // c-dirpicker round 3 item 6: hold the per-workspace unbind lock for the
+    // whole bind+publish so an unregister DELETE cannot observe this task's
+    // workspace before its binding is durable. Ids/mode were validated before
+    // the task row was created (round 4 item 5).
+    let _admission_guard = if let Some((host_id, workspace_id)) = &admission_target {
+        Some(
+            crate::workspaces::hold_workspace_operation(
+                host_id.as_id().as_str(),
+                workspace_id.as_id().as_str(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    // Round 6 item 3: test-only park point after the guard is acquired and
+    // before the binding is published (the task row exists but has no binding
+    // while parked). No-op in production.
+    if let Some((host_id, workspace_id)) = &admission_target {
+        state
+            .race_barriers
+            .wait_if_armed(
+                crate::workspaces::RacePhase::TaskBind,
+                host_id.as_id().as_str(),
+                workspace_id.as_id().as_str(),
+            )
+            .await;
+        // c-dirpicker r7 item 8: re-verify Hub membership AFTER acquiring the
+        // guard. The ids were validated before the row was created, but an
+        // unregister that won the guard earlier can have settled and removed
+        // the workspace while this task waited to acquire; binding a task to a
+        // removed directory must 409 with the half-written row rolled back,
+        // same as any other binding refusal.
+        let bound_host = host_id.as_id().as_str().to_owned();
+        let bound_workspace = workspace_id.as_id().as_str().to_owned();
+        let member = state
+            .store
+            .run_named("create_task_recheck_workspace", move |conn| {
+                let (_, workspaces) = crate::workspaces::load_snapshot(conn, &bound_host)?;
+                Ok(workspaces
+                    .iter()
+                    .any(|row| row["workspaceId"].as_str() == Some(bound_workspace.as_str())))
+            })
+            .await
+            .map_err(map_store)?;
+        if !member {
+            let _ = state
+                .store
+                .delete_task_cascade(task.meta.id.as_id().to_string())
+                .await;
+            return Err(HubError::Conflict(format!(
+                "workspace {} unregistered before the task binding settled; choose another \
+                 directory",
+                workspace_id.as_id()
+            )));
+        }
+    }
     let sharing = if let Some(request) = binding_request.as_ref() {
         match bind_task_directory(&state, &body.project_id, &task, request, &authority).await {
             Ok((binding, sharing, acquired_lease)) => {

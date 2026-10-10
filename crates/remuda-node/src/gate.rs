@@ -843,21 +843,31 @@ impl DevNode {
             }
         };
         #[cfg(unix)]
-        if let Some(pid) = child.id() {
-            *live
-                .pgid
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) =
-                Some(i32::try_from(pid).unwrap_or(0));
+        {
+            // None id (or an unconvertible one) leaves the pgid unset: a
+            // Some(0) here would later become killpg(0) against the Node's
+            // own process group.
+            if let Some(pid) = child.id()
+                && let Ok(pgid) = i32::try_from(pid)
+            {
+                *live
+                    .pgid
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(pgid);
+            }
         }
 
         // Stream gate.jsonl step results as they are flushed (gate.sh flushes
-        // every step), and stderr lines as log events.
+        // every step), and stderr lines as log events. Scoped to this child's
+        // own scratch roots: another merge in the same TMPDIR must not leak
+        // its steps into this job.
         let run_started = std::time::SystemTime::now();
+        let child_pid = child.id().unwrap_or(0);
         let step_task = tokio::spawn(stream_gate_report(
             self.clone(),
             request.job_id.clone(),
             run_started,
+            child_pid,
         ));
         let mut stderr_task: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(stderr) = child.stderr.take() {
@@ -1111,10 +1121,22 @@ impl WaitWithOutputPiped for tokio::process::Child {
     }
 }
 
-/// Tail every `<tmp>/remuda-mq-*/gate.jsonl` the merge gate flushes and emit
-/// one step event per new line. Only reports modified at or after the run
-/// started (mtime granularity tolerated) are eligible.
-async fn stream_gate_report(node: DevNode, job_id: String, run_started: std::time::SystemTime) {
+/// Tail this run's `<tmp>/remuda-mq-<child_pid>-*/gate.jsonl` and emit one
+/// step event per new line. Only reports modified at or after the run started
+/// (mtime granularity tolerated) are eligible.
+///
+/// The merge CLI names each scratch root after its OWN pid
+/// (`remuda-mq-<pid>-<n>-<nanos>`, crates/remuda/src/cmd/merge/scratch.rs), so
+/// the child pid scopes the tail to this single run. Tailing every
+/// `remuda-mq-*` dir made concurrent tests and real landing gates on the same
+/// TMPDIR stream one another's step results into the wrong job.
+async fn stream_gate_report(
+    node: DevNode,
+    job_id: String,
+    run_started: std::time::SystemTime,
+    child_pid: u32,
+) {
+    let own_prefix = format!("remuda-mq-{child_pid}-");
     let window_start = run_started - Duration::from_secs(5);
     let mut offsets: BTreeMap<PathBuf, u64> = BTreeMap::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -1122,11 +1144,7 @@ async fn stream_gate_report(node: DevNode, job_id: String, run_started: std::tim
         let temp = std::env::temp_dir();
         if let Ok(entries) = std::fs::read_dir(&temp) {
             for entry in entries.flatten() {
-                if !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("remuda-mq-")
-                {
+                if !entry.file_name().to_string_lossy().starts_with(&own_prefix) {
                     continue;
                 }
                 let report = entry.path().join("gate.jsonl");
@@ -1843,7 +1861,8 @@ mod tests {
     /// removed — and reports its real sha. The commit is left unreferenced, so
     /// only the runner's own pin can keep it alive.
     const PASSING_REAL_MERGE_SCRIPT: &str = r#"
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-fake.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-$$-0-XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
 echo '{"name":"cargo-test","status":"ok","durationMs":22,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
 base=$(git rev-parse main)
 # The shared fixture's branch points at main, so give it a commit of its own;
@@ -1866,7 +1885,8 @@ JSON
 "#;
 
     const PASSING_SCRIPT: &str = r#"
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-fake.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-$$-0-XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
 echo '{"name":"secret-scan","status":"ok","durationMs":11,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
 echo '{"name":"cargo-test","status":"ok","durationMs":22,"attempts":1,"retried":false}' >> "$scratch/gate.jsonl"
 echo 'gate: secret-scan' >&2
@@ -1881,7 +1901,8 @@ JSON
 
     const FAILING_CARGO_TEST_SCRIPT: &str = r#"
 set +e
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-fake.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-$$-0-XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
 echo '{"name":"secret-scan","status":"ok","durationMs":11,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
 emit_fail() {
     echo 'gate: cargo-test' >&2
@@ -1965,7 +1986,7 @@ JSON
         // The scratch worktree is gone, so the pin is the only thing keeping
         // the merge alive: prove it survives a prune+gc.
         assert!(
-            !git(&fixture.lane, &["worktree", "list"]).contains("remuda-mq-fake"),
+            !git(&fixture.lane, &["worktree", "list"]).contains("remuda-mq-"),
             "the fake merge must have removed its scratch worktree"
         );
         git(&fixture.lane, &["worktree", "prune"]);
@@ -2131,6 +2152,88 @@ JSON
         );
     }
 
+    /// A `gate.jsonl` under ANOTHER merge's pid scratch root must never be
+    /// streamed into this job: the tailer is scoped to the child pid this
+    /// runner spawned. Re-exec'd under a private TMPDIR (see the inner test)
+    /// so the planted foreign root never lands in the host's ambient temp dir.
+    #[test]
+    fn a_foreign_runs_gate_report_is_not_streamed() {
+        let scratch = TempDir::new().expect("private TMPDIR");
+        let exe = std::env::current_exe().expect("test binary");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "gate::tests::foreign_gate_report_is_not_streamed_inner",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env("TMPDIR", scratch.path())
+            .output()
+            .expect("re-exec the foreign-report test under a private TMPDIR");
+        assert!(
+            output.status.success(),
+            "foreign-report test broke under a private TMPDIR\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "the inner foreign-report test did not run: {stdout}"
+        );
+    }
+
+    /// Inner half of [`a_foreign_runs_gate_report_is_not_streamed`]: runs in a
+    /// re-exec'd process whose TMPDIR is private, so the foreign root it
+    /// plants can neither collide with another test run's nor pollute the
+    /// host ambient temp dir.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "re-exec'd by a_foreign_runs_gate_report_is_not_streamed under a private TMPDIR"]
+    async fn foreign_gate_report_is_not_streamed_inner() {
+        let fixture = fixture(PASSING_SCRIPT);
+        // Simulate a concurrent gate on this host: fresh, mtime-fresh report
+        // under a pid this runner did not spawn.
+        let foreign = std::env::temp_dir().join("remuda-mq-999999-0-1");
+        let _ = std::fs::remove_dir_all(&foreign);
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(
+            foreign.join("gate.jsonl"),
+            "{\"name\":\"foreign-other-gate\",\"status\":\"ok\",\"durationMs\":99,\"attempts\":1,\"retried\":false}\n",
+        )
+        .unwrap();
+        let mut events = fixture.node.gate_registry().subscribe();
+        let result = fixture
+            .node
+            .run_gate_typed(params(&fixture, "verify"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status,
+            "passed",
+            "{}",
+            result.error.unwrap_or_default()
+        );
+        let mut streamed = Vec::new();
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(Duration::from_millis(300), events.recv()).await
+        {
+            if let GateEventKind::Step { step } = event.kind {
+                streamed.push(step.name);
+            }
+        }
+        std::fs::remove_dir_all(&foreign).ok();
+        assert!(
+            streamed.iter().all(|name| name != "foreign-other-gate"),
+            "a foreign gate's step leaked into this job's stream: {streamed:?}"
+        );
+        assert!(
+            streamed.iter().any(|name| name == "cargo-test"),
+            "the run's own steps must still stream: {streamed:?}"
+        );
+    }
+
     /// Regression for hosts where the coordinator exports `TMPDIR` outside
     /// `/tmp` (the shared build host): the fake gate must flush its report
     /// under `$TMPDIR` — the same root the runner's `std::env::temp_dir()`
@@ -2216,22 +2319,22 @@ JSON
             "{streamed:?}"
         );
 
-        // The fake gate's scratch really landed under $TMPDIR, not hardcoded
-        // back under /tmp.
-        let scratches = std::fs::read_dir(&tmpdir)
+        // The streamed steps prove the tailer scanned $TMPDIR (not hardcoded
+        // /tmp); the fake gate also removes its scratch root on exit, so none
+        // of the pid-named dirs may remain.
+        let leftovers = std::fs::read_dir(&tmpdir)
             .unwrap()
             .flatten()
             .filter(|entry| {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("remuda-mq-fake.")
-                    && entry.path().join("gate.jsonl").is_file()
+                    .starts_with("remuda-mq-")
             })
             .count();
-        assert!(
-            scratches > 0,
-            "the fake gate must flush gate.jsonl under $TMPDIR"
+        assert_eq!(
+            leftovers, 0,
+            "the fake gate must remove its scratch root under $TMPDIR"
         );
     }
 

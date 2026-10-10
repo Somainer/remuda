@@ -1,7 +1,9 @@
 //! Durable Node-owned workspace membership and registration policy (D-023).
 
 use crate::{DevNode, DevServerConfig, NodeError};
-use remuda_protocol::hubnode::{WorkspaceMutationParams, WorkspaceMutationPhase};
+use remuda_protocol::hubnode::{
+    WorkspaceMutationParams, WorkspaceMutationPhase, WorkspaceResolveParams,
+};
 use remuda_protocol::{HostId, Workspace, WorkspaceId, path_guard};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -10,6 +12,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -18,6 +21,13 @@ struct RegistryState {
     revision: u64,
     workspaces: Vec<Workspace>,
     commands: BTreeMap<String, Mutation>,
+    /// Workspaces with a prepared-but-uncommitted unregister. New sessions
+    /// are refused here between prepare and commit, closing the
+    /// check-then-unbind race (c-dirpicker round 2 item 6). The flag is set
+    /// atomically with the occupancy check under the registry write lock and
+    /// disappears with the membership row at commit.
+    #[serde(default)]
+    unbinding: std::collections::HashSet<WorkspaceId>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -29,13 +39,34 @@ struct Mutation {
     #[serde(default)]
     was_registered: bool,
     settled: bool,
+    /// r7 item 1: a prepared mutation that was aborted before it committed.
+    /// An aborted unregister has its membership row and its unbinding mark
+    /// cleared of the mark; the workspace is usable again.
+    #[serde(default)]
+    aborted: bool,
 }
+
+/// Test-only async barrier between create resolution and occupancy
+/// reservation (c-dirpicker round 4 item 2). Defined here so both the
+/// runtime field and the workspace mutation tests share the type.
+#[cfg(test)]
+pub(crate) type CreateBarrierFn = std::sync::Arc<
+    dyn Fn(&WorkspaceId) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub(crate) struct WorkspaceRegistry {
     state: RegistryState,
     file: Option<PathBuf>,
-    roots: Vec<PathBuf>,
+    roots: Vec<crate::dir_browser::AllowedRoot>,
     host_id: HostId,
+    /// In-memory (never persisted) occupancy reservations held by instance
+    /// creates from admission until their row is durably inserted (or the
+    /// create fails and the guard drops). Unregister prepare counts them
+    /// together with live instances, so a create that passed admission but
+    /// has not inserted yet cannot be overtaken by an unbind (round 3 item 6).
+    reservations: Arc<std::sync::Mutex<std::collections::HashMap<WorkspaceId, u32>>>,
 }
 
 impl WorkspaceRegistry {
@@ -49,9 +80,14 @@ impl WorkspaceRegistry {
         if configured_roots.is_empty() {
             return Err(NodeError::InvalidConfig("workspace_roots is empty and HOME is unavailable; configure an absolute allowed directory".into()));
         }
+        // Canonicalize once at policy load and pin each root's identity; a
+        // later symlinked/replaced ancestor is refused by the directory
+        // browser (c-dirpicker round 3). Identity is mandatory on unix
+        // (round 4 item 1): an un-stat-able root fails policy load instead of
+        // silently browsing unpinned.
         let roots = configured_roots
             .iter()
-            .map(|root| canonical_directory(root))
+            .map(|root| canonical_directory(root).and_then(crate::dir_browser::AllowedRoot::new))
             .collect::<Result<Vec<_>, _>>()?;
         let file = config
             .workspace_registry
@@ -69,7 +105,22 @@ impl WorkspaceRegistry {
             file,
             roots,
             host_id,
+            reservations: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
+        // r7 item 1: an unbinding mark only makes sense for a mutation that is
+        // IN FLIGHT in this process. In-flight state is memory-only, so after
+        // a (re)start NOTHING is in flight: every persisted mark belongs to a
+        // prepare whose commit/abort never landed (crash, kill-9, power loss).
+        // Drop those marks here — the Hub reconciles the command on reconnect
+        // and a create must not wait forever for a settle that cannot come.
+        let stale_marks = registry.state.unbinding.len();
+        registry.state.unbinding.clear();
+        if stale_marks > 0 {
+            tracing::info!(
+                count = stale_marks,
+                "cleared stale unbinding marks for commands not in flight at registry open"
+            );
+        }
         // Persisted entries may be deleted, unmounted, or disallowed by a tightened
         // policy. Keep them listable/removable; session and worktree admission
         // revalidate current existence, canonical identity, and allowlist.
@@ -91,19 +142,181 @@ impl WorkspaceRegistry {
         self.state.workspaces.clone()
     }
 
+    /// Canonical allowlist roots (with pinned identities) workspace
+    /// registration and the directory browser (c-dirpicker) are confined to.
+    pub(crate) fn allowed_roots(&self) -> &[crate::dir_browser::AllowedRoot] {
+        &self.roots
+    }
+
     pub(crate) fn snapshot(&self) -> Value {
         json!({"workspaceRevision": self.state.revision, "workspaces": self.state.workspaces.iter().map(|workspace| {
             json!({"workspaceId": workspace.meta.id, "hostId": workspace.host_id, "root": workspace.root_path})
         }).collect::<Vec<_>>()})
     }
 
+    /// Reserve one occupancy slot. The caller MUST hold the registry's write
+    /// guard (see [`DevNode::reserve_workspace`]); this never takes the
+    /// registry RwLock itself, so it is safe to call from inside [`mutate`]'s
+    /// closure too. The counter has its own mutex because the returned guard
+    /// releases the slot after the registry guard was dropped (the create
+    /// holds it across an await).
+    ///
+    /// Round 4 item 2: this also re-validates *membership* under the same
+    /// write lock. A create resolves its workspace earlier (a slow
+    /// canonicalize/worktree probe) while only holding a read lock; an
+    /// unregister can commit and remove the membership in that window.
+    /// Checking both membership and unbinding here, atomically with the
+    /// reservation, closes the gap.
+    pub(crate) fn reserve_locked(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceReservation, NodeError> {
+        let root_path = self
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.meta.id == workspace_id)
+            .ok_or_else(|| {
+                NodeError::Conflict(format!(
+                    "workspace {} is no longer registered on this Node",
+                    workspace_id.as_id()
+                ))
+            })?
+            .root_path
+            .clone();
+        if self.state.unbinding.contains(workspace_id) {
+            return Err(NodeError::Conflict(format!(
+                "workspace {} is being unregistered; wait for it to settle before starting a session",
+                root_path
+            )));
+        }
+        *self
+            .reservations
+            .lock()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .entry(workspace_id.clone())
+            .or_insert(0) += 1;
+        Ok(WorkspaceReservation {
+            workspace_id: workspace_id.clone(),
+            table: self.reservations.clone(),
+            released: false,
+        })
+    }
+
+    /// Current in-flight create reservations for a workspace. Caller holds
+    /// the registry write lock; the reservation table is locked only for the
+    /// read.
+    fn reservation_count_locked(&self, workspace_id: &WorkspaceId) -> u32 {
+        self.reservations
+            .lock()
+            .map(|map| map.get(workspace_id).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// Resolve an unregister candidate while the caller ALREADY holds a
+    /// registry lock.
+    ///
+    /// Production takes the lock-free [`DevNode::resolve_unregister`] path,
+    /// which runs its access probe with no lock held. This locked form stays
+    /// for direct callers (unit tests) and must not be used from a route that
+    /// can race a create reservation: its `realpath` probe spawns a shell and
+    /// can block on a slow mount for the whole probe timeout.
+    ///
+    /// Identity semantics an unregister accepts:
+    /// * an absolute path;
+    /// * the exact stored canonical root bytes, matched as a string (a
+    ///   trailing `/`, a `.` component or a repeated separator is a DIFFERENT
+    ///   spelling and never takes this shortcut — r7 item 2);
+    /// * anything else goes through [`canonical_directory`] — a real `realpath`
+    ///   with the access probe, never a lexical `..` collapse
+    ///   (`/allowed/link/../p` resolves where the symlink actually points);
+    /// * the result must match a currently registered workspace, and the
+    ///   returned path is ALWAYS that row's stored root bytes.
+    pub(crate) fn resolve_unregister_locked(
+        &self,
+        candidate: &Path,
+    ) -> Result<(WorkspaceId, PathBuf), NodeError> {
+        if !candidate.is_absolute() {
+            return Err(NodeError::InvalidRequest(
+                "workspace path must be absolute".into(),
+            ));
+        }
+        // A deleted project remains removable using its stored canonical
+        // absolute path; for that EXACT string the root is trusted verbatim.
+        // Component-equivalent spellings (`/root/`, `/root/.`, `//root`) do
+        // NOT take this shortcut: they fall through to realpath like any
+        // other alias (r7 item 2).
+        let stored =
+            self.state.workspaces.iter().find(|workspace| {
+                Path::new(&workspace.root_path).as_os_str() == candidate.as_os_str()
+            });
+        let canonical = match stored {
+            Some(workspace) => PathBuf::from(&workspace.root_path),
+            None => canonical_directory(candidate)?,
+        };
+        let workspace = self
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| Path::new(&workspace.root_path) == canonical)
+            .ok_or_else(|| {
+                NodeError::InvalidRequest(format!(
+                    "workspace {} is not registered",
+                    candidate.display()
+                ))
+            })?;
+        // Always hand back the matched row's stored bytes, never the caller's
+        // spelling — the Hub compares against these exact bytes at prepare
+        // and commit (r7 item 2).
+        Ok((
+            workspace.meta.id.clone(),
+            PathBuf::from(&workspace.root_path),
+        ))
+    }
+
+    /// Short locked read for the stored-root shortcut; runs NO filesystem
+    /// probe. The match is byte-exact (`OsStr` equality), so `/root/` and
+    /// `/root/.` fall through to realpath. Returns the STORED root bytes
+    /// (r7 item 2), not the candidate.
+    pub(crate) fn stored_root_shortcut(&self, candidate: &Path) -> Option<(WorkspaceId, PathBuf)> {
+        self.state
+            .workspaces
+            .iter()
+            .find(|workspace| Path::new(&workspace.root_path).as_os_str() == candidate.as_os_str())
+            .map(|workspace| {
+                (
+                    workspace.meta.id.clone(),
+                    PathBuf::from(&workspace.root_path),
+                )
+            })
+    }
+
+    /// Short locked membership match for a `realpath` result; runs NO probe.
+    pub(crate) fn registered_match(&self, canonical: &Path) -> Option<(WorkspaceId, PathBuf)> {
+        self.state
+            .workspaces
+            .iter()
+            .find(|workspace| Path::new(&workspace.root_path) == canonical)
+            .map(|workspace| (workspace.meta.id.clone(), canonical.to_path_buf()))
+    }
+
+    /// Whether a mutation command is already durable (drives the prepare
+    /// replay shortcut; read lock held only for this in-memory lookup).
+    pub(crate) fn command_exists(&self, command_id: &str) -> bool {
+        self.state.commands.contains_key(command_id)
+    }
+
     fn validate(&self, path: &Path) -> Result<PathBuf, NodeError> {
         let canonical = canonical_directory(path)?;
-        if !self.roots.iter().any(|root| canonical.starts_with(root)) {
+        if !self
+            .roots
+            .iter()
+            .any(|root| canonical.starts_with(&root.path))
+        {
             return Err(NodeError::InvalidRequest(format!(
                 "workspace {} is outside allowed workspace_roots: {}",
                 canonical.display(),
-                display_roots(self.roots.iter().map(PathBuf::as_path))
+                display_roots(self.roots.iter().map(|root| root.path.as_path()))
             )));
         }
         for workspace in &self.state.workspaces {
@@ -139,6 +352,12 @@ impl WorkspaceRegistry {
         if canonical != root {
             return Err(NodeError::InvalidRequest(format!(
                 "registered workspace {} changed its canonical location; unregister and register it again",
+                root.display()
+            )));
+        }
+        if self.state.unbinding.contains(&workspace.meta.id) {
+            return Err(NodeError::Conflict(format!(
+                "workspace {} is being unregistered; wait for it to settle before starting a session",
                 root.display()
             )));
         }
@@ -195,10 +414,21 @@ impl WorkspaceRegistry {
         result
     }
 
+    /// Apply one prepared/committed mutation. `live_sessions` reports the
+    /// current live-session count for a workspace and is invoked for a fresh
+    /// unregister prepare while the write lock is held, so the occupancy
+    /// check and the unbinding mark are one atomic step.
+    ///
+    /// `resolved` is the identity the caller established BEFORE taking the
+    /// write lock for a fresh unregister prepare (r7 item 10: its access probe
+    /// must not run under the lock). `None` falls back to locked resolution
+    /// for direct/legacy callers and idempotent prepare replays.
     fn mutate(
         &mut self,
         method: &str,
         params: WorkspaceMutationParams,
+        resolved: Option<(WorkspaceId, PathBuf)>,
+        mut live_sessions: impl FnMut(&WorkspaceId) -> Result<usize, NodeError>,
     ) -> Result<Value, NodeError> {
         if params.command_id.trim().is_empty() || params.command_id.len() > 256 {
             return Err(NodeError::InvalidRequest(
@@ -214,50 +444,167 @@ impl WorkspaceRegistry {
                 "workspace commandId was reused with different input".into(),
             ));
         }
+        // c-dirpicker r8 item 2: abort is a fence. Three cases.
+        //  - The command is unknown: its prepare may still be queued on the
+        //    write lock or its frame was lost. Record an aborted TOMBSTONE keyed
+        //    by this command id so that late prepare/commit refuses instead of
+        //    setting the unbinding mark after the Hub already gave up (race A).
+        //  - The command was prepared but not committed: clear THIS command's
+        //    mark and record the abort, so a queued commit cannot still remove
+        //    the membership (race C).
+        //  - The command already SETTLED: commit completed on the Node while
+        //    the Hub timed out. Do not mutate anything; reply phase "settled"
+        //    with the current snapshot so the Hub observes the real outcome
+        //    instead of recording a phantom rejection (race B).
+        if params.phase == WorkspaceMutationPhase::Abort {
+            if let Some(existing) = &command
+                && existing.settled
+            {
+                let mut result = self.snapshot();
+                result["workspaceId"] = json!(&existing.workspace_id);
+                result["commandId"] = json!(&params.command_id);
+                result["phase"] = json!("settled");
+                return Ok(result);
+            }
+            if let Some(mut existing) = command {
+                next.unbinding.remove(&existing.workspace_id);
+                existing.aborted = true;
+                next.commands.insert(params.command_id.clone(), existing);
+            } else {
+                let workspace_id = params
+                    .workspace_id
+                    .as_deref()
+                    .and_then(|raw| <WorkspaceId as std::str::FromStr>::from_str(raw).ok())
+                    .unwrap_or_default();
+                next.commands.insert(
+                    params.command_id.clone(),
+                    Mutation {
+                        method: method.into(),
+                        path: params.path.clone(),
+                        // Abort performs no filesystem resolution; the
+                        // tombstone only fences this command id, it never
+                        // identifies a workspace to unbind.
+                        canonical: PathBuf::new(),
+                        workspace_id,
+                        was_registered: false,
+                        settled: false,
+                        aborted: true,
+                    },
+                );
+            }
+            self.persist(&next)?;
+            self.state = next;
+            let mut result = self.snapshot();
+            result["workspaceId"] = json!(
+                self.state
+                    .commands
+                    .get(&params.command_id)
+                    .map(|command| &command.workspace_id)
+            );
+            result["commandId"] = json!(&params.command_id);
+            result["phase"] = json!("aborted");
+            return Ok(result);
+        }
         match params.phase {
+            WorkspaceMutationPhase::Abort => {
+                // Handled before the match (idempotent standalone phase).
+                unreachable!("abort phase returns before this match")
+            }
             WorkspaceMutationPhase::Prepare => {
+                // r8 item 2 race A: an abort for this command landed first
+                // (recorded as an aborted tombstone) or this prepared command
+                // was already aborted. Refuse — never set the mark — and let
+                // the caller issue a NEW command to retry.
+                if command
+                    .as_ref()
+                    .is_some_and(|existing| existing.aborted && !existing.settled)
+                {
+                    return Err(NodeError::Conflict(format!(
+                        "workspace command {} was aborted before it settled; start a new command \
+                         to retry",
+                        params.command_id
+                    )));
+                }
                 if command.is_none() {
-                    let canonical = if method == "workspace.register" {
-                        self.validate(Path::new(&params.path))?
-                    } else {
-                        // A deleted project remains removable using its stored canonical absolute path.
-                        let path = Path::new(&params.path);
-                        if !path.is_absolute() {
-                            return Err(NodeError::InvalidRequest(
-                                "workspace path must be absolute".into(),
-                            ));
-                        }
-                        let canonical = if self
-                            .state
-                            .workspaces
-                            .iter()
-                            .any(|workspace| Path::new(&workspace.root_path) == path)
-                        {
-                            path.to_path_buf()
+                    let (canonical, workspace_id, was_registered) =
+                        if method == "workspace.register" {
+                            let canonical = self.validate(Path::new(&params.path))?;
+                            let existing = self
+                                .state
+                                .workspaces
+                                .iter()
+                                .find(|workspace| Path::new(&workspace.root_path) == canonical)
+                                .map(|workspace| workspace.meta.id.clone());
+                            let was_registered = existing.is_some();
+                            (canonical, existing.unwrap_or_default(), was_registered)
                         } else {
-                            canonical_directory(path)?
+                            // Identity was resolved before the write lock was
+                            // taken (r7 item 10); direct/legacy callers resolve
+                            // here under the lock.
+                            let (workspace_id, canonical) = match resolved {
+                                Some(found) => found,
+                                None => self.resolve_unregister_locked(Path::new(&params.path))?,
+                            };
+                            // When the Hub prepared from a resolve result, it
+                            // must send the exact stored root bytes in `path`
+                            // plus the resolved id. Verify both before anything
+                            // is marked: an alias that realpaths to the root is
+                            // rejected here, and an id/root mismatch means the
+                            // identity moved.
+                            // r7 item 2: byte-level spelling comparison.
+                            // `Path == Path` is component-based and treats
+                            // `/root`, `/root/.` and `//root` as equal; the Hub
+                            // is required to send the exact stored root bytes, so
+                            // compare OsStr bytes, not components.
+                            if let Some(expected) = params.workspace_id.as_deref()
+                                && (expected != workspace_id.as_id().as_str()
+                                    || Path::new(&params.path).as_os_str() != canonical.as_os_str())
+                            {
+                                return Err(NodeError::Conflict(format!(
+                                    "workspace unregister identity does not match the resolved \
+                                 workspace (expected {}@{}, got {})",
+                                    workspace_id.as_id(),
+                                    canonical.display(),
+                                    params.path
+                                )));
+                            }
+                            (canonical, workspace_id, true)
                         };
-                        if !self
-                            .state
-                            .workspaces
-                            .iter()
-                            .any(|workspace| Path::new(&workspace.root_path) == canonical)
-                        {
-                            return Err(NodeError::InvalidRequest(format!(
-                                "workspace {} is not registered",
-                                path.display()
+                    // Round 3 item 7: an unregister already prepared against
+                    // this canonical directory cannot be overtaken by a
+                    // register; the caller must let the unregister settle.
+                    if method == "workspace.register"
+                        && self.state.unbinding.iter().any(|id| {
+                            self.state.workspaces.iter().any(|workspace| {
+                                &workspace.meta.id == id
+                                    && Path::new(&workspace.root_path) == canonical
+                            })
+                        })
+                    {
+                        return Err(NodeError::Conflict(
+                            "an unregister for this workspace is already prepared; \
+                             let it settle before registering again"
+                                .into(),
+                        ));
+                    }
+                    if method == "workspace.unregister" {
+                        // Atomic with the write lock: a session entering in
+                        // another thread must take this same lock to reserve
+                        // occupancy, so it cannot slip in between the check
+                        // and the unbinding mark. Both live instances and
+                        // in-flight create reservations count.
+                        let live = live_sessions(&workspace_id)?;
+                        let reservations = self.reservation_count_locked(&workspace_id) as usize;
+                        let occupancy = live + reservations;
+                        if occupancy > 0 {
+                            return Err(NodeError::Conflict(format!(
+                                "workspace {} is still used by {occupancy} live session(s); \
+                                 end them before removing the directory (session history is kept)",
+                                params.path
                             )));
                         }
-                        canonical
-                    };
-                    let existing = self
-                        .state
-                        .workspaces
-                        .iter()
-                        .find(|workspace| Path::new(&workspace.root_path) == canonical)
-                        .map(|workspace| workspace.meta.id.clone());
-                    let was_registered = existing.is_some();
-                    let workspace_id = existing.unwrap_or_default();
+                        next.unbinding.insert(workspace_id.clone());
+                    }
                     next.commands.insert(
                         params.command_id.clone(),
                         Mutation {
@@ -267,6 +614,7 @@ impl WorkspaceRegistry {
                             workspace_id,
                             was_registered,
                             settled: false,
+                            aborted: false,
                         },
                     );
                 }
@@ -277,6 +625,16 @@ impl WorkspaceRegistry {
                         "workspace mutation must be prepared before commit".into(),
                     ));
                 };
+                // r8 item 2 race C: abort landed before this queued commit.
+                // The mark is already cleared and the membership must stay;
+                // refuse without removing anything.
+                if command.aborted && !command.settled {
+                    return Err(NodeError::Conflict(format!(
+                        "workspace command {} was aborted before commit; the workspace stays \
+                         registered",
+                        params.command_id
+                    )));
+                }
                 if !command.settled {
                     if method == "workspace.register" {
                         let canonical = self.validate(Path::new(&params.path))?;
@@ -291,6 +649,19 @@ impl WorkspaceRegistry {
                             .find(|workspace| Path::new(&workspace.root_path) == canonical)
                         {
                             command.workspace_id = existing.meta.id.clone();
+                            // Round 3 item 7: never clear another command's
+                            // unbinding mark. If a different unregister is
+                            // prepared against this identity, this register
+                            // cannot settle — the unregister must commit (or
+                            // fail) first, otherwise its later commit would
+                            // re-add/remove against a mark the register hid.
+                            if next.unbinding.contains(&command.workspace_id) {
+                                return Err(NodeError::Conflict(
+                                    "an unregister for this workspace is already prepared; \
+                                     let it settle before registering again"
+                                        .into(),
+                                ));
+                            }
                         } else {
                             // A prepared idempotent register must not resurrect a removed
                             // membership identity that an older unregister may still target.
@@ -305,12 +676,58 @@ impl WorkspaceRegistry {
                             next.revision += 1;
                         }
                     } else {
+                        // Round 6 item 1: the Hub re-sends the exact stored
+                        // root and the resolved id at commit; verify both
+                        // before removing. Anything that changed between the
+                        // phases refuses rather than unbinding.
+                        // r7 item 2: byte-level spelling comparison here too.
+                        if let Some(expected) = params.workspace_id.as_deref()
+                            && (expected != command.workspace_id.as_id().as_str()
+                                || Path::new(&params.path).as_os_str()
+                                    != command.canonical.as_os_str())
+                        {
+                            return Err(self.refuse_commit(
+                                next,
+                                &command,
+                                &params.command_id,
+                                NodeError::Conflict(
+                                    "workspace unregister identity changed between prepare and \
+                                     commit"
+                                        .into(),
+                                ),
+                            ));
+                        }
                         if next.workspaces.iter().any(|workspace| {
                             Path::new(&workspace.root_path) == command.canonical
                                 && workspace.meta.id != command.workspace_id
                         }) {
-                            return Err(NodeError::Conflict(
-                                "workspace was replaced after unregister prepare".into(),
+                            return Err(self.refuse_commit(
+                                next,
+                                &command,
+                                &params.command_id,
+                                NodeError::Conflict(
+                                    "workspace was replaced after unregister prepare".into(),
+                                ),
+                            ));
+                        }
+                        // Re-count at commit (defence in depth): prepare
+                        // blocked any create with a reservation and the
+                        // unbinding mark refused new ones, so this should be
+                        // zero; refuse the unbind rather than remove a
+                        // membership that gained occupancy since prepare.
+                        let live_at_commit = live_sessions(&command.workspace_id)?;
+                        let reserved_at_commit =
+                            self.reservation_count_locked(&command.workspace_id) as usize;
+                        if live_at_commit + reserved_at_commit > 0 {
+                            return Err(self.refuse_commit(
+                                next,
+                                &command,
+                                &params.command_id,
+                                NodeError::Conflict(format!(
+                                    "workspace {} gained occupancy after unregister prepare; \
+                                     the removal did not settle",
+                                    command.canonical.display()
+                                )),
                             ));
                         }
                         let previous_len = next.workspaces.len();
@@ -319,6 +736,9 @@ impl WorkspaceRegistry {
                         if previous_len != next.workspaces.len() {
                             next.revision += 1;
                         }
+                        // The identity is gone with the membership; drop its
+                        // unbinding mark too.
+                        next.unbinding.remove(&command.workspace_id);
                     }
                     command.settled = true;
                     next.commands.insert(params.command_id.clone(), command);
@@ -338,8 +758,69 @@ impl WorkspaceRegistry {
         result["phase"] = json!(match params.phase {
             WorkspaceMutationPhase::Prepare => "prepared",
             WorkspaceMutationPhase::Commit => "settled",
+            WorkspaceMutationPhase::Abort => "aborted",
         });
         Ok(result)
+    }
+
+    /// Persist an unregister commit refusal after clearing THIS command's
+    /// unbinding mark (r7 item 1a): the membership is untouched but the
+    /// workspace is immediately usable again, even if the Hub's follow-up
+    /// abort frame is lost. The command is recorded as aborted; returns the
+    /// caller's original refusal error.
+    fn refuse_commit(
+        &mut self,
+        mut next: RegistryState,
+        command: &Mutation,
+        command_id: &str,
+        error: NodeError,
+    ) -> NodeError {
+        next.unbinding.remove(&command.workspace_id);
+        let mut record = command.clone();
+        record.aborted = true;
+        next.commands.insert(command_id.to_owned(), record);
+        if let Err(persist_error) = self.persist(&next) {
+            return persist_error;
+        }
+        self.state = next;
+        error
+    }
+}
+
+/// One held occupancy reservation for an in-flight instance create
+/// (c-dirpicker round 3 item 6). Releases the slot on drop, so every failed
+/// create path frees its reservation; a successful create drops it after the
+/// instance row is durable (the live row then counts in its place).
+pub(crate) struct WorkspaceReservation {
+    workspace_id: WorkspaceId,
+    table: Arc<std::sync::Mutex<std::collections::HashMap<WorkspaceId, u32>>>,
+    released: bool,
+}
+
+impl WorkspaceReservation {
+    /// Release the slot explicitly after a durable insert; idempotent with
+    /// Drop.
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Ok(mut table) = self.table.lock()
+            && let Some(count) = table.get_mut(&self.workspace_id)
+        {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                table.remove(&self.workspace_id);
+            }
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for WorkspaceReservation {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -445,7 +926,7 @@ fn display_roots<'a>(roots: impl Iterator<Item = &'a Path>) -> String {
 pub(crate) fn is_workspace_method(method: &str) -> bool {
     matches!(
         method,
-        "workspace.list" | "workspace.register" | "workspace.unregister"
+        "workspace.list" | "workspace.resolve" | "workspace.register" | "workspace.unregister"
     )
 }
 
@@ -470,15 +951,130 @@ impl DevNode {
             .snapshot())
     }
 
+    /// Lock-free unregister candidate resolution (r7 item 10): two SHORT
+    /// registry reads around an UNLOCKED `realpath` + access probe. The probe
+    /// spawns `/bin/sh` and can block on a slow mount for the whole probe
+    /// timeout, so it must never hold the registry read lock (which would
+    /// block `reserve_workspace` and every create on this Node).
+    pub(crate) fn resolve_unregister(
+        &self,
+        candidate: &str,
+    ) -> Result<(WorkspaceId, PathBuf), NodeError> {
+        let path = Path::new(candidate);
+        if !path.is_absolute() {
+            return Err(NodeError::InvalidRequest(
+                "workspace path must be absolute".into(),
+            ));
+        }
+        // (1) Short locked read: the stored-root shortcut, no probe.
+        if let Some(found) = self
+            .inner
+            .workspace_registry
+            .read()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .stored_root_shortcut(path)
+        {
+            return Ok(found);
+        }
+        // (2) Unlocked: the killable access probe + realpath.
+        let canonical = canonical_directory(path)?;
+        // (3) Short locked read: membership match only.
+        let registry = self
+            .inner
+            .workspace_registry
+            .read()
+            .map_err(|_| NodeError::StorePoisoned)?;
+        registry.registered_match(&canonical).ok_or_else(|| {
+            NodeError::InvalidRequest(format!("workspace {} is not registered", path.display()))
+        })
+    }
+
+    pub(crate) fn workspace_command_exists(&self, command_id: &str) -> Result<bool, NodeError> {
+        Ok(self
+            .inner
+            .workspace_registry
+            .read()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .command_exists(command_id))
+    }
+
     pub(crate) fn workspace_rpc(&self, method: &str, params: Value) -> Result<Value, NodeError> {
         if method == "workspace.list" {
             return self.workspace_snapshot();
         }
+        // c-dirpicker round 6 item 1: read-only, Node-authoritative identity
+        // for a pending unregister. It runs the same resolution semantics
+        // prepare uses, takes only short-lived registry locks (the filesystem
+        // probe runs unlocked — r7 item 10), and mutates nothing; the Hub
+        // calls it before taking its occupancy guard.
+        if method == "workspace.resolve" {
+            let request: WorkspaceResolveParams = serde_json::from_value(params)?;
+            let (workspace_id, canonical_root) = self.resolve_unregister(&request.path)?;
+            return Ok(json!({
+                "workspaceId": workspace_id,
+                "canonicalRoot": canonical_root.display().to_string(),
+            }));
+        }
+        let mutation: WorkspaceMutationParams = serde_json::from_value(params)?;
+        // Resolve a FRESH unregister prepare BEFORE taking the write lock so
+        // the access probe never blocks create reservations (r7 item 10). An
+        // idempotent replay of an already-prepared command skips resolution;
+        // the locked fallback inside `mutate` covers register and direct
+        // callers.
+        let resolved = if method == "workspace.unregister"
+            && mutation.phase == WorkspaceMutationPhase::Prepare
+            && !self.workspace_command_exists(&mutation.command_id)?
+        {
+            Some(self.resolve_unregister(&mutation.path)?)
+        } else {
+            None
+        };
+        // The unregister occupancy check runs inside the registry's mutate
+        // under its write lock (the callback below), so it and the unbinding
+        // mark that blocks new creates are one atomic step. The closure only
+        // takes a shared reborrow of self for the instance store, a different
+        // lock than the registry write guard being held.
         self.inner
             .workspace_registry
             .write()
             .map_err(|_| NodeError::StorePoisoned)?
-            .mutate(method, serde_json::from_value(params)?)
+            .mutate(method, mutation, resolved, |workspace_id| {
+                Ok(self
+                    .list_instances()?
+                    .items
+                    .iter()
+                    // Process-end evidence (`exited` = clean/close,
+                    // `failed` = ended with an error; D-057 OA6: failed is
+                    // terminal process state, not a turn-level error)
+                    // frees the directory. The Hub has the same ended
+                    // definition. A live process keeps blocking regardless
+                    // of any stale lifecycle recorded before the process
+                    // actually ended.
+                    .filter(|instance| {
+                        instance.workspace_id == *workspace_id
+                            && !matches!(
+                                instance.lifecycle,
+                                remuda_protocol::InstanceLifecycle::Exited
+                                    | remuda_protocol::InstanceLifecycle::Failed
+                            )
+                    })
+                    .count())
+            })
+    }
+
+    /// Reserve occupancy for an instance create on a workspace, atomically
+    /// with the unbinding check (both take the registry write lock). The
+    /// guard must be held until the instance row is durable; it releases on
+    /// any failure. See [`WorkspaceRegistry::reserve_locked`].
+    pub(crate) fn reserve_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceReservation, NodeError> {
+        self.inner
+            .workspace_registry
+            .write()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .reserve_locked(workspace_id)
     }
 
     pub(crate) fn resolve_workspace_cwd(
@@ -602,8 +1198,142 @@ mod tests {
                 command_id: command.into(),
                 path: path.display().to_string(),
                 phase,
+                workspace_id: None,
             },
+            None,
+            |_workspace_id| Ok(0),
         )
+    }
+
+    #[test]
+    fn a_held_create_reservation_blocks_unregister_prepare_then_frees_it() {
+        // Round 3 item 6: a create that reserved occupancy (admission passed,
+        // durable insert not finished yet) must make unregister prepare
+        // refuse; releasing the reservation unblocks it.
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(root.path().to_path_buf())
+            .with_workspace_roots(vec![root.path().to_path_buf()])
+            .with_workspace_registry(data.path().to_path_buf());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace_id = registry.state.workspaces[0].meta.id.clone();
+
+        let reservation = registry.reserve_locked(&workspace_id).unwrap();
+        // Held reservation counts as occupancy even with zero live instances.
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "blocked-unregister".into(),
+                    path: registry.state.workspaces[0].root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: None,
+                },
+                None,
+                |_id| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 live session(s)"), "{error}");
+
+        // Create failed/finished: the guard drops and the unregister prepares.
+        drop(reservation);
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "allowed-unregister".into(),
+                    path: registry.state.workspaces[0].root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: None,
+                },
+                None,
+                |_id| Ok(0),
+            )
+            .unwrap();
+        // The unbinding mark is now set: a fresh create reservation is
+        // refused too.
+        assert!(registry.reserve_locked(&workspace_id).is_err());
+    }
+
+    #[test]
+    fn register_cannot_clear_another_commands_unbinding_mark() {
+        // Round 3 item 7: once an unregister is prepared against a workspace,
+        // neither a register prepare nor (if one existed) its commit can
+        // settle/clear the mark — the unregister must finish first.
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(root.path().to_path_buf())
+            .with_workspace_roots(vec![root.path().to_path_buf()])
+            .with_workspace_registry(data.path().to_path_buf());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let root_path = registry.state.workspaces[0].root_path.clone();
+
+        // Prepare the unregister with no live sessions.
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "u1".into(),
+                    path: root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: None,
+                },
+                None,
+                |_id| Ok(0),
+            )
+            .unwrap();
+        assert!(
+            registry
+                .state
+                .unbinding
+                .contains(&registry.state.workspaces[0].meta.id)
+        );
+
+        // A register for the same directory is refused at prepare.
+        let register_error = registry
+            .mutate(
+                "workspace.register",
+                WorkspaceMutationParams {
+                    command_id: "r1".into(),
+                    path: root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: None,
+                },
+                None,
+                |_id| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            register_error.contains("already prepared"),
+            "{register_error}"
+        );
+        // The mark survived the refused register.
+        assert!(
+            registry
+                .state
+                .unbinding
+                .contains(&registry.state.workspaces[0].meta.id)
+        );
+
+        // The unregister commits and clears its own mark.
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "u1".into(),
+                    path: root_path.clone(),
+                    phase: WorkspaceMutationPhase::Commit,
+                    workspace_id: None,
+                },
+                None,
+                |_id| Ok(0),
+            )
+            .unwrap();
+        assert!(registry.state.unbinding.is_empty());
     }
 
     #[test]
@@ -1198,6 +1928,799 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("worktree directory")
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_is_refused_while_a_live_session_uses_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let extra = root.path().join("extra");
+        fs::create_dir_all(extra.join("src")).unwrap();
+        let config = config(root.path(), data.path()).with_workspaces(vec![extra.clone()]);
+        let node = DevNode::new(&config).unwrap();
+        let workspace = node.workspaces().unwrap()[1].clone();
+
+        // A long-lived shell in the workspace blocks the unregister prepare.
+        let request: crate::CreateInstanceRequest = serde_json::from_value(json!({
+            "workspaceId": workspace.meta.id,
+            "kind": "terminal",
+            "driver": "shell-pty",
+            "args": ["sleep", "120"],
+            "prompt": "",
+        }))
+        .unwrap();
+        let created = node.create_instance(request).await.unwrap();
+        let instance_id = created.instance.meta.id.clone();
+        let error = node
+            .workspace_rpc(
+                "workspace.unregister",
+                json!({"commandId": "remove-busy", "path": workspace.root_path, "phase": "prepare"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 live session"), "{error}");
+
+        // A canonical alias for the same busy directory must not slip past
+        // the guard.
+        let aliased = format!("{}/./extra", root.path().canonicalize().unwrap().display());
+        let error = node
+            .workspace_rpc(
+                "workspace.unregister",
+                json!({"commandId": "remove-busy-alias", "path": aliased, "phase": "prepare"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 live session"), "{error}");
+
+        // Other workspaces are unaffected.
+        let first = node.workspaces().unwrap()[0].clone();
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-other", "path": first.root_path, "phase": "prepare"}),
+        )
+        .unwrap();
+
+        // Once the live session is purged (purge closes the driver first),
+        // the same command prepares.
+        node.purge_instance(&instance_id).await.unwrap();
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-busy", "path": workspace.root_path, "phase": "prepare"}),
+        )
+        .unwrap();
+
+        // Between prepare and commit the directory is unbinding: a new
+        // session cannot enter in the check→unbind window.
+        let blocked: crate::CreateInstanceRequest = serde_json::from_value(json!({
+            "workspaceId": workspace.meta.id,
+            "kind": "terminal",
+            "driver": "shell-pty",
+            "args": ["sleep", "1"],
+            "prompt": "",
+        }))
+        .unwrap();
+        let error = node.create_instance(blocked).await.unwrap_err().to_string();
+        assert!(error.contains("being unregistered"), "{error}");
+
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-busy", "path": workspace.root_path, "phase": "commit"}),
+        )
+        .unwrap();
+        assert!(
+            node.workspaces()
+                .unwrap()
+                .iter()
+                .all(|row| row.meta.id != workspace.meta.id)
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_native_process_dies_with_an_error_unblocks_removal() {
+        // Round 3 item 5: failed IS terminal (a non-zero native exit), so a
+        // real error exit — driven through the native-exit path, not an SQL
+        // update — ends occupancy just like a clean exit.
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(root.path().to_path_buf())
+            .with_workspace_roots(vec![root.path().to_path_buf()])
+            .with_workspace_registry(data.path().to_path_buf());
+        let node = crate::DevNode::new(&config).unwrap();
+        let workspace = node.workspaces().unwrap()[0].clone();
+
+        // A foreground command that exits non-zero: the process is genuinely
+        // gone, and the exit is terminal evidence (native-exit-code-1).
+        let request: crate::CreateInstanceRequest = serde_json::from_value(json!({
+            "workspaceId": workspace.meta.id,
+            "kind": "terminal",
+            "driver": "shell-pty",
+            "args": ["/bin/sh", "-c", "exit 1"],
+            "prompt": "",
+        }))
+        .unwrap();
+        let created = node.create_instance(request).await.unwrap();
+        let instance_id = created.instance.meta.id.clone();
+
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let instance = node
+                    .list_instances()
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .find(|instance| instance.meta.id == instance_id)
+                    .unwrap();
+                if matches!(
+                    instance.lifecycle,
+                    remuda_protocol::InstanceLifecycle::Exited
+                        | remuda_protocol::InstanceLifecycle::Failed
+                ) {
+                    break instance.lifecycle;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("native error exit detection");
+        assert!(
+            matches!(
+                settled,
+                remuda_protocol::InstanceLifecycle::Exited
+                    | remuda_protocol::InstanceLifecycle::Failed
+            ),
+            "non-zero native exit is terminal: {settled:?}"
+        );
+
+        // Removal prepares without a purge: the dead session does not count.
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-failed", "path": workspace.root_path, "phase": "prepare"}),
+        )
+        .unwrap();
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "remove-failed", "path": workspace.root_path, "phase": "commit"}),
+        )
+        .unwrap();
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_after_resolution_is_refused_when_unregister_committed_in_the_gap() {
+        // Round 4 item 2: resolve_workspace_cwd runs (slow fs resolution)
+        // before the occupancy reservation. A barrier parks the create right
+        // after resolution; an unregister commits in that window; when the
+        // create resumes, the SAME write-lock step that reserves also
+        // re-checks membership and refuses it.
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(root.path().to_path_buf())
+            .with_workspace_roots(vec![root.path().to_path_buf()])
+            .with_workspace_registry(data.path().to_path_buf());
+        let node = crate::DevNode::new(&config).unwrap();
+        let workspace = node.workspaces().unwrap()[0].clone();
+        let workspace_id = workspace.meta.id.clone();
+        let root_path = workspace.root_path.clone();
+
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (reached2, release2) = (reached.clone(), release.clone());
+        let barrier: CreateBarrierFn = std::sync::Arc::new(move |_id| {
+            let (reached, release) = (reached2.clone(), release2.clone());
+            Box::pin(async move {
+                reached.notify_one();
+                release.notified().await;
+            })
+        });
+        node.set_create_reservation_barrier(barrier).await;
+
+        let node_for_create = node.clone();
+        let create = tokio::spawn(async move {
+            let request: crate::CreateInstanceRequest = serde_json::from_value(json!({
+                "workspaceId": workspace_id,
+                "kind": "terminal",
+                "driver": "shell-pty",
+                "args": ["/bin/true"],
+                "prompt": "",
+            }))
+            .unwrap();
+            node_for_create.create_instance(request).await
+        });
+
+        // Wait until the create is parked between resolution and reservation.
+        reached.notified().await;
+        // Commit an unregister for the resolved workspace.
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "gap-unregister", "path": root_path, "phase": "prepare"}),
+        )
+        .unwrap();
+        node.workspace_rpc(
+            "workspace.unregister",
+            json!({"commandId": "gap-unregister", "path": root_path, "phase": "commit"}),
+        )
+        .unwrap();
+        // Release the parked create.
+        release.notify_one();
+
+        let result = create.await.expect("create task joins");
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("no longer registered"),
+            "create after a committed unregister must be refused at the \
+             membership+reservation step, got: {error}"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// r7 item 1: prepare an unregister, then the commit refuses (wrong id).
+    /// The Node itself clears that command's mark before returning, so a
+    /// create reservation succeeds immediately without waiting for an abort.
+    #[test]
+    fn a_refused_commit_clears_its_own_unbinding_mark() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+        let params = |phase, workspace_id: Option<&str>| WorkspaceMutationParams {
+            command_id: "cmd-r7-refused-commit".into(),
+            path: workspace.root_path.clone(),
+            phase,
+            workspace_id: workspace_id.map(str::to_owned),
+        };
+        registry
+            .mutate(
+                "workspace.unregister",
+                params(
+                    WorkspaceMutationPhase::Prepare,
+                    Some(workspace.meta.id.as_id().as_str()),
+                ),
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(registry.state.unbinding.contains(&workspace.meta.id));
+        assert!(registry.reserve_locked(&workspace.meta.id).is_err());
+
+        // Commit with a DIFFERENT id: refused, and the refusal self-clears.
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                params(WorkspaceMutationPhase::Commit, Some("wsp_definitely_other")),
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity changed"), "{error}");
+        assert!(
+            !registry.state.unbinding.contains(&workspace.meta.id),
+            "the commit refusal must clear the mark"
+        );
+        // Membership is untouched and a create works again.
+        assert!(
+            registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id)
+        );
+        let reservation = registry.reserve_locked(&workspace.meta.id).unwrap();
+        drop(reservation);
+        // The command is recorded aborted.
+        assert!(registry.state.commands["cmd-r7-refused-commit"].aborted);
+    }
+
+    /// r7 item 1: explicit abort phase clears the mark, keeps membership, and
+    /// is idempotent for unknown / already-aborted commands.
+    #[test]
+    fn abort_phase_releases_a_prepared_unregister() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-abort".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(registry.state.unbinding.contains(&workspace.meta.id));
+
+        let result = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-abort".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Abort,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert_eq!(result["phase"], json!("aborted"));
+        assert!(!registry.state.unbinding.contains(&workspace.meta.id));
+        assert!(
+            registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id)
+        );
+        // Creates flow again.
+        let reservation = registry.reserve_locked(&workspace.meta.id).unwrap();
+        drop(reservation);
+        // Idempotent: a second abort and an unknown-command abort both ack.
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-abort".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Abort,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-never-prepared".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Abort,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(registry.state.unbinding.is_empty());
+    }
+
+    /// r7 item 2 (restored r8 item 3): dot, repeated-separator and
+    /// trailing-slash spellings are not the stored-root shortcut — they
+    /// realpath to the workspace but resolve returns the MATCHED ROW's stored
+    /// bytes, never the caller's alias.
+    #[test]
+    fn resolve_returns_stored_root_bytes_for_component_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let stored = registry.workspaces()[0].root_path.clone();
+        let (id_shortcut, root_shortcut) = registry
+            .resolve_unregister_locked(Path::new(&stored))
+            .unwrap();
+        assert_eq!(root_shortcut.as_os_str(), Path::new(&stored).as_os_str());
+
+        for alias in [
+            format!("{stored}/."),
+            format!("{stored}//"),
+            format!("{stored}/./"),
+        ] {
+            let (id, resolved) = registry
+                .resolve_unregister_locked(Path::new(&alias))
+                .unwrap_or_else(|error| panic!("alias {alias:?} realpaths: {error}"));
+            assert_eq!(
+                id.as_id(),
+                id_shortcut.as_id(),
+                "alias {alias:?} resolves to the same workspace"
+            );
+            assert_eq!(
+                resolved.as_os_str(),
+                Path::new(&stored).as_os_str(),
+                "resolver returns the stored root bytes, not the alias {alias:?}"
+            );
+        }
+    }
+
+    /// r7 item 2 (restored r8 item 3): the stored-root shortcut itself is
+    /// byte-exact; nothing trims or component-matches it.
+    #[test]
+    fn stored_root_shortcut_is_byte_exact() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let stored = registry.workspaces()[0].root_path.clone();
+        assert!(registry.stored_root_shortcut(Path::new(&stored)).is_some());
+        for alias in [
+            format!("{stored}/"),
+            format!("{stored}/."),
+            format!("{stored}//"),
+        ] {
+            assert!(
+                registry.stored_root_shortcut(Path::new(&alias)).is_none(),
+                "{alias:?} must not take the byte-exact shortcut"
+            );
+        }
+    }
+
+    /// r8 item 2 race A: an abort for an UNKNOWN command lands before the
+    /// (lock-queued / delayed) prepare. The abort records an aborted tombstone;
+    /// the later prepare for the SAME command id must be refused without
+    /// setting the unbinding mark or touching membership, so nothing wedges.
+    #[test]
+    fn abort_before_prepare_tombstone_blocks_the_late_prepare() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+
+        // Abort arrives first; no such command exists yet.
+        let aborted = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-a".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Abort,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert_eq!(aborted["phase"], json!("aborted"));
+        assert!(registry.state.unbinding.is_empty());
+        assert!(registry.state.commands["cmd-r8-race-a"].aborted);
+
+        // The delayed prepare (same command id) must NOT run.
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-a".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("was aborted before it settled"), "{error}");
+        assert!(
+            !registry.state.unbinding.contains(&workspace.meta.id),
+            "the refused prepare must not set the mark"
+        );
+        assert!(
+            registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id),
+            "membership untouched"
+        );
+        // A NEW command (fresh id) is allowed — the fence is per command id.
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-a-retry".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(registry.state.unbinding.contains(&workspace.meta.id));
+    }
+
+    /// r8 item 2 race B: commit completes on the Node while the Hub's commit
+    /// call times out. The late abort must report phase "settled" WITH the
+    /// post-commit snapshot and must NOT mark the settled command aborted.
+    #[test]
+    fn abort_after_a_settled_commit_reports_settled_and_the_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+        let revision_before = registry.snapshot()["workspaceRevision"].as_u64().unwrap();
+
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-b".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-b".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Commit,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(
+            !registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id),
+            "commit removed the membership"
+        );
+
+        // The Hub's late abort.
+        let answer = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-b".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Abort,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert_eq!(answer["phase"], json!("settled"));
+        let workspaces = answer["workspaces"].as_array().unwrap();
+        assert!(
+            !workspaces
+                .iter()
+                .any(|w| w["workspaceId"] == json!(workspace.meta.id.as_id())),
+            "the settled snapshot already omits the removed workspace"
+        );
+        assert!(
+            answer["workspaceRevision"].as_u64().unwrap() > revision_before,
+            "the settled snapshot carries the advanced revision"
+        );
+        assert!(
+            !registry.state.commands["cmd-r8-race-b"].aborted,
+            "a settled command must never be flipped to aborted"
+        );
+        assert!(registry.state.commands["cmd-r8-race-b"].settled);
+    }
+
+    /// r8 item 2 race C: abort lands on a prepared (queued) command BEFORE its
+    /// commit. The mark is cleared; the later commit must refuse and leave the
+    /// membership in place rather than removing it while the Hub believes
+    /// nothing happened.
+    #[test]
+    fn commit_after_an_abort_refuses_and_keeps_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-c".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(registry.state.unbinding.contains(&workspace.meta.id));
+
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-c".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Abort,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        assert!(!registry.state.unbinding.contains(&workspace.meta.id));
+        assert!(registry.state.commands["cmd-r8-race-c"].aborted);
+
+        // The queued commit now arrives — it must not remove the membership.
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r8-race-c".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Commit,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("was aborted before commit"), "{error}");
+        assert!(
+            registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id),
+            "the aborted commit must not remove the membership"
+        );
+        // The workspace is usable again.
+        let reservation = registry.reserve_locked(&workspace.meta.id).unwrap();
+        drop(reservation);
+    }
+
+    /// r7 item 1: a mark persisted by a prepare is dropped when the registry
+    /// reopens — at process start no command can be in flight, so the mark
+    /// would otherwise wedge the workspace across a Node restart.
+    #[test]
+    fn registry_reopen_clears_stale_unbinding_marks() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let host = HostId::new();
+        let workspace_id;
+        {
+            let mut registry = WorkspaceRegistry::open(&config, host.clone()).unwrap();
+            workspace_id = registry.workspaces()[0].meta.id.clone();
+            registry
+                .mutate(
+                    "workspace.unregister",
+                    WorkspaceMutationParams {
+                        command_id: "cmd-r7-restart".into(),
+                        path: registry.workspaces()[0].root_path.clone(),
+                        phase: WorkspaceMutationPhase::Prepare,
+                        workspace_id: None,
+                    },
+                    None,
+                    |_| Ok(0),
+                )
+                .unwrap();
+            assert!(registry.state.unbinding.contains(&workspace_id));
+            drop(registry);
+        }
+        let registry = WorkspaceRegistry::open(&config, host).unwrap();
+        assert!(
+            !registry.state.unbinding.contains(&workspace_id),
+            "reopen must drop the stale mark"
+        );
+        // Membership survives; only the mark was dropped.
+        assert!(
+            registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace_id)
+        );
+    }
+
+    /// r7 item 7: prepare with the hub-supplied identity must reject an alias
+    /// spelling or a wrong workspaceId without setting a mark, persisting a
+    /// command, or removing membership.
+    #[test]
+    fn prepare_rejects_alias_and_wrong_id_without_a_mark() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+        let members_before = registry.workspaces().len();
+        let revision_before = registry.state.revision;
+
+        // (1) Dot alias: realpaths to the stored root but different bytes.
+        let alias = format!("{}/.", workspace.root_path);
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-alias".into(),
+                    path: alias,
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity does not match"), "{error}");
+        assert!(registry.state.unbinding.is_empty());
+        assert!(!registry.state.commands.contains_key("cmd-r7-alias"));
+        assert_eq!(registry.workspaces().len(), members_before);
+        assert_eq!(registry.state.revision, revision_before);
+
+        // (2) Stored root bytes with a WRONG id.
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-wrongid".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some("wsp_other_identity".into()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity does not match"), "{error}");
+        assert!(registry.state.unbinding.is_empty());
+        assert!(!registry.state.commands.contains_key("cmd-r7-wrongid"));
+        assert_eq!(registry.workspaces().len(), members_before);
+    }
+
+    /// r7 item 7: a commit whose workspaceId differs from the prepared
+    /// command's is refused (and r7 item 1 clears the mark on that refusal).
+    #[test]
+    fn commit_with_an_id_other_than_prepared_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = config(root.path(), data.path());
+        let mut registry = WorkspaceRegistry::open(&config, HostId::new()).unwrap();
+        let workspace = registry.workspaces()[0].clone();
+        registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-commitid".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Prepare,
+                    workspace_id: Some(workspace.meta.id.as_id().to_string()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap();
+        let error = registry
+            .mutate(
+                "workspace.unregister",
+                WorkspaceMutationParams {
+                    command_id: "cmd-r7-commitid".into(),
+                    path: workspace.root_path.clone(),
+                    phase: WorkspaceMutationPhase::Commit,
+                    workspace_id: Some("wsp_not_prepared".into()),
+                },
+                None,
+                |_| Ok(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity changed"), "{error}");
+        assert!(
+            !registry.state.unbinding.contains(&workspace.meta.id),
+            "refused commit clears the mark (r7 item 1)"
+        );
+        assert!(
+            registry
+                .workspaces()
+                .iter()
+                .any(|w| w.meta.id == workspace.meta.id)
         );
     }
 

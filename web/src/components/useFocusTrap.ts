@@ -111,6 +111,22 @@ export function useFocusTrap({ open, onClose, labelledBy, initialFocusRef, retur
     if (event.key !== "Tab") return;
     const container = containerRef.current;
     if (!container) return;
+    // React portals (e.g. the DirBrowser Modal rendered through a portal
+    // while mounted inside the New Session <form> inside this Sheet) keep
+    // bubbling synthetic events through their React ancestors even though
+    // their DOM nodes live elsewhere. A Tab pressed in the portalled modal
+    // must be handled by the MODAL's trap only: if the DOM target is not
+    // inside THIS trap's container, leave the event entirely alone (the
+    // innermost trap already cycled focus and stopPropagation'd below, but
+    // React propagation still reaches us, so a DOM-contains guard is the
+    // actual boundary).
+    const target = event.target;
+    if (!(target instanceof Node) || !container.contains(target)) {
+      return;
+    }
+    // This trap owns the Tab: keep it from reaching any outer trap so the
+    // innermost (active) trap is the only one that moves focus.
+    event.stopPropagation();
     const items = focusableIn(container);
     if (!items.length) {
       // Nothing to cycle between: keep focus on the container rather than

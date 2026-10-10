@@ -53,6 +53,7 @@ struct Fixture {
     lane: std::path::PathBuf,
     target: std::path::PathBuf,
     bin: std::path::PathBuf,
+    tmp: std::path::PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -93,14 +94,17 @@ fn fixture() -> Fixture {
     git(&lane, &["config", "user.name", "T"]);
     git(&lane, &["fetch", "-q", "origin"]);
 
-    // The fake merge CLI: flush one step to a `remuda-mq-*/gate.jsonl` (what the
-    // real gate does, and what `stream_gate_report` tails to emit gate.event
-    // steps), then sleep ~10s, then print the verdict JSON. Fake shas are fine
-    // for a verify — pinning the merge only warns when the object is absent.
+    // The fake merge CLI: flush one step to a `remuda-mq-<its own pid>-*/gate.jsonl`
+    // (what the real gate does, and what `stream_gate_report` tails to emit
+    // gate.event steps), then sleep ~10s, then print the verdict JSON. The
+    // scratch is pid-named so only this run tails it and is removed on exit.
+    // Fake shas are fine for a verify — pinning the merge only warns when the
+    // object is absent.
     let bin = dir.path().join("fake-merge.sh");
     let script = r#"#!/bin/bash
 set -eu
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-fake.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-$$-0-XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
 echo '{"name":"secret-scan","status":"ok","durationMs":11,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
 echo 'gate: secret-scan' >&2
 sleep 10
@@ -115,11 +119,18 @@ JSON
     let target = dir.path().join("target");
     std::fs::create_dir_all(&target).unwrap();
 
+    // Private TMPDIR: the Node whitelists TMPDIR into its gate child's env, so
+    // the fake merge's remuda-mq-* scratch stays inside the fixture and can
+    // never be tailed by or collide with a real gate on the host.
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+
     Fixture {
         _dir: dir,
         lane,
         target,
         bin,
+        tmp,
     }
 }
 
@@ -133,7 +144,7 @@ struct Node {
 }
 
 impl Node {
-    fn spawn(home: &std::path::Path) -> Self {
+    fn spawn(home: &std::path::Path, tmp: &std::path::Path) -> Self {
         // Inherit the ambient PATH so the Node's own git pre-steps (fetch / ff)
         // use whatever git the harness provides, then guarantee the base system
         // dirs the gate child needs (bash, mktemp, sleep) are present too.
@@ -148,6 +159,7 @@ impl Node {
             .arg(home.join("data"))
             .env("PATH", path)
             .env("HOME", home)
+            .env("TMPDIR", tmp)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -228,7 +240,7 @@ fn gate_run_params(fixture: &Fixture) -> Value {
 /// Drive the hello handshake, start a gate, and return the started Node so the
 /// caller can prove the carrier stays live while the gate runs.
 fn start_gate(home: &std::path::Path, fixture: &Fixture) -> Node {
-    let mut node = Node::spawn(home);
+    let mut node = Node::spawn(home, &fixture.tmp);
     let hello = node
         .wait_for(Instant::now() + Duration::from_secs(10), |frame| {
             frame["method"] == json!("node.hello")

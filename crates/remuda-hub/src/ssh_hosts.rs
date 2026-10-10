@@ -547,6 +547,23 @@ async fn connect_once(
             && hello.get("id").is_some(),
         "SSH Node hello identity/protocol mismatch; persistent daemon bridge required"
     );
+    bridge_stdio_session(state, managed, record, &mut carrier, hello, generation).await
+}
+
+/// Run one persistent-daemon bridge session over a connected stdio carrier
+/// whose `node.hello` frame has already been received (but not answered).
+///
+/// Generic over [`NodeTransport`] so the in-process test harness can drive
+/// the exact post-hello production path — hello dispatch, reply, and the
+/// shared post-hello reconciliation — without an SSH daemon.
+async fn bridge_stdio_session<T: NodeTransport>(
+    state: &AppState,
+    managed: &ManagedHost,
+    record: &HostRecord,
+    carrier: &mut T,
+    hello: Value,
+    generation: &mut Option<u64>,
+) -> anyhow::Result<()> {
     let (out_tx, mut out_rx) = mpsc::channel::<Value>(32);
     let pending = crate::transport::new_pending_rpcs();
     let mut host_id = None;
@@ -587,10 +604,13 @@ async fn connect_once(
             result.unwrap_or(Value::Null),
         ))
         .await?;
-    // D-048 B.2: re-push this host's api.egress contexts only after the hello
-    // reply is on the wire — the frames ride out_rx (the select loop below),
-    // and awaiting many bounded sends inline would block the reply.
-    crate::ws::spawn_egress_reinstall(state, managed.id.clone());
+    // The hello reply is on the wire now. Run the SAME post-hello
+    // reconciliation as the outbound WSS carrier (D-048 egress re-push and
+    // the c-dirpicker unregister-abort sweep, r9 item 1): without the sweep
+    // an SSH-managed daemon keeps a stale unbinding mark until ITS process
+    // restarts. Both spawn after the reply so their frames cannot overtake
+    // it on the bounded out_rx channel.
+    crate::ws::spawn_post_hello_tasks(state, managed.id.clone());
     state
         .store
         .ssh_status(managed.id.clone(), "online", None)
@@ -1013,5 +1033,224 @@ mod tests {
             "host-lost marker cleared: {row:?}"
         );
         store.close().await;
+    }
+
+    /// In-process stand-in for the SSH child's NDJSON carrier: frames the
+    /// bridge writes land on a channel a scripted Node task reads, and frames
+    /// that task pushes are what the bridge receives. `shutdown` models the
+    /// stdio child closing (clean `Ok(None)`).
+    struct ScriptedStdio {
+        to_node: mpsc::UnboundedSender<Value>,
+        from_node: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl NodeTransport for ScriptedStdio {
+        async fn send_json(&mut self, value: &Value) -> std::result::Result<(), remuda_ssh::Error> {
+            self.to_node
+                .send(value.clone())
+                .map_err(|_| remuda_ssh::Error::Disconnected)
+        }
+
+        async fn recv_json(&mut self) -> std::result::Result<Option<Value>, remuda_ssh::Error> {
+            let mut rx = self.from_node.lock().await;
+            tokio::select! {
+                frame = rx.recv() => Ok(frame),
+                _ = self.shutdown.wait_for(|stop| *stop) => Ok(None),
+            }
+        }
+
+        async fn close(&mut self) -> std::result::Result<(), remuda_ssh::Error> {
+            Ok(())
+        }
+    }
+
+    /// c-dirpicker r9 item 1: the SSH-stdio carrier must run the SAME
+    /// post-hello unregister abort sweep as the outbound WSS carrier. Drives
+    /// the real `bridge_stdio_session` post-hello path with an unsettled
+    /// unregister left by a dead previous link and asserts the abort frame
+    /// reaches the Node over the stdio bridge, the Hub settles the stuck
+    /// command, and a following `instance.create` succeeds.
+    #[tokio::test]
+    async fn ssh_stdio_hello_aborts_an_unsettled_unregister_and_unblocks_create() {
+        use crate::HubConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hub = crate::spawn(HubConfig::for_test(dir.path().join("data")))
+            .await
+            .unwrap();
+        let state = hub.state.clone();
+        let store = state.store.clone();
+
+        let host = new_id("hst").unwrap();
+        store
+            .insert_managed_host(
+                host.clone(),
+                AddSshHost {
+                    target: "test-node".into(),
+                    label: "SSH test".into(),
+                    labels: vec![],
+                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
+                },
+            )
+            .await
+            .unwrap();
+        let record = store
+            .get_host(host.clone())
+            .await
+            .unwrap()
+            .expect("managed host row");
+        let managed = ManagedHost {
+            id: host.clone(),
+            target: "test-node".into(),
+            policy: BinaryPolicy::RequireInstalled,
+        };
+
+        // The stale command a dropped previous link left behind: prepare is
+        // assumed to have landed (the Node would hold the unbinding mark),
+        // commit never did.
+        const WSP: &str = "wsp_01993ab0-0000-7000-8000-0000000000d9";
+        const ROOT: &str = "/srv/remuda-dp-r9/proj";
+        let (command, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": ROOT, "workspaceId": WSP}),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (to_node_tx, mut to_node_rx) = mpsc::unbounded_channel::<Value>();
+        let (from_node_tx, from_node_rx) = mpsc::unbounded_channel::<Value>();
+        let from_node = Arc::new(tokio::sync::Mutex::new(from_node_rx));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let hello = json!({
+            "jsonrpc": "2.0", "id": "ssh-hello", "method": "node.hello",
+            "params": {"hostId": host, "bridge": true, "daemon": true,
+                       "instances": [], "nodeVersion": "0.1.0-dp-r9"}
+        });
+
+        let abort_seen = Arc::new(tokio::sync::Notify::new());
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // The scripted persistent daemon: hello first, then answer the
+        // post-hello abort and the follow-up create over the SAME bridge.
+        let node = {
+            let abort_seen = abort_seen.clone();
+            let captured = captured.clone();
+            let hello = hello.clone();
+            tokio::spawn(async move {
+                from_node_tx.send(hello).unwrap();
+                while let Some(frame) = to_node_rx.recv().await {
+                    let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                    let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                    let params = frame.get("params").cloned().unwrap_or(json!({}));
+                    match method {
+                        "workspace.unregister" if params["phase"] == "abort" => {
+                            captured.lock().unwrap().push(params.clone());
+                            abort_seen.notify_waiters();
+                            from_node_tx
+                                .send(json!({
+                                    "jsonrpc": "2.0", "id": id,
+                                    "result": {
+                                        "commandId": params["commandId"].clone(),
+                                        "workspaceId": params["workspaceId"].clone(),
+                                        "phase": "aborted",
+                                    }
+                                }))
+                                .unwrap();
+                        }
+                        "instance.create" => {
+                            from_node_tx
+                                .send(json!({
+                                    "jsonrpc": "2.0", "id": id,
+                                    "result": {"ok": true, "instanceId": "it_dp_r9_create"}
+                                }))
+                                .unwrap();
+                        }
+                        // The hello reply (and anything else) needs no answer.
+                        _ => {}
+                    }
+                }
+            })
+        };
+
+        let mut carrier = ScriptedStdio {
+            to_node: to_node_tx,
+            from_node,
+            shutdown: shutdown_rx,
+        };
+        let bridge = {
+            let state = state.clone();
+            let managed = managed.clone();
+            let record = record.clone();
+            tokio::spawn(async move {
+                bridge_stdio_session(&state, &managed, &record, &mut carrier, hello, &mut None)
+                    .await
+            })
+        };
+
+        // The sweep (spawned after state.nodes.insert and the hello reply)
+        // must deliver the abort on THIS stdio carrier.
+        tokio::time::timeout(Duration::from_secs(10), abort_seen.notified())
+            .await
+            .expect("the unregister abort never arrived on the ssh stdio carrier");
+        let seen = captured.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0]["phase"], json!("abort"));
+        assert_eq!(seen[0]["path"], json!(ROOT));
+        assert_eq!(seen[0]["workspaceId"], json!(WSP));
+        assert_eq!(seen[0]["commandId"], json!(command.command_id));
+
+        // The Hub only settles the stuck command after the Node acked.
+        let row = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let row = store
+                    .get_command(command.command_id.clone())
+                    .await
+                    .unwrap()
+                    .expect("command row");
+                if row.state == "settled" {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stuck unregister never settled");
+        assert_eq!(row.settlement_outcome.as_deref(), Some("rejected"));
+
+        // The wedge is gone: a following create succeeds on the same bridge.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::http::call_node(
+                &state,
+                &host,
+                "instance.create",
+                json!({"workspaceId": WSP}),
+            ),
+        )
+        .await
+        .expect("create timed out")
+        .expect("a following create must succeed after the abort");
+        assert_eq!(answer["instanceId"], json!("it_dp_r9_create"));
+
+        // Close the carrier (child exit) and join the bridge and the node.
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), bridge)
+            .await
+            .expect("bridge join timed out")
+            .expect("bridge task panicked")
+            .expect("bridge ended in error");
+        tokio::time::timeout(Duration::from_secs(10), node)
+            .await
+            .expect("scripted node join timed out")
+            .unwrap();
+        hub.shutdown().await;
     }
 }

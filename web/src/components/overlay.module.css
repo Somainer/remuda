@@ -7,7 +7,12 @@
 .scrim {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  /* Every Sheet is a real modal scrim (focus trap, aria-modal, full-viewport
+     backdrop) whatever its variant geometry, so it rides --z-sheet above the
+     annotation dock. r3 item 1: the variant used to split tiers and the
+     desktop popover variant sat at a literal 40, under the 50 dock, leaving
+     ＋加批注 clickable through the interrupt/steer confirm. */
+  z-index: var(--z-sheet);
   display: flex;
   background: var(--scrim);
 }
@@ -73,7 +78,9 @@
 .modalScrim {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  /* Above the annotation dock: the interrupt/steer confirm is a real modal
+     scrim (r3 item 1). */
+  z-index: var(--z-sheet);
   display: flex;
   align-items: flex-end;
   justify-content: center;

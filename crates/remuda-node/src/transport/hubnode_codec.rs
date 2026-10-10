@@ -223,6 +223,9 @@ pub async fn dispatch_frame(
     if crate::files::is_host_files_method(method) {
         return node.host_files_rpc(method, params).await;
     }
+    if crate::dir_browser::is_host_dirs_method(method) {
+        return node.host_dirs_rpc(method, params).await;
+    }
     if method == "host.doctor" {
         return node.doctor().await;
     }

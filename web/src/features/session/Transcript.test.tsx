@@ -1854,17 +1854,21 @@ describe("font reflow compensator", () => {
     await act(async () => {
       // ONE font layout resizes two mounted rows above the anchor before any
       // per-row observer delivers (geometry is preset for both; total drift
-      // 200 pushes well past the 144px clamp margin).
-      geo.presetHeight("obj_long_n_30", ROW + 72);
-      geo.presetHeight("obj_long_n_31", ROW + 128);
-      // First delivery: the anchor drifted 200px in the DOM; the write for the
-      // full drift clamps at the scroll max (3120), moving +144 and queueing
+      // 248 pushes well past the 144px clamp margin). n_31 alone grows by
+      // 200 — already more than the 144px margin — so the FIRST delivery
+      // clamps under BOTH compensator forms (the old ledger-delta form adds
+      // height - prevHeight = +200; the DOM-relative form computes the same
+      // full drift here).
+      geo.presetHeight("obj_long_n_30", ROW + 48);
+      geo.presetHeight("obj_long_n_31", ROW + 200);
+      // First delivery: the anchor drifted 248px in the DOM but the write
+      // clamps at the scroll max (3120), moving exactly +144 and queueing
       // the coalesced event.
       geo.fireMeasure("obj_long_n_31");
       // Second delivery in the same synchronous batch (React has not flushed
-      // the first write's state yet): the remaining DOM drift is 56px but the
-      // write clamps to 3120 again — a NO-OP that must not clear the latch
-      // the first write armed.
+      // the first write's state yet): the remaining DOM drift is 48px but the
+      // write clamps to 3120 again — a true NO-OP in either compensator form,
+      // which must not clear the latch the first write armed.
       geo.fireMeasure("obj_long_n_30");
     });
     // Deliver the queued event. With the old assign-on-write latch the event
@@ -1931,5 +1935,4 @@ describe("font reflow compensator", () => {
     });
     expect(geo.top(), "the row's RO delivery double-counted the drift the streamed commit held").toBe(before + 40);
   });
-
 });

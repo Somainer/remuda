@@ -39,9 +39,13 @@
  * parks a blocking error ON TOP of those controls, making them unreachable
  * while the error stands. SessionPage measures its dock and publishes the
  * height as --session-dock-h (ResizeObserver); lift the stack clear of it.
- * The shell has no bottom safe-area padding (the dock reaches the band
- * edge), so the measured height already spans to the bottom. /m uses
- * PhoneShell, which never stamps data-layout="session", and keeps its anchor.
+ * r5 item 2: the tty view has no session dock — TerminalView measures its
+ * own bottom chrome (local input dock + the phone key bar, + the byte-route
+ * note on desktop) into the same property, so the stack clears the key bar
+ * there too. The shell has no bottom safe-area padding (the dock reaches the
+ * band edge and the phone bar carries the safe-area inset itself), so the
+ * measured height already spans to the bottom. /m uses PhoneShell, which
+ * never stamps data-layout="session", and keeps its anchor.
  */
 :global([data-layout="session"]) .stack {
   bottom: calc(var(--session-dock-h, 0px) + var(--space-3));

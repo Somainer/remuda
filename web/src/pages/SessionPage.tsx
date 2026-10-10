@@ -42,6 +42,7 @@ import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
 import { hubStore, useHub } from "../lib/store";
 import { e2eSeamsEnabled } from "../lib/e2eSeams";
+import { usePublishedElementHeight } from "../lib/usePublishedElementHeight";
 import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
@@ -168,33 +169,20 @@ export function SessionPage({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [view, backTo, navigate]);
 
-  // c-composerpop r4 item 1: publish the session dock's measured height as a
-  // global custom property so the notify stack can anchor ABOVE the composer
-  // control bar on /s/:id. Shell renders ShellNotify as a sibling of <main>,
-  // so a value set on a SessionPage node would not inherit to the stack; ride
-  // documentElement (its common ancestor) instead, and clear it on unmount so
-  // non-session routes never see a stale dock height.
+  // c-composerpop r4 item 1: publish the bottom chrome's measured height as a
+  // global custom property so the notify stack can anchor ABOVE the lowest
+  // interactive surface on /s/:id. Shell renders ShellNotify as a sibling of
+  // <main>, so a value set on a SessionPage node would not inherit to the
+  // stack; ride documentElement (its common ancestor). The structured views
+  // render the session dock (composer control bar); the tty view renders no
+  // dock, so TerminalView hands up its bottom chrome (local input dock +
+  // phone key bar, + the byte-route note on desktop). Exactly one is mounted
+  // at a time and SessionPage is the single writer — two writers would race
+  // on the same property across the tty/structured switch. The hook clears
+  // the value with no element so non-session routes never see a stale height.
   const [dockEl, setDockEl] = useState<HTMLDivElement | null>(null);
-  useLayoutEffect(() => {
-    const root = document.documentElement;
-    if (!dockEl) {
-      root.style.removeProperty("--session-dock-h");
-      return;
-    }
-    const publish = () => {
-      root.style.setProperty("--session-dock-h", `${dockEl.offsetHeight}px`);
-    };
-    publish();
-    let observer: ResizeObserver | undefined;
-    if (typeof ResizeObserver !== "undefined") {
-      observer = new ResizeObserver(publish);
-      observer.observe(dockEl);
-    }
-    return () => {
-      observer?.disconnect();
-      root.style.removeProperty("--session-dock-h");
-    };
-  }, [dockEl]);
+  const [ttyChromeEl, setTtyChromeEl] = useState<HTMLDivElement | null>(null);
+  usePublishedElementHeight(dockEl ?? ttyChromeEl, "--session-dock-h");
 
   const events = hub.events[instanceId] ?? [];
   const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
@@ -719,6 +707,7 @@ export function SessionPage({
         ) : resolvedView === "tty" ? (
           <TerminalView
             instance={instance}
+            bottomChromeRef={setTtyChromeEl}
             onAttachFailed={(reason) => {
               hubStore.toast(reason);
               navigate(`/s/${instance.id}/structured`, { replace: true });

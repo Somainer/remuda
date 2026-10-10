@@ -764,3 +764,186 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     await clear(page);
   });
 });
+
+test.describe("notification stack clears the tty bottom chrome (r5 item 2)", () => {
+  // Two standing blockers (distinct subjects = distinct keys): tall enough to
+  // cover the phone key bar on the pre-fix 12px anchor.
+  const raiseTwo = (page: Page) =>
+    page.evaluate(() => {
+      const lab = (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab;
+      lab?.notify({ severity: "blocking", subject: "standing one", stage: "standing error" });
+      lab?.notify({ severity: "blocking", subject: "standing two", stage: "standing error" });
+    });
+  const clear = (page: Page) =>
+    page.evaluate(() => {
+      (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab?.dismissAllBlocking();
+    });
+
+  async function createTerminal(page: Page): Promise<string> {
+    const response = await page.request.get("/v1/hosts");
+    expect(response.ok()).toBe(true);
+    const body = (await response.json()) as { items?: { id?: string; label?: string }[] };
+    const host = (body.items ?? []).find((row) => row.label === "e2e-fake-node") ?? body.items?.[0];
+    expect(host?.id, "fake node host").toBeTruthy();
+    const createdRes = await page.request.post("/v1/instances", {
+      data: {
+        hostId: host!.id,
+        workspaceId: "wsp_e2e",
+        kind: "terminal",
+        driver: "shell-pty",
+        prompt: "composer popover tty chrome",
+      },
+    });
+    expect(
+      createdRes.ok(),
+      `create terminal: ${createdRes.status()} ${await createdRes.text()}`,
+    ).toBe(true);
+    const createdBody = (await createdRes.json()) as {
+      instance: { instanceId?: string; id?: string };
+    };
+    return createdBody.instance.instanceId ?? createdBody.instance.id!;
+  }
+
+  async function gotoTty(page: Page, id: string) {
+    await page.goto(`/s/${id}/tty`);
+    await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "tty");
+    await expect(page.locator("[data-tty-ready='1']")).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator(".xterm")).toBeVisible();
+  }
+
+  // The ResizeObserver-published --session-dock-h must equal the measured tty
+  // bottom chrome (local input dock / phone key bar) and the stack must sit one
+  // 12px gap above it — same contract as the structured session dock.
+  const expectStackClearsChrome = async (page: Page) => {
+    await page.waitForFunction(
+      () => {
+        const stack = document.querySelector<HTMLElement>(
+          "[data-testid='blocking-errors']",
+        )?.parentElement;
+        const chrome = document.querySelector<HTMLElement>("[data-testid='tty-bottom-chrome']");
+        if (!stack || !chrome) return false;
+        const bottom = Math.round(window.innerHeight - stack.getBoundingClientRect().bottom);
+        const chromeH = Math.round(chrome.getBoundingClientRect().height);
+        const varVal =
+          parseFloat(
+            getComputedStyle(document.documentElement).getPropertyValue("--session-dock-h"),
+          ) || NaN;
+        return chromeH > 0 && Math.abs(varVal - chromeH) <= 1 && Math.abs(bottom - (chromeH + 12)) <= 2;
+      },
+      null,
+      { timeout: 10_000 },
+    );
+  };
+
+  /** Center hit-test: the element at the centre must own the point (not the
+   *  standing notice), and return the centre for a REAL tap. */
+  const centerPoint = async (page: Page, testId: string) => {
+    const node = page.getByTestId(testId).first();
+    await node.evaluate((el) => el.scrollIntoView({ block: "nearest", inline: "center" }));
+    const box = (await node.boundingBox())!;
+    const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    const hit = await page.evaluate(
+      (p) =>
+        document
+          .elementFromPoint(p.x, p.y)
+          ?.closest(`[data-testid='${p.id}']`)
+          ?.getAttribute("data-testid") === p.id,
+      { id: testId, ...point },
+    );
+    expect(hit, `${testId} covered by the notification stack`).toBe(true);
+    return point;
+  };
+
+  test.describe("390px compact", () => {
+    // Same touch context shape as m-keybar.hub: coarse pointer so both the
+    // local input dock and the phone key bar mount (the full bottom chrome).
+    test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+
+    test("a blocking notice lifts over the phone key bar, so tty keys stay real-tappable", async ({
+      page,
+    }) => {
+      let id = "";
+      try {
+        id = await createTerminal(page);
+        await gotoTty(page, id);
+
+        // Raise the standing notices BEFORE touching the bar (the r5
+        // ordering): on the pre-fix build the stack dropped to a 12px anchor
+        // and parked across the nine-key row.
+        await raiseTwo(page);
+        await expect(page.getByText("standing error").first()).toBeVisible();
+        await expectStackClearsChrome(page);
+
+        // A REAL tap on 键 reaches the nine-key row and reveals the raw-key
+        // strip (pre-fix: the blocker swallowed it).
+        const keyboardPoint = await centerPoint(page, "phone-key-keyboard");
+        await page.mouse.click(keyboardPoint.x, keyboardPoint.y);
+        const rawBar = page.getByTestId("tty-keybar");
+        await expect(rawBar).toBeVisible();
+        // The expanded strip grows the measured chrome; re-assert clearance.
+        await expectStackClearsChrome(page);
+
+        // Hit-test and REAL-tap a tty-key-* button in the expanded row. Ctrl
+        // is sticky, so aria-pressed proves the tap reached the key rather
+        // than the standing notice.
+        const ctrlPoint = await centerPoint(page, "tty-key-ctrl");
+        await page.mouse.click(ctrlPoint.x, ctrlPoint.y);
+        await expect(page.getByTestId("tty-key-ctrl")).toHaveAttribute("aria-pressed", "true");
+
+        if (process.env.REMUDA_EVIDENCE === "1") {
+          await page.screenshot({
+            path: "test-results/composerpop-r5-tty-notify-390.png",
+            animations: "disabled",
+          });
+        }
+      } finally {
+        await clear(page);
+        if (id) await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+      }
+    });
+  });
+
+  test("1440 /s/:id/tty: a blocking notice leaves the local input dock clickable", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    let id = "";
+    try {
+      id = await createTerminal(page);
+      await gotoTty(page, id);
+
+      // Desktop defaults to 直连 (the local dock is unmounted); switch to the
+      // 本地输入 mode so the tty-dock input is part of the bottom chrome.
+      await page.getByRole("button", { name: "本地输入" }).click();
+      await expect(page.getByTestId("tty-dock")).toBeVisible();
+      await expect(page.getByTestId("tty-mode-pill")).toHaveText("keys");
+
+      await raiseTwo(page);
+      await expect(page.getByText("standing error").first()).toBeVisible();
+      await expectStackClearsChrome(page);
+
+      const input = page.locator("[data-testid='tty-dock'] input[aria-label='本地输入']");
+      const box = (await input.boundingBox())!;
+      const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+      const hit = await page.evaluate(
+        (p) => document.elementFromPoint(p.x, p.y)?.closest("input[aria-label='本地输入']") != null,
+        point,
+      );
+      expect(hit, "tty-dock input covered by the notification stack").toBe(true);
+      // A REAL click focuses the input; typing lands in it.
+      await page.mouse.click(point.x, point.y);
+      await page.keyboard.type("ls -la");
+      await expect(input).toHaveValue("ls -la");
+
+      if (process.env.REMUDA_EVIDENCE === "1") {
+        await page.screenshot({
+          path: "test-results/composerpop-r5-tty-notify-1440.png",
+          animations: "disabled",
+        });
+      }
+    } finally {
+      await clear(page);
+      if (id) await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    }
+  });
+});

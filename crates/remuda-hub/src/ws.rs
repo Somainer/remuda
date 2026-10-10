@@ -2348,6 +2348,16 @@ mod tests {
     /// total order even when the two settles share a millisecond and their
     /// interaction ids interleave, so a strictly-forward seq cursor can never
     /// skip a row of the earlier batch.
+    ///
+    /// c-cardsettle r10 item 5 SCOPE NOTE: the "cursor mid-A" here is built
+    /// DIRECTLY from invalidated_interactions_after(None) and handed to
+    /// drain_settlement_lag — the live follower never received the first
+    /// three rows, so this test proves ONLY the durable seq ordering/drain
+    /// path, not production backpressure (it does not make the r9 commit's
+    /// "delivers part of a batch" claim true). The end-to-end assertion — a
+    /// REAL follow_session whose cursor advances mid-batch through the live
+    /// settlement bus before the block — lives in
+    /// tests/cardsettle.rs::follower_blocked_mid_batch_recovers_a_larger_later_batch_in_order.
     #[tokio::test]
     async fn settlement_cursor_mid_first_batch_recovers_a_later_overring_sweep() {
         let dir = tempfile::tempdir().expect("tmp");

@@ -1782,3 +1782,286 @@ async fn follower_lag_drains_a_large_single_sweep_before_the_gap() -> Result<()>
     hub.shutdown().await;
     Ok(())
 }
+
+/// r10 item 2 (the r9 item 3 test as actually asked): a REAL follower over
+/// `/v1/follow` receives PART of a first settlement batch live — its durable
+/// cursor ends MID that batch through the production bus path, not a
+/// hand-built cursor — is then blocked by socket backpressure while a LARGER
+/// second batch overruns the 64-notice ring, and on unblock the durable lag
+/// drain recovers every missing settlement from the cursor, tail-of-A then
+/// all of B in monotonic `settlement_events.seq` order, each exactly once,
+/// before the single `settlement-backpressure` gap.
+#[tokio::test]
+async fn follower_blocked_mid_batch_recovers_a_larger_later_batch_in_order() -> Result<()> {
+    let mut config = HubConfig::for_test(tempfile::tempdir()?.path().join("data"));
+    // A 1-deep pump→writer queue so a backed-up socket parks the pump fast.
+    config.follow_buffer_events = 1;
+    let hub = spawn(config).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+
+    // Two ready instances: A carries the first (smaller) batch, B the larger
+    // batch that later overruns the ring.
+    async fn ready_instance(
+        addr: std::net::SocketAddr,
+        cookie: &str,
+        host_id: &HostId,
+        label: &str,
+        card_count: usize,
+        node: &FakeNode,
+    ) -> Result<(String, Vec<String>)> {
+        let create_body = json!({
+            "hostId": host_id.as_id().as_str(),
+            "kind": "claude",
+            "driver": "claude-print",
+            "delegation": "none",
+            "permissionMode": "bypass",
+            "prompt": label,
+        })
+        .to_string();
+        let (status, body) =
+            http(addr, "POST", "/v1/instances", cookie, Some(&create_body)).await?;
+        assert_eq!(status, 200, "create {body}");
+        let created: Value = serde_json::from_str(&body)?;
+        let instance_id = created["instance"]["instanceId"]
+            .as_str()
+            .context("instanceId")?
+            .to_string();
+        node.append(
+            "jready",
+            &instance_id,
+            json!({ "kind": "lifecycle", "payload": {
+                "type": "entity", "entityType": "instance", "state": "ready"
+            }}),
+        )
+        .await?;
+        let mut ids = Vec::with_capacity(card_count);
+        for n in 0..card_count {
+            let id = format!("{label}_{n:05}");
+            node.append(
+                &format!("jreq-{label}-{n}"),
+                &instance_id,
+                approval_requested_event(&id),
+            )
+            .await?;
+            ids.push(id);
+        }
+        Ok((instance_id, ids))
+    }
+
+    // A's batch must overrun the shrunken 4 KiB receive window on its own
+    // (~250 B/frame), so the follower provably parks with the cursor INSIDE
+    // A; B is the larger batch that overruns the 64-notice ring.
+    const A_CARDS: usize = 40;
+    const B_CARDS: usize = 120;
+    let (inst_a, cards_a) =
+        ready_instance(addr, &cookie, &host_id, "int_r9mid_a", A_CARDS, &node).await?;
+    let (inst_b, cards_b) =
+        ready_instance(addr, &cookie, &host_id, "int_r9mid_b", B_CARDS, &node).await?;
+
+    // Raw node sockets for the two epoch reconciles. A node.hello completes a
+    // socket's handshake exactly once ("hello already completed" on a second
+    // hello), so each epoch gets its OWN socket: socket A's hello lists B live
+    // so ONLY A is lost (batch one); socket B lists nothing and loses B
+    // (batch two).
+    use futures::SinkExt;
+    macro_rules! connect_node {
+        () => {{
+            let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+            req.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {}", node.node_token()).parse()?,
+            );
+            let (socket, _) = tokio_tungstenite::connect_async(req).await?;
+            anyhow::Ok(socket)
+        }};
+    }
+    let hello = |epoch: &'static str, inventory: Value| {
+        json!({
+            "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
+            "params": {
+                "hostId": host_id.as_id().as_str(),
+                "nodeVersion": "0.1.0",
+                "nodeEpoch": epoch,
+                "instanceStoreFound": true,
+                "instances": inventory
+            }
+        })
+    };
+    // Service a raw node socket until the result frame with `want_id` lands
+    // (asserting it is a result, not an RPC error), or the deadline expires.
+    async fn await_result_frame<S>(socket: &mut S, want_id: &str, label: &str) -> Result<()>
+    where
+        S: std::marker::Unpin
+            + futures::Stream<
+                Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+            >,
+    {
+        use futures::StreamExt;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(Ok(Message::Text(text)))) =
+                tokio::time::timeout(Duration::from_millis(500), socket.next()).await
+            else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&text)?;
+            if frame.get("id").and_then(Value::as_str) == Some(want_id) {
+                assert!(frame.get("result").is_some(), "{label}: {frame}");
+                return Ok(());
+            }
+        }
+        anyhow::bail!("{label} result never arrived")
+    }
+    let mut socket_a = connect_node!()?;
+
+    // The REAL follower, unfiltered, on a tiny receive window. It connects
+    // BEFORE either batch settles, so its seed cursor precedes batch A — A's
+    // notices genuinely arrive through the live settlement bus (connect
+    // replay is empty at seed), and reading only the first three leaves its
+    // production cursor MID batch A.
+    let mut follow_req = format!("ws://{addr}/v1/follow").into_client_request()?;
+    follow_req.headers_mut().insert("Cookie", cookie.parse()?);
+    let follow_tcp = tokio::net::TcpStream::connect(addr).await?;
+    #[cfg(unix)]
+    {
+        nix::sys::socket::setsockopt(&follow_tcp, nix::sys::socket::sockopt::RcvBuf, &256)?;
+    }
+    let (mut follow, _) = tokio_tungstenite::client_async(follow_req, follow_tcp).await?;
+    // Give the follower pump time to seed its cursor and subscribe to the
+    // settlement bus before batch A is committed.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Batch one: B is reported live, so only A's 40 cards settle.
+    socket_a
+        .send(Message::Text(
+            serde_json::to_string(&hello(
+                "cs-r9mid-epoch-2",
+                json!([{
+                    "id": inst_b,
+                    "hostId": host_id.as_id().as_str(),
+                    "lifecycle": "running",
+                    "activity": "idle"
+                }]),
+            ))?
+            .into(),
+        ))
+        .await?;
+    await_result_frame(&mut socket_a, "hello", "epoch-2 hello").await?;
+
+    // Read the follower until THREE batch-A settlements have arrived live,
+    // then park the writer with an over-window journal frame and stop reading.
+    let mut live: Vec<String> = Vec::new();
+    let park_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    use futures::StreamExt;
+    'park: while tokio::time::Instant::now() < park_deadline {
+        let remaining = park_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout(remaining, follow.next()).await
+        else {
+            break 'park;
+        };
+        let frame: Value = serde_json::from_str(&text)?;
+        if frame.get("type").and_then(Value::as_str) == Some("settlement")
+            && frame["instanceId"] == json!(inst_a)
+        {
+            live.push(frame["interactionId"].as_str().unwrap().to_string());
+            if live.len() == 3 {
+                break 'park;
+            }
+        }
+    }
+    assert_eq!(live.len(), 3, "the follower receives part of batch A live");
+    // One over-window journal frame jams the tiny socket's writer; the pump
+    // stops polling the settlement ring while we never read. It rides the
+    // CURRENT generation owner (socket A, epoch-2).
+    socket_a
+        .send(Message::Text(
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": "jpad-r9mid", "method": "journal.append",
+                "params": {
+                    "instanceId": inst_b,
+                    "event": { "kind": "message",
+                               "payload": { "text": "x".repeat(16 * 1024) } }
+                }
+            }))?
+            .into(),
+        ))
+        .await?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Batch two on a FRESH socket (the handshake is one hello per socket):
+    // empty attested inventory loses B (and re-sweeps nothing new of A, whose
+    // cards are already invalidated).
+    let mut socket_b = connect_node!()?;
+    socket_b
+        .send(Message::Text(
+            serde_json::to_string(&hello("cs-r9mid-epoch-3", json!([])))?.into(),
+        ))
+        .await?;
+    await_result_frame(&mut socket_b, "hello", "epoch-3 hello").await?;
+    // socket B owns the generation now; keep socket A open so its (now
+    // displaced) task cannot race a disconnect reconcile while we drain.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // UNBLOCK: drain the real follower until its settlement-backpressure gap.
+    let mut drained: Vec<String> = Vec::new();
+    let mut settlement_gaps = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    'read: while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(next) = tokio::time::timeout(remaining, follow.next()).await.ok() else {
+            break 'read;
+        };
+        let Some(Ok(Message::Text(text))) = next else {
+            continue;
+        };
+        let frame: Value = serde_json::from_str(&text)?;
+        match frame.get("type").and_then(Value::as_str) {
+            Some("settlement") => {
+                drained.push(
+                    frame["interactionId"]
+                        .as_str()
+                        .context("settlement interactionId")?
+                        .to_string(),
+                );
+            }
+            Some("gap") if frame["reason"] == "settlement-backpressure" => {
+                settlement_gaps += 1;
+                break 'read;
+            }
+            _ => {}
+        }
+    }
+
+    // The drained tail is itself strictly ascending (tail of A, then B)…
+    let mut sorted_drained = drained.clone();
+    sorted_drained.sort();
+    assert_eq!(drained, sorted_drained, "the drain stays in seq order");
+    // …and together with the live prefix covers all 160 settlements exactly
+    // once, in one global order.
+    let mut all = live.clone();
+    all.extend(drained);
+    assert_eq!(
+        all.len(),
+        A_CARDS + B_CARDS,
+        "every lost settlement is recovered: {} of {}",
+        all.len(),
+        A_CARDS + B_CARDS
+    );
+    let mut unique = all.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), all.len(), "no settlement is delivered twice");
+    let mut want = cards_a;
+    want.extend(cards_b);
+    want.sort();
+    all.sort();
+    assert_eq!(all, want, "recovered ids are exactly batch A then batch B");
+    assert_eq!(settlement_gaps, 1, "one settlement gap closes the recovery");
+
+    hub.shutdown().await;
+    Ok(())
+}

@@ -734,12 +734,14 @@ fn spawn_status_pump(
                 }
                 failed.store(true, Ordering::SeqCst);
                 let _ = interactions.close().await;
-                let payload = failure_lifecycle(
-                    "exit",
-                    &ctx.session_id,
-                    &pane_id,
-                    "pane exited; agent process is gone",
-                );
+                // c-cardsettle-fu r1 item 3: a generic-PTY pane exit carries
+                // its real diagnostic in the event data (exit code / signal /
+                // last stderr line); persist THAT rather than the literal
+                // "failed", which told the operator nothing about the death.
+                // The generic string remains only the fallback when the
+                // carrier supplied no usable detail.
+                let diagnostic = pane_exit_diagnostic(&event.data);
+                let payload = failure_lifecycle("exit", &ctx.session_id, &pane_id, &diagnostic);
                 if emit_on(
                     &tx,
                     &seq,
@@ -984,6 +986,74 @@ async fn emit_startup_failure(
         payload,
     )
     .await
+}
+
+/// Build the human-facing diagnostic for a generic-PTY `pane.exited` event
+/// (c-cardsettle-fu r1 item 3). Prefers the real evidence the carrier
+/// reports — a signal, an exit code, or the last stderr line — over the
+/// uninformative literal "failed". Returns the generic fallback only when
+/// none of those fields is present. Field names are checked across the
+/// snake_case and camelCase shapes the herdr wire uses.
+fn pane_exit_diagnostic(data: &serde_json::Value) -> String {
+    const FALLBACK: &str = "pane exited; agent process is gone";
+    let str_field = |names: &[&str]| -> Option<String> {
+        names
+            .iter()
+            .find_map(|name| data.get(*name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let num_field = |names: &[&str]| -> Option<i64> {
+        names
+            .iter()
+            .find_map(|name| data.get(*name))
+            .and_then(serde_json::Value::as_i64)
+    };
+
+    // A signal death: signal name ("SIGKILL"/"KILL"/"kill") or raw number.
+    if let Some(signal) = str_field(&["signalName", "signal_name", "signal"]) {
+        let signal = signal
+            .strip_prefix("SIG")
+            .unwrap_or(&signal)
+            .to_ascii_uppercase();
+        return format!("agent process killed by signal {signal}");
+    }
+    if let Some(signal) = num_field(&["signal", "signalNumber", "signal_number"]) {
+        // 128+N is the shell encoding of signal N; accept both shapes.
+        let sig = if signal > 128 { signal - 128 } else { signal };
+        return format!("agent process killed by signal {sig}");
+    }
+
+    // An exit code: prefer the explicit field, also accept an object
+    // `{code: …}`/`exit_status` shape.
+    if let Some(code) = num_field(&[
+        "exitCode",
+        "exit_code",
+        "code",
+        "exitStatus",
+        "exit_status",
+        "status",
+    ])
+    .filter(|code| *code != 0)
+    {
+        return format!("agent process exited with code {code}");
+    }
+
+    // The last stderr line the child produced before exiting.
+    if let Some(stderr) = str_field(&[
+        "lastStderr",
+        "last_stderr",
+        "stderr",
+        "message",
+        "error",
+        "detail",
+    ]) {
+        return format!("agent process exited: {stderr}");
+    }
+
+    FALLBACK.to_owned()
 }
 
 fn failure_lifecycle(
@@ -1295,5 +1365,45 @@ mod tests {
         ));
         assert!(!looks_like_shell_prompt("❯ \n"));
         assert!(!looks_like_shell_prompt("OK\n❯ \n"));
+    }
+
+    /// c-cardsettle-fu r1 item 3: the stored PaneExited diagnostic names the
+    /// real exit code/signal/stderr rather than the literal "failed".
+    #[test]
+    fn pane_exit_diagnostic_names_the_real_exit_code() {
+        let diag = |data: serde_json::Value| pane_exit_diagnostic(&data);
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exit_code": 7 })),
+            "agent process exited with code 7"
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signalName": "SIGKILL" })),
+            "agent process killed by signal KILL"
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 15 })),
+            "agent process killed by signal 15"
+        );
+        assert_eq!(
+            diag(serde_json::json!({
+                "pane_id": "p1",
+                "lastStderr": "config.toml parse error at line 3"
+            })),
+            "agent process exited: config.toml parse error at line 3"
+        );
+        // A bare code 0 adds no failure diagnostic; fall through.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exitCode": 0 })),
+            "pane exited; agent process is gone"
+        );
+        // Nothing usable: generic fallback, never the literal "failed".
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1" })),
+            "pane exited; agent process is gone"
+        );
     }
 }

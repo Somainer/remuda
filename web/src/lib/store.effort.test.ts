@@ -354,3 +354,209 @@ it("an older poll projection cannot overwrite a newer live effective or move the
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });
+
+it("an identical poll still settles queued effort left by a historical onPrepend replay (c-perffu r2)", async () => {
+  // End state of an ascending load-earlier (onPrepend) replay: first the
+  // newer remuda effective edge folds (with no push-down in flight yet, it
+  // lands as a terminal-side switch), THEN the configure row journaled after
+  // it is replayed as queued — so pending exists while the effective map
+  // already carries the newer read-back. The next poll returns that SAME
+  // record; pending settlement must run independently of effective-record
+  // equality (r1 had nested it inside the effective fold gate).
+  const ctx = await startFollowing("r2-replay");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+
+  ctx.receive(effortEvent(2, "high", null, "launch"));
+  const newerAt = "2026-09-22T00:03:00Z";
+  ctx.receive({
+    ...effortEvent(3, "xhigh", false, "remuda"),
+    observedAt: newerAt,
+    payload: {
+      effective: { name: "xhigh", ultracode: false, source: "remuda", observedAt: newerAt },
+      raw: "xhigh",
+    },
+  } as unknown as Observation);
+  // The queued configure row, journaled AFTER the effective edge, replayed
+  // last: pending re-appears over the already-newer effective.
+  ctx.receive(configureLifecycle(4, "effort-queued:max", ctx.instance.id));
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // An IDENTICAL durable projection (fresh object, equal content/observedAt).
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: { name: "xhigh", ultracode: false, source: "remuda", observedAt: newerAt },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
+});
+
+it("loadEarlier onPrepend replay leaves queued effort that an identical poll then settles (c-perffu r4-2)", async () => {
+  // Drives the REAL path and ONLY that path: the follow seed carries just
+  // the latest effective observation (floor seq 5); the queued configure
+  // lifecycle exists ONLY in the older load-earlier page. The earlier r3
+  // version of this test put the queued row in the seed, so it passed with
+  // onPrepend's effort replay deleted.
+  const id = "ins_effort_prepend";
+  const journalId = "obj_effort_prepend";
+  const instance: Instance = {
+    ...mockDb.instances[0],
+    id,
+    journalId,
+    kind: "claude",
+    effortName: null,
+    effortIndex: null,
+    effortUltracode: null,
+    activity: { state: "known", value: "idle" },
+  } as Instance;
+  vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_j, _a, onBatch) => {
+    void onBatch;
+    return subscription(instance);
+  });
+
+  const seedEvents = [
+    // The bounded tail window: only the newer remuda read-back. No queued row.
+    { ...effortEvent(5, "xhigh", false, "remuda") },
+  ];
+  const olderEvents = [
+    // The older launch level (monotonic guard must not roll effective back)…
+    { ...effortEvent(1, "high", null, "launch") },
+    // …and the historical queued configure row, journaled after it. This is
+    // the ONLY source of the queued state in this test.
+    configureLifecycle(4, "effort-queued:max", id),
+  ];
+  const olderRequests: unknown[] = [];
+
+  vi.spyOn(api, "eventsRead").mockImplementation(async (args) => {
+    if (args && "beforeSeq" in args && args.beforeSeq !== undefined) {
+      olderRequests.push(args);
+      return {
+        events: olderEvents,
+        durableSeq: "5",
+        windowFromSeq: "1",
+        reachedAfterSeq: true,
+        getReadyState: () => 1,
+      } as unknown as History;
+    }
+    return {
+      events: seedEvents,
+      durableSeq: "5",
+      // Loaded floor is seq 5, strictly above the older rows.
+      windowFromSeq: "5",
+      reachedAfterSeq: true,
+      getReadyState: () => 1,
+    } as unknown as History;
+  });
+
+  await hubStore.follow(id);
+  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
+  // The queued lifecycle has not been replayed yet.
+  expect(hubStore.effortPendingOf(id)).toBeNull();
+
+  // Real load-earlier: floor 5 -> beforeSeq must be "4". loadEarlier returns
+  // the bounded-read descriptor {prepended,end,floor} (UO-6a load-earlier).
+  const result = await hubStore.loadEarlier(id);
+  expect(result).not.toBeNull();
+  expect(result).toMatchObject({ prepended: true, end: true, floor: "1" });
+  expect(result!.floor).toBe("1");
+  expect(olderRequests).toHaveLength(1);
+  expect((olderRequests[0] as { beforeSeq?: string }).beforeSeq).toBe("4");
+
+  // The older launch edge never rolls effective back; the replayed queued
+  // lifecycle now marks the push-down as queued via onPrepend.
+  expect(hubStore.effortEffectiveOf(id)?.name).toBe("xhigh");
+  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
+  expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
+
+  // A stale poll carrying a read-back OLDER than the queued configure
+  // (00:05 < the seq-4 queued request at 00:14) must NOT clear the switch
+  // (c-perffu r7: settlement needs an observation at least as new as the
+  // queued request).
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      {
+        ...instance,
+        effortEffective: {
+          name: "xhigh",
+          ultracode: false,
+          source: "remuda",
+          observedAt: "2026-09-16T00:05:00Z",
+        },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
+
+  // A current read-back at/after the queued request (00:14) settles it.
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      {
+        ...instance,
+        effortEffective: {
+          name: "max",
+          ultracode: false,
+          source: "remuda",
+          observedAt: "2026-09-16T00:14:00Z",
+        },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(id)).toBeNull();
+});
+
+it("a stale effort poll older than the queued configure leaves the queued switch pending (c-perffu r7-3)", async () => {
+  // Same fixture shape, isolated: baseline read-back t1, queued configure
+  // journaled at t2, then a poll returns an effective at t1.5 (newer than the
+  // baseline, older than the request) — pending must survive.
+  const ctx = await startFollowing("poll-queued-stale", { state: "known", value: "idle" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const t1 = "2026-09-16T00:10:00Z";
+  const t15 = "2026-09-16T00:10:30Z";
+  const t2 = "2026-09-16T00:11:00Z";
+  const list = vi.spyOn(api, "instanceList");
+
+  // Baseline effective t1.
+  list.mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: { name: "high", ultracode: null, source: "launch", observedAt: t1 } }],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(t1);
+
+  // User queues a max switch: baseline t1.
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+
+  // Live delivery: the queued configure is journaled at t2.
+  const queued = {
+    ...configureLifecycle(2, "effort-queued:max", ctx.instance.id),
+    observedAt: t2,
+  };
+  ctx.receive(queued);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // A stale poll: t1.5 is newer than baseline t1 but older than the request t2.
+  list.mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: { name: "high", ultracode: null, source: "launch", observedAt: t15 } }],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // A current read-back (t2) settles.
+  list.mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: t2 } }],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});

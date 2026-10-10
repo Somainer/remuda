@@ -2,20 +2,22 @@ import { expect, test, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
 
 /**
- * c-ghostbadge round 2: the badge must count exactly the rows the inbox shows
- * as 待你处理 — including across a REAL instance death and a deadline crossing
- * with no page reload.
+ * c-ghostbadge round 2 / c-cardsettle round 9: the badge must count exactly
+ * the rows the inbox shows as 待你处理 — and a card of an ENDED session never
+ * stays pending, even while its own deadline is still open.
  *
  * The fake node `ghostbadge-live` sentinel creates a genuinely live hook
  * approval (durable interaction.requested journal + live broker) carrying a
  * short known deadline: badge 1 / inbox 1. Then `GHOSTNODE_RESTART` via
  * instance.send drops the socket and reconnects under a new epoch that omits
  * the instance, so the Hub's reconcile_reported_instances settles it exited
- * and the new process serves no interaction.list for it. The durable row is
- * still state='pending' until the deadline crosses; the shared deadline
- * clock then flips the projection to expired in place — badge 0 / 待你处理
- * (0), asserted on the same mounted PhoneShell (no reload, in-shell client
- * navigation only) and only then re-checked after a real reload.
+ * and invalidates the pending card in the SAME transaction
+ * (generation-ended), regardless of the still-future known deadline — the
+ * Hub has no deadline sweeper, so an exemption would leave the durable row
+ * pending and the badge counting it forever. The settlement control frame
+ * flips the badge 1 -> 0 on the same mounted PhoneShell (no reload, in-shell
+ * client navigation only); the durable state is invalidated; a reload
+ * re-confirms 0.
  */
 test.describe.configure({ mode: "serial" });
 
@@ -48,7 +50,6 @@ type RawInteraction = {
   id?: string;
   instanceId?: string;
   state?: string;
-  deadline?: { state?: string; value?: string };
 };
 
 async function pendingInteractionId(page: Page, instanceId: string): Promise<string> {
@@ -89,7 +90,10 @@ async function instanceLifecycle(page: Page, instanceId: string): Promise<string
   }, instanceId);
 }
 
-test.describe("390px ghost badge across a real node restart and deadline", () => {
+test.describe("390px ghost badge across a real node restart", () => {
+  /** Settlement frames per follow socket URL, captured from before login. */
+  let settlementFramesByUrl: Record<string, string[]>;
+
   test.use({
     viewport: { width: 390, height: 844 },
     hasTouch: true,
@@ -97,6 +101,14 @@ test.describe("390px ghost badge across a real node restart and deadline", () =>
   });
 
   test.beforeEach(async ({ page }) => {
+    settlementFramesByUrl = {};
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", ({ payload }) => {
+        if (typeof payload === "string" && payload.includes('"type":"settlement"')) {
+          (settlementFramesByUrl[ws.url()] ??= []).push(payload);
+        }
+      });
+    });
     await login(page);
   });
 
@@ -106,7 +118,7 @@ test.describe("390px ghost badge across a real node restart and deadline", () =>
     }
   });
 
-  test("live card is 1/1; node restart settles the instance exited; deadline crossing flips to 0/0 in place", async ({
+  test("live card is 1/1; node restart settles instance and card together; badge flips to 0/0 in place", async ({
     page,
   }) => {
     const instanceId = await createSession(page, "ghostbadge-live sentinel");
@@ -122,43 +134,63 @@ test.describe("390px ghost badge across a real node restart and deadline", () =>
     await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (1)");
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toBeVisible();
 
+    // Stall the periodic interaction poll BEFORE the restart. With no poll,
+    // the only thing that can remove the card on this mounted page is the
+    // Hub settlement frame's own pin + refresh — so the flip below fails if
+    // settlement handling is a no-op (and it cannot be the deadline clock:
+    // the durable row becomes invalidated immediately).
+    await page.evaluate(() => {
+      const debug = (window as unknown as { __remudaHub?: { stopPoll: () => void } }).__remudaHub;
+      debug?.stopPoll();
+    });
+
     // --- End the instance for real: a new-epoch node hello that omits it. ---
     await postCommand(page, instanceId, "GHOSTNODE_RESTART");
     await expect
       .poll(() => instanceLifecycle(page, instanceId), { timeout: 20_000 })
       .toBe("exited");
 
-    // The durable interaction row survives the restart still pending (the
-    // Hub only settles the instance today; the card's own deadline retires
-    // it). This pins the scenario as a genuine ghost-in-waiting.
-    const stillPending = await page.evaluate(async (iid) => {
+    // The settlement control frame for THIS card is observed on an
+    // unfiltered /v1/follow socket.
+    await expect
+      .poll(
+        () =>
+          Object.values(settlementFramesByUrl)
+            .flat()
+            .some((text) => text.includes(`"interactionId":"${interactionId}"`)),
+        { timeout: 20_000 },
+      )
+      .toBe(true);
+    const carryingUrls = Object.entries(settlementFramesByUrl)
+      .filter(([, frames]) =>
+        frames.some((text) => text.includes(`"interactionId":"${interactionId}"`)),
+      )
+      .map(([url]) => new URL(url).search);
+    expect(carryingUrls, "the settlement rides the unfiltered follow bus").toContain("");
+
+    // c-cardsettle r9: the Hub settles the card in the SAME transaction as
+    // the exited instance, even while the card's KNOWN deadline is still
+    // open — there is no Hub deadline sweeper, so a pending row here would
+    // be counted and answerable forever.
+    const settled = await page.evaluate(async (iid) => {
       const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
       const found = (body.items ?? []).find(
         (item: RawInteraction) => item.interactionId === iid || item.id === iid,
       );
-      return found?.state === "pending"
-        ? (found.deadline?.state === "known" ? "pending-known-deadline" : "pending")
-        : found?.state ?? "missing";
+      return found?.state ?? "missing";
     }, interactionId);
-    expect(stillPending).toBe("pending-known-deadline");
+    expect(settled).toBe("invalidated");
 
-    // --- With NO reload: the card is still pending (deadline open); watch
-    // the mounted inbox tier flip 1 -> 0 when the known deadline crosses —
-    // the shared clock drives it, with no store emission or navigation. The
-    // PERSISTENT PhoneShell bottom bar (and its badge) stays mounted on this
-    // page, so pin the badge to 1 here first. ---
-    await page.goto("/m/inbox");
-    await expect(page.getByTestId("m-inbox")).toBeVisible();
-    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (1)");
-    await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1");
-    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)", {
-      timeout: 70_000,
-    });
+    // --- With NO reload and NO periodic poll: the frame (not the deadline
+    // clock) flips the inbox tier 1 -> 0 and drops the card on the STILL
+    // mounted PhoneShell. Plain eventual assertions, no elapsed-time bound.
+    // ---
+    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)");
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toHaveCount(0);
 
-    // The exact badge element pinned above flips in place — no reload, not even a
-    // route change (round 3: round 2 reloaded via goto before this assertion, so
-    // it never proved the persistent shell updated itself).
+    // The exact badge element pinned above flips in place — no reload, not
+    // even a route change (round 3: round 2 reloaded via goto before this
+    // assertion, so it never proved the persistent shell updated itself).
     await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
 
     // Navigate WITHIN the mounted shell: the bottom-bar Link is a client-side
@@ -168,7 +200,7 @@ test.describe("390px ghost badge across a real node restart and deadline", () =>
     await expect(page.getByTestId("home-list")).toBeVisible();
     await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
 
-    // A genuine reload afterwards keeps it 0 — the 0 is the durable projection,
+    // A genuine reload afterwards keeps it 0 — the 0 is the durable state,
     // not live-frame-only state.
     await page.goto("/m");
     await expect(page.getByTestId("home-list")).toBeVisible();

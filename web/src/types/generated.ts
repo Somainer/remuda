@@ -1822,7 +1822,7 @@ export type InteractionResolution = ({
 });
 
 /** InteractionResolutionReason wire values; `protocol.md` §2.6. */
-export type InteractionResolutionReason = ("answered" | "native-cleared" | "native-cancelled" | "generation-ended" | "timed-out");
+export type InteractionResolutionReason = ("answered" | "native-cleared" | "native-cancelled" | "generation-ended" | "timed-out" | "agent-demoted");
 
 /** InteractionRespondParams; `protocol.md` §6.1. */
 export type InteractionRespondParams = ({

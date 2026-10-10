@@ -1,12 +1,14 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { act, createRef } from "react";
+import { act, createRef, useRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { buildLongObservations } from "../../fixtures/session/longEvents";
-import type { Observation } from "../../types/observation";
+import type { Observation, Snapshot } from "../../types/observation";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import type { LocalBubble } from "../../lib/store";
+import { hubStore } from "../../lib/store";
+import { JournalClient, type JournalRead } from "../../lib/journal";
 import { Transcript, type TranscriptHandle } from "./Transcript";
 
 // The commit probe is only mounted under ?profile=1; the flag is a getter so
@@ -1324,4 +1326,3004 @@ describe("streaming row (D-053)", () => {
     expect(new Set(rows).size).toBe(1);
     expect((screen.getByTestId("held-queue-steer") as HTMLButtonElement).disabled).toBe(false);
   });
+});
+
+// ---------------------------------------------------------------------------
+// load-earlier through the REAL JournalClient -> Transcript path (UO-6a r4).
+// A scripted bounded read drives a real JournalClient; its onPrepend feeds the
+// rendered Transcript exactly like hubStore.follow's listener, so anchor
+// completion, scroll cancellation and cross-session identity are exercised
+// end to end.
+// ---------------------------------------------------------------------------
+describe("load-earlier paging via JournalClient (UO-6a r4)", () => {
+  const ROW = 96;
+  const VIEW = 720;
+
+  function toolPair(seqCall: number, tcId: string, instanceId: string): Observation[] {
+    const s = source();
+    return [
+      {
+        schemaVersion: 1,
+        eventId: `evt_${seqCall}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seqCall),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_call",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `n_${tcId}_c` as Id,
+          revision: "1",
+          operation: "open",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          parentToolCallId: null,
+          toolName: known("Bash"),
+          displayTitle: known("Bash"),
+          category: "shell",
+          input: known({ command: `cmd ${tcId}` }),
+          inputTextDelta: null,
+          state: "running",
+          executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+        },
+      } as Observation,
+      {
+        schemaVersion: 1,
+        eventId: `evt_${seqCall + 1}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seqCall + 1),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_result",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `n_${tcId}_r` as Id,
+          revision: "1",
+          operation: "close",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          stage: "final",
+          outcome: "succeeded",
+          blocks: [{ type: "text", text: `out ${tcId}` }],
+          structuredResult: unknownKnowledge("text"),
+          exitCode: known(0),
+          changes: [],
+        },
+      } as Observation,
+    ];
+  }
+
+  function source() {
+    return {
+      driverKind: "claude-print" as const,
+      driverVersion: "1",
+      adapterVersion: "1",
+      channel: "stdout" as const,
+      delivery: "replay" as const,
+      nativeSessionId: unknownKnowledge("none"),
+      nativeTurnId: unknownKnowledge("none"),
+      nativeAgentId: unknownKnowledge("none"),
+      nativeItemId: unknownKnowledge("none"),
+      nativeEventId: unknownKnowledge("none"),
+      nativeRequestId: { type: "none" as const },
+      sourceCursor: { type: "runtime" as const, ledgerRevision: "1" },
+    };
+  }
+
+  function msg(seq: number, role: "user" | "assistant", instanceId: string, text = `m${seq}`): Observation {
+    return {
+      schemaVersion: 1,
+      eventId: `evt_${seq}_${role}` as Id,
+      journalId: `obj_${instanceId}` as Id,
+      instanceId: instanceId as Id,
+      runId: null,
+      hostId: "hst" as Id,
+      processGeneration: "1",
+      runGeneration: null,
+      seq: String(seq),
+      observedAt: "2026-09-12T00:00:00.000Z",
+      nativeAt: known("2026-09-12T00:00:00.000Z"),
+      source: source(),
+      kind: "message",
+      completeness: "structured",
+      rawRef: null,
+      evidenceEventIds: [],
+      payload: {
+        nodeId: `n_${seq}_${role}` as Id,
+        messageId: `m_${seq}_${role}` as Id,
+        role,
+        phase: role === "user" ? "input" : "final",
+        revision: "1",
+        baseRevision: null,
+        operation: "open",
+        blocks: [{ type: "text", text }],
+        targetBlock: null,
+        parentToolCallId: null,
+        nativeOrigin: known(role === "user" ? "ui" : "assistant"),
+        status: "complete",
+      },
+    } as Observation;
+  }
+
+  function pageOf(events: Observation[], reachedAfterSeq = false) {
+    return {
+      events,
+      durableSeq: events.at(-1)?.seq ?? "0",
+      windowFromSeq: events[0]?.seq ?? null,
+      reachedAfterSeq,
+    };
+  }
+
+  type Registry = {
+    events: Record<string, Observation[]>;
+    floors: Record<string, string>;
+    clients: Record<string, JournalClient>;
+    setEvents: Record<string, (events: Observation[]) => void>;
+    setFloor: Record<string, (floor: string) => void>;
+  };
+
+  function makeClient(
+    reg: Registry,
+    instanceId: string,
+    initial: Observation[],
+    read: JournalRead,
+    snapshotFloor: string,
+    asOf: string,
+  ): JournalClient {
+    const client = new JournalClient(`obj_${instanceId}` as Id, read, {
+      onPrepend: (rows) => {
+        const merged = (reg.events[instanceId] ?? []).concat(rows).sort((a, b) => Number(a.seq) - Number(b.seq));
+        reg.setEvents[instanceId]?.(merged);
+      },
+    });
+    client.noteHistory(initial);
+    client.applySnapshot({
+      projectionVersion: "v1",
+      projectionEpoch: "ep" as Id,
+      asOfSeq: asOf,
+      instance: {} as Snapshot["instance"],
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: snapshotFloor, complete: false },
+    });
+    reg.clients[instanceId] = client;
+    reg.events[instanceId] = initial;
+    reg.floors[instanceId] = snapshotFloor;
+    return client;
+  }
+
+  function Driver({ reg }: { reg: Registry }) {
+    const { instanceId = "" } = useParams();
+    const [events, setEvents] = useState<Observation[]>(reg.events[instanceId] ?? []);
+    const [floor, setFloor] = useState<string>(reg.floors[instanceId] ?? "1");
+    const activeRef = useRef(instanceId);
+    activeRef.current = instanceId;
+    reg.setEvents[instanceId] = (next) => {
+      // A late prepend from another session's in-flight click must not paint
+      // over the route the reader switched to.
+      if (activeRef.current !== instanceId) return;
+      reg.events[instanceId] = next;
+      setEvents(next);
+    };
+    reg.setFloor[instanceId] = (next) => {
+      if (activeRef.current !== instanceId) return;
+      reg.floors[instanceId] = next;
+      setFloor(next);
+    };
+    return <Transcript events={events} earlierFloor={floor} compact />;
+  }
+
+  function GoTo({ to }: { to: string }) {
+    const navigate = useNavigate();
+    return (
+      <button type="button" data-testid={`go-${to}`} onClick={() => navigate(to)}>
+        go
+      </button>
+    );
+  }
+
+  function renderDriver(reg: Registry, path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route
+            path="/s/:instanceId"
+            element={
+              <>
+                <Driver reg={reg} />
+                <GoTo to="/s/insB" />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  /** Deterministic flat row geometry off the virtual window's pad spacer. */
+  function installGeometry(totalCount: number, opts: { echoOnWrite?: boolean } = {}) {
+    const heights = new WeakMap<Element, number>();
+    const observerCbs = new Map<Element, () => void>();
+    const isScroller = (el: unknown) => el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    let top = 0;
+    // Full-list scroll height (the existing pin tests do the same): at the
+    // scroll event the DOM still shows the PREVIOUS virtual window, and
+    // deriving scrollHeight from it flips pinRef for any valid middle offset.
+    const listHeight = () => totalCount * ROW;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? VIEW : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? listHeight() : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      const h = heights.get(el) ?? ROW;
+      if (el.dataset?.testid === "transcript-scroller") {
+        return { top: 0, left: 0, right: 500, bottom: VIEW, width: 500, height: VIEW, x: 0, y: 0, toJSON() {} } as DOMRect;
+      }
+      if (el.dataset?.anchor && el.parentElement) {
+        const list = el.parentElement;
+        const spacer = Array.from(list.children).find((c) => c.getAttribute("aria-hidden") === "true") as
+          | HTMLElement
+          | undefined;
+        const pad = Number.parseFloat(spacer?.style.height ?? "0") || 0;
+        // Sum the MEASURED heights of every mounted sibling above this row: a
+        // grown row above contributes its extra height to every later rect.
+        let preceding = 0;
+        for (const sibling of Array.from(list.querySelectorAll("[data-anchor]"))) {
+          if (sibling === el) break;
+          preceding += heights.get(sibling) ?? ROW;
+        }
+        const rowTop = pad + preceding - top;
+        return { top: rowTop, left: 0, right: 500, bottom: rowTop + h, width: 500, height: h, x: 0, y: rowTop, toJSON() {} } as DOMRect;
+      }
+      return { top: 0, left: 0, right: 0, bottom: h, width: 0, height: h, x: 0, y: 0, toJSON() {} } as DOMRect;
+    });
+    class GeometryRO {
+      private readonly cb: () => void;
+      private el: Element | null = null;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe(el: Element) {
+        this.el = el;
+        observerCbs.set(el, this.cb);
+      }
+      unobserve(el: Element) {
+        if (observerCbs.get(el) === this.cb) observerCbs.delete(el);
+      }
+      disconnect() {
+        // Real ResizeObserver disconnects only THIS observation: unmounting a
+        // row must not drop the surviving rows' callbacks from the map.
+        if (this.el && observerCbs.get(this.el) === this.cb) observerCbs.delete(this.el);
+        this.el = null;
+      }
+    }
+    vi.stubGlobal("ResizeObserver", GeometryRO);
+
+    const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
+    // Browser-like scroll model: the value clamps to [0, scrollHeight -
+    // clientHeight], writing the same value dispatches NO event, and a
+    // programmatic write's scroll event is delivered on the next animation
+    // frame (coalesced: multiple writes in one frame fire once).
+    let queued = false;
+    const maxScroll = () => Math.max(0, listHeight() - VIEW);
+    const dispatchScroll = () => {
+      queued = false;
+      fireEvent.scroll(scroller());
+    };
+    const defineScroll = () => {
+      const el = scroller();
+      Object.defineProperty(el, "scrollTop", {
+        configurable: true,
+        get: () => top,
+        set: (v: number) => {
+          const clamped = Math.max(0, Math.min(v, maxScroll()));
+          if (clamped === top) return;
+          top = clamped;
+          // Simulate a browser delivering the programmatic scroll's own event
+          // queued on the next frame (real scroll events are coalesced, not
+          // microtask-ordered against the click's finally).
+          if (opts.echoOnWrite && !queued) {
+            queued = true;
+            requestAnimationFrame(dispatchScroll);
+          }
+        },
+      });
+    };
+    // An explicit reader gesture: clamped like the browser and dispatched
+    // synchronously by the test.
+    const scrollTo = (value: number) => {
+      top = Math.max(0, Math.min(value, maxScroll()));
+      fireEvent.scroll(scroller());
+    };
+    // A real WHEEL gesture: the browser scrolls ~delta then fires wheel (and
+    // later a coalesced scroll). Clamp like the browser; tiny deltas still
+    // move within rounding.
+    const wheel = (deltaY: number) => {
+      top = Math.max(0, Math.min(top + deltaY, maxScroll()));
+      fireEvent.wheel(scroller(), { deltaY });
+    };
+    /** Flush the setter's coalesced next-frame scroll event(s). */
+    const nextFrame = () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+    const growMountedRow = (ordinal: number, height: number) => {
+      const el = scroller().querySelectorAll<HTMLElement>("[data-anchor]")[ordinal];
+      if (!el) throw new Error(`mounted row ${ordinal} not found`);
+      heights.set(el, height);
+      observerCbs.get(el)?.();
+    };
+    const scrollTopNow = () => top;
+    return { scroller, defineScroll, scrollTo, wheel, growMountedRow, scrollTopNow, nextFrame };
+  }
+
+  function gate<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("retires a load-earlier anchor whose compact fold was renamed by the older page (item 1)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeometry(39);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    // Window starts mid-turn: three tools (one compact fold) then an assistant,
+    // followed by enough turns to scroll into later.
+    const initial: Observation[] = [
+      ...toolPair(201, "tc-a", "ins1"),
+      ...toolPair(203, "tc-b", "ins1"),
+      ...toolPair(205, "tc-c", "ins1"),
+      msg(207, "assistant", "ins1"),
+    ];
+    // Thirty more message nodes: a long list the reader can sit inside
+    // without being pinned to the tail (jsdom does not clamp scrollTop).
+    for (let seq = 208, i = 0; i < 15; i += 1, seq += 2) {
+      initial.push(msg(seq, "user", "ins1"));
+      initial.push(msg(seq + 1, "assistant", "ins1"));
+    }
+    // The older page continues the SAME tool run with earlier tool_call ids:
+    // the fold compact:tc-a is renamed to compact:tc-x (the armed id vanishes).
+    const olderPage = [
+      ...toolPair(101, "tc-x", "ins1"),
+      ...toolPair(103, "tc-y", "ins1"),
+    ];
+    makeClient(
+      reg,
+      "ins1",
+      initial,
+      vi.fn<JournalRead>().mockResolvedValue(pageOf(olderPage)),
+      "201",
+      "225",
+    );
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    renderDriver(reg, "/s/ins1");
+    geo.defineScroll();
+    const scroller = geo.scroller();
+    // Mount pins a follow session to the tail; scroll to the fold at the top.
+    geo.scrollTo(0);
+    expect(scroller.querySelector("[data-anchor='compact:tc-a']")).toBeTruthy();
+    await user.click(screen.getByTestId("load-earlier"));
+    await act(async () => {});
+    // The renamed fold sits where the armed fold was.
+    expect(scroller.querySelector("[data-anchor='compact:tc-x']")).toBeTruthy();
+
+    // Drive four stable passes (mount measure + three commits from rows below
+    // the anchor) so the held restore converges and releases.
+    await act(async () => {});
+    geo.growMountedRow(5, ROW + 1);
+    geo.growMountedRow(6, ROW + 2);
+    geo.growMountedRow(7, ROW + 3);
+    geo.growMountedRow(5, ROW);
+    geo.growMountedRow(6, ROW);
+    geo.growMountedRow(7, ROW);
+
+    // After release, ordinary growth anchoring works again: scroll into the
+    // list, sample a reading anchor, then grow a mounted row ABOVE it.
+    // Sit at a genuine reading position: 40+ nodes, viewport 720, not pinned.
+    geo.scrollTo(25 * ROW);
+    await act(async () => {});
+    const before = geo.scrollTopNow();
+    // Grow a mounted row ABOVE the sampled reading anchor. Once the prepend
+    // restore has RELEASED, holdReadingAnchor compensates (a leaked restore
+    // disables that hold for the whole session and leaves the growth ignored).
+    geo.growMountedRow(4, ROW + 40);
+    expect(geo.scrollTopNow()).toBeGreaterThanOrEqual(before + 39);
+  });
+
+  it("cancels the held restore when the reader scrolls before the page lands (item 3)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeometry(40);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    const initial: Observation[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      initial.push(msg(1001 + i, i % 2 === 0 ? "user" : "assistant", "ins3", `m${1001 + i}`));
+    }
+    const older: Observation[] = [];
+    for (let i = 0; i < 20; i += 1) older.push(msg(901 + i, i % 2 === 0 ? "user" : "assistant", "ins3", `o${901 + i}`));
+    const g = gate<ReturnType<typeof pageOf>>();
+    makeClient(reg, "ins3", initial, vi.fn<JournalRead>().mockImplementation(() => g.promise), "1001", "1020");
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    renderDriver(reg, "/s/ins3");
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+    // The reader navigates manually while the older window is still in flight.
+    geo.scrollTo(300);
+    await act(async () => {
+      g.resolve(pageOf(older));
+      await Promise.resolve();
+    });
+    await act(async () => {});
+    // The prepend must not yank the scroller back to the click-time row.
+    expect(geo.scrollTopNow()).toBe(300);
+  });
+
+  it("a late resolve from session A cannot clear session B's armed restore (item 4)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeometry(40);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    const mkTurns = (instanceId: string) => {
+      const out: Observation[] = [];
+      for (let i = 0; i < 20; i += 1) {
+        out.push(msg(1001 + i, i % 2 === 0 ? "user" : "assistant", instanceId, `${instanceId}-${1001 + i}`));
+      }
+      return out;
+    };
+    // A reconnect re-anchor above held rows lets A's click resolve
+    // duplicate-only (rows all already held), which is the finalize path that
+    // used to clear whatever anchors were armed next.
+    const gateA = gate<ReturnType<typeof pageOf>>();
+    makeClient(
+      reg,
+      "insA",
+      mkTurns("insA"),
+      vi.fn<JournalRead>().mockImplementation(() => gateA.promise),
+      "1021",
+      "1040",
+    );
+    // Seed rows under the higher re-anchor floor.
+    reg.clients.insA.noteHistory(mkTurns("insA"));
+    const gateB = gate<ReturnType<typeof pageOf>>();
+    const olderB: Observation[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      olderB.push(msg(901 + i, i % 2 === 0 ? "user" : "assistant", "insB", `b-${901 + i}`));
+    }
+    makeClient(
+      reg,
+      "insB",
+      mkTurns("insB"),
+      vi.fn<JournalRead>().mockImplementation(() => gateB.promise),
+      "1001",
+      "1020",
+    );
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    renderDriver(reg, "/s/insA");
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+
+    // Route to B (same mounted Transcript) and arm B while A is still in flight.
+    await user.click(screen.getByTestId("go-/s/insB"));
+    geo.scrollTo(0);
+    const buttonB = screen.getByTestId("load-earlier");
+    await user.click(buttonB);
+    expect((buttonB as HTMLButtonElement).disabled).toBe(true);
+
+    // A resolves duplicate-only: 1001..1020 below the re-anchored floor 1021
+    // is every row A already holds.
+    await act(async () => {
+      gateA.resolve(pageOf(mkTurns("insA")));
+      await Promise.resolve();
+    });
+    // B's request is still the owner: loading state survives.
+    expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(true);
+
+    // B's real prepend lands and restores the click-time anchor (now 20 rows
+    // deeper) instead of having been cleared by A.
+    await act(async () => {
+      gateB.resolve(pageOf(olderB));
+      await Promise.resolve();
+    });
+    await act(async () => {});
+    expect(Math.abs(geo.scrollTopNow() - 20 * ROW)).toBeLessThanOrEqual(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// UO-6a round 5: programmatic vs user scroll, post-prepend fold retarget,
+// final-page settle, route-change restore reset, reconnect duplicate paging.
+// ---------------------------------------------------------------------------
+describe("load-earlier anchor lifecycle round 5", () => {
+  const ROW = 96;
+  const VIEW = 720;
+  // Active browser-like scroll model: the prototype scrollTop override is
+  // installed once but reads the CURRENT installGeo harness (its closures
+  // differ per test), so each test's clamp/event/onWrite options apply.
+  type ScrollModel = {
+    echoOnWrite: boolean;
+    onWrite?: (v: number) => void;
+    clampHeight?: () => number;
+    total: () => number;
+    clientHeight: () => number;
+    getTop: () => number;
+    setTop: (v: number) => void;
+    queue: () => void;
+    isQueued: () => boolean;
+    clearQueued: () => void;
+  };
+  let activeScroll: ScrollModel | null = null;
+  let protoScrollInstalled = false;
+  // Where jsdom defines the native accessor: restore by defineProperty on the
+  // same object, or by deleting an own override that shadowed a prototype one.
+  const nativeScrollOwner: { desc: PropertyDescriptor; on: Element } | null = (() => {
+    const onH = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop");
+    if (onH) return { desc: onH, on: HTMLElement.prototype };
+    const onE = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+    return onE ? { desc: onE, on: Element.prototype } : null;
+  })();
+  const restoreNativeScrollTop = () => {
+    if (!protoScrollInstalled || !nativeScrollOwner) return;
+    if (nativeScrollOwner.on === HTMLElement.prototype) {
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", nativeScrollOwner.desc);
+    } else {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollTop;
+    }
+    protoScrollInstalled = false;
+  };
+
+  function source() {
+    return {
+      driverKind: "claude-print" as const,
+      driverVersion: "1",
+      adapterVersion: "1",
+      channel: "stdout" as const,
+      delivery: "replay" as const,
+      nativeSessionId: unknownKnowledge("none"),
+      nativeTurnId: unknownKnowledge("none"),
+      nativeAgentId: unknownKnowledge("none"),
+      nativeItemId: unknownKnowledge("none"),
+      nativeEventId: unknownKnowledge("none"),
+      nativeRequestId: { type: "none" as const },
+      sourceCursor: { type: "runtime" as const, ledgerRevision: "1" },
+    };
+  }
+
+  function m(seq: number, role: "user" | "assistant", instanceId: string): Observation {
+    return {
+      schemaVersion: 1,
+      eventId: `e_${seq}_${role}_${instanceId}` as Id,
+      journalId: `obj_${instanceId}` as Id,
+      instanceId: instanceId as Id,
+      runId: null,
+      hostId: "hst" as Id,
+      processGeneration: "1",
+      runGeneration: null,
+      seq: String(seq),
+      observedAt: "2026-09-12T00:00:00.000Z",
+      nativeAt: known("2026-09-12T00:00:00.000Z"),
+      source: source(),
+      kind: "message",
+      completeness: "structured",
+      rawRef: null,
+      evidenceEventIds: [],
+      payload: {
+        nodeId: `n_${seq}_${role}_${instanceId}` as Id,
+        messageId: `mm_${seq}_${role}_${instanceId}` as Id,
+        role,
+        phase: role === "user" ? "input" : "final",
+        revision: "1",
+        baseRevision: null,
+        operation: "open",
+        blocks: [{ type: "text", text: `${instanceId}-m${seq}` }],
+        targetBlock: null,
+        parentToolCallId: null,
+        nativeOrigin: known(role === "user" ? "ui" : "assistant"),
+        status: "complete",
+      },
+    } as Observation;
+  }
+
+  function toolAt(seq: number, tcId: string, instanceId: string): Observation[] {
+    const s = source();
+    return [
+      {
+        schemaVersion: 1,
+        eventId: `e_${seq}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seq),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_call",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `nc_${tcId}` as Id,
+          revision: "1",
+          operation: "open",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          parentToolCallId: null,
+          toolName: known("Bash"),
+          displayTitle: known("Bash"),
+          category: "shell",
+          input: known({ command: tcId }),
+          inputTextDelta: null,
+          state: "running",
+          executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+        },
+      } as Observation,
+      {
+        schemaVersion: 1,
+        eventId: `e_${seq + 1}` as Id,
+        journalId: `obj_${instanceId}` as Id,
+        instanceId: instanceId as Id,
+        runId: null,
+        hostId: "hst" as Id,
+        processGeneration: "1",
+        runGeneration: null,
+        seq: String(seq + 1),
+        observedAt: "2026-09-12T00:00:00.000Z",
+        nativeAt: known("2026-09-12T00:00:00.000Z"),
+        source: s,
+        kind: "tool_result",
+        completeness: "structured",
+        rawRef: null,
+        evidenceEventIds: [],
+        payload: {
+          nodeId: `nr_${tcId}` as Id,
+          revision: "1",
+          operation: "close",
+          baseRevision: null,
+          toolCallId: tcId as Id,
+          stage: "final",
+          outcome: "succeeded",
+          blocks: [{ type: "text", text: tcId }],
+          structuredResult: unknownKnowledge("text"),
+          exitCode: known(0),
+          changes: [],
+        },
+      } as Observation,
+    ];
+  }
+
+  function pageOf(events: Observation[], reachedAfterSeq = false) {
+    return {
+      events,
+      durableSeq: events.at(-1)?.seq ?? "0",
+      windowFromSeq: events[0]?.seq ?? null,
+      reachedAfterSeq,
+    };
+  }
+
+  type Registry = {
+    events: Record<string, Observation[]>;
+    floors: Record<string, string>;
+    clients: Record<string, JournalClient>;
+    setEvents: Record<string, (events: Observation[]) => void>;
+    setFloor: Record<string, (floor: string) => void>;
+  };
+
+  function makeClient(
+    reg: Registry,
+    instanceId: string,
+    initial: Observation[],
+    read: JournalRead,
+    snapshotFloor: string,
+    asOf: string,
+  ): JournalClient {
+    const client = new JournalClient(`obj_${instanceId}` as Id, read, {
+      onPrepend: (rows) => {
+        const merged = (reg.events[instanceId] ?? []).concat(rows).sort((a, b) => Number(a.seq) - Number(b.seq));
+        reg.setEvents[instanceId]?.(merged);
+      },
+    });
+    client.noteHistory(initial);
+    client.applySnapshot({
+      projectionVersion: "v1",
+      projectionEpoch: "ep" as Id,
+      asOfSeq: asOf,
+      instance: {} as Snapshot["instance"],
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: snapshotFloor, complete: false },
+    });
+    reg.clients[instanceId] = client;
+    reg.events[instanceId] = initial;
+    reg.floors[instanceId] = snapshotFloor;
+    return client;
+  }
+
+  function Driver({ reg, compact = true }: { reg: Registry; compact?: boolean }) {
+    const { instanceId = "" } = useParams();
+    const [sessionId, setSessionId] = useState(instanceId);
+    const [events, setEvents] = useState<Observation[]>(reg.events[instanceId] ?? []);
+    const [floor, setFloor] = useState<string>(reg.floors[instanceId] ?? "1");
+    // Route param change WITHOUT a remount (Transcript itself stays mounted,
+    // exactly like SessionPage): swap the store-backed state in render.
+    if (sessionId !== instanceId) {
+      setSessionId(instanceId);
+      setEvents(reg.events[instanceId] ?? []);
+      setFloor(reg.floors[instanceId] ?? "1");
+    }
+    const activeRef = useRef(instanceId);
+    activeRef.current = instanceId;
+    reg.setEvents[instanceId] = (next) => {
+      if (activeRef.current !== instanceId) return;
+      reg.events[instanceId] = next;
+      setEvents(next);
+    };
+    reg.setFloor[instanceId] = (next) => {
+      if (activeRef.current !== instanceId) return;
+      reg.floors[instanceId] = next;
+      setFloor(next);
+    };
+    return <Transcript events={events} earlierFloor={floor} compact={compact} />;
+  }
+
+  function gate<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  /** Geometry harness scoped to one Driver render (see round-4 block). */
+  function installGeo(
+    totalCount: number,
+    opts: { echoOnWrite?: boolean; onWrite?: (v: number) => void; clampHeight?: () => number } = {},
+  ) {
+    const echoOnWrite = opts.echoOnWrite ?? false;
+    let dynamicTotal = totalCount;
+    const heights = new WeakMap<Element, number>();
+    const observerCbs = new Map<Element, () => void>();
+    const isScroller = (el: unknown) => el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    let top = 0;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? VIEW : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? dynamicTotal * ROW : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      const h = heights.get(el) ?? ROW;
+      if (el.dataset?.testid === "transcript-scroller") {
+        return { top: 0, left: 0, right: 500, bottom: VIEW, width: 500, height: VIEW, x: 0, y: 0, toJSON() {} } as DOMRect;
+      }
+      if (el.dataset?.anchor && el.parentElement) {
+        const list = el.parentElement;
+        const spacer = Array.from(list.children).find((c) => c.getAttribute("aria-hidden") === "true") as
+          | HTMLElement
+          | undefined;
+        const pad = Number.parseFloat(spacer?.style.height ?? "0") || 0;
+        let preceding = 0;
+        for (const sibling of Array.from(list.querySelectorAll("[data-anchor]"))) {
+          if (sibling === el) break;
+          preceding += heights.get(sibling) ?? ROW;
+        }
+        const rowTop = pad + preceding - top;
+        return { top: rowTop, left: 0, right: 500, bottom: rowTop + h, width: 500, height: h, x: 0, y: rowTop, toJSON() {} } as DOMRect;
+      }
+      return { top: 0, left: 0, right: 0, bottom: h, width: 0, height: h, x: 0, y: 0, toJSON() {} } as DOMRect;
+    });
+    class GeoRO {
+      private readonly cb: () => void;
+      private el: Element | null = null;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe(el: Element) {
+        this.el = el;
+        observerCbs.set(el, this.cb);
+      }
+      unobserve(el: Element) {
+        if (observerCbs.get(el) === this.cb) observerCbs.delete(el);
+      }
+      disconnect() {
+        // Real ResizeObserver disconnects only THIS observation: unmounting a
+        // row must not drop the surviving rows' callbacks from the map.
+        if (this.el && observerCbs.get(this.el) === this.cb) observerCbs.delete(this.el);
+        this.el = null;
+      }
+    }
+    vi.stubGlobal("ResizeObserver", GeoRO);
+    const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
+    // Browser-like scroll model installed on the PROTOTYPE, so it also
+    // intercepts the component's very first-mount restore write (an
+    // element-level override installed after render misses it). Clamp to
+    // [0, scrollHeight - clientHeight], no event when the value does not
+    // change, and a programmatic write's scroll event is delivered next frame
+    // (coalesced). Non-scroller elements keep the native accessor.
+    let queued = false;
+    const model: ScrollModel = {
+      echoOnWrite,
+      onWrite: opts.onWrite,
+      clampHeight: opts.clampHeight,
+      total: () => dynamicTotal,
+      clientHeight: () => VIEW,
+      getTop: () => top,
+      setTop: (v) => {
+        top = v;
+      },
+      queue: () => {
+        queued = true;
+      },
+      isQueued: () => queued,
+      clearQueued: () => {
+        queued = false;
+      },
+    };
+    activeScroll = model;
+    const nativeDesc = nativeScrollOwner?.desc;
+    if (!protoScrollInstalled) {
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+        configurable: true,
+        get(this: HTMLElement) {
+          if (isScroller(this) && activeScroll) return activeScroll.getTop();
+          return nativeDesc?.get?.call(this) as number;
+        },
+        set(this: HTMLElement, v: number) {
+          const m = activeScroll;
+          if (!isScroller(this) || !m) {
+            nativeDesc?.set?.call(this, v);
+            return;
+          }
+          const max = Math.max(0, (m.clampHeight?.() ?? m.total() * ROW) - m.clientHeight());
+          const clamped = Math.max(0, Math.min(v, max));
+          if (clamped === m.getTop()) return;
+          m.setTop(clamped);
+          m.onWrite?.(clamped);
+          if (m.echoOnWrite && !m.isQueued()) {
+            m.queue();
+            const el = this;
+            requestAnimationFrame(() => {
+              m.clearQueued();
+              fireEvent.scroll(el);
+            });
+          }
+        },
+      });
+      protoScrollInstalled = true;
+    }
+    // Kept for call-site compatibility: the prototype model needs no element
+    // setup and works before render.
+    const defineScroll = () => {};
+    // An explicit reader gesture: clamped and dispatched synchronously.
+    const scrollTo = (value: number) => {
+      const max = Math.max(0, (opts.clampHeight?.() ?? dynamicTotal * ROW) - VIEW);
+      top = Math.max(0, Math.min(value, max));
+      fireEvent.scroll(scroller());
+    };
+    // A real wheel gesture: scroll ~delta (clamped) then fire wheel.
+    const wheel = (deltaY: number) => {
+      const max = Math.max(0, (opts.clampHeight?.() ?? dynamicTotal * ROW) - VIEW);
+      top = Math.max(0, Math.min(top + deltaY, max));
+      fireEvent.wheel(scroller(), { deltaY });
+    };
+    /** Flush the setter's coalesced next-frame scroll event(s). */
+    const nextFrame = () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+    const growRow = (ordinal: number, height: number) => {
+      const el = scroller().querySelectorAll<HTMLElement>("[data-anchor]")[ordinal];
+      if (!el) throw new Error(`mounted row ${ordinal} not found`);
+      heights.set(el, height);
+      observerCbs.get(el)?.();
+    };
+    const setTotal = (n: number) => {
+      dynamicTotal = n;
+    };
+    return { scroller: () => scroller(), defineScroll, scrollTo, wheel, growRow, top: () => top, setTotal, nextFrame, isQueued: () => queued };
+  }
+
+  /**
+   * Turn-start fixture: a fold of tc-a/tc-b/tc-c mid-turn, the assistant end,
+   * then 15 more message turns so the list is long enough to scroll inside.
+   */
+  function foldSession(): Observation[] {
+    const initial: Observation[] = [
+      ...toolAt(201, "r5-tc-a", "insX"),
+      ...toolAt(203, "r5-tc-b", "insX"),
+      ...toolAt(205, "r5-tc-c", "insX"),
+      m(207, "assistant", "insX"),
+    ];
+    for (let seq = 208, i = 0; i < 15; i += 1, seq += 2) {
+      initial.push(m(seq, "user", "insX"));
+      initial.push(m(seq + 1, "assistant", "insX"));
+    }
+    return initial;
+  }
+
+  /** Same-turn older tools that rename the fold to compact:r5-tc-x. */
+  function sameTurnOlderTools(): Observation[] {
+    return [...toolAt(106, "r5-tc-x", "insX"), ...toolAt(108, "r5-tc-y", "insX")];
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    activeScroll = null;
+    // Restore the native scrollTop accessor the geometry stub replaced.
+    restoreNativeScrollTop();
+  });
+
+  it("a restore whose own scroll event lands mid-flight completes instead of cancelling (item 1)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeo(43, { echoOnWrite: true });
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    const g = gate<ReturnType<typeof pageOf>>();
+    const done = gate<void>();
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      // The client emits (and the restore writes + its scroll event fires)
+      // BEFORE the click's finally settles: hold the Transcript continuation
+      // on `done` so the echo truly lands while the request is in flight.
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      await done.promise;
+      return result;
+    });
+    // Older page: 31 standalone rows + two earlier tools renaming the fold.
+    const older: Observation[] = [];
+    let seq = 101;
+    for (let t = 0; t < 15; t += 1) {
+      older.push(m(seq, "user", "insX"));
+      older.push(m(seq + 1, "assistant", "insX"));
+      seq += 2;
+    }
+    older.push(m(seq, "user", "insX"));
+    older.push(...toolAt(seq + 1, "r5-tc-x", "insX"));
+    older.push(...toolAt(seq + 3, "r5-tc-y", "insX"));
+    makeClient(reg, "insX", foldSession(), () => g.promise, "201", "237");
+
+    render(
+      <MemoryRouter initialEntries={["/s/insX"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+
+    // The client emits: the restore jumps to the fold 31 rows deep and the
+    // browser echoes that programmatic scroll while the request is still in
+    // flight. The matching-target guard must not cancel the restore.
+    g.resolve(pageOf(older));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // Deliver the restore write's coalesced next-frame echo while the click
+    // continuation is still held open on `done` — the event genuinely lands
+    // mid-flight.
+    await geo.nextFrame();
+    expect(geo.top()).toBe(31 * ROW);
+
+    // Mounted rows at the target window measure a very different real height
+    // (50px). An armed restore FREEZES the unmeasured-row estimate at 96, so
+    // the fold stays pinned at 2976; a wrongly self-cancelled restore clears
+    // restoringRef, the estimate converges, and the anchor drifts to 31*50.
+    for (let i = 0; i < 8; i += 1) geo.growRow(i, 50);
+    expect(geo.top()).toBe(31 * ROW);
+
+    // Now the finally settles; the button returns to idle.
+    await act(async () => {
+      done.resolve();
+      await Promise.resolve();
+    });
+    expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("retargets a renamed fold past newly inserted standalone rows to the content row (item 2)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeo(43);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    // Older page: a finished PREVIOUS turn (its lone tool stays standalone,
+    // only one routine tool so no fold), then this turn's user message and two
+    // earlier tools that rename the fold. The fold lands FOUR slots down.
+    const older: Observation[] = [
+      m(101, "user", "insX"),
+      ...toolAt(102, "r5-tc-solo", "insX"),
+      m(104, "assistant", "insX"),
+      m(105, "user", "insX"),
+      ...sameTurnOlderTools(),
+    ];
+    let resolve!: (v: ReturnType<typeof pageOf>) => void;
+    makeClient(
+      reg,
+      "insX",
+      foldSession(),
+      () =>
+        new Promise((r) => {
+          resolve = r;
+        }),
+      "201",
+      "237",
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/s/insX"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+    await act(async () => {
+      resolve(pageOf(older));
+      await Promise.resolve();
+    });
+
+    // The restored anchor is the RENAMED FOLD, not the standalone user row at
+    // the raw pre-insert index: the estimate jump is four rows deep.
+    expect(geo.top()).toBe(4 * ROW);
+    const fold = geo.scroller().querySelector("[data-anchor='compact:r5-tc-x']");
+    expect(fold).toBeTruthy();
+    expect(Math.round((fold as HTMLElement).getBoundingClientRect().top)).toBe(0);
+  });
+
+  it("keeps restoring on the final history page until the anchor settles (item 3)", async () => {
+    const user = userEvent.setup();
+    const jumps: number[] = [];
+    const geo = installGeo(50, { onWrite: (v) => { if (v > 0) jumps.push(v); } });
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    // 20-row tail; the final page adds 30 rows down to seq 1 (window complete),
+    // so the armed first row lands at index 30, below the mounted window.
+    const tail: Observation[] = [];
+    for (let i = 0; i < 20; i += 1) tail.push(m(31 + i, i % 2 === 0 ? "user" : "assistant", "insE"));
+    const finalPage: Observation[] = [];
+    for (let seq = 1; seq <= 30; seq += 1) finalPage.push(m(seq, seq % 2 ? "user" : "assistant", "insE"));
+    let resolve!: (v: ReturnType<typeof pageOf>) => void;
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const r = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return r;
+    });
+    makeClient(reg, "insE", tail, () => new Promise((r2) => { resolve = r2; }), "31", "50");
+    render(<MemoryRouter initialEntries={["/s/insE"]}><Routes><Route path="/s/:instanceId" element={<Driver reg={reg} />} /></Routes></MemoryRouter>);
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+
+    await act(async () => {
+      resolve(pageOf(finalPage, true));
+      await Promise.resolve();
+    });
+    jumps.length = 0;
+
+    // Mount measurements keep arriving while the anchor is still deep and
+    // unmounted: a live restore RE-JUMPS toward it on every measurement commit
+    // until it mounts. The old end-page finally retired the restore, so the
+    // jump happened once and never repeats.
+    for (let i = 0; i <= 15; i += 1) {
+      await act(async () => {
+        geo.growRow(i, 50);
+      });
+    }
+    expect(jumps.length).toBeGreaterThan(1);
+    expect(screen.queryByTestId("load-earlier")).toBeNull();
+  });
+
+  it("a route switch mid-click clears the restore so estimate convergence resumes (item 4)", async () => {
+    const user = userEvent.setup();
+    const geo = installGeo(60);
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+    // Session A: a click whose read never returns.
+    const aEvents: Observation[] = [];
+    for (let i = 0; i < 40; i += 1) aEvents.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insA"));
+    makeClient(
+      reg,
+      "insA",
+      aEvents,
+      () => new Promise(() => {}),
+      "1001",
+      "1040",
+    );
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+    // Session B: a 200-node follow-pinned window. Its first-paint head rows
+    // report 96px and the pinned tail rows are later measured at 50px; middle
+    // rows stay unmeasured and render at whatever the estimate converged to.
+    const bEvents: Observation[] = [];
+    for (let i = 0; i < 200; i += 1) bEvents.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insB"));
+    makeClient(reg, "insB", bEvents, vi.fn<JournalRead>().mockResolvedValue(pageOf([])), "1", "1200");
+
+    function GoB() {
+      const navigate = useNavigate();
+      return (
+        <button type="button" data-testid="go-b" onClick={() => navigate("/s/insB")}>
+          go
+        </button>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/s/insA"]}>
+        <Routes>
+          <Route
+            path="/s/:instanceId"
+            element={
+              <>
+                <Driver reg={reg} compact={false} />
+                <GoB />
+              </>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+    geo.defineScroll();
+    geo.scrollTo(0);
+    await user.click(screen.getByTestId("load-earlier"));
+
+    // Switch routes while A's read is stuck: the epoch reset must clear A's
+    // restore (a leaked restoringRef freezes the row-height estimate).
+    await user.click(screen.getByTestId("go-b"));
+    await act(async () => {});
+    geo.setTotal(200);
+
+    // Measure the pinned tail rows at 50px: with the route reset the estimate
+    // converges; a leaked restoringRef from A keeps it frozen at 96px.
+    for (let pass = 0; pass < 4; pass += 1) {
+      const rows = geo.scroller().querySelectorAll<HTMLElement>("[data-anchor]");
+      await act(async () => {
+        rows.forEach((_i, idx) => {
+          if (idx >= rows.length - 16) geo.growRow(idx, 200);
+        });
+      });
+    }
+
+    // Jump to node 25: head rows hold 96px mount measurements, middle rows are
+    // unmeasured placeholders. Frozen estimate 96px -> 2400; a converged
+    // estimate (< 96px) lands noticeably higher.
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "insB-m1026");
+    await user.keyboard("[Enter]");
+    // Route reset restored estimate convergence: the 200px measurements move
+    // the jump well past the frozen-96 geometry (which lands near 4064).
+    expect(geo.top()).toBeGreaterThan(4500);
+  });
+
+  it("duplicate pages after a reconnect keep paging through until new rows prepend (item 5)", async () => {
+    const user = userEvent.setup();
+    const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+
+    // Real bounded server: newest `window` rows of (afterSeq, beforeSeq].
+    const window = 500;
+    const read: JournalRead = vi.fn(async (args) => {
+      const total = 3000;
+      const after = Number(args.afterSeq ?? 0);
+      const before = args.beforeSeq === undefined ? total : Math.min(Number(args.beforeSeq), total);
+      const picked: number[] = [];
+      for (let seq = before; seq > after && picked.length < window; seq -= 1) picked.push(seq);
+      picked.reverse();
+      const events = picked.map((seq) => m(seq, seq % 2 ? "user" : "assistant", "insR"));
+      return pageOf(
+        events,
+        picked.length === 0 || picked[0] === after + 1,
+      );
+    });
+
+    // Seed tail 1501..2500 (500-row seed + 1000 live rows applied later).
+    const seed: Observation[] = [];
+    for (let seq = 1501; seq <= 2000; seq += 1) seed.push(m(seq, seq % 2 ? "user" : "assistant", "insR"));
+    const client = makeClient(reg, "insR", seed, read, "1501", "2000");
+    // Live frames extend the applied cursor to 2500; mirror them into the
+    // registry state the Transcript renders (the store does this onEvents).
+    const live = Array.from({ length: 500 }, (_, i) => m(2001 + i, (2001 + i) % 2 ? "user" : "assistant", "insR"));
+    client.applyBatch({
+      subscriptionId: "sub",
+      journalId: "obj_insR" as Id,
+      fromSeq: "2001",
+      toSeq: "2500",
+      events: live,
+      durableSeq: "2500",
+    });
+    reg.events.insR = seed.concat(live).sort((a, b) => Number(a.seq) - Number(b.seq));
+    // Reconnect re-anchors the window floor above the loaded range.
+    client.applySnapshot({
+      projectionVersion: "v1",
+      projectionEpoch: "ep2" as Id,
+      asOfSeq: "3000",
+      instance: {} as Snapshot["instance"],
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "2501", complete: false },
+    });
+    vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+      const result = await reg.clients[instanceId]!.loadEarlier();
+      reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+      return result;
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/s/insR"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const button = () => screen.queryByTestId("load-earlier");
+    expect(button()).not.toBeNull();
+
+    // Click 1: 2001..2500 all already held — duplicate, no prepend, still open.
+    await user.click(button()!);
+    expect(reg.events.insR).toHaveLength(1000);
+    expect(button()).not.toBeNull();
+
+    // Click 2: 1501..2000 is the seed — also a duplicate, still open.
+    await user.click(button()!);
+    expect(reg.events.insR).toHaveLength(1000);
+    expect(button()).not.toBeNull();
+
+    // Click 3: 1001..1500 is unseen — rows prepend through to the Transcript.
+    await user.click(button()!);
+    await act(async () => {});
+    expect(reg.events.insR).toHaveLength(1500);
+    expect(reg.events.insR[0]?.seq).toBe("1001");
+    expect(button()).not.toBeNull();
+  });
+
+  // UO-6a round 6 item 2: while an older page is in flight, the restore must
+  // suppress only its OWN scroll echo. j/k navigation, search jumps and 跳到最新
+  // are intentional programmatic navigation: their events cancel the restore
+  // and the landing prepend must not restore the click-time row instead.
+  describe("round 6 item 2: in-flight programmatic navigation wins", () => {
+    type OlderPage = ReturnType<typeof pageOf>;
+
+    function setup(instanceId: string, opts: { savedAnchorId?: string; savedOffset?: number; noInitialScroll?: boolean } = {}) {
+      const user = userEvent.setup();
+      const writes: number[] = [];
+      const geo = installGeo(50, {
+        echoOnWrite: true,
+        onWrite: (v) => {
+          writes.push(v);
+        },
+      });
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const tail: Observation[] = [];
+      for (let i = 0; i < 50; i += 1) tail.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", instanceId));
+      const older: Observation[] = [];
+      for (let seq = 901; seq <= 1000; seq += 1) {
+        older.push(m(seq, seq % 2 ? "user" : "assistant", instanceId));
+      }
+      const g = gate<OlderPage>();
+      makeClient(reg, instanceId, tail, () => g.promise, "1001", "1050");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (iid) => {
+        const result = await reg.clients[iid]!.loadEarlier();
+        reg.setFloor[iid]?.(reg.clients[iid]!.retainedFloorSeq);
+        return result;
+      });
+      if (opts.savedAnchorId) {
+        localStorage.setItem(
+          `runtime.reading.v1.${instanceId}`,
+          JSON.stringify({ anchorId: opts.savedAnchorId, offset: opts.savedOffset ?? 0, ratio: 0, avgRow: ROW, follow: false }),
+        );
+      }
+      render(
+        <MemoryRouter initialEntries={[`/s/${instanceId}`]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      if (!opts.noInitialScroll) geo.scrollTo(0);
+      return { user, geo, g, writes, older };
+    }
+
+    async function land(geo: ReturnType<typeof setup>["geo"], g: ReturnType<typeof setup>["g"], older: Observation[]) {
+      // Deliver the navigation's coalesced next-frame scroll event (its
+      // cancellation) BEFORE the held page prepends.
+      await geo.nextFrame();
+      await act(async () => {
+        g.resolve(pageOf(older));
+        await Promise.resolve();
+      });
+      await act(async () => {});
+    }
+
+    // A leaked restore disables growth anchoring for the session (the hold
+    // bails while a prepend anchor is held). Cancelling must release it: after
+    // sitting at a genuine reading position, a row above the sampled anchor
+    // grows and the scroller compensates.
+    async function expectGrowthHolds(geo: ReturnType<typeof setup>["geo"]) {
+      geo.scrollTo(25 * ROW);
+      await act(async () => {});
+      const before = geo.top();
+      geo.growRow(4, ROW + 40);
+      expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+    }
+
+    // r8 item 2: an in-flight navigation RETARGETS the load-earlier hold, so
+    // after the prepend the DESTINATION row settles at the viewport top
+    // (asserted on the row's rect, not scrollTop, which shifts with the
+    // inserted rows).
+    function nodeTop(geo: ReturnType<typeof setup>["geo"], nodeId: string): number | null {
+      const row = geo.scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!row) return null;
+      return Math.round(row.getBoundingClientRect().top - geo.scroller().getBoundingClientRect().top);
+    }
+
+    it("j navigation during the fetch retargets the hold and lands the turn at the top", async () => {
+      const { user, geo, g, writes, older } = setup("insJ");
+      await user.click(screen.getByTestId("load-earlier"));
+      // First press selects turn 0 (already at top: no write/no event); the
+      // second jumps to turn 1 — the in-flight hold is re-aimed at turn 1.
+      await user.keyboard("jj");
+      // The merged list (100 prepended + 50 tail) is the real scrollHeight.
+      geo.setTotal(150);
+      await land(geo, g, older);
+      // The click-time anchor would have restored to 100*ROW; the retargeted
+      // hold never writes it. After the 100-row prepend the DESTINATION turn
+      // (the second message, n_1002 assistant) sits at the viewport top.
+      expect(writes).not.toContain(100 * ROW);
+      // Flush the retarget jump's own-echo scroll event so React's
+      // scrollTop state (and thus the rendered window) follows it, then let
+      // the settle correction finalize on the destination.
+      await geo.nextFrame();
+      await act(async () => {});
+      expect(nodeTop(geo, "n_1002_assistant_insJ"), "the j turn did not land at the top after the prepend").toBe(0);
+      expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
+      await expectGrowthHolds(geo);
+    });
+
+    it("a slow page (>5s after the key press) still lands the retargeted turn at the top", async () => {
+      const { user, geo, g, writes, older } = setup("insJSlow");
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.keyboard("jj");
+      geo.setTotal(150);
+      // The bounded read resolves more than PREPEND_SETTLE_DEADLINE_MS (5s)
+      // after the key press. The retarget's settle deadline is stamped only on
+      // the first post-landing commit (deadline: 0), so the hold must not
+      // expire before the page even lands.
+      const clockSpy = vi.spyOn(Date, "now");
+      const baseNow = Date.now();
+      clockSpy.mockImplementation(() => baseNow + 6_000);
+      await land(geo, g, older);
+      clockSpy.mockRestore();
+      expect(writes).not.toContain(100 * ROW);
+      await geo.nextFrame();
+      await act(async () => {});
+      expect(
+        nodeTop(geo, "n_1002_assistant_insJSlow"),
+        "a slow page made the retargeted hold expire before landing",
+      ).toBe(0);
+    });
+
+    it("跳到最新 during the fetch cancels the restore and keeps the tail pinned", async () => {
+      const { user, geo, g, writes, older } = setup("insLatest");
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.click(screen.getByTestId("jump-latest"));
+      await land(geo, g, older);
+      expect(writes).not.toContain(100 * ROW);
+      // Pinned to the bottom: the browser clamps scrollTop to
+      // scrollHeight - clientHeight, not scrollHeight.
+      expect(geo.top()).toBe(50 * ROW - VIEW);
+    });
+
+    it("a search jump during the fetch retargets the hold and parks the hit after the prepend", async () => {
+      const { user, geo, g, writes, older } = setup("insSearch");
+      // Earlier tests can leave coalesced scroll rAFs queued on the shared
+      // prototype setter; drain them so a stale event cannot cancel THIS
+      // test's fresh in-flight request (only observable in a full-file run).
+      for (let i = 0; i < 4; i += 1) await geo.nextFrame();
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.click(screen.getByTestId("transcript-search-open"));
+      // The hit m1035 sits at tail index 34 — after the 100-row prepend it
+      // shifts to 134, beyond the mounted window; the retarget parks it.
+      await user.type(screen.getByTestId("transcript-search-input"), "insSearch-m1035");
+      await user.keyboard("[Enter]");
+      // Merged list (100 prepended + 50 tail) is the real scrollHeight.
+      geo.setTotal(150);
+      await land(geo, g, older);
+      // The click-time anchor (100*ROW) is never written; the hit parks at the
+      // viewport top once the shifted window mounts it. Drain any coalesced
+      // scroll events queued ahead of this test before refining.
+      expect(writes).not.toContain(100 * ROW);
+      for (let i = 0; i < 5; i += 1) {
+        await geo.nextFrame();
+        await act(async () => {});
+        if (nodeTop(geo, "n_1035_user_insSearch") === 0) break;
+      }
+      expect(
+        nodeTop(geo, "n_1035_user_insSearch"),
+        "the search hit did not park at the top after the retargeted prepend",
+      ).toBe(0);
+      await expectGrowthHolds(geo);
+    });
+
+    it("a retargeted pending becomes an index pending when the page does not prepend and refines to the top", async () => {
+      // jj while the bounded read is in flight retargets the hold at turn 1.
+      // Before resolving, grow a mounted row by 40: holdReadingAnchor is inert
+      // while the retarget hold/pending is set, so the destination drifts 40px
+      // uncompensated. The read then returns a duplicate-only page (no
+      // prepend). With the r10 conversion the finally turns the inert
+      // restore into an index pending on the destination, whose refinement
+      // pulls its rect.top to 0; if the pending is dropped the 40px drift
+      // stays (nodeTop === 40).
+      const { user, geo, g, writes } = setup("insRetargetDup");
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.keyboard("jj");
+      // No gate resolution yet: the retarget restore + prepend anchor are
+      // armed, so the generic growth hold bails.
+      await act(async () => {
+        geo.growRow(0, ROW + 40);
+      });
+      await act(async () => {
+        // A duplicate row (seq 1001 is already held): merged list unchanged,
+        // so prepended:false and the request lands in the not-prepended
+        // branch.
+        g.resolve(pageOf([m(1001, "user", "insRetargetDup")]));
+        await Promise.resolve();
+      });
+      await act(async () => {});
+      await geo.nextFrame();
+      await act(async () => {});
+      expect(writes).not.toContain(100 * ROW);
+      expect(
+        nodeTop(geo, "n_1002_assistant_insRetargetDup"),
+        "the no-prepend retarget stayed 40px off because its pending was dropped",
+      ).toBe(0);
+    });
+
+    it("an in-flight retarget clears a saved restore's reflow anchor via the fromRestore path", async () => {
+      // A prior saved restore leaves a reflow anchor armed for the visit. Then
+      // a load-earlier starts and a j navigation while it is in flight
+      // RETARGETS — the retarget jump is a fromRestore write, so the item-1
+      // non-restore clear must not skip it: the stale saved anchor is retired.
+      const { user, geo, g, older } = setup("insRetargetClearsReflow", {
+        savedAnchorId: "n_1005_user_insRetargetClearsReflow",
+        noInitialScroll: true,
+      });
+      for (let i = 0; i < 8; i += 1) await geo.nextFrame();
+      expect(geo.scroller().getAttribute("data-reflow-hold"), "the seeded restore did not leave a reflow anchor").toBe("1");
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.keyboard("jj");
+      expect(
+        geo.scroller().getAttribute("data-reflow-hold"),
+        "the fromRestore retarget skipped the item-1 navigation clear",
+      ).toBe("0");
+      geo.setTotal(150);
+      await land(geo, g, older);
+      await geo.nextFrame();
+      await act(async () => {});
+      expect(nodeTop(geo, "n_1002_assistant_insRetargetClearsReflow")).toBe(0);
+    });
+
+    // UO-6a round 7 item 1: cancellation must happen synchronously at the
+    // navigation entry, not only when an onScroll event happens to fire. The
+    // prepend here is shallow (5 rows) so the click-time anchor stays MOUNTED
+    // and a still-armed restore visibly repins it; event timing is controlled
+    // explicitly instead of flushed by land().
+    describe("round 7 item 1: navigation cancels without relying on a scroll event", () => {
+      type OlderPage = ReturnType<typeof pageOf>;
+      function shallowSetup(instanceId: string) {
+        const user = userEvent.setup();
+        const writes: number[] = [];
+        const geo = installGeo(20, { echoOnWrite: true, onWrite: (v) => writes.push(v) });
+        const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+        const tail: Observation[] = [];
+        for (let i = 0; i < 20; i += 1) tail.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", instanceId));
+        // Shallow prepend: the armed anchor lands only 5 rows deep, still
+        // inside the mounted viewport, so an armed restore repins it visibly.
+        const older: Observation[] = [];
+        for (let seq = 996; seq <= 1000; seq += 1) older.push(m(seq, seq % 2 ? "user" : "assistant", instanceId));
+        const g = gate<OlderPage>();
+        makeClient(reg, instanceId, tail, () => g.promise, "1001", "1020");
+        vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (iid) => {
+          const result = await reg.clients[iid]!.loadEarlier();
+          reg.setFloor[iid]?.(reg.clients[iid]!.retainedFloorSeq);
+          return result;
+        });
+        render(
+          <MemoryRouter initialEntries={[`/s/${instanceId}`]}>
+            <Routes>
+              <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+            </Routes>
+          </MemoryRouter>,
+        );
+        geo.defineScroll();
+        geo.scrollTo(0);
+        const resolvePage = async () => {
+          await act(async () => {
+            g.resolve(pageOf(older));
+            await Promise.resolve();
+          });
+          await act(async () => {});
+        };
+        return { user, geo, g, writes, older, resolvePage };
+      }
+
+      it("a single j at the top retargets the hold so turn 0 is parked after the shallow prepend", async () => {
+        const { user, geo, writes, resolvePage } = shallowSetup("insJZero");
+        await user.click(screen.getByTestId("load-earlier"));
+        // One j selects turn 0 (n_1001), already at the top: the initial
+        // retarget write is unchanged and dispatches NO event.
+        await user.keyboard("j");
+        // The merged list (5 prepended + 20 tail) is the real scrollHeight.
+        geo.setTotal(25);
+        await resolvePage();
+        // The retargeted hold parks turn 0 at the viewport top after the
+        // 5-row prepend (its settle write moves to 5*ROW). The retarget
+        // destination and the click-time anchor are the same row here, so a
+        // distinct negative write value does not exist; assert the real guard
+        // — the park write actually happens (a dropped/cancelled hold would
+        // leave the scroller at its pre-prepend top).
+        await geo.nextFrame();
+        await act(async () => {});
+        expect(writes).toContain(5 * ROW);
+        const top = Math.round(
+          geo.scroller().querySelector<HTMLElement>('[data-anchor="n_1001_user_insJZero"]')!.getBoundingClientRect().top
+            - geo.scroller().getBoundingClientRect().top,
+        );
+        expect(top, "turn 0 did not park at the top after the shallow prepend").toBe(0);
+      });
+
+      it("after jj the retargeted hold settles and the estimate stops being frozen", async () => {
+        // Deep window: the retargeted turn lands 100 rows deep (off-screen at
+        // first), so a still-frozen restoringRef would show up through the
+        // estimate an off-window search uses. Once the retargeted hold settles
+        // on the turn, restoringRef clears and the estimate converges.
+        const { user, geo, g, writes, older } = setup("insJJEst");
+        await user.click(screen.getByTestId("load-earlier"));
+        // First j: unchanged write, no event. Second j: retargets the in-flight
+        // hold at turn 1, its write event stays queued for the next frame.
+        await user.keyboard("jj");
+        // The 100-row page prepends before the queued event fires; the
+        // retargeted hold stays armed only until it settles on turn 1.
+        await act(async () => {
+          g.resolve(pageOf(older));
+          await Promise.resolve();
+        });
+        await act(async () => {});
+        await geo.nextFrame();
+        await act(async () => {});
+        expect(writes).not.toContain(100 * ROW);
+        geo.setTotal(150);
+        await geo.nextFrame();
+        await act(async () => {});
+
+        // Measure the rows currently mounted at 200px with no further
+        // navigation: the estimate is global — frozen restoringRef keeps it at
+        // 96; released after settle it converges toward 200.
+        for (let pass = 0; pass < 4; pass += 1) {
+          const rows = geo.scroller().querySelectorAll<HTMLElement>("[data-anchor]");
+          await act(async () => {
+            rows.forEach((_row, idx) => {
+              if (idx < 16) geo.growRow(idx, 200);
+            });
+          });
+        }
+        // The first off-window navigation after the measurements must run with
+        // restoringRef already false (the retargeted hold settled), so the hit
+        // uses the converged estimate. Frozen at 96 the hit lands near 4064.
+        await user.click(screen.getByTestId("transcript-search-open"));
+        await user.type(screen.getByTestId("transcript-search-input"), "insJJEst-m1049");
+        await user.keyboard("[Enter]");
+        expect(geo.top()).toBeGreaterThan(4500);
+      });
+
+      it("a navigation whose event arrives after the prepend still parks the retargeted destination", async () => {
+        const { user, geo, writes, resolvePage } = shallowSetup("insLateEvent");
+        await user.click(screen.getByTestId("load-earlier"));
+        await user.keyboard("jj");
+        // The merged list (5 prepended + 20 tail) is the real scrollHeight.
+        geo.setTotal(25);
+        // Real response lands, THEN the deferred navigation scroll event. Its
+        // dispatched position matches the newer retarget echo (the scroller
+        // already moved), so it is not mistaken for reader input.
+        await resolvePage();
+        await geo.nextFrame();
+        await act(async () => {});
+        // The prepend never restores the click-time anchor (5*ROW); turn 1
+        // parks at the viewport top after the 5-row shift.
+        expect(writes).not.toContain(5 * ROW);
+        const top = Math.round(
+          geo.scroller().querySelector<HTMLElement>('[data-anchor="n_1002_assistant_insLateEvent"]')!.getBoundingClientRect().top
+            - geo.scroller().getBoundingClientRect().top,
+        );
+        expect(top, "turn 1 did not park at the top when its event landed after the prepend").toBe(0);
+      });
+    });
+
+    // UO-6a round 8 item 4: the gesture listener re-samples the reading anchor
+    // only while a restore/hold is armed. A plain wheel (no load-earlier in
+    // flight, no hold) that scrolls the model but dispatches no scroll event
+    // must leave the ordinary onScroll sample alone.
+    describe("round 8 item 4: gesture samples the anchor only while armed", () => {
+      it("an unarmed wheel with no scroll event keeps the onScroll sample", async () => {
+        const geo = installGeo(50, { echoOnWrite: true });
+        const events: Observation[] = [];
+        for (let i = 0; i < 50; i += 1) events.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insGateSample"));
+        render(
+          <MemoryRouter initialEntries={["/s/insGateSample"]}>
+            <Routes>
+              <Route path="/s/:instanceId" element={<Transcript events={events} compact />} />
+            </Routes>
+          </MemoryRouter>,
+        );
+        geo.defineScroll();
+        const anchorId = () => geo.scroller().getAttribute("data-reading-anchor");
+        // An ordinary scroll samples the topmost row at 25*ROW.
+        geo.scrollTo(25 * ROW);
+        await act(async () => {});
+        const sampled = anchorId();
+        expect(sampled).toBeTruthy();
+        // No load-earlier / restore / hold is armed. A wheel moves the model
+        // one row but fires NO scroll event: it must not re-sample (that would
+        // pick the next row); the onScroll sample stays.
+        geo.wheel(ROW);
+        expect(anchorId(), "an unarmed wheel re-sampled the anchor without a scroll event").toBe(sampled);
+      });
+    });
+
+    it("a reader scroll that coalesces with a correction echo far from its target cancels the restore", async () => {
+      // Input the gesture listener never sees (keyboard scrolling with body
+      // focus, middle-click autoscroll, an engine that drops gutter
+      // pointerdown) can land a scroll event in the same frame as a restore
+      // correction write, so no readerInputSeq bump happens. Pixel proximity
+      // must then classify it: an event far from the echo target is the
+      // reader, not the restore.
+      // Hold the rAF queue for this test so a queued echo cannot self-clear
+      // between the write and the far scroll (independent of test ordering).
+      const rafQueue: number[] = [];
+      let rafId = 0;
+      const realRaf = globalThis.requestAnimationFrame;
+      vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+        rafId += 1;
+        rafQueue.push(cb as unknown as number);
+        return rafId;
+      });
+      try {
+        const { user, geo, g, older } = setup("insCoalesceFar");
+        await user.click(screen.getByTestId("load-earlier"));
+        geo.setTotal(150);
+        await act(async () => {
+          g.resolve(pageOf(older));
+          await Promise.resolve();
+        });
+        // Drive settle corrections synchronously until an own-echo write is
+        // queued (the held rAF never delivers it).
+        let armed = false;
+        for (let i = 0; i < 14; i += 1) {
+          geo.growRow(4, ROW + 1);
+          if (geo.isQueued()) {
+            armed = true;
+            break;
+          }
+        }
+        expect(armed, "no restore echo was queued for the far scroll to coalesce with").toBe(true);
+        // Move FAR with a bare scroll event and NO wheel/gesture, in the same
+        // frame: the input token is unchanged but the position is 12 rows from
+        // the echo target.
+        const dest = geo.top();
+        geo.scrollTo(dest - 12 * ROW);
+        expect(
+          geo.scroller().getAttribute("data-prepend-hold"),
+          "a far scroll coalesced with the echo was swallowed and kept the restore",
+        ).toBe("0");
+      } finally {
+        rafQueue.length = 0;
+        vi.unstubAllGlobals();
+        // Restore the real rAF binding explicitly (unstubAllGlobals may leave
+        // the jsdom rAF in place until the next test's defineScroll).
+        globalThis.requestAnimationFrame = realRaf;
+      }
+    });
+
+    // UO-6a round 8 item 3: after a load-earlier cancel switches growth
+    // anchoring off, it must come back on the NEXT genuine gesture even when
+    // the gesture dispatches no usable scroll event (tiny wheel, scrollbar
+    // press without drag), or on a bounded timer when no input arrives at all.
+    describe("round 8 item 3: growth anchoring re-arms after a cancel", () => {
+      const growthHold = (geo: ReturnType<typeof setup>["geo"]) =>
+        geo.scroller().getAttribute("data-growth-hold");
+      // Functional check: a row above the sampled reading anchor grows and the
+      // scroller compensates, with NO reader scroll event dispatched.
+      function expectHoldsWithoutScroll(geo: ReturnType<typeof setup>["geo"]) {
+        const before = geo.top();
+        geo.growRow(4, ROW + 40);
+        expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+      }
+      async function releaseGate(g: ReturnType<typeof setup>["g"], older: Observation[]) {
+        await act(async () => {
+          g.resolve(pageOf(older));
+          await Promise.resolve();
+        });
+      }
+
+      it("a wheel that dispatches no scroll event re-arms growth anchoring immediately", async () => {
+        const { user, geo, g, older } = setup("insGhWheel");
+        // Sit at a real reading position, then arm a load-earlier there.
+        geo.scrollTo(25 * ROW);
+        await act(async () => {});
+        await user.click(screen.getByTestId("load-earlier"));
+        await act(async () => {});
+        // A genuine 1-2px wheel cancels the in-flight restore but is clamped
+        // away, dispatching NO scroll event. The gesture itself must re-arm
+        // growth anchoring: a later growth above the anchor is compensated.
+        fireEvent.wheel(geo.scroller(), { deltaY: 1 });
+        expect(growthHold(geo)).toBe("1");
+        expectHoldsWithoutScroll(geo);
+        await releaseGate(g, older);
+      });
+
+      it("a scrollbar-thumb press without a drag re-arms growth anchoring", async () => {
+        const { user, geo, g, older } = setup("insGhThumb");
+        geo.scrollTo(25 * ROW);
+        await act(async () => {});
+        await user.click(screen.getByTestId("load-earlier"));
+        await act(async () => {});
+        // Primary press on the scrollbar gutter (offsetWidth is 0 in jsdom so
+        // the inner 12px band counts); no drag, hence no scroll event.
+        fireEvent.pointerDown(geo.scroller(), { button: 0, clientX: 495 });
+        expect(growthHold(geo)).toBe("1");
+        expectHoldsWithoutScroll(geo);
+        await releaseGate(g, older);
+      });
+
+      it("a cancel whose scroll never arrives re-arms on the bounded timer", async () => {
+        // The cancel's write delivers its scroll event on a rAF; neuter rAF
+        // so that event NEVER fires, and fake only setTimeout. The bounded
+        // suppression timer is then the sole thing that can re-arm.
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+        const realRaf = globalThis.requestAnimationFrame;
+        vi.stubGlobal("requestAnimationFrame", () => 0);
+        try {
+          // fireEvent (not user-event): user-event drives its own timers and
+          // stalls under fake timers.
+          const { geo, g, older } = setup("insGhTimer");
+          fireEvent.click(screen.getByTestId("load-earlier"));
+          // 跳到最新 cancels (a non-restore navigation); with rAF neutered its
+          // scroll event never delivers, so growth anchoring is held off only
+          // until the bounded timer.
+          fireEvent.click(screen.getByTestId("jump-latest"));
+          expect(growthHold(geo), "the cancel must suppress growth anchoring first").toBe("0");
+          act(() => {
+            vi.advanceTimersByTime(501);
+          });
+          expect(growthHold(geo), "growth anchoring did not re-arm on the bounded timer").toBe("1");
+          act(() => {
+            g.resolve(pageOf(older));
+          });
+        } finally {
+          vi.unstubAllGlobals();
+          vi.useRealTimers();
+          void realRaf;
+        }
+      });
+    });
+
+    // UO-6a round 7 item 2: the browser can CLAMP a load-earlier restore
+    // write when the tail below the armed anchor is shorter than the
+    // viewport (the requested top exceeds scrollHeight - clientHeight). The
+    // echo must record the kept value, not the requested one, or the restore
+    // cancels its own clamped echo and releases the prepend repin.
+    describe("round 7 item 2: a clamped restore echo does not self-cancel", () => {
+      it("keeps the prepend anchor armed when the repin write is clamped mid-flight", async () => {
+        const user = userEvent.setup();
+        const writes: number[] = [];
+        const TAIL = 7;
+        const PREPEND = 40;
+        const geo = installGeo(TAIL, {
+          echoOnWrite: true,
+          onWrite: (v) => writes.push(v),
+        });
+        const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+        const tail: Observation[] = [];
+        for (let i = 0; i < TAIL; i += 1) tail.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insLEClamp"));
+        const older: Observation[] = [];
+        for (let seq = 961; seq <= 1000; seq += 1) older.push(m(seq, seq % 2 ? "user" : "assistant", "insLEClamp"));
+        const g = gate<ReturnType<typeof pageOf>>();
+        const done = gate<void>();
+        makeClient(reg, "insLEClamp", tail, () => g.promise, "1001", "1007");
+        vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (iid) => {
+          const result = await reg.clients[iid]!.loadEarlier();
+          reg.setFloor[iid]?.(reg.clients[iid]!.retainedFloorSeq);
+          await done.promise;
+          return result;
+        });
+        render(
+          <MemoryRouter initialEntries={["/s/insLEClamp"]}>
+            <Routes>
+              <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+            </Routes>
+          </MemoryRouter>,
+        );
+        geo.defineScroll();
+        geo.scrollTo(0);
+        await user.click(screen.getByTestId("load-earlier"));
+        // The 40-row prepend lands: the scrollHeight model must already cover
+        // it when the restore writes.
+        geo.setTotal(TAIL + PREPEND);
+        await act(async () => {
+          g.resolve(pageOf(older));
+          await Promise.resolve();
+        });
+        // The anchor lands 40 rows deep: requested 40*ROW=3840, but the 47
+        // rows of content clamp the write to 47*ROW - VIEW = 3792.
+        const clampMax = (TAIL + PREPEND) * ROW - VIEW;
+        await geo.nextFrame();
+        expect(writes).toContain(clampMax);
+
+        // The clamped echo lands mid-flight. Settle the click, then grow a
+        // mounted row BELOW the armed anchor: the still-armed repin recomputes
+        // and scrolls up to hold the anchor (writing again); a restore that
+        // self-cancelled on the clamped echo released the repin and stays
+        // silent (the pin re-write is the same clamped value, also a no-op).
+        await act(async () => {
+          done.resolve();
+          await Promise.resolve();
+        });
+        const before = writes.length;
+        // While pinned at the clamp line nothing can move scrollTop, so grow
+        // the journal below (normal live append): the tail unclamps and a
+        // still-armed repin realizes its outstanding delta toward 40*ROW. A
+        // self-cancelled restore released the repin, so only the pin write to
+        // the new bottom appears and 40*ROW is never written.
+        for (let i = 0; i < 10; i += 1) {
+          reg.events.insLEClamp!.push(m(2001 + i, i % 2 ? "user" : "assistant", "insLEClamp"));
+        }
+        geo.setTotal(TAIL + PREPEND + 10);
+        reg.setEvents.insLEClamp(reg.events.insLEClamp!.slice());
+        await act(async () => {});
+        expect(writes.length, "the clamped echo self-cancelled the prepend repin").toBeGreaterThan(before);
+        expect(writes).toContain(PREPEND * ROW);
+      });
+    });
+  });
+
+  // UO-6a round 6 item 1: the held post-prepend repin must end even when
+  // measurement commits STOP before the stable-pass count — either after the
+  // quiet window, or immediately on a genuine reader scroll — so it can never
+  // re-jump and undo a later scroll.
+  describe("round 6 item 1: the held restore has a definite end", () => {
+    type Page = ReturnType<typeof pageOf>;
+
+    function fixture(instanceId: string) {
+      const tail: Observation[] = [];
+      for (let i = 0; i < 20; i += 1) tail.push(m(31 + i, i % 2 === 0 ? "user" : "assistant", instanceId));
+      const older: Observation[] = [];
+      for (let seq = 1; seq <= 30; seq += 1) older.push(m(seq, seq % 2 ? "user" : "assistant", instanceId));
+      return { tail, older };
+    }
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("releases after a quiet window and never undoes a later reader scroll", async () => {
+      const user = userEvent.setup();
+      const geo = installGeo(50);
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const { tail, older } = fixture("insQuiet");
+      const g = gate<Page>();
+      makeClient(reg, "insQuiet", tail, () => g.promise, "31", "50");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        return result;
+      });
+      render(
+        <MemoryRouter initialEntries={["/s/insQuiet"]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+
+      // Freeze before the prepend commits so the settle quiet timer is faked;
+      // the page lands and corrections stop long before the stable passes.
+      vi.useFakeTimers();
+      await act(async () => {
+        g.resolve(pageOf(older, true));
+        await Promise.resolve();
+      });
+      act(() => {
+        vi.advanceTimersByTime(850);
+      });
+      vi.useRealTimers();
+
+      // Measurements stay quiet; the reader now scrolls and owns the
+      // position. A restore that stayed armed would re-jump on the next
+      // growth commit and disable growth anchoring (the probe below).
+      geo.scrollTo(25 * ROW);
+      await act(async () => {});
+      const before = geo.top();
+      geo.growRow(4, ROW + 40);
+      expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+    });
+
+    // UO-6a round 7 item 4: the quiet-timer release must be observable on its
+    // own, BEFORE any reader scroll. The earlier test only checked behaviour
+    // AFTER geo.scrollTo, which releases the hold by itself — so it passed
+    // even with the quiet release removed. Assert the hold is armed shortly
+    // after the prepend and retired purely by crossing the 800ms quiet window.
+    it("the quiet timer retires the hold with no reader scroll (data-prepend-hold)", async () => {
+      const user = userEvent.setup();
+      const geo = installGeo(50);
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const { tail, older } = fixture("insQuietObservable");
+      const g = gate<Page>();
+      makeClient(reg, "insQuietObservable", tail, () => g.promise, "31", "50");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        return result;
+      });
+      render(
+        <MemoryRouter initialEntries={["/s/insQuietObservable"]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-prepend-hold");
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+
+      vi.useFakeTimers();
+      await act(async () => {
+        g.resolve(pageOf(older, true));
+        await Promise.resolve();
+      });
+      // Measurement corrections have stopped but the quiet window (800ms) has
+      // not elapsed: the hold must still be ARMED. (The hold is what the
+      // release is about to retire.)
+      act(() => {
+        vi.advanceTimersByTime(100);
+      });
+      expect(hold(), "the load-earlier hold is armed before the quiet window").toBe("1");
+
+      // Cross the quiet window with NO reader scroll and no further size
+      // commit: the timer alone must retire the hold and reflect it at once.
+      act(() => {
+        vi.advanceTimersByTime(750);
+      });
+      expect(hold(), "the quiet window retires the hold before any scroll").toBe("0");
+      vi.useRealTimers();
+      await act(async () => {});
+      expect(hold(), "the retired hold stays retired").toBe("0");
+    });
+
+    it("a genuine reader scroll releases the settling restore immediately", async () => {
+      const user = userEvent.setup();
+      const geo = installGeo(50);
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const { tail, older } = fixture("insGesture");
+      const g = gate<Page>();
+      makeClient(reg, "insGesture", tail, () => g.promise, "31", "50");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        return result;
+      });
+      render(
+        <MemoryRouter initialEntries={["/s/insGesture"]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+      await act(async () => {
+        g.resolve(pageOf(older, true));
+        await Promise.resolve();
+      });
+
+      // The page landed (request done) but the stable passes have not
+      // accumulated: a genuine gesture must release the hold immediately.
+      // A real wheel input bumps the input token and cancels before the
+      // resulting scroll event; simulate that gesture, then the scroll.
+      fireEvent.wheel(geo.scroller(), { deltaY: 240 });
+      geo.scrollTo(25 * ROW);
+      await act(async () => {});
+      const before = geo.top();
+      geo.growRow(4, ROW + 40);
+      expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+    });
+
+    // UO-6a round 7 item 3: a tiny WHEEL gesture (1.5px) cancels an armed
+    // restore even though a scroll event that small can fall inside the
+    // restore's ±2px echo window. Without an explicit gesture listener the
+    // settle correction would treat the move as its own echo (or reverse it).
+    it("a 1.5px wheel gesture while a restore is armed retires it", async () => {
+      const user = userEvent.setup();
+      const geo = installGeo(50);
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      const { tail, older } = fixture("insWheel");
+      const g = gate<Page>();
+      makeClient(reg, "insWheel", tail, () => g.promise, "31", "50");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        return result;
+      });
+      render(
+        <MemoryRouter initialEntries={["/s/insWheel"]}>
+          <Routes>
+            <Route path="/s/:instanceId" element={<Driver reg={reg} />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+      await act(async () => {
+        g.resolve(pageOf(older, true));
+        await Promise.resolve();
+      });
+      await act(async () => {});
+      // Restore is armed (page landed but stable passes incomplete). A tiny
+      // 1.5px wheel BEFORE any scroll event retires it.
+      act(() => {
+        geo.wheel(1.5);
+      });
+      await act(async () => {});
+      // The reader now owns ~the post-wheel position. Pump a settle correction
+      // frame and more size commits: a still-armed restore would re-run its
+      // correction loop and pull the position back to the click-time anchor;
+      // retired, the position stays at the reader's wheel spot (within the
+      // 1.5px gesture).
+      const afterWheel = geo.top();
+      geo.growRow(4, ROW + 40);
+      await act(async () => {});
+      geo.growRow(5, ROW + 40);
+      await act(async () => {});
+      await geo.nextFrame();
+      expect(Math.abs(geo.top() - afterWheel)).toBeLessThanOrEqual(8);
+    });
+  });
+
+  // UO-6a round 6 item 3: a route switch must reset EVERY restore field, not
+  // just the estimate freeze — the settle timer, the loading latch, the held
+  // anchor/pending restore and the request identity.
+  describe("round 6 item 3: route switch resets every restore field", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("clears the armed settle timer and all anchors when switching mid-settle", async () => {
+      const user = userEvent.setup();
+      const writes: number[] = [];
+      const geo = installGeo(50, { onWrite: (v) => writes.push(v) });
+      const reg: Registry = { events: {}, floors: {}, clients: {}, setEvents: {}, setFloor: {} };
+      // A: a 20-row tail plus a final 30-row page; after the prepend the armed
+      // anchor sits 30 rows deep, unmounted — only the settle timer holds it.
+      const aTail: Observation[] = [];
+      for (let i = 0; i < 20; i += 1) aTail.push(m(31 + i, i % 2 === 0 ? "user" : "assistant", "insResetA"));
+      const aOlder: Observation[] = [];
+      for (let seq = 1; seq <= 30; seq += 1) aOlder.push(m(seq, seq % 2 ? "user" : "assistant", "insResetA"));
+      const gA = gate<ReturnType<typeof pageOf>>();
+      // The store call stays UNFINISHED after the client already emitted the
+      // prepend: the route switch happens with the click genuinely in flight
+      // (loading latch + request identity held), not in its finally.
+      const returnGate = gate<void>();
+      makeClient(reg, "insResetA", aTail, () => gA.promise, "31", "50");
+      // B: a 200-node window, floor above 1 so it shows its own pager.
+      const bEvents: Observation[] = [];
+      for (let i = 0; i < 200; i += 1) bEvents.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insResetB"));
+      makeClient(reg, "insResetB", bEvents, vi.fn<JournalRead>().mockResolvedValue(pageOf([])), "1001", "1200");
+      vi.spyOn(hubStore, "loadEarlier").mockImplementation(async (instanceId) => {
+        const result = await reg.clients[instanceId]!.loadEarlier();
+        reg.setFloor[instanceId]?.(reg.clients[instanceId]!.retainedFloorSeq);
+        if (instanceId === "insResetA") await returnGate.promise;
+        return result;
+      });
+
+      function GoB() {
+        const navigate = useNavigate();
+        return (
+          <button type="button" data-testid="go-b" onClick={() => navigate("/s/insResetB")}>
+            go
+          </button>
+        );
+      }
+
+      render(
+        <MemoryRouter initialEntries={["/s/insResetA"]}>
+          <Routes>
+            <Route
+              path="/s/:instanceId"
+              element={
+                <>
+                  <Driver reg={reg} compact={false} />
+                  <GoB />
+                </>
+              }
+            />
+          </Routes>
+        </MemoryRouter>,
+      );
+      geo.defineScroll();
+      geo.scrollTo(0);
+      await user.click(screen.getByTestId("load-earlier"));
+      // Let the manual scroll's real-timer persist debounce flush so only the
+      // restore's own timers remain once fake time starts.
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 300));
+      });
+
+      vi.useFakeTimers();
+      await act(async () => {
+        gA.resolve(pageOf(aOlder, true));
+        await Promise.resolve();
+      });
+      // Fire the restore writes' rAFs (scheduled during the landing commit);
+      // the 800ms settle timer is then the only pending timer.
+      act(() => {
+        vi.advanceTimersByTime(50);
+      });
+      expect(vi.getTimerCount()).toBe(1);
+      writes.length = 0;
+
+      // Switch routes WHILE A's restore is settling: the render-phase reset
+      // must clear the settle timer and every restore ref.
+      geo.setTotal(200);
+      act(() => {
+        fireEvent.click(screen.getByTestId("go-b"));
+      });
+      act(() => {
+        vi.advanceTimersByTime(50);
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      // loadingEarlier reset: B's own pager is enabled, not stuck on A's click.
+      expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
+      // pinRef reset: a fresh B session pins to the tail, which writes the
+      // mount scrollHeight (clamped to scrollHeight - clientHeight) right
+      // here — a leak suppresses the pin write and the cleared log is empty.
+      expect(writes).toContain(200 * ROW - VIEW);
+
+      // Past A's settle deadline: no late correction toward A's anchor (30
+      // rows deep) may land on B, and no timer is ever re-armed.
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(writes).not.toContain(30 * ROW);
+
+      // The rest mirrors real timing: restoringRef reset lets B's estimate
+      // converge, and the anchor reset leaves growth anchoring working.
+      vi.useRealTimers();
+
+      // A's click finally lands late: its request identity was superseded by
+      // the route reset, so it must not finalize anything on B or restore A's
+      // anchor (30 rows deep).
+      await act(async () => {
+        returnGate.resolve();
+        await Promise.resolve();
+      });
+      expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
+      expect(writes).not.toContain(30 * ROW);
+
+      // Estimate convergence (same geometry as the round-5 route test):
+      // frozen at 96 the hit lands near 4064, converged past 4500.
+      for (let pass = 0; pass < 4; pass += 1) {
+        const rows = geo.scroller().querySelectorAll<HTMLElement>("[data-anchor]");
+        await act(async () => {
+          rows.forEach((_row, idx) => {
+            if (idx >= rows.length - 16) geo.growRow(idx, 200);
+          });
+        });
+      }
+      await user.click(screen.getByTestId("transcript-search-open"));
+      await user.type(screen.getByTestId("transcript-search-input"), "insResetB-m1026");
+      await user.keyboard("[Enter]");
+      expect(geo.top()).toBeGreaterThan(4500);
+
+      // The geometry harness does not echo programmatic scrollTop writes into
+      // a scroll event, so React's scrollTop state still renders the head:
+      // re-dispatch the hit position to mount the hit rows, let the search
+      // refinement clear, and THEN verify the reading anchor works — a leaked
+      // prepend anchor makes its hold bail for the whole session.
+      geo.scrollTo(geo.top());
+      for (let flush = 0; flush < 5; flush += 1) {
+        await act(async () => {});
+      }
+      geo.scrollTo(25 * ROW);
+      await act(async () => {});
+      const before = geo.top();
+      // A mounted row above the sampled anchor grows: a leaked prepend anchor
+      // makes the reading-anchor hold bail for the whole session, so the
+      // scroller would stay put instead of compensating by ~40px.
+      geo.growRow(4, ROW + 40);
+      await act(async () => {});
+      expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+    });
+  });
+});
+describe("font reflow compensator", () => {
+  const ROW = 96;
+  const VIEW = 720;
+  type ScrollModel = {
+    total: () => number;
+    getTop: () => number;
+    setTop: (v: number) => void;
+  };
+  let activeScroll: ScrollModel | null = null;
+  let protoInstalled = false;
+  const nativeOwner = (() => {
+    const onH = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop");
+    return onH ? { desc: onH, on: HTMLElement.prototype } : null;
+  })();
+  const restoreNative = () => {
+    if (!protoInstalled || !nativeOwner) return;
+    if (nativeOwner.on === HTMLElement.prototype) Object.defineProperty(HTMLElement.prototype, "scrollTop", nativeOwner.desc);
+    else delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollTop;
+    protoInstalled = false;
+  };
+
+  function installGeo(rowCount: number) {
+    let dynamicTotal = rowCount;
+    const heights = new WeakMap<Element, number>();
+    const observerCbs = new Map<Element, () => void>();
+    const isScroller = (el: unknown) => el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    let top = 0;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? VIEW : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? dynamicTotal * ROW : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      const h = heights.get(el) ?? ROW;
+      if (el.dataset?.testid === "transcript-scroller") {
+        return { top: 0, left: 0, right: 500, bottom: VIEW, width: 500, height: VIEW, x: 0, y: 0, toJSON() {} } as DOMRect;
+      }
+      if (el.dataset?.anchor && el.parentElement) {
+        const list = el.parentElement;
+        const spacer = Array.from(list.children).find((c) => c.getAttribute("aria-hidden") === "true") as HTMLElement | undefined;
+        const pad = Number.parseFloat(spacer?.style.height ?? "0") || 0;
+        let preceding = 0;
+        for (const sib of Array.from(list.querySelectorAll("[data-anchor]"))) {
+          if (sib === el) break;
+          preceding += heights.get(sib) ?? ROW;
+        }
+        const rowTop = pad + preceding - top;
+        return { top: rowTop, left: 0, right: 500, bottom: rowTop + h, width: 500, height: h, x: 0, y: rowTop, toJSON() {} } as DOMRect;
+      }
+      return { top: 0, left: 0, right: 0, bottom: h, width: 0, height: h, x: 0, y: 0, toJSON() {} } as DOMRect;
+    });
+    class GeoRO {
+      private readonly cb: () => void;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe(el: Element) {
+        observerCbs.set(el, this.cb);
+      }
+      unobserve(el: Element) {
+        if (observerCbs.get(el) === this.cb) observerCbs.delete(el);
+      }
+      disconnect() {
+        for (const [el, cb] of observerCbs) if (cb === this.cb) observerCbs.delete(el);
+      }
+    }
+    vi.stubGlobal("ResizeObserver", GeoRO);
+    activeScroll = { total: () => dynamicTotal, getTop: () => top, setTop: (v) => (top = v) };
+    if (!protoInstalled) {
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+        configurable: true,
+        get(this: HTMLElement) {
+          if (isScroller(this) && activeScroll) return activeScroll.getTop();
+          return nativeOwner?.desc.get?.call(this) as number;
+        },
+        set(this: HTMLElement, v: number) {
+          const m = activeScroll;
+          if (!isScroller(this) || !m) {
+            nativeOwner?.desc.set?.call(this, v);
+            return;
+          }
+          // Browser model: clamp, no event when unchanged; a programmatic
+          // write's scroll event is delivered next frame (coalesced).
+          const max = Math.max(0, m.total() * ROW - VIEW);
+          const clamped = Math.max(0, Math.min(v, max));
+          if (clamped === m.getTop()) return;
+          m.setTop(clamped);
+          const el = this;
+          requestAnimationFrame(() => fireEvent.scroll(el));
+        },
+      });
+      protoInstalled = true;
+    }
+    const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
+    const readerScroll = (value: number) => {
+      const max = Math.max(0, dynamicTotal * ROW - VIEW);
+      top = Math.max(0, Math.min(value, max));
+      fireEvent.scroll(scroller());
+    };
+    const growById = (nodeId: string, height: number) => {
+      const el = scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!el) throw new Error(`row ${nodeId} not mounted`);
+      heights.set(el, height);
+      observerCbs.get(el)?.();
+    };
+    // Set a row's geometry WITHOUT delivering its ResizeObserver callback: a
+    // real font swap resizes every mounted row in the SAME layout, then the
+    // per-row observers deliver in observer-CREATION order. Preset the grown
+    // heights first so geometry already reflects the reflow when the first
+    // callback runs, then deliver callbacks in a chosen order.
+    const presetHeight = (nodeId: string, height: number) => {
+      const el = scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!el) throw new Error(`row ${nodeId} not mounted`);
+      heights.set(el, height);
+    };
+    const fireMeasure = (nodeId: string) => {
+      const el = scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!el) throw new Error(`row ${nodeId} not mounted`);
+      observerCbs.get(el)?.();
+    };
+    const nextFrame = () =>
+      new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    // Set scrollTop WITHOUT dispatching a scroll event: models a geometry the
+    // restore has not yet corrected (an estimate miss), with no reader input.
+    const quietTop = (value: number) => {
+      const max = Math.max(0, dynamicTotal * ROW - VIEW);
+      top = Math.max(0, Math.min(value, max));
+    };
+    return {
+      scroller,
+      readerScroll,
+      growById,
+      presetHeight,
+      fireMeasure,
+      quietTop,
+      top: () => top,
+      nextFrame,
+      setTotal: (n: number) => (dynamicTotal = n),
+    };
+  }
+
+  /** Render a non-follow transcript restored to anchor node N (1-based) at 0 offset. */
+  function renderRestored(instanceId: string, anchorN: number, count = 40) {
+    localStorage.clear();
+    const events = buildLongObservations({
+      instanceId: instanceId as Id,
+      journalId: `obj_${instanceId}` as Id,
+      hostId: "hst_1" as Id,
+      count,
+    });
+    localStorage.setItem(
+      `runtime.reading.v1.${instanceId}`,
+      JSON.stringify({ anchorId: `obj_long_n_${anchorN}`, offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    return renderRouted(events, `/s/${instanceId}`, false);
+  }
+
+  /** Flush until the saved restore has settled (attribute flips to 0). */
+  async function settle(geo: ReturnType<typeof installGeo>, instanceId: string) {
+    for (let i = 0; i < 30; i += 1) {
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        await Promise.resolve();
+      });
+      const active = screen.getByTestId("transcript-scroller").getAttribute("data-restore-active");
+      if (active === "0") return;
+    }
+    throw new Error(`restore never settled for ${instanceId} (top=${geo.top()})`);
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    activeScroll = null;
+    restoreNative();
+    localStorage.clear();
+    // The held-probe test puts ?restoreProbe=1 on the real jsdom location.
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("item 8: a row above the restored anchor grows -> scrollTop += delta", async () => {
+    const geo = installGeo(40);
+    renderRestored("insAbove", 5);
+    await settle(geo, "insAbove");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    expect(geo.top(), "compensates for an above-row growth").toBe(before + 40);
+  });
+
+  it("item 3 mid: above-row growth while the held-probe restore is still ARMED is compensated", async () => {
+    // Hold the font (restore stays data-restore-active=1), converge on the
+    // fallback face, then grow an above row exactly like the mid font swap.
+    const geo = installGeo(40);
+    const fakeFonts = {
+      check: () => false,
+      load: async () => [] as FontFace[],
+      ready: Promise.resolve({} as FontFaceSet),
+      status: "loaded" as FontFaceSet["status"],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+      onloading: null,
+      onloadingdone: null,
+      onloadingerror: null,
+    } as unknown as FontFaceSet;
+    Object.defineProperty(document, "fonts", { configurable: true, get: () => fakeFonts });
+    // restoreProbe reads window.location.search (not the in-memory router), so
+    // put the query on the real jsdom location.
+    window.history.replaceState({}, "", "/s/insMid?restoreProbe=1");
+    (window as unknown as { __fontSwapRestoreProbeArmed?: boolean }).__fontSwapRestoreProbeArmed = true;
+    const events = buildLongObservations({
+      instanceId: "insMid" as Id,
+      journalId: "obj_insMid" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    localStorage.setItem(
+      "runtime.reading.v1.insMid",
+      JSON.stringify({ anchorId: "obj_long_n_5", offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insMid?restoreProbe=1"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    // Converge while held: restore stays active but the offset reaches target.
+    for (let i = 0; i < 30; i += 1) {
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        await Promise.resolve();
+      });
+    }
+    const active = screen.getByTestId("transcript-scroller").getAttribute("data-restore-active");
+    expect(active, "the probe keeps the restore armed").toBe("1");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    expect(geo.top(), "an armed mid-restore compensates an above-row growth").toBe(before + 40);
+  });
+
+  it("item 3 mid (below-anchor growth): a mid-restore reflow must not finalize while the anchor is still off its saved offset", async () => {
+    // The growing row is strictly ABOVE the held restore anchor and the anchor
+    // is still 30px short of its saved offset when the font lands (the bounded
+    // long-journal mid arm: saved anchor is a burst row below the wrap block).
+    // The reflow counter-scroll holds the anchor across the above row's growth,
+    // but that MUST NOT finalize the restore at the unfinished spot. The
+    // pending offset correction has to run first; the restore finalizes only
+    // once the anchor actually reaches its saved offset.
+    //
+    // Coverage note (r8): with the DOM-relative compensator the whole drift is
+    // written by the reflow correction itself, so this test now lands on the
+    // saved offset under BOTH the pre-e6dc324d finalize-on-reflowCorrected
+    // guard and the current code — it asserts the end-to-end sequence (do not
+    // finalize while >2px off; finish AT the offset) but is not a red-on-prefix
+    // proof. The guard is defense-in-depth for a clamped/interleaved
+    // correction; that specific sequence is not driven here (clamped reflow
+    // writes themselves ARE reachable — see the r7-item-2 clamp test and
+    // installGeo.setTotal — but not the combination of a held, clamped,
+    // off-saved-offset reflow that only becomes reachable after the range
+    // grows).
+    const geo = installGeo(40);
+    let fontReady = false;
+    const fakeFonts = {
+      check: () => fontReady,
+      load: async () => [] as FontFace[],
+      ready: Promise.resolve({} as FontFaceSet),
+      status: "loaded" as FontFaceSet["status"],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+      onloading: null,
+      onloadingdone: null,
+      onloadingerror: null,
+    } as unknown as FontFaceSet;
+    Object.defineProperty(document, "fonts", { configurable: true, get: () => fakeFonts });
+    window.history.replaceState({}, "", "/s/insMidBelow?restoreProbe=1");
+    (window as unknown as { __fontSwapRestoreProbeArmed?: boolean }).__fontSwapRestoreProbeArmed = true;
+    const events = buildLongObservations({
+      instanceId: "insMidBelow" as Id,
+      journalId: "obj_insMidBelow" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    const SAVED_OFFSET = 60;
+    localStorage.setItem(
+      "runtime.reading.v1.insMidBelow",
+      JSON.stringify({ anchorId: "obj_long_n_5", offset: SAVED_OFFSET, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insMidBelow?restoreProbe=1"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const scrollerEl = () => screen.getByTestId("transcript-scroller");
+    const active = () => scrollerEl().getAttribute("data-restore-active");
+    const anchorOffset = () => {
+      const row = scrollerEl().querySelector<HTMLElement>('[data-anchor="obj_long_n_5"]');
+      if (!row) return NaN;
+      return row.getBoundingClientRect().top - scrollerEl().getBoundingClientRect().top;
+    };
+    const tick = () =>
+      act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        await Promise.resolve();
+      });
+    // Converge on the fallback face while the probe font stays held: the
+    // anchor reaches the saved offset but the restore stays armed.
+    for (let i = 0; i < 30; i += 1) await tick();
+    expect(active(), "the probe keeps the restore armed before release").toBe("1");
+    expect(Math.abs(anchorOffset() - SAVED_OFFSET)).toBeLessThanOrEqual(2);
+    // Release the held font at the same moment the anchor is 30px BELOW its
+    // saved offset (an estimate miss) and a row strictly above it grows.
+    fontReady = true;
+    await act(async () => {
+      geo.quietTop(geo.top() - 30);
+      expect(anchorOffset() - SAVED_OFFSET).toBeGreaterThan(2);
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    // The restore may not finalize while the anchor is still off: it is either
+    // still armed (correcting) or has already reached the saved offset.
+    expect(
+      active() === "1" || Math.abs(anchorOffset() - SAVED_OFFSET) <= 2,
+      "the reflow correction finalized the restore at an unfinished offset",
+    ).toBe(true);
+    // It then runs the pending offset correction and finalizes at the saved
+    // offset. Under the old ledger-delta compensator the same sequence could
+    // finalize ~30px short; at the tip (89623ff4 DOM-relative compensator)
+    // both branches land at SAVED_OFFSET — see the coverage note above.
+    for (let i = 0; i < 30; i += 1) await tick();
+    expect(active(), "the restore finalizes once the saved offset is reached").toBe("0");
+    expect(
+      Math.abs(anchorOffset() - SAVED_OFFSET),
+      "mid-restore reflow finalized away from the saved offset",
+    ).toBeLessThanOrEqual(2);
+  });
+  it("item 1: the restored row ITSELF grows -> its own top is held, no scroll jump", async () => {
+    const geo = installGeo(40);
+    renderRestored("insSelf", 5);
+    await settle(geo, "insSelf");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_5", ROW + 40);
+    });
+    expect(geo.top(), "the saved row's own growth must not scroll by its delta").toBe(before);
+  });
+
+  /** One swap resizes an above and a below row together; observers then fire. */
+  async function twoRowSwapCompensatesOnce(
+    instanceId: string,
+    order: "below-first" | "above-first",
+  ) {
+    const geo = installGeo(40);
+    renderRestored(instanceId, 5);
+    await settle(geo, instanceId);
+    const before = geo.top();
+    const anchorOffset = () => {
+      const row = geo
+        .scroller()
+        .querySelector<HTMLElement>('[data-anchor="obj_long_n_5"]');
+      return row ? row.getBoundingClientRect().top - geo.scroller().getBoundingClientRect().top : NaN;
+    };
+    expect(Math.abs(anchorOffset())).toBeLessThanOrEqual(2);
+    await act(async () => {
+      // The swap resizes BOTH rows in a single layout before any observer
+      // callback is delivered, so geometry already reflects the above row's
+      // growth when the first callback runs.
+      geo.presetHeight("obj_long_n_2", ROW + 40); // strictly ABOVE the anchor
+      geo.presetHeight("obj_long_n_6", ROW + 30); // BELOW the anchor
+      if (order === "below-first") {
+        geo.fireMeasure("obj_long_n_6");
+        geo.fireMeasure("obj_long_n_2");
+      } else {
+        geo.fireMeasure("obj_long_n_2");
+        geo.fireMeasure("obj_long_n_6");
+      }
+    });
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    // The above row's +40 is compensated exactly ONCE regardless of order and
+    // the anchor's viewport spot is held. Note (r8): at the tip the below-row
+    // observer never scrolls (the reflow anchor corrects the strictly-above
+    // row only), so the below-first ordering is redundant by design — the
+    // pre-r6 "before + 80" double count can no longer occur in either order
+    // after the r7 item-3 DOM-relative fix. This gate is retained as the
+    // order-independent anchor-stability regression check.
+    expect(geo.top(), `two-row swap scrolled twice (order ${order})`).toBe(before + 40);
+    expect(Math.abs(anchorOffset()), `anchor drifted (order ${order})`).toBeLessThanOrEqual(2);
+  }
+
+  it("item 2: two rows reflow, below-row observer first -> the drift is corrected once", async () => {
+    await twoRowSwapCompensatesOnce("insOrderBelowFirst", "below-first");
+  });
+
+  it("item 2: two rows reflow, above-row observer first -> the drift is corrected once", async () => {
+    await twoRowSwapCompensatesOnce("insOrderAboveFirst", "above-first");
+  });
+
+  it("item 2: after the reader scrolls up, a row between the new and old anchor does not jump", async () => {
+    const geo = installGeo(40);
+    renderRestored("insScroll", 5);
+    await settle(geo, "insScroll");
+    const restoredTop = geo.top();
+    // Reader scrolls UP: the new reading anchor is a row near the viewport top
+    // (n_2), while the saved row (n_5) is lower. Row n_3 sits BETWEEN them.
+    act(() => geo.readerScroll(restoredTop - 200));
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    const afterReader = geo.top();
+    expect(afterReader).toBe(restoredTop - 200);
+    // n_3 is BELOW the new reading anchor, so generic anchoring ignores its
+    // growth. The sticky-reflow bug kept n_5 as the reflow anchor; n_3 is
+    // strictly above it, so selfDelta jumped by the whole growth and rewrote
+    // the reading anchor back to the saved row.
+    await act(async () => {
+      geo.growById("obj_long_n_3", ROW + 40);
+    });
+    expect(geo.top(), "a reader who navigated owns the position; no reflow jump").toBe(afterReader);
+  });
+
+  it("item 8: a sub-pixel measurement is a no-op", async () => {
+    const geo = installGeo(40);
+    renderRestored("insSub", 5);
+    await settle(geo, "insSub");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 0.5);
+    });
+    expect(geo.top()).toBe(before);
+  });
+
+  it("item 8: repeated same-height reports do not re-apply the delta", async () => {
+    const geo = installGeo(40);
+    renderRestored("insRepeat", 5);
+    await settle(geo, "insRepeat");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+      geo.growById("obj_long_n_2", ROW + 40);
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    expect(geo.top(), "the committed delta is applied once").toBe(before + 40);
+  });
+  it("item 3: a measured height above the window survives fresh rows mounting on a window shift", async () => {
+    // Coverage of the r6 ledger fix (5ad38bd7 "make the row-height ledger the
+    // single source of truth"). The measured n_2 (above the shifted window)
+    // keeps contributing its +40 to padTop across window shifts that mount
+    // brand-new rows, whose mount-layout reports build on the ledger via
+    // new Map(rowHeightsRef.current) — so this test covers the ledger-build
+    // path by construction.
+    //
+    // It does NOT drive the exact stale-mirror interleaving described in
+    // 5ad38bd7 (a passive state->ref mirror running with a stale closure
+    // between a synchronous ledger write and its queued render). The window is
+    // real in React 19 — the layout-effect setState schedules a SEPARATE
+    // commit, and React flushes the prior commit's pending passive effects
+    // before rendering it (exactly what 5ad38bd7 / Transcript.tsx guards
+    // against) — but it could not be constructed in THIS harness: fresh rows
+    // report ROW (identical to the estimate), so the sync re-render following
+    // a window-shift ledger write mounts no further rows, and the
+    // window-shift commit's own render changed no rowHeights, leaving no
+    // mirror pending. Attempts: (a) an installGeo by-id mount-height preset
+    // over scroll-up window shifts; (b) a scheduler/unstable_mock remount
+    // (under which the saved-position restore cannot settle). Neither
+    // reproduced the rollback; the guarded behaviour stays deleted rather
+    // than re-proven red.
+    const geo = installGeo(40);
+    renderRestored("insLedger", 5);
+    await settle(geo, "insLedger");
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    const padTop = () => {
+      const list = geo.scroller().firstElementChild;
+      const spacer = Array.from(list?.children ?? []).find((c) => c.getAttribute("aria-hidden") === "true") as
+        | HTMLElement
+        | undefined;
+      return Number.parseFloat(spacer?.style.height ?? "0") || 0;
+    };
+    // Expected padTop: `start` rows above the window at ROW each, plus n_2's
+    // +40 (its index 1 is above any start >= 2), derived from the first mounted
+    // row so it holds at any scroll position.
+    const expectedPadTop = () => {
+      const first = geo.scroller().querySelector<HTMLElement>("[data-anchor]");
+      const k = Number(/obj_long_n_(\d+)/.exec(first?.dataset.anchor ?? "")?.[1] ?? 0);
+      const start = k - 1;
+      return start * ROW + (start >= 2 ? 40 : 0);
+    };
+    // Shift the window so n_2 is above it while fresh tail rows mount.
+    act(() => geo.readerScroll(1300));
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(padTop(), "the measured above-window row's height was dropped from the ledger").toBe(expectedPadTop());
+    // Further shifts that mount more fresh rows must still retain it.
+    act(() => geo.readerScroll(1600));
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(padTop(), "the measured height was lost on a second window shift").toBe(expectedPadTop());
+  });
+
+  it("r7 item 2: a clamped no-op second internal write keeps the own-scroll latch armed", async () => {
+    // Two internal writes land before the ONE coalesced scroll event: the
+    // first moves (and arms reflowOwnScrollRef), the second is clamped at the
+    // scroll max and moves nothing. An assign-style latch
+    // (`latch = moved`) CLEARS it on the no-op, so the first write's event
+    // then retires reflowAnchorRef as if the reader had scrolled. The latch
+    // must arm only and stay armed; the anchor survives its own event.
+    const geo = installGeo(40);
+    const events = buildLongObservations({
+      instanceId: "insLatch" as Id,
+      journalId: "obj_insLatch" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insLatch",
+      // n_32 restored flush with the viewport top: target top 2976, 144px
+      // below the clamp line (40*ROW - VIEW = 3120), far enough that
+      // follow-pin (which arms within 64px of the bottom) does not grab it.
+      JSON.stringify({ anchorId: "obj_long_n_32", offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insLatch"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insLatch");
+    expect(geo.top()).toBe(2976);
+    const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold");
+    expect(hold()).toBe("1");
+    await act(async () => {
+      // ONE font layout resizes two mounted rows above the anchor before any
+      // per-row observer delivers (geometry is preset for both; total drift
+      // 248 pushes well past the 144px clamp margin). n_31 alone contributes a
+      // +200 ledger delta — already more than the 144px margin — so the FIRST
+      // delivery clamps under BOTH compensator forms (the old ledger-delta
+      // form would add height - prevHeight = +200; the DOM-relative form
+      // measures the full 248 drift, since both preset rows are already grown
+      // in the DOM).
+      geo.presetHeight("obj_long_n_30", ROW + 48);
+      geo.presetHeight("obj_long_n_31", ROW + 200);
+      // First delivery: the anchor drifted 248px in the DOM but the write
+      // clamps at the scroll max (3120), moving only +144 and queueing the
+      // coalesced event.
+      geo.fireMeasure("obj_long_n_31");
+      // Second delivery in the same synchronous batch (React has not flushed
+      // the first write's state yet): the anchor is still 248-144 = 104px off
+      // (48 of that is n_30's ledger delta under the old form), but the write
+      // clamps to 3120 again — a true NO-OP in either compensator form, which
+      // must not clear the latch the first write armed.
+      geo.fireMeasure("obj_long_n_30");
+    });
+    // Deliver the queued event. With the old assign-on-write latch the event
+    // finds the latch false and retires the anchor (data-reflow-hold flips to
+    // "0" on the resulting render); arm-only keeps it held.
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(hold(), "the no-op second write disarmed the latch before the first write's own event").toBe("1");
+    expect(geo.top()).toBe(3120);
+  });
+
+  it("r7 item 3: a streamed commit that already held the row is not double-counted by the row's RO delivery", async () => {
+    // A React commit changing nodes/sizes (a streamed event) lands between the
+    // font swap's LAYOUT (rows already resized in the DOM) and the per-row
+    // ResizeObserver deliveries: with the resized row ABOVE the sampled
+    // reading anchor, the commit's generic hold counter-scrolls the drift, and
+    // row A's observer must not add its ledger height delta a SECOND time. The
+    // explicit reflow correction is the anchor's DOM-relative drift, which is
+    // 0 after the generic hold.
+    const geo = installGeo(40);
+    const opts = { instanceId: "insStream" as Id, journalId: "obj_insStream" as Id, hostId: "hst_1" as Id };
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insStream",
+      // n_12 at saved offset 300 -> restore top 756; n_6 sits strictly ABOVE
+      // the viewport then, so a later grow of n_6 drifts the on-screen anchor
+      // and the sizes-commit generic hold compensates it.
+      JSON.stringify({ anchorId: "obj_long_n_12", offset: 300, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    // Stateful driver INSIDE the route (a rerendered MemoryRouter would not
+    // propagate new props): bumping the count simulates a streamed nodes
+    // commit exactly as SessionPage's event subscription would.
+    let bump!: () => void;
+    function Driver() {
+      const [count, setCount] = useState(40);
+      bump = () => setCount((n) => n + 1);
+      return <Transcript events={buildLongObservations({ ...opts, count })} compact={false} />;
+    }
+    render(
+      <MemoryRouter initialEntries={["/s/insStream"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insStream");
+    const before = geo.top();
+    expect(before).toBe(756);
+    // The swap resizes n_6 (strictly above the anchor) in the DOM, then a
+    // streamed nodes commit lands BEFORE n_6's observer delivery: the
+    // commit's generic hold counter-scrolls the 40px drift.
+    geo.presetHeight("obj_long_n_6", ROW + 40);
+    await act(async () => {
+      bump();
+      await Promise.resolve();
+    });
+    expect(geo.top(), "the streamed commit holds the drifted anchor").toBe(before + 40);
+    // The reflow anchor must still be armed at this point. Note the commit-level
+    // generic hold is NOT gated on reflowAnchorRef, so it would still move the
+    // +40 here with the anchor retired; the real risk is that n_6's later RO
+    // delivery would then go through holdReadingAnchor instead of the reflow
+    // compensator, and the double-count branch the test targets would never
+    // run — the +40 expectation would pass without exercising the reflow path.
+    expect(
+      screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold"),
+      "the reflow anchor retired before the row's RO delivery",
+    ).toBe("1");
+    // n_6's own observer delivers after that commit: the reflow anchor's DOM
+    // drift is now 0 and the ledger height delta must not be added again.
+    await act(async () => {
+      geo.fireMeasure("obj_long_n_6");
+      await geo.nextFrame();
+    });
+    expect(geo.top(), "the row's RO delivery double-counted the drift the streamed commit held").toBe(before + 40);
+  });
+
+  // UO-6a round 8 item 1: the reflow anchor armed by a restore lives only
+  // until the reader moves. The clear must happen on the UNAMBIGUOUS input
+  // paths even when they never dispatch a scroll event (a clamped wheel, a
+  // programmatic navigation whose write is unchanged): otherwise a row growing
+  // ABOVE the stale saved anchor later counter-scrolls the view even though
+  // the reader already owns a different row.
+  it("r8 item 1: a wheel gesture with no scroll event retires the restore's reflow anchor", async () => {
+    const geo = installGeo(40);
+    renderRestored("insWheelClear", 5);
+    await settle(geo, "insWheelClear");
+    const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold");
+    expect(hold()).toBe("1");
+    // A genuine wheel that the harness does NOT turn into a scroll event
+    // (clamped / coalesced away in the browser): the gesture listener must
+    // retire the anchor without waiting for onScroll.
+    act(() => {
+      fireEvent.wheel(geo.scroller(), { deltaY: 120 });
+    });
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(hold(), "the wheel gesture left the restore reflow anchor armed").toBe("0");
+  });
+
+  it("r8 item 1: an unchanged programmatic navigation retires the anchor; a card between rows does not jump", async () => {
+    // Restore n_35 to sit 192px below the viewport top (saved offset 192 -> top
+    // 3264-192 = 3072 in a 60-row list): the topmost visible row is n_33, and
+    // n_34 sits BETWEEN n_33 and the saved n_35. Growing n_34 must NOT scroll
+    // — it is below the reader's topmost anchor.
+    const geo = installGeo(60);
+    const events = buildLongObservations({
+      instanceId: "insNavClear" as Id,
+      journalId: "obj_insNavClear" as Id,
+      hostId: "hst_1" as Id,
+      count: 60,
+    });
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insNavClear",
+      JSON.stringify({ anchorId: "obj_long_n_35", offset: 192, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/s/insNavClear"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insNavClear");
+    expect(geo.top()).toBe(3072);
+    const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold");
+    expect(hold()).toBe("1");
+    // Navigate to a hit that lands at the SAME scrollTop (n_33 base is exactly
+    // 3072): the write is unchanged and dispatches no scroll event, so only the
+    // synchronous non-restore clear retires the stale anchor.
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "prompt 33");
+    await user.keyboard("[Enter]");
+    expect(geo.top()).toBe(3072);
+    expect(hold(), "the unchanged navigation left the restore reflow anchor armed").toBe("0");
+    // Grow the card between the topmost reader row (n_33) and the old saved
+    // anchor (n_35). First report samples the generic anchor onto n_33; a
+    // second measurement pass then evaluates the hold.
+    await act(async () => {
+      geo.growById("obj_long_n_34", ROW + 40);
+    });
+    await act(async () => {
+      geo.fireMeasure("obj_long_n_33");
+      await geo.nextFrame();
+    });
+    expect(
+      geo.top(),
+      "the stale reflow anchor counter-scrolled a card the reader expanded below their anchor",
+    ).toBe(3072);
+  });
+
 });

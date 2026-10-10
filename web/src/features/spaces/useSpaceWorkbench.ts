@@ -27,7 +27,12 @@ export function useSpaceWorkbench() {
   const location = useLocation();
   const navigate = useNavigate();
   const instanceId = location.pathname.startsWith("/s/") ? location.pathname.split("/")[2] : undefined;
-  const spaces = buildSpaces(hub.workspaces, hub.instances, prefs);
+  // Memoized: a store emission that doesn't change workspaces/instances must
+  // not rebuild every Space object (c-perffu).
+  const spaces = useMemo(
+    () => buildSpaces(hub.workspaces, hub.instances, prefs),
+    [hub.workspaces, hub.instances, prefs],
+  );
   const params = new URLSearchParams(location.search);
   const newSpace = location.pathname === "/sessions/new" && params.has("host") && params.has("workspace")
     ? spaces.find((space) => space.id === spaceKey(params.get("host")!, params.get("workspace")!)) : undefined;
@@ -39,7 +44,15 @@ export function useSpaceWorkbench() {
 
   // Dismissing a blocked tab suppresses only that episode. Once the session is
   // no longer blocked, its next blocked episode may re-open the tab again.
-  const blockedKey = hub.instances.filter((instance) => projectStatus(instance) === "blocked").map((instance) => instance.id).sort().join(",");
+  const blockedKey = useMemo(
+    () =>
+      hub.instances
+        .filter((instance) => projectStatus(instance) === "blocked")
+        .map((instance) => instance.id)
+        .sort()
+        .join(","),
+    [hub.instances],
+  );
   useEffect(() => {
     spaceStore.rearmDismissed(blockedKey ? blockedKey.split(",") : []);
   }, [blockedKey]);

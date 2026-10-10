@@ -1369,18 +1369,19 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    // c-ghostbadge round 2: a GENUINELY live hook approval
-                    // with a short known deadline. The card is journaled
-                    // durably AND held in the live broker, so badge and
-                    // inbox both show 1/1 while the agent is blocked. The
-                    // spec then ends the instance through a REAL node
-                    // restart (instance.send sentinel `GHOSTNODE_RESTART`):
-                    // the new epoch omits the instance, the Hub's
-                    // reconcile_reported_instances settles it exited, the
-                    // new process serves no interaction.list for it, and
-                    // once the deadline crosses the shared projection drops
-                    // the durable pending row to expired — 0/0 with no
-                    // reload. Nothing here is pre-ended.
+                    // c-ghostbadge round 2 / c-cardsettle r9: a GENUINELY
+                    // live hook approval with a short KNOWN deadline. The
+                    // card is journaled durably AND held in the live broker,
+                    // so badge and inbox both show 1/1 while the agent is
+                    // blocked. The spec then ends the instance through a
+                    // REAL node restart (instance.send sentinel
+                    // `GHOSTNODE_RESTART`): the new epoch omits the instance,
+                    // the Hub's reconcile_reported_instances settles it
+                    // exited AND invalidates the card in the SAME
+                    // transaction regardless of its still-open deadline (r9
+                    // item 1; the Hub has no deadline sweeper), and the
+                    // settlement control frame flips badge/inbox 0/0 in
+                    // place with no reload.
                     if prompt.contains("ghostbadge-live") {
                         let iid = InteractionId::new();
                         // Long enough that the e2e's create -> restart ->
@@ -1412,6 +1413,41 @@ async fn fake_node(
                         .await?;
                         // Live broker agrees with the durable journal while
                         // the process runs (the real Node serves both).
+                        pending
+                            .lock()
+                            .await
+                            .insert(iid.as_id().as_str().to_string(), card);
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
+                            .await?;
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    // c-cardsettle: a genuinely live hook approval with an
+                    // UNKNOWN deadline (nothing client-side can retire it),
+                    // enabled only with HUB_E2E_CARDSETTLE=1. The spec ends
+                    // the instance through the existing GHOSTNODE_RESTART
+                    // instance.send sentinel (new epoch omits the instance),
+                    // after which the Hub must have invalidated this card in
+                    // the reconcile transaction — generation-ended, no client
+                    // deadline involved.
+                    if std::env::var("HUB_E2E_CARDSETTLE").as_deref() == Ok("1")
+                        && prompt.contains("cardsettle-live")
+                    {
+                        let iid = InteractionId::new();
+                        let card = fake_approval(&instance_id, host, iid.as_id().as_str());
+                        append_n = append_interaction_requested(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            &card,
+                        )
+                        .await?;
                         pending
                             .lock()
                             .await
@@ -5023,6 +5059,45 @@ fn fake_hook_question_with_deadline(
 /// r-ux-comment: prompts mentioning code get an assistant reply containing a
 /// fenced ts block, so the browser spec can quote it with the 评论 action.
 fn code_comment_reply(prompt: &str) -> Option<String> {
+    // Font-swap fixture: a COMPACT pre-wrap fenced block whose single long
+    // line crosses a wrap boundary between the FALLBACK face and IBM Plex
+    // Mono, in the GROWTH direction (fallback shorter -> Plex taller). Every
+    // latin glyph is narrower in Plex Mono (0.600em) than in the headless
+    // fallback stack's resolved face, so a latin run only ever shrinks on the
+    // swap — which a PINNED transcript survives by browser scroll-clamp alone,
+    // proving nothing. U+2044 FRACTION SLASH inverts the advance ratio: Plex
+    // Mono ships it at the full 0.600em while the fallback face renders it at
+    // ~0.21em, so the block gains two visual lines (~41.6px, measured on the
+    // mounted rows) when the woff2 lands, at BOTH pane widths. A pinned page
+    // can only absorb that growth by size-driven re-pinning (the thing the
+    // pinned e2e arm exists to prove), and the saved-position arms see a block
+    // above the anchor grow, which re-anchoring must counter-scroll.
+    if prompt.contains("font wrap probe mobile tail") {
+        // MOBILE PINNED probe (~330px content): 140 fraction slashes fit TWO
+        // visual lines on the fallback (~121/line) and FOUR on Plex (~41/line)
+        // — +2 lines, measured ~210px fallback -> ~251px Plex. Sent AFTER the
+        // burst rows so the block sits in the MOUNTED TAIL and is measurable
+        // while the transcript is pinned, with no measurement scroll.
+        let long = "⁄".repeat(140);
+        let mut body = String::from("a tail wrapping line:\n\n```ts src/font_swap_mobile.ts\n");
+        body.push_str(&long);
+        body.push_str("\n```\n\nask about the wrapped line.");
+        return Some(body);
+    }
+    if prompt.contains("font wrap probe") {
+        // Desktop + late/mid-swap probe (~684px content): 200 fraction slashes
+        // fit ONE visual line on the fallback (~252/line) and THREE on Plex
+        // (~85/line) — +2 lines, ~41.6px measured on the mounted rows. The
+        // block plus the burst anchor parked at its base stay inside the
+        // desktop scroller on both faces.
+        let long = "⁄".repeat(200);
+        let mut body = String::from(
+            "here is a wrapping line whose height differs across monospace faces:\n\n```ts src/font_swap_probe.ts\n",
+        );
+        body.push_str(&long);
+        body.push_str("\n```\n\nask about the wrapped line.");
+        return Some(body);
+    }
     if !prompt.contains("show me code") {
         return None;
     }

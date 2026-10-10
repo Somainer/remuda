@@ -65,6 +65,24 @@ const ORIGIN_LABEL: Record<Exclude<MessageOrigin, "human">, string> = {
 };
 
 /**
+ * Bounds for a load-earlier restore's post-prepend repin. The anchor must
+ * have a DEFINITE end even when measurement commits stop before the stable
+ * pass count is reached: a quiet window since the last settle commit, an
+ * absolute deadline, and a correction budget, whichever comes first.
+ */
+const PREPEND_SETTLE_QUIET_MS = 800;
+/**
+ * After a load-earlier cancel, growth anchoring is switched off until the
+ * reader demonstrably owns the new position. A real reader gesture/scroll
+ * re-arms it immediately; when no such input arrives (a cancel whose scroll
+ * never fires), re-arm on this bound so an unrelated later growth is not left
+ * uncompensated for the whole visit.
+ */
+const GROWTH_HOLD_REARM_MS = 500;
+const PREPEND_SETTLE_DEADLINE_MS = 5000;
+const PREPEND_SETTLE_MAX_CORRECTIONS = 40;
+
+/**
  * Whether this node is text the human actually wrote.
  *
  * Assistant and system messages are never injections — only `user`-role
@@ -98,6 +116,60 @@ function useCompactLayout(): boolean {
     return () => media.removeEventListener("change", update);
   }, []);
   return compact;
+}
+
+/** Where a node id lives in a top-level list. */
+function findNodeIndex(nodes: readonly TranscriptNode[], id: string): number {
+  return nodes.findIndex((n) => n.id === id);
+}
+
+/** Ids a top-level node can be matched by after a prepend (fold + children). */
+function nodeContentIds(node: TranscriptNode): Set<string> {
+  const ids = new Set<string>([node.id]);
+  if (node.type === "compact") for (const child of node.children) ids.add(child.id);
+  return ids;
+}
+
+/**
+ * Resolve the armed anchor's row in the POST-prepend node list. The id usually
+ * survives; when an older tool page renames the armed compact fold, match by
+ * content (the renamed fold still contains the armed fold's original tools),
+ * then fall back to the slot immediately before the first surviving node that
+ * used to follow it. Never returns a raw pre-insert index.
+ */
+function resolvePrependedAnchor(
+  prevNodes: readonly TranscriptNode[],
+  nextNodes: readonly TranscriptNode[],
+  armedIndex: number,
+): { node: TranscriptNode; index: number } | null {
+  const armed = prevNodes[armedIndex];
+  if (!armed) {
+    const fallback = nextNodes[armedIndex];
+    return fallback ? { node: fallback, index: armedIndex } : null;
+  }
+  const exact = findNodeIndex(nextNodes, armed.id);
+  if (exact >= 0) return { node: nextNodes[exact]!, index: exact };
+  if (armed.type === "compact") {
+    const childIds = new Set(armed.children.map((child) => child.id));
+    const renamed = nextNodes.findIndex(
+      (n) => n.type === "compact" && n.children.some((child) => childIds.has(child.id)),
+    );
+    if (renamed >= 0) return { node: nextNodes[renamed]!, index: renamed };
+  }
+  // Position fallback: the slot before the first still-present node that
+  // followed the anchor (its id or, if it joined a fold, its child content).
+  for (let k = armedIndex + 1; k < prevNodes.length; k += 1) {
+    const followerIds = nodeContentIds(prevNodes[k]!);
+    const at = nextNodes.findIndex(
+      (n) => followerIds.has(n.id) || (n.type === "compact" && n.children.some((c) => followerIds.has(c.id))),
+    );
+    if (at > 0) return { node: nextNodes[at - 1]!, index: at - 1 };
+  }
+  // The anchor was the last surviving row: keep the tail slot.
+  const tail = nextNodes.length - (prevNodes.length - armedIndex);
+  const index = Math.max(0, Math.min(tail, nextNodes.length - 1));
+  const node = nextNodes[index];
+  return node ? { node, index } : null;
 }
 
 function locateNode(nodes: readonly TranscriptNode[], nodeId: string): NodeLocation | null {
@@ -152,6 +224,13 @@ export type TranscriptProps = {
    * and drives them through TranscriptHandle instead.
    */
   toolbar?: boolean;
+  /**
+   * Lowest LOADED journal seq as tracked by the store's descending pager. When
+   * provided it is the load-earlier authority (a reconnect snapshot can
+   * re-anchor the server window above rows this client already holds); absent
+   * (standalone unit mounts) the component derives a floor from its events.
+   */
+  earlierFloor?: string | null;
 };
 
 type InnerProps = TranscriptProps & {
@@ -172,6 +251,23 @@ function TranscriptWithRoute(props: Omit<InnerProps, "routeInstanceId">) {
   return <TranscriptInner {...props} routeInstanceId={instanceId} />;
 }
 
+/**
+ * TEST-ONLY seam for the font-swap e2e fail-proof. A document loaded with
+ * ?noReanchor=1 gets NO scroll re-anchoring on measured size changes once the
+ * test arms window.__fontSwapNoReanchorArmed (immediately before releasing the
+ * held woff2 in the late-swap arm): the saved row then rides the block's
+ * font-driven reflow and the viewport-drift assertion MUST fail. Read live
+ * because the call sites are useCallbacks/layout effects that mount once.
+ * No product effect when the query param is absent.
+ */
+function fontSwapReanchorDisabled(): boolean {
+  if (typeof window === "undefined") return false;
+  return (
+    new URLSearchParams(window.location.search).has("noReanchor") &&
+    (window as unknown as { __fontSwapNoReanchorArmed?: boolean }).__fontSwapNoReanchorArmed === true
+  );
+}
+
 function TranscriptInner({
   events,
   bubbles = [],
@@ -182,6 +278,7 @@ function TranscriptInner({
   steerHeld,
   onSteerHeld,
   toolbar = true,
+  earlierFloor,
   handleRef,
 }: InnerProps) {
   // Per-instance reading position/follow persistence. The id comes from the
@@ -205,6 +302,26 @@ function TranscriptInner({
   // it explicitly (collapse must re-fold even a previously expanded row).
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
 
+  // TEST-ONLY: the font-swap mid-restore e2e arms a held-font restore probe by
+  // navigating to ?restoreProbe=1 with window.__fontSwapRestoreProbeArmed set
+  // (installed via addInitScript). Both are required: a bare ?restoreProbe=1
+  // URL has NO product effect (no held restore, the visit behaves normally),
+  // and no probe is armed without the query either.
+  const restoreProbe =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).has("restoreProbe") &&
+    (window as unknown as { __fontSwapRestoreProbeArmed?: boolean }).__fontSwapRestoreProbeArmed === true;
+  // TEST-ONLY seam for the pinned-tail fail-proof. The document is opened with
+  // ?noSizePin=1 and the e2e arms window.__fontSwapNoSizePinArmed immediately
+  // before releasing the held font; from then on BOTH programmatic pin-
+  // maintenance paths (the size-commit re-pin and the scroller-resize re-pin)
+  // are off while the structural nodes.length pin stays. The fallback pin is
+  // therefore achieved with the real product before the seam arms.
+  const noSizePin =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).has("noSizePin") &&
+    (window as unknown as { __fontSwapNoSizePinArmed?: boolean }).__fontSwapNoSizePinArmed === true;
+
   // Bounded-window paging: true while the load-earlier row awaits its page.
   // Declared before the route-switch reset below, which clears it per
   // instance like the other per-route refs.
@@ -212,6 +329,14 @@ function TranscriptInner({
   // Row heights keyed by STABLE NODE ID, never array index (see the `sizes`
   // memo below); reset per session in the route-reset block.
   const [rowHeights, setRowHeights] = useState<Map<string, number>>(new Map());
+  // Synchronous ledger of the last COMMITTED per-row heights, read before paint
+  // by setRowSize. It is the single source of truth and is written together
+  // with the state above on every measurement (setRowSize) and cleared together
+  // on route reset — there is deliberately NO passive effect mirroring state
+  // back into this ref: such a mirror can run with a STALE state between a
+  // synchronous ledger write and its queued render and roll a fresh height back
+  // to the previous commit (losing the measurement forever).
+  const rowHeightsRef = useRef(rowHeights);
 
   // The route keeps this component mounted while the reader moves directly
   // between sessions (tab switch). Per-instance refs must therefore reset on
@@ -223,16 +348,155 @@ function TranscriptInner({
   const restoredRef = useRef(false);
   // Follow state restores from the last visit; a brand-new session pins.
   const pinRef = useRef(saved ? saved.follow : true);
+  // True while a saved-position / load-earlier restore is in flight: freezes
+  // the unmeasured-row estimate so the rows above the anchor keep their saved
+  // contribution. Declared with the other per-instance refs so the route
+  // switch reset below can clear it (a frozen value left behind on a session
+  // switch stops the estimate converging for the next session).
+  const restoringRef = useRef(false);
   const scrollTopRef = useRef(0);
+  /**
+   * Echo record of a load-earlier restore's OWN scrollTop write. A scroll
+   * event is the write's echo only while this record is held AND its current
+   * scrollTop lands at (within rounding of) the recorded target. Every other
+   * event — a reader gesture, j/k navigation, a search hit, 跳到最新 — is an
+   * intentional jump that cancels the restore instead of being swallowed.
+   * The seq lets a later write's rAF invalidate only its own record.
+   */
+  const restoreEchoRef = useRef<{ top: number; seq: number; inputSeq: number } | null>(null);
+  const restoreEchoSeqRef = useRef(0);
+  /**
+   * Bumped on every genuine reader gesture (wheel/touch/scroll key/scrollbar
+   * press). A restore write records the generation it made on; the matching
+   * scroll event is the write's echo only while no reader gesture has happened
+   * since — this classifies own-vs-reader by an input TOKEN, not by how close
+   * the event's scrollTop is to the write target.
+   */
+  const readerInputSeqRef = useRef(0);
+  /**
+   * Quiet-window timer that ends a held load-earlier restore after the last
+   * settle commit, so a restore whose measurements went QUIET before the
+   * stable-pass count cannot stay armed for the session.
+   */
+  const prependSettleTimerRef = useRef<number | null>(null);
+  /**
+   * Set when intentional navigation cancels an in-flight load-earlier, so the
+   * reading-anchor growth hold does not compensate for the cancelled
+   * prepend's inserted rows until the reader scrolls again.
+   */
+  const growthHoldSuppressedRef = useRef(false);
+  /** Bounded re-arm timer for the suppression above (see GROWTH_HOLD_REARM_MS). */
+  const growthHoldRearmTimerRef = useRef<number | null>(null);
   const saveTimer = useRef<number | null>(null);
   const pendingScroll = useRef<
     | { kind: "index"; index: number; offset: number; tries: number }
-    | { kind: "restore"; anchorId: string; offset: number; tries: number }
+    | {
+        kind: "restore";
+        anchorId: string;
+        offset: number;
+        tries: number;
+        /**
+         * Load-earlier restores only: the anchor's index when the click was
+         * armed. The restore stays inert until rows are actually inserted
+         * BEFORE it (its index advances), so a live append / late row-growth
+         * commit landing during the fetch cannot clear it with a pre-prepend
+         * delta of 0. Absent on saved-position restores, which act at once.
+         */
+        awaitIndex?: number;
+        /** Owning load-earlier request; cross-session late replies never clear it. */
+        reqId?: number;
+        /** Pre-click top-level nodes, for content-based fold-rename retarget. */
+        prevNodes?: TranscriptNode[];
+        /**
+         * Set when this restore re-aimed an in-flight load-earlier hold at an
+         * intentional navigation destination (r9). If the bounded page then
+         * lands WITHOUT prepending, the inert restore (it only acts after the
+         * destination's index advances) is converted into an index pending so
+         * the destination is still refined into view.
+         */
+        retargeted?: boolean;
+      }
     | null
   >(null);
   // Held anchor for a load-earlier prepend; repinned across post-prepend
   // estimate/size changes (see the effect near the scroll math).
-  const prependAnchorRef = useRef<{ anchorId: string; offset: number; tries: number } | null>(null);
+  type PrependAnchor = {
+    anchorId: string;
+    offset: number;
+    tries: number;
+    /** Total corrections applied since the prepend landed; bounded release. */
+    corrections: number;
+    /** Absolute settle deadline (ms), stamped when the prepend first lands. */
+    deadline: number;
+    armedIndex: number;
+    reqId: number;
+    /**
+     * Top-level nodes as they were at click time. The armed anchor can vanish
+     * (an older tool page renames its compact fold); the post-prepend list is
+     * resolved against THIS list by content, never against a raw pre-insert
+     * index.
+     */
+    prevNodes: TranscriptNode[];
+  };
+  const prependAnchorRef = useRef<PrependAnchor | null>(null);
+  /**
+   * Identity of the in-flight load-earlier click. The Transcript stays mounted
+   * across session routes, so a late `finally` from session A must not clear
+   * session B's armed restore or its loading state: every finalize path checks
+   * this object is still the current request FOR THE SAME instance.
+   */
+  const loadReqRef = useRef<{ reqId: number; instanceId: string; done: boolean; cancelled: boolean } | null>(null);
+  const loadReqSeqRef = useRef(0);
+  // Bumped on arm and on completion so the anchor effects run once more even
+  // when the click fetched nothing new (no nodes/sizes commit to rerun them).
+  const [loadTick, setLoadTick] = useState(0);
+  /**
+   * The row a saved-position restore settled on, kept stable across a later
+   * font reflow of rows above it (unlike readingAnchorRef, which scroll events
+   * re-sample to the topmost visible row). Holds the row id and the viewport
+   * offset it was restored to, so a correction is the row's DOM-relative drift
+   * from that offset — idempotent if a same-commit generic hold already moved
+   * scrollTop by the same amount. Cleared on route change / nav.
+   */
+  const reflowAnchorRef = useRef<{ id: string; offset: number } | null>(null);
+  /** Set for one sizes commit when the reflow self-correction held the anchor. */
+  const reflowCorrectedThisCommitRef = useRef(false);
+  /**
+   * True only between the reflow compensator's own scrollTop write and the
+   * coalesced scroll event it dispatches, so onScroll does not mistake that
+   * write for a reader scroll (which would retire reflowAnchorRef).
+   */
+  const reflowOwnScrollRef = useRef(false);
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  // Restore-active DOM flag: written IMPERATIVELY whenever a saved/load-earlier
+  // restore arms/finalizes — the layout effect clears restoringRef in the same
+  // frame without a setState, so a render-time attribute would lag the ref by up
+  // to a second. Always present on the scroller (a constant "0" in JSX) so the
+  // late-swap arm can gate on the real restore state too. Declared before the
+  // per-instance reset block below, which also writes the attribute.
+  const setRestoreActiveAttr = () => {
+    const el = scrollerRef.current;
+    if (el) el.setAttribute("data-restore-active", restoringRef.current ? "1" : "0");
+  };
+  // The reflow-hold observability attribute is render-time on every scroll, but
+  // a gesture/navigation clear can happen with NO scroll event (a clamped wheel,
+  // an unchanged programmatic write): write it imperatively there too.
+  const setReflowHoldAttr = () => {
+    const el = scrollerRef.current;
+    if (el) el.setAttribute("data-reflow-hold", reflowAnchorRef.current ? "1" : "0");
+  };
+  // Growth-hold suppression can flip on a gesture/timeout with no scroll event
+  // (and thus no re-render), so mirror it imperatively as well.
+  const setGrowthHoldAttr = () => {
+    const el = scrollerRef.current;
+    if (el) el.setAttribute("data-growth-hold", growthHoldSuppressedRef.current ? "0" : "1");
+  };
+  // Inert observability for the sampled reading anchor id (so the gesture
+  // gating in r8 item 4 is testable without a scroll event).
+  const setReadingAnchorAttr = () => {
+    const el = scrollerRef.current;
+    if (el) el.setAttribute("data-reading-anchor", readingAnchorRef.current?.id ?? "");
+  };
   // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
   // click on a held transcript row posts exactly once.
   const steeringRef = useRef<Set<string>>(new Set());
@@ -243,9 +507,27 @@ function TranscriptInner({
     scrollTopRef.current = 0;
     pendingScroll.current = null;
     prependAnchorRef.current = null;
+    loadReqRef.current = null;
+    restoringRef.current = false;
+    setRestoreActiveAttr();
+    restoreEchoRef.current = null;
+    restoreEchoSeqRef.current = 0;
+    growthHoldSuppressedRef.current = false;
+    reflowAnchorRef.current = null;
+    reflowOwnScrollRef.current = false;
+    if (prependSettleTimerRef.current !== null) {
+      window.clearTimeout(prependSettleTimerRef.current);
+      prependSettleTimerRef.current = null;
+    }
+    if (growthHoldRearmTimerRef.current !== null) {
+      window.clearTimeout(growthHoldRearmTimerRef.current);
+      growthHoldRearmTimerRef.current = null;
+    }
+    growthHoldSuppressedRef.current = false;
     steeringRef.current.clear();
     setLoadingEarlier(false);
     setRowHeights(new Map());
+    rowHeightsRef.current = new Map();
     setExpandedTools(new Set());
     if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
     setDismissedWorkflows(instanceId ? readDismissedWorkflows(instanceId) : new Set());
@@ -299,7 +581,263 @@ function TranscriptInner({
     () => nodes.map((node) => rowHeights.get(node.id) ?? 0),
     [nodes, rowHeights],
   );
-  const scrollerRef = useRef<HTMLDivElement>(null);
+  /**
+   * Retire an armed/settling load-earlier restore synchronously, called from
+   * an INTENTIONAL navigation (j/k, a search hit, 跳到最新) BEFORE its own
+   * scrollTop is written: an unchanged/clamped write would dispatch no event
+   * and the old onScroll-only cancellation would never run, leaving the
+   * restore armed (repinning the click-time row) and the estimate frozen
+   * forever. The new navigation's own index pending is installed by the
+   * caller and is left intact; only that request's restore pending/anchor
+   * are retired. Returns void.
+   */
+  const cancelLoadRestoreRef = useRef<() => void>(() => {});
+  /**
+   * Mark the coalesced scroll event dispatched by the re-anchor machinery's
+   * OWN just-performed write. Both own-write latches are armed together: the
+   * event must neither cancel an armed load-earlier restore (restoreEchoRef)
+   * nor retire the reflow anchor (reflowOwnScrollRef) — either machinery can
+   * write while the other is armed (a font reflow landing mid load-earlier,
+   * a settle repin after a saved restore). Armed ONLY when the write moved
+   * scrollTop: an unchanged/clamped write dispatches no event, and the rAF
+   * below invalidates the latches when the browser never answers.
+   */
+  const armOwnScrollEcho = useCallback((before: number) => {
+    const el = scrollerRef.current;
+    if (!el || el.scrollTop === before) return;
+    const seq = restoreEchoSeqRef.current + 1;
+    restoreEchoSeqRef.current = seq;
+    restoreEchoRef.current = { top: el.scrollTop, seq, inputSeq: readerInputSeqRef.current };
+    reflowOwnScrollRef.current = true;
+    requestAnimationFrame(() => {
+      if (restoreEchoRef.current?.seq === seq) {
+        restoreEchoRef.current = null;
+        reflowOwnScrollRef.current = false;
+      }
+    });
+  }, []);
+  /**
+   * Write scrollTop programmatically.
+   * - fromRestore=false (intentional navigation: j/k via scrollToIndex, a
+   *   search hit via gotoMatch, 跳到最新): synchronously retire any armed
+   *   restore and invalidate the echo record before the write.
+   * - fromRestore=true (the re-anchor machinery's own writes: load-earlier /
+   *   saved restore corrections and the growth-anchor self-correction): arm
+   *   the echo so the dispatched scroll event is recognised as our own.
+   * A rAF drops a record when the browser dispatched no event.
+   */
+  const programmaticScroll = useCallback(
+    (el: HTMLElement, top: number, fromRestore = false) => {
+      if (fromRestore) {
+        const before = el.scrollTop;
+        el.scrollTop = top;
+        // Record the value the BROWSER kept, read back AFTER the write, not
+        // the requested one: a short tail (earlierFloor > 1) can clamp the
+        // restore write, so a requested-target echo would mismatch the
+        // clamped event by more than the tolerance and make the restore
+        // cancel its own echo.
+        armOwnScrollEcho(before);
+      } else {
+        cancelLoadRestoreRef.current();
+        restoreEchoRef.current = null;
+        reflowOwnScrollRef.current = false;
+        // Intentional navigation (j/k, a search hit, 跳到最新) owns the place:
+        // retire the restore's reflow anchor synchronously — the write below
+        // can be clamped/unchanged and dispatch NO scroll event, so relying on
+        // onScroll would leave the stale anchor holding across the navigation.
+        reflowAnchorRef.current = null;
+        setReflowHoldAttr();
+        el.scrollTop = top;
+      }
+      scrollTopRef.current = el.scrollTop;
+    },
+    [armOwnScrollEcho],
+  );
+  /**
+   * Retire a held load-earlier anchor: clear its quiet timer, the pending
+   * restore for the same request (its estimate freeze and correction loop end
+   * with the anchor) and, when its request has already finished, the request
+   * identity. An in-flight request is left for the click's finally to
+   * finalize (it owns the loading button state).
+   */
+  const releasePrependAnchor = useCallback((held: PrependAnchor) => {
+    if (prependSettleTimerRef.current !== null) {
+      window.clearTimeout(prependSettleTimerRef.current);
+      prependSettleTimerRef.current = null;
+    }
+    if (prependAnchorRef.current !== held) return;
+    prependAnchorRef.current = null;
+    const pending = pendingScroll.current;
+    if (pending?.kind === "restore" && pending.reqId === held.reqId) {
+      pendingScroll.current = null;
+      restoringRef.current = false;
+      setRestoreActiveAttr();
+    }
+    const req = loadReqRef.current;
+    if (req?.reqId === held.reqId && req.done) loadReqRef.current = null;
+  }, []);
+  /** Switch growth anchoring off after a cancel, bounded by a re-arm timer. */
+  const suppressGrowthHold = useCallback(() => {
+    growthHoldSuppressedRef.current = true;
+    setGrowthHoldAttr();
+    if (growthHoldRearmTimerRef.current !== null) window.clearTimeout(growthHoldRearmTimerRef.current);
+    growthHoldRearmTimerRef.current = window.setTimeout(() => {
+      growthHoldRearmTimerRef.current = null;
+      growthHoldSuppressedRef.current = false;
+      setGrowthHoldAttr();
+    }, GROWTH_HOLD_REARM_MS);
+  }, []);
+  /** Genuine reader input re-arms growth anchoring immediately and cancels the bound. */
+  const rearmGrowthHold = useCallback(() => {
+    if (growthHoldRearmTimerRef.current !== null) {
+      window.clearTimeout(growthHoldRearmTimerRef.current);
+      growthHoldRearmTimerRef.current = null;
+    }
+    growthHoldSuppressedRef.current = false;
+    setGrowthHoldAttr();
+  }, []);
+  /**
+   * Synchronously retire the current load-earlier restore from an intentional
+   * navigation — independent of whether the upcoming write changes scrollTop
+   * (a single j at the top writes an unchanged value and dispatches no scroll
+   * event, so onScroll alone can never do this). Marks the in-flight request
+   * cancelled, releases the held anchor and the restore pending, and unfreezes
+   * the estimate. The request identity stays until the click's finally runs.
+   */
+  const cancelLoadRestore = useCallback(() => {
+    const req = loadReqRef.current;
+    if (!req || req.cancelled) return;
+    req.cancelled = true;
+    const held = prependAnchorRef.current;
+    if (held?.reqId === req.reqId) releasePrependAnchor(held);
+    // The caller (j/k, search, 跳到最新) has already replaced the pending with
+    // its OWN index navigation, so the restore pending may be gone — but the
+    // estimate freeze (restoringRef) belongs to THIS request and must end
+    // regardless of the current pending kind. Clear a surviving restore
+    // pending too.
+    const pending = pendingScroll.current;
+    if (pending?.kind === "restore" && pending.reqId === req.reqId) pendingScroll.current = null;
+    restoringRef.current = false;
+    setRestoreActiveAttr();
+    // Drop the pre-navigation reading anchor: it was sampled above the row
+    // the incoming prepend will move, so without this the growth-anchor hold
+    // would compensate for that prepend and re-jump to the click-time row
+    // even after the reader intentionally navigated away.
+    readingAnchorRef.current = null;
+    suppressGrowthHold();
+  }, [releasePrependAnchor, suppressGrowthHold]);
+  useEffect(() => {
+    cancelLoadRestoreRef.current = cancelLoadRestore;
+  }, [cancelLoadRestore]);
+  useEffect(() => {
+    rearmGrowthHoldRef.current = rearmGrowthHold;
+  }, [rearmGrowthHold]);
+  // Latest sampleReadingAnchor, for the gesture cancellation effect (which is
+  // mounted before the callback is defined).
+  const sampleAnchorOnGestureRef = useRef<() => void>(() => {});
+  // Latest re-arm for the growth-hold suppression (the gesture effect mounts
+  // before rearmGrowthHold is defined).
+  const rearmGrowthHoldRef = useRef<() => void>(() => {});
+
+  // A genuine GESTURE (wheel, touch drag, a scroll keypress, or a scrollbar
+  // pointer drag) must cancel an armed load-earlier restore independently of
+  // how far it scrolls — even a 1-2px move. The onScroll echo classifier runs
+  // only on the coalesced scroll event, where a tiny move can land inside the
+  // restore's ±2px echo window and be mistaken for the restore's own write
+  // (then reversed by the next correction). These input events fire BEFORE
+  // that scroll event and are unambiguous, so retire the restore on them.
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const SCROLL_KEYS = new Set([
+      "ArrowUp",
+      "ArrowDown",
+      "PageUp",
+      "PageDown",
+      "Home",
+      "End",
+      " ",
+    ]);
+    const gesture = () => {
+      // A genuine input generation: any scroll event that arrives after this
+      // (even coalesced within the restore write's echo window) is reader
+      // input, not the restore's echo.
+      readerInputSeqRef.current += 1;
+      // Whether a load-earlier/saved restore or a prepend hold is engaged when
+      // the gesture fires. The anchor re-sample below is needed only then
+      // (cancelLoadRestore nulls the pre-restore anchor); with nothing armed a
+      // gesture that dispatches no scroll event must leave the anchor the
+      // ordinary onScroll sample owns alone.
+      const restoreOrHoldArmed =
+        restoringRef.current || prependAnchorRef.current !== null || loadReqRef.current !== null;
+      // Any genuine input also retires the reflow anchor a restore left
+      // armed: it is allowed to live only until the reader moves. Clearing
+      // here (not only in onScroll) covers a gesture whose scroll is clamped
+      // or coalesced away so no scroll event ever fires.
+      reflowAnchorRef.current = null;
+      setReflowHoldAttr();
+      cancelLoadRestoreRef.current();
+      // Genuine input re-arms growth anchoring at once — even when the gesture
+      // dispatches no scroll event (a 1-2px wheel, a scrollbar-thumb press
+      // without drag): the suppression's bounded timer must not be what gates
+      // an input that already happened.
+      rearmGrowthHoldRef.current();
+      // Re-sample the reader anchor at the current position so subsequent
+      // growth holds the post-gesture row — but ONLY while a restore/hold was
+      // armed (a tiny wheel scrolls ~0, so onScroll won't re-sample it). With
+      // nothing armed, the existing onScroll sample is left untouched.
+      if (restoreOrHoldArmed) sampleAnchorOnGestureRef.current();
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaY !== 0 || event.deltaX !== 0) gesture();
+    };
+    const onTouchMove = () => gesture();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (SCROLL_KEYS.has(event.key) && !event.defaultPrevented) gesture();
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      // A primary-button press on the vertical scrollbar gutter cancels. The
+      // gutter is the scroller itself (event.target === el) within
+      // scrollbarWidth of the right edge; content presses land on a child row.
+      if (event.button !== 0) return;
+      const target = event.target as Node;
+      if (target !== el) return;
+      const rect = el.getBoundingClientRect();
+      const scrollbarWidth = el.offsetWidth - el.clientWidth;
+      if (event.clientX >= rect.right - Math.max(scrollbarWidth, 12)) gesture();
+    };
+    el.addEventListener("wheel", onWheel, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    el.addEventListener("keydown", onKeyDown);
+    el.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("touchmove", onTouchMove);
+      el.removeEventListener("keydown", onKeyDown);
+      el.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, []);
+  /**
+   * Arm (or re-arm) the quiet-window release: when measurement/size commits
+   * stop for PREPEND_SETTLE_QUIET_MS the anchor is retired even though the
+   * stable-pass count was never reached, so a restore that went quiet cannot
+   * stay armed for the session and undo a later reader scroll.
+   */
+  const armPrependQuiet = useCallback(
+    (held: PrependAnchor) => {
+      if (prependSettleTimerRef.current !== null) window.clearTimeout(prependSettleTimerRef.current);
+      prependSettleTimerRef.current = window.setTimeout(() => {
+        prependSettleTimerRef.current = null;
+        releasePrependAnchor(held);
+        // The quiet window ends on a timer with no size or scroll commit to
+        // re-render, so bump the tick: the anchor effects re-run (and no-op on
+        // the retired hold) and data-prepend-hold flips to "0" without needing
+        // a later reader scroll.
+        setLoadTick((n) => n + 1);
+      }, PREPEND_SETTLE_QUIET_MS);
+    },
+    [releasePrependAnchor],
+  );
   // Latest scroll offset in a ref: passive-effect cleanup runs after refs are
   // detached on unmount, so the leave-session flush cannot read the DOM.
   const viewportRef = useRef(720);
@@ -407,7 +945,10 @@ function TranscriptInner({
     () => (events.length ? events.reduce((min, ev) => Math.min(min, Number(ev.seq)), Number(events[0].seq)) : 1),
     [events],
   );
-  const canLoadEarlier = nodes.length > 0 && loadedFloor > 1;
+  // The store floor survives reconnect snapshots that re-anchor the server
+  // window; the events-derived floor only backs standalone unit mounts.
+  const retainedFloor = earlierFloor === undefined ? loadedFloor : Math.max(1, Number(earlierFloor ?? 1));
+  const canLoadEarlier = nodes.length > 0 && retainedFloor > 1;
   const onLoadEarlier = useCallback(async () => {
     if (!instanceId || loadingEarlier || !canLoadEarlier) return;
     const el = scrollerRef.current;
@@ -421,20 +962,118 @@ function TranscriptInner({
       if (row) offset = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
     }
     pinRef.current = false;
-    setLoadingEarlier(true);
-    try {
-      await hubStore.loadEarlier(instanceId);
-      if (anchorId) {
-        restoringRef.current = true;
-        pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0 };
-        // Keep repinning as the prepended (unmeasured) rows settle; the
-        // one-shot restore effect alone stops before the average converges.
-        prependAnchorRef.current = { anchorId, offset, tries: 0 };
-      }
-    } finally {
-      setLoadingEarlier(false);
+    // This click owns one request identity. Transcript stays mounted across
+    // routes, so the request carries its instance + a monotone id: session
+    // switches (epoch reset) and later clicks supersede it, and this click's
+    // late finally may only finalize its OWN anchors.
+    const reqId = loadReqSeqRef.current + 1;
+    loadReqSeqRef.current = reqId;
+    const req = { reqId, instanceId, done: false, cancelled: false };
+    loadReqRef.current = req;
+    // Arm the restore BEFORE the read. loadEarlier emits the merged events list
+    // synchronously (inside the awaited call) and the external-store commit
+    // flushes before this continuation resumes, so arming after the await missed
+    // the prepend commit itself; with the page body no longer re-rendering on an
+    // incidental 1 s/2 s tick, the anchor effects never re-ran and the anchor
+    // row stayed unmounted. Armed up front, the prepend commit runs the restore.
+    const armedIndex = range.start;
+    // Snapshot the pre-click top-level list: a prepend can rename the armed
+    // compact fold, and the post-prepend anchor is resolved against this list
+    // by content rather than a raw index that shifted with the inserted rows.
+    const prevNodes = nodesRef.current.slice();
+    if (anchorId) {
+      restoringRef.current = true;
+      setRestoreActiveAttr();
+      pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0, awaitIndex: armedIndex, reqId, prevNodes };
+      // Keep repinning as the prepended (unmeasured) rows settle; the
+      // one-shot restore effect alone stops before the average converges.
+      prependAnchorRef.current = {
+        anchorId,
+        offset,
+        tries: 0,
+        corrections: 0,
+        // Stamped on the first post-landing commit; the fetch itself may take
+        // arbitrarily long and must not eat into the settle budget.
+        deadline: 0,
+        armedIndex,
+        reqId,
+        prevNodes,
+      };
     }
-  }, [instanceId, loadingEarlier, canLoadEarlier, range.start]);
+    setLoadingEarlier(true);
+    setLoadTick((n) => n + 1);
+    let result: { prepended: boolean; end: boolean } | null = null;
+    try {
+      result = await hubStore.loadEarlier(instanceId);
+    } finally {
+      req.done = true;
+      // Only the still-current request for THIS instance finalizes; after a
+      // route switch the epoch reset already cleared the refs and another
+      // session may own a newer request.
+      if (loadReqRef.current === req) {
+        setLoadingEarlier(false);
+        setLoadTick((n) => n + 1);
+        if (req.cancelled || !result || !result.prepended) {
+          // Cancelled by a reader scroll/navigation, a failed read, or a
+          // duplicate-only / empty page (nothing to anchor). A page that
+          // PREPENDED keeps the anchors until the mounted anchor settles —
+          // including the final history page (result.end), whose rows still
+          // have to mount and measure before the held offset is correct.
+          // Read the pending BEFORE releasePrependAnchor clears it.
+          const pending = pendingScroll.current;
+          const held = prependAnchorRef.current;
+          if (held?.reqId === reqId) releasePrependAnchor(held);
+          if (pending?.kind === "restore" && pending.reqId === reqId) {
+            if (pending.retargeted) {
+              // No rows prepended, so the retargeted restore (inert until the
+              // destination's index advances) never applied. Fall back to
+              // refining the navigation destination as a normal index jump so
+              // it is still landed, instead of dropping it with the hold.
+              const destIndexNow = nodesRef.current.findIndex((n) => n.id === pending.anchorId);
+              pendingScroll.current =
+                destIndexNow >= 0
+                  ? { kind: "index", index: destIndexNow, offset: pending.offset, tries: 0 }
+                  : null;
+            } else {
+              pendingScroll.current = null;
+            }
+            restoringRef.current = false;
+            setRestoreActiveAttr();
+          }
+          loadReqRef.current = null;
+        } else if (prependAnchorRef.current?.reqId !== reqId) {
+          // The prepend landed but the settle bounds (or a navigation)
+          // already retired the anchor: nothing is holding the request
+          // identity anymore.
+          loadReqRef.current = null;
+        }
+      }
+    }
+  }, [instanceId, loadingEarlier, canLoadEarlier, range.start, releasePrependAnchor]);
+
+  // Programmatic write made by the re-anchor machinery (a growth counter-scroll,
+  // a font reflow self-correction, or a pending-restore correction). Browsers
+  // dispatch NO scroll event when a write leaves scrollTop unchanged (already
+  // at the target, or clamped), so this only ARMS the latches when the write
+  // actually moved scrollTop (a coalesced scroll event is really coming). It
+  // never CLEARS an armed latch either: two internal writes can land before the
+  // one coalesced event (the second clamped at 0/max, or the restore's
+  // estimated-index path recomputing the same top), and clearing here would
+  // make the first write's event cancel the restore / retire the reflow anchor
+  // as though the reader had scrolled. Both latches arm together (see
+  // armOwnScrollEcho): the write must keep the reflow anchor AND be
+  // recognised as an in-flight load-earlier restore's own echo.
+  const ownScrollWrite = useCallback(
+    (next: number) => {
+      const el = scrollerRef.current;
+      if (!el) return;
+      const before = el.scrollTop;
+      el.scrollTop = next;
+      armOwnScrollEcho(before);
+      scrollTopRef.current = el.scrollTop;
+    },
+    [armOwnScrollEcho],
+  );
 
   // Reading anchor: the first row in view, its offset from the scroller top,
   // and the scrollTop it was sampled at (on every scroll). A row above it that
@@ -457,14 +1096,23 @@ function TranscriptInner({
       const box = row.getBoundingClientRect();
       if (box.bottom > top && box.top < bottom) {
         readingAnchorRef.current = { id: row.dataset.anchor ?? "", offset: box.top - top, top: el.scrollTop };
+        setReadingAnchorAttr();
         return;
       }
     }
+    setReadingAnchorAttr();
   }, []);
+  useEffect(() => {
+    sampleAnchorOnGestureRef.current = sampleReadingAnchor;
+  }, [sampleReadingAnchor]);
   const holdReadingAnchor = useCallback(() => {
     const el = scrollerRef.current;
     const held = readingAnchorRef.current;
     if (!el || pinRef.current || pendingScroll.current || prependAnchorRef.current) return;
+    // An intentional navigation cancelled an in-flight load-earlier: the
+    // prepend still arriving must not be compensated for until the reader
+    // scrolls again (sample on that scroll, not from the prepend's reports).
+    if (growthHoldSuppressedRef.current) return;
     // No anchor, or one the window has since unmounted: take a new one from
     // the rows now in view. Growth that already landed is not undone.
     const row = held ? el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.id)}"]`) : null;
@@ -474,10 +1122,13 @@ function TranscriptInner({
     }
     const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) < 1) return;
-    el.scrollTop += delta;
-    scrollTopRef.current = el.scrollTop;
+    // Internal growth-anchor write, not a reader scroll or an intentional
+    // navigation: fromRestore marks it so its coalesced echo neither cancels
+    // an armed load-earlier restore nor retires the reflow anchor (and it
+    // must not run the non-restore branch's synchronous cancel).
+    programmaticScroll(el, el.scrollTop + delta, true);
     held.top = el.scrollTop;
-  }, [sampleReadingAnchor]);
+  }, [sampleReadingAnchor, programmaticScroll]);
 
   // Stable per-row size reporter keyed by node id. The identity MUST stay
   // constant across parent re-renders (scroll fires setScrollTop on every
@@ -486,18 +1137,106 @@ function TranscriptInner({
   // read) for every visible row on every scroll frame.
   const setRowSize = useCallback((id: string, height: number) => {
     if (height <= 0) return;
-    // The row has already grown in the DOM: hold the reader before paint.
-    holdReadingAnchor();
-    // Sub-pixel tolerance: measured heights jitter by fractions of a px
-    // between frames; ignore deltas under 1 instead of thrashing state.
-    setRowHeights((prev) => {
-      const last = prev.get(id);
-      if (last !== undefined && Math.abs(last - height) < 1) return prev;
-      const next = new Map(prev);
+    // The fail-proof seam (?noReanchor, armed at release) turns off ALL scroll
+    // re-anchoring on measured size changes; the row heights below are still
+    // recorded so the virtualiser keeps its geometry, but the reader rides the
+    // reflow. No effect without the test query.
+    const reanchor = !fontSwapReanchorDisabled();
+    // A web-font swap (or async reflow) changes the HEIGHT of a row above the
+    // row the reader restored to. The generic holdReadingAnchor anchors to the
+    // topmost on-screen row and cannot compensate when the changing row is a
+    // tall block above (or wrapping) the held message node, so hold the
+    // restored row explicitly against the measured height delta.
+    const el = scrollerRef.current;
+    // Compare against the last COMMITTED height (the synchronous ledger in
+    // rowHeightsRef), not a stale value: the same row can be measured twice in
+    // one commit (initial layout effect + ResizeObserver) before React renders
+    // the queued state, and comparing against the pre-commit height twice would
+    // scroll the reader by the same delta on every measurement tick. Sub-pixel
+    // jitter (<1px) is ignored entirely — it is not a real layout change and
+    // must not scroll.
+    const prevHeight = rowHeightsRef.current.get(id);
+    const heightChanged = prevHeight === undefined || Math.abs(height - prevHeight) >= 1;
+    let selfDelta = 0;
+    // Note: allowed even while a saved-position restore is still pending (the
+    // mid-restore font-swap arm) — the reflow anchor IS that pending restore's
+    // target, and the restore correction alone converges to the wrong (post-
+    // reflow) spot without this height-delta compensation.
+    if (reanchor && heightChanged && el && !pinRef.current && !prependAnchorRef.current) {
+      const reflow = reflowAnchorRef.current;
+      if (reflow && prevHeight !== undefined) {
+        const resized = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(id)}"]`);
+        const anchorRow = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(reflow.id)}"]`);
+        if (resized && anchorRow && resized !== anchorRow) {
+          // Compensate only for a DIFFERENT row strictly ABOVE the restored
+          // anchor. A row's OWN growth never moves its own top, so counter-
+          // scrolling it would push that top off the saved spot (the r5 item-1
+          // bug): the anchor row's own top is held without a write, both while
+          // a restore is active (its top is layout-stable across self-growth)
+          // and after it finalizes (the generic anchor holds it).
+          const resizedDoc = el.scrollTop + resized.getBoundingClientRect().top - el.getBoundingClientRect().top;
+          const anchorDoc = el.scrollTop + anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top;
+          if (resizedDoc < anchorDoc) {
+            // Hold the anchor at its SAVED viewport offset by measuring how
+            // far it has drifted RIGHT NOW, instead of adding the resized row's
+            // ledger height delta. A React commit changing nodes/sizes (a
+            // streamed event) that lands between the font layout and this
+            // ResizeObserver delivery can already have counter-scrolled the
+            // drift via the generic hold: the DOM-relative drift is 0 then, so
+            // the anchor is corrected exactly once whichever path runs first.
+            const drift =
+              anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top - reflow.offset;
+            if (Math.abs(drift) >= 1) selfDelta = drift;
+          }
+        }
+      }
+    }
+    if (reanchor && selfDelta !== 0 && el) {
+      // This write is the compensator's OWN re-anchor, not a reader scroll:
+      // keep reflowAnchorRef across its coalesced scroll event (see the
+      // own-scroll flag consumed in onScroll). The latch arms only if the
+      // write moves scrollTop (ownScrollWrite), so a clamped no-op cannot
+      // leave it stuck to swallow the reader's next real scroll.
+      ownScrollWrite(el.scrollTop + selfDelta);
+      const held = readingAnchorRef.current;
+      if (held) held.top = el.scrollTop;
+      // Align the generic reading anchor with the post-correction restored row
+      // so the subsequent sizes-commit hold does not scroll it back.
+      const ra = reflowAnchorRef.current;
+      const raRow = ra
+        ? el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(ra.id)}"]`)
+        : null;
+      if (ra && raRow) {
+        readingAnchorRef.current = {
+          id: ra.id,
+          offset: raRow.getBoundingClientRect().top - el.getBoundingClientRect().top,
+          top: el.scrollTop,
+        };
+        // The reflow correction held the restored anchor this commit; the
+        // pending restore must not also run its post-metrics DOM correction
+        // (it would undo the hold and converge to the reflowed position).
+        reflowCorrectedThisCommitRef.current = true;
+      }
+    } else if (reanchor && !reflowAnchorRef.current) {
+      // While a reflow anchor is active the explicit above-row compensation is
+      // the SOLE hold. Falling through to holdReadingAnchor here would double
+      // count a swap that resizes two rows in RO-creation order: a row at/below
+      // the anchor measured first would let the generic hold correct the drift
+      // a strictly-above row already moved in the DOM, after which that above
+      // row's own delta would scroll the reader a SECOND time. Once the reader
+      // scrolls (clearing reflowAnchorRef) the generic hold owns position again.
+      holdReadingAnchor();
+    }
+    // Commit the height once. The ref is the synchronous ledger and is updated
+    // in the same breath as the state, so same-commit re-measurements compare
+    // against THIS value. Sub-pixel reports neither scroll nor commit.
+    if (heightChanged) {
+      const next = new Map(rowHeightsRef.current);
       next.set(id, height);
-      return next;
-    });
-  }, [holdReadingAnchor]);
+      rowHeightsRef.current = next;
+      setRowHeights(next);
+    }
+  }, [holdReadingAnchor, ownScrollWrite]);
 
   // Converge the unmeasured-row estimate on this visit's real average so
   // offsets outside the window (search hits, saved position) stop drifting.
@@ -505,7 +1244,6 @@ function TranscriptInner({
   // previous visit's average: the rows above the anchor were estimates at
   // save time too, so freezing reproduces their contribution exactly instead
   // of biasing the total toward the rows this window happened to mount.
-  const restoringRef = useRef(false);
   useLayoutEffect(() => {
     if (restoringRef.current) return;
     const measured = sizes.filter((h) => h > 0);
@@ -518,33 +1256,90 @@ function TranscriptInner({
   // math it uses): the prepended window is mostly UNMEASURED rows rendered at
   // `estimate` height. When the average later converges, padTop for thousands
   // of rows shifts after the one-shot DOM restore finished — keep re-pinning
-  // the held anchor until sizes stop changing.
+  // the held anchor while sizes settle. The hold has a DEFINITE END: a few
+  // stable passes, a quiet window after the last settle commit, an absolute
+  // deadline, or a correction budget, whichever comes first — the commits can
+  // simply stop, so stable passes alone are not enough.
   useLayoutEffect(() => {
     const held = prependAnchorRef.current;
     const el = scrollerRef.current;
     if (!held || !el || !nodesRef.current.length) return;
+    // The armed anchor can VANISH: an older tool page renames the compact fold
+    // it became (`compact:<firstToolCallId>`). Resolve the post-prepend row by
+    // CONTENT against the pre-click node list (fold child containment, then
+    // the following sibling's slot) — a raw pre-insert index points at a newly
+    // inserted row after the prepend shifted indices.
+    const exactIndex = nodes.findIndex((n) => n.id === held.anchorId);
+    let retargeted = false;
+    if (exactIndex < 0) {
+      const resolved = resolvePrependedAnchor(held.prevNodes, nodes, held.armedIndex);
+      if (resolved) {
+        held.anchorId = resolved.node.id;
+        retargeted = true;
+        const pending = pendingScroll.current;
+        if (pending?.kind === "restore" && pending.reqId === held.reqId) pending.anchorId = resolved.node.id;
+      }
+    }
+    // Applied = a content-resolved fold rename, or the same id sitting beyond
+    // its armed slot (rows inserted before it). The same id still at the armed
+    // slot means the fetch has not prepended yet — stay inert.
+    const applied = retargeted || exactIndex > held.armedIndex;
+    if (!applied) {
+      // Fetch still in flight: stay armed without burning the stable budget.
+      // Once the owning request finished without a visible prepend (duplicate
+      // page, a fold that swallowed the rows without renaming, or a retired
+      // floor), retire — otherwise the anchors stay set for the whole session,
+      // growth anchoring and estimate convergence stay disabled.
+      const req = loadReqRef.current;
+      if (req && req.reqId === held.reqId && req.done) releasePrependAnchor(held);
+      return;
+    }
+    if (held.deadline === 0) held.deadline = Date.now() + PREPEND_SETTLE_DEADLINE_MS;
+    // Absolute backstop even when commits keep arriving with corrections.
+    if (Date.now() >= held.deadline) {
+      releasePrependAnchor(held);
+      return;
+    }
     const rowEl = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.anchorId)}"]`);
     if (!rowEl) {
       // Anchor not mounted yet (the pendingScroll restore runs after this
-      // effect and brings it in): do not burn the stable-pass budget.
+      // effect and brings it in): do not burn the stable-pass budget, but the
+      // quiet timer still has to run — a window that stops committing before
+      // the anchor mounts must retire the hold instead of leaking it.
+      armPrependQuiet(held);
       return;
     }
     const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) > 1) {
-      el.scrollTop += delta;
-      scrollTopRef.current = el.scrollTop;
+      held.corrections += 1;
+      if (held.corrections >= PREPEND_SETTLE_MAX_CORRECTIONS) {
+        releasePrependAnchor(held);
+        return;
+      }
+      programmaticScroll(el, el.scrollTop + delta, true);
       held.tries = 0;
+      armPrependQuiet(held);
       return;
     }
     held.tries += 1;
     // Sizes/events arrive on separate commits; release after a few stable
     // passes with no correction needed.
-    if (held.tries >= 4) prependAnchorRef.current = null;
-  }, [sizes, nodes, estimate]);
+    if (held.tries >= 4) {
+      releasePrependAnchor(held);
+      return;
+    }
+    armPrependQuiet(held);
+  }, [sizes, nodes, estimate, loadTick, programmaticScroll, releasePrependAnchor, armPrependQuiet]);
 
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el) return;
+    // TEST-ONLY seam read live (this effect mounts once): the pinned fail-
+    // proof disables this re-pin so a font-driven content growth cannot be
+    // masked by an incidental scroller-height re-pin.
+    const pinHoldDisabled = () =>
+      new URLSearchParams(window.location.search).has("noSizePin") &&
+      (window as unknown as { __fontSwapNoSizePinArmed?: boolean }).__fontSwapNoSizePinArmed === true;
     // c-mfix round 4: a height change (the soft keyboard shrinks the band)
     // does not change nodes/sizes, so the pin effect above never reruns and a
     // long transcript pinned to the tail is left scrolled above its newest
@@ -557,9 +1352,9 @@ function TranscriptInner({
       const viewport = next < 32 ? 720 : next;
       viewportRef.current = viewport;
       setViewport(viewport);
-      if (wasPinned) {
-        el.scrollTop = el.scrollHeight;
-        scrollTopRef.current = el.scrollTop;
+      if (wasPinned && !pinHoldDisabled()) {
+        // Internal viewport-change re-pin, not reader navigation.
+        programmaticScroll(el, el.scrollHeight, true);
       }
     };
     measure();
@@ -573,31 +1368,131 @@ function TranscriptInner({
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [programmaticScroll]);
 
   useEffect(() => {
     nodesRef.current = nodes;
   }, [nodes]);
 
-  const applyOffset = useCallback((index: number, offset: number) => {
+  const applyOffset = useCallback((index: number, offset: number, fromRestore = false) => {
     const el = scrollerRef.current;
     if (!el) return;
     const { offsets, total } = rowOffsets(nodesRef.current.length, sizesHold.current, estimateRef.current);
     const base = offsets[index] ?? 0;
     const max = Math.max(0, total - el.clientHeight);
     const top = Math.min(max, Math.max(0, base + offset));
-    el.scrollTop = top;
-    scrollTopRef.current = top;
-  }, []);
+    // A retargeted in-flight restore's first jump is that restore's OWN write
+    // (echo recognised), not an intentional navigation that cancels it.
+    programmaticScroll(el, top, fromRestore);
+  }, [programmaticScroll]);
+
+  /**
+   * If a load-earlier request is still in flight (!done), re-aim its hold at
+   * a navigation destination instead of dropping the hold. The destination
+   * becomes a restore-kind hold on the SAME request: its current index/top
+   * node list gate the pending correction (it stays inert until the prepend
+   * shifts the row), and after the prepend the anchor is resolved by content
+   * and settled at its viewport offset. Returns true when the caller's normal
+   * index navigation must be skipped.
+   */
+  const retargetInFlightRestore = useCallback(
+    (destIndex: number): boolean => {
+      const req = loadReqRef.current;
+      const destNode = nodesRef.current[destIndex];
+      if (!req || req.done || req.cancelled || !destNode) return false;
+      const prevNodes = nodesRef.current.slice();
+      if (prependSettleTimerRef.current !== null) {
+        window.clearTimeout(prependSettleTimerRef.current);
+        prependSettleTimerRef.current = null;
+      }
+      prependAnchorRef.current = {
+        anchorId: destNode.id,
+        offset: 0,
+        tries: 0,
+        corrections: 0,
+        // Stamped on the first POST-LANDING commit, like the click path: the
+        // deadline starts when the page actually lands, not at navigation time.
+        // A page that resolves >PREPEND_SETTLE_DEADLINE_MS after the key press
+        // would otherwise have the repin effect see Date.now() >= deadline,
+        // release the same-request restore pending, and skip the retarget —
+        // landing the reader a page older than the turn they chose.
+        deadline: 0,
+        armedIndex: destIndex,
+        reqId: req.reqId,
+        prevNodes,
+      };
+      pendingScroll.current = {
+        kind: "restore",
+        anchorId: destNode.id,
+        offset: 0,
+        tries: 0,
+        awaitIndex: destIndex,
+        reqId: req.reqId,
+        prevNodes,
+        retargeted: true,
+      };
+      restoringRef.current = true;
+      setRestoreActiveAttr();
+      // Retarget is intentional navigation: retire any reflow anchor a prior
+      // saved restore armed (the fromRestore jump below must not keep it), so
+      // a later card growth above the destination cannot counter-scroll.
+      reflowAnchorRef.current = null;
+      setReflowHoldAttr();
+      // The hold is retargeted, not abandoned: growth anchoring stays active
+      // (cancelLoadRestore would have suppressed it), and the first jump is
+      // the restore's own write. Re-arm via the helper so any pending bounded
+      // re-arm timer is cleared and data-growth-hold is updated.
+      rearmGrowthHold();
+      applyOffset(destIndex, 0, true);
+      return true;
+    },
+    [applyOffset, rearmGrowthHold],
+  );
 
   // Refine an estimated scroll (search hit, saved position) as the window
   // measures the rows around it. pendingScroll is declared with the other
   // per-instance refs so the route-switch reset can clear it.
   useLayoutEffect(() => {
+    // Consume-or-clear the per-commit reflow-correction flag; child row
+    // measuring layout effects (setRowSize) run just before this parent
+    // layout effect on the same commit, so a set flag is always consumed here.
+    const reflowCorrected = reflowCorrectedThisCommitRef.current;
+    reflowCorrectedThisCommitRef.current = false;
     const el = scrollerRef.current;
     const pending = pendingScroll.current;
     if (!el || !pending || !nodesRef.current.length) return;
     if (pending.kind === "restore") {
+      if (pending.awaitIndex !== undefined) {
+        let armed = nodes.findIndex((n) => n.id === pending.anchorId);
+        // The armed anchor can vanish when an older tool page renames the
+        // compact fold it became: resolve the post-prepend row by content.
+        let retargeted = false;
+        if (armed < 0) {
+          const resolved = resolvePrependedAnchor(pending.prevNodes ?? [], nodes, pending.awaitIndex);
+          if (resolved) {
+            pending.anchorId = resolved.node.id;
+            armed = resolved.index;
+            retargeted = true;
+            const held = prependAnchorRef.current;
+            if (held && held.reqId === pending.reqId) held.anchorId = resolved.node.id;
+          }
+        }
+        // Nothing applied yet (no prepend, no rename). Stay armed while the
+        // fetch is in flight; once the owning request finished this way, retire
+        // instead of holding a restore that can never resolve.
+        if (!retargeted && armed < 0) {
+          const req = pending.reqId !== undefined ? loadReqRef.current : null;
+          if (req && req.reqId === pending.reqId && req.done) {
+            pendingScroll.current = null;
+            restoringRef.current = false;
+            setRestoreActiveAttr();
+            if (prependAnchorRef.current?.reqId === pending.reqId) prependAnchorRef.current = null;
+            loadReqRef.current = null;
+          }
+          return;
+        }
+        if (!retargeted && armed <= pending.awaitIndex) return;
+      }
       // Estimate a starting position from the saved average, then correct
       // against the anchor's real DOM position once the window mounts it.
       // Pure estimate math drifts because the sets of already-measured rows
@@ -605,28 +1500,88 @@ function TranscriptInner({
       // opens at the top); a DOM-relative correction is independent of which
       // other rows happen to have been measured.
       const rowEl = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(pending.anchorId)}"]`);
+      // TEST-ONLY (?restoreProbe=1): while the probe web font is still held
+      // (not available), never finalize the restore — neither on a
+      // fallback-face "settled" reading nor on the attempt cap. This keeps the
+      // restore provably pending (data-restore-active="1") until the e2e arm
+      // releases the font, so the swap deterministically lands while the
+      // restore is active. Zero effect without the query parameter.
+      //
+      // Probe at a NON-STANDARD 12px: the 13px used by the app is matched by
+      // the font stack's generic `monospace` fallback, so fonts.check at 13px
+      // returns true even with IBM Plex Mono unloaded and would finalize on
+      // the fallback face. 12px is not a metric the generic face is declared
+      // for, so the check stays false until the real Plex woff2 is in.
+      const probeFontReady = () =>
+        !restoreProbe || typeof document === "undefined"
+          ? true
+          : document.fonts.check('400 12px "IBM Plex Mono"');
       if (rowEl) {
+        // Pin the reflow anchor to the restored row for the WHOLE restore
+        // (including a restoreProbe-held restore that is still pending when a
+        // font swap lands), so height changes of rows above it hold this row.
+        reflowAnchorRef.current = { id: pending.anchorId, offset: pending.offset };
         const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - pending.offset;
-        if (Math.abs(delta) <= 2) {
+        // Finalize only once the row actually sits at the saved offset. Seed
+        // the generic reading anchor with the restored row + offset so that a
+        // LATER growth of the row itself (which the above-row compensator does
+        // not scroll for) is held by the generic anchor.
+        const finalizeRestore = () => {
+          readingAnchorRef.current = {
+            id: pending.anchorId,
+            offset: pending.offset,
+            top: el.scrollTop,
+          };
           pendingScroll.current = null;
           restoringRef.current = false;
+          setRestoreActiveAttr();
+        };
+        // A font-metrics reflow was self-corrected this commit (rows ABOVE the
+        // anchor counter-scrolled). That does not prove the anchor reached its
+        // saved offset — an estimate miss or a second same-commit correction can
+        // still leave |delta| large. Run the offset correction rather than
+        // finalizing at an unfinished position; finalize only at |delta| <= 2.
+        if (reflowCorrected && Math.abs(delta) > 2) {
+          // Own restore write: its scroll event must not retire reflowAnchorRef.
+          ownScrollWrite(el.scrollTop + delta);
+          pending.tries += 1;
           return;
         }
-        el.scrollTop += delta;
-        scrollTopRef.current = el.scrollTop;
+        if (Math.abs(delta) <= 2) {
+          if (!probeFontReady()) return;
+          finalizeRestore();
+          return;
+        }
+        ownScrollWrite(el.scrollTop + delta);
       } else {
-        const index = nodesRef.current.findIndex((n) => n.id === pending.anchorId);
+        // The anchor is not mounted yet: jump toward its estimated offset so
+        // the window mounts it, then later passes correct against the real
+        // row. Use THIS commit's lists — on a load-earlier prepend the refs
+        // are still the pre-prepend lists (their sync effect is passive), so
+        // the refs would resolve the anchor at its old index.
+        const index = nodes.findIndex((n) => n.id === pending.anchorId);
         if (index >= 0) {
-          const { offsets } = rowOffsets(nodesRef.current.length, sizesHold.current, estimateRef.current);
+          const { offsets } = rowOffsets(nodes.length, sizes, estimate);
           const top = Math.round((offsets[index] ?? 0) + pending.offset);
-          el.scrollTop = top;
-          scrollTopRef.current = top;
+          ownScrollWrite(top);
         }
       }
       pending.tries += 1;
-      if (pending.tries >= 24) {
+      if (pending.tries >= 24 && probeFontReady()) {
+        // Give-up path: retire the whole load-earlier request, not just the
+        // pending restore, or the held repin anchor (whose row never mounted)
+        // and the request identity would leak for the session. The font gate
+        // only holds a saved-position restore with ?restoreProbe; for a
+        // load-earlier probeFontReady() is always true, so this is reached at
+        // 24 tries exactly as before.
         pendingScroll.current = null;
         restoringRef.current = false;
+        setRestoreActiveAttr();
+        if (pending.kind === "restore" && pending.reqId !== undefined) {
+          const held = prependAnchorRef.current;
+          if (held?.reqId === pending.reqId) releasePrependAnchor(held);
+          if (loadReqRef.current?.reqId === pending.reqId) loadReqRef.current = null;
+        }
       }
       return;
     }
@@ -637,21 +1592,36 @@ function TranscriptInner({
       return;
     }
     pending.tries += 1;
-  }, [sizes, nodes, estimate, applyOffset]);
+  }, [sizes, nodes, estimate, applyOffset, loadTick, releasePrependAnchor, restoreProbe, ownScrollWrite]);
 
   // A commit that moves rows above the anchor (padTop re-estimated, a row
   // inserted above) holds the reader the same way a measured growth does. A
   // range commit after a jump re-acquires the anchor from the rows it mounted.
   useLayoutEffect(() => {
+    if (fontSwapReanchorDisabled()) return;
     holdReadingAnchor();
   }, [sizes, nodes, estimate, range.start, range.end, holdReadingAnchor]);
 
+  // Structural updates (new rows appended) re-pin; size-commit re-pinning is a
+  // separate effect so the test-only ?noSizePin seam can disable it.
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el || !pinRef.current) return;
-    el.scrollTop = el.scrollHeight;
-    scrollTopRef.current = el.scrollTop;
-  }, [nodes.length, sizes]);
+    // Internal re-pin, not an intentional navigation: mark it as our own
+    // write so its echo neither cancels an armed load-earlier restore nor is
+    // mistaken for a reader gesture.
+    programmaticScroll(el, el.scrollHeight, true);
+  }, [nodes.length, programmaticScroll]);
+
+  // A measured row height change (the web-font swap) re-pins the pinned
+  // transcript so a tail block that grows on the swap cannot leave a gap.
+  useLayoutEffect(() => {
+    const el = scrollerRef.current;
+    if (!el || !pinRef.current || noSizePin) return;
+    // Internal re-pin, not intentional navigation (same own-write marking).
+    programmaticScroll(el, el.scrollHeight, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sizes, programmaticScroll]);
 
   const flushPosition = useCallback((top: number) => {
     if (!instanceId) return;
@@ -688,6 +1658,10 @@ function TranscriptInner({
     pinRef.current = false;
     restoringRef.current = true;
     pendingScroll.current = { kind: "restore", anchorId: saved.anchorId, offset: saved.offset, tries: 0 };
+    // The pending-scroll layout effect runs next and also writes the
+    // attribute; set it here too so an effect that samples it between arm and
+    // the first correction sees "1".
+    setRestoreActiveAttr();
     restoredRef.current = true;
   }, [nodes, saved]);
 
@@ -697,17 +1671,20 @@ function TranscriptInner({
   useEffect(() => {
     return () => {
       if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+      if (prependSettleTimerRef.current !== null) window.clearTimeout(prependSettleTimerRef.current);
       flushPosition(scrollTopRef.current);
     };
   }, [flushPosition]);
 
   const scrollToIndex = useCallback((index: number) => {
-    const el = scrollerRef.current;
-    if (!el || index < 0) return;
+    if (!scrollerRef.current || index < 0) return;
     pinRef.current = index >= nodesRef.current.length - 1;
+    // j while an older page is loading: re-aim its hold at this turn instead
+    // of cancelling it, so the landing prepend settles onto the turn.
+    if (retargetInFlightRestore(index)) return;
     pendingScroll.current = { kind: "index", index, offset: 0, tries: 0 };
     applyOffset(index, 0);
-  }, [applyOffset]);
+  }, [applyOffset, retargetInFlightRestore]);
 
   const turnIds = useMemo(
     () => nodes.filter((n) => n.type === "message").map((n) => n.id),
@@ -770,9 +1747,12 @@ function TranscriptInner({
     } else {
       setCompactHit(null);
     }
+    // A search jump while an older page is loading re-aims the hold at the hit;
+    // after the prepend the hit row settles at the top instead of being lost.
+    if (retargetInFlightRestore(located.index)) return;
     pendingScroll.current = { kind: "index", index: located.index, offset: 0, tries: 0 };
     applyOffset(located.index, 0);
-  }, [matches, applyOffset]);
+  }, [matches, applyOffset, retargetInFlightRestore]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -948,11 +1928,79 @@ function TranscriptInner({
         ref={scrollerRef}
         className={css.scroller}
         data-testid="transcript-scroller"
+        data-restore-active="0"
+        // Inert observability for the load-earlier hold: "1" while its anchor
+        // is armed, "0" once retired (quiet window, gesture, navigation, route
+        // switch). Read from the ref at render; the quiet timer bumps loadTick
+        // so the "0" is reflected without a later scroll.
+        data-prepend-hold={prependAnchorRef.current ? "1" : "0"}
+        // Inert observability for tests: "1" while the reflow anchor armed by a
+        // restore is still holding (it outlives the restore itself and is
+        // retired only by reader input / route change). Read from the ref at
+        // render; every scroll event re-renders the scroller.
+        data-reflow-hold={reflowAnchorRef.current ? "1" : "0"}
+        // "1" when reading-anchor growth anchoring is engaged; "0" while a
+        // load-earlier cancel temporarily suppresses it (re-armed by a genuine
+        // gesture or the bounded timer). Imperatively mirrored as well.
+        data-growth-hold={growthHoldSuppressedRef.current ? "0" : "1"}
+        // Inert: the id of the row the growth/reading hold is sampled onto.
+        data-reading-anchor={readingAnchorRef.current?.id ?? ""}
         onScroll={(event) => {
           const el = event.currentTarget;
           setScrollTop(el.scrollTop);
           scrollTopRef.current = el.scrollTop;
           pinRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+          // The reflow anchor re-anchors only until the reader moves. A reflow
+          // compensator / restore-correction write dispatches the event marked
+          // with its own latch (armed together with the load-restore echo);
+          // every OTHER scroll (wheel, touch, keys, a programmatic jump) means
+          // the reader owns the place again, so retire it.
+          const reflowOwn = reflowOwnScrollRef.current;
+          reflowOwnScrollRef.current = false;
+          if (!reflowOwn) {
+            reflowAnchorRef.current = null;
+          }
+          // A reader who navigates manually while an older page is in flight
+          // OR while its restore is still settling owns the position: release
+          // that click's held anchors immediately so neither the pending
+          // prepend nor a later measurement commit can restore them back to
+          // the click-time row. Classification requires BOTH:
+          //  1. the programmaticScroll TOKEN (a live armOwnScrollEcho record,
+          //     rAF-invalidated after the single coalesced event, stamped with
+          //     the readerInputSeq at write time) — a genuine gesture bumps the
+          //     seq before the event, so a 1-2px wheel is reader input even at
+          //     the echo's pixel position; and
+          //  2. pixel proximity (±2px to the recorded target) — input the
+          //     gesture listener never sees (keyboard scrolling with body
+          //     focus, middle-click autoscroll, engines that do not deliver a
+          //     gutter pointerdown) can coalesce a scroll with a correction
+          //     write's echo; if it lands far from the echo target it is the
+          //     reader, not our math.
+          const echo = restoreEchoRef.current;
+          restoreEchoRef.current = null;
+          const ownEcho =
+            echo !== null &&
+            echo.inputSeq === readerInputSeqRef.current &&
+            Math.abs(el.scrollTop - echo.top) <= 2;
+          if (!ownEcho) {
+            // Genuine reader scroll: re-arm growth anchoring immediately.
+            rearmGrowthHold();
+            const req = loadReqRef.current;
+            if (req && !req.cancelled) {
+              if (!req.done) req.cancelled = true;
+              const held = prependAnchorRef.current;
+              if (held?.reqId === req.reqId) releasePrependAnchor(held);
+              const pending = pendingScroll.current;
+              if (pending?.kind === "restore" && pending.reqId === req.reqId) {
+                pendingScroll.current = null;
+                restoringRef.current = false;
+                setRestoreActiveAttr();
+              }
+              // A finished request's identity is released now; an in-flight
+              // one is finalized by its click's finally.
+              if (req.done && loadReqRef.current === req) loadReqRef.current = null;
+            }
+          }
           sampleReadingAnchor();
           persistSoon();
         }}
@@ -1018,7 +2066,7 @@ function TranscriptInner({
           onClick={() => {
             pinRef.current = true;
             const el = scrollerRef.current;
-            if (el) el.scrollTop = el.scrollHeight;
+            if (el) programmaticScroll(el, el.scrollHeight);
             const last = turnIds[turnIds.length - 1];
             if (last) setActiveTurn(last);
             persistSoon();

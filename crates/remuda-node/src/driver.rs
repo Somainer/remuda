@@ -199,6 +199,17 @@ pub trait Driver: Send + Sync {
     fn startup_error(&self) -> Option<String> {
         None
     }
+    /// Whether the live native child has actually ended.
+    ///
+    /// OA6 (c-cardsettle r7 item 7): a rejected command or a Node-side store
+    /// failure is never itself process-end evidence; the runtime ends an
+    /// instance on those paths ONLY when the driver reports the child gone
+    /// here. Drivers with a native exit observation (print/SDK stdout EOF)
+    /// report that same end through this probe; the default keeps an instance
+    /// alive until that observation reaches the pump.
+    fn process_gone(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { false })
+    }
     /// What this *session* can do, as opposed to what its driver kind can
     /// (D-028 §4.3, §6).
     ///
@@ -248,6 +259,13 @@ pub struct FakeDriver {
     /// without racing a wall-clock delay against scheduler latency.
     start_gate: Option<Arc<Notify>>,
     instance: Option<Instance>,
+    /// c-cardsettle r7 item 7: when set, every non-Close request fails with
+    /// this message — simulating a control/API rejection while the child is
+    /// alive (process_gone stays false).
+    command_error: Option<String>,
+    /// What [`Driver::process_gone`] reports, so a test can place the
+    /// rejection at the exact moment the driver observed the child end.
+    gone: bool,
 }
 
 impl FakeDriver {
@@ -258,6 +276,8 @@ impl FakeDriver {
             panic_prompts: BTreeSet::new(),
             start_gate: None,
             instance: None,
+            command_error: None,
+            gone: false,
         }
     }
 
@@ -272,6 +292,19 @@ impl FakeDriver {
     /// state as an actual event ordering instead of comparing elapsed time.
     pub fn with_start_gate(mut self, gate: Arc<Notify>) -> Self {
         self.start_gate = Some(gate);
+        self
+    }
+
+    /// Make every non-Close command fail with `error` while, by default,
+    /// reporting the child still alive (OA6: rejection ≠ process end).
+    pub fn with_command_error(mut self, error: impl Into<String>) -> Self {
+        self.command_error = Some(error.into());
+        self
+    }
+
+    /// Set what `process_gone` reports.
+    pub fn with_process_gone(mut self, gone: bool) -> Self {
+        self.gone = gone;
         self
     }
 }
@@ -297,9 +330,21 @@ impl Driver for FakeDriver {
         })
     }
 
+    fn process_gone(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let gone = self.gone;
+        Box::pin(async move { gone })
+    }
+
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
         Box::pin(async move {
             tokio::task::yield_now().await;
+            // OA6 r7 item 7: a configured command failure while the fake child
+            // is still alive. Close still succeeds so teardown never errors.
+            if self.command_error.is_some() && !matches!(request, DriverRequest::Close) {
+                return Err(DriverError::Failed(
+                    self.command_error.clone().expect("checked"),
+                ));
+            }
             match request {
                 DriverRequest::Send { prompt, mode, .. } => {
                     assert!(
@@ -591,6 +636,8 @@ impl DriverFactory for FakeDriverFactory {
             panic_prompts: BTreeSet::new(),
             start_gate: None,
             instance: Some(launch.instance),
+            command_error: None,
+            gone: false,
         }))
     }
 }

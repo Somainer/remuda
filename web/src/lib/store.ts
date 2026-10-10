@@ -2976,11 +2976,16 @@ class HubStore {
     const result = await api.instanceCreate(spec);
     const createdId = result.instance.id;
     const kind = spec.kind as EffortKind;
+    // c-effortui r3 item 9: seed BOTH axes. The D-056 create wire carries the
+    // flag as its own boolean; ignoring it left a fresh Start showing the
+    // switch off even though the launch argv was --effort ultracode (the next
+    // slider drag would then post ultracode:false). "ultracode" no longer
+    // exists as a tier name — the migration lives inside effortFromRecord.
     const effort =
       spec.effortName != null
-        ? effortFromRecord(kind, spec.effortName, spec.effortIndex) ??
-          effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX)
-        : effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX);
+        ? effortFromRecord(kind, spec.effortName, spec.effortIndex, spec.effortUltracode === true) ??
+          effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX, spec.effortUltracode === true)
+        : effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX, spec.effortUltracode === true);
     this.emit({
       instances: [result.instance, ...this.state.instances.filter((i) => i.id !== createdId)],
       permissionMode: { ...this.state.permissionMode, [createdId]: spec.permissionMode },

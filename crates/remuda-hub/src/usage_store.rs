@@ -232,17 +232,25 @@ impl SessionStockPoint {
         self.counters == other.counters && self.cost == other.cost
     }
 
-    /// Per-bucket growth/decrease across token buckets and cost. `None`
-    /// incoming imposes no constraint, exactly as for token buckets.
-    fn growth_against(&self, stored: &Self) -> (bool, bool) {
-        let (mut grew, mut decreased) = self.counters.growth_against(&stored.counters);
-        match (self.cost, stored.cost) {
-            (Some(incoming), Some(stored)) if incoming < stored => decreased = true,
-            (Some(incoming), Some(stored)) if incoming > stored => grew = true,
-            (Some(_), None) => grew = true,
-            _ => {}
-        }
-        (grew, decreased)
+    /// Whether a reported TOKEN bucket grew against the stored stock.
+    fn tokens_grew_against(&self, stored: &Self) -> bool {
+        self.counters.growth_against(&stored.counters).0
+    }
+
+    /// A smaller reported COST is a freeze only on a token-LESS point: that is
+    /// the result frame's cumulative cost channel, whose currency is
+    /// monotonic. On a point whose token counters grew, a lower cost is a
+    /// driver-priced estimate reset (an unpriced model turn followed by a
+    /// priced one restarted the running total); freezing it would stall the
+    /// context chip until the running total catches up (c-usagefu r4 item 4).
+    /// The stale cost is dropped on insert instead (see
+    /// [`with_reset_cost_stripped`]).
+    fn cost_decrease_blocks(&self, stored: &Self) -> bool {
+        let cost_went_down = matches!(
+            (self.cost, stored.cost),
+            (Some(incoming), Some(previous)) if incoming < previous
+        );
+        cost_went_down && !self.tokens_grew_against(stored)
     }
 }
 
@@ -257,12 +265,40 @@ fn freezes_against(incoming: &SessionStockPoint, existing: &[SessionStockPoint])
         if incoming.eq_stock(stored) {
             return true;
         }
-        let (_grew, decreased) = incoming.growth_against(stored);
-        if decreased {
+        let (token_grew, token_decreased) = incoming.counters.growth_against(&stored.counters);
+        if token_decreased {
+            return true;
+        }
+        // Cost monotonicity is enforced only for the result channel
+        // (token-less cumulative points); on a token-growing point the cost is
+        // a driver estimate that may reset (r4 item 4).
+        if !token_grew && incoming.cost_decrease_blocks(stored) {
             return true;
         }
     }
     false
+}
+
+/// When a token-growing point carries a lower cost than the stored stock, the
+/// driver's running estimate has reset (unpriced turn → priced turn). Drop
+/// that point's cost rather than persist a smaller cumulative value; its
+/// token counters remain the real content. Token-LESS points keep their cost
+/// (the result channel is monotonic and is frozen on a decrease).
+fn with_reset_cost_stripped(
+    mut row: UsageEventRow,
+    incoming: &SessionStockPoint,
+    floors: &[SessionStockPoint],
+) -> UsageEventRow {
+    let tokens_grew = floors
+        .iter()
+        .any(|stored| incoming.tokens_grew_against(stored));
+    let cost_reset = floors
+        .iter()
+        .any(|stored| matches!((incoming.cost, stored.cost), (Some(new), Some(old)) if new < old));
+    if tokens_grew && cost_reset {
+        row.cost_usd = None;
+    }
+    row
 }
 
 /// Append a new scoped cumulative-session growth point, freezing
@@ -273,8 +309,10 @@ fn freezes_against(incoming: &SessionStockPoint, existing: &[SessionStockPoint])
 /// seq:
 /// - identical counters AND cost already recorded for this session (or for a
 ///   legacy NULL-scope row) -> frozen;
-/// - any reported bucket or the cumulative cost smaller than the current
-///   stock -> frozen;
+/// - any reported TOKEN bucket smaller than the current stock -> frozen;
+/// - a smaller cumulative COST on a token-LESS point (the result channel)
+///   -> frozen; the same lower cost on a token-growing point is a driver
+///   estimate reset: the point appends with its cost dropped (r4 item 4);
 /// - otherwise the point is appended.
 fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let incoming = SessionStockPoint::of(row);
@@ -282,7 +320,8 @@ fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqli
     if freezes_against(&incoming, &floors) {
         return Ok(false);
     }
-    insert_row(conn, row)
+    let row = with_reset_cost_stripped(row.clone(), &incoming, &floors);
+    insert_row(conn, &row)
 }
 
 /// Legacy (pre-`scopeId`) session row: content-ordered against other legacy
@@ -313,7 +352,8 @@ fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqli
     if freezes_against(&incoming, &existing) {
         return Ok(false);
     }
-    insert_row(conn, row)
+    let row = with_reset_cost_stripped(row.clone(), &incoming, &existing);
+    insert_row(conn, &row)
 }
 
 /// Generic append (`INSERT OR IGNORE` on the `(instance_id, seq)` PK).
@@ -1706,6 +1746,75 @@ mod tests {
         );
         let agg = aggregate_instance(&conn, "ins_test").unwrap();
         assert!((agg.cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_token_growing_point_with_a_reset_lower_cost_is_accepted_without_the_stale_cost() {
+        // r4 item 4: priced turn (session stock 0.50, tokens 1000) -> an
+        // UNPRICED model turn emits no cost (sticky None) -> the next PRICED
+        // turn's driver total restarts at 0.02 while tokens grow. The old
+        // check froze this point until the running total passed 0.50, stalling
+        // the chip; it must be accepted with the reset cost dropped.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(insert(
+            &conn,
+            &priced_session_point(1, "s", 1, 1000, Some("0.50"))
+        ));
+        // Point 2: tokens grew, the priced running total restarted lower.
+        let accepted = insert(&conn, &priced_session_point(2, "s", 2, 2000, Some("0.02")));
+        assert!(
+            accepted,
+            "a cost decrease alongside token growth is a driver reset, not a freeze"
+        );
+
+        // The reset cost was NOT persisted (no sub-0.50 cumulative number).
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT cost_usd FROM usage_events
+                 WHERE instance_id='ins_test' AND seq=2 AND scope='session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None, "the stale reset cost is dropped");
+
+        // A later token-LESS result point with a genuine lower cumulative
+        // cost is still frozen (the result channel stays monotonic).
+        assert!(
+            !insert(&conn, &tokenless_session_record(3, "s", 3, Some("0.01"))),
+            "a token-less cost decrease is still a freeze"
+        );
+    }
+
+    /// A session growth point carrying token counters AND a reported cost.
+    fn priced_session_point(
+        seq: i64,
+        scope_id: &str,
+        revision: i64,
+        input: i64,
+        cost: Option<&str>,
+    ) -> JournalRecord {
+        let mut rec = scoped_record(
+            seq,
+            "ins_test",
+            "session",
+            Some(scope_id),
+            revision,
+            input,
+            0,
+            0,
+            0,
+            None,
+        );
+        rec.event["payload"]["cost"] = match cost {
+            Some(amount) => json!({
+                "state": "known",
+                "value": { "amount": amount, "currency": "USD" }
+            }),
+            None => json!({ "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] }),
+        };
+        rec
     }
 
     /// A result-frame session point: no token buckets (the SDK result omits

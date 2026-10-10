@@ -173,7 +173,12 @@ pub struct UsageTotals {
     pub reasoning_tokens: u64,
     /// Sum of table estimates; `None` when **any** call could not be priced
     /// (unknown model), so the figure is never presented as a complete bill.
+    /// The initial `None` (no calls yet) is distinguished from a poisoned
+    /// `None` by [`Self::cost_unpriceable`].
     cost_usd: Option<f64>,
+    /// True once a folded call could not be priced: the estimate is
+    /// permanently Unknown for this fold.
+    cost_unpriceable: bool,
 }
 
 impl UsageTotals {
@@ -185,12 +190,23 @@ impl UsageTotals {
         self.tokens.cache_write_5m += event.tokens.cache_write_5m;
         self.tokens.cache_write_1h += event.tokens.cache_write_1h;
         self.reasoning_tokens += event.reasoning_tokens.unwrap_or(0);
-        self.cost_usd = match (self.cost_usd, event.cost_usd) {
-            (Some(total), Some(cost)) => Some(total + cost),
-            (None, Some(cost)) => Some(cost),
-            // An unpriced event makes the whole total unpriceable.
-            (_, None) => None,
-        };
+        // Once ANY folded call is unpriced, the cumulative estimate is
+        // permanently Unknown — it must never revive. A revival restarts the
+        // running sum at the later call's price, so the emitted cumulative
+        // Session cost can shrink below the previous point and the Hub freezes
+        // it until the running total catches up, stalling the context chip
+        // (c-usagefu r4 item 4). Token counters are unaffected by price-table
+        // coverage and keep summing above.
+        match event.cost_usd {
+            Some(cost) if !self.cost_unpriceable => {
+                self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+            }
+            Some(_) => {}
+            None => {
+                self.cost_unpriceable = true;
+                self.cost_usd = None;
+            }
+        }
     }
 
     /// Estimated USD, only when every folded event had a table price.
@@ -464,6 +480,52 @@ mod tests {
         assert_eq!(agg.session().tokens.uncached_input, 300);
         assert_eq!(agg.session().events, 2);
         assert!(agg.session().cost_usd().is_some());
+    }
+
+    #[test]
+    fn a_later_priced_call_never_revives_the_unknown_session_cost() {
+        // r4 item 4: priced, unpriced, then priced again. The old fold reset
+        // the running sum on the unpriced call and restarted it on the next
+        // priced one, emitting a cumulative Session cost that could shrink and
+        // stall the Hub freeze check. Unknown is sticky; tokens keep summing.
+        let mut totals = UsageTotals::default();
+        let tokens = |n| TokenCounters {
+            uncached_input: n,
+            ..TokenCounters::default()
+        };
+        totals.add(&event(
+            UsageSource::ClaudeTranscript,
+            Some("t1"),
+            Some("m1"),
+            Some("claude-sonnet-5"),
+            tokens(100),
+        ));
+        assert!(totals.cost_usd().is_some(), "first priced call estimates");
+        totals.add(&event(
+            UsageSource::ClaudeTranscript,
+            Some("t2"),
+            Some("m2"),
+            Some("some-internal-model"),
+            tokens(100),
+        ));
+        assert_eq!(
+            totals.cost_usd(),
+            None,
+            "the unpriced turn poisons the bill"
+        );
+        totals.add(&event(
+            UsageSource::ClaudeTranscript,
+            Some("t3"),
+            Some("m3"),
+            Some("claude-sonnet-5"),
+            tokens(100),
+        ));
+        assert_eq!(
+            totals.cost_usd(),
+            None,
+            "a later priced call never revives the cumulative estimate"
+        );
+        assert_eq!(totals.tokens.uncached_input, 300, "tokens are unaffected");
     }
 
     #[test]

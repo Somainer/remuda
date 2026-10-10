@@ -2889,6 +2889,37 @@ describe("load-earlier anchor lifecycle round 5", () => {
       });
     });
 
+    // UO-6a round 8 item 4: the gesture listener re-samples the reading anchor
+    // only while a restore/hold is armed. A plain wheel (no load-earlier in
+    // flight, no hold) that scrolls the model but dispatches no scroll event
+    // must leave the ordinary onScroll sample alone.
+    describe("round 8 item 4: gesture samples the anchor only while armed", () => {
+      it("an unarmed wheel with no scroll event keeps the onScroll sample", async () => {
+        const geo = installGeo(50, { echoOnWrite: true });
+        const events: Observation[] = [];
+        for (let i = 0; i < 50; i += 1) events.push(m(1001 + i, i % 2 === 0 ? "user" : "assistant", "insGateSample"));
+        render(
+          <MemoryRouter initialEntries={["/s/insGateSample"]}>
+            <Routes>
+              <Route path="/s/:instanceId" element={<Transcript events={events} compact />} />
+            </Routes>
+          </MemoryRouter>,
+        );
+        geo.defineScroll();
+        const anchorId = () => geo.scroller().getAttribute("data-reading-anchor");
+        // An ordinary scroll samples the topmost row at 25*ROW.
+        geo.scrollTo(25 * ROW);
+        await act(async () => {});
+        const sampled = anchorId();
+        expect(sampled).toBeTruthy();
+        // No load-earlier / restore / hold is armed. A wheel moves the model
+        // one row but fires NO scroll event: it must not re-sample (that would
+        // pick the next row); the onScroll sample stays.
+        geo.wheel(ROW);
+        expect(anchorId(), "an unarmed wheel re-sampled the anchor without a scroll event").toBe(sampled);
+      });
+    });
+
     // UO-6a round 8 item 3: after a load-earlier cancel switches growth
     // anchoring off, it must come back on the NEXT genuine gesture even when
     // the gesture dispatches no usable scroll event (tiny wheel, scrollbar

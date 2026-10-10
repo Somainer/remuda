@@ -483,6 +483,12 @@ function TranscriptInner({
     const el = scrollerRef.current;
     if (el) el.setAttribute("data-growth-hold", growthHoldSuppressedRef.current ? "0" : "1");
   };
+  // Inert observability for the sampled reading anchor id (so the gesture
+  // gating in r8 item 4 is testable without a scroll event).
+  const setReadingAnchorAttr = () => {
+    const el = scrollerRef.current;
+    if (el) el.setAttribute("data-reading-anchor", readingAnchorRef.current?.id ?? "");
+  };
   // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
   // click on a held transcript row posts exactly once.
   const steeringRef = useRef<Set<string>>(new Set());
@@ -748,6 +754,13 @@ function TranscriptInner({
       // (even coalesced within the restore write's echo window) is reader
       // input, not the restore's echo.
       readerInputSeqRef.current += 1;
+      // Whether a load-earlier/saved restore or a prepend hold is engaged when
+      // the gesture fires. The anchor re-sample below is needed only then
+      // (cancelLoadRestore nulls the pre-restore anchor); with nothing armed a
+      // gesture that dispatches no scroll event must leave the anchor the
+      // ordinary onScroll sample owns alone.
+      const restoreOrHoldArmed =
+        restoringRef.current || prependAnchorRef.current !== null || loadReqRef.current !== null;
       // Any genuine input also retires the reflow anchor a restore left
       // armed: it is allowed to live only until the reader moves. Clearing
       // here (not only in onScroll) covers a gesture whose scroll is clamped
@@ -761,9 +774,10 @@ function TranscriptInner({
       // an input that already happened.
       rearmGrowthHoldRef.current();
       // Re-sample the reader anchor at the current position so subsequent
-      // growth holds the post-gesture row (cancelLoadRestore nulls the stale
-      // pre-restore anchor; a tiny wheel scrolls ~0 so onScroll won't run).
-      sampleAnchorOnGestureRef.current();
+      // growth holds the post-gesture row — but ONLY while a restore/hold was
+      // armed (a tiny wheel scrolls ~0, so onScroll won't re-sample it). With
+      // nothing armed, the existing onScroll sample is left untouched.
+      if (restoreOrHoldArmed) sampleAnchorOnGestureRef.current();
     };
     const onWheel = (event: WheelEvent) => {
       if (event.deltaY !== 0 || event.deltaX !== 0) gesture();
@@ -1060,9 +1074,11 @@ function TranscriptInner({
       const box = row.getBoundingClientRect();
       if (box.bottom > top && box.top < bottom) {
         readingAnchorRef.current = { id: row.dataset.anchor ?? "", offset: box.top - top, top: el.scrollTop };
+        setReadingAnchorAttr();
         return;
       }
     }
+    setReadingAnchorAttr();
   }, []);
   useEffect(() => {
     sampleAnchorOnGestureRef.current = sampleReadingAnchor;
@@ -1892,6 +1908,8 @@ function TranscriptInner({
         // load-earlier cancel temporarily suppresses it (re-armed by a genuine
         // gesture or the bounded timer). Imperatively mirrored as well.
         data-growth-hold={growthHoldSuppressedRef.current ? "0" : "1"}
+        // Inert: the id of the row the growth/reading hold is sampled onto.
+        data-reading-anchor={readingAnchorRef.current?.id ?? ""}
         onScroll={(event) => {
           const el = event.currentTarget;
           setScrollTop(el.scrollTop);

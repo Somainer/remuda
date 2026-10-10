@@ -519,7 +519,9 @@ pub async fn get_instance(
 
 #[derive(Deserialize)]
 pub struct DeleteInstanceQuery {
-    /// `force=1` stops a live Instance first instead of refusing.
+    /// `force=1` stops the addressed live chapter before deleting it. It does
+    /// not stop OTHER chapters of the same lineage — those still refuse with
+    /// 409.
     #[serde(default)]
     force: Option<u8>,
 }
@@ -528,10 +530,15 @@ pub struct DeleteInstanceQuery {
 ///
 /// Human and Bot devices only (the agent-route middleware already refuses
 /// agents, and `require_operator` refuses them again at the handler).
-/// A live Instance is refused with `409` unless `?force=1`, which stops it and
-/// settles it as `exited` before removal. Deleting an Instance that is already
-/// gone returns `404`, so a repeated `DELETE` is idempotent rather than an
-/// error the UI has to special-case.
+/// A live addressed instance is refused with `409` unless `?force=1`, which
+/// stops it and settles it as `exited` before removal. `force` stops ONLY the
+/// addressed chapter: when another chapter of the same lineage is still live
+/// the request returns `409` with "chapter(s) still live: …" whether or not
+/// force was set (r8 item 3). The Hub rows are deleted before the best-effort
+/// Node purge calls, so a continuation that advanced the lineage between the
+/// plan and the delete gets a clean 409 with no purge side effects (r8 item 2).
+/// Deleting an Instance that is already gone returns `404`, so a repeated
+/// `DELETE` is idempotent rather than an error the UI has to special-case.
 ///
 /// Removal covers the Hub's own record — journal, commands, interactions,
 /// fleet membership — and asks the owning Node to purge its per-instance data
@@ -587,17 +594,22 @@ pub async fn delete_instance(
             .filter(|chapter| chapter.instance_id != instance_id)
             .map(|chapter| format!("{} ({})", chapter.instance_id, chapter.lifecycle))
             .collect();
-        if !force {
-            return Err(HubError::Conflict(format!(
-                "instance is {}; stop it first or retry with ?force=1",
-                instance.lifecycle
-            )));
-        }
         if !offenders.is_empty() {
+            // r8 item 3: this also covers the case where the ADDRESSED chapter
+            // itself is already terminal — telling the caller "stop it first
+            // or use force" and then refusing force was a dead end. Force
+            // cannot stop a chapter the request does not address, so the
+            // refusal is the same with or without it.
             return Err(HubError::Conflict(format!(
                 "refusing to delete the lineage: chapter(s) still live: {}; \
                  ?force=1 only stops the addressed chapter — stop every chapter first",
                 offenders.join(", ")
+            )));
+        }
+        if !force {
+            return Err(HubError::Conflict(format!(
+                "instance is {}; stop it first or retry with ?force=1",
+                instance.lifecycle
             )));
         }
         stop_before_delete(&state, &instance).await?;

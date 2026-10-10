@@ -3980,3 +3980,58 @@ async fn resume_during_the_purge_loop_finds_the_lineage_already_gone() -> Result
     );
     Ok(())
 }
+
+/// r8 item 3: the addressed chapter is already terminal while ANOTHER chapter
+/// of the lineage is still live. The refusal names the live chapters and is
+/// the same with or without force — the old "stop it first or retry with
+/// ?force=1" message led to a force request that 409ed anyway.
+#[tokio::test]
+async fn deleting_a_terminal_current_chapter_with_a_live_predecessor_names_the_live_chapters()
+-> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // X stays LIVE.
+    ctx.report_session(&node, &x, false).await?;
+    // Continue X → Y while X is still running.
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    // Y (the addressed, current chapter) becomes terminal; X stays live.
+    ctx.report_session(&node, &y, true).await?;
+
+    for force in ["", "?force=1"] {
+        let response = ctx
+            .http
+            .delete(format!("{}/v1/instances/{y}{force}", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 409, "force={force:?} still refuses");
+        let text = response.text().await?;
+        assert!(
+            text.contains("chapter(s) still live") && text.contains(&x),
+            "the refusal names the live predecessor, got: {text}"
+        );
+        assert!(
+            !text.contains("stop it first"),
+            "a terminal addressed chapter must not be told to stop itself: {text}"
+        );
+    }
+    assert!(
+        node.has_no_pending_frames().await,
+        "the refusal runs no stop/return/purge side effects"
+    );
+    // Both rows survive.
+    assert!(ctx.get_instance(&x, &ctx.human).await?.is_object());
+    assert!(ctx.get_instance(&y, &ctx.human).await?.is_object());
+    Ok(())
+}

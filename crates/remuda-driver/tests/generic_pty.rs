@@ -638,6 +638,11 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
     // r2 item 1: the launch must not pin GROK_HOME (or CODEX_HOME) at the
     // empty per-instance native home — that would put the harness at a login
     // screen and lose the operator's provider config.
+    //
+    // r3 item 4: the allowlist assertion alone passed against the REVERTED
+    // code — the old pin rode the pane env map sent in workspace.create /
+    // pane.split, not recipe().env_allowlist. The fake herdr traces the env
+    // it received; assert there on BOTH calls.
     assert!(
         handle
             .recipe()
@@ -652,6 +657,35 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
         real_home_str,
         "the per-instance native home is not the operator's real home"
     );
+    let trace = fs::read_to_string(socket.with_extension("trace.jsonl"))
+        .expect("fake herdr traces the pane env it receives");
+    let traced: Vec<serde_json::Value> = trace
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("trace line is JSON"))
+        .collect();
+    let methods: Vec<&str> = traced
+        .iter()
+        .map(|row| row["method"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        methods,
+        vec!["workspace.create", "pane.split"],
+        "both pane-creating RPCs are traced"
+    );
+    for row in &traced {
+        let env = row["env"]
+            .as_object()
+            .expect("the pane env map is recorded on the trace");
+        for pinned in ["GROK_HOME", "CODEX_HOME"] {
+            assert!(
+                !env.contains_key(pinned),
+                "{} env must not pin {} at the empty native home: {env:?}",
+                row["method"].as_str().unwrap_or("rpc"),
+                pinned
+            );
+        }
+    }
 
     // The file adapter polls every 250 ms; a Usage observation from the
     // seeded updates.jsonl must arrive on the same channel as the pane's own

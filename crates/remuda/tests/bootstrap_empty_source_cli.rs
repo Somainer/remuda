@@ -6,12 +6,33 @@
 //! binary; a watchdog kills a hub that wrongly starts serving and fails the
 //! test.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_remuda")
+}
+
+/// Hermetic environment: remove EVERY REMUDA_* the calling shell exported so
+/// the spawned hub can never serve against an ambient data dir or pick up an
+/// ambient bootstrap source (c-bootstrap-dev r8 item 4). Callers then add back
+/// exactly the vars the case needs.
+fn strip_remuda_env(cmd: &mut Command) -> &mut Command {
+    let keys: Vec<OsString> = std::env::vars_os()
+        .filter_map(|(k, _)| {
+            if k.to_string_lossy().starts_with("REMUDA_") {
+                Some(k)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for k in keys {
+        cmd.env_remove(k);
+    }
+    cmd
 }
 
 /// Spawn the hub and wait up to 15 s for it to EXIT. A hub that incorrectly
@@ -45,8 +66,8 @@ fn assert_refused(output: std::process::Output, data_dir: &Path, label: &str) {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("empty"),
-        "{label}: stderr says why: {stderr}"
+        stderr.contains("resolved to an empty value"),
+        "{label}: stderr names the empty resolved value, not just the test file name: {stderr}"
     );
     assert!(
         !data_dir.join("bootstrap-token").exists(),
@@ -63,11 +84,12 @@ fn assert_refused(output: std::process::Output, data_dir: &Path, label: &str) {
 #[test]
 fn empty_bootstrap_env_refuses_to_start() {
     let dir = tempfile::tempdir().expect("data tempdir");
-    let child = Command::new(bin())
+    let mut cmd = Command::new(bin());
+    strip_remuda_env(&mut cmd);
+    let child = cmd
         .args(["hub", "--listen", "127.0.0.1:0"])
         .env("REMUDA_DATA_DIR", dir.path())
         .env("REMUDA_BOOTSTRAP_TOKEN", "")
-        .env_remove("REMUDA_WEB_PASSWORD_FILE")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -94,7 +116,9 @@ fn empty_bootstrap_file_refuses_to_start() {
     )
     .expect("write hub.toml");
 
-    let child = Command::new(bin())
+    let mut cmd = Command::new(bin());
+    strip_remuda_env(&mut cmd);
+    let child = cmd
         .args(["hub", "--listen", "127.0.0.1:0"])
         .env("REMUDA_CONFIG", &config)
         .stdout(Stdio::piped())

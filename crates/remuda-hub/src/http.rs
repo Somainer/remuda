@@ -669,33 +669,6 @@ pub async fn delete_instance(
     if !deleted {
         return Err(HubError::NotFound);
     }
-    // The audit row outlives the journal it describes; append it only once
-    // the delete committed, so a re-check 409 (a continuation advanced the
-    // lineage between plan and delete) leaves no false "deleted" record.
-    // ma-lineage r7 item 2: it records EVERY deleted chapter.
-    state
-        .store
-        .append_audit(
-            device.id.clone(),
-            "instance.delete".into(),
-            Some(instance_id.clone()),
-            json!({
-                "hostId": instance.host_id,
-                "lifecycle": instance.lifecycle,
-                "forced": force,
-                "lineageId": instance.lineage_id,
-                "chapters": chapter_details,
-            }),
-        )
-        .await
-        .map_err(|error| {
-            // r9 item 1: the lineage is already deleted. A 500 here would
-            // make a retry get 404 and skip the purges below, orphaning the
-            // Nodes' data directories forever; log and finish the
-            // best-effort work, returning 200.
-            tracing::error!(%error, instance_id = %instance_id, "delete audit failed after the lineage was removed")
-        })
-        .ok();
 
     // t-pool: a deleted session must not leave its worktree lease pinned.
     // Key on the instance's task (not the attach-lock holder, which is only
@@ -856,6 +829,36 @@ pub async fn delete_instance(
         .and_then(Value::as_str)
         .unwrap_or("purged")
         .to_string();
+
+    // The audit row outlives the journal it describes. Append it AFTER the
+    // purge loop (and only once the delete committed, so a re-check 409
+    // leaves no false "deleted" record) so it carries the real per-chapter
+    // purge outcomes: `nodePurge` for the addressed chapter and, per r7
+    // item 2 / r9 item 2, `chapterPurges` naming EVERY chapter — this is
+    // the durable record of which Nodes' data was not purged
+    // ("node-offline" is reconciled on reconnect; "purge-failed" needs
+    // manual attention). A failure here is logged, never a 500 (r9 item 1).
+    state
+        .store
+        .append_audit(
+            device.id.clone(),
+            "instance.delete".into(),
+            Some(instance_id.clone()),
+            json!({
+                "hostId": instance.host_id,
+                "lifecycle": instance.lifecycle,
+                "forced": force,
+                "lineageId": instance.lineage_id,
+                "chapters": chapter_details,
+                "nodePurge": purge,
+                "chapterPurges": Value::Object(purge_outcomes.clone()),
+            }),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, instance_id = %instance_id, "delete audit failed after the lineage was removed")
+        })
+        .ok();
 
     tracing::info!(
         %instance_id,

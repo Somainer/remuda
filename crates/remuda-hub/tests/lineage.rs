@@ -3967,7 +3967,9 @@ async fn resume_during_the_purge_loop_finds_the_lineage_already_gone() -> Result
         .context("second purge frame")?;
     assert_eq!(method, "instance.purge");
 
-    // One audit row, recorded for the successful delete only.
+    // One audit row, recorded for the successful delete only — and r9 item
+    // 2: it is appended AFTER the purge loop with nodePurge and
+    // chapterPurges naming the gated chapter's outcome.
     let db = rusqlite::Connection::open(&ctx.db_path)?;
     let audits: i64 = db.query_row(
         "SELECT COUNT(*) FROM audit_log WHERE action = 'instance.delete'",
@@ -3978,6 +3980,31 @@ async fn resume_during_the_purge_loop_finds_the_lineage_already_gone() -> Result
         audits, 1,
         "exactly one delete audit: no refused-attempt row"
     );
+    let detail: String = db.query_row(
+        "SELECT detail_json FROM audit_log WHERE action = 'instance.delete'",
+        [],
+        |row| row.get(0),
+    )?;
+    let detail: Value = serde_json::from_str(&detail)?;
+    assert!(
+        detail["nodePurge"].is_string(),
+        "the audit carries the addressed chapter's nodePurge: {detail}"
+    );
+    let purges = detail["chapterPurges"]
+        .as_object()
+        .expect("chapterPurges object on the audit row");
+    assert_eq!(
+        purges.len(),
+        2,
+        "every chapter's purge outcome is audited: {detail}"
+    );
+    for id in [x.as_str(), y.as_str()] {
+        let outcome = purges.get(id).and_then(Value::as_str).unwrap_or("missing");
+        assert_eq!(
+            outcome, "purged",
+            "the gated chapter {id} finished its purge and that outcome is audited, got {outcome}"
+        );
+    }
     Ok(())
 }
 

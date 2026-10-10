@@ -15,9 +15,10 @@ use serde_json::{Value, json};
 /// actually executes fails fast at the first `git fetch` with status
 /// `failed`; a tombstoned run must instead return `canceled` before any
 /// process is spawned.
-fn run_params(job_id: &str, lane_id: &str, repo: &std::path::Path) -> Value {
+fn run_params(job_id: &str, lane_id: &str, repo: &std::path::Path, generation: u32) -> Value {
     json!({
         "jobId": job_id,
+        "generation": generation,
         "laneId": lane_id,
         "repoPath": repo,
         "targetDir": repo.join("target"),
@@ -53,13 +54,19 @@ async fn gate_run_is_refused_canceled_when_its_cancel_was_acked_first() {
     // The exact ordering the race produces: gate.cancel is processed while
     // no run is registered (dispatch is still between the claim commit and
     // the gate.run send), acked, and only then does gate.run arrive.
-    let cancel = gate_rpc(&node, "gate.cancel", json!({ "jobId": job_id })).await;
+    let cancel = gate_rpc(
+        &node,
+        "gate.cancel",
+        json!({ "jobId": job_id, "generation": 1 }),
+    )
+    .await;
     assert_eq!(cancel["ok"], json!(true), "{cancel}");
+    assert_eq!(cancel["generation"], json!(1), "{cancel}");
 
     let result = gate_rpc(
         &node,
         "gate.run",
-        run_params(job_id, "lane-cancel-first", &repo),
+        run_params(job_id, "lane-cancel-first", &repo, 1),
     )
     .await;
     assert_eq!(
@@ -76,7 +83,12 @@ async fn the_cancel_tombstone_does_not_touch_other_jobs() {
     let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
     let repo = dir.path().join("never-checked-out");
 
-    gate_rpc(&node, "gate.cancel", json!({ "jobId": "gjb_tombstone_a" })).await;
+    gate_rpc(
+        &node,
+        "gate.cancel",
+        json!({ "jobId": "gjb_tombstone_a", "generation": 1 }),
+    )
+    .await;
 
     // A different job on the same lane runs for real: with no checkout the
     // first git fetch fails, so the verdict is a run failure — anything but
@@ -84,7 +96,7 @@ async fn the_cancel_tombstone_does_not_touch_other_jobs() {
     let other = gate_rpc(
         &node,
         "gate.run",
-        run_params("gjb_other_job", "lane-shared", &repo),
+        run_params("gjb_other_job", "lane-shared", &repo, 1),
     )
     .await;
     assert_ne!(
@@ -101,26 +113,88 @@ async fn the_tombstone_is_consumed_by_the_first_run() {
     let repo = dir.path().join("never-checked-out");
     let job_id = "gjb_tombstone_consumed";
 
-    gate_rpc(&node, "gate.cancel", json!({ "jobId": job_id })).await;
+    gate_rpc(
+        &node,
+        "gate.cancel",
+        json!({ "jobId": job_id, "generation": 1 }),
+    )
+    .await;
     let first = gate_rpc(
         &node,
         "gate.run",
-        run_params(job_id, "lane-consumed", &repo),
+        run_params(job_id, "lane-consumed", &repo, 1),
     )
     .await;
     assert_eq!(first["status"], json!("canceled"), "{first}");
 
-    // One-shot: a later same-jobId run (a fresh Hub dispatch) is no longer
-    // suppressed — it executes and fails on the missing checkout instead.
+    // A strictly NEWER generation (a requeued job re-dispatched) supersedes
+    // the cancel: it is no longer suppressed and executes — it fails on the
+    // missing checkout instead of answering canceled.
     let second = gate_rpc(
         &node,
         "gate.run",
-        run_params(job_id, "lane-consumed", &repo),
+        run_params(job_id, "lane-consumed", &repo, 2),
     )
     .await;
     assert_ne!(
         second["status"],
         json!("canceled"),
-        "the tombstone must not survive the run it was racing with: {second}"
+        "a higher-generation dispatch must supersede the cancel: {second}"
+    );
+    // The superseding run cleared the record.
+    assert_eq!(
+        node.gate_test_canceled_generation(job_id).await,
+        None,
+        "the newer generation must clear the canceled record"
+    );
+}
+
+/// Elapsed time must not authorize an old dispatch: a generation-1 run that
+/// arrives long after the cancel (well beyond the removed 60 s TTL — the
+/// clock is warped, not slept) is still refused, an older generation is
+/// refused too, and only a strictly newer generation runs.
+#[tokio::test]
+async fn a_delayed_old_generation_is_refused_however_late_it_arrives() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    let repo = dir.path().join("never-checked-out-late");
+    let job_id = "gjb_tombstone_late";
+
+    node.gate_test_warp_clock(std::time::Duration::from_secs(60 * 60));
+    gate_rpc(
+        &node,
+        "gate.cancel",
+        json!({ "jobId": job_id, "generation": 1 }),
+    )
+    .await;
+    // Warp AGAIN between cancel and run: total elapsed far past any old TTL.
+    node.gate_test_warp_clock(std::time::Duration::from_secs(60 * 60));
+    assert_eq!(
+        node.gate_test_canceled_generation(job_id).await,
+        Some(1),
+        "the record must survive arbitrary elapsed time"
+    );
+
+    // An older generation and the canceled generation itself are refused.
+    for generation in [0u32, 1] {
+        let result = gate_rpc(
+            &node,
+            "gate.run",
+            run_params(job_id, "lane-late", &repo, generation),
+        )
+        .await;
+        assert_eq!(
+            result["status"],
+            json!("canceled"),
+            "generation {generation} must be refused after 2 h: {result}"
+        );
+    }
+
+    // The strictly newer generation runs (and fails on the missing repo).
+    let fresh = gate_rpc(&node, "gate.run", run_params(job_id, "lane-late", &repo, 2)).await;
+    assert_ne!(
+        fresh["status"],
+        json!("canceled"),
+        "only a newer generation may run: {fresh}"
     );
 }

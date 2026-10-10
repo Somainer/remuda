@@ -382,7 +382,14 @@ async fn cancel_project_job(
                 // no initiator — the Node admits it as a continuation, and the
                 // Hub-side authority of the cancel itself was checked in the
                 // writer above.
-                let params = json!({ "jobId": updated.id.as_id().as_str(), "laneId": lane });
+                let params = json!({
+                    "jobId": updated.id.as_id().as_str(),
+                    "laneId": lane,
+                    // The dispatch generation being canceled: the Node
+                    // refuses a same/older generation gate.run even if that
+                    // frame is delayed past the Hub's grace settlement.
+                    "generation": updated.attempts,
+                });
                 // Best effort: the running tick also fails the job if the
                 // Node is gone.
                 if let Ok(Some(_)) = state
@@ -768,6 +775,11 @@ async fn dispatch(
         // §7.5: gate.run carries the admission record's initiator; the jobId
         // is the opId. Node-side refusal arrives with ma-fence.
         initiator: job.initiator.clone(),
+        // Dispatch generation: the attempt ordinal the claim writer stamped.
+        // The Node refuses this exact dispatch if a gate.cancel for the same
+        // generation is acked before it registers, however delayed the frame
+        // is (elapsed time never authorizes the old dispatch).
+        generation: job.attempts,
     };
     journal(state, &job.requested_by, "gate.running", &job).await;
     let state = state.clone();

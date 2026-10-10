@@ -478,6 +478,13 @@ pub struct GateRunParams {
     /// the opId is the `jobId`. Absent for Human/Bot jobs and older Hubs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiator: Option<crate::Initiator>,
+    /// Dispatch generation: the job's attempt ordinal at claim. The Node
+    /// records it when `gate.cancel` is acked and refuses a run whose
+    /// generation is at or below a canceled generation for the same job —
+    /// however delayed that run frame is. Elapsed time never authorizes a
+    /// stale dispatch; only a strictly newer generation supersedes a cancel.
+    #[serde(default)]
+    pub generation: u32,
 }
 
 fn default_base_branch() -> String {
@@ -532,6 +539,12 @@ pub struct GateRunResult {
 pub struct GateCancelParams {
     /// Job to cancel.
     pub job_id: String,
+    /// Dispatch generation (the job's attempt ordinal) being canceled. A
+    /// `gate.run` whose generation is at or below this is refused even if
+    /// its frame is delayed past any delivery window; only a strictly
+    /// newer generation for the same job is allowed to run.
+    #[serde(default)]
+    pub generation: u32,
 }
 
 /// `gate.then` params: post-land command on the project's home host.

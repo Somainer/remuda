@@ -512,48 +512,105 @@ fn current_step(trace: &Arc<std::sync::Mutex<RunTrace>>) -> Option<String> {
         .clone()
 }
 
-/// How long a cancel-before-registration tombstone lingers. It only has to
-/// outlive the gap between the Hub's `gate.cancel` ack and the `gate.run`
-/// frame already serialized behind it on the carrier (Hub dispatch is
-/// between the claim commit and the send), but this is generous under load.
-/// A same-jobId run after the TTL is a fresh Hub dispatch that legitimately
-/// runs; the tombstone is also consumed on first hit.
-const CANCEL_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+/// Hard cap on remembered canceled dispatches. This is a MEMORY bound, not
+/// an authorization window: a record never expires on its own, so elapsed
+/// time can never authorize a stale dispatch. 4096 gate jobs is far above
+/// any number one Node process could have outstanding; if a process ever
+/// saw that many canceled jobs the oldest record is evicted (its row on the
+/// Hub is terminal anyway, and the Hub's terminal-state guard plus the
+/// land's force-with-lease CAS remain the backstops).
+const MAX_CANCELED_RECORDS: usize = 4096;
 
-/// Live runs and the short-lived cancel tombstones, behind ONE lock: the
-/// "is this job running?" check in `gate.cancel` and the "may this run
-/// register?" check in `gate.run` must be one atomic decision. Otherwise a
-/// cancel can land strictly between the run's lane-slot acquisition and its
+/// One generation recorded as canceled for a job.
+#[derive(Clone, Copy)]
+struct CanceledDispatch {
+    /// Highest canceled dispatch generation for the job.
+    generation: u32,
+    /// When the cancel was recorded; used ONLY to pick a victim under the
+    /// hard job-count cap, never to decide whether a run is stale.
+    recorded_at: Instant,
+}
+
+/// Live runs and canceled-dispatch records, behind ONE lock: the "is this
+/// job canceled for this generation?" check in `gate.cancel`/`gate.run` and
+/// the "may this run register?" decision must be atomic. Otherwise a cancel
+/// can land strictly between the run's lane-slot acquisition and its
 /// registration and be answered `ok:true` while the run still executes.
 pub(crate) struct GateRunTable {
     /// jobId -> live run handle.
     runs: BTreeMap<String, Arc<LiveRun>>,
-    /// jobId -> instant its `gate.cancel` was acked while no run was
-    /// registered. The matching `gate.run` answers `canceled` without
-    /// executing.
-    tombstones: BTreeMap<String, Instant>,
+    /// jobId -> the highest dispatch generation recorded canceled. A run at
+    /// the same or an older generation refuses however late its frame
+    /// arrives; a strictly newer generation supersedes (and clears) the
+    /// record. Keyed by job count, not age.
+    canceled: BTreeMap<String, CanceledDispatch>,
 }
 
 impl GateRunTable {
     fn new() -> Self {
         Self {
             runs: BTreeMap::new(),
-            tombstones: BTreeMap::new(),
+            canceled: BTreeMap::new(),
         }
     }
 
-    /// Drop tombstones older than [`CANCEL_TOMBSTONE_TTL`].
-    fn prune_tombstones(&mut self, now: Instant) {
-        self.tombstones
-            .retain(|_, at| now.duration_since(*at) < CANCEL_TOMBSTONE_TTL);
+    /// Record `generation` as canceled for `job`. Supersedes an older
+    /// generation; keeps the highest. Enforces the job-count memory cap.
+    fn record_cancel(&mut self, job_id: &str, generation: u32, now: Instant) {
+        let supersede = self
+            .canceled
+            .get(job_id)
+            .map_or(generation, |existing| existing.generation.max(generation));
+        self.canceled.insert(
+            job_id.to_owned(),
+            CanceledDispatch {
+                generation: supersede,
+                recorded_at: now,
+            },
+        );
+        if self.canceled.len() > MAX_CANCELED_RECORDS {
+            // Evict the single oldest recorded job. Scan (rare: only once the
+            // process has seen >4096 canceled gate jobs).
+            if let Some(oldest) = self
+                .canceled
+                .iter()
+                .min_by_key(|(_, record)| record.recorded_at)
+                .map(|(job_id, _)| job_id.clone())
+            {
+                self.canceled.remove(&oldest);
+            }
+        }
+    }
+
+    /// True when `run_generation` is at or below the canceled generation for
+    /// this job — i.e. the dispatch the cancel covered, however delayed.
+    fn is_canceled_generation(&self, job_id: &str, run_generation: u32) -> bool {
+        self.canceled
+            .get(job_id)
+            .is_some_and(|record| run_generation <= record.generation)
+    }
+
+    /// A strictly newer generation supersedes the cancel: drop its record so
+    /// a re-dispatch of the requeued job runs. Returns true when present.
+    fn clear_if_superseded(&mut self, job_id: &str, run_generation: u32) -> bool {
+        if self
+            .canceled
+            .get(job_id)
+            .is_some_and(|record| run_generation > record.generation)
+        {
+            self.canceled.remove(job_id);
+            true
+        } else {
+            false
+        }
     }
 }
 
-/// Build the verdict for a `gate.run` whose `gate.cancel` was acked before
-/// the run could register, and publish its terminal `finished` event so the
-/// Hub converges even if this RPC reply is lost (the same dual verdict a
+/// Build the verdict for a `gate.run` whose generation is at or below the
+/// canceled generation, and publish its terminal `finished` event so the Hub
+/// converges even if this RPC reply is lost (the same dual verdict a
 /// finished run carries).
-fn canceled_before_run(registry: &GateRegistry, job_id: &str) -> GateRunResult {
+fn canceled_before_run(registry: &GateRegistry, job_id: &str, _generation: u32) -> GateRunResult {
     let why = "canceled before the run registered";
     let result = GateRunResult {
         job_id: job_id.to_owned(),
@@ -575,8 +632,13 @@ fn canceled_before_run(registry: &GateRegistry, job_id: &str) -> GateRunResult {
 pub(crate) struct GateRegistry {
     /// laneId → one slot; a held slot rejects a second run (`lane-busy`).
     lanes: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
-    /// Live runs plus cancel-before-registration tombstones (one lock).
+    /// Live runs plus canceled-dispatch records (one lock).
     runs: Mutex<GateRunTable>,
+    /// Test-only clock warp added to every `Instant::now()` read used for
+    /// record timestamps. Authz never reads time, so this only proves that a
+    /// record stays authoritative however much wall time has passed.
+    #[cfg(any(test, feature = "test-faults"))]
+    clock_warp: std::sync::Mutex<Duration>,
     /// Test-only holds that park the NEXT gate.run handler at its entry (the
     /// cancel-beats-run race needs the run frame to be in flight, before the
     /// registry and lane are touched, when gate.cancel arrives). One-shot:
@@ -593,9 +655,43 @@ impl GateRegistry {
             lanes: Mutex::new(BTreeMap::new()),
             runs: Mutex::new(GateRunTable::new()),
             #[cfg(any(test, feature = "test-faults"))]
+            clock_warp: std::sync::Mutex::new(Duration::ZERO),
+            #[cfg(any(test, feature = "test-faults"))]
             run_holds: Mutex::new(Vec::new()),
             events,
         }
+    }
+
+    /// Timestamp used for cancel records: real clock plus any test warp.
+    fn now(&self) -> Instant {
+        #[cfg(any(test, feature = "test-faults"))]
+        {
+            let warp = self.clock_warp.lock().expect("clock warp").to_owned();
+            Instant::now() + warp
+        }
+        #[cfg(not(any(test, feature = "test-faults")))]
+        Instant::now()
+    }
+
+    /// Test-only: shift the record clock forward by `delta` so a test can
+    /// prove a canceled dispatch stays refused long past any old TTL without
+    /// sleeping.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_test_warp_clock(&self, delta: Duration) {
+        *self.clock_warp.lock().expect("clock warp") += delta;
+    }
+
+    /// Test-only: the recorded canceled generation for a job, if any.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_canceled_generation(&self, job_id: &str) -> Option<u32> {
+        self.runs
+            .lock()
+            .await
+            .canceled
+            .get(job_id)
+            .map(|record| record.generation)
     }
 
     /// Test-only: park the next `gate.run` at the handler entry on this hold.
@@ -605,17 +701,15 @@ impl GateRegistry {
     }
 
     /// Test-only: take and await all armed entry holds for one gate.run,
-    /// BEFORE the tombstone check and the lane slot.
+    /// BEFORE the canceled-generation check and the lane slot.
     #[cfg(any(test, feature = "test-faults"))]
-    pub(crate) async fn await_run_holds(&self, job_id: &str) {
+    pub(crate) async fn await_run_holds(&self, job_id: &str, generation: u32) {
         let holds = {
             let mut armed = self.run_holds.lock().await;
             std::mem::take(&mut *armed)
         };
         for hold in holds {
-            *hold.job_id.lock().expect("hold job id") = Some(job_id.to_owned());
-            hold.arrived.notify_waiters();
-            hold.release.notified().await;
+            hold.handler_parked(job_id, generation).await;
         }
     }
 
@@ -625,60 +719,96 @@ impl GateRegistry {
     }
 }
 
-/// Test-only gate.run entry hold. The run parks until `release` is called;
-/// `wait_arrived` resolves with the dispatched job id once the frame has
-/// reached the Node handler (claim already committed on the Hub) and is
-/// parked before the run registry / lane / git steps.
+/// Test-only gate.run entry hold. The run parks until [`GateRunHold::release`]
+/// is called; [`GateRunHold::wait_arrived`] resolves with the dispatched
+/// (job id, generation) once the frame has reached the Node handler (claim
+/// already committed on the Hub) and is parked before the run registry /
+/// lane / git steps.
+///
+/// Both signals are oneshot channels. A `release()` that happens BEFORE the
+/// handler parks still unblocks it — oneshot stores the message for a later
+/// `.await`, unlike `Notify::notify_waiters()` whose permit is dropped when
+/// no notified future exists yet.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-faults"))]
 pub struct GateRunHold {
-    arrived: tokio::sync::Notify,
-    job_id: std::sync::Mutex<Option<String>>,
-    release: tokio::sync::Notify,
-}
-
-#[cfg(any(test, feature = "test-faults"))]
-impl Default for GateRunHold {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Handler takes the sender on arrival; the test awaits the receiver.
+    arrived_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<(String, u32)>>>,
+    arrived_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<(String, u32)>>>,
+    /// Test takes the sender to release; the handler awaits the receiver.
+    release_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 #[cfg(any(test, feature = "test-faults"))]
 impl GateRunHold {
+    /// Called by the run handler: publish arrival, then park until released.
+    /// Both happen through oneshot channels, so a release that precedes the
+    /// park is already stored and the await returns at once.
+    async fn handler_parked(self: &std::sync::Arc<Self>, job_id: &str, generation: u32) {
+        if let Some(tx) = self.arrived_tx.lock().expect("arrived tx").take() {
+            let _ = tx.send((job_id.to_owned(), generation));
+        }
+        if let Some(rx) = self.release_rx.lock().await.take() {
+            let _ = rx.await;
+        }
+    }
+
     /// Create a disarmed hold; arm it on a Node with
     /// [`DevNode::gate_test_arm_run_hold`].
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            arrived: tokio::sync::Notify::new(),
-            job_id: std::sync::Mutex::new(None),
-            release: tokio::sync::Notify::new(),
-        }
+    pub fn new() -> std::sync::Arc<Self> {
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        std::sync::Arc::new(Self {
+            arrived_tx: std::sync::Mutex::new(Some(arrived_tx)),
+            arrived_rx: tokio::sync::Mutex::new(Some(arrived_rx)),
+            release_tx: std::sync::Mutex::new(Some(release_tx)),
+            release_rx: tokio::sync::Mutex::new(Some(release_rx)),
+        })
     }
 
     /// Wait until the held gate.run frame arrives at the Node; returns its
-    /// job id.
-    pub async fn wait_arrived(&self) -> String {
-        loop {
-            if let Some(job_id) = self.job_id.lock().expect("hold job id").clone() {
-                return job_id;
-            }
-            let notified = self.arrived.notified();
-            if let Some(job_id) = self.job_id.lock().expect("hold job id").clone() {
-                return job_id;
-            }
-            notified.await;
-        }
+    /// (job id, generation).
+    pub async fn wait_arrived(&self) -> (String, u32) {
+        let rx = self
+            .arrived_rx
+            .lock()
+            .await
+            .take()
+            .expect("arrival awaited once");
+        rx.await.expect("gate run hold arrival sender dropped")
     }
 
-    /// Release the parked gate.run so its handler proceeds.
+    /// Release the parked gate.run so its handler proceeds. Safe to call
+    /// before the frame arrives — a oneshot message already stored unblocks
+    /// the handler's later await immediately.
     pub fn release(&self) {
-        self.release.notify_waiters();
+        if let Some(tx) = self.release_tx.lock().expect("release tx").take() {
+            let _ = tx.send(());
+        }
     }
 }
 
 impl DevNode {
+    /// Test-only: shift the canceled-record clock forward by `delta`, proving
+    /// a canceled dispatch stays refused however late its frame arrives
+    /// without sleeping.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_test_warp_clock(&self, delta: Duration) {
+        self.gate_registry().gate_test_warp_clock(delta);
+    }
+
+    /// Test-only: recorded canceled generation for a job, if any.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_canceled_generation(&self, job_id: &str) -> Option<u32> {
+        self.gate_registry()
+            .gate_test_canceled_generation(job_id)
+            .await
+    }
+
     /// Test-only: arm a hold that parks the NEXT Hub-dispatched `gate.run`
     /// at the handler entry (before run registration, the lane slot and any
     /// git step), so a test can deterministically land `gate.cancel` while
@@ -720,29 +850,34 @@ impl DevNode {
         serde_json::to_value(result).map_err(NodeError::from)
     }
 
-    /// Handle `gate.cancel` — kills the running step's process group.
+    /// Handle `gate.cancel` — kills the running step's process group and
+    /// records the canceled dispatch generation so a delayed same-generation
+    /// `gate.run` refuses instead of executing.
     pub(crate) async fn cancel_gate(&self, params: &Value) -> Result<Value, NodeError> {
         let request: GateCancelParams =
             serde_json::from_value(params.clone()).map_err(|error| {
                 NodeError::InvalidRequest(format!("invalid gate.cancel params: {error}"))
             })?;
-        let mut table = self.gate_registry().runs.lock().await;
+        let registry = self.gate_registry();
+        let mut table = registry.runs.lock().await;
         if let Some(run) = table.runs.get(&request.job_id) {
             run.cancel.send(true).ok();
             if let Some(pgid) = *run.pgid.lock().unwrap_or_else(|poison| poison.into_inner()) {
                 kill_group(pgid);
             }
-        } else {
-            // The gate.run frame is still in flight (a cancel that overtook
-            // dispatch): tombstone the job so the run refuses instead of
-            // executing after its cancel was already acked. Atomic with the
-            // run's check-and-register below.
-            let now = Instant::now();
-            table.prune_tombstones(now);
-            table.tombstones.insert(request.job_id.clone(), now);
         }
+        // Record the canceled generation whether or not the run is registered
+        // yet: if the frame is still in flight this is the tombstone; if it is
+        // already running this also blocks any duplicate/late same-generation
+        // dispatch. Keyed by generation, never by age.
+        let now = registry.now();
+        table.record_cancel(&request.job_id, request.generation, now);
         drop(table);
-        Ok(serde_json::json!({ "ok": true, "jobId": request.job_id }))
+        Ok(serde_json::json!({
+            "ok": true,
+            "jobId": request.job_id,
+            "generation": request.generation,
+        }))
     }
 
     /// Handle `gate.then` — a post-land command on the project's home host.
@@ -823,19 +958,24 @@ impl DevNode {
         // already committed, run unregistered) so a test can land
         // gate.cancel before the handler proceeds. Runs before ANY state.
         #[cfg(any(test, feature = "test-faults"))]
-        registry.await_run_holds(&request.job_id).await;
-        // A gate.cancel that overtook dispatch and was acked while no run was
-        // registered left a tombstone. Check it before touching the lane so a
-        // canceled job never reports lane-busy; the decisive re-check below
-        // (atomically with registration) closes the cancel-during-acquire
-        // window.
-        let tombstoned = {
-            let mut table = registry.runs.lock().await;
-            table.prune_tombstones(Instant::now());
-            table.tombstones.remove(&request.job_id).is_some()
+        registry
+            .await_run_holds(&request.job_id, request.generation)
+            .await;
+        // A cancel covering THIS generation (acked while no run was
+        // registered, however long ago — refusal is generation-scoped, not
+        // age-scoped) blocks the run before it touches the lane so it never
+        // reports lane-busy. The decisive re-check below, atomically with
+        // registration, closes the cancel-during-acquire window.
+        let canceled = {
+            let table = registry.runs.lock().await;
+            table.is_canceled_generation(&request.job_id, request.generation)
         };
-        if tombstoned {
-            return Ok(canceled_before_run(registry, &request.job_id));
+        if canceled {
+            return Ok(canceled_before_run(
+                registry,
+                &request.job_id,
+                request.generation,
+            ));
         }
         // One running job per lane (Node-side backstop; the Hub queue is the
         // authority).
@@ -865,13 +1005,22 @@ impl DevNode {
         });
         {
             let mut table = registry.runs.lock().await;
-            // A cancel that landed while this frame was acquiring the lane
-            // slot: the same atomic decision as cancel_gate's check.
-            if table.tombstones.remove(&request.job_id).is_some() {
+            // A cancel for THIS generation that landed while this frame was
+            // acquiring the lane slot: the same atomic decision as
+            // cancel_gate's record.
+            if table.is_canceled_generation(&request.job_id, request.generation) {
                 drop(table);
                 drop(lane_guard);
-                return Ok(canceled_before_run(registry, &request.job_id));
+                return Ok(canceled_before_run(
+                    registry,
+                    &request.job_id,
+                    request.generation,
+                ));
             }
+            // A strictly NEWER generation for this job supersedes an older
+            // cancel record (the job was requeued and re-dispatched): clear
+            // it so this run and later frames are not blocked.
+            table.clear_if_superseded(&request.job_id, request.generation);
             if table.runs.contains_key(&request.job_id) {
                 return Err(NodeError::InvalidRequest(format!(
                     "gate job {} is already running",
@@ -2018,6 +2167,7 @@ mod tests {
     fn params(fixture: &Fixture, mode: &str) -> GateRunParams {
         GateRunParams {
             initiator: None,
+            generation: 0,
             job_id: "gjb_test".into(),
             lane_id: "lane1".into(),
             repo_path: fixture.lane.to_string_lossy().into_owned(),
@@ -2748,6 +2898,7 @@ JSON
     fn bare_run_params() -> GateRunParams {
         GateRunParams {
             initiator: None,
+            generation: 0,
             job_id: "gjb_env".into(),
             lane_id: "lane1".into(),
             repo_path: "/tmp/lane".into(),

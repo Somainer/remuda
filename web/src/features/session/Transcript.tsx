@@ -71,6 +71,14 @@ const ORIGIN_LABEL: Record<Exclude<MessageOrigin, "human">, string> = {
  * absolute deadline, and a correction budget, whichever comes first.
  */
 const PREPEND_SETTLE_QUIET_MS = 800;
+/**
+ * After a load-earlier cancel, growth anchoring is switched off until the
+ * reader demonstrably owns the new position. A real reader gesture/scroll
+ * re-arms it immediately; when no such input arrives (a cancel whose scroll
+ * never fires), re-arm on this bound so an unrelated later growth is not left
+ * uncompensated for the whole visit.
+ */
+const GROWTH_HOLD_REARM_MS = 500;
 const PREPEND_SETTLE_DEADLINE_MS = 5000;
 const PREPEND_SETTLE_MAX_CORRECTIONS = 40;
 
@@ -355,8 +363,16 @@ function TranscriptInner({
    * intentional jump that cancels the restore instead of being swallowed.
    * The seq lets a later write's rAF invalidate only its own record.
    */
-  const restoreEchoRef = useRef<{ top: number; seq: number } | null>(null);
+  const restoreEchoRef = useRef<{ top: number; seq: number; inputSeq: number } | null>(null);
   const restoreEchoSeqRef = useRef(0);
+  /**
+   * Bumped on every genuine reader gesture (wheel/touch/scroll key/scrollbar
+   * press). A restore write records the generation it made on; the matching
+   * scroll event is the write's echo only while no reader gesture has happened
+   * since — this classifies own-vs-reader by an input TOKEN, not by how close
+   * the event's scrollTop is to the write target.
+   */
+  const readerInputSeqRef = useRef(0);
   /**
    * Quiet-window timer that ends a held load-earlier restore after the last
    * settle commit, so a restore whose measurements went QUIET before the
@@ -369,6 +385,8 @@ function TranscriptInner({
    * prepend's inserted rows until the reader scrolls again.
    */
   const growthHoldSuppressedRef = useRef(false);
+  /** Bounded re-arm timer for the suppression above (see GROWTH_HOLD_REARM_MS). */
+  const growthHoldRearmTimerRef = useRef<number | null>(null);
   const saveTimer = useRef<number | null>(null);
   const pendingScroll = useRef<
     | { kind: "index"; index: number; offset: number; tries: number }
@@ -459,6 +477,12 @@ function TranscriptInner({
     const el = scrollerRef.current;
     if (el) el.setAttribute("data-reflow-hold", reflowAnchorRef.current ? "1" : "0");
   };
+  // Growth-hold suppression can flip on a gesture/timeout with no scroll event
+  // (and thus no re-render), so mirror it imperatively as well.
+  const setGrowthHoldAttr = () => {
+    const el = scrollerRef.current;
+    if (el) el.setAttribute("data-growth-hold", growthHoldSuppressedRef.current ? "0" : "1");
+  };
   // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
   // click on a held transcript row posts exactly once.
   const steeringRef = useRef<Set<string>>(new Set());
@@ -481,6 +505,11 @@ function TranscriptInner({
       window.clearTimeout(prependSettleTimerRef.current);
       prependSettleTimerRef.current = null;
     }
+    if (growthHoldRearmTimerRef.current !== null) {
+      window.clearTimeout(growthHoldRearmTimerRef.current);
+      growthHoldRearmTimerRef.current = null;
+    }
+    growthHoldSuppressedRef.current = false;
     steeringRef.current.clear();
     setLoadingEarlier(false);
     setRowHeights(new Map());
@@ -573,7 +602,7 @@ function TranscriptInner({
     if (!el || el.scrollTop === before) return;
     const seq = restoreEchoSeqRef.current + 1;
     restoreEchoSeqRef.current = seq;
-    restoreEchoRef.current = { top: el.scrollTop, seq };
+    restoreEchoRef.current = { top: el.scrollTop, seq, inputSeq: readerInputSeqRef.current };
     reflowOwnScrollRef.current = true;
     requestAnimationFrame(() => {
       if (restoreEchoRef.current?.seq === seq) {
@@ -640,6 +669,26 @@ function TranscriptInner({
    * cancelled, releases the held anchor and the restore pending, and unfreezes
    * the estimate. The request identity stays until the click's finally runs.
    */
+  /** Switch growth anchoring off after a cancel, bounded by a re-arm timer. */
+  const suppressGrowthHold = useCallback(() => {
+    growthHoldSuppressedRef.current = true;
+    setGrowthHoldAttr();
+    if (growthHoldRearmTimerRef.current !== null) window.clearTimeout(growthHoldRearmTimerRef.current);
+    growthHoldRearmTimerRef.current = window.setTimeout(() => {
+      growthHoldRearmTimerRef.current = null;
+      growthHoldSuppressedRef.current = false;
+      setGrowthHoldAttr();
+    }, GROWTH_HOLD_REARM_MS);
+  }, []);
+  /** Genuine reader input re-arms growth anchoring immediately and cancels the bound. */
+  const rearmGrowthHold = useCallback(() => {
+    if (growthHoldRearmTimerRef.current !== null) {
+      window.clearTimeout(growthHoldRearmTimerRef.current);
+      growthHoldRearmTimerRef.current = null;
+    }
+    growthHoldSuppressedRef.current = false;
+    setGrowthHoldAttr();
+  }, []);
   const cancelLoadRestore = useCallback(() => {
     const req = loadReqRef.current;
     if (!req || req.cancelled) return;
@@ -660,14 +709,20 @@ function TranscriptInner({
     // would compensate for that prepend and re-jump to the click-time row
     // even after the reader intentionally navigated away.
     readingAnchorRef.current = null;
-    growthHoldSuppressedRef.current = true;
-  }, [releasePrependAnchor]);
+    suppressGrowthHold();
+  }, [releasePrependAnchor, suppressGrowthHold]);
   useEffect(() => {
     cancelLoadRestoreRef.current = cancelLoadRestore;
   }, [cancelLoadRestore]);
+  useEffect(() => {
+    rearmGrowthHoldRef.current = rearmGrowthHold;
+  }, [rearmGrowthHold]);
   // Latest sampleReadingAnchor, for the gesture cancellation effect (which is
   // mounted before the callback is defined).
   const sampleAnchorOnGestureRef = useRef<() => void>(() => {});
+  // Latest re-arm for the growth-hold suppression (the gesture effect mounts
+  // before rearmGrowthHold is defined).
+  const rearmGrowthHoldRef = useRef<() => void>(() => {});
 
   // A genuine GESTURE (wheel, touch drag, a scroll keypress, or a scrollbar
   // pointer drag) must cancel an armed load-earlier restore independently of
@@ -689,6 +744,10 @@ function TranscriptInner({
       " ",
     ]);
     const gesture = () => {
+      // A genuine input generation: any scroll event that arrives after this
+      // (even coalesced within the restore write's echo window) is reader
+      // input, not the restore's echo.
+      readerInputSeqRef.current += 1;
       // Any genuine input also retires the reflow anchor a restore left
       // armed: it is allowed to live only until the reader moves. Clearing
       // here (not only in onScroll) covers a gesture whose scroll is clamped
@@ -696,6 +755,11 @@ function TranscriptInner({
       reflowAnchorRef.current = null;
       setReflowHoldAttr();
       cancelLoadRestoreRef.current();
+      // Genuine input re-arms growth anchoring at once — even when the gesture
+      // dispatches no scroll event (a 1-2px wheel, a scrollbar-thumb press
+      // without drag): the suppression's bounded timer must not be what gates
+      // an input that already happened.
+      rearmGrowthHoldRef.current();
       // Re-sample the reader anchor at the current position so subsequent
       // growth holds the post-gesture row (cancelLoadRestore nulls the stale
       // pre-restore anchor; a tiny wheel scrolls ~0 so onScroll won't run).
@@ -1824,6 +1888,10 @@ function TranscriptInner({
         // retired only by reader input / route change). Read from the ref at
         // render; every scroll event re-renders the scroller.
         data-reflow-hold={reflowAnchorRef.current ? "1" : "0"}
+        // "1" when reading-anchor growth anchoring is engaged; "0" while a
+        // load-earlier cancel temporarily suppresses it (re-armed by a genuine
+        // gesture or the bounded timer). Imperatively mirrored as well.
+        data-growth-hold={growthHoldSuppressedRef.current ? "0" : "1"}
         onScroll={(event) => {
           const el = event.currentTarget;
           setScrollTop(el.scrollTop);
@@ -1843,16 +1911,19 @@ function TranscriptInner({
           // OR while its restore is still settling owns the position: release
           // that click's held anchors immediately so neither the pending
           // prepend nor a later measurement commit can restore them back to
-          // the click-time row. The restore's OWN programmatic scrollTop
-          // writes record their target, so only an event landing at that
-          // target is the echo of our math; an intentional programmatic
-          // navigation (j/k, a search hit, 跳到最新) invalidated the record
-          // before its event and releases like a gesture, so it is never
-          // swallowed by the restore.
+          // the click-time row. Classification is by the programmaticScroll
+          // TOKEN (a live armOwnScrollEcho record, rAF-invalidated after the
+          // single coalesced event), NOT by pixel proximity: a genuine 1-2px
+          // wheel that happens to land within ±2px of the echo is reader
+          // input, not the restore's echo. An intentional programmatic
+          // navigation invalidated the token before its event, so it releases
+          // like a gesture and is never swallowed.
           const echo = restoreEchoRef.current;
           restoreEchoRef.current = null;
-          const ownEcho = echo !== null && Math.abs(el.scrollTop - echo.top) <= 2;
+          const ownEcho = echo !== null && echo.inputSeq === readerInputSeqRef.current;
           if (!ownEcho) {
+            // Genuine reader scroll: re-arm growth anchoring immediately.
+            rearmGrowthHold();
             const req = loadReqRef.current;
             if (req && !req.cancelled) {
               if (!req.done) req.cancelled = true;
@@ -1868,9 +1939,6 @@ function TranscriptInner({
               // one is finalized by its click's finally.
               if (req.done && loadReqRef.current === req) loadReqRef.current = null;
             }
-            // Any non-echo scroll is the reader (or their navigation) owning
-            // the position again: resume normal growth anchoring.
-            growthHoldSuppressedRef.current = false;
           }
           sampleReadingAnchor();
           persistSoon();

@@ -2889,6 +2889,89 @@ describe("load-earlier anchor lifecycle round 5", () => {
       });
     });
 
+    // UO-6a round 8 item 3: after a load-earlier cancel switches growth
+    // anchoring off, it must come back on the NEXT genuine gesture even when
+    // the gesture dispatches no usable scroll event (tiny wheel, scrollbar
+    // press without drag), or on a bounded timer when no input arrives at all.
+    describe("round 8 item 3: growth anchoring re-arms after a cancel", () => {
+      const growthHold = (geo: ReturnType<typeof setup>["geo"]) =>
+        geo.scroller().getAttribute("data-growth-hold");
+      // Functional check: a row above the sampled reading anchor grows and the
+      // scroller compensates, with NO reader scroll event dispatched.
+      function expectHoldsWithoutScroll(geo: ReturnType<typeof setup>["geo"]) {
+        const before = geo.top();
+        geo.growRow(4, ROW + 40);
+        expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
+      }
+      async function releaseGate(g: ReturnType<typeof setup>["g"], older: Observation[]) {
+        await act(async () => {
+          g.resolve(pageOf(older));
+          await Promise.resolve();
+        });
+      }
+
+      it("a wheel that dispatches no scroll event re-arms growth anchoring immediately", async () => {
+        const { user, geo, g, older } = setup("insGhWheel");
+        // Sit at a real reading position, then arm a load-earlier there.
+        geo.scrollTo(25 * ROW);
+        await act(async () => {});
+        await user.click(screen.getByTestId("load-earlier"));
+        await act(async () => {});
+        // A genuine 1-2px wheel cancels the in-flight restore but is clamped
+        // away, dispatching NO scroll event. The gesture itself must re-arm
+        // growth anchoring: a later growth above the anchor is compensated.
+        fireEvent.wheel(geo.scroller(), { deltaY: 1 });
+        expect(growthHold(geo)).toBe("1");
+        expectHoldsWithoutScroll(geo);
+        await releaseGate(g, older);
+      });
+
+      it("a scrollbar-thumb press without a drag re-arms growth anchoring", async () => {
+        const { user, geo, g, older } = setup("insGhThumb");
+        geo.scrollTo(25 * ROW);
+        await act(async () => {});
+        await user.click(screen.getByTestId("load-earlier"));
+        await act(async () => {});
+        // Primary press on the scrollbar gutter (offsetWidth is 0 in jsdom so
+        // the inner 12px band counts); no drag, hence no scroll event.
+        fireEvent.pointerDown(geo.scroller(), { button: 0, clientX: 495 });
+        expect(growthHold(geo)).toBe("1");
+        expectHoldsWithoutScroll(geo);
+        await releaseGate(g, older);
+      });
+
+      it("a cancel whose scroll never arrives re-arms on the bounded timer", async () => {
+        // The cancel's write delivers its scroll event on a rAF; neuter rAF
+        // so that event NEVER fires, and fake only setTimeout. The bounded
+        // suppression timer is then the sole thing that can re-arm.
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+        const realRaf = globalThis.requestAnimationFrame;
+        vi.stubGlobal("requestAnimationFrame", () => 0);
+        try {
+          // fireEvent (not user-event): user-event drives its own timers and
+          // stalls under fake timers.
+          const { geo, g, older } = setup("insGhTimer");
+          fireEvent.click(screen.getByTestId("load-earlier"));
+          // 跳到最新 cancels (a non-restore navigation); with rAF neutered its
+          // scroll event never delivers, so growth anchoring is held off only
+          // until the bounded timer.
+          fireEvent.click(screen.getByTestId("jump-latest"));
+          expect(growthHold(geo), "the cancel must suppress growth anchoring first").toBe("0");
+          act(() => {
+            vi.advanceTimersByTime(501);
+          });
+          expect(growthHold(geo), "growth anchoring did not re-arm on the bounded timer").toBe("1");
+          act(() => {
+            g.resolve(pageOf(older));
+          });
+        } finally {
+          vi.unstubAllGlobals();
+          vi.useRealTimers();
+          void realRaf;
+        }
+      });
+    });
+
     // UO-6a round 7 item 2: the browser can CLAMP a load-earlier restore
     // write when the tail below the armed anchor is shorter than the
     // viewport (the requested top exceeds scrollHeight - clientHeight). The
@@ -3114,6 +3197,9 @@ describe("load-earlier anchor lifecycle round 5", () => {
 
       // The page landed (request done) but the stable passes have not
       // accumulated: a genuine gesture must release the hold immediately.
+      // A real wheel input bumps the input token and cancels before the
+      // resulting scroll event; simulate that gesture, then the scroll.
+      fireEvent.wheel(geo.scroller(), { deltaY: 240 });
       geo.scrollTo(25 * ROW);
       await act(async () => {});
       const before = geo.top();

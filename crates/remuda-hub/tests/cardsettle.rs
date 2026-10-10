@@ -1452,8 +1452,21 @@ async fn follower_lag_never_replays_pre_subscribe_history() -> Result<()> {
     // Backdate the pre-populated settlements OUTSIDE the 5-minute connect
     // replay window, so the only way they could reach this follower is the
     // (cursed) None-cursor history walk. The seeded cursor must exclude them.
-    hub.test_backdate_interactions(old_cards.clone(), "2000-01-01T00:00:00.000Z")
+    // c-cardsettle-fu r1 item 4: assert the UPDATE rows-affected so a silent
+    // no-op backdate (typo'd id) cannot leave the rows inside the window.
+    let (backdated_rows, backdated_events) = hub
+        .test_backdate_interactions(old_cards.clone(), "2000-01-01T00:00:00.000Z")
         .await?;
+    assert_eq!(
+        backdated_rows,
+        old_cards.len(),
+        "every pre-populated interaction row is backdated"
+    );
+    assert_eq!(
+        backdated_events,
+        old_cards.len(),
+        "every pre-populated settlement_events row is backdated"
+    );
 
     // A NEW instance with its own pending cards, the post-subscribe sweep.
     let (new_instance, new_cards) =
@@ -1982,8 +1995,20 @@ async fn follower_parked_after_kth_live_notice_drains_the_tail_of_a_then_b_in_se
     // the two cursor orders coincide, so the test would prove nothing against
     // the old cursor (the r10 item-2 failure shape).
     const BACKDATED_BEFORE_TEST: &str = "2000-01-01T00:00:00.000Z";
-    hub.test_backdate_interactions(cards_b.clone(), BACKDATED_BEFORE_TEST)
+    // c-cardsettle-fu r1 item 4: assert rows-affected for BOTH tables so the
+    // backdate is observed (a silent no-op UPDATE would let the test pass
+    // without B actually being older than A).
+    let (b_rows_backdated, b_events_backdated) = hub
+        .test_backdate_interactions(cards_b.clone(), BACKDATED_BEFORE_TEST)
         .await?;
+    assert_eq!(
+        b_rows_backdated, 120,
+        "all 120 B interactions are backdated"
+    );
+    assert_eq!(
+        b_events_backdated, 120,
+        "all 120 B settlement_events are backdated"
+    );
 
     // Release the park: the pump's next bus poll observes Lagged and drains.
     release

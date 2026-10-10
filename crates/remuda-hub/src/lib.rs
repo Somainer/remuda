@@ -660,28 +660,36 @@ impl RunningHub {
     /// 5-minute connect-replay window and prove the follower lag drain seeds
     /// at the durable max seq instead of walking the whole history.
     #[doc(hidden)]
+    /// Backdate `interaction_ids` to `rfc3339` in BOTH tables and return the
+    /// number of rows changed in EACH table, in order
+    /// `(interactions, settlement_events)`. c-cardsettle-fu r1 item 4: callers
+    /// assert the counts so a typo'd id / silent no-op UPDATE fails the test
+    /// instead of leaving the backdate unobserved.
+    #[doc(hidden)]
     pub async fn test_backdate_interactions(
         &self,
         interaction_ids: Vec<String>,
         rfc3339: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<(usize, usize)> {
         let Some(store) = self.store.as_ref() else {
             anyhow::bail!("hub store already closed");
         };
         let ts = rfc3339.to_string();
         store
             .run_named("test_backdate_interactions", move |conn| {
+                let mut interactions = 0usize;
+                let mut settlement_events = 0usize;
                 for id in &interaction_ids {
-                    conn.execute(
+                    interactions += conn.execute(
                         "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
                         rusqlite::params![ts, id],
                     )?;
-                    conn.execute(
+                    settlement_events += conn.execute(
                         "UPDATE settlement_events SET created_at = ?1 WHERE interaction_id = ?2",
                         rusqlite::params![ts, id],
                     )?;
                 }
-                Ok(())
+                Ok((interactions, settlement_events))
             })
             .await
             .map_err(Into::into)

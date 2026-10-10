@@ -1759,6 +1759,12 @@ fn epoch_mode(
             *binding = LaunchModeBinding::Dead(sticky.mode);
             return sticky.mode;
         }
+        // c-effortread r8 item 6 (Opus): a non-rebound sticky entry IS the
+        // launch session. A stored Dead mode was produced by a PRIOR rebound
+        // session and must not govern this one (returning another session's
+        // Dead(Fresh) made /resume X fall back to TranscriptTail::new and
+        // replay X's history as Current). Use the launch sticky's own measured
+        // mode and re-bind.
         // The launched process's own first reported session.
         if let Some(pre) = pre_resume_mode {
             return match *binding {
@@ -1773,7 +1779,12 @@ fn epoch_mode(
                     }
                     pre
                 }
-                LaunchModeBinding::Dead(dead_mode) => dead_mode,
+                // A Dead mode from a rebound session must not govern the
+                // launch session: use the launch sticky's own mode and re-bind.
+                LaunchModeBinding::Dead(_) => {
+                    *binding = LaunchModeBinding::Bound(pid, session);
+                    sticky.mode
+                }
                 _ => {
                     *binding = LaunchModeBinding::Bound(pid, session);
                     pre
@@ -1782,7 +1793,11 @@ fn epoch_mode(
         }
         // New launch / login shell: use the mode measured at SessionStart.
         return match *binding {
-            LaunchModeBinding::Dead(dead_mode) => dead_mode,
+            // Same item-6 fix for the no-pre-resume path.
+            LaunchModeBinding::Dead(_) => {
+                *binding = LaunchModeBinding::Bound(pid, session);
+                sticky.mode
+            }
             _ => {
                 *binding = LaunchModeBinding::Bound(pid, session);
                 sticky.mode
@@ -4225,6 +4240,73 @@ mod tests {
         assert!(
             !hand_typed.rebound,
             "no argv id => first recorded is the launch session"
+        );
+    }
+
+    /// c-effortread r8 item 6 (Opus): returning to the LAUNCH session after a
+    /// `/clear` must inherit the launch sticky's own mode, never the rebound
+    /// /clear session's Dead(Fresh). Dead(Fresh) for the launch made
+    /// /resume X fall back to a byte-0 live tail and replay X's history.
+    #[test]
+    fn r8_item6_returning_to_launch_session_never_inherits_a_rebound_dead_mode() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let launch = slug_session(dir.path(), &cwd, "launch-x", "{}\n");
+        let clear_z = slug_session(dir.path(), &cwd, "clear-z", "{}\n");
+        let mut table = SessionModeTable::default();
+        let mut launch_binding = LaunchModeBinding::Unbound;
+
+        // 1. Launch session X (argv --resume → pre_resume_mode = an
+        //    Unverified boundary) is recorded first: non-rebound.
+        let launch_found = detected_claude(7, Some("launch-x"));
+        let launch_sticky = table.record(
+            7,
+            "launch-x",
+            Some(&launch),
+            Some(ResumeMode::Unverified),
+            None,
+            &launch_found,
+        );
+        assert!(!launch_sticky.rebound);
+        let mode = epoch_mode(
+            &mut launch_binding,
+            Some(ResumeMode::Unverified),
+            Some(launch_sticky),
+            &launch_found,
+        );
+        assert!(
+            matches!(mode, ResumeMode::Unverified),
+            "launch uses its own resume mode"
+        );
+
+        // 2. /clear to Z (a Fresh rebound) marks the binding Dead(Fresh).
+        let clear_found = detected_claude(7, Some("clear-z"));
+        let clear_sticky = table.record(
+            7,
+            "clear-z",
+            Some(&clear_z),
+            None,
+            Some("clear"),
+            &clear_found,
+        );
+        assert!(clear_sticky.rebound);
+        assert_eq!(clear_sticky.mode, ResumeMode::Fresh);
+        let mode = epoch_mode(&mut launch_binding, None, Some(clear_sticky), &clear_found);
+        assert_eq!(mode, ResumeMode::Fresh);
+        assert!(matches!(
+            launch_binding,
+            LaunchModeBinding::Dead(ResumeMode::Fresh)
+        ));
+
+        // 3. /resume X while X's read anchor is unusable (X.jsonl rewritten):
+        //    argv names launch-x again. The launch sticky is non-rebound; the
+        //    stored Dead(Fresh) MUST NOT apply.
+        let re_found = detected_claude(7, Some("launch-x"));
+        let mode = epoch_mode(&mut launch_binding, None, Some(launch_sticky), &re_found);
+        assert!(
+            matches!(mode, ResumeMode::Unverified),
+            "returning to the launch session re-uses its own Unverified mode, not Z's Fresh: {mode:?}"
         );
     }
 

@@ -1780,6 +1780,142 @@ async fn a_grace_expiry_finish_between_a_result_preread_and_its_writer_keeps_the
     node.assert_next_frame_is_sentinel(&ctx).await;
 }
 
+/// A FAILED verdict (with bounded runLog) is delivered twice — the Node's
+/// `finished` event AND the gate.run reply. Both handlers pre-read Running;
+/// the first persists its log and commits Failed; the second persists its
+/// copy BEFORE loading the (now Failed) row, then stops at the terminal
+/// guard. The second persist must not delete the object the first writer
+/// referenced: the job's logObjectId has to resolve (by object id and by
+/// job id) after both arrivals. Regression for r8 item 1.
+#[tokio::test]
+async fn a_duplicate_failed_verdict_keeps_the_referenced_gate_log_object() {
+    use remuda_hub::store_test_support::TestGateFinishBeforeWrite;
+
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/duplicate-failed-log","mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job_id = body["id"].as_str().unwrap().to_owned();
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("the queued verify job claims to running");
+    assert_eq!(claimed["state"], json!("running"), "{claimed}");
+
+    let failed_result = json!({
+        "jobId": job_id,
+        "status": "failed",
+        "failedStep": "cargo-test",
+        "error": "cargo-test failed: 1 test",
+        "reason": "1 test failed",
+        "runLog": {
+            "step": "cargo-test",
+            "kind": "failed",
+            "attempts": 1,
+            "headline": "cargo-test failed",
+            "summary": ["test it_breaks ... FAILED"],
+            "tail": ["failures:", "    it_breaks"],
+            "linesSeen": 2
+        }
+    });
+
+    // First arrival: persists the log under the stable per-job object id and
+    // commits Failed with logObjectId set.
+    ctx.hub
+        .test_apply_gate_result(&job_id, failed_result.clone())
+        .await
+        .unwrap();
+    let first = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(first["state"], json!("failed"), "{first}");
+    let object_id = first["logObjectId"]
+        .as_str()
+        .expect("logObjectId after first arrival")
+        .to_owned();
+    assert!(object_id.starts_with("obj_"), "{object_id}");
+
+    // Deterministic view of the SECOND handler: its pre-read saw Running
+    // (both reads happened before the first writer committed), so put the
+    // row back exactly as it was at that read. Its own writer then finds the
+    // first arrival's terminal Failed write (the seam) and must stand down —
+    // but its persist runs first, exactly the reported ordering.
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    db.execute(
+        "UPDATE gate_jobs
+            SET state = 'running',
+                doc_json = json_set(doc_json, '$.state', 'running')
+          WHERE id = ?1",
+        rusqlite::params![job_id],
+    )
+    .unwrap();
+    drop(db);
+    ctx.store().test_arm_finish_before_gate_mutate(
+        job_id.clone(),
+        TestGateFinishBeforeWrite::DuplicateFailed,
+    );
+    ctx.hub
+        .test_apply_gate_result(&job_id, failed_result)
+        .await
+        .unwrap();
+
+    // The seam MUST have fired inside the second writer (if the pre-read had
+    // early-returned on a terminal row, the seam would still be armed).
+    assert!(
+        ctx.store().take_test_finish_before_gate_mutate().is_none(),
+        "the finish seam was not consumed: the second result's writer did not run"
+    );
+
+    // The job still points at a retrievable object: by object id AND by job
+    // id, same object, same bytes.
+    let (status, by_object) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{object_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "referenced log object 404: {by_object}");
+    assert_eq!(by_object["objectId"], json!(object_id), "{by_object}");
+    assert_eq!(
+        by_object["log"]["headline"],
+        json!("cargo-test failed"),
+        "{by_object}"
+    );
+
+    let (status, by_job) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{job_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "latest log by job id 404: {by_job}");
+    assert_eq!(
+        by_job["objectId"],
+        json!(object_id),
+        "job-id lookup resolves to a different object: {by_job}"
+    );
+
+    // The terminal row is Failed with the reference intact.
+    let final_doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(final_doc["state"], json!("failed"), "{final_doc}");
+    assert_eq!(
+        final_doc["logObjectId"],
+        json!(object_id),
+        "the duplicate rewrote/dropped the reference: {final_doc}"
+    );
+}
+
 // ── 6c. A narrowed Bot token acts for the live chapter (CLI path) ─────────
 
 #[tokio::test]

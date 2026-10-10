@@ -2616,8 +2616,9 @@ impl Store {
     }
 
     /// Test-only: drain (at most) the armed pre-mutate finish.
+    #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
-    pub(crate) fn take_test_finish_before_gate_mutate(
+    pub fn take_test_finish_before_gate_mutate(
         &self,
     ) -> Option<(String, crate::gatequeue::TestGateFinishBeforeWrite)> {
         self.test_finish_before_gate_mutate

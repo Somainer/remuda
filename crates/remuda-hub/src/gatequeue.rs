@@ -1796,35 +1796,59 @@ impl Store {
             if let Some((finished_job, kind)) = armed_finish
                 && finished_job == id
             {
-                // The terminal write that lands before this writer loads:
-                // state canceled + finishedAt, and the same evidence the
-                // real interloper commits (the duplicate's first arrival via
-                // the Canceling branch, or finish_expired_cancels' text).
-                let (error, reason) = match kind {
-                    crate::gatequeue::TestGateFinishBeforeWrite::DuplicateVerdict => (
-                        "canceled; run ended base-moved",
-                        "canceled; run ended base-moved",
-                    ),
-                    crate::gatequeue::TestGateFinishBeforeWrite::GraceExpiry => (
-                        "canceled; the lane did not answer within the cancel grace",
-                        "canceled; run did not stop in time",
-                    ),
-                };
-                conn.execute(
-                    "UPDATE gate_jobs
-                        SET state = 'canceled',
-                            doc_json = json_set(
-                                json_set(
-                                    json_set(
-                                        json_set(doc_json, '$.state', 'canceled'),
+                match kind {
+                    crate::gatequeue::TestGateFinishBeforeWrite::DuplicateFailed => {
+                        // The first duplicate's terminal write: Running ->
+                        // Failed + finishedAt, preserving whatever logObjectId
+                        // that first writer stored.
+                        conn.execute(
+                            "UPDATE gate_jobs
+                                SET state = 'failed',
+                                    doc_json = json_set(
+                                        json_set(doc_json, '$.state', 'failed'),
                                         '$.finishedAt', ?2),
-                                    '$.error', ?3),
-                                '$.reason', ?4),
-                            revision = revision + 1,
-                            updated_at = ?2
-                      WHERE id = ?1 AND state = 'canceling'",
-                    params![id, now(), error, reason],
-                )?;
+                                    revision = revision + 1,
+                                    updated_at = ?2
+                              WHERE id = ?1 AND state = 'running'",
+                            params![id, now()],
+                        )?;
+                    }
+                    _ => {
+                        // The terminal write that lands before this writer
+                        // loads: state canceled + finishedAt, and the same
+                        // evidence the real interloper commits (the
+                        // duplicate's first arrival via the Canceling branch,
+                        // or finish_expired_cancels' text).
+                        let (error, reason) = match kind {
+                            crate::gatequeue::TestGateFinishBeforeWrite::DuplicateVerdict => (
+                                "canceled; run ended base-moved",
+                                "canceled; run ended base-moved",
+                            ),
+                            crate::gatequeue::TestGateFinishBeforeWrite::GraceExpiry => (
+                                "canceled; the lane did not answer within the cancel grace",
+                                "canceled; run did not stop in time",
+                            ),
+                            crate::gatequeue::TestGateFinishBeforeWrite::DuplicateFailed => {
+                                unreachable!("handled above")
+                            }
+                        };
+                        conn.execute(
+                            "UPDATE gate_jobs
+                                SET state = 'canceled',
+                                    doc_json = json_set(
+                                        json_set(
+                                            json_set(
+                                                json_set(doc_json, '$.state', 'canceled'),
+                                                '$.finishedAt', ?2),
+                                            '$.error', ?3),
+                                        '$.reason', ?4),
+                                    revision = revision + 1,
+                                    updated_at = ?2
+                              WHERE id = ?1 AND state = 'canceling'",
+                            params![id, now(), error, reason],
+                        )?;
+                    }
+                }
             }
             let Some(mut job) = conn
                 .query_row(
@@ -2049,19 +2073,25 @@ pub enum TestGateCancelRace {
     Finished { state: &'static str },
 }
 
-/// Test-only seam: WHICH interloper commits Canceling -> Canceled inside a
-/// `mutate_gate_job` writer before its doc loads (ma-initiator r7 item 1).
+/// Test-only seam: WHICH interloper commits the terminal row write inside a
+/// `mutate_gate_job` writer before its doc loads (ma-initiator r7 item 1,
+/// r8 item 1).
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-faults"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestGateFinishBeforeWrite {
     /// The first of two duplicate verdicts (the Node's `finished` event and
-    /// the gate.run reply carry the same base-moved result) settled the row.
+    /// the gate.run reply carry the same base-moved result) settled the row
+    /// Canceling -> Canceled.
     DuplicateVerdict,
-    /// The cancel-grace finisher (`finish_expired_cancels`) settled it.
+    /// The cancel-grace finisher (`finish_expired_cancels`) settled it
+    /// Canceling -> Canceled.
     GraceExpiry,
+    /// The first of two duplicate FAILED verdicts settled the row
+    /// Running -> Failed (carrying the persisted log object id); the second
+    /// handler's pre-read still saw Running.
+    DuplicateFailed,
 }
-
 #[cfg(any(test, feature = "test-faults"))]
 impl TestGateCancelRace {
     fn apply(&self, conn: &rusqlite::Connection, id: &str) -> Result<(), crate::store::StoreError> {
@@ -2129,8 +2159,20 @@ pub(crate) struct GateLogObject {
 }
 
 impl Store {
-    /// Replace and persist the log object for one job run; returns the new
-    /// `obj_…` id.
+    /// Deterministic log-object id for a gate job. The Node delivers one
+    /// verdict TWICE (a `finished` event and the `gate.run` reply through
+    /// independent queues); a fresh random id per persist let the second
+    /// arrival delete the row the first writer had just referenced. A
+    /// per-job stable id makes the duplicate an in-place replacement: the
+    /// object id the job stores never dangles. A later re-verify attempt
+    /// replaces the bytes under the same id (still "one log per job").
+    pub(crate) fn gate_log_object_id(job_id: &str) -> String {
+        let suffix = job_id.strip_prefix("gjb_").unwrap_or(job_id);
+        format!("obj_{suffix}")
+    }
+
+    /// Replace and persist the log object for one job run; returns the
+    /// stable per-job `obj_…` id ([`Store::gate_log_object_id`]).
     pub(crate) async fn insert_gate_log(
         &self,
         project_id: &str,
@@ -2145,31 +2187,43 @@ impl Store {
         self.run_named("insert_gate_log", move |conn| {
             let now = now();
             let expires_at = gate_log_expiry(&now);
-            // One log per job: a re-verify attempt replaces the prior row so
-            // `remuda gate log <gjb>` always reads the latest run.
-            conn.execute(
-                "DELETE FROM gate_log_objects WHERE job_id = ?1",
-                params![job_id],
+            let object_id = Self::gate_log_object_id(&job_id);
+            // The Node delivers one verdict twice (finished event + RPC
+            // reply), and both handlers persist the same bytes. If the
+            // per-job row already stores that exact digest, touch nothing:
+            // no DELETE window at all, so the first writer's referenced
+            // object can never disappear underneath the job. A genuinely
+            // different run (a re-verify attempt) replaces the row under
+            // the SAME stable id, keeping every stored logObjectId valid.
+            let same: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM gate_log_objects
+                  WHERE id = ?1 AND digest = ?2",
+                params![object_id, digest],
+                |row| row.get(0),
             )?;
-            let object_id = crate::config::new_id("obj")
-                .map_err(|error| crate::store::StoreError::Id(error.to_string()))?;
-            conn.execute(
-                "INSERT INTO gate_log_objects
-                    (id, job_id, project_id, bytes, byte_len, digest,
-                     created_by, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    object_id,
-                    job_id,
-                    project_id,
-                    bytes,
-                    i64::try_from(bytes.len()).unwrap_or(i64::MAX),
-                    digest,
-                    created_by,
-                    now,
-                    expires_at,
-                ],
-            )?;
+            if same == 0 {
+                conn.execute(
+                    "DELETE FROM gate_log_objects WHERE job_id = ?1",
+                    params![job_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO gate_log_objects
+                        (id, job_id, project_id, bytes, byte_len, digest,
+                         created_by, created_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        object_id,
+                        job_id,
+                        project_id,
+                        bytes,
+                        i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+                        digest,
+                        created_by,
+                        now,
+                        expires_at,
+                    ],
+                )?;
+            }
             Ok(object_id)
         })
         .await

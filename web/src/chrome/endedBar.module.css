@@ -1,0 +1,92 @@
+/* @tokens strict */
+/* The ended session's dock surface (ui-spec §2.2). Neutral chrome for every
+   ending; only a `failed` reason is painted with the danger role. */
+
+.bar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+}
+
+.title {
+  flex: none;
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+
+.sep {
+  flex: none;
+  color: var(--fg-faint);
+}
+
+/* The reason rides the bar's own neutral surface (a restart is an
+   interruption, not a failure). */
+.reason {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-color: var(--border);
+  background: var(--bg-surface);
+  color: var(--fg-muted);
+}
+
+.reason[data-tone="failed"] {
+  color: var(--danger-fg);
+}
+
+.held {
+  margin: 0;
+  font-size: var(--text-meta);
+  color: var(--attention-fg);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.btnLg {
+  min-height: 36px;
+  padding: 0 var(--space-4);
+}
+
+.fallback {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  font-size: var(--text-meta);
+}
+
+.note {
+  color: var(--fg-muted);
+}
+
+.inherit {
+  color: var(--link);
+}
+
+/* Phones: the two resume targets share the row, 48px each. */
+@media (max-width: 767px) {
+  .actions > .btnLg {
+    flex: 1;
+    min-height: 48px;
+    padding: 0 var(--space-2);
+  }
+}

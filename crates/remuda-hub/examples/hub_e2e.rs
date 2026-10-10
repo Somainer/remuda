@@ -1369,18 +1369,19 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    // c-ghostbadge round 2: a GENUINELY live hook approval
-                    // with a short known deadline. The card is journaled
-                    // durably AND held in the live broker, so badge and
-                    // inbox both show 1/1 while the agent is blocked. The
-                    // spec then ends the instance through a REAL node
-                    // restart (instance.send sentinel `GHOSTNODE_RESTART`):
-                    // the new epoch omits the instance, the Hub's
-                    // reconcile_reported_instances settles it exited, the
-                    // new process serves no interaction.list for it, and
-                    // once the deadline crosses the shared projection drops
-                    // the durable pending row to expired — 0/0 with no
-                    // reload. Nothing here is pre-ended.
+                    // c-ghostbadge round 2 / c-cardsettle r9: a GENUINELY
+                    // live hook approval with a short KNOWN deadline. The
+                    // card is journaled durably AND held in the live broker,
+                    // so badge and inbox both show 1/1 while the agent is
+                    // blocked. The spec then ends the instance through a
+                    // REAL node restart (instance.send sentinel
+                    // `GHOSTNODE_RESTART`): the new epoch omits the instance,
+                    // the Hub's reconcile_reported_instances settles it
+                    // exited AND invalidates the card in the SAME
+                    // transaction regardless of its still-open deadline (r9
+                    // item 1; the Hub has no deadline sweeper), and the
+                    // settlement control frame flips badge/inbox 0/0 in
+                    // place with no reload.
                     if prompt.contains("ghostbadge-live") {
                         let iid = InteractionId::new();
                         // Long enough that the e2e's create -> restart ->
@@ -1412,6 +1413,41 @@ async fn fake_node(
                         .await?;
                         // Live broker agrees with the durable journal while
                         // the process runs (the real Node serves both).
+                        pending
+                            .lock()
+                            .await
+                            .insert(iid.as_id().as_str().to_string(), card);
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
+                            .await?;
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    // c-cardsettle: a genuinely live hook approval with an
+                    // UNKNOWN deadline (nothing client-side can retire it),
+                    // enabled only with HUB_E2E_CARDSETTLE=1. The spec ends
+                    // the instance through the existing GHOSTNODE_RESTART
+                    // instance.send sentinel (new epoch omits the instance),
+                    // after which the Hub must have invalidated this card in
+                    // the reconcile transaction — generation-ended, no client
+                    // deadline involved.
+                    if std::env::var("HUB_E2E_CARDSETTLE").as_deref() == Ok("1")
+                        && prompt.contains("cardsettle-live")
+                    {
+                        let iid = InteractionId::new();
+                        let card = fake_approval(&instance_id, host, iid.as_id().as_str());
+                        append_n = append_interaction_requested(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            &card,
+                        )
+                        .await?;
                         pending
                             .lock()
                             .await

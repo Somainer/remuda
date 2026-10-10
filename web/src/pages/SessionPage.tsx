@@ -1,9 +1,22 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
+import {
+  Profiler,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ComponentProps,
+  type ProfilerOnRenderCallback,
+  type ReactNode,
+} from "react";
+import { Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
+import { FileText, Info, ListCollapse, MessageSquarePlus, Rows3, ScrollText, Search } from "lucide-react";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
-import { StateDot } from "../components/StateDot";
-import { Button } from "../components/Button";
-import { Sheet } from "../components/Sheet";
+import { EndedBar } from "../chrome/EndedBar";
+import { SessionHeader, useWideDesktop } from "../chrome/SessionHeader";
+import { SessionMoreMenu, type MoreMenuItem } from "../chrome/SessionMoreMenu";
 import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { ElicitationCard } from "../features/approvals/ElicitationCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
@@ -14,10 +27,9 @@ import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
-import { Transcript } from "../features/session/Transcript";
+import { Transcript, type TranscriptHandle } from "../features/session/Transcript";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
-import { projectTurnDecision } from "../features/session/live/turnDecision";
-import { useNow } from "../features/session/live/useElapsed";
+import { useTurnDecision } from "../features/session/useTurnDecision";
 import { SessionNotifications } from "../features/session/notifications/SessionNotifications";
 import { TaskTrack } from "../features/session/TaskTrack";
 import {
@@ -27,29 +39,29 @@ import {
   useSessionTask,
 } from "../features/tasks/AnnotationPanel";
 import { composeWithAnnotations } from "../features/tasks/annotations";
-import annCss from "../features/tasks/annotation.module.css";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
 import { readDismissedWorkflows } from "../features/session/workflowDismiss";
 import { canShowTerminal, hasStructuredSignal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
 import { ScreenView } from "../features/session/ScreenView";
-import { ViewSwitch } from "../features/session/ViewSwitch";
 import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode, UI_STATUS_LABEL } from "../lib/status";
 import { apiRouteClause, apiRouteKind, routeDownMessage } from "../lib/apiRoute";
 import { projectCommandStatus } from "../lib/commandStatus";
-import { endReason } from "../lib/endReason";
+import { endReason, NODE_EPOCH_CHANGED } from "../lib/endReason";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
-import { hubStore, useHub } from "../lib/store";
+import { hubStore, type HubState } from "../lib/store";
 import { e2eSeamsEnabled } from "../lib/e2eSeams";
 import { usePublishedElementHeight } from "../lib/usePublishedElementHeight";
 import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
-import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
 import { FilesView } from "../features/files/FilesView";
 import session from "../chrome/sessionPage.module.css";
+import annCss from "../features/tasks/annotation.module.css";
+import { profilingEnabled, reportProbe } from "../lib/profileFlags";
+import type { Observation } from "../types/generated";
 import type { UsageRollup } from "../features/session/contextUsage";
 
 declare global {
@@ -61,39 +73,209 @@ declare global {
   }
 }
 
-export function SessionPage({
-  view = "auto",
-}: {
-  view?: "auto" | "structured" | "tty" | "files" | "events";
-}) {
-  const { instanceId = "" } = useParams();
-  const hub = useHub();
-  const annotationPanel = useAnnotationsContext();
+/** Stable empty list so an unfollowed session does not re-project every render. */
+const NO_EVENTS: Observation[] = [];
+
+const onSessionCommit: ProfilerOnRenderCallback = (_id, _phase, actualDuration) => {
+  reportProbe("commit:SessionPage", { actualDuration });
+};
+
+/**
+ * Structural equality over plain wire data (objects, arrays, primitives).
+ * The Hub's 2 s list refresh rebuilds every row even when nothing changed;
+ * this is what lets the page tell a real change from a re-fetched copy.
+ */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    const other = b as unknown[];
+    return a.length === other.length && a.every((item, index) => sameValue(item, other[index]));
+  }
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && sameValue(left[key], right[key]));
+}
+
+/**
+ * Everything the page body reads from the hub, narrowed to this one
+ * instance. The body subscribes to this slice, not the whole snapshot: an
+ * emit that touches another session, the host/workspace lists, or re-fetches
+ * an unchanged row selects an equal slice and the body does not re-render.
+ */
+function selectSession(state: HubState, instanceId: string) {
+  const instance = state.instances.find((i) => i.id === instanceId);
+  const kind = instance?.kind;
+  return {
+    ready: state.ready,
+    connection: state.connection,
+    compact: state.compact,
+    instance,
+    events: state.events[instanceId],
+    journalStatus: state.journalStatus[instanceId],
+    earlierFloor: state.journalFloors[instanceId] ?? null,
+    pending: state.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending"),
+    bubbles: state.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled"),
+    // c-steer: Remuda-held queue rows (Enter while busy / while a question is
+    // pending). Posted in order by flushHeld when the wait ends.
+    held: hubStore.heldBubbles(instanceId),
+    title: hubStore.titleOf(instanceId),
+    hostName: instance ? hubStore.hostName(instance.hostId) : "",
+    permissionMode: hubStore.permissionModeOf(instanceId),
+    launchPermissionMode: hubStore.launchPermissionModeOf(instanceId),
+    permissionEffective: hubStore.permissionEffectiveOf(instanceId),
+    permissionPending: hubStore.permissionPendingOf(instanceId),
+    model: hubStore.modelOf(instanceId, kind),
+    models: hubStore.modelListOf(instanceId),
+    modelEffective: hubStore.modelEffectiveOf(instanceId),
+    modelPending: hubStore.modelPendingOf(instanceId),
+    modelCatalog: hubStore.modelCatalogOf(instanceId),
+    effort: hubStore.effortOf(instanceId, kind),
+    effortEffective: hubStore.effortEffectiveOf(instanceId),
+    effortPending: hubStore.effortPendingOf(instanceId),
+    usageRollup: hubStore.usageRollupOf(instanceId),
+  };
+}
+
+type SessionSlice = ReturnType<typeof selectSession>;
+
+/**
+ * The decoder builds each list row's capability snapshot afresh and stamps
+ * it with a new client-side object id (lib/api.ts decodeInstance →
+ * lib/capabilities.ts printCapabilities `id("obj_")`), so two decodes of an
+ * unchanged row differ only in `capabilities.id`. That id is a local handle,
+ * not a Hub fact, and nothing reads it: compare the rest.
+ */
+function sameInstance(a: SessionSlice["instance"], b: SessionSlice["instance"]): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return sameValue(
+    { ...a, capabilities: { ...a.capabilities, id: null } },
+    { ...b, capabilities: { ...b.capabilities, id: null } },
+  );
+}
+
+function sameSlice(a: SessionSlice, b: SessionSlice): boolean {
+  const keys = Object.keys(a) as (keyof SessionSlice)[];
+  // The journal window is append-only and replaced on change: identity is
+  // the cheap, exact test for it.
+  return keys.every((key) =>
+    key === "events"
+      ? a.events === b.events
+      : key === "instance"
+        ? sameInstance(a.instance, b.instance)
+        : sameValue(a[key], b[key]),
+  );
+}
+
+function useSessionSlice(instanceId: string): SessionSlice {
+  const cache = useRef<{ instanceId: string; state: HubState; slice: SessionSlice } | null>(null);
+  const getSnapshot = useCallback(() => {
+    const state = hubStore.getSnapshot();
+    const last = cache.current;
+    if (last && last.instanceId === instanceId && last.state === state) return last.slice;
+    const next = selectSession(state, instanceId);
+    const slice = last && last.instanceId === instanceId && sameSlice(last.slice, next) ? last.slice : next;
+    cache.current = { instanceId, state, slice };
+    return slice;
+  }, [instanceId]);
+  return useSyncExternalStore(hubStore.subscribe, getSnapshot, getSnapshot);
+}
+
+/**
+ * The header with its Space drawer. The workbench hook reads the whole
+ * host/workspace/instance lists; it lives here, below the page body, so a
+ * list refresh re-renders the header's space chip and not the page.
+ */
+function WorkbenchSessionHeader(props: Omit<ComponentProps<typeof SessionHeader>, "spaces">) {
   const workbench = useSpaceWorkbench();
-  const { active: space, newHref } = workbench;
+  return (
+    <SessionHeader
+      {...props}
+      spaces={{
+        spaces: workbench.spaces,
+        active: workbench.active,
+        prefs: workbench.prefs,
+        instanceId: workbench.instanceId,
+        onSelect: workbench.select,
+      }}
+    />
+  );
+}
+
+/** The EndedBar's 「开新会话」 link follows the active Space (same isolation). */
+function WorkbenchEndedBar(props: Omit<ComponentProps<typeof EndedBar>, "newHref">) {
+  const { newHref } = useSpaceWorkbench();
+  return <EndedBar {...props} newHref={newHref} />;
+}
+
+/** RunDetails' own key: the controlled panel persists through the page. */
+const RUN_DETAILS_KEY = "runtime.run-details.open";
+
+function readRunDetailsOpen(): boolean {
+  try {
+    return localStorage.getItem(RUN_DETAILS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeRunDetailsOpen(open: boolean): void {
+  try {
+    localStorage.setItem(RUN_DETAILS_KEY, open ? "1" : "0");
+  } catch {
+    /* storage unavailable: state just does not persist */
+  }
+}
+
+type SessionPageProps = { view?: "auto" | "structured" | "tty" | "files" | "events" };
+
+/**
+ * The perf probe counts SessionPage commits (an idle page should commit zero
+ * times a second). The Profiler is mounted only under `?profile=1`.
+ */
+export function SessionPage(props: SessionPageProps) {
+  if (!profilingEnabled) return <SessionPageBody {...props} />;
+  return (
+    <Profiler id="SessionPage" onRender={onSessionCommit}>
+      <SessionPageBody {...props} />
+    </Profiler>
+  );
+}
+
+function SessionPageBody({
+  view = "auto",
+}: SessionPageProps) {
+  const { instanceId = "" } = useParams();
+  const hub = useSessionSlice(instanceId);
+  const annotationPanel = useAnnotationsContext();
   const navigate = useNavigate();
   const location = useLocation();
   const { mobile, offsetTop } = useWorkbenchViewport();
-  // D-040 phone fold: below this width the header cannot hold every control
-  // without pushing Stop past the viewport edge, so Compact / 文件 / 原始事件
-  // move into the ⋯ sheet. Width-keyed (not coarsePointer) so a narrow
-  // window without touch keeps the same layout — folding is a layout question.
-  // 767px deliberately stays inline: the whole row fits there and the touch
-  // contract probes that exact width.
-  const [crowded, setCrowded] = useState(false);
-  useEffect(() => {
-    if (!mobile || typeof window.matchMedia !== "function") {
-      setCrowded(false);
-      return;
-    }
-    const media = window.matchMedia("(max-width: 640px)");
-    const update = () => setCrowded(media.matches);
-    update();
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  }, [mobile]);
+  // The page-body commit probe (`?profile=1`). The Profiler around the page
+  // also counts descendant commits (the live strip's clock, the header's
+  // space chip); this one counts only the body re-rendering.
+  useLayoutEffect(() => {
+    if (profilingEnabled) reportProbe("commit:SessionPageBody", {});
+  });
+  // ui-spec §2.2: 「文件」 stays on the desktop row only from 1024px up; below
+  // that (and on compact) it is a ⋯ item.
+  const wide = useWideDesktop();
   const [moreOpen, setMoreOpen] = useState(false);
-  const moreRef = useRef<HTMLButtonElement | null>(null);
+  // D-040 (3) / D-053: run details is folded by default and its open state is
+  // remembered on this device; the ⋯ item is its only trigger.
+  const [runDetailsOpen, setRunDetailsOpen] = useState(readRunDetailsOpen);
+  const toggleRunDetails = useCallback((open: boolean) => {
+    setRunDetailsOpen(open);
+    writeRunDetailsOpen(open);
+  }, []);
+  const closeRunDetails = useCallback(() => toggleRunDetails(false), [toggleRunDetails]);
+  const transcriptRef = useRef<TranscriptHandle | null>(null);
+  const openTranscriptSearch = useCallback(() => transcriptRef.current?.openSearch(), []);
+  const collapseTranscript = useCallback(() => transcriptRef.current?.collapseAll(), []);
   const [sendingIds, setSendingIds] = useState<string[]>([]);
   const sending = sendingIds.includes(instanceId);
   const setSending = (value: boolean) => setSendingIds((ids) => value ? [...new Set([...ids, instanceId])] : ids.filter((id) => id !== instanceId));
@@ -103,12 +285,11 @@ export function SessionPage({
   // session switch; the composer also clears it on the next turn / after 4 s.
   const [interrupted, setInterrupted] = useState(false);
   useEffect(() => setInterrupted(false), [instanceId]);
-  const instance = hub.instances.find((i) => i.id === instanceId) ?? resolveTtyLabInstance(instanceId);
+  const instance = hub.instance ?? resolveTtyLabInstance(instanceId);
   // t-annotations: a session of an archived task is a read-only preview — no
   // badge/entry point and anchor selection raises nothing.
   const sessionTask = useSessionTask(instanceId, (instance as { taskId?: string | null } | undefined)?.taskId);
   const annotationReadonly = sessionTask?.archivedAt != null;
-  const followed = Boolean(hub.events[instanceId] || hub.journalStatus[instanceId]);
   const showTerminal = instance ? canShowTerminal(instance) : false;
   const showStructured = instance ? hasStructuredSignal(instance) : false;
   const remembered = showTerminal || showStructured ? readSessionView(instanceId) : null;
@@ -174,31 +355,41 @@ export function SessionPage({
   // interactive surface on /s/:id. Shell renders ShellNotify as a sibling of
   // <main>, so a value set on a SessionPage node would not inherit to the
   // stack; ride documentElement (its common ancestor). The structured views
-  // render the session dock (composer control bar); the tty view renders no
-  // dock, so TerminalView hands up its bottom chrome (local input dock +
-  // phone key bar, + the byte-route note on desktop). Exactly one is mounted
-  // at a time and SessionPage is the single writer — two writers would race
-  // on the same property across the tty/structured switch. The hook clears
-  // the value with no element so non-session routes never see a stale height.
+  // render the session dock (composer control bar); the tty view renders its
+  // bottom chrome (local input dock + phone key bar, + the byte-route note on
+  // desktop) via TerminalView. On an ENDED tty session BOTH the tty chrome and
+  // the endedDock (Resume) mount, so their heights are summed rather than one
+  // hiding the other. SessionPage is the single writer; the hook clears the
+  // value with no element so non-session routes never see a stale height.
   const [dockEl, setDockEl] = useState<HTMLDivElement | null>(null);
   const [ttyChromeEl, setTtyChromeEl] = useState<HTMLDivElement | null>(null);
-  usePublishedElementHeight(dockEl ?? ttyChromeEl, "--session-dock-h");
-
-  const events = hub.events[instanceId] ?? [];
-  const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
-  const status = instance ? projectStatus(instance) : "unknown";
+  // Stable identity: the hook observes every listed element, so a fresh array
+  // literal each render would re-subscribe constantly.
+  const bottomChromeEls = useMemo(
+    () => [dockEl, ttyChromeEl].filter((el): el is HTMLDivElement => el !== null),
+    [dockEl, ttyChromeEl],
+  );
+  usePublishedElementHeight(bottomChromeEls, "--session-dock-h");
+  // Durable-lifecycle end state (a failed process is red; a Node restart is
+  // toned — only a failed ending is ever painted red). It reads the durable
+  // lifecycle only: the Hub marks an ended row disconnected (a Node restart
+  // does exactly that), and projectStatus answers "unknown" for any
+  // disconnected row before it looks at the lifecycle. An ended session must
+  // keep its EndedBar and Resume, and must never mount a live Composer, while
+  // its host is away.
+  const ended = instance ? endReason(instance) : null;
+  const status = ended ? "exited" : instance ? projectStatus(instance) : "unknown";
+  const events = hub.events ?? NO_EVENTS;
+  const pending = hub.pending;
   // The turn-end decision folds every channel (hook latch, screen, transcript
   // tail, pending interactions), not the hook latch alone — so a turn whose
   // Stop hook never lands still ends once the screen/pty says idle. It is the
   // one decision the strip and the composer share, which is what lets a held
-  // prompt flush on the same boundary the clock stops on. A 1 Hz tick drives
-  // the hook-freshness judgement (the deciding signal after a turn goes quiet
-  // is elapsed time, not a new event).
-  const liveNow = useNow(true);
-  const turnDecision = useMemo(
-    () => projectTurnDecision(events, instance?.nativeRef, pending.length > 0, liveNow),
-    [events, instance?.nativeRef, pending.length, liveNow],
-  );
+  // prompt flush on the same boundary the clock stops on. The hook-freshness
+  // judgement is time-driven; useTurnDecision re-projects on a clock only
+  // while the turn is open and commits only when the answer changes, so an
+  // idle page does not re-render every second.
+  const turnDecision = useTurnDecision(events, instance?.nativeRef, pending.length > 0);
   // D-028 §6 composer phase. `starting` behaves like idle (one send box);
   // only a live working/blocked turn exposes steer/queue/interrupt. The
   // multi-channel turn decision outranks the instance projection for the
@@ -218,10 +409,7 @@ export function SessionPage({
     composerPhase =
       status === "blocked" ? "blocked" : status === "working" ? "working" : "idle";
   }
-  const nodeRestarted = instance?.lastError === "node-epoch-changed";
-  // c-endreason: the shared human sentence (「Node 重启，会话已中断」),
-  // neutral — the session was interrupted by the restart, never failed.
-  const nodeRestartEnd = nodeRestarted && instance ? endReason(instance) : null;
+  const nodeRestarted = instance?.lastError === NODE_EPOCH_CHANGED;
   const resolvedView = view === "auto" ? baseView : view;
   // Terminal segments offer no annotations; archived-task sessions are a
   // read-only preview (plan task-model task 9 acceptance 3).
@@ -255,11 +443,9 @@ export function SessionPage({
       cancelAnimationFrame(second);
     };
   }, [resolvedView]);
-  const journalStatus = hub.journalStatus[instanceId] ?? (followed ? "live" : "live");
-  const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
-  // c-steer: Remuda-held queue rows (Enter while busy / while a question is
-  // pending). Posted in order by flushHeld when the wait ends.
-  const heldBubbles = hubStore.heldBubbles(instanceId);
+  const journalStatus = hub.journalStatus ?? "live";
+  const bubbles = hub.bubbles;
+  const heldBubbles = hub.held;
   // C2: the header label speaks the P0-3 vocabulary while an optimistic
   // bubble is in flight (null commandId + unknown state → 「状态待确认」,
   // never a fake success). With no pending bubble it shows the instance-level
@@ -286,7 +472,7 @@ export function SessionPage({
   // composer — never held behind this gate until the network returns.
   const snapshotLoading =
     Boolean(instance) &&
-    hub.events[instanceId] === undefined &&
+    hub.events === undefined &&
     bubbles.length === 0 &&
     !isTtyLabFixtureId(instanceId);
 
@@ -313,106 +499,43 @@ export function SessionPage({
     }
   };
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
+  const endedBar = ended ? (
+    <WorkbenchEndedBar
+      reason={ended}
+      nodeRestarted={nodeRestarted}
+      heldCount={heldBubbles.length}
+      canResume={canResume}
+      resuming={resuming}
+      onResume={(mode) => {
+        void startResume(mode);
+      }}
+    />
+  ) : null;
   const connLabel = journalStatus === "live" ? hub.connection : journalStatus;
-  const workspace = space?.name;
-  const title = hubStore.titleOf(instance.id);
+  const title = hub.title;
   const structuredOnly = uiMode(instance) === "structured-only";
   const genericPty = isGenericPty(instance);
   const promoted = isPromoted(instance);
   const binding = promoted ? transcriptBinding(events) : null;
   const activity = instance.activity.state === "known" ? instance.activity.value : instance.activity.state;
-  const hostName = hubStore.hostName(instance.hostId);
+  // A tty-lab fixture is not a hub row, so the slice has no host for it.
+  const hostName = hub.instance ? hub.hostName : hubStore.hostName(instance.hostId);
   const nativeRefShort = nativeShort(instance);
   const showViewExtras = resolvedView === "structured" || resolvedView === "files" || resolvedView === "events";
-  const closeMore = () => setMoreOpen(false);
-  const renderDensity = (menu: boolean) => (
-    <button
-      key="density"
-      type="button"
-      role={menu ? "menuitem" : undefined}
-      className={`${session.headBtn} ${hub.compact ? session.headBtnOn : ""} ${menu ? session.menuBtn : ""}`}
-      data-testid="density-toggle"
-      data-mode={hub.compact ? "compact" : "full"}
-      onClick={() => {
-        hubStore.setCompact(!hub.compact);
-        if (menu) closeMore();
-      }}
-    >
-      {hub.compact ? "Compact" : "Full"}
-    </button>
-  );
-  const renderFiles = (menu: boolean) => (
-    <button
-      key="files"
-      type="button"
-      role={menu ? "menuitem" : undefined}
-      className={`${resolvedView === "files" ? session.headBtnActive : session.headBtn} ${menu ? session.menuBtn : ""}`}
-      data-testid="files-toggle"
-      aria-pressed={resolvedView === "files"}
-      onClick={() => {
-        if (resolvedView === "files") navigate(backTo);
-        else openFiles();
-        if (menu) closeMore();
-      }}
-    >
-      文件
-    </button>
-  );
-  const renderEvents = (menu: boolean) => (
-    <button
-      key="events"
-      type="button"
-      role={menu ? "menuitem" : undefined}
-      className={`${resolvedView === "events" ? session.headBtnActive : session.headBtn} ${menu ? session.menuBtn : ""}`}
-      data-testid="events-toggle"
-      aria-pressed={resolvedView === "events"}
-      onClick={() => {
-        navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`);
-        if (menu) closeMore();
-      }}
-    >
-      原始事件
-    </button>
-  );
-  const resumeControl = canResume ? (
-    <span className={session.headRow} data-testid="resume-control">
-      {/* D-026: resume continues the same native session on a NEW
-          instance, so both targets navigate away from this one. */}
-      <Button
-        variant="primary"
-        disabled={resuming}
-        onClick={() => {
-          void startResume("structured");
-        }}
-      >
-        继续（结构化）
-      </Button>
-      <button
-        type="button"
-        className={session.headBtn}
-        data-testid="resume-terminal"
-        disabled={resuming}
-        onClick={() => {
-          void startResume("terminal");
-        }}
-      >
-        在终端中继续
-      </button>
-    </span>
-  ) : (
-    <Link to={newHref} className={session.inheritLink}>开新会话继承 cwd</Link>
-  );
-  // Two resume buttons cannot share the crowded 390px main row without
-  // wrapping over the disclosure; on phones they take their own header row.
-  const resumeOnOwnRow = status === "exited" && crowded && canResume;
+  const toggleFiles = () => {
+    if (resolvedView === "files") navigate(backTo);
+    else openFiles();
+  };
+  const transcriptMounted = resolvedView === "structured" && !snapshotLoading && !genericPty;
+  const filesInline = wide && !mobile && showViewExtras;
 
-  // The 运行详情 fields as one array: the summary advertises exactly the
-  // number of items it can reveal (ui-spec §2.2), so the count is derived,
+  // The 运行详情 fields as one array: the ⋯ item advertises exactly the
+  // number of items the panel reveals (ui-spec §2.2), so the count is derived,
   // never hand-maintained. host/cost keep the desktop main row; on compact
-  // (and coarse-pointer compact, which also sets `mobile` above 640px) the
-  // disclosure is their only home — provenance and promotion move here too.
+  // (and coarse-pointer compact) the panel is their only home (D-049).
+  // Provenance and promotion live here on every width (D-053).
   const diagnostics: ReactNode[] = [];
-  if (mobile) diagnostics.push(<span key="host" className={session.metaHost}>{hostName}</span>);
+  if (mobile) diagnostics.push(<span key="host" data-testid="run-details-host">{hostName}</span>);
   diagnostics.push(
     <span key="driver" data-testid="session-driver">
       {promoted ? `${instance.driver} · promoted` : instance.driver}
@@ -445,16 +568,16 @@ export function SessionPage({
   if (structuredOnly && !showTerminal) {
     diagnostics.push(<span key="structured-only">structured-only — 无终端 tab</span>);
   }
-  if (mobile && promoted) {
+  if (promoted) {
     diagnostics.push(
-      <span key="promoted" className={session.status} data-testid="promoted-badge" title={
+      <span key="promoted" data-testid="promoted-badge" title={
         instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
       }>
         {instance.kind} · promoted
       </span>,
     );
   }
-  if (mobile && instance.launchedBy) {
+  if (instance.launchedBy) {
     diagnostics.push(<LaunchedByMark key="launched-by" launchedBy={instance.launchedBy} />);
   }
   diagnostics.push(<ConnectionIndicator key="connection" status={connLabel} />);
@@ -502,6 +625,86 @@ export function SessionPage({
     index === 0 ? [node] : [<span key={`sep-${index}`} className={session.dotSep}>·</span>, node],
   );
 
+  // The ⋯ menu, in the fixed ui-spec §2.2 order. The view switch and Stop are
+  // never here (D-040 (2)).
+  const moreItems: MoreMenuItem[] = [
+    {
+      key: "run-details",
+      testId: "run-details-summary",
+      label: `运行详情 · ${diagnostics.length} 项`,
+      icon: Info,
+      checked: runDetailsOpen,
+      onSelect: () => toggleRunDetails(!runDetailsOpen),
+    },
+  ];
+  if (transcriptMounted) {
+    moreItems.push(
+      {
+        key: "search",
+        testId: "transcript-search-open",
+        label: "搜索正文",
+        icon: Search,
+        onSelect: openTranscriptSearch,
+      },
+      {
+        key: "collapse",
+        testId: "collapse-all",
+        label: "全部折叠",
+        icon: ListCollapse,
+        onSelect: collapseTranscript,
+      },
+    );
+  }
+  moreItems.push({
+    key: "density",
+    testId: "density-toggle",
+    label: "紧凑工具卡",
+    icon: Rows3,
+    checked: hub.compact,
+    data: { "data-mode": hub.compact ? "compact" : "full" },
+    onSelect: () => hubStore.setCompact(!hub.compact),
+  });
+  if (showViewExtras && !filesInline) {
+    moreItems.push({
+      key: "files",
+      testId: "files-toggle",
+      label: "文件",
+      icon: FileText,
+      checked: resolvedView === "files",
+      onSelect: toggleFiles,
+    });
+  }
+  if (showViewExtras) {
+    moreItems.push({
+      key: "events",
+      testId: "events-toggle",
+      label: "原始事件",
+      icon: ScrollText,
+      checked: resolvedView === "events",
+      onSelect: () => navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`),
+    });
+  }
+  // §2.2 item 7: the only annotation entry point. An archived task's session
+  // is a read-only preview, so the item stays visible but inert; terminal
+  // segments offer no annotations at all.
+  if (annotationReadonly && resolvedView !== "tty" && resolvedView !== "events") {
+    moreItems.push({
+      key: "annotate",
+      testId: "annotation-readonly-tag",
+      label: "只读预览 · 不可批注",
+      icon: MessageSquarePlus,
+      disabled: true,
+    });
+  } else if (annotationAllowed) {
+    moreItems.push({
+      key: "annotate",
+      testId: "annotation-add",
+      label: "加批注",
+      icon: MessageSquarePlus,
+      onSelect: () => annotationPanel.openPanel(instance.id, "card", null),
+    });
+  }
+
   return (
     <div
       className={session.page}
@@ -521,155 +724,31 @@ export function SessionPage({
       data-annotation-readonly={annotationReadonly ? "1" : "0"}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
-      <header className={session.header}>
-        <div className={session.headRow}>
-          {mobile ? (
-            <Link className={session.back} to="/sessions" aria-label="返回">
-              ←
-            </Link>
-          ) : null}
-          {/* D-040: on compact /s/:id* the whole chips strip folds into this
-              one current-space chip; it opens the unchanged spaces drawer. */}
-          {mobile ? (
-            <span className={session.headSpaceChip}>
-              <SpacesMobile
-                variant="chip"
-                spaces={workbench.spaces}
-                active={workbench.active}
-                prefs={workbench.prefs}
-                instanceId={workbench.instanceId}
-                onSelect={workbench.select}
-              />
-            </span>
-          ) : null}
-          {/* The chip already names the space, so the mobile title does not
-              repeat the "space / " prefix. */}
-          <h1 className={session.title} title={workspace ? `${workspace} / ${title}` : title}>
-            {workspace && !mobile ? `${workspace} / ${title}` : title}
-          </h1>
-          <span
-            className={session.status}
-            data-testid="session-status-label"
-            title={statusLabel}
-          >
-            <StateDot status={status} />
-            {/* At crowded phone widths only the dot shows; the word stays in
-                the DOM (tests, screen readers) and in the title tooltip. */}
-            <span className={session.statusWord}>{statusLabel}</span>
-          </span>
-          {/* Provenance and promotion badges ride the desktop main row; on
-              compact (including the coarse-pointer compact clause) they are
-              rendered once, inside the 运行详情 disclosure. */}
-          {!mobile ? (
-            <span className={session.headBadges}>
-              {promoted ? (
-                <span className={session.status} data-testid="promoted-badge" title={
-                  instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
-                }>
-                  {instance.kind} · promoted
-                </span>
-              ) : null}
-              <LaunchedByMark launchedBy={instance.launchedBy} />
-            </span>
-          ) : null}
-          {!mobile ? (
-            <>
-              <span className={session.hostChip} data-testid="session-host" title={`主机 ${hostName}`}>
-                {hostName}
-              </span>
-              <span className={session.costChip} data-testid="session-cost">
-                {cost}
-              </span>
-            </>
-          ) : null}
-          <span className={session.spacer} />
-          {showTerminal ? (
-            <ViewSwitch
-              value={resolvedView === "tty" ? "tty" : "structured"}
-              onChange={(next) => navigate(`/s/${instance.id}/${next}`)}
-            />
-          ) : null}
-          {crowded ? null : renderDensity(false)}
-          {crowded || !showViewExtras ? null : (
-            <>
-              {/* 文件/原始事件 stay inline whenever the row fits; only the
-                  crowded phone fold moves them into ⋯ (D-040). */}
-              {renderFiles(false)}
-              {renderEvents(false)}
-            </>
-          )}
-          {status === "exited" && !resumeOnOwnRow ? resumeControl : null}
-          {status !== "exited" ? (
-            <button
-              type="button"
-              className={session.stopBtn}
-              aria-label="Stop"
-              onClick={() => {
+      <WorkbenchSessionHeader
+        mobile={mobile}
+        title={title}
+        taskTitle={sessionTask?.title ?? null}
+        status={status}
+        statusLabel={statusLabel}
+        hostName={hostName}
+        cost={cost}
+        view={showTerminal ? (resolvedView === "tty" ? "tty" : "structured") : null}
+        onView={(next) => navigate(`/s/${instance.id}/${next}`)}
+        files={filesInline ? { active: resolvedView === "files", onToggle: toggleFiles } : null}
+        onStop={
+          status === "exited"
+            ? null
+            : () => {
                 void hubStore.close(instance.id);
-              }}
-            >
-              {mobile ? "■" : "■ 停止"}
-            </button>
-          ) : null}
-          {crowded ? (
-            <>
-              {/* The view switch and Stop are permanent main-row citizens;
-                  this ⋯ only ever holds Compact / 文件 / 原始事件. */}
-              <button
-                type="button"
-                className={session.moreBtn}
-                data-testid="session-more-open"
-                aria-label="更多会话操作"
-                aria-haspopup="menu"
-                aria-expanded={moreOpen}
-                ref={moreRef}
-                onClick={() => setMoreOpen((value) => !value)}
-              >
-                ⋯
-              </button>
-              <Sheet
-                open={moreOpen}
-                onClose={closeMore}
-                variant="sheet"
-                testId="session-more-sheet"
-                returnFocusRef={moreRef}
-              >
-                <div className={session.moreMenu} role="menu" aria-label="会话操作">
-                  {renderDensity(true)}
-                  {showViewExtras ? renderFiles(true) : null}
-                  {showViewExtras ? renderEvents(true) : null}
-                </div>
-              </Sheet>
-            </>
-          ) : null}
-        </div>
-        {resumeOnOwnRow ? (
-          <div className={session.resumeRow} data-testid="resume-row">
-            {resumeControl}
-          </div>
-        ) : null}
-        <RunDetails count={diagnostics.length}>{diagnosticRows}</RunDetails>
-      </header>
-      {nodeRestarted ? (
-        <div
-          className={session.nodeRestart}
-          data-testid="node-restart-banner"
-          title={nodeRestartEnd?.detail ?? undefined}
-        >
-          <span>{nodeRestartEnd?.label ?? "Node 重启，会话已中断"}</span>
-          <Button
-            variant="primary"
-            disabled={resuming || !canResume}
-            data-testid="node-restart-resume"
-            onClick={() => {
-              void startResume("structured");
-            }}
-          >
-            Resume
-          </Button>
-          {!canResume ? <span className={session.nodeRestartNote}>该会话没有可续接的 transcript</span> : null}
-        </div>
-      ) : null}
+              }
+        }
+        more={
+          <SessionMoreMenu open={moreOpen} onOpenChange={setMoreOpen} sheet={mobile} items={moreItems} />
+        }
+      />
+      <RunDetails count={diagnostics.length} open={runDetailsOpen} onClose={closeRunDetails}>
+        {diagnosticRows}
+      </RunDetails>
       {routeDown ? (
         <div className={session.routeDown} role="alert" data-testid="session-api-route-down">
           <span className={session.routeDownTitle}>
@@ -698,7 +777,7 @@ export function SessionPage({
           <FilesView
             hostId={instance.hostId}
             workspaceId={instance.workspaceId}
-            hostLabel={hubStore.hostName(instance.hostId)}
+            hostLabel={hostName}
             onBack={() => {
               if (location.key !== "default") navigate(-1);
               else navigate(backTo, { replace: true });
@@ -721,9 +800,11 @@ export function SessionPage({
           <ScreenView instance={instance} events={events} />
         ) : (
           <Transcript
+            ref={transcriptRef}
             events={events}
             bubbles={bubbles}
             compact={hub.compact}
+            earlierFloor={hub.earlierFloor}
             journalStatus={journalStatus}
             steerHeld={steerHeldControl(instance.kind, composerPhase, instance.capabilities)}
             onSteerHeld={async (_iid, id) => {
@@ -738,73 +819,79 @@ export function SessionPage({
           />
         )}
       </div>
-      {resolvedView === "tty" || resolvedView === "events" ? null : <div ref={setDockEl} className={session.dock} data-testid="session-dock">
-        {/* Zero-flow floating chip row anchored at the dock top: it rests
-            just above the composer (over the transcript edge) and never
-            shrinks the session body's measured viewport share — visible
-            whether the in-flow panel is open or not. */}
+      {resolvedView === "tty" || resolvedView === "events" ? (
+        // Terminal segments and raw events carry no dock, but an ended session
+        // still offers its one resume entry under the pane. Publish its height
+        // too: on /events there is no tty chrome, and without this the notify
+        // stack's safe-bottom fallback painted over the Resume button.
+        endedBar ? (
+          <div ref={setDockEl} className={session.endedDock} data-testid="session-ended-dock">
+            {endedBar}
+          </div>
+        ) : null
+      ) : <div ref={setDockEl} className={session.dock} data-testid="session-dock">
+        {/* Zero-flow floating chip row anchored at the dock top (c-composerpop
+            r2/r3): rests just above the composer over the transcript edge and
+            never shrinks the session body's measured viewport share. It carries
+            ONLY the annotation badge; per §2.2 item 7 the 加批注 entry point and
+            the read-only tag live in the ⋯ menu (a single testid each). */}
         <div className={annCss.floatLayer}>
           <div data-testid="annotation-dock" className={annCss.annotationBar}>
-            <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
-            {annotationAllowed ? (
-              <button
-                type="button"
-                className={annCss.badge}
-                data-testid="annotation-add"
-                onClick={() => annotationPanel.openPanel(instance.id, "card", null)}
-              >
-                ＋ 加批注
-              </button>
-            ) : annotationReadonly ? (
-              <span className={annCss.readonlyTag} data-testid="annotation-readonly-tag">
-                只读预览 · 不可批注
-              </span>
-            ) : null}
+            <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} floating />
           </div>
         </div>
-        <LiveStatusStrip
-          events={events}
-          instance={instance}
-          nativeRef={instance.nativeRef}
-          hasPending={pending.length > 0}
-          decision={turnDecision}
-          onInterrupt={() => hubStore.cancel(instance.id)}
-        />
+        {pending.length > 0 ? (
+          <div className={session.pendingArea} data-testid="pending-area">
+            {pending.map((item) =>
+              item.kind === "question" ? (
+                <QuestionForm
+                  key={item.id}
+                  interaction={item}
+                  busy={sending}
+                  onRespond={(answer) => {
+                    setSending(true);
+                    void hubStore.respond(item.id, answer).finally(() => setSending(false));
+                  }}
+                />
+              ) : item.kind === "elicitation" ? (
+                <ElicitationCard
+                  key={item.id}
+                  interaction={item}
+                  busy={sending}
+                  onRespond={(answer) => {
+                    setSending(true);
+                    void hubStore.respond(item.id, answer).finally(() => setSending(false));
+                  }}
+                />
+              ) : (
+                <ApprovalCard
+                  key={item.id}
+                  interaction={item}
+                  busy={sending}
+                  onRespond={(answer) => {
+                    setSending(true);
+                    void hubStore.respond(item.id, answer).finally(() => setSending(false));
+                  }}
+                />
+              ),
+            )}
+          </div>
+        ) : null}
         <SessionNotifications key={`notes-${instance.id}`} instanceId={instance.id} events={events} />
-        <TaskTrack tasks={tasks} />
-        {pending.map((item) =>
-          item.kind === "question" ? (
-            <QuestionForm
-              key={item.id}
-              interaction={item}
-              busy={sending}
-              onRespond={(answer) => {
-                setSending(true);
-                void hubStore.respond(item.id, answer).finally(() => setSending(false));
-              }}
-            />
-          ) : item.kind === "elicitation" ? (
-            <ElicitationCard
-              key={item.id}
-              interaction={item}
-              busy={sending}
-              onRespond={(answer) => {
-                setSending(true);
-                void hubStore.respond(item.id, answer).finally(() => setSending(false));
-              }}
-            />
-          ) : (
-            <ApprovalCard
-              key={item.id}
-              interaction={item}
-              busy={sending}
-              onRespond={(answer) => {
-                setSending(true);
-                void hubStore.respond(item.id, answer).finally(() => setSending(false));
-              }}
-            />
-          ),
+        {/* An ended SESSION says so once, in the EndedBar; the strip's
+            「回合结束」 would repeat it. An ended TURN of a live session keeps
+            the strip. */}
+        {endedBar ? null : (
+          <LiveStatusStrip
+            events={events}
+            instance={instance}
+            nativeRef={instance.nativeRef}
+            hasPending={pending.length > 0}
+            decision={turnDecision}
+            onInterrupt={() => hubStore.cancel(instance.id)}
+          />
         )}
+        <TaskTrack tasks={tasks} />
         {genericPty ? (
           <div className={session.keys} data-testid="keys-row">
             {(["enter", "esc", "ctrl+c"] as const).map((key) => (
@@ -829,7 +916,9 @@ export function SessionPage({
           taskTitle={sessionTask?.title ?? null}
           readonly={annotationReadonly}
         />
-        <Composer
+        {/* An ended session mounts no Composer: the EndedBar is its one
+            surface (and the one resume entry). */}
+        {endedBar ?? <Composer
           key={instance.id}
           instanceId={instance.id}
           mobile={mobile}
@@ -870,29 +959,29 @@ export function SessionPage({
           onFlushHeld={() => hubStore.flushHeld(instance.id)}
           onInterrupt={() => hubStore.cancel(instance.id)}
           permissionMode={
-            genericPty ? ptyYoloChipLabel(instance.kind) : hubStore.permissionModeOf(instance.id)
+            genericPty ? ptyYoloChipLabel(instance.kind) : hub.permissionMode
           }
           launchPermissionMode={
-            genericPty ? undefined : hubStore.launchPermissionModeOf(instance.id)
+            genericPty ? undefined : hub.launchPermissionMode
           }
-          permissionEffective={genericPty ? null : hubStore.permissionEffectiveOf(instance.id)}
-          permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}
+          permissionEffective={genericPty ? null : hub.permissionEffective}
+          permissionPending={genericPty ? null : hub.permissionPending}
           kind={instance.kind}
-          model={hubStore.modelOf(instance.id, instance.kind)}
+          model={hub.model}
           launchModel={instance.model ?? null}
-          models={hubStore.modelListOf(instance.id) ?? undefined}
-          modelEffective={hubStore.modelEffectiveOf(instance.id)?.id ?? null}
-          modelPending={hubStore.modelPendingOf(instance.id)}
-          modelSelectionPath={hubStore.modelEffectiveOf(instance.id)?.selectionPath ?? null}
-          modelCatalog={hubStore.modelCatalogOf(instance.id)}
-          effort={hubStore.effortOf(instance.id, instance.kind)}
-          effortEffective={hubStore.effortEffectiveOf(instance.id)}
-          effortPending={hubStore.effortPendingOf(instance.id)}
+          models={hub.models ?? undefined}
+          modelEffective={hub.modelEffective?.id ?? null}
+          modelPending={hub.modelPending}
+          modelSelectionPath={hub.modelEffective?.selectionPath ?? null}
+          modelCatalog={hub.modelCatalog}
+          effort={hub.effort}
+          effortEffective={hub.effortEffective}
+          effortPending={hub.effortPending}
           contextLabel={(() => {
             const pct = contextPercent(usage, instance.kind);
             return pct == null ? null : `${pct}%`;
           })()}
-          usageRollup={hubStore.usageRollupOf(instance.id)}
+          usageRollup={hub.usageRollup}
           onPermission={
             genericPty || instance.kind !== "claude"
               ? undefined
@@ -945,7 +1034,7 @@ export function SessionPage({
               setSending(false);
             }
           }}
-        />
+        />}
       </div>}
     </div>
   );

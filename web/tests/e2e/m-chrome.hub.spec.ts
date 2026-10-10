@@ -226,11 +226,13 @@ async function assertHitTarget(page: Page, target: Locator, owner: string): Prom
       ["br", cx + half - 0.5, cy + half - 0.5],
     ] as const) {
       if (!inside(x, y)) throw new Error(`${name}: ${corner} hot corner outside ${vw}x${vh}`);
-      const hit = document
-        .elementFromPoint(x, y)
-        ?.closest("[data-mchrome-owner]")
-        ?.getAttribute("data-mchrome-owner");
-      if (hit !== name) throw new Error(`${name}: ${corner} resolved to "${hit ?? "none"}"`);
+      const el = document.elementFromPoint(x, y);
+      const hit = el?.closest("[data-mchrome-owner]")?.getAttribute("data-mchrome-owner");
+      if (hit !== name) {
+        const box = `${rect.left.toFixed(1)},${rect.top.toFixed(1)} ${rect.width.toFixed(1)}x${rect.height.toFixed(1)}`;
+        const got = el ? `${el.tagName.toLowerCase()}.${el.className}` : "nothing";
+        throw new Error(`${name}: ${corner} (${x},${y}) resolved to "${hit ?? "none"}" (${got}); box ${box}`);
+      }
     }
   }, { owner, half: HALF });
 }
@@ -282,10 +284,15 @@ test.describe("390px compact session route", () => {
     await page.getByRole("button", { name: "关闭空间面板" }).click();
     await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
 
-    // view-switch + Stop stay in the header with full 44px hit geometry.
+    // view-switch + Stop stay in the header with full 44px hit geometry; the
+    // one-row header (D-053) is 52px and its 返回 / ⋯ own 44px zones too.
+    const headerBox = await page.locator("[data-testid='session-page'] > header").boundingBox();
+    expect(Math.round(headerBox!.height)).toBe(52);
+    await assertHitTarget(page, page.getByRole("link", { name: "返回" }), "back");
     await assertHitTarget(page, page.getByTestId("view-switch-tty"), "seg-tty");
     await assertHitTarget(page, page.getByTestId("view-switch-structured"), "seg-struct");
     await assertHitTarget(page, page.getByRole("button", { name: "Stop" }), "stop");
+    await assertHitTarget(page, page.getByTestId("session-more-open"), "more");
 
     // D-049 transcript fold: trigger only, chips unmounted; expand → same
     // components with the same testids.

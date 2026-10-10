@@ -93,7 +93,7 @@ export type Interaction = EntityMeta & {
   }>;
   delivery: "not-sent" | "intent-durable" | "written" | "confirmed" | "rejected" | "unknown";
   resolution: Knowledge<{
-    reason: "answered" | "native-cleared" | "native-cancelled" | "generation-ended" | "timed-out";
+    reason: "answered" | "native-cleared" | "native-cancelled" | "generation-ended" | "timed-out" | "agent-demoted";
     eventIds: Id[];
   }>;
 };

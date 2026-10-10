@@ -9,7 +9,7 @@
 
 use remuda_journal::{MapContext, WorkflowJournalTailer, WorkflowLaunch};
 use remuda_protocol::{
-    HostId, Id, InstanceId, ObservationPayload, RunId, SourceChannel, WorkflowState,
+    HostId, Id, InstanceId, Knowledge, ObservationPayload, RunId, SourceChannel, WorkflowState,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -371,4 +371,69 @@ impl<T> KnownExt for remuda_protocol::Knowledge<T> {
     fn is_known(&self) -> bool {
         matches!(self, remuda_protocol::Knowledge::Known { .. })
     }
+}
+
+/// c-cardsettle r4 item 5: `agent_failed` marks THAT workflow member failed
+/// (the owner sees which agent failed and can retry); the run row itself is a
+/// separate concern. Builds a minimal registered run with one member.
+#[test]
+fn agent_failed_marks_only_that_workflow_member() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_failed";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    fs::create_dir_all(&run_dir).unwrap();
+    // A minimal agent transcript so the run/member has an on-disk file.
+    fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("task1".into()),
+            tool_call_id: Some("toolu_wf".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // The member starts non-failed.
+    let before: Vec<_> = tailer
+        .poll()
+        .unwrap()
+        .into_iter()
+        .filter_map(|env| match env.body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(before.iter().all(|s| *s != WorkflowState::Failed));
+
+    // A subagent StopFailure marks exactly that member failed.
+    let out = tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    let states: Vec<_> = out
+        .into_iter()
+        .filter_map(|env| match env.body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        states.contains(&WorkflowState::Failed),
+        "the failed member must be reported Failed, got {states:?}"
+    );
 }

@@ -651,3 +651,32 @@ describe("SessionList hold-modifier badges (⌘1–9)", () => {
     expect(screen.queryByText(/⌘ /)).toBeNull();
   });
 });
+
+describe("SessionList relative-time clock (c-perffu r2)", () => {
+  it("advances 刚刚 → 1m while the hub snapshot reference never changes", async () => {
+    // react-testing act for fake-timer microtask flushes.
+    const { act } = await import("@testing-library/react");
+    vi.useFakeTimers();
+    const t0 = new Date("2026-09-29T10:00:00Z").getTime();
+    vi.setSystemTime(t0);
+    // One fixed fixture reference; no store listener ever fires.
+    hub.instances = [
+      session("ins_clock", {
+        updatedAt: new Date(t0 - 10_000).toISOString(),
+      }),
+    ];
+    try {
+      renderList();
+      expect(screen.getByText("刚刚")).toBeTruthy();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(61_000);
+      });
+
+      expect(screen.getByText("1m")).toBeTruthy();
+      expect(screen.queryByText("刚刚")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -14,6 +14,8 @@ workspace = true
 default = []
 # Embed `web/dist` when present at compile time; otherwise a 404 placeholder.
 embed-web = []
+# Test-only fault injection (Store fault flags, see store::test_faults).
+test-faults = []
 
 [dependencies]
 anyhow.workspace = true
@@ -53,15 +55,19 @@ webauthn-rs-core = "=0.5.5"
 
 [dev-dependencies]
 anyhow.workspace = true
+# Test-only fault injection; self dependency so integration tests compile
+# with the feature without pulling it into the production lib.
+remuda-hub = { path = ".", features = ["test-faults"] }
 base64 = "0.22"
 ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
 # Software ES256 authenticator for the passkey ceremony tests (D-029).
 openssl = "0.10"
 # utimensat/TimeSpec: tests backdate an access-code file's mtime to exercise
-# the round-3 "file newer than stamp" re-stamp rule. Features unify with the
-# normal-dep entry; no new crate is pulled.
-nix = { version = "0.28", default-features = false, features = ["fs", "time"] }
-# The offline Anthropic-Messages gateway the api-routing relay e2e runs against.
+# the round-3 "file newer than stamp" re-stamp rule. SO_RCVBUF on a follower's
+# unread socket lets the r7 settlement-order test deterministically force
+# writer backpressure. Features unify with the normal-dep entry; no new crate
+# is pulled.
+nix = { version = "0.28", default-features = false, features = ["fs", "time", "net", "socket"] }
 remuda-journal.workspace = true
 remuda-testing.workspace = true
 serde_cbor_2 = "0.13"

@@ -44,15 +44,18 @@ describe("endReason: interrupted (neutral, never red)", () => {
     });
   });
 
-  it("maps node-lost-instance and host-lost", () => {
+  it("maps node-lost-instance and the host-lost markers", () => {
     expect(endReason(input({ lastError: "node-lost-instance" }))).toMatchObject({
       label: "Node 已丢失该会话，会话已中断",
       tone: "interrupted",
     });
-    expect(endReason(input({ lifecycle: "failed", lastError: "host-lost" }))).toMatchObject({
-      label: "主机失联，会话已中断",
-      tone: "interrupted",
-    });
+    // ma-lineage r7 item 5(b): current and legacy spellings both map.
+    for (const code of ["host-contact-lost", "host-lost"]) {
+      expect(endReason(input({ lifecycle: "failed", lastError: code }))).toMatchObject({
+        label: "主机失联，会话已中断",
+        tone: "interrupted",
+      });
+    }
   });
 
   it("maps the herdr carrier family to one neutral sentence", () => {

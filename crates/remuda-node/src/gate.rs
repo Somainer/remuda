@@ -2187,10 +2187,24 @@ JSON
     /// Inner half of [`a_foreign_runs_gate_report_is_not_streamed`]: runs in a
     /// re-exec'd process whose TMPDIR is private, so the foreign root it
     /// plants can neither collide with another test run's nor pollute the
-    /// host ambient temp dir.
+    /// host ambient temp dir. The guard at the top panics unless the outer
+    /// test exported that TMPDIR, so a direct `--ignored`/`--include-ignored`
+    /// invocation can never plant the foreign root in the ambient temp dir.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "re-exec'd by a_foreign_runs_gate_report_is_not_streamed under a private TMPDIR"]
     async fn foreign_gate_report_is_not_streamed_inner() {
+        let tmpdir = std::env::var_os("TMPDIR").expect("outer test must export TMPDIR");
+        assert_ne!(
+            std::path::Path::new(&tmpdir),
+            std::path::Path::new("/tmp"),
+            "the planted foreign root needs a TMPDIR that is not /tmp"
+        );
+        assert_eq!(
+            std::env::temp_dir(),
+            std::path::PathBuf::from(&tmpdir),
+            "the foreign root is planted under $TMPDIR"
+        );
+
         let fixture = fixture(PASSING_SCRIPT);
         // Simulate a concurrent gate on this host: fresh, mtime-fresh report
         // under a pid this runner did not spawn.

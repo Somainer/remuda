@@ -210,16 +210,22 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   // Next-request context = 4794 + 29496 = 34290 → 17% of the 200k window.
   await sendUsageTurn(page, "4794,260,29496,0");
   await expect(chip).toHaveText("17%", { timeout: 15_000 });
-  // The additive Hub rollup rides the instance poll (2 s); the 17% label
-  // itself is already painted client-side from the usage event, so wait for
-  // the poll-hydrated rollup before exercising the popover.
-  await expect(chip).toHaveAttribute("data-has-popover", "1", { timeout: 10_000 });
   const ring = chip.locator("span").first();
   await expect(ring).toHaveAttribute("style", /--ctx-pct:\s*17%/);
-
+  // The additive Hub rollup rides the instance poll (2 s); the 17% label
+  // and ring paint client-side straight from the usage event. The chip's
+  // data-has-popover is a STATIC "1" (it opens the RC3 empty card too), so
+  // waiting on it never observed the poll. Open the card and gate on a
+  // ROLLUP-DERIVED signal instead: the turn row paints (and the empty-state
+  // note unmounts) at the rollup-hydrated commit.
   await chip.click();
   const popover = page.getByTestId("context-usage-popover");
   await expect(popover).toBeVisible();
+  // data-has-popover is static (RC3 empty card opens too), so wait for a
+  // ROLLUP-DERIVED signal before reading numbers: the turn row paints and
+  // the empty-state note unmounts at the rollup-hydrated commit.
+  await expect(page.getByTestId("context-usage-turns")).toHaveText("1", { timeout: 10_000 });
+  await expect(page.getByTestId("context-usage-empty-note")).toHaveCount(0);
   // The card (not the chip beneath) is the topmost thing at its own centre:
   // the element at the point must be the popover or one of its descendants.
   const popoverBox = await popover.boundingBox();
@@ -310,10 +316,13 @@ test("context chip popover becomes a sheet at 390 px touch width", async ({ brow
     await expect(narrow.getByTestId("composer-options-sheet")).toBeVisible();
     const chip = narrow.getByTestId("context-chip");
     await expect(chip).toHaveText("17%", { timeout: 15_000 });
-    await expect(chip).toHaveAttribute("data-has-popover", "1", { timeout: 10_000 });
     await chip.click();
     const sheet = narrow.getByTestId("context-usage-popover");
     await expect(sheet).toBeVisible();
+    // Same rollup-derived gate as desktop: wait for the turn row inside the
+    // sheet and for the empty-state note to unmount.
+    await expect(sheet.getByTestId("context-usage-turns")).toHaveText("1", { timeout: 10_000 });
+    await expect(narrow.getByTestId("context-usage-empty-note")).toHaveCount(0);
     await expect(sheet).toHaveAttribute("data-mobile", "1");
     // The sheet (not composer/chip beneath) is topmost near its top: the hit
     // element must be the sheet or a descendant.

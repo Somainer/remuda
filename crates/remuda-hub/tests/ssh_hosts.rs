@@ -409,7 +409,7 @@ async fn bridge_loss_preserves_instance_then_replays_from_hub_watermark() {
     .await;
     assert_eq!(disconnected["lifecycle"], "running", "{disconnected}");
     assert_eq!(disconnected["connectivity"], "disconnected");
-    assert_ne!(disconnected["lastError"], "host-lost");
+    assert_ne!(disconnected["lastError"], "host-contact-lost");
     std::fs::remove_file(remote.join("fixture-pause-bridge")).unwrap();
     wait_host(&hub, &token, id, |host| {
         host["online"] == true && host["lastError"].is_null()

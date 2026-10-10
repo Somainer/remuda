@@ -98,6 +98,24 @@ export const INTERACTION_LABEL: Record<InteractionUiState, string> = {
 };
 
 /**
+ * A card invalidated because its instance generation ended (c-cardsettle): the
+ * Hub settles it in the same transaction that makes the instance terminal,
+ * stamping `resolution.reason = generation-ended`. It shares the 已离队
+ * superseded projection, but the reason is the process ending — never another
+ * device answering — so its departed wording differs.
+ */
+export function generationEnded(interaction: Interaction): boolean {
+  return (
+    interaction.state === "invalidated"
+    && interaction.resolution.state === "known"
+    && interaction.resolution.value.reason === "generation-ended"
+  );
+}
+
+/** Departed-row wording for a generation-ended card (c-cardsettle). */
+export const DEPARTED_GENERATION_ENDED_TEXT = "进程已结束，未作用于新进程";
+
+/**
  * Whether the native side confirmed it dropped this request.
  *
  * `answer-committed` only says Remuda durably recorded an answer. Until the

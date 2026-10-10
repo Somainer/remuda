@@ -53,7 +53,7 @@ async function renderSession(instance: Instance, events: Observation[]) {
   vi.spyOn(store.hubStore, "titleOf").mockReturnValue("terminal");
   vi.spyOn(store.hubStore, "hostName").mockReturnValue("local");
   vi.spyOn(store.hubStore, "workspaceOf").mockReturnValue(undefined);
-  vi.spyOn(store, "useHub").mockReturnValue({
+  vi.spyOn(store.hubStore, "getSnapshot").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
     instances: [instance],

@@ -608,27 +608,83 @@ test.describe("notification stack clears the phone home bar at 390 (r2/r3 item 2
 
 
 test.describe("notification stack does not cover menus (item 8)", () => {
-  const raiseTwo = (page: Page) =>
-    page.evaluate(() => {
-      const lab = (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab;
-      // Distinct subjects = distinct keys, so both stack (taller stack).
-      lab?.notify({ severity: "blocking", subject: "standing one", stage: "standing error" });
-      lab?.notify({ severity: "blocking", subject: "standing two", stage: "standing error" });
-    });
   const clear = (page: Page) =>
     page.evaluate(() => {
       (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab?.dismissAllBlocking();
     });
 
+  // The permission menu is flush full-width option buttons, so the only inert
+  // chrome its top band offers is the popover's 7px padding; the effort panel
+  // has inert chrome (plain divs, the aria-hidden bolt) throughout. Rather
+  // than guessing how many rows reach which band, raise distinct standing
+  // errors (distinct subjects = distinct keys, BLOCKING_LIMIT 5) until the
+  // menu∩standing-error intersection actually contains an inert probe point.
+  const raiseBlockersUntilInertOverlap = async (page: Page, menuTestId: string) => {
+    const interactive =
+      'button,input,select,textarea,a[href],[role="button"],[role="slider"],[role="switch"],[tabindex]';
+    for (let n = 1; n <= 5; n++) {
+      // Raise the nth distinct standing error (distinct subject = distinct
+      // key; BLOCKING_LIMIT 5) and keep the legacy hubStore.toast fresh (2.4 s
+      // TTL), then wait for the React commit before measuring.
+      await page.evaluate((index) => {
+        const lab = (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab;
+        lab?.toast("已保存更改");
+        lab?.notify({
+          severity: "blocking",
+          subject: `standing ${index}`,
+          stage: "standing error",
+        });
+      }, n);
+      await page.waitForFunction(
+        (count) => document.querySelectorAll("[data-testid='blocking-error']").length === count,
+        n,
+      );
+      const hasInertOverlap = await page.evaluate(
+        ({ testId, interactive }) => {
+          const rectOf = (el: Element) => {
+            const r = el.getBoundingClientRect();
+            return { x: r.x, y: r.y, w: r.width, h: r.height };
+          };
+          const menu = document.querySelector<HTMLElement>(`[data-testid='${testId}']`);
+          const blocker = document.querySelector<HTMLElement>("[data-testid='blocking-errors']");
+          if (!menu || !blocker) return false;
+          const a = rectOf(menu);
+          const b = rectOf(blocker);
+          const region = {
+            x: Math.max(a.x, b.x),
+            y: Math.max(a.y, b.y),
+            w: Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x),
+            h: Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y),
+          };
+          if (region.w < 8 || region.h < 8) return false;
+          for (let yy = region.y + 2; yy < region.y + region.h - 2; yy += 2) {
+            for (let xx = region.x + 2; xx < region.x + region.w - 2; xx += 2) {
+              const el = document.elementFromPoint(xx, yy);
+              if (
+                el?.closest(`[data-testid='${testId}']`) &&
+                !(el as HTMLElement).closest(interactive)
+              ) {
+                return true;
+              }
+            }
+          }
+          return false;
+        },
+        { testId: menuTestId, interactive },
+      );
+      if (hasInertOverlap) return;
+    }
+    throw new Error(`standing-error stack never produced an inert overlap with ${menuTestId}`);
+  };
+
   test("open menus stay hit-testable above a blocking notification", async ({ page }) => {
-    // The standing-error stack is bottom-CENTER; the right-anchored
-    // permission menu never meets it at 1440, but the left-anchored effort
-    // panel does. Two blockers make that overlap tall enough to probe.
-    //
-    // Base build: .stack z-30 with default pointer events, popover z-5:
-    // the overlap hit resolves to the stack and stack pointer-events is
-    // "auto". Fixed: popover z-40, .stack pointer-events:none, only
-    // .blocking auto — the hit lands on the panel.
+    // The standing-error stack is bottom-CENTER and the menus open upward
+    // from the control bar; with the dock at its real (short) height the
+    // popups overlap the stack. Base build: .stack z-30 with default pointer
+    // events, popover z-5: the overlap hit resolves to the stack and stack
+    // pointer-events is "auto". Fixed: popover above the stack, .stack
+    // pointer-events:none with only .blocking auto — the hit lands on the
+    // menu.
     // Find a REAL-clickable INERT point — panel/menu chrome, never a control
     // (whose own click would close or change something). When useBlocker is
     // set the point is constrained to the menu∩standing-error intersection:
@@ -689,24 +745,44 @@ test.describe("notification stack does not cover menus (item 8)", () => {
       });
 
     await page.setViewportSize({ width: 1440, height: 900 });
-    await createSession(page, "composer popover zorder");
+    const id = await createSession(page, "composer popover zorder");
+    // Answer the create-time approval FIRST: while it stands it lives inside
+    // the measured session dock and hoists the stack hundreds of px up, out
+    // of the menus' geometry — the intersection probes below would then find
+    // no overlap (the r4 "separated" assertion passed only via that lift).
+    await clearApprovals(page, id);
+    await expect(page.getByTestId("composer-input")).toBeEnabled();
+    // Wait for the answered approval card to unmount AND for the
+    // ResizeObserver-published --session-dock-h to converge with the now
+    // shorter dock. The server answer lands immediately, but the client store
+    // learns it on its ~2 s poll, so the card (and the stale, taller anchor)
+    // outlives clearApprovals by a couple of seconds; probing against the
+    // stale anchor parks the stack above the menus with no intersection.
+    await expect(page.getByTestId("approval-card")).toHaveCount(0, { timeout: 15_000 });
+    await page.waitForFunction(
+      () => {
+        const dock = document.querySelector<HTMLElement>("[data-testid='session-dock']");
+        if (!dock) return false;
+        const varVal =
+          parseFloat(
+            getComputedStyle(document.documentElement).getPropertyValue("--session-dock-h"),
+          ) || NaN;
+        return dock.offsetHeight > 0 && Math.abs(varVal - dock.offsetHeight) <= 1;
+      },
+      null,
+      { timeout: 10_000 },
+    );
 
-    // Permission menu: a REAL click on the menu's own chrome (not a row,
-    // which selects-and-closes by design) is delivered to the menu and keeps
-    // it open while standing errors are up.
+    // Permission menu: open FIRST, THEN raise the blockers until they reach
+    // the menu's top chrome band — the r5 ordering. A REAL click on an INERT
+    // point inside the menu∩standing-error intersection is delivered to the
+    // menu and keeps it open while the standing errors are up.
     await page.getByTestId("permission-chip").click();
     const permMenu = page.getByTestId("permission-menu");
     await expect(permMenu).toBeVisible();
-    await raiseTwo(page);
-    await expect(page.getByText("standing one")).toBeVisible();
-    const permRow = permMenu.locator("[data-testid^='permission-option-']:not([disabled])").first();
-    const permBox = (await permRow.boundingBox())!;
-    const onPermRow = await page.evaluate((b) => {
-      const el = document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2);
-      return !!el?.closest("[data-testid='permission-menu']");
-    }, permBox);
-    expect(onPermRow).toBe(true);
-    const permPoint = await inertPoint("permission-menu", false);
+    await raiseBlockersUntilInertOverlap(page, "permission-menu");
+    await expect(page.getByText("standing error").first()).toBeVisible();
+    const permPoint = await inertPoint("permission-menu", true);
     expect(permPoint.ok, permPoint.ok ? "" : permPoint.reason).toBe(true);
     if (permPoint.ok) {
       await page.mouse.click(permPoint.x!, permPoint.y!);
@@ -714,15 +790,16 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     }
     await clear(page);
     await page.keyboard.press("Escape");
+    await expect(permMenu).toHaveCount(0);
 
-    // Effort panel. r4 item 1 anchors the stack ABOVE the session dock, so the
-    // panel (which pops up over the dock) and the centered stack no longer
-    // overlap by design — open first, then raise.
+    // Effort panel: same ordering — open, then raise. With the approval card
+    // gone the panel DOES overlap the centered stack; z-order keeps the panel
+    // on top.
     await page.getByTestId("model-effort-chip").click();
     const sliderPanel = page.getByTestId("effort-slider-panel");
     await expect(sliderPanel).toBeVisible();
-    await raiseTwo(page);
-    await expect(page.getByText("standing one")).toBeVisible();
+    await raiseBlockersUntilInertOverlap(page, "effort-slider-panel");
+    await expect(page.getByText("standing error").first()).toBeVisible();
 
     // Token guarantees (fail deterministically on base).
     const styles = await styleGuarantees(page);
@@ -731,27 +808,10 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     expect(styles!.blockingPointerEvents).toBe("auto");
     expect(styles!.panelZ).toBeGreaterThan(styles!.stackZ);
 
-    // The r4 item-1 lift separates the panel from the stack: with the blocker
-    // raised their rects must NOT intersect (the regression parked the stack
-    // across the chips/menus). Document the separation, then prove the panel is
-    // still fully interactive on its own: a REAL click on its chrome keeps it
-    // open while the standing error is up.
-    const separated = await page.evaluate(() => {
-      const rectOf = (el: Element) => {
-        const r = el.getBoundingClientRect();
-        return { x: r.x, y: r.y, w: r.width, h: r.height };
-      };
-      const panel = document.querySelector("[data-testid='effort-slider-panel']");
-      const blocker = document.querySelector("[data-testid='blocking-errors']");
-      if (!panel || !blocker) return false;
-      const a = rectOf(panel);
-      const b = rectOf(blocker);
-      const overlapX = a.x < b.x + b.w && a.x + a.w > b.x;
-      const overlapY = a.y < b.y + b.h && a.y + a.h > b.y;
-      return !(overlapX && overlapY);
-    });
-    expect(separated).toBe(true);
-    const effortPoint = await inertPoint("effort-slider-panel", false);
+    // Prove the panel is interactive INSIDE its overlap with the standing
+    // stack: a REAL click on inert panel chrome at an intersection point
+    // reaches the panel and leaves it open while the standing error is up.
+    const effortPoint = await inertPoint("effort-slider-panel", true);
     expect(effortPoint.ok, effortPoint.ok ? "" : effortPoint.reason).toBe(true);
     if (effortPoint.ok) {
       await page.mouse.click(effortPoint.x!, effortPoint.y!);
@@ -759,7 +819,7 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     }
     if (process.env.REMUDA_EVIDENCE === "1") {
       // 1440 desktop evidence paired with the 390 shots in the r3 item-1 suite.
-      await page.screenshot({ path: "test-results/composerpop-r4-menu-above-notify-1440.png", animations: "disabled" });
+      await page.screenshot({ path: "test-results/composerpop-r5-menu-above-notify-1440.png", animations: "disabled" });
     }
     await clear(page);
   });

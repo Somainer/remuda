@@ -605,6 +605,32 @@ impl EffortTracker {
         }
     }
 
+    /// c-effortread r8 item 5: restore the last published observation when a
+    /// demote/re-promotion builds a fresh tracker for the SAME (pid, session).
+    /// The seeded tracker re-latches level/flag/source/semantics so an
+    /// attachment-less assistant record after re-promotion keeps reporting the
+    /// known flag (e.g. `{high, ultracode: Some(true)}`) instead of dropping
+    /// it to `None`. Current-process is already true (this is a live
+    /// continuation, not a resume replay).
+    pub fn seed_observed(
+        &mut self,
+        name: EffortName,
+        ultracode: Option<bool>,
+        source: EffortSource,
+        semantics: EffortSemantics,
+    ) {
+        self.semantics = semantics;
+        self.last = Some(ObservedEffort { name, ultracode });
+        // `source` is mapper-owned bookkeeping; preserve the seeded source so
+        // the next observation is attributed consistently.
+        self.pending_source = source;
+        self.pending_source = source;
+        self.flag = ultracode;
+        self.ultracode_pending = false;
+        self.awaiting = None;
+        self.current_process = true;
+    }
+
     /// Put the tracker in pre-launch history mode (live mapper only). Until
     /// [`Self::mark_current_process`] is called, every state-mutating record
     /// (assistant levels, verdicts, attachments, slash arms) is ignored: a

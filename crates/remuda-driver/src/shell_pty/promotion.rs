@@ -914,6 +914,11 @@ pub(super) fn spawn(
         // demote/re-promotion continues the same transcript where it left
         // off instead of re-emitting it from the sticky anchor.
         let mut read_anchors = std::collections::HashMap::new();
+        // c-effortread r8 item 5: EffortTracker latch per (pid, session),
+        // captured from every pump and re-seeded into the replacement mapper
+        // on demote/re-promotion.
+        let mut effort_seeds: std::collections::HashMap<(i32, String), EffortTrackerSeed> =
+            std::collections::HashMap::new();
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1420,6 +1425,7 @@ pub(super) fn spawn(
                         &mut launch_mode,
                         pre_resume_mode,
                         &mut read_anchors,
+                        &mut effort_seeds,
                     )
                     .await;
                 }
@@ -1873,6 +1879,8 @@ async fn maintain_binding(
     launch_mode: &mut LaunchModeBinding,
     pre_resume_mode: Option<ResumeMode>,
     read_anchors: &mut std::collections::HashMap<(i32, String), TailAnchor>,
+    // c-effortread r8 item 5: tracker latch carried across re-promotion.
+    effort_seeds: &mut std::collections::HashMap<(i32, String), EffortTrackerSeed>,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -2040,6 +2048,11 @@ async fn maintain_binding(
             launch_permission,
             continue_resume_mode,
             continue_anchor,
+            // c-effortread r8 item 5: re-latch the tracker from the last
+            // hydrator for this (pid, session).
+            effort_seeds
+                .get(&(found.pid, binding.session_id.clone()))
+                .cloned(),
         );
     }
     if let Some(active) = hydrator.as_mut() {
@@ -2050,6 +2063,11 @@ async fn maintain_binding(
                 // the whole conversation.
                 if let Some(anchor) = active.tail.anchor() {
                     read_anchors.insert((found.pid, binding.session_id.clone()), anchor);
+                }
+                // c-effortread r8 item 5: remember the effort latch so the
+                // replacement mapper after a re-promotion keeps level/flag.
+                if let Some(seed) = EffortTrackerSeed::from_mapper(&active.mapper) {
+                    effort_seeds.insert((found.pid, binding.session_id.clone()), seed);
                 }
             }
             Err(()) => {
@@ -2244,6 +2262,33 @@ struct Hydrator {
     missing_polls: u32,
 }
 
+/// c-effortread r8 item 5: per-(pid, session) EffortTracker state that must
+/// survive a demote/re-promotion of the same pid/session. A new Hydrator builds
+/// a fresh TranscriptMapper whose tracker forgets the last level/flag/
+/// semantics; on a decoupled build with ultracode on at high, a later
+/// assistant record without a re-sent ultra_effort attachment then observed
+/// `{high, ultracode: None}` and the chip fell back to "high". Seeding the new
+/// tracker from the last PUBLISHED observation restores the latch.
+#[derive(Debug, Clone, Default)]
+struct EffortTrackerSeed {
+    /// The last published effort latch (level + tri-state flag + semantics).
+    last: Option<(
+        remuda_protocol::EffortName,
+        Option<bool>,
+        remuda_protocol::EffortSemantics,
+    )>,
+}
+
+impl EffortTrackerSeed {
+    /// Capture the current tracker latch from a live mapper (c-effortread r8
+    /// item 5). `None` when it has never observed a level.
+    fn from_mapper(mapper: &TranscriptMapper) -> Option<Self> {
+        mapper.effort_seed().map(|(name, flag, semantics)| Self {
+            last: Some((name, flag, semantics)),
+        })
+    }
+}
+
 /// Consecutive live-tail NotFound polls that mark the binding degraded.
 const LIVE_MISSING_POLL_DEGRADE: u32 = 3;
 
@@ -2268,6 +2313,9 @@ impl Hydrator {
         launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
         mode: ResumeMode,
         continue_anchor: Option<TailAnchor>,
+        // c-effortread r8 item 5: last published effort state from the prior
+        // hydrator for the same (pid, session), restored across re-promotion.
+        effort_seed: Option<EffortTrackerSeed>,
     ) -> Option<Self> {
         tracing::info!(
             instance_id = %ctx.instance_id.as_id(),
@@ -2303,6 +2351,11 @@ impl Hydrator {
         }
         if let Some(bridge) = permission_bridge {
             mapper = mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
+        }
+        // c-effortread r8 item 5: re-latch effort level/flag/semantics from the
+        // previous hydrator's last published observation on re-promotion.
+        if let Some(last) = effort_seed.and_then(|seed| seed.last) {
+            mapper = mapper.with_effort_seed(last);
         }
         // r7 item 4(c): a re-promotion of the same (pid, session) continues at
         // the last offset the previous hydrator read instead of replaying the
@@ -3510,6 +3563,7 @@ mod tests {
             None,
             mode,
             None,
+            None,
         )
         .expect("hydrator opens against the bound transcript")
     }
@@ -3537,7 +3591,9 @@ mod tests {
             .iter()
             .filter_map(|observation| match &observation.body {
                 ObservationPayload::Effort(payload) => {
-                    Some((payload.effective.name, payload.effective.readback_available))
+                    let row: (Option<remuda_protocol::EffortName>, Option<bool>) =
+                        (payload.effective.name, payload.effective.ultracode);
+                    Some(row)
                 }
                 _ => None,
             })
@@ -3585,13 +3641,12 @@ mod tests {
                 "content": [{"type": "text", "text": format!("reply {n}")}],
                 "stop_reason": "end_turn",
             },
-            "perTurnEffort": null,
         });
         if let Some(level) = effort {
             record
                 .as_object_mut()
                 .expect("object")
-                .insert("effort".into(), serde_json::json!(level));
+                .insert("perTurnEffort".into(), serde_json::json!(level));
         }
         let mut line = record.to_string();
         line.push('\n');
@@ -3919,12 +3974,24 @@ mod tests {
         assert!(bridge.has_pending());
 
         // The bound file is replaced (shrink): the boundary is lost.
+        // c-effortread r8 item 4(e): file shrink/replacement IS still a
+        // withdrawal trigger (only session-local exec stopped being one); the
+        // edge carries readbackAvailable=false, which effort_rows exposes
+        // separately (the level field is null on the withdrawal edge).
         std::fs::write(&fx.binding.path, "{\"rotated\":true}\n").expect("rotate");
         pump_once(&mut hydrator, &fx).await;
-        let edges = effort_rows(&drain(&mut fx));
+        let withdrawn: Vec<bool> = drain(&mut fx)
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                ObservationPayload::Effort(payload) => {
+                    Some(payload.effective.readback_available == Some(false))
+                }
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            edges,
-            vec![(None, Some(false))],
+            withdrawn,
+            vec![true],
             "one explicit read-back-unavailable edge withdraws the projected state"
         );
         assert!(
@@ -4332,6 +4399,7 @@ mod tests {
             None,
             ResumeMode::Boundary(child_boundary),
             None,
+            None,
         )
         .expect("hydrator opens on the resume boundary");
         pump(&mut hydrator, &tx, &seq, &ctx)
@@ -4365,6 +4433,141 @@ mod tests {
         assert!(
             conversation_hydrated(&second, "Set effort level to max"),
             "the post-spawn verdict publishes through the resume boundary"
+        );
+    }
+
+    /// c-effortread r8 item 5 (Opus): the EffortTracker latch survives a
+    /// demote/re-promotion. On a decoupled build with ultracode ON at high,
+    /// after a re-promotion an assistant record WITHOUT a new ultra_effort
+    /// attachment must still report the flag true (chip "ultracode"), not drop
+    /// to None (chip "high") — the replacement mapper is seeded from the last
+    /// published observation.
+    #[tokio::test]
+    async fn r8_item5_effort_tracker_latch_survives_repromotion() {
+        // Native 2.1.289 shape: a top-level attachment record with
+        // ultra_effort_enter, then the assistant high record rides the
+        // latched flag onto its edge.
+        let first_turn = format!(
+            "{}{}",
+            serde_json::json!({
+                "type":"attachment",
+                "attachment":{"type":"ultra_effort_enter","reminderType":"full"}
+            })
+            .to_string()
+                + "\n",
+            assistant_line(Some("high"), 2),
+        );
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &first_turn);
+        let bridge = std::sync::Arc::new(crate::effort::EffortBridge::new());
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Fresh, Some(&bridge));
+        pump_once(&mut hydrator, &fx).await;
+        let first = drain(&mut fx);
+        assert!(
+            effort_rows(&first).iter().any(|(name, flag)| *name
+                == Some(remuda_protocol::EffortName::High)
+                && *flag == Some(true)),
+            "the first epoch publishes high + ultracode on: {:?}",
+            effort_rows(&first)
+        );
+
+        // Capture the seed exactly as the production pump does.
+        let seed = EffortTrackerSeed::from_mapper(&hydrator.mapper).expect("seed captured");
+
+        // A FRESH replacement mapper (what a new Hydrator builds after
+        // demote/re-promotion) seeded with the latch: an attachment-less
+        // assistant record keeps the flag.
+        let mut seeded_mapper = TranscriptMapper::new(
+            remuda_protocol::DriverKind::ShellPty,
+            fx.ctx.instance_id.clone(),
+            fx.ctx.run_id.clone(),
+            fx.ctx.journal_id.clone(),
+            fx.ctx.host_id.clone(),
+            PUMP_SESSION.to_owned(),
+            "promoted".to_owned(),
+        );
+        seeded_mapper = seeded_mapper.with_effort_seed(seed.last.expect("seed has last"));
+        // An attachment-less assistant record at the SAME level after
+        // re-promotion: the seeded tracker's latch is still {High, on}, so it
+        // emits NO effort edge (no spurious {High, None} regression) and
+        // last_observed keeps the flag true.
+        let no_attachment = assistant_line(Some("high"), 9);
+        let mut mapped: Vec<_> = seeded_mapper.map_line(&no_attachment).expect("line maps");
+        mapped.extend(seeded_mapper.flush().expect("flush"));
+        let seeded_rows: Vec<(Option<remuda_protocol::EffortName>, Option<bool>)> = mapped
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                ObservationPayload::Effort(payload) => {
+                    Some((payload.effective.name, payload.effective.ultracode))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            seeded_rows.iter().all(|(_, flag)| *flag != Some(false)),
+            "the seeded mapper never emits a flag-off regression: {seeded_rows:?}"
+        );
+        assert_eq!(
+            seeded_mapper.effort_seed(),
+            Some((
+                remuda_protocol::EffortName::High,
+                Some(true),
+                remuda_protocol::EffortSemantics::Decoupled
+            )),
+            "the latch stays {{High, ultracode on}} after the attachment-less record"
+        );
+
+        // A CHANGE to a different level (max) rides the latched flag onto the
+        // new edge — this is the chip the review scenario actually reads.
+        let mut at_max = seeded_mapper;
+        let mut mapped_max: Vec<_> = at_max
+            .map_line(&assistant_line(Some("max"), 10))
+            .expect("line maps");
+        mapped_max.extend(at_max.flush().expect("flush"));
+        let max_rows: Vec<(Option<remuda_protocol::EffortName>, Option<bool>)> = mapped_max
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                ObservationPayload::Effort(payload) => {
+                    Some((payload.effective.name, payload.effective.ultracode))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            max_rows.iter().any(
+                |(name, flag)| *name == Some(remuda_protocol::EffortName::Max)
+                    && *flag == Some(true)
+            ),
+            "a level change carries the seeded ultracode flag onto the new edge: {max_rows:?}"
+        );
+
+        // The same high record on an UNSEEDED fresh mapper has no flag latch
+        // (regression baseline: pre-fix behaviour the seed replaces).
+        let mut unseeded = TranscriptMapper::new(
+            remuda_protocol::DriverKind::ShellPty,
+            fx.ctx.instance_id.clone(),
+            fx.ctx.run_id.clone(),
+            fx.ctx.journal_id.clone(),
+            fx.ctx.host_id.clone(),
+            PUMP_SESSION.to_owned(),
+            "promoted".to_owned(),
+        );
+        let mut mapped2: Vec<_> = unseeded
+            .map_line(&assistant_line(Some("high"), 9))
+            .expect("line maps");
+        mapped2.extend(unseeded.flush().expect("flush"));
+        let rows2: Vec<(Option<remuda_protocol::EffortName>, Option<bool>)> = mapped2
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                ObservationPayload::Effort(payload) => {
+                    Some((payload.effective.name, payload.effective.ultracode))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rows2.iter().all(|(_, flag)| *flag != Some(true)),
+            "without the seed the latch is gone (regression baseline): {rows2:?}"
         );
     }
 
@@ -4601,6 +4804,7 @@ mod tests {
             None,
             ResumeMode::Fresh,
             Some(anchor.clone()),
+            None,
         )
         .expect("the anchored tail reopens");
         pump_once(&mut reopened, &fx).await;

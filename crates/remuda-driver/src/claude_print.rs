@@ -2656,6 +2656,44 @@ impl TranscriptMapper {
         self
     }
 
+    /// c-effortread r8 item 5: snapshot the EffortTracker latch
+    /// (name, flag, semantics) for re-seeding a replacement mapper on
+    /// re-promotion. None when no level has been observed.
+    pub(crate) fn effort_seed(
+        &self,
+    ) -> Option<(
+        remuda_protocol::EffortName,
+        Option<bool>,
+        remuda_protocol::EffortSemantics,
+    )> {
+        let last = self.effort.last_observed()?;
+        Some((last.name, last.ultracode, self.effort.semantics()))
+    }
+
+    /// c-effortread r8 item 5: seed a freshly built mapper's EffortTracker
+    /// with the last published observation of the previous (same pid/session)
+    /// hydrator, so a demote/re-promotion does not forget the latched
+    /// level/flag/semantics. Without it a decoupled build with ultracode on
+    /// emits `{high, ultracode: None}` on the next attachment-less assistant
+    /// record and the chip drops from "ultracode" to "high".
+    pub(crate) fn with_effort_seed(
+        mut self,
+        seed: (
+            remuda_protocol::EffortName,
+            Option<bool>,
+            remuda_protocol::EffortSemantics,
+        ),
+    ) -> Self {
+        let (name, ultracode, semantics) = seed;
+        self.effort.seed_observed(
+            name,
+            ultracode,
+            remuda_protocol::EffortSource::Remuda,
+            semantics,
+        );
+        self
+    }
+
     /// Set whether the records about to be mapped are provenanced to THIS
     /// process (D-056 (4)).
     ///
@@ -2885,6 +2923,28 @@ impl TranscriptMapper {
             &mut self.mapper,
             &Outbound::from_value(Value::Object(frame)),
         )?;
+        // The outbound mapper emits conversation records; effort/model/
+        // permission EXTRAS (the read-back side channels) were computed in
+        // map_record against the ORIGINAL record — re-apply them to the frame
+        // emitted from the flushed group so a late flush() of the buffered
+        // assistant run still produces its effort edge (c-effortread r8 item 5
+        // exposed this: a seeded re-promoted mapper's flushed assistant record
+        // otherwise lost the ultracode flag).
+        //
+        // IMPORTANT: extras are applied in BOTH places — map_record applies
+        // them for a complete (non-buffered) record, emit_conversation applies
+        // them when the same record is emitted from the group buffer on
+        // flush(). The trackers dedup identical edges (last == observed is no
+        // edge), so a record that already emitted them produces nothing the
+        // second time.
+        if value.get("type").and_then(Value::as_str) == Some("assistant") {
+            out.extend(self.map_effort_assistant(&value)?);
+            out.extend(self.map_model_assistant(&value)?);
+        } else if value.get("type").and_then(Value::as_str) == Some("user") {
+            out.extend(self.note_effort_user(&value)?);
+            out.extend(self.note_model_user(&value)?);
+            out.extend(self.note_permission_user(&value)?);
+        }
         // Stamp authorship on the messages this record produced. Tool results
         // and tool calls carry their own identity and are left alone.
         if value.get("type").and_then(Value::as_str) == Some("user") {
@@ -2931,6 +2991,8 @@ impl TranscriptMapper {
         } else if kind == "system" {
             extra = self.note_model_system(&value)?;
         } else if kind == "attachment" {
+            // Top-level attachment records carry §9.1 ultra_effort_enter|exit
+            // (2.1.272+) in addition to queued_command lifecycle.
             extra = self.note_effort_attachment(&value)?;
         }
         let mut mapped = match kind {

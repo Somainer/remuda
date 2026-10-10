@@ -464,10 +464,20 @@ pub async fn list_instances(
         // rows are the same settled, host-gone sessions main always hid, and
         // filtering only the new spelling brought them all back into the PWA
         // list after the upgrade.
-        let host_lost = matches!(
+        //
+        // r9 item 4: the hide is gated on a TERMINAL lifecycle as well as
+        // the marker. Host loss is contact loss, not a death: a return-to-live
+        // event (a Node journaling ready/running, or the same-epoch daemon
+        // reconcile reporting RUNNING) brings the chapter back even though
+        // the projection preserves `last_error` as contact-loss history.
+        // Hiding purely on the marker would keep every revived session out
+        // of the PWA list forever.
+        let marked_host_lost = matches!(
             instance.last_error.as_deref(),
             Some(crate::store::HOST_LOST_MARKER | crate::store::LEGACY_HOST_LOST_MARKER)
         );
+        let terminal = matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed");
+        let host_lost = marked_host_lost && terminal;
         let mut keep = !host_lost || query.include_history;
         if agent {
             let caller_id = device.instance_id.as_deref();

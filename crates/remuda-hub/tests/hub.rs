@@ -295,6 +295,23 @@ async fn device_and_enroll(
     Ok((cookie, token, enroll))
 }
 
+/// Read one JSON-RPC frame from a fake Node websocket (hub e2e).
+async fn next_reply(
+    node: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Result<Value> {
+    use futures::StreamExt;
+    let frame = node
+        .next()
+        .await
+        .context("ws frame missing")?
+        .context("ws frame error")?
+        .into_text()
+        .context("ws text")?;
+    Ok(serde_json::from_str(&frame)?)
+}
+
 /// model-pin-1 §5.4 public-API regression: a launch `model_pin_mismatch`
 /// diagnostic the Node appends is projected onto the instance and served
 /// verbatim on the public GET instance JSON, so run details keeps it even
@@ -6295,5 +6312,172 @@ async fn concurrent_retries_against_dead_forward_all_report_unforwarded() -> Res
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(sends_back.load(Ordering::Relaxed), 1);
     assert_eq!(sends.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+/// r9 item 4: host loss is contact loss, not a death. A swept row that
+/// later reports a return-to-live state reappears in the DEFAULT instance
+/// list even though the projection preserves the host-lost marker as
+/// history; a still-terminal marked row stays hidden.
+#[tokio::test]
+async fn a_revived_host_lost_chapter_reappears_in_the_default_list() -> Result<()> {
+    async fn connect(
+        addr: std::net::SocketAddr,
+        token: &str,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
+        let mut request = format!("ws://{addr}/v1/node").into_client_request()?;
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse()?);
+        let (ws, _) = tokio_tungstenite::connect_async(request).await?;
+        Ok(ws)
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = HubConfig::for_test(dir.path().join("data"));
+    config.host_lost_grace_ms = 20;
+    let hub = spawn(config).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+
+    let mut node = connect(hub.addr, &enroll).await?;
+    node.send(Message::Text(
+        json!({"jsonrpc":"2.0","id":"hello","method":"node.hello",
+            "params":{"hostId":host_id.as_id(),"nodeVersion":"test","label":"revive-test"}
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let hello: Value = next_reply(&mut node).await?;
+    let node_token = hello["result"]["nodeToken"]
+        .as_str()
+        .expect("nodeToken")
+        .to_owned();
+
+    let mut ids = Vec::new();
+    for seq in ["1", "3"] {
+        let id = InstanceId::new();
+        node.send(Message::Text(
+            json!({"jsonrpc":"2.0","id":seq,"method":"journal.append",
+                "params":{"instanceId":id.as_id(),"event":{
+                    "kind":"lifecycle",
+                    "payload":{"type":"entity","entityType":"instance","state":"ready"}
+                }}}
+            )
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        assert!(next_reply(&mut node).await?.get("result").is_some());
+        ids.push(id);
+    }
+    let revived = ids[0].as_id().to_string();
+    let still_gone = ids[1].as_id().to_string();
+    drop(node);
+
+    // Sweep: both hidden from the default list.
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (_, _, body) = http(
+                hub.addr,
+                "GET",
+                "/v1/instances",
+                &[("Cookie", &cookie)],
+                None,
+            )
+            .await?;
+            if serde_json::from_str::<Value>(&body)?["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+            {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+
+    // Same host returns; journal a return-to-live event for ONE swept
+    // chapter (the projection keeps last_error).
+    let mut node2 = connect(hub.addr, &node_token).await?;
+    node2
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":"r1","method":"node.hello",
+                "params":{"hostId":host_id.as_id(),"nodeVersion":"test","label":"revive-test"}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    assert!(next_reply(&mut node2).await?.get("result").is_some());
+    node2
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":"r2","method":"journal.append",
+                "params":{"instanceId":revived,"event":{
+                    "kind":"lifecycle",
+                    "payload":{"type":"entity","entityType":"instance","state":"ready"}
+                }}}
+            )
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    assert!(next_reply(&mut node2).await?.get("result").is_some());
+
+    // The revived chapter is back in the DEFAULT list — its row still
+    // carries the host-lost marker, but the lifecycle is live again.
+    let default_list = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (_, _, body) = http(
+                hub.addr,
+                "GET",
+                "/v1/instances",
+                &[("Cookie", &cookie)],
+                None,
+            )
+            .await?;
+            let value = serde_json::from_str::<Value>(&body)?;
+            let listed: Vec<String> = value["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["instanceId"].as_str().unwrap().to_owned())
+                .collect();
+            if listed.iter().any(|id| id == &revived) {
+                break Ok::<_, anyhow::Error>(listed);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    assert!(
+        !default_list.iter().any(|id| id == &still_gone),
+        "the still-terminal marked chapter stays hidden: {default_list:?}"
+    );
+    let (_, _, row_body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{revived}"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    let row: Value = serde_json::from_str(&row_body)?;
+    assert_eq!(
+        row["lastError"], "host-contact-lost",
+        "marker kept as history: {row}"
+    );
+    assert_ne!(
+        row["lifecycle"], "exited",
+        "the revived chapter is live again: {row}"
+    );
+    drop(node2);
+    hub.shutdown().await;
     Ok(())
 }

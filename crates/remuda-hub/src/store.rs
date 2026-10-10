@@ -3753,10 +3753,24 @@ impl Store {
                     // The node epoch changed: the old process is provably
                     // gone — stamp ended_at so the row releases its seat/
                     // fan-out, preserving the reason as context.
+                    //
+                    // ma-lineage r7 item 4: a chapter that was LIVE when the
+                    // Node restarted gets last_error = `node-epoch-changed`
+                    // UNCONDITIONALLY, even when a stale entity error is still
+                    // on the row (the projection keeps a non-null last_error
+                    // via COALESCE after the chapter returned to ready). The
+                    // web keys its "Node restarted" end reason and Resume
+                    // affordance on that exact spelling, so the old error must
+                    // not leak. Only rows that were ALREADY exited/failed keep
+                    // their existing error (COALESCE).
                     tx.execute(
                         "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                             ended_at = COALESCE(ended_at, ?1),
-                            last_error = CASE WHEN last_error IS NULL THEN ?2 ELSE last_error END,
+                            last_error = CASE
+                                WHEN lifecycle IN ('exited', 'failed')
+                                    THEN COALESCE(last_error, ?2)
+                                ELSE ?2
+                            END,
                             updated_at = ?1
                          WHERE id = ?3",
                         params![&now, &reason, id],
@@ -9672,6 +9686,84 @@ mod tests {
                 "epoch change stamps end evidence for {id}"
             );
         }
+        store.close().await;
+    }
+
+    /// ma-lineage r7 item 4: on a nodeEpoch change, a chapter that was LIVE
+    /// (but still carries a stale entity error — the projection keeps a
+    /// non-null last_error after a return to ready) is exited with
+    /// `node-epoch-changed`, the exact spelling the web keys its Node-restart
+    /// end reason and Resume affordance on. A row already exited/failed keeps
+    /// its existing error.
+    #[tokio::test]
+    async fn epoch_change_replaces_stale_error_on_formerly_live_rows() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "epoch-staleerror").await;
+
+        let recovered = seed_acknowledged_instance(&store, &host).await;
+        let already_failed = seed_acknowledged_instance(&store, &host).await;
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        // A turn/entity error while the chapter was up, followed by a return
+        // to ready: the projection keeps the old last_error via COALESCE.
+        db.execute(
+            "UPDATE instances SET last_error = 'api-error: 429' WHERE id = ?1",
+            rusqlite::params![recovered.instance_id],
+        )
+        .unwrap();
+        // An evidence-less already-failed row carries the same stale error.
+        db.execute(
+            "UPDATE instances SET lifecycle = 'failed', ended_at = NULL,
+                last_error = 'api-error: 429' WHERE id = ?1",
+            rusqlite::params![already_failed.instance_id],
+        )
+        .unwrap();
+        drop(db);
+
+        store
+            .record_node_epoch(host.clone(), Some("a".into()))
+            .await
+            .unwrap();
+        store
+            .record_node_epoch(host.clone(), Some("b".into()))
+            .await
+            .unwrap();
+        let (lost, _) = store
+            .reconcile_reported_instances(host, vec![], "node-epoch-changed".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(lost.len(), 2);
+
+        let recovered = store
+            .get_instance(recovered.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.lifecycle, "exited");
+        assert_eq!(
+            recovered.last_error.as_deref(),
+            Some("node-epoch-changed"),
+            "a formerly-live row gets the restart reason, not the stale error"
+        );
+        assert!(
+            store
+                .instance_has_process_end_evidence(&recovered)
+                .await
+                .unwrap(),
+            "the epoch end stamps end evidence"
+        );
+
+        let already_failed = store
+            .get_instance(already_failed.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            already_failed.last_error.as_deref(),
+            Some("api-error: 429"),
+            "an already-terminal row keeps its existing error"
+        );
         store.close().await;
     }
 

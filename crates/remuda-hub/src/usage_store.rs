@@ -170,9 +170,12 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
 }
 
 /// Query every cumulative session stock a new scoped point must not move
-/// backwards against: the point's OWN session id plus any LEGACY NULL-scope
-/// session rows (c-ctxusage r5 item 3B). A byte-0 restart replay cannot
-/// re-append a smaller stock than the old-format cumulative total.
+/// backwards against: the point's OWN session id, and — only while that
+/// instance has no scoped session rows yet — LEGACY NULL-scope session rows
+/// (c-ctxusage r5 item 3B / r6 item 5). A byte-0 restart replay cannot
+/// re-append a smaller stock than the old-format cumulative total, but once
+/// scoped rows exist for the instance the legacy total is stale history and
+/// must not floor a DIFFERENT, later scoped session's stock.
 fn existing_session_floors(
     conn: &Connection,
     row: &UsageEventRow,
@@ -181,7 +184,16 @@ fn existing_session_floors(
         "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session'
-           AND (scope_id = ?2 OR scope_id IS NULL)",
+           AND scope_id = ?2
+         UNION ALL
+         SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+         FROM usage_events
+         WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM usage_events
+               WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NOT NULL
+               LIMIT 1
+           )",
     )?;
     let floors = stmt
         .query_map(params![row.instance_id, row.scope_id], |r| {
@@ -2926,6 +2938,66 @@ mod tests {
             Some(1200),
             "scoped world ignores the legacy row; the small replay never clobbered 1000"
         );
+    }
+
+    /// r6 item 5: the legacy NULL-scope floor applies only WHILE the instance
+    /// has no scoped session rows. The FIRST scoped session is still floored
+    /// by the old cumulative total, but once scoped rows exist a DIFFERENT
+    /// later session must not be frozen by that unrelated legacy number.
+    #[test]
+    fn legacy_null_scope_floor_does_not_freeze_a_second_scoped_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // One legacy cumulative row for a former session: 1000.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &legacy_session_row(1, "ins_5", 1000, 100, "2020-01-01T00:00:00.000Z")
+            )
+            .unwrap()
+        );
+        // First scoped session: no scoped rows yet, so the legacy floor
+        // applies; 500 is frozen, 1200 lands.
+        assert!(
+            !insert(
+                &conn,
+                &scoped_record(10, "ins_5", "session", Some("s1"), 1, 500, 50, 0, 0, None)
+            ),
+            "the FIRST scoped session is still floored by the legacy row"
+        );
+        assert!(insert(
+            &conn,
+            &scoped_record(11, "ins_5", "session", Some("s1"), 1, 1200, 120, 0, 0, None)
+        ));
+
+        // A different, later session with a much smaller stock: scoped rows
+        // now exist, so the legacy floor is irrelevant and it appends.
+        assert!(
+            insert(
+                &conn,
+                &scoped_record(12, "ins_5", "session", Some("s2"), 1, 100, 10, 0, 0, None)
+            ),
+            "a later scoped session must not be floored by another session's legacy total"
+        );
+        // Its own per-scope-id floor still works: a shrink within s2 freezes.
+        assert!(
+            !insert(
+                &conn,
+                &scoped_record(13, "ins_5", "session", Some("s2"), 1, 80, 8, 0, 0, None)
+            ),
+            "the own-scope-id floor still freezes a backwards s2 point"
+        );
+        // s2's current stock is exactly its own point.
+        let points = conn
+            .query_row(
+                "SELECT input_tokens FROM usage_events
+                 WHERE instance_id = 'ins_5' AND scope = 'session' AND scope_id = 's2'
+                 ORDER BY observed_at DESC, seq DESC LIMIT 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(points, 100);
     }
 
     /// r5 item 7: a bulk codex replay with NO native timestamps (ingest

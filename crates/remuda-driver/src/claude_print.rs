@@ -1538,7 +1538,7 @@ fn usage_from_result(
         amount: amount.to_string(),
         currency: "USD".into(),
     });
-    Ok(Some(mapper.observation(
+    let mut observation = mapper.observation(
         Completeness::Structured,
         NativeRequestKey::None,
         ObservationPayload::Usage(Box::new(UsagePayload {
@@ -1571,7 +1571,18 @@ fn usage_from_result(
             accounting: remuda_protocol::Accounting::Reported,
             native_fields_ref: None,
         })),
-    )?))
+    )?;
+    // c-ctxusage r6 item 2: this is a LIVE print/sdk delivery (the terminal
+    // `result` read at process receipt), so the receipt time IS the native
+    // call time. The Hub's rate windows (TPM / lastTurnAt) fold only rows with
+    // a native timestamp, so leaving it Unknown dropped live print/sdk turns
+    // from every window even though nothing is being replayed. Historical
+    // transcript replays go through `usage_from_usage_object`, which carries
+    // the record's own timestamp instead.
+    observation.native_at = Knowledge::Known {
+        value: observation.observed_at.clone(),
+    };
+    Ok(Some(observation))
 }
 
 fn map_task_started(mapper: &mut Mapper, task: &TaskStarted) -> DriverResult<Vec<Observation>> {
@@ -4164,5 +4175,46 @@ mod plan_review_mint_tests {
             plan: Some(PLAN.into()),
         }));
         assert!(remuda_driver::interaction::validate_answer(&review, &approval_answer).is_err());
+    }
+
+    /// c-ctxusage r6 item 2: a LIVE print/sdk `result` usage frame is stamped
+    /// with its receipt time as `native_at` (delivery is Live), so the Hub
+    /// counts it in the TPM/lastTurnAt windows. Before the fix it stayed
+    /// Unknown and was excluded like a bulk replay.
+    #[test]
+    fn live_result_usage_carries_receipt_time_as_native_at() {
+        let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, "sess-live");
+        let frame = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "duration_ms": 420,
+            "duration_api_ms": 400,
+            "num_turns": 1,
+            "result": "done",
+            "stop_reason": "end_turn",
+            "total_cost_usd": 0.001,
+            "usage": { "input_tokens": 250, "output_tokens": 30 },
+            "modelUsage": {},
+            "permission_denials": [],
+            "session_id": "66666666-6666-4666-8666-666666666666",
+            "uuid": "dddddddd-dddd-4ddd-8ddd-ddddddddd020",
+            "result_index": 1
+        });
+        let observations = mapper.map(frame).expect("map result");
+        let usage = observations
+            .iter()
+            .find(|obs| matches!(obs.body, ObservationPayload::Usage(_)))
+            .expect("result frame emits one usage observation");
+        assert_eq!(usage.source.delivery, SourceDelivery::Live);
+        match &usage.native_at {
+            Knowledge::Known { value } => {
+                assert_eq!(
+                    value, &usage.observed_at,
+                    "live receipt time is the native call time"
+                );
+            }
+            other => panic!("native_at must be Known on live result usage, got {other:?}"),
+        }
     }
 }

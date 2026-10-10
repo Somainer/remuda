@@ -3031,4 +3031,105 @@ mod tests {
         assert_eq!(rollup.session_input_tokens, Some(340));
         assert_eq!(rollup.last_turn_at.as_deref(), Some(now.as_str()));
     }
+
+    /// r6 item 2: a LIVE claude-print/sdk result row is stamped with its
+    /// receipt time as `nativeAt`, so it enters the rate windows and sets
+    /// lastTurnAt even though no historical timestamp exists; a BULK replay
+    /// carrying an old native timestamp still counts totals but stays out of
+    /// the current windows. The old `observed_at_source='native'` filter
+    /// silently dropped every live print/sdk row because the mapper left
+    /// native_at Unknown (source 'ingest').
+    #[test]
+    fn live_print_result_usage_enters_windows_historical_replay_stays_out() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // Bulk replay first: two old turns with their real (hours-old) native
+        // times, ingested now — same counters, old stamps.
+        let old1 = ago(7_200);
+        let old2 = ago(7_000);
+        let replay1 = scoped_record(
+            1,
+            "ins_live",
+            "turn",
+            Some("replay-1"),
+            1,
+            500,
+            50,
+            0,
+            0,
+            Some(&old1),
+        );
+        let replay2 = scoped_record(
+            2,
+            "ins_live",
+            "turn",
+            Some("replay-2"),
+            1,
+            700,
+            70,
+            0,
+            0,
+            Some(&old2),
+        );
+        assert!(insert(&conn, &replay1));
+        assert!(insert(&conn, &replay2));
+        let rollup = rollup_instance(&conn, "ins_live", "claude", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.turns, 2, "replayed turns count as turns");
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(1_200),
+            "totals fold history"
+        );
+        assert_eq!(rollup.tpm_in_60s, None, "history is not current throughput");
+        assert_eq!(rollup.tpm_in_5m, None);
+        assert_eq!(
+            rollup.last_turn_at.as_deref(),
+            Some(old2.as_str()),
+            "the newest NATIVE time still wins, even if historical"
+        );
+
+        // Now the live print result: the driver stamps nativeAt = receipt.
+        let receipt = ago(2);
+        let live = scoped_record(
+            3,
+            "ins_live",
+            "turn",
+            Some("live-result"),
+            1,
+            250,
+            25,
+            0,
+            0,
+            Some(&receipt),
+        );
+        // Sanity: projection really treated the stamped time as native.
+        assert_eq!(
+            project_usage_event(&live, None, None)
+                .unwrap()
+                .observed_at_source,
+            "native",
+            "a stamped live result is a native-time row"
+        );
+        assert!(insert(&conn, &live));
+        let rollup = rollup_instance(&conn, "ins_live", "claude", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.turns, 3);
+        assert_eq!(rollup.session_input_tokens, Some(1_450));
+        assert_eq!(
+            rollup.tpm_in_60s,
+            Some(250),
+            "the live receipt-time turn enters the 60 s window; history does not"
+        );
+        assert_eq!(rollup.tpm_out_60s, Some(25));
+        assert_eq!(rollup.tpm_in_5m, Some(50), "250 over the 5-minute average");
+        assert_eq!(
+            rollup.last_turn_at.as_deref(),
+            Some(receipt.as_str()),
+            "lastTurnAt follows the live receipt time"
+        );
+    }
 }

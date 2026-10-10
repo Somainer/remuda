@@ -1682,7 +1682,17 @@ impl SessionModeTable {
         if let Some(entry) = self.modes.get(&key) {
             return *entry;
         }
-        let first_for_pid = self.first_pid.insert(pid);
+        // c-effortread r8 item 4(a): "first for pid" is about WHICH session the
+        // pid launched with, not the transcript handed to this first record.
+        // If argv's session id names a DIFFERENT session than the one being
+        // recorded, the argv session is stale (an in-TUI switch already
+        // happened, e.g. a hook delivery racing the first poll) — record this
+        // as a rebound, never as the launch's own first session.
+        let argv_names_other_session = found
+            .session_id
+            .as_deref()
+            .is_some_and(|argv_id| argv_id != session_id);
+        let first_for_pid = self.first_pid.insert(pid) && !argv_names_other_session;
         let (mode, rebound) = if first_for_pid {
             // The launched process's own FIRST reported session. A pre-spawn
             // capture (a Remuda-launched resume) wins. Without one the mode
@@ -2006,9 +2016,20 @@ async fn maintain_binding(
         let mode = epoch_mode(launch_mode, pre_resume_mode, sticky, &bound_found);
         // r7 item 4(c): continue a re-promoted same-session tail at its last
         // read offset instead of replaying from the sticky anchor.
+        // c-effortread r8 item 4(c): a CURRENT (Fresh, gate-open) anchor must
+        // reopen as a live tail — never forced into a resume tail, which would
+        // turn subsequent Fresh edges into Unverified.
         let continue_anchor = read_anchors
             .get(&(found.pid, binding.session_id.clone()))
-            .copied();
+            .cloned();
+        let continue_live = continue_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.current);
+        let continue_resume_mode = if continue_live {
+            ResumeMode::Fresh
+        } else {
+            mode
+        };
         *hydrator = Hydrator::open(
             ctx,
             &binding,
@@ -2017,7 +2038,7 @@ async fn maintain_binding(
             model,
             permission_bridge,
             launch_permission,
-            mode,
+            continue_resume_mode,
             continue_anchor,
         );
     }
@@ -4071,6 +4092,75 @@ mod tests {
         assert!(table.mode_for(8, LATE_STARTER).is_none());
     }
 
+    /// c-effortread r8 item 4(a): the pid's first RECORDED session is assumed
+    /// to be the launch session only when argv agrees. If argv names a
+    /// different session (a hook/poll raced an in-TUI switch), the recorded
+    /// session is a rebound.
+    #[test]
+    fn r8_item4a_first_recorded_session_that_disagrees_with_argv_is_a_rebound() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let launched = slug_session(dir.path(), &cwd, "launch-id", "{}\n");
+        let switched = slug_session(dir.path(), &cwd, "switched-id", "{}\n");
+        let mut table = SessionModeTable::default();
+        // argv says the launch session is "launch-id" but the first RECORDED
+        // session is "switched-id". Without a hook source the rebound file is
+        // non-empty → unverified anchor; the key assertion is rebound=true.
+        let argv_found = detected_claude(9, Some("launch-id"));
+        let m = table.record(9, "switched-id", Some(&switched), None, None, &argv_found);
+        assert!(
+            m.rebound,
+            "argv disagreement => the recorded session is a rebound"
+        );
+        assert!(
+            matches!(m.mode, ResumeMode::Boundary(_)),
+            "non-empty file without a clear source sizes to an unverified anchor"
+        );
+
+        // With a /clear source the same argv disagreement is a rebound Fresh.
+        let mut table_clear = SessionModeTable::default();
+        let cleared = table_clear.record(
+            9,
+            "switched-id",
+            Some(&switched),
+            None,
+            Some("clear"),
+            &argv_found,
+        );
+        assert!(cleared.rebound);
+        assert_eq!(cleared.mode, ResumeMode::Fresh);
+
+        // Agreement stays the launch session.
+        let mut table2 = SessionModeTable::default();
+        let agreed = table2.record(
+            9,
+            "launch-id",
+            Some(&launched),
+            None,
+            None,
+            &detected_claude(9, Some("launch-id")),
+        );
+        assert!(
+            !agreed.rebound,
+            "argv agreement => the first session is the launch session"
+        );
+        // No argv session id at all: first recorded wins (legacy behaviour).
+        let mut table3 = SessionModeTable::default();
+        let hand_typed = table3.record(
+            9,
+            "switched-id",
+            Some(&switched),
+            None,
+            None,
+            &detected_claude(9, None),
+        );
+        assert!(
+            !hand_typed.rebound,
+            "no argv id => first recorded is the launch session"
+        );
+    }
+
     /// c-effortread r8 item 2: a `/clear` hook with source "clear" is Fresh
     /// even when the rebound transcript ALREADY HOLDS THE PROMPT at the time
     /// the sticky mode is recorded (queued/pasted prompt beat the 800 ms
@@ -4510,7 +4600,7 @@ mod tests {
             None,
             None,
             ResumeMode::Fresh,
-            Some(anchor),
+            Some(anchor.clone()),
         )
         .expect("the anchored tail reopens");
         pump_once(&mut reopened, &fx).await;

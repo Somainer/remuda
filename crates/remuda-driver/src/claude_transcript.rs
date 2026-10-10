@@ -722,14 +722,19 @@ pub struct TranscriptTail {
 /// [`TranscriptTail`], keyed per (pid, session) by the promotion poller so a
 /// re-promotion resumes at the last read offset instead of replaying the
 /// sticky boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TailAnchor {
     /// File identity the offset is valid on.
     identity: FileIdentity,
-    /// First unread byte at capture time.
+    /// c-effortread r8 item 4(b): the first unread byte at capture AND the
+    /// half-written JSONL line already buffered at that byte (the tail only
+    /// hands back whole lines, so a line whose terminator arrived after the
+    /// anchor must be carried across a demote/re-promotion rather than
+    /// re-read from disk — re-reading it duplicates the partial record).
     start: u64,
+    partial: String,
     /// The tail was reading Current (gate open). False = Unverified.
-    current: bool,
+    pub(crate) current: bool,
     /// The tracked resume had already been displaced.
     displaced: bool,
     /// Head fingerprint at capture (None for a live tail).
@@ -917,6 +922,8 @@ impl TranscriptTail {
         Some(TailAnchor {
             identity: tracked,
             start: self.offset,
+            // Carry the held partial line (c-effortread r8 item 4b).
+            partial: self.partial.clone(),
             // A live tail, or a verified, undisplaced resume tail, was reading
             // Current; everything else was reading Unverified.
             current: self
@@ -951,7 +958,10 @@ impl TranscriptTail {
         Some(Self {
             path,
             offset: anchor.start,
-            partial: String::new(),
+            // Restore the held partial line instead of dropping it
+            // (c-effortread r8 item 4b): the tail reads new bytes after it and
+            // completes the line without re-reading the buffered prefix.
+            partial: anchor.partial,
             resume: Some(ResumeState {
                 identity: anchor.identity,
                 head,
@@ -1161,6 +1171,79 @@ impl TranscriptTail {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// c-effortread r8 item 4(b): the held partial line rides across a
+    /// demote/re-promotion. A tail that has buffered a half-written JSONL
+    /// line captures it in the TailAnchor; the continued tail restores the
+    /// partial and completes the line from new bytes instead of re-reading the
+    /// prefix (which would duplicate the record).
+    #[test]
+    fn r8_item4b_partial_line_is_carried_by_anchor_and_continued_tail() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("session.jsonl");
+        // A complete line followed by a partial one with no terminator.
+        let complete = "{\"type\":\"assistant\",\"x\":1}\n";
+        let partial_prefix = "{\"type\":\"assistant\",\"x\":";
+        write(&path, &format!("{complete}{partial_prefix}"));
+
+        // Fresh live tail: the complete line reads, the partial is buffered.
+        let mut tail = TranscriptTail::new(path.clone());
+        let first = tail.poll().expect("first poll");
+        assert_eq!(first.lines.len(), 1, "only the complete line is returned");
+        assert_eq!(tail.anchor().expect("anchor").partial, partial_prefix);
+
+        // Capture and reopen through continued(): the partial must survive.
+        let anchor = tail.anchor().expect("anchor");
+        assert!(anchor.current, "a fresh live tail anchors as Current");
+        let mut continued = TranscriptTail::continued(path.clone(), anchor).expect("reopen");
+        // The terminator + rest of the partial line arrives.
+        append(&path, "2}\n");
+        let second = continued.poll().expect("second poll");
+        assert_eq!(
+            second.lines.len(),
+            1,
+            "the completed partial yields one line"
+        );
+        assert_eq!(
+            second.lines[0],
+            format!("{partial_prefix}2}}"),
+            "the buffered prefix + new suffix complete the same record"
+        );
+    }
+
+    /// c-effortread r8 item 4(c): a CURRENT (Fresh) anchor keeps the reopened
+    /// tail live (verified); only an unverified anchor continues as a resume
+    /// tail.
+    #[test]
+    fn r8_item4c_current_anchor_reopens_as_a_live_tail() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("live.jsonl");
+        write(&path, "{}\n");
+        let mut fresh = TranscriptTail::new(path.clone());
+        let _ = fresh.poll().expect("poll");
+        let live_anchor = fresh.anchor().expect("anchor");
+        assert!(live_anchor.current);
+        let continued_live =
+            TranscriptTail::continued(path.clone(), live_anchor).expect("continue");
+        assert!(
+            continued_live.verified(),
+            "a Current anchor reopens as a live (gate-open) tail"
+        );
+
+        // An unverified EOF anchor reopens as non-current.
+        let history = format!("{}{}", "{\"old\":true}\n", "{\"old2\":true}\n");
+        let resume_path = dir.path().join("resume.jsonl");
+        write(&resume_path, &history);
+        let boundary = ResumeBoundary::unverified_eof(&resume_path).expect("boundary");
+        let unverified_tail = TranscriptTail::resumed(resume_path.clone(), boundary);
+        let unverified_anchor = unverified_tail.anchor().expect("anchor");
+        assert!(!unverified_anchor.current);
+        let reopened = TranscriptTail::continued(resume_path, unverified_anchor).expect("continue");
+        assert!(
+            !reopened.verified(),
+            "an Unverified anchor stays a resume tail"
+        );
+    }
 
     #[test]
     fn project_dir_encoding_matches_claudes_own_naming() {

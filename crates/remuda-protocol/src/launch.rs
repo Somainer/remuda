@@ -365,10 +365,15 @@ pub struct EffortEffective {
     pub observed_at: Timestamp,
     /// D-056 (4): whether effort read-back is available for this process.
     /// `Some(false)` means a resume boundary that was verified became
-    /// unverifiable mid-run (shrink/replacement/EOF, an exec keeping the shell
-    /// pid, a backward clock step): consumers must clear any projected
-    /// effective level/flag (the UI renders `?`) and must not treat a pending
-    /// switch as applied. Normal observations omit it (`None` = available).
+    /// unverifiable mid-run (transcript shrink/replacement/EOF, or a backward
+    /// clock step): consumers must clear any projected effective level/flag
+    /// (the UI renders `?`) and must not treat a pending switch as applied.
+    /// Normal observations omit it (`None` = available).
+    ///
+    /// NOTE: a session-local `exec` that keeps the shell pid is NOT itself a
+    /// withdrawal trigger any more: exec preserves the verified boundary
+    /// (c-effortread r8 item 4e); only a subsequent shrink/replacement/EOF
+    /// actually invalidates read-back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readback_available: Option<bool>,
 }

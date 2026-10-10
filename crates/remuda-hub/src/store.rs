@@ -8812,6 +8812,135 @@ mod tests {
             Some("remuda")
         );
     }
+
+    /// c-dirpicker r11 item 3: `dedup_duplicate_hosts` moves a loser host's
+    /// commands onto the survivor, but the two hosts have UNRELATED link
+    /// generation counters. A loser at generation 7 with a stale unregister
+    /// intent must not be hidden on a survivor currently at 2 (swept only once
+    /// it happens to reach 8): the merge NULLs the stamp so the survivor's very
+    /// next reconnect sweep treats it as dead-link intent and aborts it.
+    #[tokio::test]
+    async fn host_dedup_nulls_link_generation_of_moved_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let command_id = {
+            let store = Store::open(&path).unwrap();
+            let survivor = new_id("hst").unwrap();
+            let loser = new_id("hst").unwrap();
+            let dup_inventory = |hostname: &str| crate::inventory::HostInventoryUpdate {
+                display_label: Some("dup-node".into()),
+                hostname: Some(hostname.into()),
+                ..Default::default()
+            };
+            store
+                .authenticate_host(
+                    HostAuthRequest {
+                        presented: enroll_token(&store, "dup-survivor").await,
+                        hello_host_id: Some(survivor.clone()),
+                        label: Some("dup-node".into()),
+                        node_version: None,
+                    },
+                    verify_eq,
+                    |_| Ok("test-hash".into()),
+                )
+                .await
+                .unwrap();
+            store
+                .authenticate_host(
+                    HostAuthRequest {
+                        presented: enroll_token(&store, "dup-loser").await,
+                        hello_host_id: Some(loser.clone()),
+                        label: Some("dup-node".into()),
+                        node_version: None,
+                    },
+                    verify_eq,
+                    |_| Ok("test-hash".into()),
+                )
+                .await
+                .unwrap();
+            store
+                .apply_inventory(survivor.clone(), dup_inventory("dup-host"), None)
+                .await
+                .unwrap();
+            store
+                .apply_inventory(loser.clone(), dup_inventory("dup-host"), None)
+                .await
+                .unwrap();
+            // The survivor must win the dedup ordering (online sorts first).
+            store.mark_host_offline(loser.clone()).await.unwrap();
+            // Counters deliberately diverge: survivor 2, loser 7.
+            for _ in 0..2 {
+                store
+                    .bump_host_link_generation(survivor.clone())
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..7 {
+                store
+                    .bump_host_link_generation(loser.clone())
+                    .await
+                    .unwrap();
+            }
+            let (command, _) = store
+                .queue_command(
+                    None,
+                    None,
+                    loser.clone(),
+                    "workspace.unregister".into(),
+                    json!({"path": "/srv/dup", "workspaceId": "wsp_dup"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            // The INSERT stamp is the loser's current generation (7).
+            assert!(
+                store
+                    .list_unsettled_workspace_unregisters(&loser, 8)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.command_id == command.command_id),
+                "on the loser the gen-7 row is dead-link only past generation 7"
+            );
+            command.command_id
+        };
+        // A fresh process opens the data dir; dedup runs on every open.
+        let store = Store::open(&path).unwrap();
+        let hosts = store
+            .read("test hosts", |conn| {
+                let mut stmt = conn.prepare("SELECT id FROM hosts").unwrap();
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(hosts.len(), 1, "the duplicate host pair merged into one");
+        let survivor = hosts[0].clone();
+        let moved = store
+            .get_command(command_id.clone())
+            .await
+            .unwrap()
+            .expect("the command survived the merge");
+        assert_eq!(
+            moved.host_id, survivor,
+            "the command now belongs to the survivor"
+        );
+        // NULL semantics: a gen-2 sweep on the survivor aborts it. With the
+        // loser's 7 carried over, 7 < 2 is false and the row would be hidden
+        // until generation 8.
+        let pending = store
+            .list_unsettled_workspace_unregisters(&survivor, 2)
+            .await
+            .unwrap();
+        assert!(
+            pending.iter().any(|row| row.command_id == command_id),
+            "the merged stale unregister is swept on the survivor's current link, not hidden: {pending:?}"
+        );
+    }
 }
 
 fn touch_host_online(
@@ -8884,8 +9013,17 @@ fn dedup_duplicate_hosts(conn: &Connection) -> Result<(), rusqlite::Error> {
                 "UPDATE instances SET host_id = ?1 WHERE host_id = ?2",
                 params![&survivor, &row.id],
             )?;
+            // c-dirpicker r11 item 3: a moved command rode the LOSER host's
+            // link, whose generation counter is unrelated to the survivor's.
+            // Keeping the loser's stamp (e.g. 7) on a survivor at 2 would hide
+            // a dead-link unregister from the reconnect sweep until the
+            // survivor happened to reach generation 8. NULL it instead: the
+            // next sweep on the survivor treats the row as belonging to a dead
+            // pre-merge link and aborts it, the same semantics a pre-upgrade
+            // NULL has. Settled rows are filtered by state regardless, so the
+            // null costs them nothing.
             conn.execute(
-                "UPDATE commands SET host_id = ?1 WHERE host_id = ?2",
+                "UPDATE commands SET host_id = ?1, link_generation = NULL WHERE host_id = ?2",
                 params![&survivor, &row.id],
             )?;
             conn.execute(

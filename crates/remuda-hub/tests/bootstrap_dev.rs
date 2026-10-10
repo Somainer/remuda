@@ -669,14 +669,21 @@ async fn explicit_file_at_the_hub_token_path_pins_and_blocks_regen() -> Result<(
         hub.shutdown().await;
     }
 
-    // Recovery (1) documented in remuda-cli.md: write a DIFFERENT code to the
-    // same self-referential source — a genuine content change re-stamps.
+    // Recovery (1) documented in remuda-cli.md: write a DIFFERENT code to a
+    // SEPARATE access file (outside the data dir, as the doc requires — a
+    // self-referential source can never show a content change). Point the
+    // explicit source at it; a genuine content change re-stamps.
     const NEW_PINNED_CODE: &str = "operator-pinned-code-two-at-least-16-xx";
-    write_code_file(&token_path, NEW_PINNED_CODE)?;
+    let new_code_file = {
+        let mut p = token_path.clone();
+        p.set_file_name("access-code-recovered");
+        p
+    };
+    write_code_file(&new_code_file, NEW_PINNED_CODE)?;
     {
         let hub = spawn(explicit_file_config(
             hub_data.clone(),
-            token_path.clone(),
+            new_code_file.clone(),
             NEW_PINNED_CODE,
         ))
         .await?;
@@ -686,12 +693,14 @@ async fn explicit_file_at_the_hub_token_path_pins_and_blocks_regen() -> Result<(
     }
 
     // Recovery (2): deleting the stamp with the code unchanged backfills it.
+    // Recovery (2): deleting the stamp with the code unchanged backfills it —
+    // still pointing at the separate access file from recovery (1).
     std::fs::write(&stamp_path, EXPIRED_STAMP)?;
     std::fs::remove_file(&stamp_path)?;
     {
         let hub = spawn(explicit_file_config(
             hub_data.clone(),
-            token_path.clone(),
+            new_code_file.clone(),
             NEW_PINNED_CODE,
         ))
         .await?;
@@ -701,17 +710,18 @@ async fn explicit_file_at_the_hub_token_path_pins_and_blocks_regen() -> Result<(
     }
 
     // A no-source restart does not "regain" rotation until the operator starts
-    // once without the explicit file (the documented adoption path).
+    // once without the explicit file (the documented adoption path). The
+    // persisted token now holds NEW_PINNED_CODE.
     {
         let hub = spawn(minted_config(hub_data.clone())).await?;
-        login(hub.addr, OPERATOR_CODE).await?;
+        login(hub.addr, NEW_PINNED_CODE).await?;
         assert!(
             !marker_path.is_file(),
             "a no-source start adopts and clears the marker"
         );
         let rotated = remuda_hub::rotate_bootstrap(&hub_data)?;
         assert_ne!(
-            rotated, OPERATOR_CODE,
+            rotated, NEW_PINNED_CODE,
             "rotation is hub-owned again after adoption"
         );
         hub.shutdown().await;

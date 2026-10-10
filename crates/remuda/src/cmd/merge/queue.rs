@@ -13,6 +13,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -20,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use nix::sys::signal::{Signal::SIGKILL, kill};
-use nix::sys::wait::{WaitPidFlag, waitpid};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
@@ -498,6 +499,12 @@ struct Lane {
     noticed: Option<Instant>,
     /// Set by whichever side (monitor or watchdog) claims the lane first.
     claimed: Arc<AtomicBool>,
+    /// Set the instant the monitor's non-blocking wait (or the watchdog's
+    /// waitpid) actually reaps the child. An unreaped child — running OR
+    /// zombie — keeps its pid and process group pinned; once reaped the
+    /// kernel may recycle the pid, so kill paths must hold this lock and
+    /// signal only while it is still false.
+    reaped: Arc<Mutex<bool>>,
 }
 
 pub(crate) fn run_queue(args: MergeArgs) -> MergeReport {
@@ -659,7 +666,7 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
             {
                 busy.insert(idx, lane);
                 match spawn_verify(args, &ctx, tx.clone(), idx, lane, base.clone()) {
-                    Ok((pid, claimed)) => {
+                    Ok((pid, claimed, reaped)) => {
                         if !spawned_pids.contains(&pid) {
                             spawned_pids.push(pid);
                         }
@@ -673,6 +680,7 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
                                 started: Instant::now(),
                                 noticed: None,
                                 claimed,
+                                reaped,
                             },
                         );
                     }
@@ -920,7 +928,7 @@ fn spawn_verify(
     idx: usize,
     lane: usize,
     base: String,
-) -> std::io::Result<(u32, Arc<AtomicBool>)> {
+) -> std::io::Result<(u32, Arc<AtomicBool>, Arc<Mutex<bool>>)> {
     let repo = ctx.repo.clone();
     let reference = ctx.references[idx].clone();
     let lock = ctx.lock.clone();
@@ -971,7 +979,9 @@ fn spawn_verify(
     let mut child = command.spawn()?;
     let pid = child.id();
     let claimed = Arc::new(AtomicBool::new(false));
+    let reaped = Arc::new(Mutex::new(false));
     let monitor_claimed = claimed.clone();
+    let monitor_reaped = reaped.clone();
     thread::spawn(move || {
         // Watch for the preparing sidecar so the next lane can speculate.
         let mut announced = false;
@@ -984,13 +994,33 @@ fn spawn_verify(
                     merge: preparing.merged,
                 });
             }
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => thread::sleep(std::time::Duration::from_millis(25)),
-                // ECHILD: someone else reaped the lane. The watchdog owns
-                // the verdict in that case.
-                Err(_) => break,
+            // try_wait and the reaped flag share one critical section: once
+            // this observes a terminated child the pid is reaped HERE and the
+            // flag is set in the same instant, so a kill path holding the
+            // lock can never signal the pid after the kernel is free to
+            // recycle it.
+            let terminated = {
+                let mut reaped_guard = monitor_reaped
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        *reaped_guard = true;
+                        true
+                    }
+                    Ok(None) => false,
+                    // ECHILD: another thread in this process already reaped
+                    // the lane; record that so no signal follows.
+                    Err(_) => {
+                        *reaped_guard = true;
+                        true
+                    }
+                }
+            };
+            if terminated {
+                break;
             }
+            thread::sleep(std::time::Duration::from_millis(25));
         }
         // try_wait already reaped in the normal path; wait_with_output then
         // only drains the pipes and returns the cached status.
@@ -1005,7 +1035,7 @@ fn spawn_verify(
         };
         let _ = tx.send(Event::Finished(job));
     });
-    Ok((pid, claimed))
+    Ok((pid, claimed, reaped))
 }
 
 /// Turn a lane child's exit into a state-machine job. A gate verdict is a
@@ -1162,13 +1192,15 @@ fn descendant_pids(root: u32) -> Vec<u32> {
     found
 }
 
-/// Kill a lane's whole descendant tree and process group, but only while its
-/// pid still names a live, non-zombie process. A pid the kernel has already
-/// recycled after the lane exited must never be signalled: the negative-pid
-/// group kill could otherwise target an unrelated process group that took the
-/// same id. Returns whether the lane was alive.
-fn kill_lane_if_alive(pid: u32) -> bool {
-    if !pid_running(pid) {
+/// Kill a lane's whole descendant tree and process group, but ONLY while the
+/// lane's child has not been reaped. Liveness alone is not the right guard:
+/// once the monitor (or this watchdog) reaps the child the kernel can hand
+/// the same pid — and `-pid` group address — to an unrelated process, while
+/// an unreaped child that is merely a zombie still pins its pid and pgid.
+/// Returns whether the signal was sent.
+fn kill_lane_if_alive(pid: u32, reaped: &Arc<Mutex<bool>>) -> bool {
+    let guard = reaped.lock().unwrap_or_else(|poison| poison.into_inner());
+    if *guard {
         return false;
     }
     kill_lane_group(pid);
@@ -1197,12 +1229,18 @@ fn kill_lane_group(pid: u32) {
 }
 
 /// Best-effort direct reap (only works if this thread is the parent, which
-/// it is not in normal operation; harmless ECHILD otherwise).
-fn reap_pid(pid: u32) {
-    let _ = waitpid(
+/// it is not in normal operation; harmless ECHILD otherwise). Returns true
+/// once the child is definitely reaped (a terminal WaitStatus, or ECHILD
+/// meaning another thread reaped it).
+fn reap_pid(pid: u32) -> bool {
+    match waitpid(
         Pid::from_raw(i32::try_from(pid).unwrap_or(0)),
         Some(WaitPidFlag::WNOHANG),
-    );
+    ) {
+        Ok(WaitStatus::StillAlive) => false,
+        Ok(_) | Err(nix::Error::ECHILD) => true,
+        Err(_) => false,
+    }
 }
 
 /// Apply one lane event to the driver tables and state machine.
@@ -1255,7 +1293,7 @@ fn wait_event(
                     reap_grace().as_secs()
                 );
                 if running {
-                    kill_lane_if_alive(lane.pid);
+                    kill_lane_if_alive(lane.pid, &lane.reaped);
                 }
                 lane.noticed = Some(now);
             }
@@ -1272,7 +1310,12 @@ fn wait_event(
         if let Some(idx) = overdue
             && let Some(lane) = active.get(&idx)
         {
-            reap_pid(lane.pid);
+            if reap_pid(lane.pid) {
+                *lane
+                    .reaped
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = true;
+            }
             let detail =
                 "lane process was gone or killed past the grace period and its monitor never reported"
                     .to_string();
@@ -1294,9 +1337,9 @@ fn drain_lanes(
 ) {
     let now = Instant::now();
     for lane in active.values_mut() {
-        // Guarded inside: a lane already exited (or reaped and pid-reused)
-        // is past needing a signal, and its recycled pid must not be touched.
-        kill_lane_if_alive(lane.pid);
+        // The guard signals only while the child has not been reaped; a pid
+        // recycled after a reap must never receive the lane group's SIGKILL.
+        kill_lane_if_alive(lane.pid, &lane.reaped);
         // Start the reap grace immediately rather than after the next tick.
         lane.noticed = Some(now);
     }
@@ -1674,25 +1717,52 @@ mod tests {
         std::fs::remove_dir_all(&foreign_root).ok();
     }
 
-    /// `kill_lane_if_alive` must not signal an exited/reaped lane pid, and must
-    /// take down a live lane group.
+    /// `kill_lane_if_alive` gates on the child NOT having been reaped rather
+    /// than on liveness: the reaped flag must veto the signal even when the
+    /// pid currently names a live, unrelated process (a pid the kernel
+    /// recycled), and an unreaped live lane must still be killed.
     #[test]
-    fn kill_lane_if_alive_skips_an_exited_pid_and_kills_a_live_one() {
-        // Exited and already reaped child: the guard reports "not alive" and
-        // sends nothing.
-        let exited = std::process::Command::new("true").spawn().unwrap();
-        let pid = exited.id();
-        let _ = exited.wait_with_output().unwrap();
+    fn kill_lane_if_alive_signals_only_a_lane_not_yet_reaped() {
+        // A definitely LIVE process addressed with a "reaped" guard must be
+        // left untouched — this is the pid-recycling case (liveness alone
+        // would kill it).
+        let mut decoy = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let decoy_pid = decoy.id();
+        let veto = Arc::new(Mutex::new(true));
+        assert!(
+            !kill_lane_if_alive(decoy_pid, &veto),
+            "a reaped lane's guard must veto the kill even for a live pid"
+        );
+        assert!(
+            pid_running(decoy_pid),
+            "the foreign live process must not have been signalled"
+        );
+        // The decoy is this test's own child: tear it down directly.
+        kill_lane_group(decoy_pid);
+        let _ = decoy.wait();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while pid_running(pid) && std::time::Instant::now() < deadline {
+        while pid_running(decoy_pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        assert!(!pid_running(decoy_pid));
+
+        // A real child this thread reaped: guard marked reaped, no signal.
+        let exited = std::process::Command::new("true").spawn().unwrap();
+        let exited_pid = exited.id();
+        let _ = exited.wait_with_output().unwrap();
         assert!(
-            !kill_lane_if_alive(pid),
-            "an exited lane pid must not be signalled"
+            !kill_lane_if_alive(exited_pid, &Arc::new(Mutex::new(true))),
+            "an actually reaped child must never be signalled"
         );
 
-        // Live lane in its own group with a descendant: the guard kills both.
+        // Unreaped + live: the group kill goes through and reaps the lane.
         let mut live = std::process::Command::new("bash")
             .args(["-c", "sleep 300 & sleep 300"])
             .process_group(0)
@@ -1702,16 +1772,16 @@ mod tests {
             .spawn()
             .unwrap();
         let live_pid = live.id();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !pid_running(live_pid) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(kill_lane_if_alive(live_pid));
+        let open = Arc::new(Mutex::new(false));
+        assert!(kill_lane_if_alive(live_pid, &open));
         let _ = live.wait();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while pid_running(live_pid) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(!pid_running(live_pid), "the live lane group must be gone");
+        assert!(
+            !pid_running(live_pid),
+            "the unreaped live lane group must be gone"
+        );
     }
 }

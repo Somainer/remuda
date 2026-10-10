@@ -2267,7 +2267,7 @@ describe("load-earlier anchor lifecycle round 5", () => {
     const setTotal = (n: number) => {
       dynamicTotal = n;
     };
-    return { scroller: () => scroller(), defineScroll, scrollTo, wheel, growRow, top: () => top, setTotal, nextFrame };
+    return { scroller: () => scroller(), defineScroll, scrollTo, wheel, growRow, top: () => top, setTotal, nextFrame, isQueued: () => queued };
   }
 
   /**
@@ -2799,6 +2799,40 @@ describe("load-earlier anchor lifecycle round 5", () => {
         "the search hit did not park at the top after the retargeted prepend",
       ).toBe(0);
       await expectGrowthHolds(geo);
+    });
+
+    it("a retargeted pending becomes an index pending when the page does not prepend and refines to the top", async () => {
+      // jj while the bounded read is in flight retargets the hold at turn 1.
+      // Before resolving, grow a mounted row by 40: holdReadingAnchor is inert
+      // while the retarget hold/pending is set, so the destination drifts 40px
+      // uncompensated. The read then returns a duplicate-only page (no
+      // prepend). With the r10 conversion the finally turns the inert
+      // restore into an index pending on the destination, whose refinement
+      // pulls its rect.top to 0; if the pending is dropped the 40px drift
+      // stays (nodeTop === 40).
+      const { user, geo, g, writes } = setup("insRetargetDup");
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.keyboard("jj");
+      // No gate resolution yet: the retarget restore + prepend anchor are
+      // armed, so the generic growth hold bails.
+      await act(async () => {
+        geo.growRow(0, ROW + 40);
+      });
+      await act(async () => {
+        // A duplicate row (seq 1001 is already held): merged list unchanged,
+        // so prepended:false and the request lands in the not-prepended
+        // branch.
+        g.resolve(pageOf([m(1001, "user", "insRetargetDup")]));
+        await Promise.resolve();
+      });
+      await act(async () => {});
+      await geo.nextFrame();
+      await act(async () => {});
+      expect(writes).not.toContain(100 * ROW);
+      expect(
+        nodeTop(geo, "n_1002_assistant_insRetargetDup"),
+        "the no-prepend retarget stayed 40px off because its pending was dropped",
+      ).toBe(0);
     });
 
     it("an in-flight retarget clears a saved restore's reflow anchor via the fromRestore path", async () => {

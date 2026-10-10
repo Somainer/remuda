@@ -3303,9 +3303,18 @@ mod tests {
             .unwrap()
         );
 
-        let rollup = rollup_instance(&conn, "ins_r57", "codex", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r57",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: Some("codex"),
+            },
+        )
+        .unwrap()
+        .unwrap();
         // Totals still count; current windows and lastTurnAt do not.
         assert_eq!(rollup.session_input_tokens, Some(300));
         assert_eq!(rollup.session_output_tokens, Some(30));
@@ -3333,9 +3342,18 @@ mod tests {
             Some(&now), // scoped_record marks nativeAt -> source native
         );
         assert!(insert(&conn, &native));
-        let rollup = rollup_instance(&conn, "ins_r57", "codex", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r57",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: Some("codex"),
+            },
+        )
+        .unwrap()
+        .unwrap();
         // Only the native 40 is in-window; the ingest rows still count totals.
         assert_eq!(
             rollup.tpm_in_60s,

@@ -238,14 +238,10 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
     // c-usagefu (b): one per-response Message snapshot, then the end-of-turn
     // Turn snapshot and the cumulative Session snapshot.
     assert_eq!(usages.len(), 3);
-    assert_eq!(usages[0].scope, remuda_protocol::UsageScope::Message);
-    assert_eq!(usages[1].scope, remuda_protocol::UsageScope::Turn);
-    assert_eq!(usages[2].scope, remuda_protocol::UsageScope::Session);
-    // The Message row is keyed on the native response id.
-    assert_eq!(usages[0].scope_id, "r1");
-    // Turn and Session rows carry the per-turn / cumulative counters; the
-    // per-request Message row is the context basket source.
-    assert_eq!(usages[1].scope_id, "t1");
+    let message = match &usages[0].payload {
+        ObservationPayload::Usage(usage) => usage,
+        _ => unreachable!(),
+    };
     let turn = match &usages[1].payload {
         ObservationPayload::Usage(usage) => usage,
         _ => unreachable!(),
@@ -254,6 +250,14 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
         ObservationPayload::Usage(usage) => usage,
         _ => unreachable!(),
     };
+    assert_eq!(message.scope, remuda_protocol::UsageScope::Message);
+    assert_eq!(turn.scope, remuda_protocol::UsageScope::Turn);
+    assert_eq!(session.scope, remuda_protocol::UsageScope::Session);
+    // The Message row is keyed on the native response id.
+    assert_eq!(message.scope_id, "r1");
+    // Turn and Session rows carry the per-turn / cumulative counters; the
+    // per-request Message row is the context basket source.
+    assert_eq!(turn.scope_id, "t1");
     // c-ctxusage r5 item 7: the Turn/Session rows carry the rollout record's
     // own timestamp, so a byte-0 replay is historical evidence, not
     // ingest-time throughput. The task_complete record stamps ...:45.380Z.

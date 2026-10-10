@@ -910,8 +910,39 @@ pub(crate) fn select_carrier(
     explicit: Option<&str>,
 ) -> Result<String, HubError> {
     if harness != "claude" {
-        // codex/grok only have the herdr-backed generic pty driver.
-        return Ok("generic-pty".to_string());
+        // codex/grok prefer the native shell-pty the Node advertises as
+        // launchable: the hook session materializes the per-session shadow
+        // home the file adapters read. generic-pty stays the fallback for a
+        // host that only carries herdr — there the pane is deliberately NOT
+        // pinned to a home (the per-instance home is empty and would lose the
+        // operator's login; c-usagefu r2 item 1), so its file adapter tails
+        // the operator's real home.
+        let native = native_carrier_works(host);
+        return match explicit {
+            Some("native") | Some("shell-pty") => {
+                if native {
+                    Ok("shell-pty".to_string())
+                } else {
+                    Err(HubError::Unsatisfiable {
+                        reasons: vec![
+                            "host Node does not advertise a launchable native shell-pty carrier"
+                                .into(),
+                        ],
+                    })
+                }
+            }
+            Some("herdr") | Some("generic-pty") => Ok("generic-pty".to_string()),
+            Some(other) => Err(HubError::BadRequest(format!(
+                "carrier must be native|herdr, got {other:?}"
+            ))),
+            None => {
+                if native {
+                    Ok("shell-pty".to_string())
+                } else {
+                    Ok("generic-pty".to_string())
+                }
+            }
+        };
     }
     let has_herdr = host.herdr.as_ref().is_some_and(|value| !value.is_null());
     let native = || native_carrier_works(host);
@@ -957,9 +988,11 @@ pub(crate) fn select_carrier(
     }
 }
 
-/// Validate an explicit `dispatch --driver` override. Only Claude may pick the
-/// native `shell-pty` / `claude-print` / `claude-pty` carriers; codex and grok
-/// always run on `generic-pty`.
+/// Validate an explicit `dispatch --driver` override. Claude may pick
+/// `shell-pty` / `claude-print` / `claude-pty`; codex and grok may pick
+/// `shell-pty` (a.k.a. `native`) when the Node reports it launchable, else the
+/// herdr-backed `generic-pty`. An override the host cannot honour is refused,
+/// never silently swapped (c-usagefu r2 item 1).
 fn select_worker_driver(
     harness: &str,
     explicit: &str,
@@ -988,7 +1021,9 @@ fn select_worker_driver(
             }
             Ok(driver.to_string())
         }
-        ("codex" | "grok", "generic-pty") => Ok("generic-pty".to_string()),
+        ("codex" | "grok", driver @ ("generic-pty" | "shell-pty" | "native" | "herdr")) => {
+            select_carrier(harness, host, Some(driver))
+        }
         _ => Err(HubError::BadRequest(format!(
             "driver {explicit} is not valid for harness {harness}"
         ))),
@@ -1851,8 +1886,11 @@ mod driver_choice_tests {
         // `remuda watch` reads; herdr's blit cannot scroll (D-028).
         let both = host(Some(true), true);
         assert_eq!(driver_for("claude", &both).unwrap(), "shell-pty");
-        // codex/grok have only the herdr-backed generic pty driver.
-        assert_eq!(driver_for("codex", &both).unwrap(), "generic-pty");
+        // c-usagefu r2 item 1: codex/grok also prefer the launchable native
+        // carrier — the hook session's shadow home keeps the file adapters
+        // working without an empty-home login loss.
+        assert_eq!(driver_for("codex", &both).unwrap(), "shell-pty");
+        assert_eq!(driver_for("grok", &both).unwrap(), "shell-pty");
         let native_only = host(Some(true), false);
         assert_eq!(driver_for("claude", &native_only).unwrap(), "shell-pty");
     }
@@ -1897,11 +1935,29 @@ mod driver_choice_tests {
                 "{reason}"
             );
         }
-        // codex/grok resolve to generic-pty unconditionally (batch 6), so they
-        // are the one pair that never reaches this refusal.
+        // codex/grok take the launchable native carrier when advertised, and
+        // only fall back to generic-pty where the Node reports it cannot run
+        // shell-pty.
         assert_eq!(
             driver_for("codex", &host(Some(false), false)).unwrap(),
             "generic-pty"
+        );
+        assert_eq!(
+            driver_for("grok", &host(Some(true), false)).unwrap(),
+            "shell-pty"
+        );
+        assert_eq!(
+            select_worker_driver("codex", "herdr", &host(Some(true), true)).unwrap(),
+            "generic-pty",
+            "an explicit herdr request still takes generic-pty"
+        );
+        let error = select_worker_driver("grok", "native", &host(Some(false), false))
+            .expect_err("native requested but not launchable");
+        assert!(
+            matches!(&error, HubError::Unsatisfiable { reasons } if reasons
+                .iter()
+                .any(|reason| reason.contains("shell-pty carrier"))),
+            "{error:?}"
         );
     }
 

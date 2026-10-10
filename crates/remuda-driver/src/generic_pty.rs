@@ -30,7 +30,7 @@ use remuda_protocol::{
     RunId, Severity, SourceChannel, U64,
 };
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -93,6 +93,16 @@ pub struct GenericPtyOptions {
     /// stamp the file-tail adapter observations for codex/grok (c-usagefu (d));
     /// absent in standalone tests, which mint a fresh id.
     pub instance_id: Option<InstanceId>,
+    /// Explicit home the codex/grok file-tail adapter tails.
+    ///
+    /// Production always leaves this `None`: the driver then resolves the
+    /// operator's real home from the ambient `CODEX_HOME`/`GROK_HOME` (else
+    /// `$HOME/.codex`/`$HOME/.grok`) — the same environment the herdr pane's
+    /// harness process resolves, since the driver runs in the Node process.
+    /// The pane itself is never pinned to this home (r2 item 1). Tests set it
+    /// because the workspace forbids process-env mutation; it must name a home
+    /// the operator's harness actually writes to.
+    pub file_adapter_home: Option<PathBuf>,
 }
 
 impl GenericPtyOptions {
@@ -119,6 +129,7 @@ impl GenericPtyOptions {
             liveness_timeout_ms: 60_000,
             line_matcher: Some("^DONE".into()),
             instance_id: None,
+            file_adapter_home: None,
         }
     }
 }
@@ -306,24 +317,7 @@ impl GenericPtyDriver {
             .await
             .map_err(map_herdr)?;
         let client = bind_client(&server, &self.options)?;
-        let mut env = HashMap::new();
-        // Only pin CLAUDE_CONFIG_DIR when the native home actually holds a
-        // login. An isolated dir without one makes Claude 2.1 report "Not
-        // logged in" even when the host user is authenticated. The test is
-        // credential evidence, not the presence of `.claude.json`: claude-pty
-        // seeds that file with onboarding flags and no credentials, and a
-        // config dir the two drivers share must not be mistaken for a login.
-        if crate::claude_onboarding::has_login_material(std::path::Path::new(&recipe.native_home)) {
-            env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
-        }
-        // c-usagefu (d): pin the harness-native home for codex/grok the same
-        // way the shell-pty path does, so a launched session keeps its
-        // rollout/usage files in the Node-prepared per-instance home instead
-        // of the real `~/.codex` / `~/.grok`, and the file-tail adapter has
-        // an unambiguous home to discover the session in.
-        if let Some(home_env) = preset.home_env {
-            env.insert(home_env.into(), recipe.native_home.clone());
-        }
+        let mut env = pane_home_env(std::path::Path::new(&recipe.native_home));
         // D-045: driver-computed capability handshakes, attached only when
         // granted; they pass the REMUDA_ deny prefix that guards caller env.
         for entry in recipe
@@ -535,12 +529,18 @@ impl GenericPtyDriver {
     /// carrier, while Hub dispatch forces every non-claude harness onto
     /// generic-pty — so Grok/Codex sessions never produced structured usage.
     ///
-    /// The pane's `CODEX_HOME`/`GROK_HOME` was pinned to the prepared native
-    /// home above; the adapter discovers the session there (registry cwd match;
-    /// the herdr pane reports no child pid). A tail that cannot start yet (the
-    /// session has not registered) keeps retrying on its poll tick. Failure to
-    /// spawn degrades silently, like the promoted-adapter watch — losing the
-    /// file channel never fails the launch.
+    /// The pane is deliberately NOT handed a pinned `CODEX_HOME`/`GROK_HOME`
+    /// (r2 item 1: the per-instance home is empty and would lose the
+    /// operator's login), so the harness reads and writes its REAL home — the
+    /// same environment resolution the promoted-hand-typed path uses
+    /// (`CODEX_HOME`/`GROK_HOME`, else `$HOME/.codex`/`$HOME/.grok`). The
+    /// adapter tails that home and binds by cwd registry match (the herdr pane
+    /// reports no child pid); an ambiguous cwd match makes discovery fail
+    /// closed rather than attach to another instance's session. A tail that
+    /// cannot start yet (the session has not registered) keeps retrying on its
+    /// poll tick. Failure to spawn degrades silently, like the
+    /// promoted-adapter watch — losing the file channel never fails the
+    /// launch.
     fn spawn_file_tail_adapters(
         &self,
         spec: &InstanceSpec,
@@ -552,8 +552,17 @@ impl GenericPtyDriver {
             AgentKind::Codex | AgentKind::Grok => spec.kind,
             _ => return None,
         };
+        // The Node and the herdr daemon share the operator's login
+        // environment, so resolving the harness home from this process gives
+        // the same home the pane's harness process resolves. Tests inject the
+        // home explicitly (`file_adapter_home`) because the workspace forbids
+        // process-env mutation.
+        let home_path = self.options.file_adapter_home.clone().or_else(|| {
+            crate::adapters::supervisor::promoted_home(kind, PathBuf::from(&recipe.cwd), None)
+                .map(|adapter_home| adapter_home.home)
+        })?;
         let home = crate::adapters::AdapterHome {
-            home: PathBuf::from(&recipe.native_home),
+            home: home_path,
             cwd: PathBuf::from(&recipe.cwd),
             pid: None,
         };
@@ -1351,6 +1360,37 @@ fn pin_source(source: &BinarySource) -> DriverResult<BinaryPin> {
     }
 }
 
+/// The home-directory variables the generic-pty pane is pinned to.
+///
+/// Claude's `CLAUDE_CONFIG_DIR` is pinned only when the registered native home
+/// actually holds a login. An isolated dir without one makes Claude 2.1 report
+/// "Not logged in" even when the host user is authenticated. The test is
+/// credential evidence, not the presence of `.claude.json`: claude-pty seeds
+/// that file with onboarding flags and no credentials, and a config dir the
+/// two drivers share must not be mistaken for a login.
+///
+/// c-usagefu r2 item 1: this map deliberately NEVER contains `CODEX_HOME` /
+/// `GROK_HOME`. The Node-registered native home for a generic-pty launch is an
+/// empty per-instance directory it only `mkdir -p`s. Pinning either name would
+/// point the harness at a home without the operator's `auth.json` /
+/// `config.toml` — a login screen and lost provider config on every
+/// Hub-dispatched codex/grok worker (and, with `REMUDA_CLAUDE_CONFIG_DIR`
+/// set, every instance would share one dir). The herdr pane inherits the
+/// daemon's environment, so the harness resolves its real home the same way a
+/// hand-typed command would; the file-tail adapter reads that same real home
+/// (`spawn_file_tail_adapters`). See the materializer invariant: a partial
+/// shadow home would lose the operator's login.
+fn pane_home_env(native_home: &Path) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if crate::claude_onboarding::has_login_material(native_home) {
+        env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            native_home.to_string_lossy().into_owned(),
+        );
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1371,5 +1411,50 @@ mod tests {
         ));
         assert!(!looks_like_shell_prompt("❯ \n"));
         assert!(!looks_like_shell_prompt("OK\n❯ \n"));
+    }
+
+    /// c-usagefu r2 item 1: the Node-registered native home on a generic-pty
+    /// launch is an empty per-instance directory. The pane env must never pin
+    /// `CODEX_HOME`/`GROK_HOME` at it — that would take the operator's
+    /// `~/.codex`/`~/.grok` login material away — and an empty Claude home is
+    /// not pinned either (the host user keeps their own login).
+    #[test]
+    fn pane_env_for_an_empty_home_pins_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = pane_home_env(dir.path());
+        assert!(
+            env.is_empty(),
+            "empty per-instance home must not pin any config dir: {env:?}"
+        );
+        assert!(!env.contains_key("CODEX_HOME"));
+        assert!(!env.contains_key("GROK_HOME"));
+        assert!(!env.contains_key("CLAUDE_CONFIG_DIR"));
+    }
+
+    /// c-usagefu r2 item 1: even when the registered home carries a real Claude
+    /// login (the only condition that pins `CLAUDE_CONFIG_DIR`), the
+    /// codex/grok home names are still absent. Nothing the driver computes may
+    /// ever point them at a home without login material.
+    #[test]
+    fn pane_env_pins_claude_only_never_codex_or_grok() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            "{\"accessToken\":\"fixture\"}",
+        )
+        .unwrap();
+        let env = pane_home_env(dir.path());
+        assert_eq!(
+            env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(dir.path().to_string_lossy().as_ref())
+        );
+        assert!(
+            !env.contains_key("CODEX_HOME"),
+            "pinning CODEX_HOME at the per-instance home loses the operator's login: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GROK_HOME"),
+            "pinning GROK_HOME at the per-instance home loses the operator's login: {env:?}"
+        );
     }
 }

@@ -544,13 +544,19 @@ pub(crate) async fn handle_node_method(
             // previous link left behind carry the old value and are aborted.
             // Durable and monotonic, so hub restarts and backward wall-clock
             // steps neither reuse nor move a generation.
-            state
+            //
+            // r11 item 2: the bumped value is stored IN the registry slot
+            // together with the transport. `ConnectedNodes::pin` hands the pair
+            // out atomically, so a forwarding attempt stamps and rides the very
+            // same link even while a half-open previous session is still
+            // registered during this hello window.
+            let link_generation = state
                 .store
                 .bump_host_link_generation(host.host_id.clone())
                 .await?;
             let generation = state
                 .nodes
-                .insert(
+                .insert_with_generation(
                     host.host_id.clone(),
                     Arc::new(
                         WssTransport::new(out_tx.clone(), pending.clone()).with_kind(
@@ -558,6 +564,7 @@ pub(crate) async fn handle_node_method(
                                 .unwrap_or(TransportKind::OutboundWss),
                         ),
                     ),
+                    link_generation,
                 )
                 .await;
             *session_generation = Some(generation);

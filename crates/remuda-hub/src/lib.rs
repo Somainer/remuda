@@ -482,6 +482,23 @@ impl RunningHub {
         self.state.nodes.insert(host_id.to_owned(), transport).await;
     }
 
+    /// Test helper (c-dirpicker r11 item 2): mount a synthetic transport AS a
+    /// specific durable link generation — exactly what the `node.hello` arm
+    /// does after `bump_host_link_generation`. Lets interleave tests model the
+    /// bump→insert window with the previous session still registered.
+    #[doc(hidden)]
+    pub async fn test_set_node_transport_with_generation(
+        &self,
+        host_id: &str,
+        transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
+        link_generation: i64,
+    ) {
+        self.state
+            .nodes
+            .insert_with_generation(host_id.to_owned(), transport, link_generation)
+            .await;
+    }
+
     /// Test helper: block every Node-registry lookup (`kind_of`, `call`,
     /// `insert`) until `release` is sent (or dropped). Returns only once the
     /// lock is actually held, so a command POST parked afterwards is
@@ -565,6 +582,34 @@ impl RunningHub {
         };
         self.state.race_barriers.insert(
             phase,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test helper (c-dirpicker r11 item 2): arm the park point between the
+    /// forward-intent stamp and the prepare send of the REAL unregister DELETE
+    /// handler — after the handler pinned its transport. A test parks the
+    /// DELETE there, runs the next hello (generation bump + new transport
+    /// insert), releases, and asserts the prepare/commit stayed on the pinned
+    /// link.
+    #[doc(hidden)]
+    pub fn test_arm_forward_marked_barrier(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardMarked,
             (host_id.to_owned(), workspace_id.to_owned()),
             crate::workspaces::BarrierSlot {
                 reached: reached.clone(),

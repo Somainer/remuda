@@ -105,6 +105,9 @@ pub(crate) struct RaceBarriers {
     /// Parks task creation right after it acquires the per-workspace guard
     /// and before the binding is published.
     task_bind: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks the unregister handler after the forward intent was stamped and
+    /// the transport pinned, before the prepare is sent (r11 item 2).
+    forward_marked: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
 }
 
 impl RaceBarriers {
@@ -113,6 +116,7 @@ impl RaceBarriers {
         let table = match phase {
             RacePhase::Unregister => &self.unregister,
             RacePhase::TaskBind => &self.task_bind,
+            RacePhase::ForwardMarked => &self.forward_marked,
         };
         table.lock().unwrap().insert(key, slot);
     }
@@ -124,6 +128,7 @@ impl RaceBarriers {
             let table = match phase {
                 RacePhase::Unregister => &self.unregister,
                 RacePhase::TaskBind => &self.task_bind,
+                RacePhase::ForwardMarked => &self.forward_marked,
             };
             table
                 .lock()
@@ -143,6 +148,12 @@ impl RaceBarriers {
 pub(crate) enum RacePhase {
     Unregister,
     TaskBind,
+    /// c-dirpicker r11 item 2: parks the unregister handler right AFTER the
+    /// forward intent was stamped and BEFORE the prepare is sent. At this
+    /// point the new code has already PINNED the transport the prepare rides;
+    /// the mark-then-resolve ordering this replaces had not, so a hello that
+    /// lands during the park moves only the new code's pin nowhere.
+    ForwardMarked,
 }
 
 /// Stable substrings the Node's unregister prepare emits for occupancy/race
@@ -566,14 +577,33 @@ async fn mutate(
         payload["workspaceId"] = json!(workspace_id);
     }
     crate::agent_scope::stamp(&mut payload, &device);
+    // c-dirpicker r11 item 2: pin the (transport, link generation) pair BEFORE
+    // queueing. The INSERT stamps this generation as a floor; the mark refreshes
+    // it; prepare, commit and every best-effort abort below ride THIS transport.
+    // A hello installing a new link between any of those steps can no longer
+    // move one frame onto a different link than the row is attributed to.
+    let pinned = state.nodes.pin(&id).await.ok_or(HubError::HostOffline {
+        host_id: id.clone(),
+    })?;
     let (command, _) = state
         .store
         .queue_command(None, None, id.clone(), method.into(), payload, None)
         .await?;
     state
         .store
-        .mark_forward_intent(command.command_id.clone())
+        .mark_forward_intent(command.command_id.clone(), pinned.link_generation())
         .await?;
+    // r11 item 2 test seam: park AFTER the stamp with the pinned transport
+    // already held. A hello during the park installs a new link, but the
+    // prepare below must ride THIS pin. No-op in production.
+    state
+        .race_barriers
+        .wait_if_armed(
+            RacePhase::ForwardMarked,
+            &id,
+            node_workspace_id.as_deref().unwrap_or(""),
+        )
+        .await;
     let mut rpc_params = json!({
         "path": node_path,
         "commandId": command.command_id,
@@ -582,7 +612,7 @@ async fn mutate(
     if let Some(workspace_id) = &node_workspace_id {
         rpc_params["workspaceId"] = json!(workspace_id);
     }
-    let prepared = crate::http::call_node(state, &id, method, rpc_params).await;
+    let prepared = crate::http::call_node_pinned(&id, &pinned, method, rpc_params).await;
     let prepared = match prepared {
         Err(HubError::BadRequest(reason)) if method == "workspace.unregister" => {
             // The Node enforces the same occupancy rule at prepare (its view
@@ -607,6 +637,7 @@ async fn mutate(
             // returning; an unreachable host is reconciled on reconnect.
             abort_unregister(
                 state,
+                Some(&pinned),
                 &id,
                 &node_path,
                 &node_workspace_id,
@@ -637,7 +668,7 @@ async fn mutate(
     if let Some(workspace_id) = &node_workspace_id {
         commit_params["workspaceId"] = json!(workspace_id);
     }
-    let settled = match crate::http::call_node(state, &id, method, commit_params).await {
+    let settled = match crate::http::call_node_pinned(&id, &pinned, method, commit_params).await {
         Ok(answer) => answer,
         Err(HubError::BadRequest(reason)) if node_unregister_conflict(&reason).is_some() => {
             // r7 item 1: a commit refusal must release the prepared unbinding
@@ -645,6 +676,7 @@ async fn mutate(
             // this abort is the explicit, idempotent reconciliation).
             abort_unregister(
                 state,
+                Some(&pinned),
                 &id,
                 &node_path,
                 &node_workspace_id,
@@ -659,6 +691,7 @@ async fn mutate(
             // the reconnect sweep reconciles the command.
             abort_unregister(
                 state,
+                Some(&pinned),
                 &id,
                 &node_path,
                 &node_workspace_id,
@@ -689,6 +722,7 @@ async fn mutate(
         {
             abort_unregister(
                 state,
+                Some(&pinned),
                 &id,
                 &node_path,
                 &node_workspace_id,
@@ -726,6 +760,7 @@ async fn mutate(
 ///  - any transport error — leave the row unsettled; the next hello retries.
 async fn abort_unregister(
     state: &AppState,
+    pinned: Option<&crate::transport::PinnedNodeCall>,
     host_id: &str,
     node_path: &str,
     node_workspace_id: &Option<String>,
@@ -739,7 +774,16 @@ async fn abort_unregister(
     if let Some(workspace_id) = node_workspace_id {
         params["workspaceId"] = json!(workspace_id);
     }
-    match crate::http::call_node(state, host_id, "workspace.unregister", params).await {
+    // r11 item 2: inside a forwarding attempt the abort rides the SAME pinned
+    // transport the prepare/commit used; the reconnect sweep has no attempt in
+    // flight and resolves the freshly registered transport normally.
+    let rpc = match pinned {
+        Some(pin) => {
+            crate::http::call_node_pinned(host_id, pin, "workspace.unregister", params).await
+        }
+        None => crate::http::call_node(state, host_id, "workspace.unregister", params).await,
+    };
+    match rpc {
         Ok(answer) if answer.get("phase").and_then(Value::as_str) == Some("settled") => {
             // The commit really landed on the Node before the abort arrived.
             // Mark completed FIRST (the row is still accepted here), then
@@ -845,6 +889,7 @@ pub async fn abort_unsettled_unregisters_on_reconnect(
             .map(str::to_owned);
         abort_unregister(
             state,
+            None,
             host_id,
             &node_path,
             &workspace_id,
@@ -1350,7 +1395,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_forward_intent(old.command_id.clone())
+            .mark_forward_intent(old.command_id.clone(), 0)
             .await
             .unwrap();
 
@@ -1396,7 +1441,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_forward_intent(new.command_id.clone())
+            .mark_forward_intent(new.command_id.clone(), 1)
             .await
             .unwrap();
 
@@ -1568,6 +1613,132 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1, "{listed:?}");
         assert_eq!(listed[0].command_id, legacy.command_id);
+
+        hub.shutdown().await;
+    }
+
+    /// r11 item 2: the registry pairs a transport with the durable generation
+    /// its adopting hello stamped, and `pin` hands the pair out atomically.
+    /// During the bump→insert hello window the half-open L1 stays paired with
+    /// gen 1 (so an in-window attempt marks 1, rides L1, and the gen-2 sweep
+    /// aborts it); after L2 registers every pin pairs gen 2 with L2.
+    #[tokio::test]
+    async fn forward_pin_pairs_transport_with_its_link_generation() {
+        use crate::HubConfig;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hub = crate::spawn(HubConfig::for_test(dir.path().join("data")))
+            .await
+            .unwrap();
+        let state = hub.state.clone();
+        let store = state.store.clone();
+        let host = crate::config::new_id("hst").unwrap();
+        hub.test_insert_host(&host).await.unwrap();
+        assert_eq!(
+            store.bump_host_link_generation(host.clone()).await.unwrap(),
+            1
+        );
+
+        let l1 = Arc::new(RecordingAbortNode::default());
+        hub.test_set_node_transport_with_generation(&host, l1.clone(), 1)
+            .await;
+
+        let pin1 = state.nodes.pin(&host).await.expect("L1 live");
+        assert_eq!(pin1.link_generation(), 1);
+
+        // The hello window: durable counter already bumped, registry still
+        // carrying the half-open L1 slot.
+        assert_eq!(
+            store.bump_host_link_generation(host.clone()).await.unwrap(),
+            2
+        );
+        let window_pin = state.nodes.pin(&host).await.expect("L1 still registered");
+        assert_eq!(
+            window_pin.link_generation(),
+            1,
+            "the stale L1 transport must stay paired with gen 1, never read the bumped 2"
+        );
+
+        // An in-window forwarding attempt marks the PINNED 1 and the gen-2
+        // sweep attributes it to a dead link even though the frame reaches L1.
+        let (stuck, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/window", "workspaceId": "wsp_window"}),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_forward_intent(stuck.command_id.clone(), window_pin.link_generation())
+            .await
+            .unwrap();
+        window_pin
+            .call(
+                "workspace.unregister",
+                json!({"commandId": stuck.command_id, "phase": "prepare"}),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_unsettled_workspace_unregisters(&host, 2)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.command_id == stuck.command_id),
+            "a gen-1 stamp rides the gen-2 sweep even though the registry was mid-hello"
+        );
+        assert!(
+            store
+                .list_unsettled_workspace_unregisters(&host, 1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the gen-1 sweep spares it"
+        );
+        assert!(
+            l1.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, id)| method == "workspace.unregister" && id == &stuck.command_id)
+        );
+
+        // L2 lands: every new pin pairs L2 with gen 2 and the frame can no
+        // longer reach L1 or be stamped with 1.
+        let l2 = Arc::new(RecordingAbortNode::default());
+        hub.test_set_node_transport_with_generation(&host, l2.clone(), 2)
+            .await;
+        let pin2 = state.nodes.pin(&host).await.expect("L2 live");
+        assert_eq!(pin2.link_generation(), 2);
+        pin2.call(
+            "workspace.unregister",
+            json!({"commandId": "cmd-on-l2", "phase": "prepare"}),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(
+            l2.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, id)| method == "workspace.unregister" && id == "cmd-on-l2")
+        );
+        assert!(
+            !l1.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, id)| id == "cmd-on-l2"),
+            "after L2 registers a pinned frame never rides the stale L1"
+        );
 
         hub.shutdown().await;
     }

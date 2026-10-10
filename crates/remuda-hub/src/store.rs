@@ -4210,12 +4210,25 @@ impl Store {
 
     /// Persist forward intent. Returns false if already forwarded (do not resend).
     ///
-    /// c-dirpicker r10 item 1: also stamp the host's CURRENT link generation
-    /// on the row. A command is only ever forwarded over the link the host
-    /// holds right now (DELETEs against an offline host fail before queueing),
-    /// so the stamp attributes the command to that link independent of wall
-    /// clocks; the reconnect sweep aborts rows stamped by an older link.
-    pub async fn mark_forward_intent(&self, command_id: String) -> Result<bool, StoreError> {
+    /// c-dirpicker r10 item 1: stamp the host link generation the forwarding
+    /// attempt PINNED when it chose its transport, so the reconnect sweep
+    /// attributes the row to that link independent of wall clocks.
+    ///
+    /// r11 item 2: the generation is an argument pinned at the registry BEFORE
+    /// this call, not re-read here. The bump (hello) and the transport registry
+    /// are two separate structures: re-reading inside this writer job could
+    /// stamp the NEW generation while the frame rides a half-open PREVIOUS
+    /// transport (the row would then survive a sweep that must abort it), or
+    /// stamp an old one for a frame that rides the new link (a live DELETE
+    /// aborted). [`crate::transport::ConnectedNodes::pin`] hands out the
+    /// transport and generation together; the row already carries the
+    /// INSERT-time stamp ([`Self::queue_command`]), which this refreshes for a
+    /// bump between INSERT and the forwarding attempt.
+    pub async fn mark_forward_intent(
+        &self,
+        command_id: String,
+        link_generation: i64,
+    ) -> Result<bool, StoreError> {
         self.run_named("mark_forward_intent", move |conn| {
             let Some(row) = load_command(conn, &command_id)? else {
                 return Err(StoreError::Id("unknown command".into()));
@@ -4228,13 +4241,10 @@ impl Store {
                 "UPDATE commands
                     SET forwarded = 1,
                         resolution = 'unknown',
-                        link_generation = (
-                            SELECT h.link_generation FROM hosts h
-                             WHERE h.id = commands.host_id
-                        ),
-                        updated_at = ?1
-                  WHERE id = ?2",
-                params![now, command_id],
+                        link_generation = ?1,
+                        updated_at = ?2
+                  WHERE id = ?3",
+                params![link_generation, now, command_id],
             )?;
             Ok(true)
         })
@@ -6927,7 +6937,7 @@ mod tests {
             .await
             .expect("command");
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await
             .expect("forward intent");
 
@@ -7063,7 +7073,7 @@ mod tests {
             .await
             .expect("command");
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await
             .expect("forward once");
         // The RPC accept deadline elapsed: unknown, not resent.
@@ -7159,7 +7169,7 @@ mod tests {
             .await
             .expect("command");
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await
             .expect("forward once");
 
@@ -7271,7 +7281,7 @@ mod tests {
             .await
             .expect("command");
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await
             .expect("forward once");
 

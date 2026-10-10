@@ -1485,7 +1485,7 @@ mod abort {
             )
             .await?;
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await?;
         store.mark_accepted(command.command_id.clone()).await?;
         // Model the reconnect hello adopting a new link before the sweep
@@ -1561,7 +1561,7 @@ mod abort {
             )
             .await?;
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await?;
         store.mark_accepted(command.command_id.clone()).await?;
         // The stuck command rode the previous link; the reconnect hello must
@@ -2006,6 +2006,225 @@ async fn reconnect_after_dropped_prepare_aborts_on_the_new_socket_and_unblocks_t
     );
 
     second.abort();
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// Scripted Node for the r11 item 2 transport/generation pinning tests.
+/// `dead` answers every `workspace.unregister` RPC with an error (a half-open
+/// link whose writes fail); a live node answers the protocol phases.
+struct InterleaveNode {
+    name: &'static str,
+    calls: Mutex<Vec<&'static str>>,
+    dead: std::sync::atomic::AtomicBool,
+}
+
+impl InterleaveNode {
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn list_reply(&self) -> Value {
+        json!({
+            "workspaceRevision": 1,
+            "workspaces": [{
+                "workspaceId": WORKSPACE,
+                "hostId": "hst_interleave",
+                "root": ROOT,
+            }],
+        })
+    }
+}
+
+impl NodeTransport for InterleaveNode {
+    fn kind(&self) -> TransportKind {
+        TransportKind::OutboundWss
+    }
+
+    fn call(
+        &self,
+        method: &str,
+        params: Value,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, remuda_hub::HubError>> + Send + '_>>
+    {
+        let method = method.to_owned();
+        let phase = params
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let command_id = params.get("commandId").cloned().unwrap_or(Value::Null);
+        Box::pin(async move {
+            match method.as_str() {
+                "workspace.list" => Ok(Some(self.list_reply())),
+                "workspace.resolve" => Ok(Some(json!({
+                    "workspaceId": WORKSPACE,
+                    "canonicalRoot": ROOT,
+                }))),
+                "workspace.unregister" => {
+                    let label: &'static str = match phase.as_str() {
+                        "prepare" => "prepare",
+                        "commit" => "commit",
+                        "abort" => "abort",
+                        _ => "other",
+                    };
+                    self.calls.lock().unwrap().push(label);
+                    if self.dead.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(remuda_hub::HubError::Internal(format!(
+                            "{} link is dead (simulated broken pipe)",
+                            self.name
+                        )));
+                    }
+                    let reply_phase = match phase.as_str() {
+                        "prepare" => "prepared",
+                        "commit" => "settled",
+                        // Any non-"settled" ack is positive abort evidence.
+                        _ => "aborted",
+                    };
+                    Ok(Some(json!({
+                        "workspaceRevision": 2,
+                        "workspaces": [],
+                        "workspaceId": WORKSPACE,
+                        "commandId": command_id,
+                        "phase": reply_phase,
+                    })))
+                }
+                other => Err(remuda_hub::HubError::Internal(format!(
+                    "unexpected {other}"
+                ))),
+            }
+        })
+    }
+
+    fn notify(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, remuda_hub::HubError>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(true)))
+    }
+}
+
+/// r11 item 2 interleaving (i): the DELETE has stamped the forward intent and
+/// pinned the half-open L1 when the L2 hello bumps to gen 2 and registers.
+/// Prepare (and the failure abort) must ride L1 — never L2 — so the operator
+/// error is L1's dead-link failure rather than an L2 answer for a gen-1 row,
+/// and L2's post-hello sweep is what aborts the stale command. Interleaving
+/// (ii): a DELETE that arrives AFTER L2 registered pins gen 2; prepare+commit
+/// ride L2 and settle, and no sweep aborts it.
+///
+/// The park point is the ForwardMarked barrier: after the mark, before the
+/// prepare. Code that re-resolved the transport only at send time (the old
+/// mark→call_node ordering) would ride L2 here and answer 200; the pinned
+/// ordering fails on dead L1 instead.
+#[tokio::test]
+async fn forward_pin_keeps_prepare_commit_on_one_link_across_a_hello() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = HubConfig::for_test(dir.path().join("data"));
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let host = HostId::new().as_id().as_str().to_owned();
+    hub.test_insert_host(&host).await?;
+    let store = hub.store().expect("store");
+
+    // L1 adopts gen 1 — a half-open link whose writes now fail.
+    assert_eq!(store.bump_host_link_generation(host.clone()).await?, 1);
+    let l1 = Arc::new(InterleaveNode {
+        name: "L1",
+        calls: Mutex::new(Vec::new()),
+        dead: std::sync::atomic::AtomicBool::new(true),
+    });
+    hub.test_set_node_transport_with_generation(&host, l1.clone(), 1)
+        .await;
+
+    // Observe the snapshot so the DELETE resolves by exact root.
+    let (status, _) = json_request(
+        hub.addr,
+        "GET",
+        &format!("/v1/hosts/{}/workspaces", host),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200);
+
+    // DELETE parks after the mark/pin, before the prepare.
+    let (reached, release) = hub.test_arm_forward_marked_barrier(&host, WORKSPACE);
+    let addr = hub.addr;
+    let host_for_delete = host.clone();
+    let cookie_for_delete = cookie.clone();
+    let delete = tokio::spawn(async move {
+        json_request(
+            addr,
+            "DELETE",
+            &format!("/v1/hosts/{}/workspaces", host_for_delete),
+            &[("Cookie", &cookie_for_delete)],
+            Some(&json!({"path": ROOT}).to_string()),
+        )
+        .await
+    });
+    reached.notified().await;
+
+    // The L2 hello lands while the DELETE is parked: durable bump and the new
+    // transport register (the real hello arm order).
+    assert_eq!(store.bump_host_link_generation(host.clone()).await?, 2);
+    let l2 = Arc::new(InterleaveNode {
+        name: "L2",
+        calls: Mutex::new(Vec::new()),
+        dead: std::sync::atomic::AtomicBool::new(false),
+    });
+    hub.test_set_node_transport_with_generation(&host, l2.clone(), 2)
+        .await;
+    release.send(()).expect("release the parked DELETE");
+
+    // The pinned L1 prepare fails (dead link); the best-effort abort rides the
+    // SAME pinned L1. The operator gets a failure, never an L2 answer for a
+    // gen-1 row.
+    let (status, body) = delete.await.expect("delete task joined")?;
+    assert_ne!(
+        status, 200,
+        "a dead pinned link must not report success: {body}"
+    );
+    assert_eq!(
+        l1.calls(),
+        vec!["prepare", "abort"],
+        "prepare and the best-effort abort both stayed on L1"
+    );
+    assert!(l2.calls().is_empty(), "the parked DELETE never rode L2");
+
+    // L2's post-hello sweep aborts the gen-1 row over L2.
+    hub.test_reconcile_unsettled_unregisters(&host).await;
+    assert_eq!(
+        l2.calls(),
+        vec!["abort"],
+        "only L2 runs the gen-2 sweep abort"
+    );
+    assert_eq!(
+        l1.calls(),
+        vec!["prepare", "abort"],
+        "the sweep does not retry the dead L1 transport"
+    );
+
+    // Interleaving (ii): a DELETE after L2 registered pins gen 2 and the whole
+    // prepare→commit rides L2 and settles.
+    let (status, body) = json_request(
+        hub.addr,
+        "DELETE",
+        &format!("/v1/hosts/{}/workspaces", host),
+        &[("Cookie", &cookie)],
+        Some(&json!({"path": ROOT}).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(l2.calls(), vec!["abort", "prepare", "commit"]);
+    assert_eq!(
+        l1.calls(),
+        vec!["prepare", "abort"],
+        "a gen-2 forwarding attempt never touches the stale L1"
+    );
+
     hub.shutdown().await;
     Ok(())
 }

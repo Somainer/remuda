@@ -353,6 +353,81 @@ fn approval_requested_event(interaction_wire: &str) -> Value {
 /// Drive an instance with one unknown-deadline pending approval up to the
 /// point the card is durable-pending. Returns the ids; the caller ends the
 /// generation.
+/// Open a real /v1/follow WebSocket and prove the follower pump seeded its
+/// settlement cursor AND subscribed to the bus BEFORE the test acts: settle a
+/// throwaway sentinel card first, connect, and read frames until the sentinel's
+/// connect-replay `settlement` frame arrives. Replaces a fixed
+/// `timeout(follow.next())` drain, which proved nothing about seeding and
+/// could return before (or long after) the pump subscribed (r12 item 5).
+///
+/// Returns the connected follower stream; the caller drives it for the real
+/// event under test.
+async fn connect_follower_proven_seeded(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    label: &str,
+) -> Result<(
+    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    String,
+)> {
+    // The sentinel MUST live on its OWN throwaway host: its settle sweep
+    // lists `instances: []`, which sweeps EVERY instance on that host. Using
+    // the test's node/host would pre-settle the test's own cards (as
+    // generation-ended) and mask later per-card settlements.
+    let sentinel_enroll = enroll_token(addr, cookie).await?;
+    let (sentinel_node, sentinel_host) = FakeNode::spawn(addr, &sentinel_enroll).await?;
+    let (_sentinel_inst, sentinel_card) = seed_live_card(
+        addr,
+        cookie,
+        &sentinel_node,
+        &sentinel_host,
+        &format!("{label} sentinel"),
+    )
+    .await?;
+    let _sentinel_inst = sweep_with_new_epoch(
+        &addr,
+        &sentinel_node,
+        &sentinel_host,
+        &format!("cs-{label}-sentinel"),
+        json!([]),
+        99,
+    )
+    .await?;
+
+    let mut req = format!("ws://{addr}/v1/follow").into_client_request()?;
+    req.headers_mut().insert("Cookie", cookie.parse()?);
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let (mut follow, _) = tokio_tungstenite::client_async(req, tcp).await?;
+
+    // The sentinel's connect-replay frame only exists after the follower
+    // seeded its cursor from durable max seq and ran its startup catch-up, so
+    // observing it is a deterministic subscription/seeding proof.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut seeded = false;
+    while tokio::time::Instant::now() < deadline {
+        let Some(Ok(msg)) = tokio::time::timeout_at(deadline, follow.next())
+            .await
+            .ok()
+            .flatten()
+        else {
+            break;
+        };
+        let Message::Text(text) = msg else { continue };
+        let frame: Value = serde_json::from_str(&text)?;
+        if frame.get("type") == Some(&json!("settlement"))
+            && frame["interactionId"] == json!(sentinel_card)
+        {
+            seeded = true;
+            break;
+        }
+    }
+    assert!(
+        seeded,
+        "follower did not replay the pre-connect sentinel (seeding unproven)"
+    );
+    Ok((follow, sentinel_card))
+}
+
 async fn seed_live_card(
     addr: std::net::SocketAddr,
     cookie: &str,
@@ -2048,18 +2123,10 @@ async fn follower_frame_after_a_demotion_carries_agent_demoted_reason() -> Resul
     let (instance_id, int_id) =
         seed_live_card(addr, &cookie, &node, &host_id, "r11 demotion frame").await?;
 
-    // Follower connects BEFORE the demotion so it takes the live bus frame.
-    let mut follow_req = format!("ws://{addr}/v1/follow").into_client_request()?;
-    follow_req.headers_mut().insert("Cookie", cookie.parse()?);
-    let follow_tcp = tokio::net::TcpStream::connect(addr).await?;
-    let (mut follow, _) = tokio_tungstenite::client_async(follow_req, follow_tcp).await?;
-    // Pump the initial snapshot/handshake out of the socket until the
-    // follower pump is subscribed (the first text frame proves the socket is
-    // live; a tiny settle window is enough).
-    // Drain any immediate frame (snapshot/replay) so the pump is subscribed.
-    let _ = tokio::time::timeout(Duration::from_secs(5), follow.next())
-        .await
-        .ok();
+    // Follower connects BEFORE the demotion; the sentinel connect-replay
+    // proves its pump seeded and subscribed (r12 item 5: no fixed 5 s drain).
+    let (mut follow, _sentinel) =
+        connect_follower_proven_seeded(addr, &cookie, "r12-demotion").await?;
 
     // The exact shell_pty retire_payload("invalidated", "agent-demoted")
     // entity event.
@@ -2301,7 +2368,7 @@ async fn follower_receives_the_delete_transaction_settlement_frame_after_sweep()
     // sentinel connect-replay proves seeding+subscription (r12 item 5: no
     // fixed 5 s drain).
     let (mut follow, _sentinel) =
-        connect_follower_proven_seeded(addr, &cookie, &node, &host_id, "r12-delete").await?;
+        connect_follower_proven_seeded(addr, &cookie, "r12-delete").await?;
 
     // Plain DELETE (no force): the swept row is already `exited`, so
     // stop_before_delete never runs — the delete transaction settles the

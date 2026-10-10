@@ -133,7 +133,23 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         if let Some(path) = &stdin_file {
             record_stdin_marker(path, &incoming);
         }
+        let was_initialized = session.saw_initialize;
         session.handle_incoming(incoming, &mut lines)?;
+        // ma-sdk-state r4 item 3: FAKE_CLAUDE_CLOSE_STDIN closes the read end
+        // on the SAME iteration that completes the handshake — the first
+        // prompt must never be consumed, so its write fails while the child
+        // parks alive. Closing on a later iteration would let the first send
+        // through (it is the frame that triggers this loop body).
+        if close_stdin && !was_initialized && session.saw_initialize {
+            #[cfg(unix)]
+            {
+                // Drop our read end of stdin. `std::io::stdin()` only borrows
+                // fd 0, so that alone leaves the pipe open; close the fd
+                // outright (safe wrapper forbidden by the workspace lint).
+                let _ = nix::unistd::close(0);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(300));
+        }
         // c-cardsettle r8 item 1: a test can ask the child to leave on its OWN
         // once the scripted conversation is exhausted — WITHOUT stdin EOF and
         // WITHOUT an `instance.close` (whose explicit-close entity ends the

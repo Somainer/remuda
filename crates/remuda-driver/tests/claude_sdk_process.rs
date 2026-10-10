@@ -967,3 +967,72 @@ async fn a_result_queued_during_the_write_window_starts_then_results() {
 
     driver.close().await.expect("close");
 }
+
+/// ma-sdk-state r4 item 3 (OA6): the fake child closes its OWN stdin fd after
+/// the handshake and keeps running with stdout open. The acknowledged write
+/// must surface as an error, but the process is still alive:
+/// * `send` returns `Err`, never `transport_written`;
+/// * the reservation produced ZERO turn_started observations;
+/// * the child process survives (parent-death reaper notwithstanding) and
+///   `process_gone()` stays false — the Node must not terminalize on this.
+#[tokio::test]
+async fn a_live_child_that_closed_its_stdin_errors_the_send_without_any_turn_start() {
+    let (_tmp, driver, spec) = driver_with_env(
+        ScriptKind::Ok,
+        BTreeMap::from([("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into())]),
+    );
+    let mut handle = driver.start(spec).await.expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Give the child a beat to run its post-handshake stdin close.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        process_alive(&pid),
+        "the child parked alive with stdin closed"
+    );
+
+    let result = driver.send(prompt("into a closed stdin")).await;
+    assert!(
+        result.is_err(),
+        "the write against the child-closed stdin must error, got {result:?}"
+    );
+    assert!(
+        !driver.process_gone().await,
+        "a closed stdin on a live child is not process loss"
+    );
+
+    // Drain for a grace period: the failed reservation must not have leaked a
+    // turn_started, and the live child sends no stdout exit either.
+    let mut leaked = Vec::new();
+    while let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(300), handle.recv()).await
+    {
+        leaked.push(obs);
+    }
+    for obs in &leaked {
+        assert_ne!(
+            lifecycle_named(obs),
+            Some("turn_started"),
+            "a failed write emits no turn_started: {obs:?}"
+        );
+        assert!(
+            !(lifecycle_named(obs) == Some("session") && lifecycle_status(obs) == Some("exited")),
+            "a live child emits no exit while its stdin is closed: {obs:?}"
+        );
+    }
+    assert!(
+        process_alive(&pid),
+        "the child is still running after the failed write"
+    );
+
+    driver.close().await.expect("close");
+    assert!(
+        !process_alive(&pid),
+        "close still reaps the live child through the ladder"
+    );
+}

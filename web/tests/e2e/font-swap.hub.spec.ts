@@ -1029,7 +1029,7 @@ test("a saved position in a bounded long journal survives a monospace swap landi
   // woff2, real ResizeObserver timing). It is NOT a proof that specifically
   // fails on the pre-e6dc324d finalize-on-reflowCorrected guard: the armed
   // barrier releases only after the restore converged within 2px, the wrap row
-  // is strictly above the anchor, and with the r8 DOM-relative compensator
+  // is strictly above the anchor, and with the 89623ff4 (r7 item 3)
   // the whole drift is written by the reflow correction itself, so BOTH the
   // old finalize-on-reflowCorrected branch and the current code land the
   // anchor on its saved offset. The "don't finalize while reflowCorrected but

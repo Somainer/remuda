@@ -392,6 +392,12 @@ impl Store {
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()?;
+                // r9 item 2 (OA6): "was this row REALLY terminal?" must use
+                // process-end EVIDENCE, not the lifecycle string alone. The
+                // host-lost sweep marker (`exited` + 'host-lost' + no
+                // ended_at) is only potentially dead; a daemon that now
+                // reports the instance exited authoritatively attests the
+                // process end, so its pending cards must settle.
                 let was_terminal = match &previous {
                     Some((lifecycle, last_error, ended_at)) => {
                         crate::store::lifecycle_has_process_end_evidence(
@@ -403,18 +409,26 @@ impl Store {
                     None => true,
                 };
                 let now_terminal = matches!(lifecycle, "exited" | "failed" | "closed");
+                // ma-lineage r5 item 1: a daemon reconcile reporting RUNNING
+                // is authoritative liveness (D-019, same epoch) — it revives a
+                // host-lost/ambiguous terminal row, clearing ended_at (host
+                // loss is contact loss, not a death) and last_error.
+                let reports_running = lifecycle == "running";
                 tx.execute(
                     "UPDATE instances SET lifecycle = ?3, activity = ?4, connectivity = 'connected',
-                     last_error = ?5, updated_at = ?6,
-                     ended_at = CASE WHEN ?7 THEN COALESCE(ended_at, ?6) ELSE ended_at END
-                     WHERE id = ?1 AND host_id = ?2",
+                     last_error = CASE WHEN ?7 THEN NULL ELSE ?5 END,
+                     ended_at = CASE WHEN ?7 THEN NULL
+                                     WHEN ?8 THEN COALESCE(ended_at, ?6)
+                                     ELSE ended_at END,
+                     updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
                     params![
                         id,
-                        host_id,
+                        &host_id,
                         lifecycle,
                         activity,
                         instance["lastError"].as_str(),
                         &now,
+                        reports_running,
                         now_terminal
                     ],
                 )?;
@@ -663,17 +677,35 @@ mod tests {
             .await
             .unwrap();
         store.ssh_status(id.clone(), "online", None).await.unwrap();
-        let instance = store
-            .insert_instance(
-                id.clone(),
-                None,
-                "claude".into(),
-                "claude-print".into(),
-                None,
-                json!({}),
-            )
-            .await
-            .unwrap();
+        // ma-lineage r6 item 3(c): host-lost sweeps only chapters that
+        // reached a live lifecycle; acknowledge this instance (ready).
+        let instance = {
+            let inserted = store
+                .insert_instance(
+                    id.clone(),
+                    None,
+                    "claude".into(),
+                    "claude-print".into(),
+                    None,
+                    json!({}),
+                )
+                .await
+                .unwrap();
+            store
+                .append_journal(
+                    id.clone(),
+                    inserted.instance_id.clone(),
+                    Some(1),
+                    json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+                )
+                .await
+                .unwrap();
+            store
+                .get_instance(inserted.instance_id)
+                .await
+                .unwrap()
+                .unwrap()
+        };
         let host_id = id.clone();
         store
             .run_named(
@@ -756,7 +788,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(instance.lifecycle, "exited");
-        assert_eq!(instance.last_error.as_deref(), Some("host-lost"));
+        assert_eq!(instance.last_error.as_deref(), Some("host-contact-lost"));
         store.close().await;
     }
 
@@ -923,6 +955,89 @@ mod tests {
             .unwrap();
         assert_eq!(row.state, "invalidated");
         assert!(!row.blocking);
+        store.close().await;
+    }
+
+    /// ma-lineage r5 item 1(c): a daemon inventory that reports an instance
+    /// RUNNING revives a host-lost/ambiguous terminal row: lifecycle returns
+    /// to running and ended_at / last_error are cleared (D-019 same-epoch
+    /// process is alive).
+    #[tokio::test]
+    async fn daemon_inventory_running_report_revives_a_host_lost_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .insert_managed_host(
+                host.clone(),
+                AddSshHost {
+                    target: "lineage-revive".into(),
+                    label: "lineage-revive".into(),
+                    labels: vec![],
+                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .ssh_status(host.clone(), "online", None)
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "claude".into(),
+                "claude-sdk".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let host_lost_id = instance.instance_id.clone();
+        store
+            .run_named("host-lost", move |conn| {
+                conn.execute(
+                    "UPDATE instances
+                        SET lifecycle = 'exited', activity = 'idle',
+                            connectivity = 'disconnected',
+                            last_error = 'host-contact-lost',
+                            ended_at = NULL
+                      WHERE id = ?1",
+                    [host_lost_id.as_str()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        store
+            .reconcile_daemon_instances(
+                host.clone(),
+                vec![json!({
+                    "id": instance.instance_id,
+                    "hostId": host,
+                    "lifecycle": "running",
+                    "activity": "idle"
+                })],
+            )
+            .await
+            .unwrap();
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.lifecycle, "running",
+            "daemon running report revives the row"
+        );
+        assert_eq!(row.connectivity, "connected");
+        assert!(
+            row.last_error.is_none(),
+            "host-lost marker cleared: {row:?}"
+        );
         store.close().await;
     }
 }

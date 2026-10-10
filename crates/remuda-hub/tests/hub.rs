@@ -42,6 +42,20 @@ async fn offline_host_exits_in_background_and_is_only_listed_in_history() -> Res
     ))
     .await?;
     assert!(recv_json(&mut node).await?.get("result").is_some());
+    // ma-lineage r6 item 3(c): host-loss sweeps only chapters that reached a
+    // live lifecycle — bring the instance to running before disconnecting.
+    node.send(Message::Text(
+        json!({"jsonrpc":"2.0", "id":"3", "method":"journal.append",
+            "params":{"instanceId":instance_id.as_id().as_str(), "event":{
+                "kind":"lifecycle",
+                "payload":{"type":"entity","entityType":"instance","state":"ready"}
+            }}
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    assert!(recv_json(&mut node).await?.get("result").is_some());
     let (_, _, body) = http(
         hub.addr,
         "GET",
@@ -90,7 +104,7 @@ async fn offline_host_exits_in_background_and_is_only_listed_in_history() -> Res
     .await?;
     let history: Value = serde_json::from_str(&body)?;
     assert_eq!(history["items"][0]["lifecycle"], "exited");
-    assert_eq!(history["items"][0]["lastError"], "host-lost");
+    assert_eq!(history["items"][0]["lastError"], "host-contact-lost");
     let (status, _, _) = http(
         hub.addr,
         "GET",

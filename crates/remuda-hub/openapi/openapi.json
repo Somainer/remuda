@@ -1243,6 +1243,27 @@
       },
       "InstanceDeleted": {
         "properties": {
+          "chapterIds": {
+            "description": "Every chapter removed with a whole-lineage delete (the addressed instance plus its predecessors); a single id for a plain instance.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "chapterPurges": {
+            "additionalProperties": {
+              "description": "Outcome of the Node `instance.purge` call for that chapter.",
+              "enum": [
+                "purged",
+                "node-offline",
+                "node-rejected",
+                "purge-failed"
+              ],
+              "type": "string"
+            },
+            "description": "Per-chapter `instance.purge` outcome, keyed by chapter id; the Hub records are deleted either way.",
+            "type": "object"
+          },
           "deleted": {
             "const": true,
             "type": "boolean"
@@ -1251,7 +1272,7 @@
             "type": "string"
           },
           "nodePurge": {
-            "description": "Outcome of the Node `instance.purge` call; the Hub record is deleted either way.",
+            "description": "Outcome of the Node `instance.purge` call for the addressed chapter; the Hub record is deleted either way.",
             "enum": [
               "purged",
               "node-offline",
@@ -1746,7 +1767,7 @@
             "type": "string"
           },
           "endedAt": {
-            "description": "Last update once the chapter reached an ended lifecycle (exited/failed/closed); null while live.",
+            "description": "Timestamp of the chapter's process-end evidence (the observedAt of the classified end event or a by-construction scheduler end), stamped once and immutable; null while live or when no end evidence is recorded (host loss and ambiguous legacy failures leave it null).",
             "type": [
               "string",
               "null"

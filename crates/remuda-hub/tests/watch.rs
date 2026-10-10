@@ -679,6 +679,23 @@ fn turn_error_event() -> Value {
     })
 }
 
+/// The print/SDK driver's REAL session exit: topic=session, status=exited —
+/// process-end evidence distinct from the failed TURN that precedes it.
+fn session_exit_event() -> Value {
+    json!({
+        "kind": "lifecycle",
+        "payload": {
+            "type": "native",
+            "topic": "session",
+            "nativeName": "session",
+            "severity": "info",
+            "affectsCompletion": false,
+            "nativeId": { "state": "known", "value": "sess-failed-1" },
+            "status": { "state": "known", "value": "exited" },
+        },
+    })
+}
+
 #[tokio::test]
 async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
     let ctx = Ctx::spawn().await.unwrap();
@@ -721,19 +738,76 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
     assert_eq!(row["state"]["state"], "working");
     assert!(row["watch"]["observedAt"].is_string(), "{row}");
 
-    // D-057 OA6 (ma-lineage round 3): a turn result error is turn-level, never
-    // process termination — the durable Hub row does NOT converge to failed
-    // from the turn error alone (the print/sdk driver emits a separate process
-    // exit event when the child actually ends). The watch-layer failed state
-    // above still classifies the turn.
+    // ma-lineage r4 / c-cardsettle r5: a failed TURN is not a process death —
+    // the durable Hub row does NOT converge to failed from the turn error
+    // alone (the print/sdk driver emits a separate process exit event when the
+    // child ends), and the live child still accepts a REAL next prompt.
     let (status, instance) = ctx
         .request("GET", &format!("/v1/instances/{instance_id}"), None)
         .await;
     assert_eq!(status, 200, "{instance}");
     assert_ne!(
         instance["lifecycle"], "failed",
-        "a turn result error must not fail the durable instance: {instance}"
+        "the turn error alone keeps the process alive: {instance}"
     );
+
+    let prompt_body = json!({
+        "operation": "instance.send",
+        "payload": {
+            "instanceId": instance_id,
+            "input": {
+                "type": "prompt",
+                "mode": "new-turn",
+                "blocks": [{ "type": "text", "text": "please retry the task" }]
+            },
+            "completionScope": "native-turn"
+        }
+    });
+    let (status, receipt) = ctx
+        .request(
+            "POST",
+            &format!("/v1/instances/{instance_id}/commands"),
+            Some(prompt_body),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the live child accepts another prompt: {receipt}"
+    );
+    assert!(
+        receipt["command"]["commandId"].is_string(),
+        "the command receipt names the accepted command: {receipt}"
+    );
+    // The receipt is real: the fake Node received instance.send for THIS
+    // instance carrying the retry prompt.
+    let sends = ctx.node.payloads("instance.send");
+    let delivered = sends
+        .iter()
+        .any(|payload| payload["instanceId"] == json!(instance_id));
+    assert!(
+        delivered,
+        "the retry prompt was delivered to the child: {sends:?}"
+    );
+
+    // ── Stage 2: the driver's REAL session exit settles the card ───────────
+    ctx.node
+        .append_journal(&instance_id, &[session_exit_event()]);
+
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    // The real session/exited ends the PROCESS (clean print close after a
+    // failed turn); watch failure remains the classification of the turn.
+    assert_eq!(
+        row["watch"]["status"], "failed",
+        "the failed-turn watch classification persists: {row}"
+    );
+
+    // The Hub instance row converged to EXITED from the real session/exited.
+    let (status, instance) = ctx
+        .request("GET", &format!("/v1/instances/{instance_id}"), None)
+        .await;
+    assert_eq!(status, 200, "{instance}");
+    assert_eq!(instance["lifecycle"], "exited");
 
     // Persisted on the roster, sticky on the next observation, with timestamp.
     let (_, roster) = ctx.request("GET", "/v1/workers", None).await;

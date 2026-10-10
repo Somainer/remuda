@@ -189,7 +189,7 @@ struct TurnBook {
 }
 
 impl TurnBook {
-    fn begin_turn(&mut self) {
+    fn begin_turn(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.reserved = Some(seq);
@@ -197,13 +197,18 @@ impl TurnBook {
             seq,
             open_workflows: HashSet::new(),
         });
+        seq
     }
 
-    /// The reserved turn's write committed. Clears `reserved` AT commit (the
-    /// worker clears it from the ticket's queue position) so a later turn can
-    /// never read a stale reservation for a turn already started.
-    fn turn_committed(&mut self) {
-        self.reserved = None;
+    /// The reserved turn's write committed. Clear `reserved` AT commit (the
+    /// worker does this from the ticket's queue position) so a later turn never
+    /// reads a stale reservation for a turn already started. Conditional on the
+    /// committing seq: if a NEWER turn has already begun (its reservation now in
+    /// flight), clearing the older ticket must not clobber that newer one.
+    fn turn_committed(&mut self, seq: u64) {
+        if self.reserved == Some(seq) {
+            self.reserved = None;
+        }
     }
 
     /// Roll back the reservation opened by [`Self::begin_turn`] when its prompt
@@ -921,11 +926,11 @@ impl Driver for ClaudePrintDriver {
                 // resolves and emits turn_started there, so every frame the
                 // turn produces — enqueued only after the child receives the
                 // prompt — is published strictly behind its start.
-                let reservation = TurnReservation::shared(prompt.native_client_message_id.clone());
-                {
+                let reservation = {
                     let mut mapper = self.inner.mapper.lock().await;
-                    mapper.begin_turn_reservation();
-                }
+                    let seq = mapper.begin_turn_reservation();
+                    TurnReservation::shared(seq, prompt.native_client_message_id.clone())
+                };
                 let publisher = self.inner.publish.lock().await.clone();
                 if let Some(publisher) = publisher.as_ref()
                     && publisher
@@ -1349,6 +1354,9 @@ enum PublishJob {
 /// position; on commit it emits turn_started there, ahead of every frame that
 /// follows the ticket. On cancel it resumes without emitting a start.
 struct TurnReservation {
+    /// Per-turn book seq, so the worker clearing `reserved` at commit matches
+    /// THIS turn and never clobbers a newer turn's in-flight reservation.
+    seq: u64,
     client_message_id: String,
     committed: tokio::sync::Notify,
     /// Set BEFORE the notify in BOTH commit and cancel, closing the lost-wakeup
@@ -1364,8 +1372,9 @@ struct TurnReservation {
 }
 
 impl TurnReservation {
-    fn new(client_message_id: String) -> Self {
+    fn new(seq: u64, client_message_id: String) -> Self {
         Self {
+            seq,
             client_message_id,
             committed: tokio::sync::Notify::new(),
             resolved: std::sync::atomic::AtomicBool::new(false),
@@ -1375,8 +1384,8 @@ impl TurnReservation {
     }
 
     /// Wrap in an [`Arc`] for sharing between the send task and the worker.
-    fn shared(client_message_id: String) -> Arc<Self> {
-        Arc::new(Self::new(client_message_id))
+    fn shared(seq: u64, client_message_id: String) -> Arc<Self> {
+        Arc::new(Self::new(seq, client_message_id))
     }
 
     /// The write succeeded: unpark a waiter parked at the ticket.
@@ -1687,7 +1696,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                     if reservation.wait_for_commit().await && reservation.claim_start() {
                         let start = {
                             let mut mapper = inner.mapper.lock().await;
-                            mapper.commit_turn_reservation();
+                            mapper.commit_turn_reservation(reservation.seq);
                             mapper.turn_started_observation(&reservation.client_message_id)?
                         };
                         emit_all(&inner, vec![start]).await?;
@@ -2689,16 +2698,18 @@ impl Mapper {
     /// native client message id (echoed by the harness on its `user` record) is
     /// carried so a later fold can join the two.
     /// Open the settlement book for a new root turn BEFORE its prompt write
-    /// blocks (ma-sdk-state r5 item 1), emitting nothing.
-    fn begin_turn_reservation(&mut self) {
-        self.turns.begin_turn();
+    /// blocks (ma-sdk-state r5 item 1), emitting nothing. Returns the turn's
+    /// seq so the publication ticket can clear the right reservation at commit.
+    fn begin_turn_reservation(&mut self) -> u64 {
+        self.turns.begin_turn()
     }
 
     /// The reserved turn's write committed; clear the in-flight reservation so
     /// no later turn reads a stale one. Called by the publication worker from
-    /// the reservation ticket's queue position.
-    fn commit_turn_reservation(&mut self) {
-        self.turns.turn_committed();
+    /// the reservation ticket's queue position. Only clears when the
+    /// committing turn is still the reserved one, so a newer begin wins.
+    fn commit_turn_reservation(&mut self, seq: u64) {
+        self.turns.turn_committed(seq);
     }
 
     /// Roll back the latest turn reservation when its write fails.
@@ -2726,10 +2737,10 @@ impl Mapper {
     }
 
     fn turn_started(&mut self, client_message_id: &str) -> DriverResult<Observation> {
-        self.turns.begin_turn();
+        let seq = self.turns.begin_turn();
         // A start derived directly from the stream (replay/hydration) has no
         // in-flight write, so it holds no reservation.
-        self.turns.turn_committed();
+        self.turns.turn_committed(seq);
         self.turn_started_observation(client_message_id)
     }
 
@@ -5126,7 +5137,7 @@ mod turn_reservation_wakeup_tests {
     /// on the Notify forever, wedging the publication worker until close).
     #[tokio::test]
     async fn cancel_before_wait_resolves_without_a_start_and_without_hanging() {
-        let reservation = TurnReservation::shared("msg-cancel-before-wait".to_string());
+        let reservation = TurnReservation::shared(0, "msg-cancel-before-wait".to_string());
         // Cancel first; only afterwards does the (worker) side await.
         reservation.cancel();
         let committed = tokio::time::timeout(Duration::from_secs(2), reservation.wait_for_commit())
@@ -5138,7 +5149,7 @@ mod turn_reservation_wakeup_tests {
     /// A normal commit resolves a waiting ticket as committed.
     #[tokio::test]
     async fn commit_resolves_a_waiting_ticket_as_committed() {
-        let reservation = TurnReservation::shared("msg-commit".to_string());
+        let reservation = TurnReservation::shared(0, "msg-commit".to_string());
         let ticket = reservation.clone();
         let waiter = tokio::spawn(async move { ticket.wait_for_commit().await });
         // Let the waiter register its notified() before committing.
@@ -5199,5 +5210,45 @@ mod exit_permit_on_build_error_tests {
         );
         drop(tx);
         assert!(rx.recv().await.is_none(), "the stream reaches EOF");
+    }
+}
+
+#[cfg(test)]
+mod turn_book_reserved_seq_tests {
+    use super::*;
+
+    /// ma-sdk-state r5 item 1 follow-up: the worker clears `reserved` when it
+    /// processes a ticket, but a NEWER turn may already have begun by then
+    /// (send N+1's begin races ahead of the worker draining N's ticket).
+    /// Committing the OLDER seq must not clobber the newer in-flight
+    /// reservation, or a later failed write could not roll its own book back.
+    #[test]
+    fn committing_an_older_ticket_does_not_clear_a_newer_reservation() {
+        let mut book = TurnBook::default();
+        let a = book.begin_turn();
+        let b = book.begin_turn();
+        assert_eq!(book.reserved, Some(b));
+
+        // N's ticket is processed only after N+1 began: conditional clear.
+        book.turn_committed(a);
+        assert_eq!(
+            book.reserved,
+            Some(b),
+            "the older commit must not clobber turn B's reservation"
+        );
+
+        // A failed write for B must still be able to roll B back (back turn is
+        // the reserved one).
+        book.cancel_latest_turn();
+        // B removed; A still outstanding, reserved cleared.
+        assert_eq!(book.reserved, None);
+        assert!(book.outstanding.iter().any(|turn| turn.seq == a));
+        assert!(!book.outstanding.iter().any(|turn| turn.seq == b));
+
+        // Committing the matching (current) seq clears normally.
+        let c = book.begin_turn();
+        assert_eq!(book.reserved, Some(c));
+        book.turn_committed(c);
+        assert_eq!(book.reserved, None);
     }
 }

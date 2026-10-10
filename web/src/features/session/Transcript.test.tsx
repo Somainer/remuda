@@ -2713,11 +2713,18 @@ describe("load-earlier anchor lifecycle round 5", () => {
       // First press selects turn 0 (already at top: no write/no event); the
       // second jumps to turn 1 — the in-flight hold is re-aimed at turn 1.
       await user.keyboard("jj");
+      // The merged list (100 prepended + 50 tail) is the real scrollHeight.
+      geo.setTotal(150);
       await land(geo, g, older);
       // The click-time anchor would have restored to 100*ROW; the retargeted
       // hold never writes it. After the 100-row prepend the DESTINATION turn
       // (the second message, n_1002 assistant) sits at the viewport top.
       expect(writes).not.toContain(100 * ROW);
+      // Flush the retarget jump's own-echo scroll event so React's
+      // scrollTop state (and thus the rendered window) follows it, then let
+      // the settle correction finalize on the destination.
+      await geo.nextFrame();
+      await act(async () => {});
       expect(nodeTop(geo, "n_1002_assistant_insJ"), "the j turn did not land at the top after the prepend").toBe(0);
       expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
       await expectGrowthHolds(geo);
@@ -2793,31 +2800,40 @@ describe("load-earlier anchor lifecycle round 5", () => {
         return { user, geo, g, writes, older, resolvePage };
       }
 
-      it("a single j at the top (no scroll event) is not repinned by the prepend", async () => {
+      it("a single j at the top retargets the hold so turn 0 is parked after the shallow prepend", async () => {
         const { user, geo, writes, resolvePage } = shallowSetup("insJZero");
         await user.click(screen.getByTestId("load-earlier"));
-        // One j selects turn 0 already at the top: applyOffset writes an
-        // UNCHANGED clamped value, so the browser dispatches NO event.
+        // One j selects turn 0 (n_1001), already at the top: the initial
+        // retarget write is unchanged and dispatches NO event.
         await user.keyboard("j");
-        // The shallow page lands with no queued event in between.
+        // The merged list (5 prepended + 20 tail) is the real scrollHeight.
+        geo.setTotal(25);
         await resolvePage();
-        // The armed anchor sits 5 rows deep and is mounted: an uncancelled
-        // restore repins it to 5*ROW; the cancelled restore leaves top at 0.
-        expect(writes).not.toContain(5 * ROW);
-        expect(geo.top()).toBe(0);
+        // The retargeted hold parks turn 0 at the viewport top after the
+        // 5-row prepend (its settle write moves to 5*ROW); the click-time
+        // anchor never gets a separate write.
+        await geo.nextFrame();
+        await act(async () => {});
+        expect(writes).not.toContain(5 * ROW - ROW);
+        const top = Math.round(
+          geo.scroller().querySelector<HTMLElement>('[data-anchor="n_1001_user_insJZero"]')!.getBoundingClientRect().top
+            - geo.scroller().getBoundingClientRect().top,
+        );
+        expect(top, "turn 0 did not park at the top after the shallow prepend").toBe(0);
       });
 
-      it("after jj (event delivered after the prepend) the estimate is not frozen", async () => {
-        // Deep window: the armed anchor lands 100 rows deep (off-screen), so a
-        // still-frozen restoringRef shows up only through the estimate an
-        // off-window search uses — exactly bug (b).
+      it("after jj the retargeted hold settles and the estimate stops being frozen", async () => {
+        // Deep window: the retargeted turn lands 100 rows deep (off-screen at
+        // first), so a still-frozen restoringRef would show up through the
+        // estimate an off-window search uses. Once the retargeted hold settles
+        // on the turn, restoringRef clears and the estimate converges.
         const { user, geo, g, writes, older } = setup("insJJEst");
         await user.click(screen.getByTestId("load-earlier"));
-        // First j: unchanged write, no event. Second j: moves to turn 1, its
-        // event stays queued for the next frame.
+        // First j: unchanged write, no event. Second j: retargets the in-flight
+        // hold at turn 1, its write event stays queued for the next frame.
         await user.keyboard("jj");
-        // The 100-row page prepends BEFORE the queued event fires; without the
-        // synchronous cancel restoringRef would stay true forever.
+        // The 100-row page prepends before the queued event fires; the
+        // retargeted hold stays armed only until it settles on turn 1.
         await act(async () => {
           g.resolve(pageOf(older));
           await Promise.resolve();
@@ -2827,11 +2843,12 @@ describe("load-earlier anchor lifecycle round 5", () => {
         await act(async () => {});
         expect(writes).not.toContain(100 * ROW);
         geo.setTotal(150);
+        await geo.nextFrame();
+        await act(async () => {});
 
-        // Measure the rows currently mounted near the top at 200px, with NO
-        // navigation or gesture in between (the growth hold is suppressed by
-        // the cancel). The estimate is global: frozen restoringRef keeps it
-        // at 96; released, it converges toward 200.
+        // Measure the rows currently mounted at 200px with no further
+        // navigation: the estimate is global — frozen restoringRef keeps it at
+        // 96; released after settle it converges toward 200.
         for (let pass = 0; pass < 4; pass += 1) {
           const rows = geo.scroller().querySelectorAll<HTMLElement>("[data-anchor]");
           await act(async () => {
@@ -2840,8 +2857,8 @@ describe("load-earlier anchor lifecycle round 5", () => {
             });
           });
         }
-        // The first off-window navigation after the measurements: it must run
-        // with restoringRef already false (synchronous cancel), so the hit
+        // The first off-window navigation after the measurements must run with
+        // restoringRef already false (the retargeted hold settled), so the hit
         // uses the converged estimate. Frozen at 96 the hit lands near 4064.
         await user.click(screen.getByTestId("transcript-search-open"));
         await user.type(screen.getByTestId("transcript-search-input"), "insJJEst-m1049");
@@ -2849,18 +2866,26 @@ describe("load-earlier anchor lifecycle round 5", () => {
         expect(geo.top()).toBeGreaterThan(4500);
       });
 
-      it("a navigation whose event arrives after the prepend keeps its destination", async () => {
+      it("a navigation whose event arrives after the prepend still parks the retargeted destination", async () => {
         const { user, geo, writes, resolvePage } = shallowSetup("insLateEvent");
         await user.click(screen.getByTestId("load-earlier"));
         await user.keyboard("jj");
-        // Real response lands, THEN the deferred navigation scroll event.
+        // The merged list (5 prepended + 20 tail) is the real scrollHeight.
+        geo.setTotal(25);
+        // Real response lands, THEN the deferred navigation scroll event. Its
+        // dispatched position matches the newer retarget echo (the scroller
+        // already moved), so it is not mistaken for reader input.
         await resolvePage();
         await geo.nextFrame();
         await act(async () => {});
-        // Without the synchronous cancel the coalesced post-prepend event
-        // matches the restore's new echo and the prepend repins to 5*ROW.
+        // The prepend never restores the click-time anchor (5*ROW); turn 1
+        // parks at the viewport top after the 5-row shift.
         expect(writes).not.toContain(5 * ROW);
-        expect(geo.top()).toBe(ROW);
+        const top = Math.round(
+          geo.scroller().querySelector<HTMLElement>('[data-anchor="n_1002_assistant_insLateEvent"]')!.getBoundingClientRect().top
+            - geo.scroller().getBoundingClientRect().top,
+        );
+        expect(top, "turn 1 did not park at the top when its event landed after the prepend").toBe(0);
       });
     });
 

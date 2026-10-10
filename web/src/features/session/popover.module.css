@@ -11,7 +11,7 @@
   flex-direction: column;
   width: min(300px, calc(100vw - 16px));
   box-sizing: border-box;
-  z-index: 5;
+  z-index: var(--z-popover);
   overflow: hidden;
 }
 

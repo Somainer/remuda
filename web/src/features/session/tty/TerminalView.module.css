@@ -302,6 +302,13 @@ html[data-keyboard="1"] .host {
   background: var(--term-bg);
 }
 
+/* c-composerpop r5 item 2: measured wrapper for the tty bottom chrome; its
+   height is published as --session-dock-h so the notify stack clears the
+   local input dock and the phone key bar. */
+.bottomChrome {
+  flex: none;
+}
+
 .note {
   flex: none;
   border-top: 1px solid var(--term-border);

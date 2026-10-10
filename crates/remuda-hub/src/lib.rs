@@ -178,17 +178,23 @@ pub mod store_test_support {
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
 
-    /// Test-only fault guard: arm a Store failure and clear it on drop, so a
-    /// failed assertion can never leave the fault armed for another test.
-    pub fn arm_lease_lookup_failure() -> impl Drop {
-        crate::store::test_faults::arm_lease_lookup_failure();
-        struct LeaseLookupFault;
+    /// Test-only fault guard: arm failures on ONE store (per-Store flags,
+    /// `test-faults` feature only) and clear them on drop, so a failed
+    /// assertion can never leave a fault armed and other Stores are never
+    /// affected.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn arm_lease_lookup_failure(store: &Store) -> impl Drop {
+        crate::store::test_faults::arm_lease_lookup_failure(store.fault_flags());
+        struct LeaseLookupFault {
+            flags: std::sync::Arc<crate::store::test_faults::FaultFlags>,
+        }
+        let flags = store.fault_flags().clone();
         impl Drop for LeaseLookupFault {
             fn drop(&mut self) {
-                crate::store::test_faults::clear();
+                crate::store::test_faults::clear(&self.flags);
             }
         }
-        LeaseLookupFault
+        LeaseLookupFault { flags }
     }
 
     /// D-057 continuation-resume inputs/outcomes for the race suite.

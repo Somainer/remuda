@@ -4103,7 +4103,9 @@ async fn a_post_commit_lease_lookup_failure_still_purges_every_chapter_and_retur
     // Arm the post-commit fault BEFORE the delete: the committed delete
     // still succeeds, the lease lookup then errors, and the handler must log
     // and continue into the purge loop.
-    let _fault = remuda_hub::store_test_support::arm_lease_lookup_failure();
+    let _fault = remuda_hub::store_test_support::arm_lease_lookup_failure(
+        ctx.hub.store().expect("hub store"),
+    );
     let response = ctx
         .http
         .delete(format!("{}/v1/instances/{}", ctx.base(), y))

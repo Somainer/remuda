@@ -28,32 +28,40 @@ use tokio::sync::{Semaphore, oneshot};
 #[path = "store_auth_tests.rs"]
 mod auth_tests;
 
-/// Test-only fault injection for post-commit best-effort paths. Integration
-/// tests arm a flag via [`crate::store_test_support`] to make one Store
-/// method fail, proving an HTTP handler still completes the remaining
-/// best-effort work instead of returning 500 after the commit. Compiled into
-/// every build (one relaxed atomic load per faulted call site); never armed
-/// outside tests.
+/// Test-only fault injection for post-commit best-effort paths. Gated
+/// behind the `test-faults` feature (enabled via the crate's own
+/// dev-dependency), so the production `remuda-hub` lib contains no fault
+/// flag, check or error variant. The flags are PER STORE (not process
+/// globals): arming one test's Store cannot fail lookups for any other
+/// Store in the same test binary.
+#[cfg(any(test, feature = "test-faults"))]
 pub(crate) mod test_faults {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    static LEASE_LOOKUP_FAILURE: AtomicBool = AtomicBool::new(false);
-
-    /// Make every [`crate::store::Store::active_worktree_leases_for_task`]
-    /// call fail until [`clear`] runs.
-    pub fn arm_lease_lookup_failure() {
-        LEASE_LOOKUP_FAILURE.store(true, Ordering::Release);
+    /// Per-Store injected-fault flags. Store holds an [`Option`] that is
+    /// `None` in every non-fault build.
+    #[derive(Default)]
+    pub(crate) struct FaultFlags {
+        pub lease_lookup_failure: AtomicBool,
     }
 
-    /// Clear every injected fault.
-    pub fn clear() {
-        LEASE_LOOKUP_FAILURE.store(false, Ordering::Release);
+    /// Make every `active_worktree_leases_for_task` call on THIS store fail
+    /// until [`clear`] runs.
+    pub fn arm_lease_lookup_failure(flags: &FaultFlags) {
+        flags.lease_lookup_failure.store(true, Ordering::Release);
     }
 
-    pub(super) fn lease_lookup_injected_failure() -> Result<(), crate::store::StoreError> {
-        if LEASE_LOOKUP_FAILURE.load(Ordering::Acquire) {
-            Err(crate::store::StoreError::Internal(
-                "test injected failure: active_worktree_leases_for_task".to_owned(),
+    /// Clear every injected fault for this store.
+    pub fn clear(flags: &FaultFlags) {
+        flags.lease_lookup_failure.store(false, Ordering::Release);
+    }
+
+    pub(super) fn lease_lookup_injected_failure(
+        flags: &FaultFlags,
+    ) -> Result<(), crate::store::StoreError> {
+        if flags.lease_lookup_failure.load(Ordering::Acquire) {
+            Err(crate::store::StoreError::FaultInjected(
+                "active_worktree_leases_for_task".to_owned(),
             ))
         } else {
             Ok(())
@@ -85,9 +93,10 @@ pub enum StoreError {
     /// A passkey with the same credential id is already registered.
     #[error("duplicate credential")]
     DuplicateCredential,
-    /// An internal/injected failure not caused by SQLite itself.
-    #[error("store: {0}")]
-    Internal(String),
+    /// An injected test fault (`test-faults` feature only).
+    #[cfg(any(test, feature = "test-faults"))]
+    #[error("injected store fault: {0}")]
+    FaultInjected(String),
 }
 
 fn sqlite_is_busy(err: &rusqlite::Error) -> bool {
@@ -244,6 +253,18 @@ pub struct Store {
     readers: Arc<ReaderPool>,
     /// Joins the writer thread after the last clone drops its channel sender.
     _join: Arc<StoreJoin>,
+    /// Per-Store test fault flags (`test-faults` feature only). Shared via
+    /// [`Arc`] so every clone of the store arms the SAME flags.
+    #[cfg(any(test, feature = "test-faults"))]
+    faults: Arc<test_faults::FaultFlags>,
+}
+
+impl Store {
+    /// Per-Store test fault flags (`test-faults` feature only).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn fault_flags(&self) -> &Arc<test_faults::FaultFlags> {
+        &self.faults
+    }
 }
 
 /// Delete one chapter's rows and write its interaction tombstones /
@@ -2298,6 +2319,8 @@ impl Store {
             _join: Arc::new(StoreJoin {
                 thread: Mutex::new(Some(thread)),
             }),
+            #[cfg(any(test, feature = "test-faults"))]
+            faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
 
@@ -3565,7 +3588,8 @@ impl Store {
         host_id: String,
         task_id: String,
     ) -> Result<Vec<WorktreeLeaseRow>, StoreError> {
-        test_faults::lease_lookup_injected_failure()?;
+        #[cfg(any(test, feature = "test-faults"))]
+        test_faults::lease_lookup_injected_failure(&self.faults)?;
         self.run_named("active_worktree_leases_for_task", move |conn| {
             // Match the task on the decoded array so `task_ids_json` stays an
             // internal detail rather than leaking a JSON1 expression to callers.

@@ -847,7 +847,18 @@ impl ShellPtyDriver {
 
     /// §9.1: queue `/effort <level>` for the composer, ready-ladder gated, and
     /// wait for transcript read-back while the composer is idle.
-    async fn switch_effort(&self, level: &str) -> DriverResult<DriverAck> {
+    async fn switch_effort(&self, level: &str, ultracode: Option<bool>) -> DriverResult<DriverAck> {
+        // The promoted-shell carrier does not hold the agent's reported binary
+        // version, so the version-gated ultracode axis fails closed here (the
+        // Herdr `claude_pty` carrier is the version-aware one and types
+        // `ultracode` / `ultracode on|off` itself). Plain level switches work.
+        if ultracode == Some(true) {
+            return Err(DriverError::CapabilityUnsupported(
+                "ultracode cannot be switched from a promoted-shell carrier; \
+                 use the managed Claude session"
+                    .to_owned(),
+            ));
+        }
         let Some(request) = crate::effort::EffortRequest::from_level(level) else {
             return Err(DriverError::CapabilityUnsupported(format!(
                 "claude /effort does not accept {level:?} in-session; \
@@ -2581,7 +2592,7 @@ impl Driver for ShellPtyDriver {
             && !level.is_empty()
             && switch.model_id.is_empty()
         {
-            return self.switch_effort(level).await;
+            return self.switch_effort(level, switch.effort_ultracode).await;
         }
         // §9.1: a model switch is `/model <id>` proven by the verdict.
         if self.session_kind() == Some(AgentKind::Claude)

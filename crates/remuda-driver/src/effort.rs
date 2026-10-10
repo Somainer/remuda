@@ -313,6 +313,60 @@ impl EffortRequest {
         }
     }
 
+    /// Build the in-session request for a LIVE configure from the two D-056
+    /// axes (`{name, ultracode}`) and the reported build semantics.
+    ///
+    /// - Coupled (2.1.203–2.1.283): a flag-on request is the single bare
+    ///   `/effort ultracode` — on those builds that word IS the xhigh-tier
+    ///   command; anything else is a plain level word. The UI guarantees it
+    ///   never asks for `{non-xhigh, true}`.
+    /// - Decoupled (≥2.1.284): when the tier is unchanged versus the last
+    ///   requested selection this is the orthogonal toggle
+    ///   (`/effort ultracode on|off`); when the tier moves, the flag is
+    ///   genuinely orthogonal and a plain `/effort <level>` leaves it as is.
+    ///   With no prior selection (unknown provenance) a level word is the safe
+    ///   spelling — a guessed `ultracode off` could toggle a live flag.
+    /// - Legacy/unknown: a flag-on request is rejected by the caller's version
+    ///   gate; here only plain level words are produced.
+    pub(crate) fn for_configure(
+        level: &str,
+        ultracode: Option<bool>,
+        semantics: remuda_protocol::EffortSemantics,
+        current: Option<EffortRequest>,
+    ) -> Option<Self> {
+        let normalized = level.trim().to_ascii_lowercase();
+        if semantics == remuda_protocol::EffortSemantics::Coupled && ultracode == Some(true) {
+            return Self::from_level("ultracode");
+        }
+        if semantics == remuda_protocol::EffortSemantics::Decoupled {
+            let same_tier = current
+                .map(|request| {
+                    EffortSelection {
+                        name: request.name,
+                        ultracode: request.ultracode,
+                    }
+                    .level_name()
+                        == normalized.as_str()
+                })
+                .unwrap_or(false);
+            if let Some(current) = current.filter(|_| same_tier) {
+                // Carry the ACTUAL tier (the flag-only request name must not
+                // collapse to xhigh), so the next same-tier toggle keeps
+                // comparing against the right level.
+                return Some(Self {
+                    name: current.name,
+                    ultracode: ultracode == Some(true),
+                    word: if ultracode == Some(true) {
+                        "ultracode on"
+                    } else {
+                        "ultracode off"
+                    },
+                });
+            }
+        }
+        Self::from_level(&normalized)
+    }
+
     /// The native spelling to type after `/effort ` — a level word,
     /// `ultracode`, or `ultracode on` / `ultracode off`.
     pub(crate) fn command_word(&self) -> &'static str {
@@ -1136,6 +1190,60 @@ mod sync_tests {
                 .awaits_level(Decoupled),
             None
         );
+    }
+
+    #[test]
+    fn live_configure_picks_the_command_word_for_each_gate() {
+        use remuda_protocol::EffortSemantics::{Coupled, Decoupled, Unknown};
+        let sel = |name: EffortName, ultracode: bool| EffortSelection { name, ultracode };
+
+        // Coupled: {xhigh,true} is the single bare word.
+        let coupled_on = EffortRequest::for_configure("xhigh", Some(true), Coupled, None).unwrap();
+        assert_eq!(coupled_on.command_word(), "ultracode");
+        assert_eq!(coupled_on.name, EffortName::Xhigh);
+        // Coupled: a plain level never gains the flag, even with a stale true.
+        let coupled_level =
+            EffortRequest::for_configure("max", Some(false), Coupled, None).unwrap();
+        assert_eq!(coupled_level.command_word(), "max");
+
+        // Decoupled, no provenance: the safe spelling is always the level —
+        // never a guessed `ultracode off` that could toggle a live flag.
+        let cold = EffortRequest::for_configure("high", Some(false), Decoupled, None).unwrap();
+        assert_eq!(cold.command_word(), "high");
+        let cold_on = EffortRequest::for_configure("high", Some(true), Decoupled, None).unwrap();
+        assert_eq!(cold_on.command_word(), "high");
+
+        // Decoupled, same tier as the last request: the flag toggle words.
+        let current_high = EffortRequest::from_selection(sel(EffortName::High, false));
+        let on = EffortRequest::for_configure("high", Some(true), Decoupled, Some(current_high))
+            .unwrap();
+        assert_eq!(on.command_word(), "ultracode on");
+        assert_eq!(
+            on.name,
+            EffortName::High,
+            "the flag toggle keeps the real tier"
+        );
+        let off = EffortRequest::for_configure("high", Some(false), Decoupled, Some(on)).unwrap();
+        assert_eq!(off.command_word(), "ultracode off");
+        assert_eq!(off.name, EffortName::High);
+
+        // Decoupled, tier moves while the flag rides along: plain level word,
+        // flag stays where it was on an orthogonal build.
+        let current_high_on = EffortRequest::from_selection(sel(EffortName::High, true));
+        let drag =
+            EffortRequest::for_configure("max", Some(true), Decoupled, Some(current_high_on))
+                .unwrap();
+        assert_eq!(drag.command_word(), "max");
+        assert_eq!(drag.name, EffortName::Max);
+
+        // Unknown gate: only levels are produced.
+        assert_eq!(
+            EffortRequest::for_configure("xhigh", Some(false), Unknown, None)
+                .unwrap()
+                .command_word(),
+            "xhigh"
+        );
+        assert!(EffortRequest::for_configure("bogus", None, Coupled, None).is_none());
     }
 
     #[tokio::test]

@@ -2572,6 +2572,7 @@ export type ModelSelectionPath = ("listed" | "typed");
 export type ModelSwitchInput = ({
   "effective": ModelEffective;
   "effort"?: (string | null);
+  "effortUltracode"?: (boolean | null);
   "modelId": (string);
   "permissionMode"?: (string | null);
   [key: string]: unknown;

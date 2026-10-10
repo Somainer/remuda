@@ -556,6 +556,12 @@ pub struct ModelSwitchInput {
     /// Native effort tier name when the driver supports a runtime switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// D-056 orthogonal ultracode flag accompanying [`Self::effort`]. The
+    /// driver picks the exact in-session spelling (a bare `/effort ultracode`
+    /// on coupled builds, `/effort ultracode on|off` on decoupled ones) from
+    /// this boolean plus the tier and the reported binary version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_ultracode: Option<bool>,
     /// Native permission-mode spelling when the driver supports a runtime
     /// switch (Claude PTY: shift+tab cycling). Launch-only modes the carrier
     /// cannot cycle into are rejected by the driver.

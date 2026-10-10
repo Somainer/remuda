@@ -11794,6 +11794,13 @@
             "null"
           ]
         },
+        "effortUltracode": {
+          "description": "D-056 orthogonal ultracode flag accompanying [`Self::effort`]. The\ndriver picks the exact in-session spelling (a bare `/effort ultracode`\non coupled builds, `/effort ultracode on|off` on decoupled ones) from\nthis boolean plus the tier and the reported binary version.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "modelId": {
           "description": "`model_id`; protocol §3.1.",
           "type": "string"

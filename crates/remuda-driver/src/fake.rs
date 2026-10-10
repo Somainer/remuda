@@ -304,6 +304,9 @@ impl Driver for FakeDriver {
                 if let Some(effort) = &switch.effort {
                     related.insert("effort".into(), effort.clone());
                 }
+                if let Some(ultracode) = switch.effort_ultracode {
+                    related.insert("effortUltracode".into(), ultracode.to_string());
+                }
                 self.emit(ObservationPayload::Lifecycle(Box::new(
                     LifecyclePayload::Native(Box::new(NativeLifecycle {
                         topic: LifecycleTopic::Session,
@@ -311,13 +314,17 @@ impl Driver for FakeDriver {
                         native_id: Knowledge::NotApplicable,
                         status: Knowledge::Known {
                             value: format!(
-                                "applied model={} effort={}",
+                                "applied model={} effort={} ultracode={}",
                                 if switch.model_id.is_empty() {
                                     "-"
                                 } else {
                                     switch.model_id.as_str()
                                 },
                                 switch.effort.as_deref().unwrap_or("-"),
+                                switch
+                                    .effort_ultracode
+                                    .map(|on| if on { "true" } else { "false" })
+                                    .unwrap_or("-"),
                             ),
                         },
                         related_ids: related,
@@ -494,7 +501,8 @@ mod tests {
                 remuda_protocol::ModelSwitchInput {
                     model_id: "opus".into(),
                     effective: remuda_protocol::ModelEffective::NextTurn,
-                    effort: Some("ultracode".into()),
+                    effort: Some("xhigh".into()),
+                    effort_ultracode: Some(true),
                     permission_mode: None,
                 },
             )))
@@ -511,11 +519,18 @@ mod tests {
         assert_eq!(
             native.status,
             Knowledge::Known {
-                value: "applied model=opus effort=ultracode".into(),
+                value: "applied model=opus effort=xhigh ultracode=true".into(),
             }
+        );
+        assert_eq!(
+            native
+                .related_ids
+                .get("effortUltracode")
+                .map(String::as_str),
+            Some("true")
         );
         let state = driver.state.lock().await;
         assert_eq!(state.model.as_deref(), Some("opus"));
-        assert_eq!(state.effort.as_deref(), Some("ultracode"));
+        assert_eq!(state.effort.as_deref(), Some("xhigh"));
     }
 }

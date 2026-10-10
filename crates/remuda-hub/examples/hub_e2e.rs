@@ -2123,9 +2123,11 @@ async fn fake_node(
                             )
                             .await?;
                         } else {
-                            let want_ultra =
-                                effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)
-                                    || requested == "ultracode";
+                            let want_ultra = effort
+                                .get("ultracode")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                                || requested == "ultracode";
                             // "__clamp__" opts into the clamp explicitly; a
                             // plain Claude max with the switch OFF also clamps
                             // (the 2.1.289 case-g model without xhigh), but

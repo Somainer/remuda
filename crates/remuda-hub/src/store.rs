@@ -11528,6 +11528,94 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r10 item 4(b): replaying the entity-driven invalidation
+    /// (a demotion replayed across reconnects) must not append a second
+    /// `settlement_events` row. SQLite counts a WHERE match as changed even
+    /// with identical values, so without the `state <> 'invalidated'` guard
+    /// each replay logged a duplicate notice and stepped the delivery cursor.
+    #[tokio::test]
+    async fn a_replayed_entity_invalidation_logs_one_settlement_event() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-demotion-replay").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        let demotion = json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "entity",
+                "entityType": "interaction",
+                "entityId": int_id,
+                "revision": "3",
+                "previousState": "pending",
+                "state": "invalidated",
+                "reasonCode": "agent-demoted",
+                "evidenceEventIds": [],
+                "entity": {
+                    "id": int_id,
+                    "state": "invalidated",
+                    "blocking": false,
+                    "answerable": false,
+                    "resolution": { "state": "unknown" }
+                }
+            }
+        });
+        let first = store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                demotion.clone(),
+            )
+            .await
+            .expect("first demotion");
+        assert_eq!(
+            first.settlement.interactions.len(),
+            1,
+            "the first invalidation logs one"
+        );
+
+        // Two replays of the SAME terminal entity (reconnect journal catch-up
+        // can deliver it repeatedly): neither moves the row nor logs an event.
+        for seq in [Some(2_i64), Some(3_i64)] {
+            let replay = store
+                .append_journal(
+                    host.clone(),
+                    instance.instance_id.clone(),
+                    seq,
+                    demotion.clone(),
+                )
+                .await
+                .expect("replay");
+            assert!(
+                replay.settlement.is_empty(),
+                "a replay of an invalidation entity produces no live settlement"
+            );
+        }
+
+        let count: i64 = {
+            let interaction = int_id.clone();
+            store
+                .run_named("r10_count_settlement_events", move |conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM settlement_events WHERE interaction_id = ?1",
+                        params![&interaction],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+                })
+                .await
+                .expect("count")
+        };
+        assert_eq!(
+            count, 1,
+            "exactly one settlement_events row survives the replays"
+        );
+        store.close().await;
+    }
+
     /// c-cardsettle r6 item 1: the production drivers' STARTUP frames share
     /// the exit nativeName (`topic=session`, nativeName `session`) — print/SDK
     /// init status "started", PTY ready statuses idle/working/blocked/done/
@@ -13625,10 +13713,16 @@ fn apply_interaction_event(
             _ => event.to_string(),
         };
         let now = now_rfc3339();
+        // r10 item 4(b): never re-stamp an already-invalidated row. SQLite
+        // counts a WHERE match as changed even when the values are identical,
+        // so a replay of the demotion/invalidation entity used to match the
+        // terminal row again and append a SECOND settlement_events row (a
+        // duplicate follower notice and a phantom delivery-cursor step).
         let changed = conn.execute(
-                "UPDATE interactions SET state = ?1, blocking = 0, payload_json = ?2, updated_at = ?3 WHERE id = ?4",
-                params![state, payload_json, now, id],
-            )?;
+            "UPDATE interactions SET state = ?1, blocking = 0, payload_json = ?2, updated_at = ?3
+                 WHERE id = ?4 AND state <> 'invalidated'",
+            params![state, payload_json, now, id],
+        )?;
         // r9 item 3: an entity-driven INVALIDATION (e.g. a transcript
         // picker demotion) is a settlement too — record it in the
         // monotonic log with its REAL reason and return the notice so

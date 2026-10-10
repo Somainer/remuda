@@ -1437,6 +1437,21 @@ describe("font reflow compensator", () => {
       heights.set(el, height);
       observerCbs.get(el)?.();
     };
+    // Set a row's geometry WITHOUT delivering its ResizeObserver callback: a
+    // real font swap resizes every mounted row in the SAME layout, then the
+    // per-row observers deliver in observer-CREATION order. Preset the grown
+    // heights first so geometry already reflects the reflow when the first
+    // callback runs, then deliver callbacks in a chosen order.
+    const presetHeight = (nodeId: string, height: number) => {
+      const el = scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!el) throw new Error(`row ${nodeId} not mounted`);
+      heights.set(el, height);
+    };
+    const fireMeasure = (nodeId: string) => {
+      const el = scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!el) throw new Error(`row ${nodeId} not mounted`);
+      observerCbs.get(el)?.();
+    };
     const nextFrame = () =>
       new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     // Set scrollTop WITHOUT dispatching a scroll event: models a geometry the
@@ -1449,6 +1464,8 @@ describe("font reflow compensator", () => {
       scroller,
       readerScroll,
       growById,
+      presetHeight,
+      fireMeasure,
       quietTop,
       top: () => top,
       nextFrame,
@@ -1654,6 +1671,54 @@ describe("font reflow compensator", () => {
       geo.growById("obj_long_n_5", ROW + 40);
     });
     expect(geo.top(), "the saved row's own growth must not scroll by its delta").toBe(before);
+  });
+
+  /** One swap resizes an above and a below row together; observers then fire. */
+  async function twoRowSwapCompensatesOnce(
+    instanceId: string,
+    order: "below-first" | "above-first",
+  ) {
+    const geo = installGeo(40);
+    renderRestored(instanceId, 5);
+    await settle(geo, instanceId);
+    const before = geo.top();
+    const anchorOffset = () => {
+      const row = geo
+        .scroller()
+        .querySelector<HTMLElement>('[data-anchor="obj_long_n_5"]');
+      return row ? row.getBoundingClientRect().top - geo.scroller().getBoundingClientRect().top : NaN;
+    };
+    expect(Math.abs(anchorOffset())).toBeLessThanOrEqual(2);
+    await act(async () => {
+      // The swap resizes BOTH rows in a single layout before any observer
+      // callback is delivered, so geometry already reflects the above row's
+      // growth when the first callback runs.
+      geo.presetHeight("obj_long_n_2", ROW + 40); // strictly ABOVE the anchor
+      geo.presetHeight("obj_long_n_6", ROW + 30); // BELOW the anchor
+      if (order === "below-first") {
+        geo.fireMeasure("obj_long_n_6");
+        geo.fireMeasure("obj_long_n_2");
+      } else {
+        geo.fireMeasure("obj_long_n_2");
+        geo.fireMeasure("obj_long_n_6");
+      }
+    });
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    // The above row's +40 is compensated exactly ONCE regardless of order; the
+    // anchor's viewport spot is held. A generic-hold + per-row double count
+    // would land at before + 80 in the below-first order.
+    expect(geo.top(), `two-row swap scrolled twice (order ${order})`).toBe(before + 40);
+    expect(Math.abs(anchorOffset()), `anchor drifted (order ${order})`).toBeLessThanOrEqual(2);
+  }
+
+  it("item 2: two rows reflow, below-row observer first -> the drift is corrected once", async () => {
+    await twoRowSwapCompensatesOnce("insOrderBelowFirst", "below-first");
+  });
+
+  it("item 2: two rows reflow, above-row observer first -> the drift is corrected once", async () => {
+    await twoRowSwapCompensatesOnce("insOrderAboveFirst", "above-first");
   });
 
   it("item 2: after the reader scrolls up, a row between the new and old anchor does not jump", async () => {

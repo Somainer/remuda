@@ -617,7 +617,14 @@ function TranscriptInner({
         // (it would undo the hold and converge to the reflowed position).
         reflowCorrectedThisCommitRef.current = true;
       }
-    } else if (reanchor) {
+    } else if (reanchor && !reflowAnchorRef.current) {
+      // While a reflow anchor is active the explicit above-row compensation is
+      // the SOLE hold. Falling through to holdReadingAnchor here would double
+      // count a swap that resizes two rows in RO-creation order: a row at/below
+      // the anchor measured first would let the generic hold correct the drift
+      // a strictly-above row already moved in the DOM, after which that above
+      // row's own delta would scroll the reader a SECOND time. Once the reader
+      // scrolls (clearing reflowAnchorRef) the generic hold owns position again.
       holdReadingAnchor();
     }
     // Commit the height once. Update the ref synchronously (the state mirror

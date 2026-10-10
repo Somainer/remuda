@@ -201,6 +201,10 @@ pub enum FdErrorKind {
     Missing,
     /// A name was empty, self/parent, or contained a separator.
     BadComponent,
+    /// The regular leaf has more than one hard link (`st_nlink > 1`): appending
+    /// would also write through every other directory entry that shares the
+    /// inode, possibly one outside the pinned root.
+    Hardlinked,
     /// Any other OS error (the raw message is kept).
     Other(String),
 }
@@ -262,6 +266,13 @@ impl std::fmt::Display for FdError {
             FdErrorKind::BadComponent => {
                 write!(f, "{:?} is not a single safe path component", self.at)
             }
+            FdErrorKind::Hardlinked => {
+                write!(
+                    f,
+                    "{:?} is hard-linked (nlink > 1); refusing to append to a shared inode",
+                    self.at
+                )
+            }
             FdErrorKind::Other(ref message) => write!(f, "{:?}: {message}", self.at),
         }
     }
@@ -272,7 +283,7 @@ impl std::error::Error for FdError {}
 impl From<FdError> for std::io::Error {
     fn from(error: FdError) -> Self {
         let kind = match error.kind {
-            FdErrorKind::Symlink | FdErrorKind::NotDirectory => {
+            FdErrorKind::Symlink | FdErrorKind::NotDirectory | FdErrorKind::Hardlinked => {
                 std::io::ErrorKind::PermissionDenied
             }
             FdErrorKind::Missing => std::io::ErrorKind::NotFound,
@@ -748,8 +759,13 @@ impl DirFd {
     /// (`O_WRONLY|O_APPEND|O_NOFOLLOW|O_NONBLOCK`).
     ///
     /// The entry is `fstatat`-classified first, so a FIFO never blocks the
-    /// open; the post-open `fstat` requires a regular file on the fd. Absence
-    /// is [`FdErrorKind::Missing`], a symlink is [`FdErrorKind::Symlink`].
+    /// open; the post-open `fstat` requires a regular file on the fd with
+    /// exactly ONE link. Absence is [`FdErrorKind::Missing`], a symlink is
+    /// [`FdErrorKind::Symlink`], and a hard-linked leaf (`st_nlink > 1`) is
+    /// [`FdErrorKind::Hardlinked`]: appending would also grow every other
+    /// directory entry sharing the inode — round 7 item 4, the fake-harness
+    /// confinement bypass where an operator file was hardlinked into an
+    /// allocated home at `projects/<slug>/<S>.jsonl`.
     pub fn open_append_leaf(&self, name: &[u8]) -> Result<File, FdError> {
         check_component(name)?;
         let pre = self
@@ -774,6 +790,15 @@ impl DirFd {
             return Err(FdError::new(
                 String::from_utf8_lossy(name),
                 FdErrorKind::Other("not a regular file".into()),
+            ));
+        }
+        // Round 7 item 4: a single-link count on the OPENED fd. A hardlinked
+        // transcript shares the inode with a path outside the pinned root; an
+        // append would write the child's turn through that entry too.
+        if stat.st_nlink != 1 {
+            return Err(FdError::new(
+                String::from_utf8_lossy(name),
+                FdErrorKind::Hardlinked,
             ));
         }
         Ok(file)
@@ -1202,6 +1227,51 @@ mod tests {
             "append blocked"
         );
         assert!(result.is_err(), "fifo append refused");
+    }
+
+    /// Round 7 item 4: a regular leaf with more than one hard link must not be
+    /// opened for append — the second directory entry sharing the inode may
+    /// sit outside the pinned root, so an append would write through it too.
+    #[cfg(unix)]
+    #[test]
+    fn open_append_leaf_refuses_a_hardlinked_leaf() {
+        let tmp = tempdir();
+        let root = anchor(&tmp);
+        std::fs::write(tmp.path().join("inside.jsonl"), b"SHARED\n").expect("seed");
+        // The second name lives OUTSIDE the pinned tree, exactly like an
+        // operator file hardlinked into an allocated fake home.
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).expect("outside dir");
+        std::fs::hard_link(
+            tmp.path().join("inside.jsonl"),
+            outside_dir.join("operator.jsonl"),
+        )
+        .expect("hardlink");
+        let error = root
+            .open_append_leaf(b"inside.jsonl")
+            .expect_err("a hardlinked leaf is refused for append");
+        assert_eq!(error.kind, FdErrorKind::Hardlinked);
+    }
+
+    /// A freshly created single-link leaf appends normally: the link-count
+    /// leg refuses only shared inodes.
+    #[test]
+    fn open_append_leaf_accepts_a_single_link_leaf() {
+        use std::io::Write;
+        let tmp = tempdir();
+        let root = anchor(&tmp);
+        let mut file = root.create_leaf_excl(b"single.jsonl").expect("excl create");
+        file.write_all(b"one\n").expect("seed");
+        drop(file);
+        let mut append = root
+            .open_append_leaf(b"single.jsonl")
+            .expect("single link appends");
+        append.write_all(b"two\n").expect("append");
+        drop(append);
+        assert_eq!(
+            std::fs::read(tmp.path().join("single.jsonl")).expect("read"),
+            b"one\ntwo\n"
+        );
     }
 
     #[cfg(unix)]

@@ -870,6 +870,93 @@ fn resume_refuses_to_append_through_a_symlinked_home_projects() {
     );
 }
 
+/// Round 7 item 4: a hardlinked transcript defeats path confinement — the
+/// second directory entry shares the inode and can sit OUTSIDE the allocated
+/// home. An operator file hardlinked in at `projects/<slug>/<S>.jsonl` used to
+/// be appended through `open_append_leaf`, which checked the file type but not
+/// `st_nlink`; the resumed child's turn then grew the external file too. The
+/// append must now be refused at STARTUP and the external transcript stays
+/// byte-identical.
+#[test]
+#[cfg(unix)]
+fn resume_refuses_to_append_through_a_hardlinked_transcript() {
+    let _serial = support::serial();
+    let home = support::temp_home();
+    let sink = support::temp_home();
+
+    let workspace_raw = std::env::temp_dir().join(format!(
+        "r7hl-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&workspace_raw).expect("workspace");
+    let workspace = std::fs::canonicalize(&workspace_raw).expect("physical workspace");
+    let _workspace_guard = RemoveOnDrop(workspace_raw.clone());
+    let slug = remuda_driver::claude_transcript::encode_project_dir(&workspace);
+    let session = "00000000-0000-4000-8000-000000000008";
+
+    // First normal Claude run so a valid single-link transcript exists.
+    {
+        let mut h = HarnessBuilder::new("claude")
+            .home(home.clone())
+            .scenario("ok.json")
+            .cwd(workspace.clone())
+            .arg("--cwd")
+            .arg(workspace.to_str().unwrap())
+            .arg("--session-id")
+            .arg(session)
+            .spawn();
+        h.submit("first prompt");
+        h.wait_exit(WAIT);
+    }
+
+    // An operator-owned file outside the allocated home, then a SECOND NAME
+    // for the same inode planted at the resume transcript slot.
+    let external_slug = sink.join("projects").join(&slug);
+    std::fs::create_dir_all(&external_slug).expect("external slug dir");
+    let external_transcript = external_slug.join(format!("{session}.jsonl"));
+    std::fs::write(&external_transcript, "SEED\n").expect("seed external transcript");
+
+    let home_transcript = home
+        .join("projects")
+        .join(&slug)
+        .join(format!("{session}.jsonl"));
+    std::fs::remove_file(&home_transcript).expect("remove the real transcript");
+    std::fs::hard_link(&external_transcript, &home_transcript).expect("hardlink into home");
+
+    // The resume fails at STARTUP: send NOTHING and wait purely on exit.
+    let mut h = HarnessBuilder::new("claude")
+        .home(home.clone())
+        .scenario("ok.json")
+        .cwd(workspace.clone())
+        .arg("--cwd")
+        .arg(workspace.to_str().unwrap())
+        .arg("--resume")
+        .arg(session)
+        .spawn();
+    let status = h.wait_status(WAIT);
+    assert!(
+        !status.success(),
+        "resume against a hardlinked transcript must exit non-zero"
+    );
+    let output = h.captured_text();
+    assert!(
+        output.contains("fake-harness")
+            && (output.contains("hard-link")
+                || output.contains("hardlink")
+                || output.contains("shared inode")),
+        "the specific hardlink refusal must be printed before exit, got: {output}"
+    );
+    let after = std::fs::read_to_string(&external_transcript).expect("transcript still readable");
+    assert_eq!(
+        after, "SEED\n",
+        "no append byte reaches the external transcript through the shared inode"
+    );
+}
+
 #[cfg(unix)]
 struct RemoveOnDrop(std::path::PathBuf);
 #[cfg(unix)]

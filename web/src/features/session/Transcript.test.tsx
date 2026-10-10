@@ -1779,13 +1779,24 @@ describe("font reflow compensator", () => {
     expect(geo.top(), "the committed delta is applied once").toBe(before + 40);
   });
   it("item 3: a measured height above the window survives fresh rows mounting on a window shift", async () => {
-    // The height ledger is the single source of truth: when a window shift
-    // mounts brand-new rows (their mount layout effect reports a size built on
-    // the ledger) it must never roll a previously committed height back to an
-    // older snapshot. A passive state->ref mirror could run stale between a
-    // synchronous ledger write and its queued render and drop the earlier row;
-    // the measured n_2 (above the shifted window) must keep contributing its
-    // +40 to padTop.
+    // Coverage of the r6 ledger fix (5ad38bd7 "make the row-height ledger the
+    // single source of truth"). The measured n_2 (above the shifted window)
+    // keeps contributing its +40 to padTop across window shifts that mount
+    // brand-new rows, whose mount-layout reports build on the ledger via
+    // new Map(rowHeightsRef.current) — so this test covers the ledger-build
+    // path by construction.
+    //
+    // It does NOT drive the exact stale-mirror interleaving described in
+    // 5ad38bd7 (a passive state->ref mirror running with a stale closure
+    // between a synchronous ledger write and its queued render). That window
+    // is not reachable in this ROW-based jsdom harness: the layout-effect
+    // setState's sync re-render commits inside the same commit, and React
+    // drains the pending passive effect before the next discrete event, so a
+    // stale closure never observes a newer ledger write. Both an
+    // installGeo by-id mount-height preset and a scheduler/unstable_mock
+    // remount (under which the saved-position restore cannot settle) were
+    // tried without reproducing the rollback; the guarded behaviour stays
+    // deleted rather than re-proven red.
     const geo = installGeo(40);
     renderRestored("insLedger", 5);
     await settle(geo, "insLedger");

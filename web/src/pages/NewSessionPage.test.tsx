@@ -394,6 +394,35 @@ it.each([
   expect(payload.effortUltracode).toBe(false);
 });
 
+it("item 12c: the per-model catalog default outranks the device default for the unpinned slider", () => {
+  // Device default pins max (index 4)…
+  localStorage.setItem(
+    "runtime.device-settings.v1",
+    JSON.stringify({ defaultEffortIndex: 4 }),
+  );
+  // …but the remembered model is opus, whose catalog default is medium.
+  localStorage.setItem(
+    "runtime.new-session",
+    JSON.stringify({ model: "opus" }),
+  );
+  renderWithCli();
+  const slider = screen.getByTestId("new-session-effort-slider");
+  // Unpinned (no draft effort): the MODEL default wins, not device max.
+  expect(slider).toHaveAttribute("data-name", "medium");
+  expect(slider).toHaveAttribute("data-index", "1");
+  expect(screen.getByTestId("new-session-effort")).toHaveAttribute("data-pinned", "0");
+});
+
+it("item 12c: an unknown model falls back to the device default", () => {
+  localStorage.setItem(
+    "runtime.device-settings.v1",
+    JSON.stringify({ defaultEffortIndex: 4 }),
+  );
+  // No model default exists for passthrough/auto → device default is used.
+  renderWithCli();
+  expect(screen.getByTestId("new-session-effort-slider")).toHaveAttribute("data-index", "4");
+});
+
 it("writes the slider's tier into the instance it creates", async () => {
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
   renderWithCli();

@@ -143,9 +143,25 @@ export function computeAnchored(
         ? roomAboveCleared
         : roomAbove
       : roomBelow;
-  const cap = Math.min(vhCap, room);
-  const maxHeight = cap > 0 ? cap : undefined;
-  const panelHeight = Math.min(need, maxHeight ?? need);
+  // A 0–40px card-cleared strip is not a usable panel. Below a usable minimum
+  // fall back to the room on the OTHER side (often still larger than the
+  // cleared strip, even when too small to flip the placement outright);
+  // capping at the usable floor rather than the strip keeps every row
+  // reachable — overlapping a DISMISSIBLE parked card is the already-accepted
+  // lesser evil. A literal 0 is never treated as "uncapped" (which painted the
+  // full-vh panel over everything).
+  const PANEL_USABLE_MIN = 120;
+  const rawCap = Math.min(vhCap, room);
+  let capped: number;
+  if (rawCap >= PANEL_USABLE_MIN) {
+    capped = rawCap;
+  } else if (blockedUpByCard) {
+    capped = Math.min(vhCap, Math.max(roomBelow, PANEL_USABLE_MIN));
+  } else {
+    capped = Math.min(vhCap, Math.max(rawCap, PANEL_USABLE_MIN));
+  }
+  const maxHeight = capped > 0 ? capped : Math.min(vhCap, PANEL_USABLE_MIN);
+  const panelHeight = Math.min(need, maxHeight);
 
   // Horizontal alignment against the trigger, then shift inside the viewport.
   let left: number;

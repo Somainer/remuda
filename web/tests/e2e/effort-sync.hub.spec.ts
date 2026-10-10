@@ -405,6 +405,19 @@ test("three consecutive switches (flag on, level, flag off/on) each settle", asy
   await expect(page.getByTestId("model-effort-pending")).toHaveCount(0);
 });
 
+// The sentinel configure words (__queued__ / __degrade__ / __ultra_refuse…)
+// are understood ONLY by the in-process fake Node in
+// crates/remuda-hub/examples/hub_e2e.rs. Those tests gate on the harness knob
+// at COLLECTION time rather than probing the trigger with a sentinel POST
+// (a probe against a real Node types garbage into a live session). The gate
+// runs the in-process hub with HUB_E2E_FAKE_NODE=1; a default full-suite run
+// skips them, exactly like HUB_E2E_API_ROUTE for the api-route suite.
+test.describe("fake-node sentinel configure outcomes", () => {
+  test.skip(
+    process.env.HUB_E2E_FAKE_NODE !== "1",
+    "set HUB_E2E_FAKE_NODE=1 for the in-process hub_e2e fake Node",
+  );
+
 test("a model refusal disables only the switch, never ends the session", async ({ page }) => {
   const instanceId = await createSession(page, "effort switch refusals");
   await clearApprovals(page, instanceId);
@@ -439,4 +452,6 @@ test("a queued level shows 排队中; a degraded verdict clears the indicator", 
     index: 4,
   });
   await expect(page.getByTestId("model-effort-pending")).toHaveCount(0, { timeout: 10_000 });
+});
+
 });

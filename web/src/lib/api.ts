@@ -18,6 +18,7 @@ import type {
 } from "../features/providers";
 import { PROVIDER_PROFILES } from "../features/providers/fixtures";
 import { coerceUsageRollup } from "../features/session/contextUsage";
+import type { CapabilitySnapshot } from "../types/nativeRef";
 import type { components, paths } from "./api.generated";
 import { printCapabilities, ptyCapabilities, agentPtyCapabilities } from "./capabilities";
 import type { JournalRead } from "./journal";
@@ -271,23 +272,28 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     apiRoute?: components["schemas"]["ApiRoute"] | null;
   };
   const ptyDriver = driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty";
-  const capabilities =
-    ptyDriver && kind !== "terminal"
+  // Clone EVERY synthesized snapshot: the non-PTY fallback below is a
+  // module-level object (HUB_CAPABILITIES), and stamping binaryVersion on it
+  // leaked one instance's reported version onto every other non-PTY instance
+  // (c-effortui r3 item 12a).
+  const capabilities: CapabilitySnapshot = {
+    ...(ptyDriver && kind !== "terminal"
       ? agentPtyCapabilities(kind, driver)
       : ptyDriver
         ? ptyCapabilities(driver)
-        : HUB_CAPABILITIES;
-  // D-056 round 2: never run the version gate on a fabricated version. The
-  // static matrix blanks binaryVersion; if the Hub/Node record carries a real
-  // per-instance capability snapshot (or the future transcript version),
-  // stamp that reported version onto the synthesized snapshot. An unknown
-  // version then disables ONLY the ultracode switch with a named reason.
+        : HUB_CAPABILITIES),
+  };
+  // The gate runs ONLY on a REPORTED version. The print matrix's static
+  // "2.1.268" is fixture data, not this instance's CLI: blank it for the
+  // synthesized fallback (pty matrices already blank) and stamp just the
+  // Hub/Node record's value, so one claude-print/sdk instance can never
+  // fabricate coupled/decoupled for its peers and an unreported build is
+  // honestly "unknown" (switch locked with a named reason).
   const reportedVersion = (
     rec as { capabilities?: { binaryVersion?: unknown } | null }
   ).capabilities?.binaryVersion;
-  if (typeof reportedVersion === "string" && reportedVersion.trim()) {
-    capabilities.binaryVersion = reportedVersion.trim();
-  }
+  capabilities.binaryVersion =
+    typeof reportedVersion === "string" && reportedVersion.trim() ? reportedVersion.trim() : "";
   const launchedBy =
     extra.launchedBy === "remuda" || extra.launchedBy === "user" ? extra.launchedBy : null;
   const signalTier =

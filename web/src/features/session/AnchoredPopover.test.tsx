@@ -99,6 +99,24 @@ describe("computeAnchored placement math", () => {
     );
     expect(measured.placement).toBe("up");
     expect(measured.top).toBeLessThan(857);
+    // Item 12b: the card-cleared strip here is only ~71px — the panel must
+    // NOT be capped to that unusable strip (and 0 must never mean uncapped).
+    expect(measured.maxHeight).toBeGreaterThanOrEqual(120);
+  });
+
+  it("item 12b: falls back to the other side's room when the cleared strip is tiny", () => {
+    // Card leaves ~32px cleared above but 104px below (below the dodge floor,
+    // so placement stays up); the cap uses the larger below room instead of a
+    // 20–40px strip.
+    const measured = computeAnchored(
+      { top: 500, bottom: 530, left: 100, right: 200, width: 100 },
+      { preferredHeight: 206, width: 300 },
+      { width: 1440, height: 650 },
+      { ...OPTS, avoidBottom: 452 },
+    );
+    expect(measured.placement).toBe("up");
+    expect(measured.maxHeight).toBeGreaterThanOrEqual(100);
+    expect(measured.maxHeight).not.toBeLessThan(100);
   });
 
   it("shifts a panel that would overflow the right edge back inside", () => {

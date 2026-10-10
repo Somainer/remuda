@@ -1551,6 +1551,25 @@ fn usage_from_assistant_message(
         return Ok(None);
     };
     let model = msg.message.get("model").and_then(Value::as_str);
+    turn_usage_observation(mapper, message_id, model, usage, 1)
+}
+
+/// Build one Turn-scoped per-call usage observation for an assistant message
+/// from a native stream-json `usage` blob.
+///
+/// Revision 1 is the PROVISIONAL blob riding the assistant / `message_start`
+/// frame: with `--include-partial-messages` its `output_tokens` is whatever
+/// had been produced at that instant. Revision 2 is the FINAL blob riding
+/// `message_delta`, which carries the message's full final usage (identical
+/// input/cache buckets, true output count — c-usagefu r2 item 2). The Hub
+/// revision-replaces the row when counters grow.
+fn turn_usage_observation(
+    mapper: &mut Mapper,
+    message_id: &str,
+    model: Option<&str>,
+    usage: &Value,
+    revision: u64,
+) -> DriverResult<Option<Observation>> {
     let Some(event) =
         crate::usage::claude::usage_from_message_usage(Some(message_id), None, model, usage)
     else {
@@ -1568,7 +1587,7 @@ fn usage_from_assistant_message(
     let mut totals = crate::usage::UsageTotals::default();
     totals.add(&event);
     let mut payload =
-        crate::usage::to_usage_payload(UsageScope::Turn, message_id.to_owned(), 1, &totals);
+        crate::usage::to_usage_payload(UsageScope::Turn, message_id.to_owned(), revision, &totals);
     payload.usage_id = Id::derive(
         "obj",
         mapper.instance_id.as_id().as_str(),

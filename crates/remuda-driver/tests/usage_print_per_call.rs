@@ -2,11 +2,12 @@
 //!
 //! The REAL stream-json session `claude-exit-plan-mode-allow.jsonl` is fed
 //! through the same `StdoutMapper` the live `claude-print` / `claude-sdk`
-//! readers use. Per-call token counters must come from each `assistant`
-//! frame's `message.usage` — never the `result` frame, whose `usage` is summed
-//! over every call in the turn. The result keeps only the cumulative reported
-//! cost and carries `modelUsage.<model>.contextWindow` as a new optional
-//! field. All-zero results emit nothing.
+//! readers use. Per-call token counters come from each model message's stream
+//! usage — the provisional assistant frame at revision 1, revised to the final
+//! `message_delta` blob at revision 2 — never the `result` frame, whose
+//! `usage` is summed over every call in the turn. The result keeps only the
+//! cumulative reported cost and carries `modelUsage.<model>.contextWindow` as
+//! a new optional field. All-zero results emit nothing.
 
 use remuda_driver::claude_print::review::StdoutMapper;
 use remuda_protocol::{Knowledge, ObservationPayload, U64, UsageScope};
@@ -48,27 +49,68 @@ fn per_call_usage_comes_from_assistant_frames_and_last_call_context_is_33718() {
     let mut mapper = StdoutMapper::new();
     let payloads = usages(&mut mapper, &frames);
 
-    // Four distinct top-level model messages (msg_replay_02/03/04/05); the
-    // two frames repeating msg_replay_02 and msg_replay_04 are content-block
-    // duplicates and must NOT produce a second usage payload each.
+    // Four distinct top-level model messages (msg_replay_02/03/04/05). Each
+    // emits the PROVISIONAL usage from its assistant frame at revision 1 and
+    // then the FINAL usage from its `message_delta` at revision 2 (c-usagefu r2
+    // item 2); the two assistant frames repeating msg_replay_02/04 are
+    // content-block duplicates that produce nothing extra.
     let turn: Vec<_> = payloads
         .iter()
         .filter(|p| p.scope == UsageScope::Turn)
         .collect();
     assert_eq!(
-        turn.iter().map(|p| p.scope_id.as_str()).collect::<Vec<_>>(),
+        turn.iter()
+            .map(|p| (p.scope_id.as_str(), p.metric_revision.0))
+            .collect::<Vec<_>>(),
         vec![
-            "msg_replay_02",
-            "msg_replay_03",
-            "msg_replay_04",
-            "msg_replay_05"
+            ("msg_replay_02", 1),
+            ("msg_replay_02", 2),
+            ("msg_replay_03", 1),
+            ("msg_replay_03", 2),
+            ("msg_replay_04", 1),
+            ("msg_replay_04", 2),
+            ("msg_replay_05", 1),
+            ("msg_replay_05", 2),
         ]
+    );
+
+    // The regression: msg_replay_05's provisional assistant frame reports 9
+    // output tokens; its message_delta reports the final 30. Before the fix the
+    // per-call row was frozen at 9 (and every print session undercounted its
+    // output ~9x).
+    let msg05: Vec<_> = turn
+        .iter()
+        .filter(|p| p.scope_id == "msg_replay_05")
+        .collect();
+    assert_eq!(known(&msg05[0].output_tokens), 9, "provisional rev 1");
+    assert_eq!(known(&msg05[1].output_tokens), 30, "final rev 2");
+
+    // The Hub keeps the LAST revision per message id; collect those to read
+    // the rollup exactly as the store would.
+    let mut final_by_id: std::collections::BTreeMap<&str, &remuda_protocol::UsagePayload> =
+        std::collections::BTreeMap::new();
+    for payload in &turn {
+        final_by_id.insert(payload.scope_id.as_str(), payload);
+    }
+    let final_rows: Vec<_> = final_by_id.into_values().collect();
+
+    // Final output per call: 233/47/132/30 — 442 summed, matching the
+    // authoritative result.usage (the old provisional chain was 8/32/1/9 = 50).
+    let outputs: Vec<u64> = final_rows.iter().map(|p| known(&p.output_tokens)).collect();
+    assert_eq!(outputs, vec![233, 47, 132, 30]);
+    assert_eq!(
+        outputs.iter().sum::<u64>(),
+        442,
+        "final per-call output sums to result.usage output_tokens"
     );
 
     // The last call (msg_replay_05): 1 uncached input + 33,598 cache read +
     // 119 cache write = 33,718 tokens of context — the number the chip
     // displays. The summed result.usage would be ~134k and is never used.
-    let last = turn.last().expect("last turn usage");
+    let last = final_rows
+        .iter()
+        .find(|p| p.scope_id == "msg_replay_05")
+        .expect("last turn usage");
     let context = known(&last.input_tokens)
         + known(&last.cache_read_tokens)
         + known(&last.cache_write_tokens);
@@ -76,7 +118,7 @@ fn per_call_usage_comes_from_assistant_frames_and_last_call_context_is_33718() {
     assert_eq!(known(&last.input_tokens), 1);
     assert_eq!(known(&last.cache_read_tokens), 33_598);
     assert_eq!(known(&last.cache_write_tokens), 119);
-    assert_eq!(known(&last.output_tokens), 9);
+    assert_eq!(known(&last.output_tokens), 30);
 
     // The result frame is one token-less SESSION snapshot: cost only, with the
     // native per-model context window attached. Its summed counters are gone.

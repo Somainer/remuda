@@ -22,6 +22,11 @@ pub(super) struct StreamState {
     /// (`modelUsage.<model>.contextWindow`), stamped onto later per-call
     /// usage payloads for that model.
     pub(super) model_windows: std::collections::BTreeMap<String, u64>,
+    /// Model label per active native message id, captured on `message_start`
+    /// (`message.model`). `message_delta` carries the final usage but no model,
+    /// so the revision-2 per-call payload reads it from here (c-usagefu r2
+    /// item 2).
+    pub(super) message_models: HashMap<String, String>,
     /// Mapped ids of TOP-LEVEL (`parent_tool_use_id == null`) ExitPlanMode
     /// tool_use blocks seen on assistant messages. D-051 (6a): only such a
     /// call is minted as a PlanReview; sub-agent (nested) ExitPlanMode calls
@@ -164,6 +169,11 @@ pub(super) fn map_stream(
                 .stream
                 .active
                 .insert(frame.parent_tool_use_id.clone(), id.into());
+            // Keep the model beside the id so message_delta (which carries the
+            // final usage but no model field) can stamp it.
+            if let Some(model) = event.pointer("/message/model").and_then(Value::as_str) {
+                mapper.stream.message_models.insert(id.into(), model.into());
+            }
         }
         return Ok(Vec::new());
     }
@@ -171,6 +181,26 @@ pub(super) fn map_stream(
         // Missing native identity cannot be repaired using a per-event UUID.
         return mapper.opaque(kind, OpaqueReason::UnmappedFields, event);
     };
+    // c-usagefu r2 item 2: `message_delta` closes one assistant message with
+    // its FINAL usage blob (with `--include-partial-messages` the usage on the
+    // assistant/message_start frames is the provisional in-flight count).
+    // Re-emit the same Turn payload at revision 2; the Hub growth-replaces the
+    // provisional row. Top-level only, matching the revision-1 emission —
+    // sub-agent deltas are sidechains.
+    if kind == "message_delta" {
+        if frame.parent_tool_use_id.is_none()
+            && let Some(usage) = event.get("usage")
+        {
+            // Clone out before the mutable helper borrows the mapper.
+            let model = mapper.stream.message_models.get(&native).cloned();
+            if let Some(usage_obs) =
+                super::turn_usage_observation(mapper, &native, model.as_deref(), usage, 2)?
+            {
+                return Ok(vec![usage_obs]);
+            }
+        }
+        return Ok(Vec::new());
+    }
     let parent = parent_id(mapper, frame.parent_tool_use_id.as_deref())?;
     let key = (frame.parent_tool_use_id.clone(), native.clone());
     let mut blocks = mapper.stream.blocks.remove(&key).unwrap_or_default();
@@ -270,6 +300,7 @@ pub(super) fn map_stream(
         }
         if kind == "message_stop" {
             mapper.stream.active.remove(&frame.parent_tool_use_id);
+            mapper.stream.message_models.remove(&native);
         }
     }
     mapper.stream.blocks.insert(key, blocks);

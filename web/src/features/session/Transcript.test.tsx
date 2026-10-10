@@ -1582,9 +1582,18 @@ describe("font reflow compensator", () => {
     // is still 30px short of its saved offset when the font lands (the bounded
     // long-journal mid arm: saved anchor is a burst row below the wrap block).
     // The reflow counter-scroll holds the anchor across the above row's growth,
-    // but that MUST NOT finalize the restore at the unfinished spot. The pending
-    // offset correction has to run first; the restore finalizes only once the
-    // anchor actually reaches its saved offset.
+    // but that MUST NOT finalize the restore at the unfinished spot. The
+    // pending offset correction has to run first; the restore finalizes only
+    // once the anchor actually reaches its saved offset.
+    //
+    // Coverage note (r8): with the DOM-relative compensator the whole drift is
+    // written by the reflow correction itself, so this test now lands on the
+    // saved offset under BOTH the pre-e6dc324d finalize-on-reflowCorrected
+    // guard and the current code — it asserts the end-to-end sequence (do not
+    // finalize while >2px off; finish AT the offset) but is not a red-on-prefix
+    // proof. The guard is defense-in-depth for a clamped/interleaved
+    // correction, which this ROW-based harness cannot physically drive (the
+    // clamp and the rect ledger use different coordinate systems).
     const geo = installGeo(40);
     let fontReady = false;
     const fakeFonts = {
@@ -1660,8 +1669,6 @@ describe("font reflow compensator", () => {
       "mid-restore reflow finalized away from the saved offset",
     ).toBeLessThanOrEqual(2);
   });
-
-
   it("item 1: the restored row ITSELF grows -> its own top is held, no scroll jump", async () => {
     const geo = installGeo(40);
     renderRestored("insSelf", 5);

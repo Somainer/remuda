@@ -38,6 +38,12 @@ export default defineConfig({
       url: `${hubUrl}/healthz`,
       reuseExistingServer: process.env.HUB_E2E_EXTERNAL === "1",
       timeout: 300_000,
+      // Without this Playwright SIGKILLs the whole process group at teardown,
+      // so the harness never runs its shutdown path and the per-run
+      // dir-picker browse tree leaks (c-dirpicker r9 item 3). Ask for SIGTERM
+      // first — the hub_e2e harness removes its OWNED browse root on SIGTERM
+      // and ctrl-c — and only SIGKILL if it has not exited within 5 s.
+      gracefulShutdown: { signal: "SIGTERM", timeout: 5_000 },
       stdout: "pipe",
       stderr: "pipe",
       env: {

@@ -35,6 +35,9 @@ pub const METHOD_WORKSPACE_LIST: &str = "workspace.list";
 pub const METHOD_WORKSPACE_REGISTER: &str = "workspace.register";
 /// Prepare or commit persistent workspace removal.
 pub const METHOD_WORKSPACE_UNREGISTER: &str = "workspace.unregister";
+/// Read-only Node-authoritative resolution of an unregister candidate path
+/// (c-dirpicker round 6 item 1).
+pub const METHOD_WORKSPACE_RESOLVE: &str = "workspace.resolve";
 /// Provision a worker's worktree and per-worker target directory (M1 batch 5a).
 pub const METHOD_WORKER_PROVISION: &str = "worker.provision";
 /// Reclaim a worker's tab, worktree and target directory (M1 batch 5a).
@@ -95,6 +98,11 @@ pub const METHOD_HOST_FILES_READ: &str = "host.files.read";
 /// answer "unknown method", which the Hub surfaces as a clean 400 instead of
 /// hanging the route.
 pub const METHOD_HOST_FILES_SEARCH: &str = "host.files.search";
+/// Hub→Node: browse the host filesystem for a directory to register
+/// (c-dirpicker). Directories only, confined to the Node's configured
+/// `workspace_roots`, never following symlinks. Human-origin callers only;
+/// the Hub refuses Bot/Agent origins before proxying.
+pub const METHOD_HOST_DIRS_LIST: &str = "host.dirs.list";
 
 // ── api.* stream class (D-048, 2026-09-19) ─────────────────────────────────
 //
@@ -207,6 +215,8 @@ pub enum HubNodeMethod {
     WorkspaceRegister,
     /// [`METHOD_WORKSPACE_UNREGISTER`].
     WorkspaceUnregister,
+    /// [`METHOD_WORKSPACE_RESOLVE`].
+    WorkspaceResolve,
     /// [`METHOD_WORKER_PROVISION`].
     WorkerProvision,
     /// [`METHOD_WORKER_REMOVE`].
@@ -269,6 +279,12 @@ pub enum WorkspaceMutationPhase {
     Prepare,
     /// Revalidate and persist membership before acknowledging settlement.
     Commit,
+    /// c-dirpicker r7 item 1: cancel a prepared-but-uncommitted mutation.
+    /// For an unregister this clears the durable unbinding mark WITHOUT
+    /// touching membership, so a prepare whose commit never lands (link drop,
+    /// restart, timeout, refusal) cannot wedge the workspace. Idempotent: an
+    /// unknown or already-settled command acknowledges without change.
+    Abort,
 }
 
 /// `workspace.register` / `workspace.unregister` input (D-023).
@@ -281,6 +297,14 @@ pub struct WorkspaceMutationParams {
     pub path: String,
     /// Required: commit without a durable prepare is rejected.
     pub phase: WorkspaceMutationPhase,
+    /// c-dirpicker round 6 item 1: on an unregister the Hub sends the
+    /// workspace identity its read-only `workspace.resolve` call established,
+    /// alongside the *exact stored canonical root bytes* in `path`. The Node
+    /// verifies both at prepare and again at commit before removing anything,
+    /// so a `..`/symlink alias can never settle a different workspace.
+    /// Absent on register and on older-Hub unregisters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 /// Registered root projected into a host's inventory.
@@ -312,6 +336,33 @@ pub struct WorkspaceRegistryResult {
     /// `prepared` or `settled`; absent on reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+}
+
+/// Read-only, Node-authoritative resolution of an unregister candidate path
+/// (c-dirpicker round 6 item 1).
+///
+/// `host.dirs.list` must never be used to identify a removal target: its
+/// pinned-root no-follow walk is a browse view, and its lexical `..` handling
+/// can name a different real directory than the `realpath` semantics
+/// `workspace.unregister` resolves with. This RPC runs the *exact same
+/// resolution function* the unregister prepare uses, mutates nothing, and
+/// returns the stored identity so the Hub can take its occupancy guard and
+/// count users against the right workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceResolveParams {
+    /// Absolute directory on the Node filesystem, sent verbatim.
+    pub path: String,
+}
+
+/// Identity the Node resolved a [`WorkspaceResolveParams`] candidate to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceResolveResult {
+    /// Stable membership id stored on the Node.
+    pub workspace_id: String,
+    /// The exact stored canonical root bytes, byte-for-byte.
+    pub canonical_root: String,
 }
 
 /// Shared selector for the read-only host-file RPCs: a registered workspace
@@ -466,6 +517,59 @@ pub struct HostFilesSearchResult {
     pub files_scanned: u64,
     /// Total file bytes read in content mode.
     pub bytes_scanned: u64,
+}
+
+/// `host.dirs.list` params (c-dirpicker). The human-only directory browser.
+///
+/// Every path is an absolute Node path: the browser is not anchored to a
+/// registered workspace, but the Node confines it to the configured
+/// `workspace_roots` allowlist (the same policy registration validates
+/// against). Symlinks are never followed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDirsListParams {
+    /// Absolute directory to list. Absent names the Node default start
+    /// (the user's home when it lies inside an allowed root, else the first
+    /// allowed root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Include dot-directories; absent/`false` hides them.
+    #[serde(default)]
+    pub show_hidden: bool,
+}
+
+/// One subdirectory row in a [`HostDirsListResult`]. Symlinks are never
+/// listed (lstat classification), so a row is always a real directory the
+/// browser can descend into without escaping the allowlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDirEntry {
+    /// Bare directory name; never a path.
+    pub name: String,
+}
+
+/// `host.dirs.list` result: the canonical directory, navigation boundaries
+/// and its subdirectories (bounded).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDirsListResult {
+    /// Canonical absolute directory that was actually listed.
+    pub path: String,
+    /// Canonical parent when it still lies inside an allowed root; `None` at
+    /// the browse boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Canonical user home when it lies inside an allowed root, else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// Canonical configured allowlist roots (`workspace_roots`).
+    pub roots: Vec<String>,
+    /// Canonical already-registered workspace roots, for quick jumps.
+    pub workspaces: Vec<String>,
+    /// Subdirectories, sorted by name and capped at the Node bound.
+    pub dirs: Vec<HostDirEntry>,
+    /// True when entries were dropped at the result-size cap.
+    pub truncated: bool,
 }
 
 /// `node.auth` params (stdio first frame).
@@ -1393,6 +1497,7 @@ impl HubNodeMethod {
             Self::WorkspaceList => METHOD_WORKSPACE_LIST,
             Self::WorkspaceRegister => METHOD_WORKSPACE_REGISTER,
             Self::WorkspaceUnregister => METHOD_WORKSPACE_UNREGISTER,
+            Self::WorkspaceResolve => METHOD_WORKSPACE_RESOLVE,
             Self::WorkerProvision => METHOD_WORKER_PROVISION,
             Self::WorkerRemove => METHOD_WORKER_REMOVE,
             Self::InstanceCreate => METHOD_INSTANCE_CREATE,
@@ -1434,6 +1539,7 @@ impl HubNodeMethod {
             METHOD_WORKSPACE_LIST => Self::WorkspaceList,
             METHOD_WORKSPACE_REGISTER => Self::WorkspaceRegister,
             METHOD_WORKSPACE_UNREGISTER => Self::WorkspaceUnregister,
+            METHOD_WORKSPACE_RESOLVE => Self::WorkspaceResolve,
             METHOD_WORKER_PROVISION => Self::WorkerProvision,
             METHOD_WORKER_REMOVE => Self::WorkerRemove,
             METHOD_INSTANCE_CREATE => Self::InstanceCreate,

@@ -1420,10 +1420,23 @@ fn spawn_transcript_pump(
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 ) -> JoinHandle<()> {
+    // Shared state between the pump task, the detached streaming flusher, and
+    // the abort guard that runs in the pump task's Drop on task abort.
+    //
+    // Single-consumer rule (c-ctxusage r7): ONLY the detached flusher task
+    // pops from `pending`. The pump and the guard park frames into it; the
+    // flusher confirm-sends each one (fresh seq/envelope, preserved
+    // native_at) and pops only after a successful send, so no frame is ever
+    // duplicated or lost between the async flusher and the abort path.
     let slot: TranscriptSlot = Arc::new(StdMutex::new(None));
     let pending: TranscriptPending = Arc::new(StdMutex::new(VecDeque::new()));
     let flush_notify = Arc::new(Notify::new());
     let flush_stop = Arc::new(AtomicBool::new(false));
+    // Set by a blocking collect closure while it owns the hydrator (it has
+    // taken it out of `slot`). The abort guard waits on this, never on a
+    // blindly-polled slot: when unbound no map is in flight and there is
+    // nothing to finish.
+    let map_in_flight = Arc::new(AtomicBool::new(false));
     // Detached streaming flusher: unlike the pump task it is NOT aborted with
     // it. The pump's abort guard parks + finishes frames and then sets the
     // stop flag; this task drains everything first and exits, so frames
@@ -1434,7 +1447,7 @@ fn spawn_transcript_pump(
     let flusher_pending = Arc::clone(&pending);
     let flusher_notify = Arc::clone(&flush_notify);
     let flusher_stop = Arc::clone(&flush_stop);
-    tokio::spawn(async move {
+    let flusher_handle = tokio::spawn(async move {
         loop {
             if flusher_stop.load(Ordering::SeqCst)
                 && transcript_pending_lock(&flusher_pending).is_empty()
@@ -1457,20 +1470,17 @@ fn spawn_transcript_pump(
     });
     let guard_slot = Arc::clone(&slot);
     let guard_pending = Arc::clone(&pending);
-    let guard_events = tx.clone();
-    let guard_seq = Arc::clone(&seq);
-    let guard_ctx = ctx.clone();
     let guard_notify = Arc::clone(&flush_notify);
     let guard_stop = Arc::clone(&flush_stop);
+    let guard_in_flight = Arc::clone(&map_in_flight);
     tokio::spawn(async move {
         let _guard = AbortTranscriptGuard {
             slot: guard_slot,
             pending: guard_pending,
             notify: guard_notify,
             stop: guard_stop,
-            events: guard_events,
-            seq: guard_seq,
-            ctx: guard_ctx,
+            map_in_flight: guard_in_flight,
+            disarmed: false,
         };
         // The launch model snapshot (carrying the discovered catalog) is
         // emitted once when the pump first binds the transcript.
@@ -1580,21 +1590,23 @@ fn spawn_transcript_pump(
                     .await;
                 }
             }
-            // c-ctxusage r6 item 4c: blocking collection. The hydrator moves
-            // out of the shared slot for the closure and is parked back once
-            // the map completes; task abort only DETACHES the closure, so it
-            // finishes and the guard can then lock the returned slot. Mapped
-            // frames are parked in chunks into the shared pending queue and
-            // streamed by the detached flusher, so a big first-bind replay
-            // delivers progress while the map is still running.
-            let map = tokio::task::spawn_blocking({
+            // Blocking collection. The hydrator moves out of the shared slot
+            // for the closure and is parked back once the map completes; task
+            // abort only DETACHES the closure, so it finishes detached and the
+            // abort guard hands its residual finish to the blocking pool.
+            // Mapped frames are parked in chunks for the single streaming
+            // flusher. `map_in_flight` marks the window during which the
+            // hydrator is OUT of the slot.
+            let collect = tokio::task::spawn_blocking({
                 let slot = Arc::clone(&slot);
                 let pending = Arc::clone(&pending);
                 let notify = Arc::clone(&flush_notify);
+                let in_flight = Arc::clone(&map_in_flight);
                 move || {
                     let Some(mut hydrated) = transcript_slot_lock(&slot).take() else {
                         return;
                     };
+                    in_flight.store(true, Ordering::SeqCst);
                     let lines = hydrated.tail.poll().unwrap_or_default();
                     let mut chunk: Vec<Observation> = Vec::with_capacity(TRANSCRIPT_EMIT_CHUNK);
                     let park = |frames: &mut Vec<Observation>| {
@@ -1617,67 +1629,46 @@ fn spawn_transcript_pump(
                     }
                     park(&mut chunk);
                     *transcript_slot_lock(&slot) = Some(hydrated);
+                    in_flight.store(false, Ordering::SeqCst);
                 }
             });
-            // The normal path awaits completion; when the pump task is
-            // aborted the JoinHandle future is dropped (the closure keeps
-            // running detached). A completion arriving after abort is ignored.
+            // Normal path awaits the poll map; on abort the JoinHandle future
+            // is dropped but the detached closure keeps running (and clears
+            // map_in_flight itself).
             if !*shutdown.borrow() {
-                let _ = map.await;
+                let _ = collect.await;
             }
-            // c-ctxusage r4 item 2 / r6 item 4c: cooperative shutdown. On
-            // close, read the final append and `finish()` the buffered
-            // assistant run so its usage reaches usage_events even with no
-            // stop_reason and no superseding record, instead of being aborted
-            // mid-run.
+            // Cooperative shutdown: read the final append and `finish()` the
+            // buffered run on the blocking pool (never on a runtime thread),
+            // park its frames, then stop + await the single flusher so every
+            // frame is confirmed sent, and disarm the abort guard.
             let shutdown_fired = *shutdown.borrow_and_update();
             tokio::select! {
                 () = tokio::time::sleep(TRANSCRIPT_POLL), if !shutdown_fired => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        tokio::task::spawn_blocking({
-                            let slot = Arc::clone(&slot);
-                            let pending = Arc::clone(&pending);
-                            let notify = Arc::clone(&flush_notify);
-                            move || {
-                                let Some(mut hydrated) =
-                                    transcript_slot_lock(&slot).take()
-                                else {
-                                    return;
-                                };
-                                let lines = hydrated.tail.poll().unwrap_or_default();
-                                let mut frames = Vec::new();
-                                for line in &lines {
-                                    if let Ok(batch) = hydrated.mapper.map_line(line) {
-                                        frames.extend(batch);
-                                    }
-                                }
-                                if let Ok(batch) = hydrated.mapper.finish() {
-                                    frames.extend(batch);
-                                }
-                                if !frames.is_empty() {
-                                    transcript_pending_lock(&pending).append(&mut frames.into());
-                                    notify.notify_one();
-                                }
-                                *transcript_slot_lock(&slot) = Some(hydrated);
-                            }
-                        })
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("transcript mapping task panicked: {error}")
-                        });
-                        // Wait for the flusher to confirm every frame (normal
-                        // shutdown); the abort path goes through the guard.
-                        while !transcript_pending_lock(&pending).is_empty() {
-                            if !drain_pending(&pending, &tx, &seq, &ctx).await {
-                                return;
-                            }
-                        }
+                        final_finish_blocking(
+                            &slot,
+                            &pending,
+                            &flush_notify,
+                            &map_in_flight,
+                        )
+                        .await;
+                        flush_stop.store(true, Ordering::SeqCst);
+                        flush_notify.notify_one();
+                        let _ = flusher_handle.await;
+                        _guard.disarm();
                         return;
                     }
                 }
             }
         }
+        // Normal task end with the channel gone (no abort): nothing can be
+        // delivered, so release the flusher and disarm the abort path without
+        // blocking.
+        flush_stop.store(true, Ordering::SeqCst);
+        flush_notify.notify_one();
+        _guard.disarm();
     })
 }
 
@@ -1704,102 +1695,117 @@ async fn drain_pending(
     }
 }
 
-/// Abort-path safety net for the claude-pty transcript pump. Mirrors the
-/// shell-pty FinaliseGuard (c-ctxusage r6 item 4c). It is a normal value held
-/// inside the spawned task, so aborting the task runs this Drop.
+/// Cooperative-shutdown finalise: poll new lines and `finish()` the buffered
+/// run, entirely on the blocking pool, parking frames for the flusher. Waits
+/// for any in-flight collect (which owns the hydrator) first, also off the
+/// runtime thread.
+async fn final_finish_blocking(
+    slot: &TranscriptSlot,
+    pending: &TranscriptPending,
+    notify: &Arc<Notify>,
+    in_flight: &Arc<AtomicBool>,
+) {
+    let slot = Arc::clone(slot);
+    let pending = Arc::clone(pending);
+    let notify = Arc::clone(notify);
+    let in_flight = Arc::clone(in_flight);
+    let join = tokio::task::spawn_blocking(move || {
+        // A detached collect (from an aborted previous tick) may still own the
+        // hydrator; park the blocking thread — never a runtime worker — until
+        // it returns the slot.
+        while in_flight.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let Some(mut hydrated) = transcript_slot_lock(&slot).take() else {
+            return;
+        };
+        let lines = hydrated.tail.poll().unwrap_or_default();
+        let mut frames = Vec::new();
+        for line in &lines {
+            if let Ok(batch) = hydrated.mapper.map_line(line) {
+                frames.extend(batch);
+            }
+        }
+        if let Ok(batch) = hydrated.mapper.finish() {
+            frames.extend(batch);
+        }
+        if !frames.is_empty() {
+            transcript_pending_lock(&pending).append(&mut frames.into());
+            notify.notify_one();
+        }
+    });
+    let _ = join.await;
+}
+
+/// Abort-path safety net for the claude-pty transcript pump. Held inside the
+/// pump task, so task abort runs its Drop.
 ///
-/// A blocking map detached by the abort parks the hydrator back in the shared
-/// slot when it finishes; the guard waits (bounded) for that, takes the
-/// hydrator, synchronously `finish()`es it and best-effort sends every frame
-/// through [`build_observation`] — the same stamping as the live pump, with
-/// the mapper's `native_at` preserved. Usage frames go first with bounded
-/// backoff so the final usage row survives a momentarily-full channel.
+/// It NEVER blocks a runtime thread and it NEVER sends frames itself (the
+/// detached flusher is the single queue consumer). On abort it hands the
+/// residual finish to the blocking pool (which waits for any in-flight
+/// collect, finishes the hydrator, and parks frames), then releases the
+/// flusher. On a normal cooperative return [`AbortTranscriptGuard::disarm`]
+/// suppresses it entirely — the caller has already finalised and joined the
+/// flusher.
 struct AbortTranscriptGuard {
     slot: TranscriptSlot,
     pending: TranscriptPending,
     notify: Arc<Notify>,
     stop: Arc<AtomicBool>,
-    events: mpsc::Sender<Observation>,
-    seq: Arc<AtomicU64>,
-    ctx: ObsCtx,
+    map_in_flight: Arc<AtomicBool>,
+    disarmed: bool,
+}
+
+impl AbortTranscriptGuard {
+    fn disarm(mut self) {
+        self.disarmed = true;
+    }
 }
 
 impl Drop for AbortTranscriptGuard {
     fn drop(&mut self) {
-        // Wait for a detached blocking map to park the hydrator back.
-        for _ in 0..24_000 {
-            if transcript_slot_lock(&self.slot).is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        if let Some(mut hydrated) = transcript_slot_lock(&self.slot).take() {
-            let lines = hydrated.tail.poll().unwrap_or_default();
-            let mut frames = Vec::new();
-            for line in &lines {
-                if let Ok(batch) = hydrated.mapper.map_line(line) {
-                    frames.extend(batch);
-                }
-            }
-            if let Ok(batch) = hydrated.mapper.finish() {
-                frames.extend(batch);
-            }
-            if !frames.is_empty() {
-                transcript_pending_lock(&self.pending).append(&mut frames.into());
-            }
-        }
-        // Release the detached flusher after the frames above are queued; it
-        // confirms-sends everything. The synchronous fallback below covers a
-        // receiver that cannot keep up (bounded channel full).
-        self.stop.store(true, Ordering::SeqCst);
-        self.notify.notify_one();
-        let frames: VecDeque<_> = std::mem::take(&mut *transcript_pending_lock(&self.pending));
-        if frames.is_empty() {
+        if self.disarmed {
+            // Cooperative shutdown already finalised and drained.
             return;
         }
-        for wait in [true, false] {
-            for stamped in &frames {
-                let is_usage = matches!(stamped.body, ObservationPayload::Usage(_));
-                if is_usage != wait {
-                    continue;
-                }
-                let n = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-                let Ok(mut observation) = build_observation(
-                    &self.ctx,
-                    n,
-                    SourceChannel::Transcript,
-                    stamped.completeness,
-                    stamped.body.clone(),
-                    stamped.native_at.clone(),
-                ) else {
-                    continue;
-                };
-                observation.evidence_event_ids = stamped.evidence_event_ids.clone();
-                if !self.try_deliver(observation, wait) {
+        // Run the residual finish on the blocking pool. We are inside the
+        // runtime's task-abort machinery: do not await (we are not in an async
+        // context), and do not park a runtime worker. A detached blocking
+        // thread does the bounded wait for an in-flight collect plus the
+        // mapper finish, then parks the frames.
+        let slot = Arc::clone(&self.slot);
+        let pending = Arc::clone(&self.pending);
+        let in_flight = Arc::clone(&self.map_in_flight);
+        let stop = Arc::clone(&self.stop);
+        let stop_notify = Arc::clone(&self.notify);
+        std::thread::spawn(move || {
+            // Bounded: only wait for a collect that is actually running; an
+            // unbound pump exits immediately.
+            for _ in 0..24_000 {
+                if !in_flight.load(Ordering::SeqCst) {
                     break;
                 }
+                std::thread::sleep(Duration::from_millis(5));
             }
-        }
-    }
-}
-
-impl AbortTranscriptGuard {
-    fn try_deliver(&self, observation: Observation, wait: bool) -> bool {
-        if !wait {
-            return self.events.try_send(observation).is_ok();
-        }
-        let mut observation = observation;
-        for _ in 0..100 {
-            match self.events.try_send(observation) {
-                Ok(()) => return true,
-                Err(mpsc::error::TrySendError::Full(parked)) => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    observation = parked;
+            if let Some(mut hydrated) = transcript_slot_lock(&slot).take() {
+                let lines = hydrated.tail.poll().unwrap_or_default();
+                let mut frames = Vec::new();
+                for line in &lines {
+                    if let Ok(batch) = hydrated.mapper.map_line(line) {
+                        frames.extend(batch);
+                    }
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                if let Ok(batch) = hydrated.mapper.finish() {
+                    frames.extend(batch);
+                }
+                if !frames.is_empty() {
+                    transcript_pending_lock(&pending).append(&mut frames.into());
+                }
             }
-        }
-        false
+            // Release the flusher once the residual frames are queued.
+            stop.store(true, Ordering::SeqCst);
+            stop_notify.notify_one();
+        });
     }
 }
 
@@ -2731,6 +2737,52 @@ pub(crate) async fn emit_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// c-ctxusage r7 item 2 regression: on an unbound transcript the pump task
+    /// used to spend 120 s in AbortTranscriptGuard::Drop (24,000 × 5 ms sleeps
+    /// on the slot) at EVERY task end, freezing a current-thread runtime and
+    /// pinning a worker on every unbound close. The guard now waits only while
+    /// a map is in flight (off the runtime); an unbound task must stop almost
+    /// immediately. Bound is a generous 1 s — the pre-fix behaviour took 120 s.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unbound_transcript_pump_shuts_down_under_one_second() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
+        let (tx, _rx) = mpsc::channel::<Observation>(8);
+        let seq = Arc::new(AtomicU64::new(0));
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").unwrap(),
+            run_id: RunId::new(),
+            session_id: "unbound-session".to_owned(),
+            pin_version: "fixture".to_owned(),
+        };
+        // No SessionStart ever arrives: the transcript slot stays None.
+        let started = std::time::Instant::now();
+        let handle = spawn_transcript_pump(
+            Arc::new(std::sync::Mutex::new(None)),
+            tx,
+            ctx,
+            seq,
+            shutdown_rx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        // Tick the runtime a few times so the pump parks in its interval.
+        tokio::task::yield_now().await;
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "unbound abort took {:?}; guard must not sleep-poll the slot",
+            started.elapsed()
+        );
+    }
 
     /// D-027: a PTY driver cannot inline bytes, so an attachment has to reach
     /// the agent as an absolute path it can open with its own Read tool.

@@ -1629,7 +1629,11 @@ export function Composer({
           data-testid="effort-menu"
           data-placement={effortAnchor.placement}
         >
-          {effortSliderNode}
+          {/* c-effortui r4: when the panel is height-capped to a narrow strip
+              above a parked approval card, the slider must live in the one
+              scroll region so its track/switch stay reachable (and clipped
+              content scrolls) instead of overflowing under the composer dock. */}
+          <div data-popover-scroll="1">{effortSliderNode}</div>
         </div>
       ) : null}
       {!mobile && menu === "permission" ? (

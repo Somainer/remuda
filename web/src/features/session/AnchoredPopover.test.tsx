@@ -89,7 +89,10 @@ describe("computeAnchored placement math", () => {
 
   it("stays up when a card blocks up and below cannot host a usable panel", () => {
     // Composer docked at the bottom (no usable room below) with a parked
-    // card: opening down would push controls off-screen, so stay up.
+    // card: opening down would push controls off-screen, so stay up. The
+    // card-cleared strip here (71px) is UNDER the 120px usable minimum, so the
+    // panel falls back to the bounded plain above-room cap (it may overlap the
+    // dismissible card) rather than clipping its controls out of reach.
     const measured = computeAnchored(
       { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
       { preferredHeight: 131, width: 300 },
@@ -98,11 +101,22 @@ describe("computeAnchored placement math", () => {
     );
     expect(measured.placement).toBe("up");
     expect(measured.top).toBeLessThan(857);
-    // Item 12b: the panel is capped EXACTLY to the card-cleared strip (71px
-    // here: 857 − 8 gap − (770 card + 8 gap)), so its bottom edge clears the
-    // card rather than growing to a "usable" floor that would overlap it.
-    expect(measured.maxHeight).toBe(71);
-    expect(measured.top).toBe(857 - 8 - 71);
+    expect(measured.maxHeight).toBe(540); // min(841 plain above-room, 60vh)
+  });
+
+  it("item 5(a): a card-cleared strip AT the usable minimum keeps the clearance", () => {
+    // A 120px cleared strip is usable, so the panel caps EXACTLY to it and its
+    // bottom edge clears the card (non-overlap geometry, composer-effort e2e
+    // class). Trigger 857, card bottom 721: 857 − 8 − (721+8) = 120.
+    const measured = computeAnchored(
+      { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
+      { preferredHeight: 131, width: 300 },
+      { width: 1440, height: 900 },
+      { ...OPTS, avoidBottom: 721 },
+    );
+    expect(measured.placement).toBe("up");
+    expect(measured.maxHeight).toBe(120);
+    expect(measured.top).toBe(857 - 8 - 120);
   });
 
   it("item 12b: a literal 0 cleared strip is bounded, never rendered uncapped", () => {
@@ -161,10 +175,10 @@ describe("computeAnchored placement math", () => {
     expect(measured.maxHeight).toBe(120);
   });
 
-  it("item 5(a): with a parked card the usable floor never overrides the clearance", () => {
-    // Same docked geometry as the composer-effort overlap e2e: the cleared
-    // strip (71px) is under the usable minimum, but growing the panel would
-    // cover the card — so the cap stays exactly the strip.
+  it("item 5(a): a sub-minimum card-cleared strip falls back to plain above-room", () => {
+    // Dock with a narrow 71px cleared strip: below the usable minimum, so the
+    // panel uses the bounded plain above-room (covering the dismissible card
+    // is the documented lesser evil) and its controls stay reachable.
     const measured = computeAnchored(
       { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
       { preferredHeight: 131, width: 300 },
@@ -172,8 +186,7 @@ describe("computeAnchored placement math", () => {
       { ...OPTS, avoidBottom: 770 },
     );
     expect(measured.placement).toBe("up");
-    expect(measured.maxHeight).toBe(71);
-    expect(measured.top).toBe(857 - 8 - 71);
+    expect(measured.maxHeight).toBe(540);
   });
 
   it("shifts a panel that would overflow the right edge back inside", () => {

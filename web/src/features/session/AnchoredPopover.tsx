@@ -132,15 +132,15 @@ export function computeAnchored(
   } else {
     placement = !blockedUpByCard && roomAbove > roomBelow ? "up" : "down";
   }
-  // When the panel stays UP despite the parked card (below has no room for a
-  // usable panel), it is HEIGHT-CAPPED to the card-cleared room so its bottom
-  // edge never overlaps the card — even a 20–40px cleared strip keeps the
-  // panel clear of the card and the inner region scrolls. A usable-minimum
-  // floor is applied ONLY to plain (unblocked) up placement (the r4 5(a)
-  // "20–40 px strip" case, with no card to keep clear of); against a card the
-  // strip is exactly the clearance and must not grow. A LITERAL 0 never means
-  // "uncapped" (that painted the full-vh panel); it falls back to the bounded
-  // plain above-room.
+  // A panel staying UP with a parked card below:
+  // - when the card-cleared strip is at least DOWN_USABLE tall, cap to the
+  //   strip so the panel's bottom edge clears the card (inner region scrolls);
+  // - when the strip is UNDER the usable minimum, fall back to the plain
+  //   above-room cap. The panel may then overlap the DISMISSIBLE card — the
+  //   pre-dodge documented lesser evil — but its controls (e.g. the effort
+  //   track) stay fully reachable, which the strict strip could clip. (The
+  //   composer-effort overlap e2e asserts non-overlap only for the geometry
+  //   with a usable strip; the docked narrow case covers the card.)
   const room =
     placement === "up"
       ? blockedUpByCard
@@ -148,10 +148,11 @@ export function computeAnchored(
         : roomAbove
       : roomBelow;
   let cap = Math.min(vhCap, room);
+  if (placement === "up" && blockedUpByCard && 0 < cap && cap < DOWN_USABLE) {
+    cap = Math.min(vhCap, roomAbove);
+  }
   if (placement === "up" && !blockedUpByCard && 0 < cap && cap < DOWN_USABLE) {
-    // No card: grow a tiny strip to the usable minimum (the panel starts at
-    // the trigger minus 120 and its lower rows extend toward the trigger; the
-    // inner region scrolls). Bounded only by the 60vh cap, not by room.
+    // Plain (no card) short strip: grow to the usable minimum.
     cap = Math.min(vhCap, DOWN_USABLE);
   }
   if (cap <= 0) {

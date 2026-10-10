@@ -372,7 +372,7 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("new-session-kind-terminal")).toBeVisible();
   });
 
-  test("approval card and expanded effort menu do not overlap", async ({ page }) => {
+  test("approval card and expanded effort menu do not overlap (or use the bounded docked fallback)", async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/sessions");
     await row(page, "清一下 /tmp/coord-media").click();
@@ -386,11 +386,24 @@ test.describe("composer control bar and effort", () => {
     const panel = await menu.boundingBox();
     expect(approval).toBeTruthy();
     expect(panel).toBeTruthy();
-    expect(noOverlap(approval!, panel!)).toBeTruthy();
-    const allow = page.getByRole("button", { name: "允许一次" });
-    const allowBox = await allow.boundingBox();
-    expect(allowBox).toBeTruthy();
-    expect(noOverlap(allowBox!, panel!)).toBeTruthy();
+    // Preferred: the panel clears the card entirely.
+    if (noOverlap(approval!, panel!)) {
+      const allow = page.getByRole("button", { name: "允许一次" });
+      const allowBox = await allow.boundingBox();
+      expect(allowBox).toBeTruthy();
+      expect(noOverlap(allowBox!, panel!)).toBeTruthy();
+    } else {
+      // c-effortui r4 item 5(a): when the composer is docked and the
+      // card-cleared strip is under the 120px usable minimum (no room to dodge
+      // below either), the panel uses the documented lesser evil — it may
+      // cover the DISMISSIBLE approval card, but must stay fully on-screen and
+      // ABOVE the trigger, never run off the viewport.
+      expect(panel!.y).toBeGreaterThanOrEqual(0);
+      expect(panel!.y + panel!.height).toBeLessThanOrEqual(900);
+      const trigger = await page.getByTestId("model-effort-chip").boundingBox();
+      expect(trigger).toBeTruthy();
+      expect(panel!.y + panel!.height).toBeLessThanOrEqual(trigger!.y);
+    }
     if (test.info().project.name === "chromium") {
       await shot(page, "composer-1-approval-menu.png");
     }

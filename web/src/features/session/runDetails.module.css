@@ -49,6 +49,29 @@
   padding-top: var(--space-1);
 }
 
+/* Controlled (D-053): the panel unfolds in document flow right under the
+   header, opened from ⋯. Two classes so the compact margins below never
+   apply to it. */
+.runDetails.panel {
+  margin: 0;
+  padding: var(--space-2) 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+@media (max-width: 767px) {
+  .runDetails.panel {
+    padding: var(--space-2) var(--space-3);
+  }
+}
+
+.runDetails.panel > summary {
+  padding: 0;
+}
+
+.runDetails.panel > summary::after {
+  content: none;
+}
+
 /* Compact: the trigger keeps a 21px visual row but gets the same invisible
    44px reach as the glyph controls (ui-spec §3.4, D-039). Its zone would
    otherwise rise into the header chip's, so the disclosure sits 14px below

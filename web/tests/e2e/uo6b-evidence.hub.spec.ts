@@ -144,7 +144,7 @@ test.beforeAll(async ({}, testInfo) => {
 
 test.describe.configure({ mode: "serial" });
 
-test("the live strip settles on the fake-Node exited-combo fixture (m-realdevice shape)", async ({ page }) => {
+test("an exited-combo session shows the EndedBar and no live strip (m-realdevice shape)", async ({ page }) => {
   await login(page, "e2e-uo6b");
   await page.goto("/sessions/new");
   const host = await page
@@ -159,20 +159,17 @@ test("the live strip settles on the fake-Node exited-combo fixture (m-realdevice
   await page.waitForURL(/\/s\//, { timeout: 20_000 });
   const id = new URL(page.url()).pathname.split("/")!.pop()!;
 
-  const strip = page.getByTestId("live-status-strip");
-  // The fixture ends with the entity("exited") record: the strip must settle
-  // instead of keeping the stalled 工具运行中 row with a growing timer.
-  await expect(strip).toHaveAttribute("data-turn", "ended", { timeout: 20_000 });
-  await expect(strip).toHaveAttribute("data-phase", "turn-ended");
-  await expect(strip).toHaveAttribute("data-settled", "exited");
-  // No stall warning, no interrupt, no live token count on the settled row.
+  // The fixture ends with the entity("exited") record. UO-6a round 2: an
+  // ended SESSION says so once, in the EndedBar — the live strip (and its
+  // stalled 工具运行中 row / growing timer) is not mounted at all. The
+  // strip's own settle-on-exit projection stays unit-covered.
+  await expect(page.getByTestId("ended-bar")).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByTestId("live-status-strip")).toHaveCount(0);
+  // No stall warning, no interrupt, no live token count, no clock.
   await expect(page.getByTestId("live-health-hook")).toHaveCount(0);
   await expect(page.getByTestId("live-interrupt")).toHaveCount(0);
   await expect(page.getByTestId("live-token-count")).toHaveCount(0);
-  const elapsed = page.getByTestId("live-elapsed");
-  const first = await elapsed.textContent();
-  await page.waitForTimeout(2_200);
-  expect(await elapsed.textContent()).toBe(first);
+  await expect(page.getByTestId("live-elapsed")).toHaveCount(0);
   await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
 });
 
@@ -210,20 +207,16 @@ test("UO-6b r2: a HUB-detected Node restart settles the live strip and shows Res
   // severity + message and NO status (the payload round 1 threw on).
   await rawKeys(page, id, "TTYNODE_RESTART\r");
 
-  // The strip settles: ended, node-restart attribution, frozen clock, every
-  // live affordance gone — no React error from the status-less diagnostic.
-  await expect(strip).toHaveAttribute("data-turn", "ended", { timeout: 30_000 });
-  await expect(strip).toHaveAttribute("data-phase", "turn-ended");
-  await expect(strip).toHaveAttribute("data-settled", "node-restart");
-  await expect(page.getByTestId("live-interrupt")).toHaveCount(0);
-  const frozen = await elapsed.textContent();
-  await page.waitForTimeout(2_200);
-  expect(await elapsed.textContent(), "the settled clock kept growing").toBe(frozen);
-
-  // The instance row the Hub reconciled drives the banner + Resume.
+  // The instance row the Hub reconciled (ended, and disconnected) drives the
+  // EndedBar's restart banner + Resume; UO-6a round 2 unmounts the live strip
+  // with it, so every live affordance is gone — and no React error from the
+  // status-less diagnostic.
   await expect(page.getByTestId("node-restart-banner")).toContainText(nodeRestartLabel, {
-    timeout: 20_000,
+    timeout: 30_000,
   });
+  await expect(strip).toHaveCount(0);
+  await expect(page.getByTestId("live-interrupt")).toHaveCount(0);
+  await expect(elapsed).toHaveCount(0);
   await expect(page.getByTestId("node-restart-resume")).toBeEnabled();
   expect(pageErrors, `page errors during restart: ${pageErrors.join("\n")}`).toEqual([]);
   await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);

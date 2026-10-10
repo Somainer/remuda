@@ -354,6 +354,14 @@ export type HubState = {
   interactionsHydrated: boolean;
   events: Record<string, Observation[]>;
   journalStatus: Record<string, JournalClient["status"]>;
+  /**
+   * Lowest LOADED (retained) journal seq per instance, mirrored from the
+   * JournalClient's descending pager. The transcript's load-earlier button
+   * points at THIS floor rather than the min event seq: a reconnect snapshot
+   * re-anchors the server window above manually paged rows, which stay held.
+   * "1" (or absent for an unfollowed instance) hides the button.
+   */
+  journalFloors: Record<string, string>;
   bubbles: LocalBubble[];
   permissionMode: Record<string, string>;
   effort: Record<string, EffortSelection>;
@@ -406,6 +414,7 @@ const initial: HubState = {
   interactionsHydrated: false,
   events: {},
   journalStatus: {},
+  journalFloors: {},
   bubbles: [],
   permissionMode: {},
   effort: {},
@@ -1455,44 +1464,6 @@ class HubStore {
     return this.connectionBindGen;
   }
   /**
-   * Rebind to a journal ANOTHER mount already finished loading (navigation
-   * back, or a racing same-journal mount whose seed won): its OPEN fresh
-   * socket certifies live immediately and closes an attempt a superseded
-   * mount still owned. A silent/dead socket keeps the OLD bind-deadline
-   * dance (followBound): an immediate resume would reopen the socket while a
-   * REST gap-backfill is still running and could strand gap-backfill (the
-   * bumped resume generation aborts fillGap) — the deadline reuses the live
-   * frame/probe evidence instead.
-   */
-  private rebindMountedConnection() {
-    if (!this.connection) return;
-    if (this.followSocketLive()) this.connection.followRebindLive();
-    // rebind: judge the EXISTING socket on its frame/probe deadline. The
-    // machine may still sit in a previous mount's recovering state; without
-    // the rebind flag followBound would inherit that and beginResume() a
-    // second socket (c-reconnfu gate 6 item 1).
-    else this.connection.followBound({ rebind: true });
-  }
-
-  /**
-   * Hand-off from a mount whose seed LOST to another mount of the same
-   * journal that is already loading, SCOPED to the captured (journal,
-   * binding generation, attempt): only an OPEN fresh socket on the STILL-BOUND
-   * journal may certify, and only the exact attempt this mount armed (or
-   * shared with the winner). A deferred duplicate seed from an obsolete
-   * navigation (rapid A → B → A → B) whose journal is no longer bound, or
-   * whose attempt was superseded, is a no-op: it must not retire the
-   * winning mount's attempt/watchdog, and a silent socket is left to the
-   * winner's own attempt.
-   */
-  private handOffMountedConnection(journalId: Id, gen: number, attemptId: number | undefined) {
-    if (!this.connection || attemptId === undefined) return;
-    if (this.connectionBoundJournal !== journalId) return;
-    if (!this.followSocketLive()) return;
-    this.connection.followAttemptLive(attemptId, gen);
-  }
-
-  /**
    * The follow link is genuinely live only when the socket is OPEN AND a frame
    * arrived within LIVE_FRAME_MS. This is the ONLY thing that lets a
    * foreground resume trust a cached "live" instead of reopening.
@@ -1811,8 +1782,6 @@ class HubStore {
       const j = this.state.instances.find((i) => i.id === instanceId)?.journalId;
       if (j) this.bindConnection(instanceId, j);
       else {
-        // Not in the local projection yet: reopenFollow re-fetches the
-        // instance and discovers its journal; no generation to bump.
         this.connectionBoundTo = instanceId;
         this.connectionBoundJournal = null;
       }
@@ -2804,219 +2773,178 @@ class HubStore {
     // opened: if the subscribe fails while the Hub is unreachable (offline
     // reload), the machine's reconnect resume must still know which instance
     // to reopen — binding only after a successful open left reloaded sessions
-    // with a delivered row but no follow and no journal join. The binding
-    // generation supersedes any mount still in flight for another journal.
-    const bindGen = this.bindConnection(instance.id, instance.journalId);
+    // with a delivered row but no follow and no journal join.
+    this.connectionBoundTo = instance.id;
+    this.connectionBoundJournal = instance.journalId;
     if (!this.state.instances.some((i) => i.id === instanceId)) {
       this.emit({ instances: [instance, ...this.state.instances] });
     }
     // Fold projected effective state/catalog the single record carries.
     this.hydrateEffortEffective([instance]);
     this.hydrateModels([instance]);
-    // Already mounted (SessionPage re-render / navigation back to a session
-    // whose socket stayed open): rebind the connection machine to THIS
-    // follow. The global state was previously driven by the socket the user
-    // just left; revalidate the re-bound one immediately — certify live when
-    // its socket is OPEN+fresh, otherwise arm recovery for this binding
-    // rather than inherit the previous mount's watchdog.
+    // Already mounted (SessionPage re-render): rebind the connection machine
+    // to this active follow; a dead socket is reopened by the machine.
     if (this.journals.has(instance.journalId)) {
-      this.rebindMountedConnection();
+      this.connectionBoundTo = instanceId;
+      this.connectionBoundJournal = instance.journalId;
       return;
     }
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
-    // The REST seed + first subscribe are an in-flight link attempt: the
-    // bootstrap claimed live, but a seed read that hangs or fails must not
-    // strand the session "live" with no reconnect timer. The machine arms the
-    // recovering watchdog now; success is reported once the subscribe
-    // snapshot certifies the socket, failure goes offline and schedules.
-    const attemptId = this.connection?.followAttemptBegin(bindGen);
-    try {
-      // Seed from ONE bounded tail window (newest rows win). The old ascending
-      // 512-loop sliced the front of the tail, silently dropping everything
-      // below the middle of the window on a long journal. Older rows load on
-      // demand via JournalClient.loadEarlier.
-      const seed = await api.eventsRead({ journalId: instance.journalId, limit: 2000 });
-      // Another mount may finish loading this journal while this read is
-      // pending. It now owns the attempt (same binding generation, shared
-      // slot): hand off a live socket or leave its own attempt/watchdog to
-      // close, but never end this mount's attempt against it.
-      if (this.journals.has(instance.journalId)) {
-        // Scoped to THIS mount's captured binding/attempt: a deferred
-        // duplicate seed from an obsolete navigation must not retire the
-        // winning mount's attempt.
-        this.handOffMountedConnection(instance.journalId, bindGen, attemptId);
-        return;
+    // Seed from ONE bounded tail window (newest rows win). The old ascending
+    // 512-loop sliced the front of the tail, silently dropping everything
+    // below the middle of the window on a long journal. Older rows load on
+    // demand via JournalClient.loadEarlier.
+    const seed = await api.eventsRead({ journalId: instance.journalId, limit: 2000 });
+    // Another mount may finish loading this journal while this read is pending.
+    if (this.journals.has(instance.journalId)) return;
+    const history = seed.events;
+    const historyPhrase = liveSummary(history);
+    this.emit({
+      instances: applyInstanceActivity(this.state.instances, history),
+      events: { ...this.state.events, [instanceId]: history },
+      summaries: historyPhrase
+        ? { ...this.state.summaries, [instanceId]: historyPhrase }
+        : this.state.summaries,
+    });
+    // §9.1: the Hub record usually already carries the latest effective level;
+    // replay history effort edges too so a reconnect before refresh is honest.
+    for (const event of history) {
+      this.noteEffortObservation(instanceId, event);
+      this.noteEffortLifecycle(instanceId, event);
+      // History replay hydrates observed model state only; it must not settle a
+      // push-down pending or fold the selection (those belong to live events).
+      this.noteModelObservation(instanceId, event, false);
+      this.noteModelLifecycle(instanceId, event, false);
+      this.notePermissionObservation(instanceId, event);
+      this.notePermissionLifecycle(instanceId, event);
+    }
+    const read: JournalRead = async (args) => {
+      if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
-      const history = seed.events;
-      const historyPhrase = liveSummary(history);
-      this.emit({
-        instances: applyInstanceActivity(this.state.instances, history),
-        events: { ...this.state.events, [instanceId]: history },
-        summaries: historyPhrase
-          ? { ...this.state.summaries, [instanceId]: historyPhrase }
-          : this.state.summaries,
-      });
-      // §9.1: the Hub record usually already carries the latest effective level;
-      // replay history effort edges too so a reconnect before refresh is honest.
-      for (const event of history) {
-        this.noteEffortObservation(instanceId, event);
-        this.noteEffortLifecycle(instanceId, event);
-        // History replay hydrates observed model state only; it must not settle a
-        // push-down pending or fold the selection (those belong to live events).
-        this.noteModelObservation(instanceId, event, false);
-        this.noteModelLifecycle(instanceId, event, false);
-        this.notePermissionObservation(instanceId, event);
-        this.notePermissionLifecycle(instanceId, event);
-      }
-      const read: JournalRead = async (args) => {
-        if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
-          await new Promise((resolve) => setTimeout(resolve, 500));
+      return api.eventsRead(args);
+    };
+    const last = history.at(-1)?.seq ?? ("0" as Observation["seq"]);
+    const seedAsOf = (Number(seed.durableSeq) >= Number(last) ? seed.durableSeq : last) as Observation["seq"];
+    const client = new JournalClient(instance.journalId, read, {
+      onEvents: (events) => {
+        const current = this.state.events[instanceId] ?? [];
+        const seen = new Set(current.map((e) => e.eventId));
+        const fresh = events.filter((e) => !seen.has(e.eventId));
+        // §9.1: live effort edges update the effective level immediately —
+        // the slider reflects the transcript, not the optimistic request.
+        for (const event of fresh) {
+          this.noteEffortObservation(instanceId, event);
+          this.noteEffortLifecycle(instanceId, event);
+          this.noteModelObservation(instanceId, event, true);
+          this.noteModelLifecycle(instanceId, event, true);
+          this.notePermissionObservation(instanceId, event);
+          this.notePermissionLifecycle(instanceId, event);
         }
-        return api.eventsRead(args);
-      };
-      const last = history.at(-1)?.seq ?? ("0" as Observation["seq"]);
-      const seedAsOf = (Number(seed.durableSeq) >= Number(last) ? seed.durableSeq : last) as Observation["seq"];
-      const client = new JournalClient(instance.journalId, read, {
-        onEvents: (events) => {
-          const current = this.state.events[instanceId] ?? [];
-          const seen = new Set(current.map((e) => e.eventId));
-          const fresh = events.filter((e) => !seen.has(e.eventId));
-          // §9.1: live effort edges update the effective level immediately —
-          // the slider reflects the transcript, not the optimistic request.
-          for (const event of fresh) {
-            this.noteEffortObservation(instanceId, event);
-            this.noteEffortLifecycle(instanceId, event);
-            this.noteModelObservation(instanceId, event, true);
-            this.noteModelLifecycle(instanceId, event, true);
-            this.notePermissionObservation(instanceId, event);
-            this.notePermissionLifecycle(instanceId, event);
-          }
-          const next = current.concat(fresh);
-          const screen = latestScreenSnapshot(next);
-          const phrase = liveSummary(next);
-          // Clear a finished run's phrase so the row falls back to its
-          // constant sentence instead of keeping a stale (invented) status.
-          const summaries = { ...this.state.summaries };
-          if (phrase) summaries[instanceId] = phrase;
-          else delete summaries[instanceId];
-          // Commit through the one screen ordering: catch-up re-derives the
-          // latest journal screen on EVERY batch (including non-screen events),
-          // and a live RPC buffer already fresh through that seq is newer — a
-          // re-derived equal-or-older seq must not roll it (DONE badge flapping
-          // while the new turn works).
-          const screenPatch =
-            screen.lines.length && screen.seq !== null
-              ? this.screenCommitPatch(instanceId, lastLines(screen.lines, 80), doneFromLines(screen.lines), {
-                  kind: "journal",
-                  seq: screen.seq,
-                })
-              : null;
-          const settledBubbles = settleBubbles(this.state.bubbles, instanceId, next);
-          // A journal message is stronger evidence than the queued/accepted Hub
-          // row: retire the matching outbox rows so a later reconnect cannot
-          // keep retrying a command that demonstrably executed.
-          if (this.outbox) {
-            for (const ev of next) {
-              if (ev.kind !== "message") continue;
-              const commandId = (ev.payload as { commandId?: Id }).commandId;
-              const rec = commandId ? this.outbox.get(commandId) : null;
-              if (commandId && rec && rec.state !== "done" && rec.state !== "rejected") {
-                void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
-              }
+        const next = current.concat(fresh);
+        const screen = latestScreenSnapshot(next);
+        const phrase = liveSummary(next);
+        // Clear a finished run's phrase so the row falls back to its
+        // constant sentence instead of keeping a stale (invented) status.
+        const summaries = { ...this.state.summaries };
+        if (phrase) summaries[instanceId] = phrase;
+        else delete summaries[instanceId];
+        // Commit through the one screen ordering: catch-up re-derives the
+        // latest journal screen on EVERY batch (including non-screen events),
+        // and a live RPC buffer already fresh through that seq is newer — a
+        // re-derived equal-or-older seq must not roll it (DONE badge flapping
+        // while the new turn works).
+        const screenPatch =
+          screen.lines.length && screen.seq !== null
+            ? this.screenCommitPatch(instanceId, lastLines(screen.lines, 80), doneFromLines(screen.lines), {
+                kind: "journal",
+                seq: screen.seq,
+              })
+            : null;
+        const settledBubbles = settleBubbles(this.state.bubbles, instanceId, next);
+        // A journal message is stronger evidence than the queued/accepted Hub
+        // row: retire the matching outbox rows so a later reconnect cannot
+        // keep retrying a command that demonstrably executed.
+        if (this.outbox) {
+          for (const ev of next) {
+            if (ev.kind !== "message") continue;
+            const commandId = (ev.payload as { commandId?: Id }).commandId;
+            const rec = commandId ? this.outbox.get(commandId) : null;
+            if (commandId && rec && rec.state !== "done" && rec.state !== "rejected") {
+              void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
             }
           }
-          this.emit({
-            instances: applyInstanceActivity(this.state.instances, events),
-            events: { ...this.state.events, [instanceId]: next },
-            bubbles: settledBubbles,
-            screens: screenPatch ?? this.state.screens,
-            summaries,
-          });
-        },
-        onPrepend: (older) => {
-          const current = this.state.events[instanceId] ?? [];
-          const seen = new Set(current.map((e) => e.eventId));
-          const fresh = older.filter((e) => !seen.has(e.eventId));
-          if (!fresh.length) return;
-          // Load-earlier rows land above every loaded node. Merge by seq rather
-          // than trusting arrival order: assemble/Transcript anchor on it.
-          const merged = current.concat(fresh).sort((a, b) => Number(a.seq) - Number(b.seq));
-          for (const event of fresh) {
-            this.noteEffortObservation(instanceId, event);
-            this.noteEffortLifecycle(instanceId, event);
-            this.noteModelObservation(instanceId, event, false);
-            this.noteModelLifecycle(instanceId, event, false);
-            this.notePermissionObservation(instanceId, event);
-            this.notePermissionLifecycle(instanceId, event);
-          }
-          this.emit({
-            instances: applyInstanceActivity(this.state.instances, fresh),
-            events: { ...this.state.events, [instanceId]: merged },
-          });
-        },
-        onStatus: (status) => {
-          // Journal completeness is a PER-SESSION concern only; it must never
-          // publish the global connection state (only the connection machine
-          // publishes live, and a journal live read does not prove the follow
-          // socket is open — a frozen transcript could otherwise show 已连接).
-          this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: status } });
-        },
-        onGap: (from, to) => {
-          void client.fillGap(from, to, client.currentResumeGen()).then((acked) => {
-            if (acked) void api.eventsAck(this.subs.get(instance.journalId) ?? "resume", instance.journalId, acked);
-          });
-        },
-      });
-      this.journals.set(instance.journalId, client);
-      client.applySnapshot({
-        projectionVersion: "v1",
-        projectionEpoch: id("epoch_"),
-        asOfSeq: seedAsOf,
-        instance: {} as Instance,
-        runs: [],
-        commands: [],
-        pendingInteractions: [],
-        nodes: [],
-        // The seed is a bounded window: its floor is a window floor, and
-        // complete=false says older rows remain behind load-earlier. It is NOT
-        // fed as a retention floor anywhere (JournalClient uses it only as the
-        // load-earlier anchor and live-batch stale check).
-        history: { earliestRetainedSeq: seed.windowFromSeq ?? "1", complete: seed.reachedAfterSeq },
-      });
-      await this.openFollowSocket(instance, client, last, {
-        earliestRetainedSeq: seed.windowFromSeq ?? "1",
-        complete: seed.reachedAfterSeq,
-      });
-      // The subscribe snapshot certified the socket over this exact mount:
-      // report success so the recovering watchdog is cleared for this attempt
-      // — but only while THIS mount is still the bound one: a mount the user
-      // navigated away from mid-seed must not certify the new session.
-      if (
-        this.connection &&
-        attemptId !== undefined &&
-        bindGen === this.connectionBindGen &&
-        this.connectionBoundJournal === instance.journalId
-      ) {
-        this.connection.followAttemptEnd(true, attemptId, bindGen);
-      }
-      // (connectionBoundTo/Journal were bound at the top of follow(), so the
-      // machine owns this session even when this first open failed offline.)
-    } catch (err) {
-      // Seed/subscribe failure: never leave a false live. Go offline (the
-      // bounded reconnect loop retries this exact mount via resumeConnection
-      // → reopenFollow → follow) and surface the failure to the caller. A
-      // failure belongs to a superseded mount, though: it must not take the
-      // newly bound session offline, so it is reported only while still bound.
-      if (
-        this.connection &&
-        attemptId !== undefined &&
-        bindGen === this.connectionBindGen &&
-        this.connectionBoundJournal === instance.journalId
-      ) {
-        this.connection.followAttemptEnd(false, attemptId, bindGen);
-      }
-      throw err;
-    }
+        }
+        this.emit({
+          instances: applyInstanceActivity(this.state.instances, events),
+          events: { ...this.state.events, [instanceId]: next },
+          bubbles: settledBubbles,
+          screens: screenPatch ?? this.state.screens,
+          summaries,
+        });
+      },
+      onPrepend: (older) => {
+        const current = this.state.events[instanceId] ?? [];
+        const seen = new Set(current.map((e) => e.eventId));
+        const fresh = older.filter((e) => !seen.has(e.eventId));
+        if (!fresh.length) return;
+        // Load-earlier rows land above every loaded node. Merge by seq rather
+        // than trusting arrival order: assemble/Transcript anchor on it.
+        const merged = current.concat(fresh).sort((a, b) => Number(a.seq) - Number(b.seq));
+        for (const event of fresh) {
+          this.noteEffortObservation(instanceId, event);
+          this.noteEffortLifecycle(instanceId, event);
+          this.noteModelObservation(instanceId, event, false);
+          this.noteModelLifecycle(instanceId, event, false);
+          this.notePermissionObservation(instanceId, event);
+          this.notePermissionLifecycle(instanceId, event);
+        }
+        this.emit({
+          instances: applyInstanceActivity(this.state.instances, fresh),
+          events: { ...this.state.events, [instanceId]: merged },
+          journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq },
+        });
+      },
+      onStatus: (status) => {
+        // Journal completeness is a PER-SESSION concern only; it must never
+        // publish the global connection state (only the connection machine
+        // publishes live, and a journal live read does not prove the follow
+        // socket is open — a frozen transcript could otherwise show 已连接).
+        this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: status } });
+      },
+      onGap: (from, to) => {
+        void client.fillGap(from, to, client.currentResumeGen()).then((acked) => {
+          if (acked) void api.eventsAck(this.subs.get(instance.journalId) ?? "resume", instance.journalId, acked);
+        });
+      },
+    });
+    this.journals.set(instance.journalId, client);
+    // The seed rows crossed the events READ, not the follow socket: register
+    // them so a descending load-earlier window overlapping the seed counts as
+    // duplicate-only (advancing the cursor) rather than a false prepend.
+    client.noteHistory(history);
+    client.applySnapshot({
+      projectionVersion: "v1",
+      projectionEpoch: id("epoch_"),
+      asOfSeq: seedAsOf,
+      instance: {} as Instance,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      // The seed is a bounded window: its floor is a window floor, and
+      // complete=false says older rows remain behind load-earlier. It is NOT
+      // fed as a retention floor anywhere (JournalClient uses it only as the
+      // load-earlier anchor and live-batch stale check).
+      history: { earliestRetainedSeq: seed.windowFromSeq ?? "1", complete: seed.reachedAfterSeq },
+    });
+    this.emit({ journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq } });
+    await this.openFollowSocket(instance, client, last, {
+      earliestRetainedSeq: seed.windowFromSeq ?? "1",
+      complete: seed.reachedAfterSeq,
+    });
+    // (connectionBoundTo/Journal were bound at the top of follow(), so the
+    // machine owns this session even when this first open failed offline.)
   }
 
   /**
@@ -3110,13 +3038,21 @@ class HubStore {
     }
   }
 
-  /** Fetch one window of older history for the transcript's load-earlier row. */
+  /**
+   * Fetch one window of older history for the transcript's load-earlier row.
+   * Returns whether rows were prepended and whether the retained end was
+   * reached (null when the instance/journal is not followed here).
+   */
   async loadEarlier(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId);
     if (!instance) return null;
     const client = this.journals.get(instance.journalId);
     if (!client) return null;
-    return client.loadEarlier();
+    const result = await client.loadEarlier();
+    // Duplicate-only pages fire no onPrepend, so emit the (possibly advanced)
+    // retained floor here: the button must stay visible while history remains.
+    this.emit({ journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq } });
+    return result;
   }
 
   /**

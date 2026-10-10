@@ -11,9 +11,9 @@ import css from "./runDetails.module.css";
  *
  * D-053 moved the trigger from a second header row into the ⋯ menu. When
  * `open` / `onClose` are supplied the disclosure is controlled: the menu owns
- * the trigger (so no <summary> is rendered here) and persistence is the
- * caller's responsibility. With no props the component keeps its original
- * self-triggering behaviour byte-for-byte.
+ * the trigger, the <summary> becomes the panel heading (activating it asks the
+ * caller to close), and persistence is the caller's responsibility. With no
+ * props the component keeps its original self-triggering behaviour.
  */
 const KEY = "runtime.run-details.open";
 
@@ -65,8 +65,29 @@ export function RunDetails({
   }, [controlled, open, onClose]);
 
   return (
-    <details className={css.runDetails} data-testid="run-details" open={isOpen}>
-      {controlled ? null : (
+    <details
+      className={controlled ? `${css.runDetails} ${css.panel}` : css.runDetails}
+      data-testid="run-details"
+      open={isOpen}
+      // Controlled and closed: the ⋯ item is the only trigger, so the folded
+      // panel takes no row at all.
+      hidden={controlled && !isOpen}
+    >
+      {controlled ? (
+        // A <details> always needs its <summary>. Controlled, it is the panel
+        // heading; activating it folds the panel back (the menu reopens it).
+        <summary
+          data-testid="run-details-heading"
+          onClick={(event) => {
+            event.preventDefault();
+            onClose?.();
+          }}
+        >
+          <span className={css.chev} aria-hidden="true" />
+          运行详情
+          <span className={css.count}>{count} 项</span>
+        </summary>
+      ) : (
         <summary
           data-testid="run-details-summary"
           onClick={(event) => {

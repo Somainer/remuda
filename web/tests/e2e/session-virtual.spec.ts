@@ -83,29 +83,25 @@ test.describe("transcript virtualization and session chrome", () => {
     await page.goto("/s/ins_mock_stale");
     await expect(page.getByTestId("journal-banner")).toBeVisible({ timeout: 8_000 });
     await expect(page.getByTestId("journal-banner")).toHaveAttribute("data-state", "readonly-stale", { timeout: 8_000 });
-    // The diagnostic meta row now lives inside the 运行详情 disclosure
-    // (D-040); the 只读 suffix moves with it.
+    // The diagnostic meta row lives in 运行详情, opened from the header ⋯
+    // (D-053); the 只读 suffix moves with it.
+    await page.getByTestId("session-more-open").click();
     await page.getByTestId("run-details-summary").click();
     await expect(page.getByTestId("session-meta")).toContainText("只读");
   });
 
-  test("Compact/Full persists and collapse-all folds tools", async ({ page }, info) => {
-    // Density lives inline on desktop; below the 640px compact fold it moves
-    // into the header ⋯ sheet (D-040), so open the sheet before every lookup
-    // — no viewport pin, so both chromium and mobile-webkit exercise it.
-    const compact = info.project.name === "mobile-webkit";
-    const densityToggle = () =>
-      compact
-        ? page.getByTestId("session-more-sheet").getByTestId("density-toggle")
-        : page.getByTestId("density-toggle");
+  test("Compact/Full persists and collapse-all folds tools", async ({ page }) => {
+    // Density lives in the header ⋯ at every width (D-053): a popover on
+    // desktop, a sheet on the phone. Open it before every lookup — no
+    // viewport pin, so both chromium and mobile-webkit exercise it.
+    const densityToggle = () => page.getByTestId("session-more-menu").getByTestId("density-toggle");
     const openDensityMenu = async () => {
-      if (compact) {
-        await page.getByTestId("session-more-open").click();
-        await expect(page.getByTestId("session-more-sheet")).toBeVisible();
-      }
+      await page.getByTestId("session-more-open").click();
+      await expect(page.getByTestId("session-more-menu")).toBeVisible();
     };
     const closeDensityMenu = async () => {
-      if (compact) await page.keyboard.press("Escape");
+      if (await page.getByTestId("session-more-menu").count()) await page.keyboard.press("Escape");
+      await expect(page.getByTestId("session-more-menu")).toHaveCount(0);
     };
 
     await openNamedSession(page, "看 TaskManager spill");

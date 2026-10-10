@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
 import { useFocusTrap } from "./useFocusTrap";
 import css from "./overlay.module.css";
 
@@ -51,7 +52,13 @@ export function Modal({
   }, [open]);
 
   if (!open) return null;
-  return (
+  // Portal to document.body (c-dirpicker round 4 item 7): the modal is often
+  // mounted inside a <form> (the New Session sheet). Rendered inline it is a
+  // DOM descendant of that form, so a real Enter in a modal text field
+  // implicitly submits the outer form. Portaling moves it out of the form
+  // subtree entirely; keydown handling then only needs to intercept Enter on
+  // the modal's own text inputs.
+  const panel = (
     <div className={css.modalScrim} style={{ top: box.top, height: box.height }} onClick={onClose} role="presentation">
       <div
         {...aria}
@@ -64,4 +71,8 @@ export function Modal({
       </div>
     </div>
   );
+  if (typeof document === "undefined") {
+    return panel;
+  }
+  return createPortal(panel, document.body);
 }

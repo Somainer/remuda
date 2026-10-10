@@ -540,7 +540,8 @@
 .drawerBackdrop {
   position: fixed;
   inset: 0;
-  z-index: 45;
+  /* A real overlay scrim: above the annotation dock (r3 item 1). */
+  z-index: var(--z-sheet);
   background: var(--scrim);
 }
 
@@ -579,7 +580,7 @@
 .sheetBackdrop {
   position: fixed;
   inset: 0;
-  z-index: 60;
+  z-index: var(--z-sheet);
   display: flex;
   align-items: flex-end;
   justify-content: center;

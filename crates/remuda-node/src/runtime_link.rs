@@ -26,6 +26,12 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
     if crate::workspace::is_workspace_method(method) {
         return node.workspace_rpc(method, params);
     }
+    if crate::dir_browser::is_host_dirs_method(method) {
+        return node.host_dirs_rpc(method, params).await;
+    }
+    if crate::files::is_host_files_method(method) {
+        return node.host_files_rpc(method, params).await;
+    }
     if crate::interactions::is_interaction_method(method) {
         return node.dispatch_interaction(method, params).await;
     }

@@ -8,6 +8,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -663,6 +664,46 @@ fn descendant_with_cmd(root: u32, needle: &[u8]) -> Option<u32> {
     None
 }
 
+/// Every live pid whose /proc cmdline contains `needle` (a fixture-specific
+/// path, so parallel tests never match one another).
+fn processes_with_cmdline(needle: &[u8]) -> Vec<(u32, String)> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline"))
+            && cmdline.windows(needle.len()).any(|window| window == needle)
+        {
+            found.push((
+                pid,
+                String::from_utf8_lossy(&cmdline).replace('\0', " "),
+            ));
+        }
+    }
+    found
+}
+
+/// Wait until no live process's cmdline names this fixture's gate stub.
+fn wait_for_no_stub_processes(stub: &Path) {
+    let needle = stub.to_string_lossy().into_owned();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let survivors = processes_with_cmdline(needle.as_bytes());
+        if survivors.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "gate stub processes outlived the queue: {survivors:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Wait until the gate trace contains a step event matching all predicates.
 fn wait_for_trace<F>(path: &Path, matches: F)
 where
@@ -774,6 +815,7 @@ fn queue_killed_lane_is_a_failed_branch_while_others_land() {
     assert_eq!(branches[2]["status"], "landed");
     assert!(git(&repo.root, &["for-each-ref", "refs/remuda/merge/"]).is_empty());
     repo.assert_cleaned();
+    wait_for_no_stub_processes(&repo.stub_path());
 }
 
 #[test]
@@ -813,6 +855,7 @@ fn queue_watchdog_kills_a_hung_lane_and_the_queue_completes() {
     // the queue: no remuda merge process for this temp repo remains.
     assert_eq!(repo.main(), repo.base, "a hung gate never lands");
     repo.assert_cleaned();
+    wait_for_no_stub_processes(&repo.stub_path());
 }
 
 // ---------------------------------------------------------------------------
@@ -877,9 +920,13 @@ fn concurrent_merge_exits_three_and_wait_runs_after_the_lock_frees() {
         .unwrap();
     // Give the waiter time to block on the lock.
     std::thread::sleep(std::time::Duration::from_millis(500));
-    // Releasing the holder (and its hung gate subtree) unblocks the waiter.
+    // Kill ONLY the merge pid, never its process group: a group SIGKILL also
+    // takes gate.sh's supervised launcher down before its parent-death guard
+    // runs, orphaning the sleeping gate stub in its own session (2026 leaks).
+    // Direct SIGKILL lets the supervisor's PR_SET_PDEATHSIG guard reap the
+    // stub; the stub itself also exits once it is reparented.
     nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(-(first.id() as i32)),
+        nix::unistd::Pid::from_raw(first.id() as i32),
         nix::sys::signal::SIGKILL,
     )
     .unwrap();
@@ -891,4 +938,6 @@ fn concurrent_merge_exits_three_and_wait_runs_after_the_lock_frees() {
     });
     assert_exit(&landed, &landed_report, 0);
     assert_eq!(landed_report["status"], "ok");
+    // Nothing running this fixture's gate stub may outlive the queue.
+    wait_for_no_stub_processes(&repo.stub_path());
 }

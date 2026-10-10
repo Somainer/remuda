@@ -11,8 +11,9 @@ Beyond the trace of the normal stub it models these scenarios:
   passes alone while the merged tree fails.
 * ``queue-kill.txt`` makes this gate process send SIGKILL to itself during
   ``cargo-test`` (an externally killed lane: no final report is written).
-* ``queue-hang.txt`` parks the gate in ``cargo-test`` forever, so the queue
-  watchdog can kill the lane itself.
+* ``queue-hang.txt`` parks the gate in ``cargo-test`` until the queue
+  watchdog kills the lane (or until its parent vanishes, so it cannot leak
+  as an orphan).
 """
 import json
 import os
@@ -44,8 +45,15 @@ if step == "cargo-test":
         time.sleep(float(os.environ.get("REMUDA_TEST_KILL_DELAY", "1")))
         os.kill(os.getpid(), signal.SIGKILL)
     if Path("queue-hang.txt").is_file():
-        while True:
-            time.sleep(3600)
+        # Park only while the direct parent (gate.sh's supervised step
+        # launcher) is alive. If a SIGKILLed lane takes the supervisor down
+        # before its parent-death handler can tear this group down, the
+        # reparenting (ppid changes) ends the sleep loop by itself, so the
+        # stub can never outlive the test as an orphan.
+        parent = os.getppid()
+        while os.getppid() == parent:
+            time.sleep(0.2)
+        sys.exit(0)
 if step == "gen-api-current":
     Path("web/src/lib/api.generated.ts").write_text(
         "generated client current\n", encoding="utf-8")

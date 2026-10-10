@@ -32,6 +32,15 @@ pub use interactions::delegated_decisions_test_support;
 /// Test-only seam for the D-057 continuation-resume race.
 #[doc(hidden)]
 pub use store::lineage_test_support;
+/// Test-only seam: project real driver observations through the Hub usage
+/// pipeline (driver close/finalise tests in remuda-node).
+#[doc(hidden)]
+pub mod usage_store_test_support {
+    pub use crate::store::JournalRecord;
+    pub use crate::usage_store::{
+        insert_usage_event, migrate, project_usage_event, rollup_instance,
+    };
+}
 mod inventory;
 mod maintenance;
 mod model_catalog;

@@ -805,17 +805,27 @@ pub(super) fn spawn(
     // Abort-path safety net: even if the task is aborted while a first-bind
     // pump is still mapping a large transcript, the guard's Drop runs the
     // mapper's synchronous `finish()` and best-effort delivers the
-    // observations via try_send before its sender drops. The variable is read
-    // only by its Drop impl.
-
+    // observations via try_send before its sender drops. The guard OWNS the
+    // hydrator slot the loop works from (c-ctxusage r6 item 3): a separate
+    // loop-local would be None in Drop, so an abort after the bounded wait
+    // lost the buffered last run. The variable is read only by its Drop impl.
+    let hydrator_slot: HydratorSlot = Arc::new(Mutex::new(None));
+    let pending_emissions: PendingEmissions =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let finalise_guard = FinaliseGuard {
-        hydrator: None,
+        slot: Arc::clone(&hydrator_slot),
+        pending: Arc::clone(&pending_emissions),
         events: events.clone(),
+        seq: Arc::clone(&seq),
+        ctx: ctx.clone(),
         done: false,
     };
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
-        let mut hydrator: Option<Hydrator> = None;
+        let hydrator = hydrator_slot;
+        let pending = pending_emissions;
+        // The live hydrator lives behind `hydrator` for the whole epoch; the
+        // loop only ever holds it through the shared slot below.
         // Raise-only + blocked latch across the whole promoted session
         // (design §2.4 rule 6, §10 anchor ④). The stateless screen read feeds
         // it; its verdict is what we both journal and expose via the status
@@ -936,12 +946,12 @@ pub(super) fn spawn(
                     return;
                 }
                 bindings.demobilize();
-                finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
+                finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await;
                 announced = None;
             }
             if saw_promote {
                 bindings.begin_epoch(&ctx.cwd, &ctx.claude_home);
-                finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
+                finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await;
                 announced = None;
                 bypass_announced = false;
                 trust_attempted = false;
@@ -978,7 +988,7 @@ pub(super) fn spawn(
                         found.as_ref().expect("matched foreground"),
                         &report,
                     ) {
-                        finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
+                        finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await;
                         announced = None;
                     }
                     bindings.ingest_session_start(report);
@@ -1307,7 +1317,8 @@ pub(super) fn spawn(
                         &bindings,
                         &ctx,
                         found,
-                        &mut hydrator,
+                        &hydrator,
+                        &pending,
                         &mut announced,
                         &events,
                         &seq,
@@ -1319,7 +1330,7 @@ pub(super) fn spawn(
                     )
                     .await;
                 }
-                _ => finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await,
+                _ => finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await,
             }
             // c-ctxusage r5 item 6: close can land while this iteration's pump
             // is still mapping. Check before waiting another tick so the final
@@ -1337,35 +1348,129 @@ pub(super) fn spawn(
         // last assistant run (usage with no stop_reason) instead of dropping
         // the hydrator on close/process exit. This awaits the current pump's
         // completion first and must finish before close aborts the task.
-        finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
-        // Hand the (now drained) hydrator to the guard and disarm it so the
+        finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await;
+        // The async finalise drained the shared slot. Disarm the guard so its
         // abort-path Drop does not finalise a second time.
-        finalise_guard.disarm(hydrator);
+        finalise_guard.disarm();
         let _ = finalised.send(());
     })
 }
 
+/// The shared slot the promoter loop and its [`FinaliseGuard`] keep the live
+/// [`Hydrator`] in. The loop works the hydrator only through this slot (it
+/// never keeps a local `Option`), so an aborted task's guard Drop still sees
+/// the hydrator the last pump was using (c-ctxusage r6 item 3).
+type HydratorSlot = Arc<Mutex<Option<Hydrator>>>;
+
+/// Mapper observations already collected for emission but not yet confirmed
+/// sent. Frames are parked here across the emit `await`, so a task aborted
+/// mid-send still hands them to the channel from the [`FinaliseGuard`]
+/// (c-ctxusage r6 item 3). A frame is popped only after a successful send.
+type PendingEmissions = Arc<Mutex<std::collections::VecDeque<Observation>>>;
+
+/// Lock the slot, tolerating a poisoned mutex (a panic inside a mapped line
+/// must not prevent the abort-path finalise).
+fn slot_lock(slot: &HydratorSlot) -> std::sync::MutexGuard<'_, Option<Hydrator>> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Stamp and send every parked observation (the same envelope rewrite as
+/// `emit_native`: fresh promoter seq, preserved `native_at`), popping each
+/// only after it is confirmed sent. A closed channel leaves the remaining
+/// frames parked for the synchronous guard and ends the loop.
+async fn flush_pending(
+    pending: &PendingEmissions,
+    events: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &PromoteCtx,
+) {
+    loop {
+        let Some(stamped) = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front()
+            .cloned()
+        else {
+            return;
+        };
+        let Ok(mut observation) = build(
+            ctx,
+            seq.fetch_add(1, Ordering::SeqCst) + 1,
+            SourceChannel::Transcript,
+            stamped.completeness,
+            stamped.body,
+            stamped.native_at,
+        ) else {
+            // An un-stampable frame is dropped rather than wedging the queue.
+            pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            continue;
+        };
+        observation.evidence_event_ids = stamped.evidence_event_ids;
+        match events.send(observation).await {
+            Ok(()) => {
+                pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front();
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 /// Best-effort abort-path safety net for [`spawn`].
 ///
-/// Normal shutdown runs `Hydrator::finalize` (async, ordered delivery) and
-/// marks `done`. If the runtime aborts the task before that — e.g. a wedged
-/// first-bind pump exceeding close's bounded wait — the guard's Drop still
-/// runs the mapper's synchronous `finish()` and tries to hand the
-/// observations to the still-held channel via `try_send`. Delivery is best
-/// effort, but the final usage mapping is never silently skipped.
-#[allow(dead_code)] // fields are consumed in Drop / disarm
+/// Normal shutdown drains the pending queue and `Hydrator::finish_collect`
+/// (async, ordered delivery) and marks `done`. If the runtime aborts the task
+/// before that — e.g. a first-bind pump or finalise exceeding close's bounded
+/// wait — the guard's Drop first delivers whatever frames the async send loop
+/// had parked but not confirmed, and then, if the hydrator is still in the
+/// shared slot, runs its synchronous `finish_sync()` and delivers that too.
+/// Every frame goes through [`build`] exactly as `emit_native` does (fresh
+/// seq, promoter envelope, preserved `native_at`), never the mapper's raw
+/// envelope. Delivery is best effort, but the final usage mapping is never
+/// silently skipped.
 struct FinaliseGuard {
-    hydrator: Option<Hydrator>,
+    slot: HydratorSlot,
+    pending: PendingEmissions,
     events: mpsc::Sender<Observation>,
+    seq: Arc<AtomicU64>,
+    ctx: PromoteCtx,
     done: bool,
 }
 
 impl FinaliseGuard {
-    /// Happy-path completion: the async finalise already ran, so just retain
-    /// the drained hydrator and suppress the Drop finalise.
-    fn disarm(mut self, hydrator: Option<Hydrator>) {
-        self.hydrator = hydrator;
+    /// Happy-path completion: the async finalise already drained the queue and
+    /// removed the hydrator from the slot; suppress the Drop finalise.
+    fn disarm(mut self) {
         self.done = true;
+    }
+
+    /// `try_send` for the abort path. Drop cannot await room in the bounded
+    /// channel, but the RunHandle drains on another runtime worker: usage
+    /// frames get a short bounded backoff (`wait`), since the final usage row
+    /// is the guard's whole point; everything else gets one best-effort shot,
+    /// so a content storm can never stall task teardown.
+    fn try_deliver(&self, observation: Observation, wait: bool) -> bool {
+        if !wait {
+            return self.events.try_send(observation).is_ok();
+        }
+        let mut observation = observation;
+        for _ in 0..100 {
+            match self.events.try_send(observation) {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Full(parked)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    observation = parked;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        false
     }
 }
 
@@ -1374,14 +1479,66 @@ impl Drop for FinaliseGuard {
         if self.done {
             return;
         }
-        if let Some(hydrator) = self.hydrator.as_mut()
-            && let Ok(observations) = hydrator.finish_sync()
+        // 1. Frames a pump/finalise collected and parked but never confirmed
+        // sent.
+        let mut observations: std::collections::VecDeque<_> = std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        // 2. The hydrator is still in the slot when the abort landed before or
+        // during a pump (the finalise path removes it only after every frame
+        // was sent). Take it and finish it synchronously.
+        if let Some(mut hydrator) = slot_lock(&self.slot).take()
+            && let Ok(finished) = hydrator.finish_sync()
         {
-            for observation in observations {
-                // Best effort: a full/gone channel drops the observation.
-                if self.events.try_send(observation).is_err() {
-                    break;
-                }
+            observations.extend(finished);
+        }
+        for stamped in &observations {
+            // Best-effort ordering on the abort path: the channel is bounded
+            // and try_send cannot wait for room, so deliver Usage frames
+            // FIRST — the final usage row is the whole point of the guard —
+            // then everything else while space lasts.
+            if !matches!(stamped.body, ObservationPayload::Usage(_)) {
+                continue;
+            }
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let Ok(mut observation) = build(
+                &self.ctx,
+                seq,
+                SourceChannel::Transcript,
+                stamped.completeness,
+                stamped.body.clone(),
+                stamped.native_at.clone(),
+            ) else {
+                continue;
+            };
+            observation.evidence_event_ids = stamped.evidence_event_ids.clone();
+            if !self.try_deliver(observation, true) {
+                break;
+            }
+        }
+        for stamped in observations {
+            if matches!(stamped.body, ObservationPayload::Usage(_)) {
+                continue;
+            }
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let Ok(mut observation) = build(
+                &self.ctx,
+                seq,
+                SourceChannel::Transcript,
+                stamped.completeness,
+                stamped.body,
+                stamped.native_at,
+            ) else {
+                continue;
+            };
+            // Mirror emit_native: the mapper's replay evidence rides along.
+            observation.evidence_event_ids = stamped.evidence_event_ids;
+            // Best effort: a full/gone channel drops the observation.
+            if !self.try_deliver(observation, false) {
+                break;
             }
         }
     }
@@ -1568,7 +1725,8 @@ async fn maintain_binding(
     bindings: &BindingHandle,
     ctx: &PromoteCtx,
     found: &Detected,
-    hydrator: &mut Option<Hydrator>,
+    hydrator: &HydratorSlot,
+    pending: &PendingEmissions,
     announced: &mut Option<String>,
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
@@ -1603,7 +1761,7 @@ async fn maintain_binding(
     }
 
     if bindings.degraded() {
-        finalize_hydrator(hydrator, events, seq, ctx).await;
+        finalize_hydrator(hydrator, pending, events, seq, ctx).await;
         let related = bindings
             .binding()
             .map(|binding| {
@@ -1678,7 +1836,7 @@ async fn maintain_binding(
         // the chip would show another session's context. Demote/promote/
         // rebind/vanish/close keep their reading finalise; only the
         // cwd-mismatch degrade drops the hydrator unread.
-        hydrator.take();
+        slot_lock(hydrator).take();
         let mut related = BTreeMap::from([
             ("sessionId".to_owned(), binding.session_id.clone()),
             ("source".to_owned(), binding.source.as_wire().to_owned()),
@@ -1697,8 +1855,8 @@ async fn maintain_binding(
         return;
     }
 
-    if hydrator.is_none() {
-        *hydrator = Hydrator::open(
+    if slot_lock(hydrator).is_none() {
+        let opened = Hydrator::open(
             ctx,
             &binding,
             effort_bridge,
@@ -1707,14 +1865,17 @@ async fn maintain_binding(
             permission_bridge,
             launch_permission,
         );
+        if let Some(opened) = opened {
+            *slot_lock(hydrator) = Some(opened);
+        }
     }
-    if let Some(active) = hydrator.as_mut() {
-        match pump(active, events, seq, ctx).await {
+    if slot_lock(hydrator).is_some() {
+        match pump(hydrator, pending, events, seq, ctx).await {
             Ok(()) => {}
             Err(()) => {
                 // The bound file vanished: degrade, never silently rebind.
                 bindings.mark_degraded("bound transcript file vanished");
-                finalize_hydrator(hydrator, events, seq, ctx).await;
+                finalize_hydrator(hydrator, pending, events, seq, ctx).await;
                 let related = BTreeMap::from([
                     ("sessionId".to_owned(), binding.session_id.clone()),
                     ("source".to_owned(), binding.source.as_wire().to_owned()),
@@ -1946,39 +2107,12 @@ impl Hydrator {
     /// stop_reason still publishes its counters. A poll read error is treated
     /// as "nothing new" here: the finalise itself must never be skipped.
     ///
-    /// Best-effort by contract: when the event channel is already gone the
-    /// observations are dropped rather than failing the shutdown.
-    async fn finalize(
-        mut self,
-        events: &mpsc::Sender<Observation>,
-        seq: &AtomicU64,
-        ctx: &PromoteCtx,
-    ) {
-        let lines = self.tail.poll().unwrap_or_default();
-        let mut batches: Vec<_> = lines
-            .iter()
-            .map(|line| self.mapper.map_line(line))
-            .collect();
-        batches.push(self.mapper.finish());
-        for batch in batches {
-            let Ok(mapped) = batch else {
-                continue;
-            };
-            for observation in mapped {
-                if emit_native(events, seq, ctx, SourceChannel::Transcript, &observation)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Synchronous finalise for the task-abort safety net (no async emit is
-    /// possible during Drop): one last tail read plus `mapper.finish()`,
-    /// returning the observations for the guard to best-effort `try_send`.
-    fn finish_sync(&mut self) -> DriverResult<Vec<Observation>> {
+    /// Synchronous and run by the caller WHILE the hydrator stays in its
+    /// shared slot; emission happens after the lock is released. An abort
+    /// landing during those emissions is then still covered by the
+    /// [`FinaliseGuard`], and the rescue re-arms the final usage for one more
+    /// delivery (c-ctxusage r6 item 3).
+    fn finish_collect(&mut self) -> DriverResult<Vec<Observation>> {
         let lines = self.tail.poll().unwrap_or_default();
         let mut observations = Vec::new();
         for line in &lines {
@@ -1987,18 +2121,81 @@ impl Hydrator {
         observations.extend(self.mapper.finish()?);
         Ok(observations)
     }
+
+    /// Synchronous half of a poll pump, run while the caller holds the
+    /// [`HydratorSlot`] lock and with NO await in scope: take the one-shot
+    /// launch snapshot, poll the tail, map every new line and poll-flush the
+    /// mapper. Returns `(launch snapshots, mapped observations)` for the
+    /// caller to emit after releasing the lock. A tail read error is
+    /// `Err(())`; per-line mapper errors are skipped as before.
+    fn collect_pump(&mut self) -> Result<(Vec<Observation>, Vec<Observation>), ()> {
+        let pending = std::mem::take(&mut self.pending);
+        let lines = self.tail.poll().map_err(|_| ())?;
+        // The mapper buffers an assistant run until something supersedes it, so
+        // the last message of a batch would otherwise sit unseen until the next
+        // record arrives — which, at the end of a turn, may be minutes away.
+        // Flushing at the end of each poll is what makes a finished turn appear.
+        let mut batches: Vec<_> = lines
+            .iter()
+            .map(|line| self.mapper.map_line(line))
+            .collect();
+        batches.push(self.mapper.flush());
+        let mut mapped = Vec::new();
+        for batch in batches {
+            match batch {
+                Ok(batch) => mapped.extend(batch),
+                Err(error) => tracing::debug!(%error, "transcript line did not map"),
+            }
+        }
+        Ok((pending, mapped))
+    }
+
+    /// Synchronous finalise for the task-abort safety net (no async emit is
+    /// possible during Drop).
+    fn finish_sync(&mut self) -> DriverResult<Vec<Observation>> {
+        self.finish_collect()
+    }
 }
 
 /// Finalise and discard the current hydrator, if any, preserving the last
 /// turn's observations across an epoch boundary (c-ctxusage r4 item 2).
+///
+/// c-ctxusage r6 item 3: every collected frame is parked in the shared pending
+/// queue before the first emit await and the hydrator stays in its slot until
+/// every frame is confirmed sent. An abort anywhere in the async phase leaves
+/// the un-sent frames (and, if collection had not finished taking the group
+/// state, the hydrator itself) for the [`FinaliseGuard`] to deliver.
 async fn finalize_hydrator(
-    hydrator: &mut Option<Hydrator>,
+    slot: &HydratorSlot,
+    pending: &PendingEmissions,
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
     ctx: &PromoteCtx,
 ) {
-    if let Some(active) = hydrator.take() {
-        active.finalize(events, seq, ctx).await;
+    if slot_lock(slot).is_none() {
+        return;
+    }
+    let collected = {
+        let mut guard = slot_lock(slot);
+        match guard.as_mut() {
+            Some(hydrator) => hydrator.finish_collect().unwrap_or_default(),
+            None => return,
+        }
+    };
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(collected);
+    flush_pending(pending, events, seq, ctx).await;
+    // Epoch boundary: a later bind must open a fresh hydrator. Only reached
+    // once every parked frame was confirmed (or the channel went with the
+    // task); on abort the guard owns both the queue and the slot.
+    if pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty()
+    {
+        slot_lock(slot).take();
     }
 }
 
@@ -2007,60 +2204,50 @@ async fn finalize_hydrator(
 /// `Err(())` means the bound file can no longer be opened (it vanished); the
 /// caller degrades rather than rebinding. Mapper failures on individual lines
 /// are non-fatal bookkeeping noise.
+///
+/// c-ctxusage r6 item 3: synchronous mapper steps run while holding the slot
+/// lock and before the first await, and the mapped frames are parked in the
+/// shared pending queue for emission. An aborted task therefore loses no
+/// frames: the [`FinaliseGuard`] drains the queue then finishes whatever is
+/// still in the slot.
 async fn pump(
-    hydrator: &mut Hydrator,
+    slot: &HydratorSlot,
+    pending: &PendingEmissions,
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
     ctx: &PromoteCtx,
 ) -> Result<(), ()> {
-    // Launch snapshot (model list/current model) once, ahead of replayed lines.
-    if !hydrator.pending.is_empty() {
-        for observation in std::mem::take(&mut hydrator.pending) {
-            if emit(
-                events,
-                seq,
-                ctx,
-                SourceChannel::Transcript,
-                observation.completeness,
-                observation.body,
-            )
-            .await
-            .is_err()
-            {
-                return Err(());
-            }
-        }
-    }
-    let lines = hydrator.tail.poll().map_err(|_| ())?;
-    // The mapper buffers an assistant run until something supersedes it, so
-    // the last message of a batch would otherwise sit unseen until the next
-    // record arrives — which, at the end of a turn, may be minutes away.
-    // Flushing at the end of each poll is what makes a finished turn appear.
-    let mut batches: Vec<_> = lines
-        .iter()
-        .map(|line| hydrator.mapper.map_line(line))
-        .collect();
-    batches.push(hydrator.mapper.flush());
-    for batch in batches {
-        let mapped = match batch {
-            Ok(mapped) => mapped,
-            Err(error) => {
-                tracing::debug!(%error, "transcript line did not map");
-                continue;
-            }
+    // Synchronous, cancellation-safe section: tail poll + all mapping happens
+    // here under the slot lock.
+    let (launch_snapshots, mapped) = {
+        let mut guard = slot_lock(slot);
+        let Some(hydrator) = guard.as_mut() else {
+            return Ok(());
         };
-        for observation in mapped {
-            // c-ctxusage r3 item 5: preserve the mapper-provided native time
-            // (historical usage timestamps) instead of rebuilding the envelope
-            // with native_at: Unknown.
-            if emit_native(events, seq, ctx, SourceChannel::Transcript, &observation)
-                .await
-                .is_err()
-            {
-                return Err(());
-            }
-        }
+        hydrator.collect_pump()?
+    };
+    // Launch snapshots carry no native time: emit rebuilds their envelope,
+    // exactly as the old direct `emit` call did. They are one-shot model
+    // baseline frames; an aborted delivery is recreated on the next bind.
+    for observation in launch_snapshots {
+        emit(
+            events,
+            seq,
+            ctx,
+            SourceChannel::Transcript,
+            observation.completeness,
+            observation.body,
+        )
+        .await
+        .map_err(|_| ())?;
     }
+    // Park transcript frames in the guard-shared queue, then send with
+    // abort-safe confirmation.
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(mapped);
+    flush_pending(pending, events, seq, ctx).await;
     Ok(())
 }
 
@@ -2101,31 +2288,6 @@ async fn emit(
             evidence_event_ids: Vec::new(),
         },
     )?;
-    events
-        .send(observation)
-        .await
-        .map_err(|_| DriverError::ControlUnavailable)
-}
-
-/// Send an observation the mapper already stamped, preserving its envelope's
-/// `native_at` (c-ctxusage r3 item 5 — historical usage must keep its time).
-async fn emit_native(
-    events: &mpsc::Sender<Observation>,
-    seq: &AtomicU64,
-    ctx: &PromoteCtx,
-    channel: SourceChannel,
-    stamped: &Observation,
-) -> DriverResult<()> {
-    let mut observation = build(
-        ctx,
-        seq.fetch_add(1, Ordering::SeqCst) + 1,
-        channel,
-        stamped.completeness,
-        stamped.body.clone(),
-        stamped.native_at.clone(),
-    )?;
-    // The replay completeness/evidence the mapper computed rides along.
-    observation.evidence_event_ids = stamped.evidence_event_ids.clone();
     events
         .send(observation)
         .await
@@ -2544,13 +2706,15 @@ mod tests {
         let ctx = ctx_in(&cwd);
         let found = detected_claude(42, Some(session));
         let (tx, mut rx) = mpsc::channel::<Observation>(128);
-        let mut hydrator: Option<Hydrator> = None;
+        let hydrator: HydratorSlot = Arc::new(Mutex::new(None));
+        let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let mut announced: Option<String> = None;
         maintain_binding(
             &bindings,
             &ctx,
             &found,
-            &mut hydrator,
+            &hydrator,
+            &pending,
             &mut announced,
             &tx,
             &std::sync::atomic::AtomicU64::new(0),
@@ -2565,7 +2729,10 @@ mod tests {
             !bindings.degraded(),
             "still indeterminate: no cwd record yet"
         );
-        assert!(hydrator.is_some(), "the hydrator opened against the claim");
+        assert!(
+            slot_lock(&hydrator).is_some(),
+            "the hydrator opened against the claim"
+        );
         // Phase 1 drains only content (no stop_reason -> no usage).
         while let Ok(_obs) = rx.try_recv() {}
 
@@ -2621,7 +2788,8 @@ mod tests {
             &bindings,
             &ctx,
             &found,
-            &mut hydrator,
+            &hydrator,
+            &pending,
             &mut announced,
             &tx,
             &std::sync::atomic::AtomicU64::new(0),
@@ -2633,7 +2801,7 @@ mod tests {
         )
         .await;
         assert!(bindings.degraded(), "the foreign cwd degrades the claim");
-        assert!(hydrator.is_none(), "the hydrator is discarded");
+        assert!(slot_lock(&hydrator).is_none(), "the hydrator is discarded");
 
         let mut saw_usage = false;
         let mut saw_foreign_message = false;
@@ -3039,15 +3207,19 @@ mod tests {
             source: BindingSource::Hook,
         };
         let ctx = ctx_in(&cwd);
-        let mut hydrator = Hydrator::open(&ctx, &binding, None, None, None, None, None)
-            .expect("hydrator binds the seeded transcript");
+        let hydrator: HydratorSlot = Arc::new(Mutex::new(Some(
+            Hydrator::open(&ctx, &binding, None, None, None, None, None)
+                .expect("hydrator binds the seeded transcript"),
+        )));
+        let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
 
         let (tx, mut rx) = mpsc::channel::<Observation>(64);
 
         // Ordinary poll cycle: content is journaled, but usage with no
         // stop_reason stays with the run.
         pump(
-            &mut hydrator,
+            &hydrator,
+            &pending,
             &tx,
             &std::sync::atomic::AtomicU64::new(0),
             &ctx,
@@ -3065,11 +3237,15 @@ mod tests {
             "a poll flush must not publish usage for a run without stop_reason"
         );
 
-        // Close/exit/demotion all route through Hydrator::finalize now.
-        hydrator
-            .finalize(&tx, &std::sync::atomic::AtomicU64::new(0), &ctx)
-            .await;
-        // DEBUG: also collect what the pump phase saw
+        // Close/exit/demotion all route through finalize_hydrator now.
+        finalize_hydrator(
+            &hydrator,
+            &pending,
+            &tx,
+            &std::sync::atomic::AtomicU64::new(0),
+            &ctx,
+        )
+        .await;
         drop(tx);
 
         let mut finalised = Vec::new();
@@ -3088,5 +3264,127 @@ mod tests {
         assert_eq!(known(&payload.cache_read_tokens), 4_000);
         assert_eq!(known(&payload.cache_write_tokens), 7);
         assert_eq!(known(&payload.output_tokens), 11);
+    }
+
+    /// c-ctxusage r6 item 3, carrier level: the abort-path FinaliseGuard
+    /// finishes the hydrator it shares its SLOT with (not a None copy),
+    /// stamps through the same builder as emit_native (promoter seq/envelope,
+    /// preserved native_at + evidence), and rescues the buffered no-stop
+    /// usage. Before the fix the guard's own hydrator was always None and the
+    /// raw try_send bypassed the envelope rewrite.
+    #[tokio::test]
+    async fn finalise_guard_drop_finishes_the_hydrator_in_its_shared_slot() {
+        use crate::claude_transcript::{BindingSource, TranscriptBinding};
+        use remuda_protocol::Knowledge;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session = "eeeeeeee-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let stamped_at = "2026-10-08T12:00:00.000Z";
+        let body = serde_json::json!({
+            "type": "assistant",
+            "uuid": "uuid-guard",
+            "timestamp": stamped_at,
+            "isSidechain": false,
+            "message": {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_guard_last",
+                "model": "claude-opus-5-5",
+                "content": [{"type": "text", "text": "GUARD_DONE"}],
+                "stop_reason": null,
+                "usage": {
+                    "input_tokens": 5,
+                    "cache_read_input_tokens": 6_000,
+                    "cache_creation_input_tokens": 9,
+                    "output_tokens": 13,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 9,
+                        "ephemeral_1h_input_tokens": 0
+                    }
+                }
+            }
+        });
+        let path = slug_session(&home, &cwd, session, &format!("{}\n", body));
+        let binding = TranscriptBinding {
+            session_id: session.into(),
+            path,
+            cwd: cwd.clone(),
+            source: BindingSource::Hook,
+        };
+        let ctx = ctx_in(&cwd);
+        let slot: HydratorSlot = Arc::new(Mutex::new(Some(
+            Hydrator::open(&ctx, &binding, None, None, None, None, None).unwrap(),
+        )));
+        let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let seq = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = mpsc::channel::<Observation>(128);
+
+        // One poll: content flows, no-stop usage stays buffered. Drain the
+        // content observations; no usage must have been published yet.
+        pump(&slot, &pending, &tx, &seq, &ctx).await.expect("pump");
+        let mut saw_usage = false;
+        while let Ok(obs) = rx.try_recv() {
+            if matches!(obs.body, ObservationPayload::Usage(_)) {
+                saw_usage = true;
+            }
+        }
+        assert!(!saw_usage, "poll never publishes the no-stop run");
+        let seq_after_poll = seq.load(Ordering::SeqCst);
+
+        // Simulate the task aborting before the async finalise: the guard
+        // never disarms; Drop must finish through the shared slot.
+        let guard = FinaliseGuard {
+            slot: Arc::clone(&slot),
+            pending: Arc::clone(&pending),
+            events: tx.clone(),
+            seq: Arc::clone(&seq),
+            ctx: ctx.clone(),
+            done: false,
+        };
+        drop(guard);
+        drop(tx);
+
+        // try_send parks the rescued frames directly in the channel buffer.
+        let mut rescued = Vec::new();
+        while let Ok(obs) = rx.try_recv() {
+            rescued.push(obs);
+        }
+        let usage: Vec<_> = rescued
+            .iter()
+            .filter_map(|obs| match &obs.body {
+                ObservationPayload::Usage(payload) => Some((obs, payload.as_ref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 1, "Drop rescued exactly the buffered usage");
+        let (observation, payload) = usage[0];
+        // Stamped through the promoter builder with a FRESH promoter seq.
+        assert!(
+            observation.seq.0 > seq_after_poll,
+            "guard allocates a promoter seq, not the mapper's raw envelope"
+        );
+        assert_eq!(observation.source.channel, SourceChannel::Transcript);
+        match &observation.native_at {
+            Knowledge::Known { value } => assert_eq!(
+                String::from(value.clone()),
+                stamped_at,
+                "the native record time is preserved, not rebuilt"
+            ),
+            other => panic!("native_at preserved: {other:?}"),
+        }
+        let known = |value: &Knowledge<remuda_protocol::U64>| match value {
+            Knowledge::Known { value } => value.0,
+            other => panic!("expected Known counter, got {other:?}"),
+        };
+        assert_eq!(payload.scope_id, "msg_guard_last");
+        assert_eq!(known(&payload.input_tokens), 5);
+        assert_eq!(known(&payload.cache_read_tokens), 6_000);
+        assert_eq!(known(&payload.cache_write_tokens), 9);
+        assert_eq!(known(&payload.output_tokens), 13);
+        // After the guard ran, the slot is empty (finalised once).
+        assert!(slot_lock(&slot).is_none());
     }
 }

@@ -32,14 +32,48 @@ use remuda_protocol::{
     SourceDelivery, Timestamp, TranscriptRef, TtyOutput, TtyRepresentation, U64,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
+
+/// The hydrator the claude-pty transcript pump works from, shared with its
+/// abort guard (c-ctxusage r6 item 4c). The blocking map holds the hydrator
+/// only while it owns this lock; a task aborted past close's bound detaches
+/// the map (it finishes and parks the hydrator back), and the guard's Drop
+/// waits for it, then synchronously `finish()`es the buffered run.
+type TranscriptSlot = Arc<StdMutex<Option<TranscriptHydrator>>>;
+/// Mapped frames waiting for confirmed delivery (c-ctxusage r6 item 3/4c). A
+/// blocking map parks them in chunks while it runs; the streaming flusher
+/// drains them asynchronously and the abort guard takes over synchronously.
+type TranscriptPending = Arc<StdMutex<VecDeque<Observation>>>;
+/// Frames mapped per blocking chunk before parking.
+const TRANSCRIPT_EMIT_CHUNK: usize = 2_048;
+
+struct TranscriptHydrator {
+    tail: crate::claude_transcript::TranscriptTail,
+    mapper: TranscriptMapper,
+}
+
+fn transcript_slot_lock(
+    slot: &TranscriptSlot,
+) -> std::sync::MutexGuard<'_, Option<TranscriptHydrator>> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn transcript_pending_lock(
+    pending: &TranscriptPending,
+) -> std::sync::MutexGuard<'_, VecDeque<Observation>> {
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 const HOOK_SCRIPT: &str = r#"#!/bin/sh
 set -eu
@@ -1386,14 +1420,63 @@ fn spawn_transcript_pump(
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 ) -> JoinHandle<()> {
+    let slot: TranscriptSlot = Arc::new(StdMutex::new(None));
+    let pending: TranscriptPending = Arc::new(StdMutex::new(VecDeque::new()));
+    let flush_notify = Arc::new(Notify::new());
+    let flush_stop = Arc::new(AtomicBool::new(false));
+    // Detached streaming flusher: unlike the pump task it is NOT aborted with
+    // it. The pump's abort guard parks + finishes frames and then sets the
+    // stop flag; this task drains everything first and exits, so frames
+    // collected by a map still in flight when close aborts get delivered.
+    let flusher_events = tx.clone();
+    let flusher_seq = Arc::clone(&seq);
+    let flusher_ctx = ctx.clone();
+    let flusher_pending = Arc::clone(&pending);
+    let flusher_notify = Arc::clone(&flush_notify);
+    let flusher_stop = Arc::clone(&flush_stop);
     tokio::spawn(async move {
-        let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
-            None;
+        loop {
+            if flusher_stop.load(Ordering::SeqCst)
+                && transcript_pending_lock(&flusher_pending).is_empty()
+            {
+                return;
+            }
+            flusher_notify.notified().await;
+            if !drain_pending(
+                &flusher_pending,
+                &flusher_events,
+                &flusher_seq,
+                &flusher_ctx,
+            )
+            .await
+            {
+                transcript_pending_lock(&flusher_pending).clear();
+                return;
+            }
+        }
+    });
+    let guard_slot = Arc::clone(&slot);
+    let guard_pending = Arc::clone(&pending);
+    let guard_events = tx.clone();
+    let guard_seq = Arc::clone(&seq);
+    let guard_ctx = ctx.clone();
+    let guard_notify = Arc::clone(&flush_notify);
+    let guard_stop = Arc::clone(&flush_stop);
+    tokio::spawn(async move {
+        let _guard = AbortTranscriptGuard {
+            slot: guard_slot,
+            pending: guard_pending,
+            notify: guard_notify,
+            stop: guard_stop,
+            events: guard_events,
+            seq: guard_seq,
+            ctx: guard_ctx,
+        };
         // The launch model snapshot (carrying the discovered catalog) is
         // emitted once when the pump first binds the transcript.
         let mut launch_snapshot = model.as_ref().and_then(|m| m.launch.clone());
         while !tx.is_closed() {
-            if hydrator.is_none() {
+            if transcript_slot_lock(&slot).is_none() {
                 let path = transcript_slot
                     .lock()
                     .ok()
@@ -1459,104 +1542,103 @@ fn spawn_transcript_pump(
                         mapper =
                             mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
                     }
-                    hydrator = Some((crate::claude_transcript::TranscriptTail::new(path), mapper));
+                    *transcript_slot_lock(&slot) = Some(TranscriptHydrator {
+                        tail: crate::claude_transcript::TranscriptTail::new(path),
+                        mapper,
+                    });
                 }
             }
-            if let Some(hydrated) = hydrator.take() {
-                // A read error is transient (the file is being appended to);
-                // the next tick retries from the same offset.
-                // D-045 §6.2: mapping (and the screenshot staging it can do)
-                // runs on a blocking thread — the stager parks until the Hub
-                // answers, so this never stalls a tokio worker.
-                let (tail, mapper, batches) =
-                    tokio::task::spawn_blocking(move || -> (
-                        crate::claude_transcript::TranscriptTail,
-                        TranscriptMapper,
-                        Vec<Result<Vec<Observation>, DriverError>>,
-                    ) {
-                        let (mut tail, mut mapper) = hydrated;
-                        let lines = tail.poll().unwrap_or_default();
-                        // Flush the buffered assistant run at the end of the
-                        // batch: the mapper holds a run open until superseded,
-                        // so the final message of a finished turn would
-                        // otherwise wait for the next record to arrive.
-                        let mut batches: Vec<_> =
-                            lines.iter().map(|line| mapper.map_line(line)).collect();
-                        batches.push(mapper.flush());
-                        (tail, mapper, batches)
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("transcript mapping task panicked: {error}")
-                    });
-                hydrator = Some((tail, mapper));
-                for batch in batches {
-                    let mapped = match batch {
-                        Ok(mapped) => mapped,
-                        Err(error) => {
-                            tracing::debug!(%error, "transcript line did not map");
-                            continue;
-                        }
+            // c-ctxusage r6 item 4c: blocking collection. The hydrator moves
+            // out of the shared slot for the closure and is parked back once
+            // the map completes; task abort only DETACHES the closure, so it
+            // finishes and the guard can then lock the returned slot. Mapped
+            // frames are parked in chunks into the shared pending queue and
+            // streamed by the detached flusher, so a big first-bind replay
+            // delivers progress while the map is still running.
+            let map = tokio::task::spawn_blocking({
+                let slot = Arc::clone(&slot);
+                let pending = Arc::clone(&pending);
+                let notify = Arc::clone(&flush_notify);
+                move || {
+                    let Some(mut hydrated) = transcript_slot_lock(&slot).take() else {
+                        return;
                     };
-                    for observation in mapped {
-                        // Preserve the mapper's native_at (historical usage
-                        // timestamps) — c-ctxusage r3 item 5.
-                        if emit_native_obs(&tx, &seq, &ctx, SourceChannel::Transcript, &observation)
-                            .await
-                            .is_err()
-                        {
+                    let lines = hydrated.tail.poll().unwrap_or_default();
+                    let mut chunk: Vec<Observation> = Vec::with_capacity(TRANSCRIPT_EMIT_CHUNK);
+                    let park = |frames: &mut Vec<Observation>| {
+                        if frames.is_empty() {
                             return;
                         }
+                        transcript_pending_lock(&pending).extend(frames.drain(..));
+                        notify.notify_one();
+                    };
+                    for line in &lines {
+                        if let Ok(batch) = hydrated.mapper.map_line(line) {
+                            chunk.extend(batch);
+                            if chunk.len() >= TRANSCRIPT_EMIT_CHUNK {
+                                park(&mut chunk);
+                            }
+                        }
                     }
+                    if let Ok(batch) = hydrated.mapper.flush() {
+                        chunk.extend(batch);
+                    }
+                    park(&mut chunk);
+                    *transcript_slot_lock(&slot) = Some(hydrated);
                 }
+            });
+            // The normal path awaits completion; when the pump task is
+            // aborted the JoinHandle future is dropped (the closure keeps
+            // running detached). A completion arriving after abort is ignored.
+            if !*shutdown.borrow() {
+                let _ = map.await;
             }
-            // c-ctxusage r4 item 2: cooperative shutdown. On close, read the
-            // final append and `finish()` the buffered assistant run so its
-            // usage reaches usage_events even with no stop_reason and no
-            // superseding record, instead of being aborted mid-run.
+            // c-ctxusage r4 item 2 / r6 item 4c: cooperative shutdown. On
+            // close, read the final append and `finish()` the buffered
+            // assistant run so its usage reaches usage_events even with no
+            // stop_reason and no superseding record, instead of being aborted
+            // mid-run.
             let shutdown_fired = *shutdown.borrow_and_update();
             tokio::select! {
                 () = tokio::time::sleep(TRANSCRIPT_POLL), if !shutdown_fired => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        if let Some((tail, mapper)) = hydrator.take() {
-                            // Owned move through the blocking task, mirroring
-                            // the regular poll batch.
-                            let (_tail, _mapper, batches) =
-                                tokio::task::spawn_blocking(move || -> (
-                                    crate::claude_transcript::TranscriptTail,
-                                    TranscriptMapper,
-                                    Vec<Result<Vec<Observation>, DriverError>>,
-                                ) {
-                                    let (mut tail, mut mapper) = (tail, mapper);
-                                    let lines = tail.poll().unwrap_or_default();
-                                    let mut batches: Vec<_> =
-                                        lines.iter().map(|line| mapper.map_line(line)).collect();
-                                    batches.push(mapper.finish());
-                                    (tail, mapper, batches)
-                                })
-                                .await
-                                .unwrap_or_else(|error| {
-                                    panic!("transcript mapping task panicked: {error}")
-                                });
-                            for batch in batches {
-                                let Ok(mapped) = batch else {
-                                    continue;
+                        tokio::task::spawn_blocking({
+                            let slot = Arc::clone(&slot);
+                            let pending = Arc::clone(&pending);
+                            let notify = Arc::clone(&flush_notify);
+                            move || {
+                                let Some(mut hydrated) =
+                                    transcript_slot_lock(&slot).take()
+                                else {
+                                    return;
                                 };
-                                for observation in mapped {
-                                    if emit_native_obs(
-                                        &tx,
-                                        &seq,
-                                        &ctx,
-                                        SourceChannel::Transcript,
-                                        &observation,
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        return;
+                                let lines = hydrated.tail.poll().unwrap_or_default();
+                                let mut frames = Vec::new();
+                                for line in &lines {
+                                    if let Ok(batch) = hydrated.mapper.map_line(line) {
+                                        frames.extend(batch);
                                     }
                                 }
+                                if let Ok(batch) = hydrated.mapper.finish() {
+                                    frames.extend(batch);
+                                }
+                                if !frames.is_empty() {
+                                    transcript_pending_lock(&pending).append(&mut frames.into());
+                                    notify.notify_one();
+                                }
+                                *transcript_slot_lock(&slot) = Some(hydrated);
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("transcript mapping task panicked: {error}")
+                        });
+                        // Wait for the flusher to confirm every frame (normal
+                        // shutdown); the abort path goes through the guard.
+                        while !transcript_pending_lock(&pending).is_empty() {
+                            if !drain_pending(&pending, &tx, &seq, &ctx).await {
+                                return;
                             }
                         }
                         return;
@@ -1565,6 +1647,128 @@ fn spawn_transcript_pump(
             }
         }
     })
+}
+
+/// Confirm-send every parked transcript observation (fresh claude-pty seq and
+/// envelope, preserving the mapper's `native_at`), popping only after success.
+/// Returns false when the channel is gone.
+async fn drain_pending(
+    pending: &TranscriptPending,
+    tx: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &ObsCtx,
+) -> bool {
+    loop {
+        let stamped = transcript_pending_lock(pending).front().cloned();
+        let Some(stamped) = stamped else {
+            return true;
+        };
+        match emit_native_obs(tx, seq, ctx, SourceChannel::Transcript, &stamped).await {
+            Ok(()) => {
+                transcript_pending_lock(pending).pop_front();
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Abort-path safety net for the claude-pty transcript pump. Mirrors the
+/// shell-pty FinaliseGuard (c-ctxusage r6 item 4c). It is a normal value held
+/// inside the spawned task, so aborting the task runs this Drop.
+///
+/// A blocking map detached by the abort parks the hydrator back in the shared
+/// slot when it finishes; the guard waits (bounded) for that, takes the
+/// hydrator, synchronously `finish()`es it and best-effort sends every frame
+/// through [`build_observation`] — the same stamping as the live pump, with
+/// the mapper's `native_at` preserved. Usage frames go first with bounded
+/// backoff so the final usage row survives a momentarily-full channel.
+struct AbortTranscriptGuard {
+    slot: TranscriptSlot,
+    pending: TranscriptPending,
+    notify: Arc<Notify>,
+    stop: Arc<AtomicBool>,
+    events: mpsc::Sender<Observation>,
+    seq: Arc<AtomicU64>,
+    ctx: ObsCtx,
+}
+
+impl Drop for AbortTranscriptGuard {
+    fn drop(&mut self) {
+        // Wait for a detached blocking map to park the hydrator back.
+        for _ in 0..24_000 {
+            if transcript_slot_lock(&self.slot).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(mut hydrated) = transcript_slot_lock(&self.slot).take() {
+            let lines = hydrated.tail.poll().unwrap_or_default();
+            let mut frames = Vec::new();
+            for line in &lines {
+                if let Ok(batch) = hydrated.mapper.map_line(line) {
+                    frames.extend(batch);
+                }
+            }
+            if let Ok(batch) = hydrated.mapper.finish() {
+                frames.extend(batch);
+            }
+            if !frames.is_empty() {
+                transcript_pending_lock(&self.pending).append(&mut frames.into());
+            }
+        }
+        // Release the detached flusher after the frames above are queued; it
+        // confirms-sends everything. The synchronous fallback below covers a
+        // receiver that cannot keep up (bounded channel full).
+        self.stop.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
+        let frames: VecDeque<_> = std::mem::take(&mut *transcript_pending_lock(&self.pending));
+        if frames.is_empty() {
+            return;
+        }
+        for wait in [true, false] {
+            for stamped in &frames {
+                let is_usage = matches!(stamped.body, ObservationPayload::Usage(_));
+                if is_usage != wait {
+                    continue;
+                }
+                let n = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+                let Ok(mut observation) = build_observation(
+                    &self.ctx,
+                    n,
+                    SourceChannel::Transcript,
+                    stamped.completeness,
+                    stamped.body.clone(),
+                    stamped.native_at.clone(),
+                ) else {
+                    continue;
+                };
+                observation.evidence_event_ids = stamped.evidence_event_ids.clone();
+                if !self.try_deliver(observation, wait) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl AbortTranscriptGuard {
+    fn try_deliver(&self, observation: Observation, wait: bool) -> bool {
+        if !wait {
+            return self.events.try_send(observation).is_ok();
+        }
+        let mut observation = observation;
+        for _ in 0..100 {
+            match self.events.try_send(observation) {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Full(parked)) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    observation = parked;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        false
+    }
 }
 
 fn spawn_tty_pump(

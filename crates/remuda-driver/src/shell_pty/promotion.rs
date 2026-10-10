@@ -49,10 +49,10 @@ use remuda_protocol::{
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// Everything the poller needs to stamp Observations for one instance.
 #[derive(Clone)]
@@ -812,9 +812,26 @@ pub(super) fn spawn(
     let hydrator_slot: HydratorSlot = Arc::new(Mutex::new(None));
     let pending_emissions: PendingEmissions =
         Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let flush_notify = Arc::new(Notify::new());
+    let flush_done = Arc::new(AtomicBool::new(false));
+    // Streams parked transcript frames out of the shared queue as a blocking
+    // collection chunks them in, so a big first-bind replay delivers progress
+    // while the map is still running. On abort it keeps streaming what the
+    // detached collect + guard park; the guard then sets flush_done to release
+    // it.
+    let flusher_handle = tokio::spawn(emission_flusher(
+        Arc::clone(&pending_emissions),
+        Arc::clone(&flush_notify),
+        Arc::clone(&flush_done),
+        events.clone(),
+        Arc::clone(&seq),
+        ctx.clone(),
+    ));
     let finalise_guard = FinaliseGuard {
         slot: Arc::clone(&hydrator_slot),
         pending: Arc::clone(&pending_emissions),
+        flush_stop: Arc::clone(&flush_done),
+        flush_notify: Arc::clone(&flush_notify),
         events: events.clone(),
         seq: Arc::clone(&seq),
         ctx: ctx.clone(),
@@ -946,12 +963,12 @@ pub(super) fn spawn(
                     return;
                 }
                 bindings.demobilize();
-                finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await;
+                finalize_hydrator(&hydrator, &pending, &flush_notify, &events, &seq, &ctx).await;
                 announced = None;
             }
             if saw_promote {
                 bindings.begin_epoch(&ctx.cwd, &ctx.claude_home);
-                finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await;
+                finalize_hydrator(&hydrator, &pending, &flush_notify, &events, &seq, &ctx).await;
                 announced = None;
                 bypass_announced = false;
                 trust_attempted = false;
@@ -988,7 +1005,8 @@ pub(super) fn spawn(
                         found.as_ref().expect("matched foreground"),
                         &report,
                     ) {
-                        finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await;
+                        finalize_hydrator(&hydrator, &pending, &flush_notify, &events, &seq, &ctx)
+                            .await;
                         announced = None;
                     }
                     bindings.ingest_session_start(report);
@@ -1319,6 +1337,7 @@ pub(super) fn spawn(
                         found,
                         &hydrator,
                         &pending,
+                        &flush_notify,
                         &mut announced,
                         &events,
                         &seq,
@@ -1330,7 +1349,9 @@ pub(super) fn spawn(
                     )
                     .await;
                 }
-                _ => finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await,
+                _ => {
+                    finalize_hydrator(&hydrator, &pending, &flush_notify, &events, &seq, &ctx).await
+                }
             }
             // c-ctxusage r5 item 6: close can land while this iteration's pump
             // is still mapping. Check before waiting another tick so the final
@@ -1348,9 +1369,16 @@ pub(super) fn spawn(
         // last assistant run (usage with no stop_reason) instead of dropping
         // the hydrator on close/process exit. This awaits the current pump's
         // completion first and must finish before close aborts the task.
-        finalize_hydrator(&hydrator, &pending, &events, &seq, &ctx).await;
-        // The async finalise drained the shared slot. Disarm the guard so its
-        // abort-path Drop does not finalise a second time.
+        finalize_hydrator(&hydrator, &pending, &flush_notify, &events, &seq, &ctx).await;
+        // Every frame (the finalise included) is parked in the shared queue;
+        // stop the streaming flusher only once it has drained everything.
+        flush_done.store(true, Ordering::SeqCst);
+        // notify_one stores a permit, so the wakeup cannot race the flusher
+        // re-entering its wait.
+        flush_notify.notify_one();
+        let _ = flusher_handle.await;
+        // The async finalise drained the shared slot and queue. Disarm the
+        // guard so its abort-path Drop does not finalise a second time.
         finalise_guard.disarm();
         let _ = finalised.send(());
     })
@@ -1363,10 +1391,17 @@ pub(super) fn spawn(
 type HydratorSlot = Arc<Mutex<Option<Hydrator>>>;
 
 /// Mapper observations already collected for emission but not yet confirmed
-/// sent. Frames are parked here across the emit `await`, so a task aborted
-/// mid-send still hands them to the channel from the [`FinaliseGuard`]
-/// (c-ctxusage r6 item 3). A frame is popped only after a successful send.
+/// sent. A blocking collection parks frames here IN CHUNKS while the map is
+/// still running and the async [`emission_flusher`] streams them out, so a
+/// large first-bind replay neither buffers its whole batch nor makes pump
+/// progress unobservable. Frames are popped only after a confirmed send —
+/// an aborted task's [`FinaliseGuard`] delivers whatever remains
+/// (c-ctxusage r6 item 3).
 type PendingEmissions = Arc<Mutex<std::collections::VecDeque<Observation>>>;
+
+/// Lines mapped per blocking-collect chunk before the frames are parked for
+/// the flusher.
+const EMIT_CHUNK: usize = 2_048;
 
 /// Lock the slot, tolerating a poisoned mutex (a panic inside a mapped line
 /// must not prevent the abort-path finalise).
@@ -1384,7 +1419,7 @@ async fn flush_pending(
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
     ctx: &PromoteCtx,
-) {
+) -> bool {
     loop {
         let Some(stamped) = pending
             .lock()
@@ -1392,7 +1427,7 @@ async fn flush_pending(
             .front()
             .cloned()
         else {
-            return;
+            return true;
         };
         let Ok(mut observation) = build(
             ctx,
@@ -1417,7 +1452,7 @@ async fn flush_pending(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .pop_front();
             }
-            Err(_) => return,
+            Err(_) => return false,
         }
     }
 }
@@ -1437,6 +1472,10 @@ async fn flush_pending(
 struct FinaliseGuard {
     slot: HydratorSlot,
     pending: PendingEmissions,
+    /// Set by the guard after abort-path delivery to release the streaming
+    /// flusher (the cooperative path sets it on the flusher directly).
+    flush_stop: Arc<AtomicBool>,
+    flush_notify: Arc<Notify>,
     events: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
     ctx: PromoteCtx,
@@ -1541,6 +1580,10 @@ impl Drop for FinaliseGuard {
                 break;
             }
         }
+        // Release the still-alive streaming flusher: every frame is now either
+        // delivered above, parked-and-sent by the flusher, or undeliverable.
+        self.flush_stop.store(true, Ordering::SeqCst);
+        self.flush_notify.notify_one();
     }
 }
 
@@ -1727,9 +1770,10 @@ async fn maintain_binding(
     found: &Detected,
     hydrator: &HydratorSlot,
     pending: &PendingEmissions,
+    notify: &Arc<Notify>,
     announced: &mut Option<String>,
     events: &mpsc::Sender<Observation>,
-    seq: &AtomicU64,
+    seq: &Arc<AtomicU64>,
     effort_bridge: Option<&Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<EffortSelection>,
     model: Option<&ModelSync>,
@@ -1761,7 +1805,7 @@ async fn maintain_binding(
     }
 
     if bindings.degraded() {
-        finalize_hydrator(hydrator, pending, events, seq, ctx).await;
+        finalize_hydrator(hydrator, pending, notify, events, seq, ctx).await;
         let related = bindings
             .binding()
             .map(|binding| {
@@ -1870,29 +1914,43 @@ async fn maintain_binding(
         }
     }
     if slot_lock(hydrator).is_some() {
-        match pump(hydrator, pending, events, seq, ctx).await {
-            Ok(()) => {}
-            Err(()) => {
-                // The bound file vanished: degrade, never silently rebind.
-                bindings.mark_degraded("bound transcript file vanished");
-                finalize_hydrator(hydrator, pending, events, seq, ctx).await;
-                let related = BTreeMap::from([
-                    ("sessionId".to_owned(), binding.session_id.clone()),
-                    ("source".to_owned(), binding.source.as_wire().to_owned()),
-                    ("reason".to_owned(), "vanished".to_owned()),
-                ]);
-                announce(
-                    announced,
-                    TRANSCRIPT_DEGRADED,
-                    diagnostic_lifecycle(TRANSCRIPT_DEGRADED, "bound transcript vanished", related),
-                    events,
-                    seq,
-                    ctx,
-                )
-                .await;
-                return;
+        // The transcript pump runs DETACHED from the promoter loop: a big
+        // first-bind replay can block-map for tens of seconds, and awaiting it
+        // here would starve the 800 ms detection/binding tick. It shares the
+        // hydrator slot; on a vanished file it degrades + finalises itself.
+        let pump_slot = Arc::clone(hydrator);
+        let pump_pending = Arc::clone(pending);
+        let pump_notify = Arc::clone(notify);
+        let pump_events = events.clone();
+        let pump_seq = seq.clone();
+        let pump_ctx = ctx.clone();
+        let pump_bindings = Arc::clone(&bindings.inner);
+        tokio::spawn(async move {
+            match pump(
+                &pump_slot,
+                &pump_pending,
+                &pump_notify,
+                &pump_events,
+                &pump_seq,
+                &pump_ctx,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(()) => {
+                    // The bound file vanished: degrade, never silently rebind.
+                    // A reading finalise is intentionally NOT run here: the
+                    // vanished file makes the last poll authoritative.
+                    let mut slot = pump_bindings
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slot.binding.is_some() {
+                        slot.degraded = true;
+                        slot.degraded_reason = "bound transcript file vanished".to_owned();
+                    }
+                }
             }
-        }
+        });
     }
     announce(
         announced,
@@ -2106,12 +2164,6 @@ impl Hydrator {
     /// then `finish()` the mapper so an assistant record with usage and no
     /// stop_reason still publishes its counters. A poll read error is treated
     /// as "nothing new" here: the finalise itself must never be skipped.
-    ///
-    /// Synchronous and run by the caller WHILE the hydrator stays in its
-    /// shared slot; emission happens after the lock is released. An abort
-    /// landing during those emissions is then still covered by the
-    /// [`FinaliseGuard`], and the rescue re-arms the final usage for one more
-    /// delivery (c-ctxusage r6 item 3).
     fn finish_collect(&mut self) -> DriverResult<Vec<Observation>> {
         let lines = self.tail.poll().unwrap_or_default();
         let mut observations = Vec::new();
@@ -2122,32 +2174,55 @@ impl Hydrator {
         Ok(observations)
     }
 
-    /// Synchronous half of a poll pump, run while the caller holds the
-    /// [`HydratorSlot`] lock and with NO await in scope: take the one-shot
-    /// launch snapshot, poll the tail, map every new line and poll-flush the
-    /// mapper. Returns `(launch snapshots, mapped observations)` for the
-    /// caller to emit after releasing the lock. A tail read error is
-    /// `Err(())`; per-line mapper errors are skipped as before.
-    fn collect_pump(&mut self) -> Result<(Vec<Observation>, Vec<Observation>), ()> {
-        let pending = std::mem::take(&mut self.pending);
-        let lines = self.tail.poll().map_err(|_| ())?;
+    /// Synchronous half of a poll pump, run on a blocking thread: take the
+    /// one-shot launch snapshot, poll the tail, map every new line and
+    /// poll-flush the mapper. Mapped transcript frames are parked into
+    /// `parked` in [`EMIT_CHUNK`]s as the map progresses (with `notify`
+    /// waking the streaming flusher), so callers can observe/deliver pump
+    /// progress WHILE a large first-bind replay is still being mapped rather
+    /// than after the whole (potentially minute-long) map. Returns the
+    /// one-shot launch snapshots. A tail read error is `Err`; per-line mapper
+    /// errors are skipped as before.
+    fn collect_pump(
+        &mut self,
+        parked: &PendingEmissions,
+        notify: &Notify,
+    ) -> std::io::Result<Vec<Observation>> {
+        let launch = std::mem::take(&mut self.pending);
+        let lines = self.tail.poll()?;
         // The mapper buffers an assistant run until something supersedes it, so
         // the last message of a batch would otherwise sit unseen until the next
         // record arrives — which, at the end of a turn, may be minutes away.
         // Flushing at the end of each poll is what makes a finished turn appear.
-        let mut batches: Vec<_> = lines
-            .iter()
-            .map(|line| self.mapper.map_line(line))
-            .collect();
-        batches.push(self.mapper.flush());
-        let mut mapped = Vec::new();
-        for batch in batches {
-            match batch {
-                Ok(batch) => mapped.extend(batch),
+        let mut chunk: Vec<Observation> = Vec::with_capacity(EMIT_CHUNK);
+        let park = |frames: &mut Vec<Observation>| {
+            if frames.is_empty() {
+                return;
+            }
+            parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(frames.drain(..));
+            notify.notify_one();
+        };
+        for line in &lines {
+            match self.mapper.map_line(line) {
+                Ok(batch) => {
+                    chunk.extend(batch);
+                    if chunk.len() >= EMIT_CHUNK {
+                        park(&mut chunk);
+                        chunk = Vec::with_capacity(EMIT_CHUNK);
+                    }
+                }
                 Err(error) => tracing::debug!(%error, "transcript line did not map"),
             }
         }
-        Ok((pending, mapped))
+        match self.mapper.flush() {
+            Ok(batch) => chunk.extend(batch),
+            Err(error) => tracing::debug!(%error, "transcript flush failed"),
+        }
+        park(&mut chunk);
+        Ok(launch)
     }
 
     /// Synchronous finalise for the task-abort safety net (no async emit is
@@ -2157,17 +2232,45 @@ impl Hydrator {
     }
 }
 
+/// Run one synchronous collection closure on a blocking thread while the
+/// hydrator stays in its slot. `tokio::task::abort` does NOT interrupt a
+/// spawned blocking closure — it runs to completion detached — so an abort
+/// landing mid-map never poisons the slot mutex or drops the mapper halfway
+/// through: the [`FinaliseGuard`] simply blocks on the slot lock until the
+/// map finishes, then finishes the retained group. The closure locks the
+/// slot itself (never moving the hydrator out).
+async fn blocking_collect<F, T>(slot: HydratorSlot, f: F) -> std::io::Result<T>
+where
+    F: FnOnce(&mut Hydrator) -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut guard = slot_lock(&slot);
+        let Some(hydrator) = guard.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "hydrator slot empty",
+            ));
+        };
+        f(hydrator)
+    })
+    .await
+    .expect("blocking collection must not panic")
+}
+
 /// Finalise and discard the current hydrator, if any, preserving the last
 /// turn's observations across an epoch boundary (c-ctxusage r4 item 2).
 ///
 /// c-ctxusage r6 item 3: every collected frame is parked in the shared pending
 /// queue before the first emit await and the hydrator stays in its slot until
 /// every frame is confirmed sent. An abort anywhere in the async phase leaves
-/// the un-sent frames (and, if collection had not finished taking the group
-/// state, the hydrator itself) for the [`FinaliseGuard`] to deliver.
+/// the un-sent frames (and, if collection had not finished, the hydrator
+/// itself — blocking collection runs detached to completion) for the
+/// [`FinaliseGuard`] to deliver.
 async fn finalize_hydrator(
     slot: &HydratorSlot,
     pending: &PendingEmissions,
+    notify: &Arc<Notify>,
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
     ctx: &PromoteCtx,
@@ -2175,28 +2278,21 @@ async fn finalize_hydrator(
     if slot_lock(slot).is_none() {
         return;
     }
-    let collected = {
-        let mut guard = slot_lock(slot);
-        match guard.as_mut() {
-            Some(hydrator) => hydrator.finish_collect().unwrap_or_default(),
-            None => return,
-        }
-    };
-    pending
+    let collected = blocking_collect(Arc::clone(slot), |hydrator| {
+        hydrator.finish_collect().map_err(std::io::Error::other)
+    })
+    .await
+    .unwrap_or_default();
+    // The finalise completed synchronously; park its frames for the streaming
+    // flusher and retire the hydrator — an epoch boundary must reopen fresh.
+    let mut guard = pending
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .extend(collected);
-    flush_pending(pending, events, seq, ctx).await;
-    // Epoch boundary: a later bind must open a fresh hydrator. Only reached
-    // once every parked frame was confirmed (or the channel went with the
-    // task); on abort the guard owns both the queue and the slot.
-    if pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_empty()
-    {
-        slot_lock(slot).take();
-    }
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.extend(collected);
+    drop(guard);
+    notify.notify_one();
+    slot_lock(slot).take();
+    let _ = (events, seq, ctx);
 }
 
 /// Drain whatever the transcript gained since the last poll.
@@ -2205,30 +2301,31 @@ async fn finalize_hydrator(
 /// caller degrades rather than rebinding. Mapper failures on individual lines
 /// are non-fatal bookkeeping noise.
 ///
-/// c-ctxusage r6 item 3: synchronous mapper steps run while holding the slot
-/// lock and before the first await, and the mapped frames are parked in the
-/// shared pending queue for emission. An aborted task therefore loses no
-/// frames: the [`FinaliseGuard`] drains the queue then finishes whatever is
-/// still in the slot.
+/// c-ctxusage r6 item 3: synchronous mapper steps run on a blocking thread
+/// while the hydrator stays in its shared slot, and the mapped frames are
+/// parked in the shared pending queue for emission. An aborted task therefore
+/// loses no frames: the blocking map finishes detached, the guard drains the
+/// queue then finishes whatever is still in the slot.
 async fn pump(
     slot: &HydratorSlot,
     pending: &PendingEmissions,
+    notify: &Arc<Notify>,
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
     ctx: &PromoteCtx,
 ) -> Result<(), ()> {
-    // Synchronous, cancellation-safe section: tail poll + all mapping happens
-    // here under the slot lock.
-    let (launch_snapshots, mapped) = {
-        let mut guard = slot_lock(slot);
-        let Some(hydrator) = guard.as_mut() else {
-            return Ok(());
-        };
-        hydrator.collect_pump()?
-    };
+    let parked = Arc::clone(pending);
+    let pinged = Arc::clone(notify);
+    let launch_snapshots = blocking_collect(Arc::clone(slot), move |hydrator| {
+        hydrator.collect_pump(&parked, &pinged)
+    })
+    .await
+    .map_err(|_| ())?;
     // Launch snapshots carry no native time: emit rebuilds their envelope,
     // exactly as the old direct `emit` call did. They are one-shot model
     // baseline frames; an aborted delivery is recreated on the next bind.
+    // Transcript frames park themselves in chunks during the blocking map and
+    // are delivered by the streaming flusher.
     for observation in launch_snapshots {
         emit(
             events,
@@ -2241,14 +2338,41 @@ async fn pump(
         .await
         .map_err(|_| ())?;
     }
-    // Park transcript frames in the guard-shared queue, then send with
-    // abort-safe confirmation.
-    pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .extend(mapped);
-    flush_pending(pending, events, seq, ctx).await;
     Ok(())
+}
+
+/// Background drain for [`PendingEmissions`]: a blocking collection parks
+/// mapped frames in chunks as the map progresses and pings `notify`; this
+/// task stamps and sends them via the same envelope rewrite as the old
+/// `emit_native`. Exits once `done` is set (a stored permit guarantees the
+/// final wakeup) and the queue has drained, or when the channel is gone.
+async fn emission_flusher(
+    pending: PendingEmissions,
+    notify: Arc<Notify>,
+    done: Arc<AtomicBool>,
+    events: mpsc::Sender<Observation>,
+    seq: Arc<AtomicU64>,
+    ctx: PromoteCtx,
+) {
+    loop {
+        if done.load(Ordering::SeqCst)
+            && pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        {
+            return;
+        }
+        notify.notified().await;
+        if !flush_pending(&pending, &events, &seq, &ctx).await {
+            // Channel went away with the task: nothing more can be delivered.
+            pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            return;
+        }
+    }
 }
 
 /// Stamp and send one Observation on the driver's event channel.
@@ -2345,6 +2469,28 @@ mod tests {
     use super::*;
     use remuda_protocol::{QuestionAnswer, QuestionFieldAnswer};
     use std::io::Write;
+
+    /// Test helper: spawn the streaming emission flusher the promoter loop
+    /// owns in production. Returns its done flag and join handle; a test sets
+    /// the flag + awaits once it expects no more frames.
+    fn spawn_test_flusher(
+        pending: &PendingEmissions,
+        notify: &Arc<Notify>,
+        events: mpsc::Sender<Observation>,
+        seq: Arc<AtomicU64>,
+        ctx: PromoteCtx,
+    ) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+        let done = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(emission_flusher(
+            Arc::clone(pending),
+            Arc::clone(notify),
+            Arc::clone(&done),
+            events,
+            seq,
+            ctx,
+        ));
+        (done, handle)
+    }
 
     fn ctx_in(dir: &Path) -> PromoteCtx {
         PromoteCtx {
@@ -2708,6 +2854,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Observation>(128);
         let hydrator: HydratorSlot = Arc::new(Mutex::new(None));
         let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let notify = Arc::new(Notify::new());
         let mut announced: Option<String> = None;
         maintain_binding(
             &bindings,
@@ -2715,9 +2862,10 @@ mod tests {
             &found,
             &hydrator,
             &pending,
+            &notify,
             &mut announced,
             &tx,
-            &std::sync::atomic::AtomicU64::new(0),
+            &Arc::new(std::sync::atomic::AtomicU64::new(0)),
             None,
             None,
             None,
@@ -2790,9 +2938,10 @@ mod tests {
             &found,
             &hydrator,
             &pending,
+            &notify,
             &mut announced,
             &tx,
-            &std::sync::atomic::AtomicU64::new(0),
+            &Arc::new(std::sync::atomic::AtomicU64::new(0)),
             None,
             None,
             None,
@@ -3212,20 +3361,18 @@ mod tests {
                 .expect("hydrator binds the seeded transcript"),
         )));
         let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let notify = Arc::new(Notify::new());
+        let seq = Arc::new(AtomicU64::new(0));
 
         let (tx, mut rx) = mpsc::channel::<Observation>(64);
+        let (_flush_done, _flusher) =
+            spawn_test_flusher(&pending, &notify, tx.clone(), Arc::clone(&seq), ctx.clone());
 
         // Ordinary poll cycle: content is journaled, but usage with no
         // stop_reason stays with the run.
-        pump(
-            &hydrator,
-            &pending,
-            &tx,
-            &std::sync::atomic::AtomicU64::new(0),
-            &ctx,
-        )
-        .await
-        .expect("pump");
+        pump(&hydrator, &pending, &notify, &tx, &seq, &ctx)
+            .await
+            .expect("pump");
         let mut saw_usage_after_poll = false;
         while let Ok(observation) = rx.try_recv() {
             if matches!(observation.body, ObservationPayload::Usage(_)) {
@@ -3238,14 +3385,7 @@ mod tests {
         );
 
         // Close/exit/demotion all route through finalize_hydrator now.
-        finalize_hydrator(
-            &hydrator,
-            &pending,
-            &tx,
-            &std::sync::atomic::AtomicU64::new(0),
-            &ctx,
-        )
-        .await;
+        finalize_hydrator(&hydrator, &pending, &notify, &tx, &seq, &ctx).await;
         drop(tx);
 
         let mut finalised = Vec::new();
@@ -3319,12 +3459,17 @@ mod tests {
             Hydrator::open(&ctx, &binding, None, None, None, None, None).unwrap(),
         )));
         let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let notify = Arc::new(Notify::new());
         let seq = Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = mpsc::channel::<Observation>(128);
+        let (flush_done, _flusher) =
+            spawn_test_flusher(&pending, &notify, tx.clone(), Arc::clone(&seq), ctx.clone());
 
         // One poll: content flows, no-stop usage stays buffered. Drain the
         // content observations; no usage must have been published yet.
-        pump(&slot, &pending, &tx, &seq, &ctx).await.expect("pump");
+        pump(&slot, &pending, &notify, &tx, &seq, &ctx)
+            .await
+            .expect("pump");
         let mut saw_usage = false;
         while let Ok(obs) = rx.try_recv() {
             if matches!(obs.body, ObservationPayload::Usage(_)) {
@@ -3339,6 +3484,8 @@ mod tests {
         let guard = FinaliseGuard {
             slot: Arc::clone(&slot),
             pending: Arc::clone(&pending),
+            flush_stop: Arc::clone(&flush_done),
+            flush_notify: Arc::clone(&notify),
             events: tx.clone(),
             seq: Arc::clone(&seq),
             ctx: ctx.clone(),

@@ -451,7 +451,11 @@ pub async fn list_instances(
     let scope = crate::agent_scope::caller_project_scope(&state, &device).await?;
     let mut items = state.store.list_instances(query.host_id).await?;
     items.retain(|instance| {
-        let mut keep = instance.last_error.as_deref() != Some("host-lost") || query.include_history;
+        // A contact-loss row is hidden from the default list (shown via
+        // include_history); the legacy "host-lost" spelling keeps its old
+        // ended meaning and is not filtered.
+        let mut keep = instance.last_error.as_deref() != Some(crate::store::HOST_LOST_MARKER)
+            || query.include_history;
         if agent {
             let caller_id = device.instance_id.as_deref();
             let in_subtree = caller_id.is_some_and(|id| {

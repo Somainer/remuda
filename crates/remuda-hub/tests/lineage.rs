@@ -100,19 +100,37 @@ impl FakeNode {
         host: &str,
         bearer: &str,
     ) -> Result<(Self, Option<String>)> {
+        Self::connect_bearer_hello(hub, host, bearer, json!({})).await
+    }
+
+    /// Like [`Self::connect_bearer`] but merges `extra` into the hello
+    /// params — e.g. `nodeEpoch` + an `instances` inventory that drives the
+    /// node-restart reconcile (ma-lineage r7 item 5c).
+    async fn connect_bearer_hello(
+        hub: &remuda_hub::RunningHub,
+        host: &str,
+        bearer: &str,
+        extra: Value,
+    ) -> Result<(Self, Option<String>)> {
         let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
         request
             .headers_mut()
             .insert("Authorization", format!("Bearer {bearer}").parse()?);
         let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
+        let mut params = json!({ "hostId": host, "host": {
+            "hostname":"lineage-node", "workspaces":[], "workspaceRevision":0,
+            "herdr":{"path":"/usr/bin/herdr"},
+            "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged_in"}]
+        }});
+        if let (Some(object), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
         node.send(Message::Text(
             json!({
                 "jsonrpc":"2.0", "id":"hello", "method":"node.hello",
-                "params": { "hostId": host, "host": {
-                    "hostname":"lineage-node", "workspaces":[], "workspaceRevision":0,
-                    "herdr":{"path":"/usr/bin/herdr"},
-                    "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged_in"}]
-                }}
+                "params": params
             })
             .to_string()
             .into(),
@@ -179,6 +197,19 @@ impl FakeNode {
         bearer: &str,
     ) -> Result<Self> {
         Ok(Self::connect_bearer(hub, host, bearer).await?.0)
+    }
+
+    /// Reconnect with a persistent token and extra hello params (a new
+    /// `nodeEpoch` + inventory to trigger the node-restart reconcile).
+    async fn connect_with_token_hello(
+        hub: &remuda_hub::RunningHub,
+        host: &str,
+        bearer: &str,
+        extra: Value,
+    ) -> Result<Self> {
+        Ok(Self::connect_bearer_hello(hub, host, bearer, extra)
+            .await?
+            .0)
     }
 
     /// Fresh enrollment (new host): enrolls and returns the persistent
@@ -365,11 +396,15 @@ impl Ctx {
     }
 
     async fn resume(&self, id: &str, token: &str) -> Result<reqwest::Response> {
+        self.resume_mode(id, token, "structured").await
+    }
+
+    async fn resume_mode(&self, id: &str, token: &str, mode: &str) -> Result<reqwest::Response> {
         Ok(self
             .http
             .post(format!("{}/v1/instances/{id}/resume", self.base()))
             .bearer_auth(token)
-            .json(&json!({"mode":"structured"}))
+            .json(&json!({ "mode": mode }))
             .send()
             .await?)
     }
@@ -935,6 +970,9 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
              WHERE id = ?1",
             rusqlite::params![x],
         )?;
+        // Simulate a pre-r7 database: the journal backfill is the user_version
+        // 3 one-time migration.
+        db.execute_batch("PRAGMA user_version = 2;")?;
         // Append a later DIAGNOSTIC event (after the exit): it is neither
         // process end nor return-to-live, so the earlier exit must survive.
         db.execute(
@@ -993,6 +1031,9 @@ async fn ended_at_backfill_skips_an_end_followed_by_return_to_live() -> Result<(
     hub.shutdown().await;
     {
         let db = rusqlite::Connection::open(&db_path)?;
+        // Simulate a pre-r7 database so the reopen runs the one-time journal
+        // backfill (user_version 3).
+        db.execute_batch("PRAGMA user_version = 2;")?;
         // Wipe both ended_at and append a LATER ready to x's journal.
         db.execute("UPDATE instances SET ended_at = NULL", rusqlite::params![])?;
         db.execute(
@@ -1053,7 +1094,7 @@ async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -
     assert_eq!(changed, 1, "the seat's row is host-lost");
     let row = ctx.get_instance(&x, &ctx.human).await?;
     assert_eq!(row["lifecycle"], json!("exited"), "{row}");
-    assert_eq!(row["lastError"], json!("host-lost"), "{row}");
+    assert_eq!(row["lastError"], json!("host-contact-lost"), "{row}");
     assert_eq!(
         first_chapter_ended_at(&ctx, &x).await?,
         None,
@@ -2318,6 +2359,140 @@ async fn a_reaped_requested_successor_releases_the_address_owner_seat() -> Resul
         second.status(),
         200,
         "the reaped successor no longer holds the address-owner seat"
+    );
+    Ok(())
+}
+
+/// ma-lineage r7 item 5(c): a nodeEpoch change ends an unreported live holder
+/// WITH process-end evidence, so the address-owner seat is released and a
+/// replacement holder can be created (HTTP-level proof).
+#[tokio::test]
+async fn an_epoch_change_end_releases_the_address_owner_seat_end_to_end() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer_hello(
+        &ctx.hub,
+        &ctx.host,
+        &enroll,
+        json!({"nodeEpoch": "epoch-1"}),
+    )
+    .await?;
+    let node_token = node_token.context("node token")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
+
+    // Reconnect under a NEW epoch with an attested empty inventory: the Node
+    // holds nothing, so X ends with node-epoch-changed + endedAt.
+    let mut node = FakeNode::connect_with_token_hello(
+        &ctx.hub,
+        &ctx.host,
+        &node_token,
+        json!({"nodeEpoch": "epoch-2", "instances": [], "instanceStoreFound": true}),
+    )
+    .await?;
+    ctx.wait_until(&x, |view| {
+        view["lifecycle"] == json!("exited") && view["lastError"] == json!("node-epoch-changed")
+    })
+    .await?;
+
+    // The seat is free: a second address-owner holder is accepted and
+    // launched.
+    let second = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-pty",
+            "grants": ["address-owner"], "prompt": "replacement seat"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        second.status(),
+        200,
+        "the epoch-ended holder released the seat"
+    );
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.create");
+    Ok(())
+}
+
+/// ma-lineage r7 item 5(d): a chapter that is terminal WITHOUT process-end
+/// evidence (the host-lost contact-loss marker) derives host-offline while its
+/// host link is down, and starting once the link is live again.
+#[tokio::test]
+async fn an_evidence_less_terminal_chapter_derives_host_offline_then_starting() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) =
+        FakeNode::connect_bearer_hello(&ctx.hub, &ctx.host, &enroll, json!({})).await?;
+    let node_token = node_token.context("node token")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
+    let (swept, _) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
+    assert_eq!(swept, 1);
+
+    let lineage_state = || async {
+        let lineage: Value = ctx
+            .http
+            .get(format!("{}/v1/lineages/{x}", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::Ok(lineage["state"].as_str().unwrap().to_owned())
+    };
+    assert_eq!(
+        lineage_state().await?,
+        "host-offline",
+        "an evidence-less terminal chapter on a down host derives host-offline"
+    );
+
+    // Same epoch, same token: no epoch change, link live — the ambiguous
+    // chapter reads as starting, not as a genuine running/ended session.
+    let _node = FakeNode::connect_with_token(&ctx.hub, &ctx.host, &node_token).await?;
+    assert_eq!(lineage_state().await?, "starting");
+    Ok(())
+}
+
+/// ma-lineage r7 item 5(d): a `{mode:"terminal"}` continuation of a
+/// claude-sdk session launches claude-pty and keeps the resume session id —
+/// the requested mode's driver is honoured, not the structured default.
+#[tokio::test]
+async fn a_terminal_mode_continuation_launches_claude_pty_with_the_session() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    let response = ctx.resume_mode(&x, &ctx.human, "terminal").await?;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await?;
+    assert_eq!(body["replayed"], json!(false));
+
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close", "the live predecessor is closed");
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    assert_eq!(
+        params["spec"]["driver"],
+        json!("claude-pty"),
+        "terminal mode maps the successor to claude-pty"
+    );
+    assert_eq!(
+        params["spec"]["resumeSessionId"],
+        json!(SESSION),
+        "the native session is resumed, not relaunched blank"
     );
     Ok(())
 }

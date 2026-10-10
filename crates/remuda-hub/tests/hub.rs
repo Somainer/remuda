@@ -104,7 +104,7 @@ async fn offline_host_exits_in_background_and_is_only_listed_in_history() -> Res
     .await?;
     let history: Value = serde_json::from_str(&body)?;
     assert_eq!(history["items"][0]["lifecycle"], "exited");
-    assert_eq!(history["items"][0]["lastError"], "host-lost");
+    assert_eq!(history["items"][0]["lastError"], "host-contact-lost");
     let (status, _, _) = http(
         hub.addr,
         "GET",

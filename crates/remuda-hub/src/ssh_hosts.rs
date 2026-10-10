@@ -762,7 +762,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(instance.lifecycle, "exited");
-        assert_eq!(instance.last_error.as_deref(), Some("host-lost"));
+        assert_eq!(instance.last_error.as_deref(), Some("host-contact-lost"));
         store.close().await;
     }
 
@@ -975,7 +975,7 @@ mod tests {
                     "UPDATE instances
                         SET lifecycle = 'exited', activity = 'idle',
                             connectivity = 'disconnected',
-                            last_error = 'host-lost',
+                            last_error = 'host-contact-lost',
                             ended_at = NULL
                       WHERE id = ?1",
                     [host_lost_id.as_str()],

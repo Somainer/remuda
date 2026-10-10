@@ -74,7 +74,9 @@ const EXACT: ReadonlyMap<string, { label: string; tone: EndTone }> = new Map([
   // A stop reached a Node that does not know the instance.
   ["node-lost-instance", { label: "Node 已丢失该会话，会话已中断", tone: "interrupted" }],
   // Host connection gone while the row was settling; fate of the process
-  // unknown, so never a claimed failure.
+  // unknown, so never a claimed failure. "host-contact-lost" is the current
+  // Hub marker; "host-lost" is the legacy spelling (ma-lineage r7 item 5b).
+  ["host-contact-lost", { label: "主机失联，会话已中断", tone: "interrupted" }],
   ["host-lost", { label: "主机失联，会话已中断", tone: "interrupted" }],
   // Herdr-carried PTY: the carrier socket/server/process the pane lived in is
   // gone. Same human fact as a Node restart — the session was cut short.

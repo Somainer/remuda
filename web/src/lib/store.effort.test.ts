@@ -753,6 +753,72 @@ it("a refusal recorded with a null model id never auto-clears", async () => {
   expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
 });
 
+it("item 4a: a polled positive flag for another model never clears the model-scoped refusal", async () => {
+  const ctx = await startFollowing("refusal-poll-scope");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // Refusal is recorded for model A.
+  await hubStore.setModel(ctx.instance.id, "model-a");
+  ctx.receive(configureLifecycle(2, modelRefuse, ctx.instance.id));
+  const rawRefusal = () =>
+    (hubStore as unknown as { state: { effortRefusal: Record<string, { scope: string; modelId: string | null }> } })
+      .state.effortRefusal[ctx.instance.id];
+  expect(rawRefusal()).toMatchObject({ scope: "model", modelId: "model-a" });
+
+  // Move to model B, then a POLL carries positive ultracode evidence on the
+  // Hub record. The model-A refusal must survive (the old poll path cleared
+  // any refusal on any positive flag).
+  const rowB: Instance = {
+    ...ctx.instance,
+    durableSeq: "50",
+    model: "model-b",
+    effortEffective: { name: "xhigh", ultracode: true, source: "remuda", observedAt: "2026-10-08T12:00:00.000Z" },
+  };
+  const list = vi.spyOn(api, "instanceList").mockResolvedValue({ items: [rowB] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  await hubStore.setModel(ctx.instance.id, "model-b");
+  await hubStore.refresh();
+  expect(rawRefusal(), "model A refusal survives B's positive poll").toMatchObject({
+    scope: "model",
+    modelId: "model-a",
+  });
+
+  // Positive evidence while the current model IS the bound one clears it.
+  await hubStore.setModel(ctx.instance.id, "model-a");
+  list.mockResolvedValue({
+    items: [
+      {
+        ...rowB,
+        durableSeq: "51",
+        model: "model-a",
+        effortEffective: { name: "xhigh", ultracode: true, source: "remuda", observedAt: "2026-10-08T12:01:00.000Z" },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
+});
+
+it("item 4b: a refusal before model state binds to the launch model and clears on its positive flag", async () => {
+  const ctx = await startFollowing("refusal-early-binding");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // No modelEffective, no picker selection yet — only the launch spec names a
+  // model. Make sure the store sees it (as on a fresh follow).
+  hubStore["emit"]({
+    instances: [{ ...ctx.instance, durableSeq: "99", model: "launch-model-x" }],
+  });
+
+  // The refusal arrives before any model catalog/effective projection.
+  ctx.receive(configureLifecycle(2, modelRefuse, ctx.instance.id));
+  const refusal = hubStore.effortRefusalOf(ctx.instance.id);
+  expect(refusal?.scope).toBe("model");
+  expect(refusal?.modelId, "bound to the launch model, never null").toBe("launch-model-x");
+
+  // Positive switch evidence for that same model clears it (the null-bound
+  // refusal used to block every later model and never auto-cleared).
+  ctx.receive(flagOn(3, "xhigh"));
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
+});
+
 it("r2 item 1: the version gate prefers the snapshot version, then the host's pinned CLI, else unknown", () => {
   const base: Instance = {
     ...mockDb.instances[0],

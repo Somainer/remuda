@@ -972,6 +972,28 @@ class HubStore {
     }
   }
 
+  /** Best-known current model for an instance: the transcript read-back, then
+   *  the optimistic picker selection, then the launch spec's model. */
+  private currentEffortModelId(instanceId: Id): string | null {
+    const fromMap =
+      this.state.modelEffective[instanceId]?.id ?? this.state.models[instanceId] ?? null;
+    if (fromMap) return fromMap;
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    return instance?.model ? String(instance.model) : null;
+  }
+
+  /** Whether a positive ultracode read-back clears THIS refusal (c-effortui r3
+   *  item 4): a process-scoped refusal always clears; a model-scoped one only
+   *  on positive evidence for the model it was bound to. A null-bound refusal
+   *  (older rows / direct seeds) is never auto-cleared. */
+  private positiveFlagClearsEffortRefusal(instanceId: Id): boolean {
+    const refusal = this.state.effortRefusal[instanceId];
+    if (!refusal) return false;
+    if (refusal.scope !== "model") return true;
+    if (refusal.modelId == null) return false;
+    return refusal.modelId === this.currentEffortModelId(instanceId);
+  }
+
   private clearEffortRefusal(instanceId: Id) {
     if (!this.state.effortRefusal[instanceId]) return;
     const refusal = { ...this.state.effortRefusal };
@@ -1387,10 +1409,12 @@ class HubStore {
     const refusalPatch: Partial<HubState> = {};
     if (isUltraRefusal) {
       const scope = parsed.reason === ULTRA_MODEL_REASON ? "model" : "process";
-      const modelId =
-        scope === "model"
-          ? (this.state.modelEffective[instanceId]?.id ?? this.state.models[instanceId] ?? null)
-          : null;
+      // Bind the refusal to the model it actually concerns even when the
+      // verdict arrives before the model catalog/effective state: read-back
+      // id, then the optimistic picker selection, then the launch spec model.
+      // Only a session with no model identity at all is recorded null (c-effortui
+      // r3 item 4 — a null refusal otherwise blocked every later model).
+      const modelId = scope === "model" ? this.currentEffortModelId(instanceId) : null;
       refusalPatch.effortRefusal = {
         ...this.state.effortRefusal,
         [instanceId]: {
@@ -3892,8 +3916,7 @@ class HubStore {
     if (refusal.scope === "model") {
       // Bound to the model the driver named; a different current model
       // re-enables the switch immediately.
-      const currentModel =
-        this.state.modelEffective[instanceId]?.id ?? this.state.models[instanceId] ?? null;
+      const currentModel = this.currentEffortModelId(instanceId);
       if (currentModel && refusal.modelId && currentModel !== refusal.modelId) {
         return null;
       }

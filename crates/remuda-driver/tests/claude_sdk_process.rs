@@ -1236,12 +1236,17 @@ async fn an_older_buffered_result_cannot_settle_a_newer_outstanding_input_throug
         driver.send(prompt_id("second", "msg-b")).await?;
         Ok::<ClaudeSdkDriver, DriverError>(driver)
     });
-    // Wait until the worker holds turn A's ticket and the write has acked.
+    // Wait until the worker holds turn A's ticket, the write has acked, AND
+    // turn A's RESULT frame is queued behind the ticket. Waiting for the result
+    // specifically (not just any frame) is what makes the strict cross-turn
+    // order deterministic rather than scheduler luck (r6 item 3): A's result is
+    // in the queue BEFORE B even begins.
     barrier
-        .wait_until_reserve_parked(Duration::from_secs(5))
+        .wait_until_result_parked(Duration::from_secs(5))
         .await;
     // Release the SEND only: A commits, the worker publishes start_A then
-    // stays parked at the ticket (worker gate still shut).
+    // stays parked at the ticket (worker gate still shut). A's result is
+    // already queued, so it precedes B's start.
     barrier.release_send();
     // Wait until B's reservation is enqueued — B's book is now open, in the
     // queue behind A's buffered result.

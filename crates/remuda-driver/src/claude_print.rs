@@ -1335,13 +1335,18 @@ async fn map_loop(
         };
         // Unbounded: enqueue never parks on the writer/sender, so stdout keeps
         // draining even while a prompt write is blocked and close is running.
+        // test-stub only: detect the turn RESULT frame specifically (not an
+        // assistant/keepalive frame) so an armed barrier can wait until that
+        // result is queued behind the parked ticket (ma-sdk-state r6 item 3).
+        #[cfg(feature = "test-stub")]
+        let is_turn_result = matches!(&frame, Outbound::Result(_));
         if publisher.send(PublishJob::Frame(Box::new(frame))).is_err() {
             break;
         }
-        // test-stub only: record that a frame now sits behind any parked
-        // Reserve ticket (the armed race's queued result).
         #[cfg(feature = "test-stub")]
-        test_barrier::note_frame_enqueued(&inner.barrier);
+        if is_turn_result {
+            test_barrier::note_frame_enqueued(&inner.barrier);
+        }
     }
     // Child stdout reached EOF. Enqueue the exit BEHIND every already-queued
     // frame so `exited` is always the last published observation; the worker

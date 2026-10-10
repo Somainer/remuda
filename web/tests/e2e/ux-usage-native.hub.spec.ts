@@ -33,35 +33,44 @@ import { expect, test, type Page } from "@playwright/test";
 
 const execFileAsync = promisify(execFile);
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const root = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../..",
+);
 
-const target =
-  process.env.CARGO_TARGET_DIR
-    ? path.resolve(process.env.CARGO_TARGET_DIR)
-    : path.resolve(root, process.env.CARGO_TARGET_DIR_REL ?? "target");
-const remuda = process.env.HUB_E2E_REMUDA_BIN ?? path.join(target, "debug/remuda");
+const target = process.env.CARGO_TARGET_DIR
+  ? path.resolve(process.env.CARGO_TARGET_DIR)
+  : path.resolve(root, process.env.CARGO_TARGET_DIR_REL ?? "target");
+const remuda =
+  process.env.HUB_E2E_REMUDA_BIN ?? path.join(target, "debug/remuda");
 const harness =
-  process.env.HUB_E2E_FAKE_HARNESS_BIN ?? path.join(target, "debug/fake-harness");
+  process.env.HUB_E2E_FAKE_HARNESS_BIN ??
+  path.join(target, "debug/fake-harness");
 const nativeNode =
-  process.env.HUB_E2E_NATIVE_NODE_BIN ?? path.join(target, "debug/examples/native_hub_e2e");
+  process.env.HUB_E2E_NATIVE_NODE_BIN ??
+  path.join(target, "debug/examples/native_hub_e2e");
 
-test.beforeAll(async () => {
-  const args = ["build", "--locked"];
-  if (!process.env.HUB_E2E_REMUDA_BIN) args.push("-p", "remuda", "--bin", "remuda");
-  if (!process.env.HUB_E2E_FAKE_HARNESS_BIN) {
-    args.push("-p", "remuda-testing", "--bin", "fake-harness");
-  }
-  if (!process.env.HUB_E2E_NATIVE_NODE_BIN) {
-    args.push("-p", "remuda-node", "--example", "native_hub_e2e");
-  }
-  await execFileAsync("cargo", args, {
-    cwd: root,
-    env: process.env,
-    timeout: 570_000,
-    maxBuffer: 8 * 1024 * 1024,
-  });
-  await Promise.all([access(remuda), access(harness), access(nativeNode)]);
-}, { timeout: 600_000 });
+test.beforeAll(
+  async () => {
+    const args = ["build", "--locked"];
+    if (!process.env.HUB_E2E_REMUDA_BIN)
+      args.push("-p", "remuda", "--bin", "remuda");
+    if (!process.env.HUB_E2E_FAKE_HARNESS_BIN) {
+      args.push("-p", "remuda-testing", "--bin", "fake-harness");
+    }
+    if (!process.env.HUB_E2E_NATIVE_NODE_BIN) {
+      args.push("-p", "remuda-node", "--example", "native_hub_e2e");
+    }
+    await execFileAsync("cargo", args, {
+      cwd: root,
+      env: process.env,
+      timeout: 570_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    await Promise.all([access(remuda), access(harness), access(nativeNode)]);
+  },
+  { timeout: 600_000 },
+);
 
 // A real self-skip: when the three fixture binaries are missing AND the test
 // was launched without explicit prebuilt overrides. There is no catch->skip
@@ -121,11 +130,17 @@ async function stopNode(node: ChildProcess) {
 }
 
 async function login(page: Page, bootstrap: string) {
-  const body = JSON.stringify({ bootstrapToken: bootstrap, deviceName: "usage-native-e2e" });
+  const body = JSON.stringify({
+    bootstrapToken: bootstrap,
+    deviceName: "usage-native-e2e",
+  });
   let cookie = "";
   for (let i = 0; i < 60; i++) {
     const response = await page.request.post("/v1/login", {
-      headers: { Origin: new URL(page.url()).origin, "Content-Type": "application/json" },
+      headers: {
+        Origin: new URL(page.url()).origin,
+        "Content-Type": "application/json",
+      },
       data: body,
     });
     const setCookie = response.headers()["set-cookie"];
@@ -139,11 +154,16 @@ async function login(page: Page, bootstrap: string) {
 }
 
 async function command(page: Page, instanceId: string, payload: object) {
-  const response = await page.request.post(`/v1/instances/${instanceId}/commands`, {
-    headers: { Origin: new URL(page.url()).origin },
-    data: payload,
-  });
-  expect(response.ok(), `${response.status()}: ${await response.text()}`).toBe(true);
+  const response = await page.request.post(
+    `/v1/instances/${instanceId}/commands`,
+    {
+      headers: { Origin: new URL(page.url()).origin },
+      data: payload,
+    },
+  );
+  expect(response.ok(), `${response.status()}: ${await response.text()}`).toBe(
+    true,
+  );
 }
 
 async function rawKeys(page: Page, instanceId: string, text: string) {
@@ -157,9 +177,15 @@ function quote(value: string) {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-test("native transcript usage drives the context chip through the real promoted path", async ({ page }) => {
+test("native transcript usage drives the context chip through the real promoted path", async ({
+  page,
+}) => {
+  // mkdtemp requires its parent to exist already.
   const scratch = path.join(target, "hub-e2e", "usage-native");
-  const dir = await realpath(await mkdtemp(path.join(scratch, "usage-native-")));
+  await mkdir(scratch, { recursive: true });
+  const dir = await realpath(
+    await mkdtemp(path.join(scratch, "usage-native-")),
+  );
   const dataDir = path.join(dir, "data");
   await mkdir(dataDir, { recursive: true });
   const workspace = path.join(dir, "workspace");
@@ -169,28 +195,36 @@ test("native transcript usage drives the context chip through the real promoted 
   const eventsFile = path.join(dir, "native-events.jsonl");
   const tokenFile = path.join(dir, "enroll-token");
   const shell = path.join(bin, "test-shell");
-  await Promise.all([mkdir(dataDir), mkdir(workspace), mkdir(bin), mkdir(claudeHome)]);
+  await Promise.all([
+    mkdir(dataDir),
+    mkdir(workspace),
+    mkdir(bin),
+    mkdir(claudeHome),
+  ]);
   await copyFile(harness, path.join(bin, "claude"));
   await chmod(path.join(bin, "claude"), 0o700);
   await writeFile(
     shell,
-    "#!/bin/sh\nif [ \"${1:-}\" = --version ]; then exec /bin/sh --version; fi\nexec /bin/sh\n",
+    '#!/bin/sh\nif [ "${1:-}" = --version ]; then exec /bin/sh --version; fi\nexec /bin/sh\n',
     { mode: 0o700 },
   );
   await writeFile(scriptFile, JSON.stringify(SCENARIO));
 
   const hub = new URL(
-    process.env.VITE_HUB_URL ?? `http://127.0.0.1:${process.env.HUB_E2E_LISTEN ?? "58880"}`,
+    process.env.VITE_HUB_URL ??
+      `http://127.0.0.1:${process.env.HUB_E2E_LISTEN ?? "58880"}`,
   );
   hub.protocol = hub.protocol === "https:" ? "wss" : "ws";
   hub.pathname = "/v1/node";
 
   // Linux uses the /proc/self/fd alias (same as promoted-claude.spec.ts): the
   // native example canonicalizes paths and needs the handle kept open.
-  const dataHandle = process.platform === "linux" ? await open(dataDir, "r") : undefined;
-  const dataPath = process.platform === "linux"
-    ? `/proc/${process.pid}/fd/${dataHandle!.fd}`
-    : dataDir;
+  const dataHandle =
+    process.platform === "linux" ? await open(dataDir, "r") : undefined;
+  const dataPath =
+    process.platform === "linux"
+      ? `/proc/${process.pid}/fd/${dataHandle!.fd}`
+      : dataDir;
 
   const nodeLog = path.join(dir, "node.log");
   let node: ChildProcess | undefined;
@@ -243,9 +277,11 @@ test("native transcript usage drives the context chip through the real promoted 
     const minted = await page.request.post("/v1/hosts/enroll-token", {
       headers: { Origin: new URL(page.url()).origin },
     });
-    await login(page, (await minted.json() as { token: string }).token);
+    await login(page, ((await minted.json()) as { token: string }).token);
 
-    const workspacesResponse = await page.request.get(`/v1/hosts/${hostId}/workspaces`);
+    const workspacesResponse = await page.request.get(
+      `/v1/hosts/${hostId}/workspaces`,
+    );
     const workspaces = (await workspacesResponse.json()) as {
       workspaces: { workspaceId: string }[];
     };
@@ -267,7 +303,9 @@ test("native transcript usage drives the context chip through the real promoted 
       instance: { instanceId?: string; id?: string };
     };
     instanceId = result.instance.instanceId ?? result.instance.id;
-    expect(created.ok(), `${created.status()}: ${await created.text()}`).toBe(true);
+    expect(created.ok(), `${created.status()}: ${await created.text()}`).toBe(
+      true,
+    );
 
     const id = instanceId!;
     await page.goto(`/s/${id}`);

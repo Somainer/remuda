@@ -962,32 +962,30 @@ async function savedPositionSurvivesSwap(
   // RE-ANCHOR INVARIANT (viewport offset). Absolute document tops are blind to
   // scroll re-anchoring (a correction moves scrollTop and the viewport top by
   // equal/opposite amounts), so compare the anchor's SCROLLER-RELATIVE offset.
+  // Both TIGHT bounds hold on the saved anchorId row in EVERY arm (late and
+  // mid, short and bounded long) — none are gated on which row was saved.
+  expect(Number.isFinite(beforeSwap), `no pre-swap offset sampled (${measured})`).toBe(true);
   // (a) The reader restored at a fallback-face position (beforeSwap); after the
   //     swap the anchor must stay at that SAME viewport spot (settled ≈
-  //     beforeSwap) in EVERY arm.
-  if (beforeSwap !== null) {
-    expect(
-      Math.abs(settled - beforeSwap),
-      `post-swap anchor drifted from its pre-swap viewport offset — re-anchor failed (${measured})`,
-    ).toBeLessThanOrEqual(DRIFT_PX);
-  }
-  // (b) Round-2 saved-position bound (item 9): the gated restore must be no
-  // further from the first-visit SAVED offset than the font-already-loaded
-  // control restore is. Never weakened.
+  //     beforeSwap).
+  expect(
+    Math.abs(settled - (beforeSwap as number)),
+    `post-swap anchor drifted from its pre-swap viewport offset — re-anchor failed (${measured})`,
+  ).toBeLessThanOrEqual(DRIFT_PX);
+  // (b) The post-swap position must coincide with the font-already-loaded
+  //     CONTROL restore: a swap adds no offset, whether the saved anchor is the
+  //     growing wrap row itself or a burst row below it.
+  expect(
+    Math.abs(settled - control),
+    `post-swap anchor moved vs the font-already-loaded control (${measured})`,
+  ).toBeLessThanOrEqual(DRIFT_PX);
+  // (c) Round-2 saved-position bound (item 9): the gated restore must be no
+  // further from the first-visit SAVED offset than the control restore is.
+  // Never weakened.
   expect(
     Math.abs(settled - saved),
     `swap restore landed farther from the saved offset than the control restore (${measured})`,
   ).toBeLessThanOrEqual(Math.abs(control - saved) + DRIFT_PX);
-  // (c) When the saved anchor IS the growing wrap-block row, its own height
-  // change must keep its own top: the natural Plex restore position (control),
-  // the held fallback position and the post-swap position all coincide. Item 1
-  // — fails if the anchor row's own growth scrolls it off (the r4 bug).
-  if (savedAnchorIsWrapBlock) {
-    expect(
-      Math.abs(settled - control),
-      `the growing saved row's own top moved vs the font-already-loaded control (${measured})`,
-    ).toBeLessThanOrEqual(DRIFT_PX);
-  }
   await assertRowsStacked(scroller);
 }
 
@@ -1015,7 +1013,6 @@ test("a saved position in a bounded long journal survives a monospace swap landi
   test.setTimeout(240_000);
   await savedPositionSurvivesSwap(page, LONG_BURST, "first");
 });
-
 
 test("a pinned transcript stays pinned through a late monospace swap", async ({ page }) => {
   test.setTimeout(120_000);

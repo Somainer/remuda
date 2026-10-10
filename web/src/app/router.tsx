@@ -2,21 +2,34 @@ import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 import { AuthGate } from "./AuthGate";
 import { Shell } from "./Shell";
 import { PhoneShell } from "./PhoneShell";
+// Login stays in the initial chunk: it is the unauthed first paint and must
+// not wait on a route chunk. Every authed surface is a separate chunk
+// (c-perffu UO-11: the eager all-pages bundle made cold navigation parse ~1.5
+// MB of JS in one long task), wrapped in a per-page LazyRoute boundary (r2:
+// rejected offline/stale chunk keeps the Shell mounted with re-import/
+// reload; r3: each page is its OWN component type so sibling navigation
+// unmounts the old page instead of re-rendering it).
 import { LoginPage } from "../pages/LoginPage";
-import { SessionsPage } from "../pages/SessionsPage";
-import { NewSessionPage } from "../pages/NewSessionPage";
-import { SessionPage } from "../pages/SessionPage";
-import { ApprovalsPage } from "../pages/ApprovalsPage";
-import { HostsPage, HostDetailPage } from "../pages/HostsPage";
-import { FleetPage } from "../pages/FleetPage";
-import { ProjectsPage, ProjectDetailPage } from "../pages/ProjectsPage";
-import { ProvidersPage, ProviderDetailPage } from "../pages/ProvidersPage";
-import { BotsPage, BotDetailPage } from "../pages/BotsPage";
-import { SettingsPage } from "../pages/SettingsPage";
-import { SubagentView } from "../features/session/subagent/SubagentView";
-import { Inbox } from "../features/mobile/Inbox";
-import { HomeList } from "../features/mobile/HomeList";
-import { BoardPage } from "../features/tasks/Board";
+import {
+  ApprovalsRoute,
+  BoardRoute,
+  BotDetailRoute,
+  BotsRoute,
+  FleetRoute,
+  HomeListRoute,
+  HostDetailRoute,
+  HostsRoute,
+  InboxRoute,
+  NewSessionRoute,
+  ProjectDetailRoute,
+  ProjectsRoute,
+  ProviderDetailRoute,
+  ProvidersRoute,
+  SessionRoute,
+  SessionsRoute,
+  SettingsRoute,
+  SubagentRoute,
+} from "./lazyRoutes";
 import { resolveLanding } from "../lib/mobileRoute";
 import { useWorkbenchViewport } from "../lib/viewport";
 
@@ -53,32 +66,35 @@ export function AppRouter() {
         <Route element={<Shell />}>
           <Route path="/" element={<RootLanding />} />
           <Route element={<ViewportGate />}>
-            <Route path="/sessions" element={<SessionsPage />} />
-            <Route path="/approvals" element={<ApprovalsPage />} />
-            <Route path="/board" element={<BoardPage />} />
+            <Route path="/sessions" element={<SessionsRoute />} />
+            <Route path="/approvals" element={<ApprovalsRoute />} />
+            <Route path="/board" element={<BoardRoute />} />
           </Route>
-          <Route path="/sessions/new" element={<NewSessionPage />} />
-          <Route path="/s/:instanceId" element={<SessionPage />} />
-          <Route path="/s/:instanceId/tty" element={<SessionPage view="tty" />} />
-          <Route path="/s/:instanceId/structured" element={<SessionPage view="structured" />} />
-          <Route path="/s/:instanceId/files" element={<SessionPage view="files" />} />
-          <Route path="/s/:instanceId/events" element={<SessionPage view="events" />} />
-          <Route path="/s/:instanceId/agents/:agentId" element={<SubagentView />} />
-          <Route path="/hosts" element={<HostsPage />} />
-          <Route path="/hosts/:hostId" element={<HostDetailPage />} />
-          <Route path="/fleet" element={<FleetPage />} />
-          <Route path="/projects" element={<ProjectsPage />} />
-          <Route path="/projects/:workspaceId" element={<ProjectDetailPage />} />
-          <Route path="/providers" element={<ProvidersPage />} />
-          <Route path="/providers/:profileId" element={<ProviderDetailPage />} />
-          <Route path="/bots" element={<BotsPage />} />
-          <Route path="/bots/:channelId" element={<BotDetailPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/sessions/new" element={<NewSessionRoute />} />
+          <Route path="/s/:instanceId" element={<SessionRoute />} />
+          <Route path="/s/:instanceId/tty" element={<SessionRoute view="tty" />} />
+          <Route
+            path="/s/:instanceId/structured"
+            element={<SessionRoute view="structured" />}
+          />
+          <Route path="/s/:instanceId/files" element={<SessionRoute view="files" />} />
+          <Route path="/s/:instanceId/events" element={<SessionRoute view="events" />} />
+          <Route path="/s/:instanceId/agents/:agentId" element={<SubagentRoute />} />
+          <Route path="/hosts" element={<HostsRoute />} />
+          <Route path="/hosts/:hostId" element={<HostDetailRoute />} />
+          <Route path="/fleet" element={<FleetRoute />} />
+          <Route path="/projects" element={<ProjectsRoute />} />
+          <Route path="/projects/:workspaceId" element={<ProjectDetailRoute />} />
+          <Route path="/providers" element={<ProvidersRoute />} />
+          <Route path="/providers/:profileId" element={<ProviderDetailRoute />} />
+          <Route path="/bots" element={<BotsRoute />} />
+          <Route path="/bots/:channelId" element={<BotDetailRoute />} />
+          <Route path="/settings" element={<SettingsRoute />} />
         </Route>
         <Route element={<ViewportGate />}>
           <Route path="/m" element={<PhoneShell />}>
-            <Route index element={<HomeList />} />
-            <Route path="inbox" element={<Inbox />} />
+            <Route index element={<HomeListRoute />} />
+            <Route path="inbox" element={<InboxRoute />} />
             <Route path="*" element={<Navigate to="/m" replace />} />
           </Route>
         </Route>

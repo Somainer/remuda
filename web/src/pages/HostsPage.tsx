@@ -11,6 +11,7 @@ import {
   installedCli,
   isStaleOffline,
   useHostViews,
+  useStaleCutoffTick,
   type HostView,
 } from "../features/hosts";
 import { fromHub, type ProviderProfile } from "../features/providers";
@@ -37,20 +38,20 @@ function useHostPolling() {
 }
 
 /** The primary status line: online rtt, plain offline, or stale = unknown. */
-function statusText(host: HostView): string {
+function statusText(host: HostView, nowMs: number): string {
   if (host.state === "connecting") return "连接中…";
   if (host.online) return `在线${host.rttMs != null ? ` ${host.rttMs}ms` : ""}`;
-  if (isStaleOffline(host)) return "状态待确认";
+  if (isStaleOffline(host, nowMs)) return "状态待确认";
   return "离线 —";
 }
 
 /** The one-line summary shown below 1024px: status, CLI inventory and the
  *  session count are appended for every state, so phones keep all facts. */
-function mobileSummary(host: HostView): string {
+function mobileSummary(host: HostView, nowMs: number): string {
   let head: string;
   if (host.state === "connecting") head = "连接中…";
   else if (host.online) head = `在线${host.rttMs != null ? ` ${host.rttMs}ms` : ""}`;
-  else head = isStaleOffline(host) ? "状态待确认" : "离线";
+  else head = isStaleOffline(host, nowMs) ? "状态待确认" : "离线";
   const seen = !host.online && host.lastSeenAt ? ` · 最后心跳 ${host.lastSeenAt.slice(11, 16)}` : "";
   const cli = cliSummary(host.cli) ? ` · ${cliSummary(host.cli)}` : "";
   return `${head}${seen}${cli} · 会话 ${host.instanceCount}`;
@@ -60,10 +61,13 @@ export function HostsPage() {
   useHostPolling();
   const hub = useHub();
   const hosts = useHostViews(hub.hosts, hub.instances);
+  // Wake up exactly when the next offline host crosses into the stale group;
+  // equal quiet polls emit nothing, so the cutoff timer is what re-groups.
+  const nowMs = useStaleCutoffTick(hub.hosts);
   const [adding, setAdding] = useState(false);
   const [showStale, setShowStale] = useState(false);
-  const stale = hosts.filter((h) => isStaleOffline(h));
-  const visible = showStale ? hosts : hosts.filter((h) => !isStaleOffline(h));
+  const stale = hosts.filter((h) => isStaleOffline(h, nowMs));
+  const visible = showStale ? hosts : hosts.filter((h) => !isStaleOffline(h, nowMs));
   const online = hosts.filter((h) => h.online).length;
 
   return (
@@ -105,7 +109,7 @@ export function HostsPage() {
           </div>
           <div className={css.list}>
             {visible.map((host) => {
-              const staleHost = isStaleOffline(host);
+              const staleHost = isStaleOffline(host, nowMs);
               const dotClass = host.online
                 ? css.dotOn
                 : staleHost
@@ -127,9 +131,9 @@ export function HostsPage() {
                     <span className={css.identity}>
                       <span className={`${css.name} ${host.online ? "" : css.nameOff}`}>{host.label}</span>
                       {host.lastError ? <span role="status" className={css.sshError}>{host.lastError}</span> : null}
-                      <span className={css.mobileMeta}>{mobileSummary(host)}</span>
+                      <span className={css.mobileMeta}>{mobileSummary(host, nowMs)}</span>
                     </span>
-                    <span className={`${css.cell} ${css.cellRtt}`}>{statusText(host)}</span>
+                    <span className={`${css.cell} ${css.cellRtt}`}>{statusText(host, nowMs)}</span>
                     <span className={`${css.cell} ${css.cellCli}`}>{cliSummary(host.cli) || "—"}</span>
                     <span className={`${css.cell} ${css.cellTransport}`}>
                       {host.transport}

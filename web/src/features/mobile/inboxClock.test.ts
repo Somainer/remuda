@@ -122,3 +122,51 @@ describe("inboxClock (c-ghostbadge round 2)", () => {
     off();
   });
 });
+
+describe("inboxClock independent display tick (c-perffu r3)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    __resetInboxClockForTest(T0);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("advances on its own with equal payloads and no deadlines at all", () => {
+    const ticks: number[] = [];
+    const off = subscribeInboxClock(() => ticks.push(getInboxClockNow()));
+
+    // No syncInboxDeadlineClock call: no pending deadline exists. Repeated
+    // equal data pages would be no-emit polls, yet labels must still age.
+    vi.advanceTimersByTime(46_000);
+    expect(ticks.length).toBeGreaterThanOrEqual(3);
+    expect(getInboxClockNow()).toBeGreaterThanOrEqual(T0 + 45_000);
+    // formatListTime's 刚刚 → 1m boundary (45s) is now visible.
+    expect(getInboxClockNow() - T0).toBeGreaterThanOrEqual(45_000);
+    off();
+
+    // Once unsubscribed the display timer stops (no leaked ticks).
+    const countAfter = ticks.length;
+    vi.advanceTimersByTime(60_000);
+    expect(ticks).toHaveLength(countAfter);
+  });
+
+  it("keeps deadline invalidation while the display tick runs", () => {
+    const ticks: number[] = [];
+    const off = subscribeInboxClock(() => ticks.push(getInboxClockNow()));
+    syncInboxDeadlineClock([card(new Date(T0 + 5_000).toISOString())], T0);
+
+    // Deadline crosses first (5s), with no display tick due yet.
+    vi.advanceTimersByTime(5_002);
+    const deadlineTicks = ticks.length;
+    expect(ticks[deadlineTicks - 1]).toBeGreaterThanOrEqual(T0 + 5_000);
+    expect(deadlineTicks).toBe(1);
+
+    // Display ticks continue afterwards on their own.
+    vi.advanceTimersByTime(45_000);
+    expect(ticks.length).toBeGreaterThan(deadlineTicks);
+    off();
+  });
+});

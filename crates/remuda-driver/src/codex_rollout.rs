@@ -294,6 +294,25 @@ impl RolloutTail {
         }
     }
 
+    /// Start following a rollout at its CURRENT END.
+    ///
+    /// A launch-discovery bind must not replay a rollout from byte zero: a
+    /// crash-loop relaunch whose previous session started inside the clock
+    /// slack can match the same file, and reading it from the start would
+    /// re-journal that whole transcript, usage and cost. Beginning at the
+    /// current length reads only content appended after the bind. The cost is
+    /// deliberately bounded: a 0.154 rollout is created LAZILY with its
+    /// `session_meta` on the first turn, so the file a poll first sees is
+    /// normally header-only (the header maps to no observations anyway).
+    pub fn new_at_end(path: PathBuf) -> std::io::Result<Self> {
+        let offset = std::fs::metadata(&path)?.len();
+        Ok(Self {
+            path,
+            offset,
+            partial: Vec::new(),
+        })
+    }
+
     /// File being followed.
     #[must_use]
     pub fn path(&self) -> &Path {

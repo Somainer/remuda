@@ -381,7 +381,7 @@ fn write_rollout(home: &Path, date: &str, id: &str, cwd: &str, started: &str) {
 #[test]
 fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
     let home = tempfile::tempdir().unwrap();
-    let cwd = Path::new("/projects/alpha");
+    let cwd = Path::new("/projects/alpha-r3bind");
     // Relative times: floor ten seconds ago keeps the 120 s discovery window
     // open for the test's duration.
     let now = OffsetDateTime::now_utc();
@@ -396,14 +396,14 @@ fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
         home.path(),
         "2026/09/14",
         "foreign-other-cwd",
-        "/projects/beta",
+        "/projects/beta-r3bind",
         &rfc(now - time::Duration::seconds(1)),
     );
     write_rollout(
         home.path(),
         "2026/09/13",
         "foreign-same-cwd-old",
-        "/projects/alpha",
+        "/projects/alpha-r3bind",
         &rfc(now - time::Duration::seconds(600)),
     );
     std::fs::write(
@@ -431,7 +431,7 @@ fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
         home.path(),
         "2026/09/14",
         "own-session",
-        "/projects/alpha",
+        "/projects/alpha-r3bind",
         &rfc(now - time::Duration::seconds(2)),
     );
     assert!(adapter.discover().unwrap());
@@ -447,7 +447,7 @@ fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
 #[test]
 fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
     let home = tempfile::tempdir().unwrap();
-    let cwd = Path::new("/projects/alpha");
+    let cwd = Path::new("/projects/alpha-r3amb");
     // Keep the discovery window open so this exercises the Ambiguous branch,
     // not the deadline branch.
     let now = OffsetDateTime::now_utc();
@@ -457,14 +457,14 @@ fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
         home.path(),
         "2026/09/14",
         "one",
-        "/projects/alpha",
+        "/projects/alpha-r3amb",
         &rfc(now - time::Duration::seconds(5)),
     );
     write_rollout(
         home.path(),
         "2026/09/14",
         "two",
-        "/projects/alpha",
+        "/projects/alpha-r3amb",
         &rfc(now - time::Duration::seconds(1)),
     );
 
@@ -496,7 +496,7 @@ fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
 #[test]
 fn a_rollout_appearing_long_after_launch_binds_when_the_first_prompt_is_late() {
     let home = tempfile::tempdir().unwrap();
-    let cwd = Path::new("/projects/alpha");
+    let cwd = Path::new("/projects/alpha-r4late");
     // Floor 200 s ago — under the old deadline this adapter had given up.
     let floor = OffsetDateTime::now_utc() - time::Duration::seconds(200);
     let mut adapter = CodexAdapter::new(AdapterHome {
@@ -518,7 +518,7 @@ fn a_rollout_appearing_long_after_launch_binds_when_the_first_prompt_is_late() {
         home.path(),
         "2026/09/14",
         "late-prompt",
-        "/projects/alpha",
+        "/projects/alpha-r4late",
         &started,
     );
     assert!(
@@ -540,7 +540,7 @@ fn a_fresh_file_carrying_a_pre_launch_session_never_binds() {
     let floor = OffsetDateTime::now_utc() - time::Duration::seconds(5);
     let mut adapter = CodexAdapter::new(AdapterHome {
         home: home.path().to_path_buf(),
-        cwd: Path::new("/projects/alpha").to_path_buf(),
+        cwd: Path::new("/projects/alpha-r4old").to_path_buf(),
         pid: None,
         launched_at: Some(floor),
     });
@@ -551,9 +551,147 @@ fn a_fresh_file_carrying_a_pre_launch_session_never_binds() {
         home.path(),
         "2026/09/14",
         "old-session",
-        "/projects/alpha",
+        "/projects/alpha-r4old",
         &old,
     );
     assert!(!adapter.discover().unwrap());
     assert!(adapter.binding().is_none());
+}
+
+/// Build an unbound driver-launch adapter (with an open discovery window).
+fn launch_adapter(home: &Path, cwd: &str, floor: OffsetDateTime) -> CodexAdapter {
+    CodexAdapter::new(AdapterHome {
+        home: home.to_path_buf(),
+        cwd: Path::new(cwd).to_path_buf(),
+        pid: None,
+        launched_at: Some(floor),
+    })
+}
+
+#[test]
+fn overlapping_same_cwd_launch_windows_fail_closed_for_both() {
+    // r4 item 3: two generic-pty codex instances in the same cwd seconds
+    // apart. A is unbound (its rollout not created yet) when B launches; the
+    // overlap must make both adapters fail closed even if only one rollout
+    // ever appears — B must never bind A's thread.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/race-overlap";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+
+    let mut a = launch_adapter(home.path(), cwd, floor);
+    assert!(!a.discover().unwrap(), "nothing exists yet: NotYet");
+    assert!(!a.discovery_gave_up);
+
+    let mut b = launch_adapter(home.path(), cwd, floor);
+    assert!(
+        b.window.as_ref().is_some_and(|window| window.tainted()),
+        "B opened into A's still-open window"
+    );
+    assert!(!b.discover().unwrap());
+    assert!(b.discovery_gave_up, "B fails closed immediately");
+    assert!(b.binding().is_none());
+
+    // A becomes ambiguous too while still unbound; its own rollout appearing
+    // does not rescue either adapter.
+    assert!(!a.discover().unwrap());
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "A-only",
+        cwd,
+        &now.format(&Rfc3339).unwrap(),
+    );
+    assert!(!a.discover().unwrap());
+    assert!(a.binding().is_none());
+
+    // When both windows close, a LATER launch in the same cwd starts clean.
+    drop(a);
+    drop(b);
+    let fresh = launch_adapter(home.path(), cwd, OffsetDateTime::now_utc());
+    assert!(
+        !fresh.window.as_ref().is_some_and(|window| window.tainted()),
+        "the registry refcount cleared with the two windows"
+    );
+}
+
+#[test]
+fn a_second_instance_never_binds_the_firsts_already_bound_rollout() {
+    // The original race shape: A was prompted first and bound its unique
+    // rollout; B opens before its own (lazy) rollout exists. Even though the
+    // locator sees exactly one matching file, B's overlapping window forbids
+    // binding it.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/race-bound";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+
+    let mut a = launch_adapter(home.path(), cwd, floor);
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "A-thread",
+        cwd,
+        &now.format(&Rfc3339).unwrap(),
+    );
+    assert!(a.discover().unwrap());
+    assert_eq!(
+        a.binding().map(|binding| binding.session_id.as_str()),
+        Some("A-thread")
+    );
+
+    let mut b = launch_adapter(home.path(), cwd, floor);
+    assert!(!b.discover().unwrap(), "one file, but two live windows");
+    assert!(b.binding().is_none());
+    assert!(b.discovery_gave_up);
+}
+
+#[test]
+fn a_launch_bind_tails_from_the_end_and_never_replays_pre_bind_records() {
+    // r4 item 3 crash-loop shape: the matched file already carries a whole
+    // prior turn at bind time. A launch tail starts at the current end, so
+    // those records are never re-journaled; only post-bind appends flow.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/race-tail";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let started = now.format(&Rfc3339).unwrap();
+    let session_dir = home.path().join("sessions/2026/09/14");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let path = session_dir.join("rollout-replay.jsonl");
+    // Header plus a PRE-BIND turn line.
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"replay\",\"session_id\":\"replay\",\"cwd\":\"{cwd}\",\"timestamp\":\"{started}\"}}}}\n\
+             {{\"timestamp\":\"{started}\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"old-turn\"}}}}\n"
+        ),
+    )
+    .unwrap();
+
+    let mut adapter = launch_adapter(home.path(), cwd, floor);
+    assert!(adapter.discover().unwrap(), "the in-slack file matches");
+    let pre_bind = adapter.poll().unwrap();
+    assert!(
+        pre_bind.is_empty(),
+        "pre-bind records must not replay, got {pre_bind:?}"
+    );
+
+    // Content appended AFTER the bind is tailed normally.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{started}\",\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"new-turn\"}}}}"
+    )
+    .unwrap();
+    drop(file);
+    let post_bind = adapter.poll().unwrap();
+    let turns: Vec<_> = post_bind
+        .iter()
+        .filter_map(|obs| obs.turn_id.clone())
+        .collect();
+    assert_eq!(turns, vec!["new-turn"]);
 }

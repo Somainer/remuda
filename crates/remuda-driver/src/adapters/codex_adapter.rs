@@ -85,12 +85,22 @@ pub struct CodexAdapter {
     /// adapter keeps discovering (cheaply, via the locator's mtime/date
     /// pruning — c-usagefu r4 item 2/6) until it binds or the instance closes.
     discovery_gave_up: bool,
+    /// Process-wide same-cwd launch window for a driver launch. None for a
+    /// promoted/attach adapter (no launch floor); when two windows overlap
+    /// the cwd is ambiguous and this adapter fails closed (r4 item 3).
+    window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
 }
 
 impl CodexAdapter {
     /// Create an unbound adapter for a shadow `CODEX_HOME`.
     #[must_use]
     pub fn new(home: AdapterHome) -> Self {
+        // A driver launch joins/opens the process-wide same-cwd discovery
+        // window; a promoted attach (no floor) does not participate.
+        let window = home
+            .launched_at
+            .is_some()
+            .then(|| crate::adapters::codex_discovery::DiscoveryWindow::open(&home.cwd));
         Self {
             home,
             confirmed: None,
@@ -107,6 +117,7 @@ impl CodexAdapter {
             usage_totals: UsageAggregator::new(),
             fallback_model: None,
             discovery_gave_up: false,
+            window,
         }
     }
 
@@ -143,7 +154,18 @@ impl CodexAdapter {
 
     /// Bind the rollout tail for a discovered session.
     fn bind(&mut self, session_id: String, path: PathBuf) {
-        self.tail = Some(RolloutTail::new(path.clone()));
+        // A driver launch binds a session and must read only what is appended
+        // AFTER the bind — never byte zero, or a crash-loop relaunch within
+        // the clock slack re-journals the previous rollout (r4 item 3).
+        // Hook-confirmed / promoted attaches still hydrate from byte zero
+        // (their durable dedupe makes the replay harmless and the history is
+        // wanted).
+        let tail = if self.home.launched_at.is_some() {
+            RolloutTail::new_at_end(path.clone()).unwrap_or_else(|_| RolloutTail::new(path.clone()))
+        } else {
+            RolloutTail::new(path.clone())
+        };
+        self.tail = Some(tail);
         self.binding = Some(AdapterBinding {
             session_id: session_id.clone(),
             directory: path.parent().map(|parent| parent.to_path_buf()),
@@ -197,6 +219,12 @@ impl CodexAdapter {
         // No time deadline: the rollout can appear on a first prompt minutes
         // after launch. Old pre-launch rollouts are filtered by timestamp AND
         // skipped cheaply via mtime/date pruning in the locator.
+        // Cross-instance same-cwd: another launch window overlapping this cwd
+        // makes ownership unprovable for both, permanently.
+        if self.window.as_ref().is_some_and(|window| window.tainted()) {
+            self.discovery_gave_up = true;
+            return Ok(false);
+        }
         match locate_rollout_by_cwd(&self.home.home, &self.home.cwd, launched_at) {
             CwdRollout::Found { id, path } => {
                 self.confirmed = Some(id.clone());

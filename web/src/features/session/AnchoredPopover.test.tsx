@@ -162,6 +162,32 @@ describe("computeAnchored placement math", () => {
     expect(measured.maxHeight).toBe(99); // 60vh of 166 = 99, below the floor
   });
 
+  it("r5 item 5: a usable floor that would push the panel above the viewport is clamped to the margin", () => {
+    // Trigger top BELOW 136 (the floor needs more room than exists above) and
+    // below unusable (only 5px) so it cannot flip down: the unclamped up top
+    // would be negative, hiding the first rows. Top must clamp to the margin.
+    const measured = computeAnchored(
+      { top: 100, bottom: 130, left: 100, right: 200, width: 100 },
+      { preferredHeight: 300, width: 300 },
+      { width: 1440, height: 143 },
+      OPTS,
+    );
+    expect(measured.placement).toBe("up");
+    expect(measured.top).toBeGreaterThanOrEqual(8);
+  });
+
+  it("r5 item 5: a trigger with room below flips down instead of clamping an off-screen up panel", () => {
+    // Same low trigger but room BELOW the trigger: placement flips down.
+    const measured = computeAnchored(
+      { top: 100, bottom: 130, left: 100, right: 200, width: 100 },
+      { preferredHeight: 300, width: 300 },
+      // 300px below vs 92px above.
+      { width: 1440, height: 600 },
+      OPTS,
+    );
+    expect(measured.placement).toBe("down");
+  });
+
   it("item 5(a): the usable floor grows a sub-120 strip in a tall viewport", () => {
     // Dock near the bottom of a 900px viewport (below ~5px, unusable): the
     // plain above-room is 100px; the floor grows it to 120.

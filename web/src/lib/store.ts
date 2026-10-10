@@ -92,7 +92,6 @@ const HELD_RETRY_MAX_MS = 30_000;
 import { liveSummary } from "../features/session/liveSummary";
 import { HubHttpError, isUnauthorized } from "./httpError";
 import { hostClaudeVersion } from "./driverMatrix";
-import { isGenericPty } from "./status";
 import { e2eSeamsEnabled } from "./e2eSeams";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
@@ -284,6 +283,10 @@ function predictDriverCommandWord(
 ): string {
   const kind = instance?.kind ?? "claude";
   if (kind !== "claude") return effort.name;
+  // c-effortui r5 item 3: mirror effortVersionGate's carrier lock — a
+  // shell-pty driver never types the ultracode words; its predictor is always
+  // the plain level (the shell-pty carrier fails flag-on configure itself).
+  if (instance?.driver === "shell-pty") return effort.name;
   // Snapshot reported version first, then the host's pinned CLI (the store's
   // documented source order), mirroring HubStore.effortVersionGate.
   const hostId =
@@ -294,11 +297,17 @@ function predictDriverCommandWord(
   const gate = claudeVersionGate(reported ?? hostClaudeVersion(host) ?? "");
   if (gate === "coupled" && effort.ultracode) return "ultracode";
   if (gate === "decoupled") {
-    const observedName =
+    // c-effortui r5 item 2: mirror the driver's provenance fallback —
+    // observed effective, optimistic selection, then the durable instance
+    // record (effortName/effortUltracode) — so a session opened on another
+    // device / created outside this tab predicts the same word the driver
+    // types (driver: bridge.observed() ?? requested()).
+    const currentLevel =
       state.effortEffective[instanceId]?.name ??
       state.effort[instanceId]?.name ??
+      instance?.effortName ??
       null;
-    if (observedName === effort.name) {
+    if (currentLevel === effort.name) {
       return effort.ultracode ? "ultracode on" : "ultracode off";
     }
   }
@@ -351,10 +360,12 @@ function effortLifecycleRequest(word: string): EffortLifecycleRequest {
   return { name: normalized };
 }
 
-/** Whether a lifecycle word is an ultracode switch word (bare or toggle). */
+/** Whether a lifecycle word is an ultracode switch word (bare or toggle).
+ *  c-effortui r5 item 2: accept any separator the driver journals — the
+ *  actual command space form (`ultracode on`), plus `:`/`_`/`-`. */
 function lifecycleNamesUltraWord(word: string): boolean {
   const n = word.trim().toLowerCase();
-  return n === "ultracode" || n.startsWith("ultracode:") || n.startsWith("ultracode-");
+  return n === "ultracode" || /^ultracode[\s:_-]+(on|off)$/.test(n);
 }
 
 /** Whether a parsed lifecycle word refers to the in-flight request.
@@ -4044,11 +4055,13 @@ class HubStore {
    *  version. */
   effortVersionGate(instanceId: Id): ClaudeVersionGate {
     const instance = this.state.instances.find((row) => row.id === instanceId);
-    // c-effortui r4 item 5(c): a promoted-shell carrier cannot type the
-    // version-gated ultracode words (only the Herdr claude_pty carrier knows
-    // the reported build), so lock the switch for a generic PTY Claude
-    // regardless of the reported/pinned version.
-    if (instance && isGenericPty(instance)) return "unknown";
+    // c-effortui r4 item 5(c) / r5 item 3: the shell-pty CARRIER (promoted or
+    // generic) cannot type the version-gated ultracode words — only the Herdr
+    // claude_pty carrier accepts live flag-on configure (its driver refuses
+    // them for shell-pty). Key on the driver, not isGenericPty (which returns
+    // false for promoted shells and for shell-pty with a structured tier,
+    // leaving the switch enabled on a carrier that rejects every flag-on POST).
+    if (instance?.driver === "shell-pty") return "unknown";
     const reported = instance?.capabilities?.binaryVersion;
     if (reported) return claudeVersionGate(reported);
     if (instance) {

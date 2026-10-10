@@ -996,34 +996,96 @@ it("item 9: create seeds the orthogonal ultracode flag from the spec", async () 
   });
 });
 
-it("r4 item 5(c): a generic-PTY (promoted-shell) Claude session locks the ultracode switch even on 2.1.289", async () => {
-  // The shell-pty carrier cannot type version-gated ultracode words; the web
-  // gate must read "unknown" (switch locked, flag fails closed) regardless of
-  // the reported build.
+it("r5 item 3: the ultracode lock keys on driver shell-pty, including PROMOTED shells on 2.1.289", async () => {
+  // r4 keyed on isGenericPty(), which returns false for promoted shells
+  // (mode==="promoted") and for shell-pty with a structured tier — leaving the
+  // switch enabled on a carrier that refuses every flag-on configure. The lock
+  // must follow the DRIVER.
   const host = {
     id: "host-shell-pty",
     label: "shell pty",
     state: "online" as const,
     cli: [{ kind: "claude", version: "2.1.289", installed: true }],
   } as never;
-  const generic: Instance = {
+  const cases: Array<{ label: string; mode: Instance["mode"]; signalTier: string }> = [
+    // Generic promoted shell (no structured signal).
+    { label: "generic", mode: "native", signalTier: "none" },
+    // r5 regression: a PROMOTED shell — isGenericPty() returns false here.
+    { label: "promoted", mode: "promoted", signalTier: "hook" },
+    // r5 regression: shell-pty with a structured tier — also false.
+    { label: "structured-tier", mode: "native", signalTier: "hook" },
+  ];
+  for (const { label, mode, signalTier } of cases) {
+    const id = `ins_shell_pty_${label}`;
+    const shell: Instance = {
+      ...mockDb.instances[0],
+      id,
+      hostId: "host-shell-pty",
+      kind: "claude",
+      driver: "shell-pty",
+      mode,
+      nativeRef: { ...mockDb.instances[0].nativeRef, signalTier: signalTier as never },
+      capabilities: { ...mockDb.instances[0].capabilities, binaryVersion: "2.1.289" } as never,
+    };
+    hubStore["emit"]({ hosts: [host], instances: [shell] });
+    expect(hubStore.effortVersionGate(id), `${label} shell-pty locks`).toBe("unknown");
+    const gated = (hubStore as unknown as {
+      gateLiveEffort: (id: string, e: { name: string; index: number; kind: string; ultracode: boolean }) => unknown;
+    }).gateLiveEffort(id, { name: "xhigh", index: 3, kind: "claude", ultracode: true });
+    expect(gated, `${label} flag-on fails closed`).toMatchObject({ ultracode: false });
+  }
+
+  // claude-pty with 2.1.289 stays decoupled (the lock is carrier-specific).
+  const herdr: Instance = {
     ...mockDb.instances[0],
-    id: "ins_shell_pty_gate",
+    id: "ins_herdr_claude_pty",
     hostId: "host-shell-pty",
     kind: "claude",
-    driver: "shell-pty",
-    // shell-pty with a non-structured signal tier → isGenericPty() true.
-    nativeRef: { ...mockDb.instances[0].nativeRef, signalTier: "none" },
-    mode: "native",
+    driver: "claude-pty",
     capabilities: { ...mockDb.instances[0].capabilities, binaryVersion: "2.1.289" } as never,
   };
-  hubStore["emit"]({ hosts: [host], instances: [generic] });
-  expect(hubStore.effortVersionGate(generic.id)).toBe("unknown");
-  // And a live flag-on configure fails closed to the level.
-  const gated = (hubStore as unknown as {
-    gateLiveEffort: (id: string, e: { name: string; index: number; kind: string; ultracode: boolean }) => unknown;
-  }).gateLiveEffort(generic.id, { name: "xhigh", index: 3, kind: "claude", ultracode: true });
-  expect(gated).toMatchObject({ ultracode: false });
+  hubStore["emit"]({ instances: [herdr] });
+  expect(hubStore.effortVersionGate(herdr.id)).toBe("decoupled");
+});
+
+it("r5 item 2: the command-word predictor falls back to the durable record on reload/other device", async () => {
+  // A decoupled session pinned {high,false}, opened with NO live effective
+  // projection and NO optimistic selection (reload on another device / created
+  // outside this tab): flipping the switch on must predict "ultracode on" —
+  // matching the driver (which falls back observed ?? requested ?? launch).
+  // The r4 predictor only read effective/optimistic state and predicted
+  // "high", so queued/applied/degraded ("ultracode on|off") never matched.
+  const ctx = await startFollowing("predictor-durable-fallback");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const row: Instance = {
+    ...ctx.instance,
+    driver: "claude-pty",
+    capabilities: { ...ctx.instance.capabilities, binaryVersion: "2.1.289" },
+    effortName: "high",
+    effortIndex: 2,
+    effortUltracode: false,
+  };
+  hubStore["emit"]({ hosts: [], instances: [row] });
+  // Ensure no live/optimistic state shadows the durable record.
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  // Flip the switch on (wire {high,ultracode:true}); the predictor must use
+  // the durable record fallback and predict "ultracode on".
+  await hubStore.setUltracode(ctx.instance.id, true);
+  const queuedWord = (() => {
+    const p = (hubStore as unknown as {
+      state: { effortPending: Record<string, { commandWord?: string }> };
+    }).state.effortPending[ctx.instance.id];
+    return p?.commandWord;
+  })();
+  expect(queuedWord).toBe("ultracode on");
+  // Lifecycle matching accepts the space form (r5 item 2 separator fix).
+  // Applied (not degraded) so the applied word match path settles it.
+  // Applied (not degraded) so the applied-word match path settles it.
+  ctx.receive(configureLifecycle(2, "effort-applied:ultracode on", "xhigh"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  hubStore.logout();
 });
 
 it("r4 item 4: a coupled drag to max survives a reload with persisted {xhigh,true}", async () => {

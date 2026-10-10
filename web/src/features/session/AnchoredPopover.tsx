@@ -173,10 +173,18 @@ export function computeAnchored(
   const maxLeft = Math.max(margin, viewport.width - margin - panel.width);
   left = Math.min(Math.max(margin, left), maxLeft);
 
-  const top =
+  let top =
     placement === "up"
       ? triggerRect.top - gap - panelHeight
       : triggerRect.bottom + gap;
+  // c-effortui r5 item 5: a usable-min floor on a trigger sitting LOW
+  // (top < DOWN_USABLE) can put the panel's first rows off the top of the
+  // viewport. Clamp to the margin when there is no usable room below either;
+  // if below IS usable the placement logic above would have flipped down, so
+  // this only trims an unavoidable up panel.
+  if (placement === "up" && top < margin) {
+    top = margin;
+  }
   return { placement, left, top, maxHeight };
 }
 

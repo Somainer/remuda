@@ -341,6 +341,47 @@ it("item 3: request A's read-back never settles B — queued threshold and the r
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
+it("r4 item 3: a decoupled tier drag with the flag on is matched by the plain level lifecycle word", async () => {
+  // On decoupled builds the driver types a plain `/effort max` for a
+  // {max,true} TIER move (the ortho flag rides along), so the queued/applied/
+  // degraded lifecycle carries the LEVEL word even though the pending's flag
+  // is on. The pending must be matched and cleared — 切换中 must not stick.
+  const ctx = await startFollowing("decoupled-drag-flag-on", { state: "known", value: "working" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const row: Instance = {
+    ...ctx.instance,
+    durableSeq: "99",
+    effortEffective: {
+      name: "high",
+      ultracode: true,
+      source: "remuda",
+      observedAt: "2026-10-08T12:00:00.000Z",
+    },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [row] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  hubStore["emit"]({ instances: [row] });
+  await hubStore.refresh();
+
+  // Drag to max with the flag still on → the driver types plain /effort max.
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: true });
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.commandWord).toBe("max");
+
+  // QUEUED with the LEVEL word despite flag=true.
+  ctx.receive(configureLifecycle(2, "effort-queued:max", "x", "2026-10-08T12:01:01.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({
+    name: "max",
+    ultracode: true,
+    queued: true,
+  });
+
+  // A flag REFUSAL word ("ultracode") for the same request also clears the
+  // pending (the configure carried the flag even though the typed word was
+  // the plain level).
+  ctx.receive(configureLifecycle(3, "effort-degraded:max:dialog-kept", "x", "2026-10-08T12:01:05.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
 it("a decoupled queued `ultracode on` edge names the flag request and keeps the tier", async () => {
   // The driver's decoupled command word is "ultracode on" (a space); the
   // queued/applied lifecycle must parse as the FLAG axis, not an unknown tier.
@@ -953,6 +994,81 @@ it("item 9: create seeds the orthogonal ultracode flag from the spec", async () 
     name: "high",
     ultracode: false,
   });
+});
+
+it("r4 item 5(c): a generic-PTY (promoted-shell) Claude session locks the ultracode switch even on 2.1.289", async () => {
+  // The shell-pty carrier cannot type version-gated ultracode words; the web
+  // gate must read "unknown" (switch locked, flag fails closed) regardless of
+  // the reported build.
+  const host = {
+    id: "host-shell-pty",
+    label: "shell pty",
+    state: "online" as const,
+    cli: [{ kind: "claude", version: "2.1.289", installed: true }],
+  } as never;
+  const generic: Instance = {
+    ...mockDb.instances[0],
+    id: "ins_shell_pty_gate",
+    hostId: "host-shell-pty",
+    kind: "claude",
+    driver: "shell-pty",
+    // shell-pty with a non-structured signal tier → isGenericPty() true.
+    nativeRef: { ...mockDb.instances[0].nativeRef, signalTier: "none" },
+    mode: "native",
+    capabilities: { ...mockDb.instances[0].capabilities, binaryVersion: "2.1.289" } as never,
+  };
+  hubStore["emit"]({ hosts: [host], instances: [generic] });
+  expect(hubStore.effortVersionGate(generic.id)).toBe("unknown");
+  // And a live flag-on configure fails closed to the level.
+  const gated = (hubStore as unknown as {
+    gateLiveEffort: (id: string, e: { name: string; index: number; kind: string; ultracode: boolean }) => unknown;
+  }).gateLiveEffort(generic.id, { name: "xhigh", index: 3, kind: "claude", ultracode: true });
+  expect(gated).toMatchObject({ ultracode: false });
+});
+
+it("r4 item 4: a coupled drag to max survives a reload with persisted {xhigh,true}", async () => {
+  const ctx = await startFollowing("coupled-reloaded-drag");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // Pinned 2.1.277 (coupled); the DURABLE record is {xhigh,true} — the
+  // post-reload/other-device state, with NO optimistic state.effort entry.
+  await pinGate(ctx, "2.1.277");
+  const recorded: Instance = {
+    ...ctx.instance,
+    durableSeq: "100",
+    capabilities: { ...ctx.instance.capabilities, binaryVersion: "2.1.277" },
+    effortName: "xhigh",
+    effortIndex: 3,
+    effortUltracode: true,
+    effortEffective: {
+      name: "xhigh",
+      ultracode: true,
+      source: "remuda",
+      observedAt: "2026-10-08T12:00:00.000Z",
+    },
+  };
+  vi.mocked(api.instanceList).mockResolvedValue({ items: [recorded] } as never);
+  hubStore["emit"]({ instances: [recorded] });
+  await hubStore.refresh();
+  // The optimistic-only map is empty after reload (record drives effortOf).
+  expect(hubStore["state"].effort[ctx.instance.id]).toBeUndefined();
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({
+    name: "xhigh",
+    ultracode: true,
+  });
+
+  // First drag to max must NOT be re-linked to xhigh: coupled flag exists only
+  // at xhigh, so it posts {max,false} exactly once and the slider stays on max.
+  let posted: { name?: string; ultracode?: boolean } = {};
+  vi.mocked(api.instanceConfigure).mockImplementation(
+    (_id: string, _perm: string, extras?: { effort?: { name?: string; ultracode?: boolean } }) => {
+      posted = extras?.effort ?? {};
+      return Promise.resolve({} as never);
+    },
+  );
+  // PRE gate", hubStore.effortVersionGate(ctx.instance.id), "effortOf", JSON.stringify(hubStore.effortOf(ctx.instance.id,"claude")), "inst", hubStore["state"].instances.find(i=>i.id===ctx.instance.id)?.effortName, hubStore["state"].instances.find(i=>i.id===ctx.instance.id)?.effortUltracode);
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: true });
+  expect(posted).toMatchObject({ name: "max", ultracode: false });
+  expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({ name: "max" });
 });
 
 it("item 2 coupled: turning the switch on moves the slider to xhigh and posts {xhigh,on}", async () => {

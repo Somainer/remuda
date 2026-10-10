@@ -92,6 +92,7 @@ const HELD_RETRY_MAX_MS = 30_000;
 import { liveSummary } from "../features/session/liveSummary";
 import { HubHttpError, isUnauthorized } from "./httpError";
 import { hostClaudeVersion } from "./driverMatrix";
+import { isGenericPty } from "./status";
 import { e2eSeamsEnabled } from "./e2eSeams";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
@@ -145,6 +146,17 @@ export type EffortPending = {
    * stale verdict and is ignored (c-effortui r2 item 2).
    */
   source: "client" | "lifecycle";
+  /**
+   * The exact command word the DRIVER types for this configure
+   * (c-effortui r4 item 3). On decoupled builds a TIER move with the flag on
+   * is a plain level word (`/effort max` leaves the ortho flag as-is), so its
+   * `effort-queued/applied/degraded:<word>` lifecycle carries the LEVEL even
+   * though the request's flag is true. Matching purely on
+   * `{name,ultracode}` rejected that word (flag-on pending vs level word) and
+   * stuck the indicator; the matcher compares the lifecycle word to this.
+   * `null` for wire-owned pendings synthesized from the word itself.
+   */
+  commandWord: string | null;
 };
 
 /**
@@ -254,6 +266,45 @@ function permissionLifecycleStatus(status: unknown):
 
 const PERMISSION_PENDING_MAX_AGE_MS = 30 * 60_000;
 
+/**
+ * Predict the EXACT word the driver types for a live configure
+ * (c-effortui r4 item 3; mirrors remuda-driver `EffortRequest::for_configure`).
+ * The driver journals the typed command word in its queued/applied/degraded
+ * lifecycle; on decoupled builds a TIER move that carries the flag
+ * (`{max,true}`) is typed as the plain level (`/effort max` leaves the ortho
+ * flag untouched), so a flag-ON pending can legitimately carry a level
+ * lifecycle word. Same observed tier + flag change → `ultracode on|off`;
+ * a tier move → the level word; coupled flag-on → `ultracode`.
+ */
+function predictDriverCommandWord(
+  effort: EffortSelection,
+  instance: Instance | undefined,
+  state: HubState,
+  instanceId: Id,
+): string {
+  const kind = instance?.kind ?? "claude";
+  if (kind !== "claude") return effort.name;
+  // Snapshot reported version first, then the host's pinned CLI (the store's
+  // documented source order), mirroring HubStore.effortVersionGate.
+  const hostId =
+    instance?.hostId ??
+    state.instances.find((row) => row.id === instanceId)?.hostId;
+  const host = state.hosts.find((h) => h.id === hostId);
+  const reported = instance?.capabilities?.binaryVersion;
+  const gate = claudeVersionGate(reported ?? hostClaudeVersion(host) ?? "");
+  if (gate === "coupled" && effort.ultracode) return "ultracode";
+  if (gate === "decoupled") {
+    const observedName =
+      state.effortEffective[instanceId]?.name ??
+      state.effort[instanceId]?.name ??
+      null;
+    if (observedName === effort.name) {
+      return effort.ultracode ? "ultracode on" : "ultracode off";
+    }
+  }
+  return effort.name;
+}
+
 /** Parse an `instance.configure` effort lifecycle status the driver journals. */
 function effortLifecycleStatus(status: unknown):
   | { kind: "queued" | "applied" | "degraded"; word: string; reason: string }
@@ -300,15 +351,36 @@ function effortLifecycleRequest(word: string): EffortLifecycleRequest {
   return { name: normalized };
 }
 
+/** Whether a lifecycle word is an ultracode switch word (bare or toggle). */
+function lifecycleNamesUltraWord(word: string): boolean {
+  const n = word.trim().toLowerCase();
+  return n === "ultracode" || n.startsWith("ultracode:") || n.startsWith("ultracode-");
+}
+
 /** Whether a parsed lifecycle word refers to the in-flight request.
- *  Compares BOTH axes (c-effortui r3 item 3): a plain level word carries no
- *  flag, so it cannot name a flag-on request; the coupled bare `ultracode` is
- *  the xhigh level command and must not match a flag request parked on another
- *  tier. A wire-owned (lifecycle-synthesized) pending bypasses this in its
- *  caller — the driver owns that request end to end. */
+ *  Prefer the pending's predicted COMMAND word (c-effortui r4 item 3): a
+ *  decoupled tier move with the flag on is typed as a plain level word. Only
+ *  when the pending carries no predicted word (older wire-owned pending) fall
+ *  back to comparing the two axes. A flag REFUSAL/verdict word also names any
+ *  flag-CARRYING pending: a configure that posted `{tier,true}` typed the
+ *  plain `/effort <tier>` can still come back as an ultracode refusal. */
 function effortLifecycleMatches(pending: EffortPending, word: string): boolean {
+  if (pending.commandWord !== null) {
+    const normalized = word.trim().toLowerCase();
+    // Exact predicted word (level word, bare coupled word, decoupled toggle).
+    if (normalized === pending.commandWord) return true;
+    // "ultracode on|off" prediction also accepts the bare switch word used by
+    // journal/fake-node refusal and degradation statuses.
+    if (pending.commandWord.startsWith("ultracode ") && normalized === "ultracode") {
+      return true;
+    }
+    // A flag CARRYING request (typed as a plain tier move on decoupled) can
+    // still be refused/degraded via the ultracode switch word.
+    if (pending.ultracode && lifecycleNamesUltraWord(normalized)) return true;
+    return false;
+  }
   const request = effortLifecycleRequest(word);
-  const bareCoupled = word.trim().toLowerCase() === "ultracode";
+  const bareCoupled = normalizedWordIsBareUltracode(word);
   if (request.name !== undefined) {
     if (request.name !== pending.name) return false;
     if (pending.ultracode) return false;
@@ -318,6 +390,10 @@ function effortLifecycleMatches(pending: EffortPending, word: string): boolean {
     if (bareCoupled && pending.name !== "xhigh") return false;
   }
   return request.name !== undefined || request.ultracode !== undefined;
+}
+
+function normalizedWordIsBareUltracode(word: string): boolean {
+  return word.trim().toLowerCase() === "ultracode";
 }
 
 /**
@@ -1332,6 +1408,10 @@ class HubStore {
           levelSettled: false,
           flagSettled: false,
           source: "lifecycle",
+          // Synthesized from the driver's own queued word; it is its own
+          // command-word identity, so leave the client prediction null and
+          // match via the two-axis fallback.
+          commandWord: null,
         };
         this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: current.nonce } });
       }
@@ -3785,15 +3865,30 @@ class HubStore {
     if ((instance?.kind ?? "claude") !== "claude") return requested;
     const gate = this.effortVersionGate(instanceId);
     if (gate === "coupled") {
-      const current = this.state.effort[instanceId];
-      // Same tier as the current optimistic selection (or no tier yet) with
-      // the flag on = the switch itself was flipped → link it to xhigh.
-      if (requested.ultracode === true && (!current || current.name === requested.name)) {
+      // c-effortui r4 item 4: read the CURRENT selection from the same source
+      // the UI renders (`effortOf`), not the optimistic-only `state.effort`
+      // map, which is empty after a reload or on another device. With a
+      // persisted record {xhigh,true} a drag to max otherwise saw no current
+      // selection and re-linked the switch to xhigh, swallowing the first drag
+      // and re-typing `/effort ultracode`.
+      const current = this.effortOf(instanceId, "claude");
+      const currentTier = current.name;
+      // Same tier as the current selection with the flag on = the switch
+      // itself was flipped → link it to xhigh. When the current tier is
+      // unknown (no record and no optimistic choice) the first flag-on links
+      // too, preserving the cold-start switch behaviour.
+      const hasRecord =
+        Boolean(this.state.effort[instanceId]) ||
+        Boolean(instance?.effortName) ||
+        Boolean(this.state.effortEffective[instanceId]);
+      if (requested.ultracode === true && (!hasRecord || currentTier === requested.name)) {
         return coupledSelection(requested);
       }
-      // A tier move: the coupled flag exists only at xhigh.
+      // A tier move away from xhigh: the coupled flag exists only at xhigh,
+      // so the flag is OFF no matter what the caller's optimistic axes carried
+      // (e.g. a drag whose input still rides the flag from the old tier).
       if (requested.name !== "xhigh" || requested.index !== CLAUDE_XHIGH_INDEX) {
-        return requested.ultracode === true ? { ...requested, ultracode: false } : requested;
+        return { ...requested, ultracode: false };
       }
       return requested;
     }
@@ -3813,6 +3908,11 @@ class HubStore {
     // replaced request's late events cannot settle this indicator.
     const nonce = (this.state.effortNonces[instanceId] ?? 0) + 1;
     const currentView = this.state.effortEffective[instanceId] ?? null;
+    // c-effortui r4 item 3: predict the exact word the driver will type so the
+    // queued/applied/degraded lifecycle (which echoes the typed command word)
+    // can be matched even when a decoupled TIER move carries the flag — the
+    // driver then types the plain level word with flag=true in the payload.
+    const commandWord = predictDriverCommandWord(effort, instance, this.state, instanceId);
     const pending: EffortPending = {
       nonce,
       name: effort.name,
@@ -3825,6 +3925,7 @@ class HubStore {
       levelSettled: currentView?.name === effort.name,
       flagSettled: effort.ultracode !== true && currentView?.ultracode !== true,
       source: "client",
+      commandWord,
     };
     this.settledEffortPushdown.delete(instanceId);
     // Optimistically adopt the requested axes SYNCHRONOUSLY, before the
@@ -3914,6 +4015,11 @@ class HubStore {
    *  version. */
   effortVersionGate(instanceId: Id): ClaudeVersionGate {
     const instance = this.state.instances.find((row) => row.id === instanceId);
+    // c-effortui r4 item 5(c): a promoted-shell carrier cannot type the
+    // version-gated ultracode words (only the Herdr claude_pty carrier knows
+    // the reported build), so lock the switch for a generic PTY Claude
+    // regardless of the reported/pinned version.
+    if (instance && isGenericPty(instance)) return "unknown";
     const reported = instance?.capabilities?.binaryVersion;
     if (reported) return claudeVersionGate(reported);
     if (instance) {

@@ -324,8 +324,11 @@ impl EffortRequest {
     ///   requested selection this is the orthogonal toggle
     ///   (`/effort ultracode on|off`); when the tier moves, the flag is
     ///   genuinely orthogonal and a plain `/effort <level>` leaves it as is.
-    ///   With no prior selection (unknown provenance) a level word is the safe
-    ///   spelling — a guessed `ultracode off` could toggle a live flag.
+    ///   With no prior selection, a flag-ON request can only be the first
+    ///   switch flip (a flag-on drag rides an already-on flag, so a prior
+    ///   request must exist) and is typed `ultracode on` at the carried tier;
+    ///   flag-off with no provenance stays a plain level word rather than
+    ///   guessing at a live flag.
     /// - Legacy/unknown: a flag-on request is rejected by the caller's version
     ///   gate; here only plain level words are produced.
     pub(crate) fn for_configure(
@@ -361,6 +364,28 @@ impl EffortRequest {
                     } else {
                         "ultracode off"
                     },
+                });
+            }
+            // No provenance: a first flag-on at this carried tier is the
+            // toggle; resolve the tier from the level word so later
+            // same-tier requests compare correctly.
+            if current.is_none() && ultracode == Some(true) {
+                let name = match normalized.as_str() {
+                    "low" => EffortName::Low,
+                    "medium" => EffortName::Medium,
+                    "high" => EffortName::High,
+                    "xhigh" => EffortName::Xhigh,
+                    "max" => EffortName::Max,
+                    other => {
+                        // Unknown/non-Claude tier with a flag: never guess a
+                        // toggle; let from_level produce the honest None.
+                        return Self::from_level(other);
+                    }
+                };
+                return Some(Self {
+                    name,
+                    ultracode: true,
+                    word: "ultracode on",
                 });
             }
         }
@@ -1206,12 +1231,14 @@ mod sync_tests {
             EffortRequest::for_configure("max", Some(false), Coupled, None).unwrap();
         assert_eq!(coupled_level.command_word(), "max");
 
-        // Decoupled, no provenance: the safe spelling is always the level —
-        // never a guessed `ultracode off` that could toggle a live flag.
+        // Decoupled, no provenance: a first flag-OFF is the plain level (never
+        // a guessed `ultracode off` that could toggle a live flag)…
         let cold = EffortRequest::for_configure("high", Some(false), Decoupled, None).unwrap();
         assert_eq!(cold.command_word(), "high");
+        // …but a first flag-ON can only be the switch flip at the carried tier.
         let cold_on = EffortRequest::for_configure("high", Some(true), Decoupled, None).unwrap();
-        assert_eq!(cold_on.command_word(), "high");
+        assert_eq!(cold_on.command_word(), "ultracode on");
+        assert_eq!(cold_on.name, EffortName::High);
 
         // Decoupled, same tier as the last request: the flag toggle words.
         let current_high = EffortRequest::from_selection(sel(EffortName::High, false));

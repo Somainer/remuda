@@ -143,10 +143,36 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         if close_stdin && !was_initialized && session.saw_initialize {
             #[cfg(unix)]
             {
-                // Drop our read end of stdin. `std::io::stdin()` only borrows
-                // fd 0, so that alone leaves the pipe open; close the fd
-                // outright (safe wrapper forbidden by the workspace lint).
-                let _ = nix::unistd::close(0);
+                use std::os::fd::AsRawFd;
+                let dbg = std::fs::read_dir("/proc/self/fd")
+                    .map(|rd| {
+                        rd.flatten()
+                            .map(|e| {
+                                let n = e.file_name().to_string_lossy().into_owned();
+                                let tgt = std::fs::read_link(e.path())
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                format!("{n}->{tgt}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                eprintln!(
+                    "CLOSESTDIN before close fd0_raw={} fds={dbg}",
+                    std::io::stdin().as_raw_fd()
+                );
+                let rc = nix::unistd::close(0);
+                eprintln!(
+                    "CLOSESTDIN close rc={rc:?} fds_after_close: {}",
+                    std::fs::read_dir("/proc/self/fd")
+                        .map(|rd| rd
+                            .flatten()
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" "))
+                        .unwrap_or_default()
+                );
             }
             std::thread::sleep(std::time::Duration::from_secs(300));
         }

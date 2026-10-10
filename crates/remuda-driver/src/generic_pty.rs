@@ -546,9 +546,11 @@ impl GenericPtyDriver {
     /// reports no child pid); codex (r3 item 1) binds only a UNIQUE rollout
     /// whose cwd is this launch cwd and whose session started at/after THIS
     /// launch — a same-cwd collision fails closed, and the `session_index`
-    /// "newest renamed thread anywhere" guess is never used. A tail that
-    /// cannot start yet (the session has not registered) keeps retrying on its
-    /// poll tick until the adapter's short discovery window elapses. Failure
+    /// "newest renamed thread anywhere" guess is never used. A bound rollout
+    /// must additionally carry a first prompt THIS driver dispatched (r5
+    /// item 5), and a tail that cannot start yet (the lazily-created 0.154
+    /// rollout has not registered) keeps retrying, cheaply via mtime pruning,
+    /// until the adapter binds or the instance closes. Failure
     /// to spawn degrades silently, like the promoted-adapter watch — losing
     /// the file channel never fails the launch.
     fn spawn_file_tail_adapters(

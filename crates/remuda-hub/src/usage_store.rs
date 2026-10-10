@@ -724,27 +724,37 @@ pub enum BudgetStatus {
 /// Cost column for an aggregate query.
 ///
 /// Stock vs flow, per session then per instance (c-usagefu r4 item 1; r5
-/// item 3):
+/// items 3/7):
 /// - a `session` row is a CUMULATIVE STOCK. The billable value is the NEWEST
 ///   accepted point per `(instance_id, scope_id)` and those per-session
 ///   stocks are SUMMED — a single global newest row let one instance answer
 ///   for ten, and interleaving sessions flipped the number;
-/// - newest points are ranked over ALL session rows, including NULL costs.
-///   When ANY of an instance's session partitions has a NULL newest point
-///   (the driver-priced running cost went Unknown after an unpriced turn —
-///   sticky Unknown, r5 item 4), the instance is treated as STOCK-LESS for
-///   billing: its per-call FLOW estimates are summed instead, so the budget
-///   band keeps advancing rather than freezing at the last priced stock;
+/// - scoped and LEGACY NULL-scope rows never mix. When an instance has ANY
+///   scoped session row, NULL-scope rows are the pre-`scopeId` world and are
+///   excluded from the partition set entirely (same rule as the token stock,
+///   c-ctxusage r5 item 3B), so a session straddling the upgrade is not
+///   double-counted; the legacy chain is used only when no scoped row exists;
+/// - newest points are ranked over all ELIGIBLE session rows, including NULL
+///   costs. When any partition's newest point is NULL (the driver-priced
+///   running cost went Unknown after an unpriced turn — sticky Unknown), the
+///   instance is STOCK-LESS for billing and its per-call FLOW estimates are
+///   summed instead, so the budget band keeps advancing;
 /// - per-call (`turn`/`message`) rows therefore count for exactly the
-///   instances not in the stock-eligible set (a per-call-only SDK session on
-///   a profile is never wiped by a priced session on another instance).
+///   instances not in the stock-eligible set.
 ///
-/// Each aggregate builds one statement with two CTEs (`r5_` prefix avoids
-/// clashes with other callers): `r5_newest_stock` and
-/// `r5_stock_instances`.
+/// `r5_` CTEs: `r5_scoped_instances` (instances with any scoped session
+/// row), `r5_eligible_stock` (newest point per scoped partition, plus the
+/// legacy NULL chain where no scoped row exists), `r5_stock_instances`
+/// (instances whose every newest point is priced). Pricing decisions are
+/// precomputed once per statement; the flow subquery joins the CTEs rather
+/// than running a correlated NOT EXISTS per row.
 fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate: &str) -> String {
     format!(
-        "WITH r5_newest_stock AS (
+        "WITH r5_scoped_instances AS (
+            SELECT DISTINCT instance_id FROM usage_events
+            WHERE {stock_predicate} AND scope = 'session' AND scope_id IS NOT NULL
+         ),
+         r5_eligible_stock AS (
             SELECT instance_id, scope_id, cost FROM (
                 SELECT instance_id, scope_id,
                        CAST(cost_usd AS REAL) AS cost,
@@ -753,27 +763,42 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
                        ) AS rn
                 FROM usage_events
                 WHERE {stock_predicate} AND scope = 'session'
+                  AND (
+                      scope_id IS NOT NULL
+                      OR instance_id NOT IN (
+                          SELECT instance_id FROM r5_scoped_instances
+                      )
+                  )
             )
             WHERE rn = 1
          ),
          r5_stock_instances AS (
-            SELECT instance_id FROM r5_newest_stock
+            SELECT instance_id FROM r5_eligible_stock
             GROUP BY instance_id
             HAVING COUNT(cost) = COUNT(*)
+         ),
+         r5_flow_instances AS (
+            -- Every instance in the aggregate except those fully covered by
+            -- priced stock: includes instances that have session rows at all
+            -- (eligible-stock set, NULL-newest excluded above) AND instances
+            -- with only per-call rows (no session rows).
+            SELECT DISTINCT instance_id FROM usage_events
+            WHERE ({stock_predicate} OR scope != 'session')
+            EXCEPT
+            SELECT instance_id FROM r5_stock_instances
          )
          SELECT COUNT(*),
                 COALESCE(SUM(total_tokens), 0),
                 COALESCE(SUM(input_tokens), 0),
                 COALESCE(SUM(output_tokens), 0),
-                (SELECT COALESCE(SUM(cost), 0.0) FROM r5_newest_stock
+                (SELECT COALESCE(SUM(cost), 0.0) FROM r5_eligible_stock
                  WHERE instance_id IN (SELECT instance_id FROM r5_stock_instances))
                 +
                 (SELECT COALESCE(SUM(CAST(flow.cost_usd AS REAL)), 0.0)
                  FROM usage_events flow
-                 WHERE {flow_predicate} AND flow.scope != 'session'
-                   AND flow.instance_id NOT IN (
-                       SELECT instance_id FROM r5_stock_instances
-                   ))
+                 JOIN r5_flow_instances
+                   ON r5_flow_instances.instance_id = flow.instance_id
+                 WHERE {flow_predicate} AND flow.scope != 'session')
          FROM usage_events WHERE {outer_predicate}"
     )
 }
@@ -1902,6 +1927,53 @@ mod tests {
             (supply.cost_usd - 0.30).abs() < 1e-9,
             "supply advances on flow after the NULL newest point, got {}",
             supply.cost_usd
+        );
+    }
+
+    #[test]
+    fn legacy_null_scope_cost_is_ignored_once_an_instance_has_scoped_sessions() {
+        // r5 item 7: a session that straddled the scopeId upgrade has both
+        // legacy NULL-scope rows and newer scoped rows. The legacy chain and
+        // the scoped partitions are the SAME cumulative session, so summing
+        // both double-counts. Scoped wins (matching the token rule): once any
+        // scoped row exists, NULL-scope stock contributes nothing.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // Legacy world: NULL scope_id priced at 0.40.
+        let mut legacy = tokenless_session_record(1, "ignored-scope", 1, Some("0.40"));
+        legacy.event["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scopeId");
+        assert!(insert(&conn, &legacy));
+        // Post-upgrade: scoped cumulative 0.50.
+        assert!(insert(
+            &conn,
+            &tokenless_session_record_for("ins_test", 2, "s1", 1, Some("0.50"))
+        ));
+
+        let agg = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!(
+            (agg.cost_usd - 0.50).abs() < 1e-9,
+            "scoped stock alone counts (no 0.40 + 0.50), got {}",
+            agg.cost_usd
+        );
+
+        // With no scoped rows the legacy NULL-scope chain still works on its
+        // own.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut legacy = tokenless_session_record(1, "ignored-scope", 1, Some("0.30"));
+        legacy.event["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scopeId");
+        assert!(insert(&conn, &legacy));
+        let agg = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!(
+            (agg.cost_usd - 0.30).abs() < 1e-9,
+            "legacy chain still sums"
         );
     }
 

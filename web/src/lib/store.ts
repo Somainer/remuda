@@ -523,11 +523,15 @@ export type HubState = {
   effortNonces: Record<string, number>;
   /** GET /v1/supply/catalog rows (per-model default + ultracode capability). */
   supplyCatalog: ModelEffortCatalogRow[] | null;
-  /** r7 item 4(a): instances whose read-back was withdrawn by an explicit
-   *  `readbackAvailable:false` edge (or a Hub projection going from a level
-   *  to null). Distinct from "never read back": a pending push-down renders
-   *  `?` only while this is true, never merely because no edge arrived. */
-  effortReadbackWithdrawn: Record<string, boolean>;
+  /** r7 item 4(a) / c-effortread r8 item 1: per-instance read-back WITHDRAWAL
+   *  WATERMARK — the parsed observedAt of the latest `readbackAvailable:false`
+   *  edge (or Hub projection level→null). Any level view at or OLDER than the
+   *  watermark is rejected (a "Load earlier" older edge cannot restore a
+   *  withdrawn level); only a strictly newer valid view clears it. Absent =
+   *  not withdrawn. Distinct from "never read back": a pending push-down
+   *  renders `?` only while a watermark exists, never merely because no edge
+   *  arrived. */
+  effortReadbackWithdrawn: Record<string, string>;
   /** context-usage-1 Hub-computed token/context rollup per instance.
    *  Hydrated separately from `instances` for the same reason effort is:
    *  mergeInstanceSnapshots keeps the local instance while its
@@ -1008,16 +1012,27 @@ class HubStore {
       if (!view) {
         // r7 item 4(a): distinguish "the Hub projection went from a level to
         // null" (an explicit withdrawal) from "never projected". The pending
-        // chip shows `?` only for the former.
+        // chip shows `?` only for the former. c-effortread r8 item 1: record
+        // the watermark as the previous projection's observedAt (the null
+        // record carries no timestamp) so older poll/load-earlier edges can't
+        // restore it.
         if (previousPoll) {
           delete next[id];
-          withdrawnNext[id] = true;
+          withdrawnNext[id] = previousPoll.observedAt || "";
           effectiveUpdated = true;
         }
         continue;
       }
-      // A real projection clears the withdrawal marker.
-      if (withdrawnNext[id]) {
+      // c-effortread r8 item 1: a poll carrying a view at or older than the
+      // withdrawal watermark is stale (an in-flight poll with the
+      // pre-withdrawal record) — keep the projection withdrawn, do not clear
+      // the marker or move the slider.
+      const watermark = withdrawnNext[id];
+      if (watermark != null && (!view.observedAt || Date.parse(view.observedAt) <= Date.parse(watermark))) {
+        continue;
+      }
+      // A strictly newer real projection clears the withdrawal watermark.
+      if (withdrawnNext[id] != null) {
         delete withdrawnNext[id];
         effectiveUpdated = true;
       }
@@ -1250,33 +1265,47 @@ class HubStore {
     // pending switch and do not move the optimistic slider — the configure
     // outcome (or its bounded timeout) owns the pending indicator.
     if (parsed.withdrawn) {
+      const at = parsed.observedAt ?? null;
       const held = this.state.effortEffective[instanceId];
-      if (!held) return true;
       // r6 item 8(a): a withdrawal arriving out of order (e.g. via
       // "Load earlier" AFTER a later valid edge M) is older history and must
       // not delete the newer projection.
-      if (
-        parsed.observedAt
-        && Date.parse(parsed.observedAt) < Date.parse(held.observedAt)
-      ) {
+      if (held && at && Date.parse(at) < Date.parse(held.observedAt)) {
         return false;
+      }
+      // c-effortread r8 item 1: raise/keep the watermark even when nothing is
+      // currently held (reload with withdrawal in seed history, or an earlier
+      // edge already cleared the projection), so a following OLDER level edge
+      // (onPrepend replay, in-flight poll with the pre-withdrawal record) can
+      // never re-project a withdrawn level.
+      const watermarks = this.state.effortReadbackWithdrawn;
+      const previous = watermarks[instanceId];
+      if (at && previous && Date.parse(at) <= Date.parse(previous)) {
+        // An older withdrawal changes nothing further; still clear a stale
+        // projection if one exists.
+        if (!held) return true;
       }
       const effortEffective = { ...this.state.effortEffective };
       delete effortEffective[instanceId];
-      this.emit({
-        effortEffective,
-        effortReadbackWithdrawn: {
-          ...this.state.effortReadbackWithdrawn,
-          [instanceId]: true,
-        },
-      });
+      const nextWatermarks = { ...watermarks, [instanceId]: at ?? previous ?? "" };
+      this.emit({ effortEffective, effortReadbackWithdrawn: nextWatermarks });
       return true;
     }
     const view = parsed.effective;
     if (!view) return false;
     const current = this.state.effortEffective[instanceId];
     if (current && Date.parse(view.observedAt) < Date.parse(current.observedAt)) return false;
-    const withdrawnClear = this.state.effortReadbackWithdrawn[instanceId] === true;
+    // c-effortread r8 item 1: reject any level view at or OLDER than the
+    // withdrawal watermark — an older edge replayed via "Load earlier" (or an
+    // in-flight poll carrying the pre-withdrawal record) must not restore the
+    // withdrawn level. Only a strictly newer view clears the watermark.
+    const withdrawnAt = this.state.effortReadbackWithdrawn[instanceId];
+    if (withdrawnAt != null) {
+      if (!view.observedAt || Date.parse(view.observedAt) <= Date.parse(withdrawnAt)) {
+        return false;
+      }
+    }
+    const withdrawnClear = withdrawnAt != null;
     const patch: Partial<HubState> = {
       effortEffective: {
         ...this.state.effortEffective,
@@ -4280,7 +4309,13 @@ class HubStore {
    *  read back a level returns false, so a pending chip there shows the
    *  pending word rather than a false "?". */
   effortReadbackWithdrawnOf(instanceId: Id): boolean {
-    return this.state.effortReadbackWithdrawn[instanceId] === true;
+    return this.state.effortReadbackWithdrawn[instanceId] != null;
+  }
+
+  /** c-effortread r8 item 1: the withdrawal watermark observedAt for an
+   *  instance, or null when read-back is currently available. */
+  effortWithdrawnAtOf(instanceId: Id): string | null {
+    return this.state.effortReadbackWithdrawn[instanceId] ?? null;
   }
 
   /** context-usage-1: Hub-computed per-session usage rollup; null until the

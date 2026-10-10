@@ -1311,6 +1311,103 @@ it("r6 item 6: a no-fraction updatedAt must not outrank a fractional observedAt"
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("high");
 });
 
+it("r8 item 1: an older level edge after a withdrawal (Load earlier) cannot restore the projection", async () => {
+  const ctx = await startFollowing("withdrawn-sticky-older-edge");
+  // Level at 12:00, withdrawal at 12:05 (deletes the projection).
+  ctx.receive(effortEvent(2, "high", false, "remuda", "2026-10-08T12:00:00.000Z"));
+  const withdrawn: Observation = {
+    eventId: "evt_eff_wd_1",
+    instanceId: "x",
+    journalId: "x",
+    seq: "3",
+    kind: "effort",
+    observedAt: "2026-10-08T12:05:00Z",
+    source: { channel: "transcript" },
+    payload: {
+      effective: {
+        name: null,
+        ultracode: null,
+        source: "unknown",
+        observedAt: "2026-10-08T12:05:00Z",
+        readbackAvailable: false,
+      },
+      raw: null,
+    },
+  } as unknown as Observation;
+  ctx.receive(withdrawn);
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(true);
+  expect(hubStore.effortWithdrawnAtOf(ctx.instance.id)).toBe("2026-10-08T12:05:00Z");
+
+  // "Load earlier" replays an OLDER medium edge (12:03) as history.
+  const older = effortEvent(4, "medium", false, "slash", "2026-10-08T12:03:00.000Z");
+  hubStore["noteEffortObservation"](ctx.instance.id, older, false);
+  expect(
+    hubStore.effortEffectiveOf(ctx.instance.id),
+    "the older edge must not re-project a withdrawn level"
+  ).toBeNull();
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(true);
+
+  // A same-timestamp edge is also rejected (<= watermark).
+  const sameTime = effortEvent(5, "high", false, "slash", "2026-10-08T12:05:00.000Z");
+  hubStore["noteEffortObservation"](ctx.instance.id, sameTime, false);
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+
+  // A strictly NEWER valid edge restores the projection and clears the marker.
+  const newer = effortEvent(6, "max", false, "remuda", "2026-10-08T12:06:00.000Z");
+  hubStore["noteEffortObservation"](ctx.instance.id, newer, true);
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(false);
+});
+
+it("r8 item 1: a withdrawal sets the watermark even with no projection held (reload seed)", async () => {
+  // Reload case: the seeded history contains the withdrawal but the
+  // projection was already absent (no earlier level in the live map). The
+  // marker must still be set so an older poll edge cannot repopulate it.
+  const ctx = await startFollowing("withdrawn-seed-reload");
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  const withdrawn: Observation = {
+    eventId: "evt_eff_wd_seed",
+    instanceId: "x",
+    journalId: "x",
+    seq: "2",
+    kind: "effort",
+    observedAt: "2026-10-08T13:00:00Z",
+    source: { channel: "transcript" },
+    payload: {
+      effective: {
+        name: null,
+        ultracode: null,
+        source: "unknown",
+        observedAt: "2026-10-08T13:00:00Z",
+        readbackAvailable: false,
+      },
+      raw: null,
+    },
+  } as unknown as Observation;
+  ctx.receive(withdrawn);
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(true);
+  // An older poll record cannot clear the withdrawal.
+  const older: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "high", ultracode: false, source: "remuda", observedAt: "2026-10-08T12:59:00.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [older] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(true);
+  // A newer poll record restores.
+  const newer: Instance = {
+    ...older,
+    effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: "2026-10-08T13:01:00.000Z" },
+  };
+  vi.mocked(api.instanceList).mockResolvedValue({ items: [newer] } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(false);
+});
+
 it("r6 item 8a: an out-of-order withdrawal (older observedAt) never deletes the newer edge", async () => {
   const ctx = await startFollowing("withdrawn-out-of-order");
   // Newer valid edge M (contiguous after the follow cursor).

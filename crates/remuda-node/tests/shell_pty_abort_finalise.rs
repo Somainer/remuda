@@ -168,10 +168,6 @@ fn to_journal_record(observation: &Observation) -> JournalRecord {
 async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
-    if std::env::var("KEEP_ABORT_E2E").is_ok() {
-        eprintln!("ABORT_E2E dir retained: {root:?}");
-        std::mem::forget(dir);
-    }
     let workspace = root.join("workspace");
     let native_home = root.join("home");
     let instance_dir = root.join("instance");
@@ -189,13 +185,9 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
     // pump close aborts into.
     let transcript = remuda_driver::claude_transcript::project_dir(&native_home, &workspace)
         .join(format!("{SESSION_ID}.jsonl"));
-    // The abort gate makes backlog size irrelevant: a handful of records is
-    // enough (the collect parks before reading them regardless).
-    let pairs: u32 = std::env::var("ABORT_BACKLOG_PAIRS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(20);
-    seed_transcript(&transcript, pairs);
+    // The abort gate makes backlog size irrelevant: a handful of closed-turn
+    // records is enough (the collect parks before reading them regardless).
+    seed_transcript(&transcript, 20);
     // Test-only file-backed seams live next to the transcript (found by file
     // name, not process env): the collect gate parks the first-bind pump
     // before it reads the tail, and the skip marker makes close's cooperative

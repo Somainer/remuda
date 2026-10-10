@@ -15,10 +15,7 @@ use remuda_driver::{
 use remuda_hub::usage_store_test_support::{
     JournalRecord, insert_usage_event, migrate, project_usage_event, rollup_instance,
 };
-use remuda_protocol::{
-    ContentBlock, DriverInput, InstanceSpec, Knowledge, Observation, ObservationPayload,
-    PromptInput, PromptMode, TextBlock,
-};
+use remuda_protocol::{InstanceSpec, Knowledge, Observation, ObservationPayload};
 use remuda_testing::{
     FakeHerdrOptions, FakeHerdrServer, ShortTempDir, ensure_workspace_bin, install_executable,
 };
@@ -50,18 +47,6 @@ fn spec(cwd: &Path) -> InstanceSpec {
     spec.cwd = cwd.to_string_lossy().into_owned();
     spec.model_id = Some("haiku".into());
     spec
-}
-
-#[allow(dead_code)]
-fn prompt(text: &str) -> DriverInput {
-    DriverInput::Prompt(Box::new(PromptInput {
-        mode: PromptMode::NewTurn,
-        blocks: vec![ContentBlock::Text(Box::new(TextBlock {
-            text: text.into(),
-        }))],
-        origin: remuda_protocol::InputOrigin::Human,
-        native_client_message_id: "m1".into(),
-    }))
 }
 
 fn filler(index: u32) -> String {
@@ -160,11 +145,9 @@ async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
     // Seed the transcript the pump binds via session-meta before it starts.
     fs::create_dir_all(&launch).unwrap();
     let transcript = launch.join("transcript.jsonl");
-    let pairs: u32 = std::env::var("CP_CLOSE_BACKLOG")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30_000);
-    seed_transcript(&transcript, pairs);
+    // A small closed-turn backlog plus the no-stop final record; close timing
+    // is asserted on events, not on the mapping duration.
+    seed_transcript(&transcript, 30);
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         instance_id: None,

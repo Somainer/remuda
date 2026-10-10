@@ -2253,6 +2253,20 @@ impl Hydrator {
         }
         let launch = std::mem::take(&mut self.pending);
         let lines = self.tail.poll()?;
+        // The launch model snapshot must reach the consumer AHEAD of any
+        // replayed transcript frame (a replayed model edge must not overwrite
+        // the launch baseline). Park it at the FRONT of the shared queue before
+        // any mapped chunk is appended; the FIFO flusher then emits it first.
+        if !launch.is_empty() {
+            let mut guard = parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let existing: std::collections::VecDeque<Observation> = guard.drain(..).collect();
+            guard.extend(launch);
+            guard.extend(existing);
+            drop(guard);
+            notify.notify_one();
+        }
         // The mapper buffers an assistant run until something supersedes it, so
         // the last message of a batch would otherwise sit unseen until the next
         // record arrives — which, at the end of a turn, may be minutes away.
@@ -2285,7 +2299,7 @@ impl Hydrator {
             Err(error) => tracing::debug!(%error, "transcript flush failed"),
         }
         park(&mut chunk);
-        Ok(launch)
+        Ok(Vec::new())
     }
 }
 
@@ -2402,6 +2416,11 @@ async fn pump(
     seq: &AtomicU64,
     ctx: &PromoteCtx,
 ) -> Result<(), ()> {
+    // Unbound: do NOT spawn a blocking task that just returns NotFound every
+    // poll interval (r7: avoid a pointless spawn_blocking on an idle loop).
+    if slot_lock(slot).is_none() {
+        return Ok(());
+    }
     let parked = Arc::clone(pending);
     let pinged = Arc::clone(notify);
     let launch_snapshots =

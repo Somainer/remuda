@@ -77,20 +77,15 @@ pub struct CodexAdapter {
     usage_totals: UsageAggregator,
     /// Optional fallback model for usage records whose turn had no context.
     fallback_model: Option<String>,
-    /// Discovery was proven impossible for this launch: two same-cwd sessions
-    /// appeared in the launch window (ambiguous, fail closed), or the deadline
-    /// passed with no matching rollout. When set, the poller stops scanning
-    /// the home so an unbound adapter does not walk `sessions/` every tick for
-    /// the instance's whole life.
+    /// Discovery was proven impossible for this launch: two same-cwd
+    /// post-launch rollouts exist at the same time (ambiguous, fail closed).
+    /// When set, the poller stops scanning the home forever. A mere "nothing
+    /// matched yet" does NOT set this: codex 0.154 writes `session_meta`
+    /// lazily on the first turn, which can arrive minutes after launch, so the
+    /// adapter keeps discovering (cheaply, via the locator's mtime/date
+    /// pruning — c-usagefu r4 item 2/6) until it binds or the instance closes.
     discovery_gave_up: bool,
 }
-
-/// How long after a driver launch (generic-pty: no hooks, no child pid) the
-/// adapter keeps looking for a same-cwd rollout that started at/after launch.
-/// The codex TUI writes `session_meta` within seconds of pane start; once this
-/// window elapses with no unique match, no session is ever coming — stop the
-/// 250 ms directory rescans rather than continuing for the instance's life.
-const LAUNCH_DISCOVERY_WINDOW: time::Duration = time::Duration::seconds(120);
 
 impl CodexAdapter {
     /// Create an unbound adapter for a shadow `CODEX_HOME`.
@@ -166,9 +161,11 @@ impl CodexAdapter {
     /// 2. **Driver launch with a launch floor** (generic-pty: no hooks, no
     ///    child pid, real operator home): the ONLY acceptable match is a
     ///    unique rollout whose `session_meta.cwd` is the launch cwd and whose
-    ///    session started at/after launch. Zero matches keeps polling (the TUI
-    ///    has not registered yet, until [`LAUNCH_DISCOVERY_WINDOW`]); two or
-    ///    more fail closed forever. The `session_index.jsonl` recency guess is
+    ///    session started at/after launch. Zero matches keeps polling for the
+    ///    adapter's WHOLE life (codex 0.154 creates the rollout lazily on the
+    ///    first turn; the locator's mtime/date pruning keeps that cheap); two
+    ///    or more matches at once fail closed forever (see item 3 for the
+    ///    cross-instance race). The `session_index.jsonl` recency guess is
     ///    deliberately NOT used here: it is a name index over EVERY project
     ///    and its last line is whatever thread the operator renamed last,
     ///    anywhere — binding that journals a foreign project's transcript,
@@ -177,8 +174,7 @@ impl CodexAdapter {
     ///    predates us, so the name-index recency guess remains the last
     ///    resort, exactly as before.
     fn discover(&mut self) -> DriverResult<bool> {
-        // A prior poll already proved binding impossible (ambiguity, or the
-        // window elapsed): never rescan and never reverse that decision.
+        // A prior poll proved ambiguity: never rescan and never reverse.
         if self.discovery_gave_up {
             return Ok(false);
         }
@@ -198,10 +194,9 @@ impl CodexAdapter {
             }
             return Ok(false);
         };
-        if time::OffsetDateTime::now_utc() > launched_at + LAUNCH_DISCOVERY_WINDOW {
-            self.discovery_gave_up = true;
-            return Ok(false);
-        }
+        // No time deadline: the rollout can appear on a first prompt minutes
+        // after launch. Old pre-launch rollouts are filtered by timestamp AND
+        // skipped cheaply via mtime/date pruning in the locator.
         match locate_rollout_by_cwd(&self.home.home, &self.home.cwd, launched_at) {
             CwdRollout::Found { id, path } => {
                 self.confirmed = Some(id.clone());

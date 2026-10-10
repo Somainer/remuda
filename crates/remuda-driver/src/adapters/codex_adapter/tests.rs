@@ -489,14 +489,15 @@ fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
     assert!(adapter.binding().is_none());
 }
 
-/// Past the discovery window with no unique match, the adapter stops scanning
-/// the home: a same-cwd rollout appearing afterwards never binds and never
-/// restarts the per-tick directory walk.
+/// codex 0.154 creates the rollout LAZILY on the first turn: an instance
+/// first prompted long after pane start (well past the old 120 s window) must
+/// still bind when its rollout appears. Discovery keeps running until bound;
+/// there is no time deadline (c-usagefu r4 item 2).
 #[test]
-fn after_the_discovery_window_a_late_rollout_never_binds() {
+fn a_rollout_appearing_long_after_launch_binds_when_the_first_prompt_is_late() {
     let home = tempfile::tempdir().unwrap();
     let cwd = Path::new("/projects/alpha");
-    // Floor 200 s ago: the 120 s discovery window has already elapsed.
+    // Floor 200 s ago — under the old deadline this adapter had given up.
     let floor = OffsetDateTime::now_utc() - time::Duration::seconds(200);
     let mut adapter = CodexAdapter::new(AdapterHome {
         home: home.path().to_path_buf(),
@@ -506,18 +507,53 @@ fn after_the_discovery_window_a_late_rollout_never_binds() {
     });
     assert!(!adapter.discover().unwrap());
     assert!(adapter.binding().is_none());
+    assert!(
+        !adapter.discovery_gave_up,
+        "NotYet never gives up; the poll loop keeps discovering until bound"
+    );
 
+    // First prompt at t+200 s: the rollout's session started just now.
     let started = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
     write_rollout(
         home.path(),
         "2026/09/14",
-        "late",
+        "late-prompt",
         "/projects/alpha",
         &started,
     );
     assert!(
-        !adapter.discover().unwrap(),
-        "the deadline decision is final"
+        adapter.discover().unwrap(),
+        "the lazily-created post-launch rollout binds"
     );
+    assert_eq!(
+        adapter.binding().map(|binding| binding.session_id.as_str()),
+        Some("late-prompt")
+    );
+}
+
+/// A rollout that physically exists long after launch but whose session
+/// STARTED before it is a pre-launch session: the content timestamp, not the
+/// file mtime, decides ownership, so it never binds.
+#[test]
+fn a_fresh_file_carrying_a_pre_launch_session_never_binds() {
+    let home = tempfile::tempdir().unwrap();
+    let floor = OffsetDateTime::now_utc() - time::Duration::seconds(5);
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: Path::new("/projects/alpha").to_path_buf(),
+        pid: None,
+        launched_at: Some(floor),
+    });
+    let old = (floor - time::Duration::seconds(600))
+        .format(&Rfc3339)
+        .unwrap();
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "old-session",
+        "/projects/alpha",
+        &old,
+    );
+    assert!(!adapter.discover().unwrap());
     assert!(adapter.binding().is_none());
 }

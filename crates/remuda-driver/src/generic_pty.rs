@@ -371,6 +371,12 @@ impl GenericPtyDriver {
         self.resources
             .record(&client, &session_name, &created, &pane_id)
             .await?;
+        // Discovery floor captured at the agent.start boundary, BEFORE the
+        // RPC returns and before wait_agent_settled (up to 60 s): codex
+        // 0.154 writes session_meta lazily on the first turn, so a floor
+        // sampled after settling could post-date the session's own timestamp
+        // and the adapter would never bind (c-usagefu r4 item 2).
+        let launched_at = time::OffsetDateTime::now_utc();
         let started = crate::pty_interaction::start_agent(
             &client,
             AgentStartParams {
@@ -502,7 +508,7 @@ impl GenericPtyDriver {
         // c-usagefu (d): tail the codex/grok session files from the pinned
         // native home so generic-pty dispatch gets usage/live observations the
         // way shell-pty launches do.
-        let adapter_handle = self.spawn_file_tail_adapters(&spec, &recipe, &ctx, &tx);
+        let adapter_handle = self.spawn_file_tail_adapters(&spec, &recipe, &ctx, &tx, launched_at);
         *self.inner.lock().await = Some(PtyLive {
             ctx,
             client,
@@ -551,15 +557,13 @@ impl GenericPtyDriver {
         recipe: &LaunchRecipe,
         ctx: &crate::claude_pty::ObsCtx,
         events: &mpsc::Sender<Observation>,
+        launched_at: time::OffsetDateTime,
     ) -> Option<crate::adapters::supervisor::AdapterHandle> {
         let kind = match spec.kind {
             AgentKind::Codex | AgentKind::Grok => spec.kind,
             _ => return None,
         };
-        // Discovery floor: the pane's agent.start was dispatched just above,
-        // so the native session this adapter is allowed to bind cannot have
-        // started before now (a small clock slack lives in the locator).
-        let launched_at = time::OffsetDateTime::now_utc();
+        // `launched_at` is sampled at the agent.start boundary by the caller.
         // The Node and the herdr daemon share the operator's login
         // environment, so resolving the harness home from this process gives
         // the same home the pane's harness process resolves. Tests inject the

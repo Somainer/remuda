@@ -404,7 +404,9 @@ test.describe("composer control bar and effort", () => {
       const rowEl = page.getByTestId("new-session-perm-row");
       await expect(rowEl).toBeVisible();
       const chips = rowEl.getByRole("button");
-      await expect(chips).toHaveCount(4);
+      // The LAUNCH fieldset offers all six CLI modes (incl. plan/dontAsk);
+      // every one stays single-line at both widths.
+      await expect(chips).toHaveCount(6);
       const count = await chips.count();
       for (let i = 0; i < count; i++) {
         await assertSingleLine(chips.nth(i));

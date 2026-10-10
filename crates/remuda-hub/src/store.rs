@@ -503,6 +503,16 @@ pub struct InstanceRecord {
     /// Current model id from create / `instance.configure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Requested harness permission mode from the create / configure spec
+    /// (D-057 §3.3). The transcript-observed effective mode is
+    /// `permissionEffective` inside the spec; this is the seated value that
+    /// survives a continuation resume.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "permissionMode"
+    )]
+    pub permission_mode: Option<String>,
     /// Requested launch renderer; actual mode comes from the tty snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui: Option<remuda_protocol::TuiMode>,
@@ -655,6 +665,137 @@ pub struct InstanceRecord {
         rename = "usageRollup"
     )]
     pub usage_rollup: Option<crate::usage_store::InstanceUsageRollup>,
+    /// D-057 §5: lineage this chapter belongs to (its own id for a plain
+    /// instance); serialized as `lineageId`.
+    #[serde(rename = "lineageId")]
+    pub lineage_id: String,
+    /// Chapter position inside the lineage, 1-based.
+    pub generation: i64,
+    /// Why this chapter exists: `owner-resume` / later C1 causes; `null` for
+    /// a first chapter or a plain instance.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "chapterCause"
+    )]
+    pub chapter_cause: Option<String>,
+    /// When authority moved away from this chapter to its successor.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "fencedAt")]
+    pub fenced_at: Option<String>,
+    /// C1 restart policy copied to every chapter of a continuity lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Value>,
+}
+
+/// C1 restart policy chosen at create time (D-057 §6.1).
+///
+/// Stored on every chapter of a continuity lineage and on the lineage row.
+/// Only a Human creator may set it; no behaviour follows until `ma-restart`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartPolicy {
+    /// Restart on Node-attested process loss / start failure.
+    pub on_process_loss: bool,
+    /// At-most restart decisions per rolling hour (>= 1).
+    pub max_per_hour: u32,
+}
+
+/// One agent across process lifetimes (D-057 §5). The row exists only for
+/// continuity instances: one that holds a grant or carries a restart policy.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageRecord {
+    /// First chapter's instance id.
+    pub lineage_id: String,
+    /// The chapter authority currently belongs to.
+    pub current_instance_id: String,
+    /// Current chapter generation; bumped inside every fence transaction.
+    pub generation: i64,
+    /// Stored state (`starting` / `running` / `paused`). Reads derive the
+    /// host-offline/live view from the current chapter on top of this.
+    pub state: String,
+    /// Who paused (`device` / `self` / `ancestor` / `restart-cap` /
+    /// `process-exit`) with its attributes; `None` while unpaused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_by: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+    /// C1 restart policy copied to every chapter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Value>,
+    /// Reference to the first chapter's create spec and launch origin.
+    #[serde(skip_serializing)]
+    pub origin_spec_ref: Option<Value>,
+    pub updated_at: String,
+}
+
+/// One chapter row in a lineage projection (`GET /v1/lineages/{id}`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageChapter {
+    pub instance_id: String,
+    pub generation: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chapter_cause: Option<String>,
+    pub created_at: String,
+    /// Last update once the chapter reached an ended lifecycle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    /// When authority moved to the successor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fenced_at: Option<String>,
+}
+
+/// Raw `lineages` columns, in SELECT order.
+type LineageRow = (
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn load_lineage(conn: &Connection, lineage_id: &str) -> Result<Option<LineageRecord>, StoreError> {
+    let row: Option<LineageRow> = conn
+        .query_row(
+            "SELECT lineage_id, current_instance_id, generation, state,
+                    paused_by_json, paused_at, restart_json, origin_spec_ref, updated_at
+             FROM lineages WHERE lineage_id = ?1",
+            params![lineage_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let parse = |raw: Option<String>| raw.and_then(|text| serde_json::from_str(&text).ok());
+    Ok(Some(LineageRecord {
+        lineage_id: row.0,
+        current_instance_id: row.1,
+        generation: row.2,
+        state: row.3,
+        paused_by: parse(row.4),
+        paused_at: row.5,
+        restart: parse(row.6),
+        origin_spec_ref: parse(row.7),
+        updated_at: row.8,
+    }))
 }
 
 /// Delegation-tree state attached at instance create; design §2.5.
@@ -675,6 +816,9 @@ pub struct InstanceDelegation {
     /// non-delegating insert paths (fleet fan-out, D-026 resume, SSH host
     /// creates), which the operator already authorized directly.
     pub enforce_tree: bool,
+    /// D-057 §6.1 C1 restart policy; `Some` makes the new instance a
+    /// continuity lineage even when it holds no grants.
+    pub restart: Option<RestartPolicy>,
 }
 
 impl Default for InstanceDelegation {
@@ -690,6 +834,7 @@ impl Default for InstanceDelegation {
             grants: Vec::new(),
             task_id: None,
             enforce_tree: false,
+            restart: None,
         }
     }
 }
@@ -716,6 +861,7 @@ fn enforce_grant_uniqueness(
             .query_row(
                 &format!(
                     "SELECT 1 FROM instances WHERE {ACTIVE_HOLDER_SQL}
+                 AND fenced_at IS NULL
                  AND grants_json LIKE '%\"address-owner\"%' LIMIT 1"
                 ),
                 [],
@@ -739,6 +885,7 @@ fn enforce_grant_uniqueness(
                 .query_row(
                     &format!(
                         "SELECT 1 FROM instances WHERE {ACTIVE_HOLDER_SQL}
+                     AND fenced_at IS NULL
                      AND grants_json LIKE '%\"dispatch\"%'
                      AND scope_json LIKE ?1 LIMIT 1"
                     ),
@@ -881,14 +1028,14 @@ pub(crate) fn validate_child_delegation(
         )));
     }
     if let Some(pid) = parent_id {
-        let active_children: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM instances
-             WHERE spec_json LIKE ?1
-               AND lifecycle NOT IN ('exited', 'failed', 'closed')",
-            params![format!("%\"parentInstanceId\":\"{pid}\"%")],
-            |row| row.get(0),
-        )?;
-        if u32::try_from(active_children).unwrap_or(0) >= limits.fan_out {
+        // D-057 §5: one shared lineage resolver backs every parent edge —
+        // `owns()`, the D-051 routed-decision edge and this fan-out count — so
+        // they can never disagree. Children are counted per child LINEAGE
+        // across every chapter: a worker that itself continued (predecessor
+        // ended, successor live) still occupies one slot, and a continuation
+        // chapter of the parent's own lineage never counts as a child.
+        let active_children = count_active_lineage_children(conn, pid)?;
+        if active_children >= limits.fan_out {
             return Err(StoreError::Conflict(format!(
                 "parent {pid} already has {active_children} active children; fan-out limit is {}",
                 limits.fan_out
@@ -926,6 +1073,396 @@ fn node_depth(conn: &Connection, start: &str) -> Result<u32, StoreError> {
         }
     }
     Ok(depth)
+}
+
+/// D-057 §5: the stamped lineage id of an instance.
+///
+/// A row written before ma-lineage has no stamped `lineage_id`, and a plain
+/// instance is always its own lineage, so both read as the instance's own id.
+/// `None` means the instance does not exist.
+pub(crate) fn lineage_id_of(conn: &Connection, id: &str) -> Result<Option<String>, StoreError> {
+    conn.query_row(
+        "SELECT COALESCE(lineage_id, id) FROM instances WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+/// D-057 §5: the single lineage edge every parent-edge rule reads
+/// (`owns()`, the D-051 routed-decision edge, fan-out).
+///
+/// A caller owns a target when the target is a chapter in the caller's
+/// lineage, or the target's parent is. Successor chapters therefore keep
+/// reading and controlling what predecessor chapters created, while plain
+/// instances keep the old self-or-direct-parent semantics (each plain
+/// instance is its own lineage).
+pub(crate) fn lineage_owns_conn(
+    conn: &Connection,
+    caller_id: &str,
+    target_id: &str,
+) -> Result<bool, StoreError> {
+    let Some(caller_lineage) = lineage_id_of(conn, caller_id)? else {
+        return Ok(false);
+    };
+    let Some(target_lineage) = lineage_id_of(conn, target_id)? else {
+        return Ok(false);
+    };
+    if target_lineage == caller_lineage {
+        return Ok(true);
+    }
+    Ok(parent_lineage_of(conn, target_id)? == Some(caller_lineage))
+}
+
+/// Stamped lineage id of `id`'s parent edge, when the edge names an existing
+/// instance. The shared half of the lineage resolver: every parent-edge rule
+/// ultimately compares this value against a caller lineage.
+pub(crate) fn parent_lineage_of(conn: &Connection, id: &str) -> Result<Option<String>, StoreError> {
+    let parent: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(spec_json, '$.parentInstanceId')
+             FROM instances WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    match parent {
+        Some(parent) => Ok(lineage_id_of(conn, &parent)?),
+        None => Ok(None),
+    }
+}
+
+/// Count the parent lineage's **active child lineages** — the fan-out resolver
+/// (D-057 §5), expressed with the same lineage edge [`lineage_owns_conn`] uses.
+///
+/// Each distinct child lineage with at least one non-terminal, non-fenced
+/// chapter counts once: a worker that itself continued (its predecessor
+/// exited and its successor chapter is live) still occupies one slot, which
+/// the earlier per-row `chapter_cause IS NULL` count dropped. The parent's own
+/// continuation chapters are excluded: a chapter of the parent lineage is not
+/// a child.
+pub(crate) fn count_active_lineage_children(
+    conn: &Connection,
+    parent_id: &str,
+) -> Result<u32, StoreError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT COALESCE(child.lineage_id, child.id))
+         FROM instances child
+         WHERE child.lifecycle NOT IN ('exited', 'failed', 'closed')
+           AND child.fenced_at IS NULL
+           AND COALESCE(child.lineage_id, child.id) <>
+               (SELECT COALESCE(lineage_id, id) FROM instances WHERE id = ?1)
+           AND EXISTS (
+               SELECT 1 FROM instances edge
+               WHERE COALESCE(edge.lineage_id, edge.id)
+                     = COALESCE(child.lineage_id, child.id)
+                 AND json_extract(edge.spec_json, '$.parentInstanceId') IS NOT NULL
+                 AND (SELECT COALESCE(parent.lineage_id, parent.id)
+                        FROM instances parent
+                       WHERE parent.id
+                             = json_extract(edge.spec_json, '$.parentInstanceId'))
+                     = (SELECT COALESCE(lineage_id, id)
+                          FROM instances WHERE id = ?1)
+           )",
+        params![parent_id],
+        |row| row.get(0),
+    )?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// Inputs to the ma-lineage continuation-resume transaction.
+pub struct ContinuationResumeRequest {
+    /// Any chapter the owner addressed; the transaction fences the lineage's
+    /// current chapter.
+    pub addressed_instance_id: String,
+    /// Generation the HTTP handler observed before queueing the writer job;
+    /// the CAS fails when another resume/restart committed first.
+    pub expected_generation: i64,
+    /// Successor host — always the current chapter's host.
+    pub host_id: String,
+    /// Resolved create spec for the successor (continuation edge, resume id,
+    /// provider overlay already attached by the handler).
+    pub spec: Value,
+    /// `instance.resume` (recovery from a native session id) or
+    /// `instance.create` (fresh launch from the origin spec).
+    pub operation: String,
+    /// Optional first prompt for the successor.
+    pub prompt: Option<String>,
+    /// Wire origin of the resume create (`human` for an owner Resume).
+    pub origin: String,
+    /// UI title for the successor.
+    pub title: Option<String>,
+}
+
+/// Payload of the winning continuation transaction.
+#[derive(Debug)]
+pub struct ContinuationResumed {
+    pub lineage_id: String,
+    pub fenced: Box<InstanceRecord>,
+    pub successor: InstanceRecord,
+    pub command: CommandRecord,
+}
+
+/// Outcome of [`Store::continuation_resume`].
+#[derive(Debug)]
+pub enum ContinuationResumeResult {
+    /// This transaction fenced the predecessor and inserted the successor.
+    Resumed(Box<ContinuationResumed>),
+    /// The generation CAS lost: the lineage already advanced. `current` is
+    /// the chapter the winning transaction created, which the caller presents
+    /// as an idempotent replay instead of starting another chapter.
+    Superseded { current: Box<InstanceRecord> },
+}
+
+/// Hook fired at continuation-resume points with `(point, lineageId)`.
+pub(crate) type ContinuationHook = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// Deterministic hook points for the §7.10 race suites. Production builds
+/// leave the slot empty; tests install a blocking rendezvous through
+/// [`lineage_test_support`].
+static CONTINUATION_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ContinuationHook>>> =
+    std::sync::OnceLock::new();
+
+/// Test-only seam for the ma-lineage continuation-resume race.
+#[doc(hidden)]
+pub mod lineage_test_support {
+    /// Hook fired at continuation-resume points with `(point, lineageId)`.
+    pub type Hook = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+    /// Install a hook fired at continuation-resume points with `(point,
+    /// lineageId)`. `None` removes it.
+    ///
+    /// `read` fires in the HTTP handler just after the generation is read and
+    /// before the writer job is queued; `cas` fires inside the writer
+    /// transaction between the lineage read and its compare-and-set. A
+    /// blocking rendezvous on `cas` serialises two resumes deterministically.
+    pub fn set_hook(hook: Option<Hook>) {
+        let slot = super::CONTINUATION_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+        *slot.lock().expect("continuation hook lock") = hook;
+    }
+}
+
+/// Invoke an installed continuation-resume hook at `point` with the lineage
+/// id. `read` fires in the HTTP handler after the generation read; `cas`
+/// fires inside the writer transaction between the read and the CAS write.
+///
+/// `read` (async runtime) and `cas` (writer thread) fire concurrently during
+/// the race suites, so the slot is cloned, never taken, per invocation.
+pub(crate) fn run_continuation_hook(point: &str, lineage_id: &str) {
+    let Some(slot) = CONTINUATION_HOOK.get() else {
+        return;
+    };
+    let hook = slot.lock().ok().and_then(|guard| guard.clone());
+    if let Some(hook) = hook {
+        hook(point, lineage_id);
+    }
+}
+
+/// The fence-and-continue transaction behind [`Store::continuation_resume`].
+fn continuation_resume_tx(
+    conn: &mut Connection,
+    mut request: ContinuationResumeRequest,
+) -> Result<ContinuationResumeResult, StoreError> {
+    let tx = conn.transaction()?;
+    let addressed = load_instance(&tx, &request.addressed_instance_id)?
+        .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
+    let lineage = load_lineage(&tx, &addressed.lineage_id)?
+        .ok_or_else(|| StoreError::Id("addressed instance is not a continuity lineage".into()))?;
+    let lineage_id = lineage.lineage_id.clone();
+    let current_id = lineage.current_instance_id.clone();
+    run_continuation_hook("cas", &lineage_id);
+    // ma-lineage round 2: the owner may address an OLDER, already-fenced
+    // chapter. Such a resume is the same continuation its successor already
+    // represents — return that successor idempotently instead of fencing the
+    // live chapter and minting another one. Only the lineage's CURRENT chapter
+    // starts another continuation. Placed after the CAS rendezvous hook (which
+    // serializes concurrent resumes) but before any write: a racing loser that
+    // observed the old generation rolls back here and returns the winner.
+    if addressed.instance_id != current_id {
+        let current = load_instance(&tx, &current_id)?
+            .ok_or_else(|| StoreError::Id("current chapter missing".into()))?;
+        return Ok(ContinuationResumeResult::Superseded {
+            current: Box::new(current),
+        });
+    }
+    let successor_id = new_id("ins").map_err(|e| StoreError::Id(e.to_string()))?;
+    let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
+    let command_id = new_id("cmd").map_err(|e| StoreError::Id(e.to_string()))?;
+    let now = now_rfc3339();
+    let successor_generation = lineage.generation + 1;
+    // Compare-and-set on (generation, current chapter): a racing resume that
+    // observed the same lineage state matches zero rows.
+    let cas = tx.execute(
+        "UPDATE lineages
+            SET current_instance_id = ?1, generation = ?2, state = 'starting',
+                updated_at = ?3
+          WHERE lineage_id = ?4 AND generation = ?5 AND current_instance_id = ?6",
+        params![
+            successor_id,
+            successor_generation,
+            now,
+            lineage_id,
+            request.expected_generation,
+            current_id,
+        ],
+    )?;
+    if cas == 0 {
+        // The generation CAS lost: the lineage already advanced — possibly
+        // because the addressed chapter was already fenced and the live
+        // chapter moved on. Roll the (empty) transaction back and present the
+        // winner's current chapter as an idempotent replay. A resume addressed
+        // to the fenced chapter must therefore converge on the existing
+        // successor instead of fencing the live one (ma-lineage round 2).
+        drop(tx);
+        let lineage = load_lineage(conn, &lineage_id)?
+            .ok_or_else(|| StoreError::Id("lineage vanished after lost CAS".into()))?;
+        let current = load_instance(conn, &lineage.current_instance_id)?
+            .ok_or_else(|| StoreError::Id("current chapter vanished after lost CAS".into()))?;
+        return Ok(ContinuationResumeResult::Superseded {
+            current: Box::new(current),
+        });
+    }
+    // 1. Fence the CURRENT chapter — which is what the generation CAS just
+    // advanced from. The owner may have addressed an older fenced chapter;
+    // `current_id` is the lineage's current chapter regardless, so the live
+    // successor is what gets fenced and never a chapter fenced already.
+    tx.execute(
+        "UPDATE instances SET fenced_at = ?1, updated_at = ?2 WHERE id = ?3",
+        params![now, now, current_id],
+    )?;
+    // 2. Delete every device row bound to the predecessor: its launch
+    //    credential and any MCP token minted for it.
+    tx.execute("DELETE FROM devices WHERE instance_id = ?1", [&current_id])?;
+    let current = load_instance(&tx, &current_id)?
+        .ok_or_else(|| StoreError::Id("current chapter missing".into()))?;
+    // ma-lineage round 2: the seated permission mode is part of how the
+    // successor runs. The HTTP layer builds the successor spec from
+    // `spec_for_resume`, which does not carry the raw create spec, so carry
+    // both the requested `permissionMode` and the transcript-observed
+    // `permissionEffective` over here, filling only what the prepared spec
+    // lacks. A fresh-launch recovery (origin spec) already carries the
+    // requested mode, so its value wins.
+    let predecessor_spec: Value = tx
+        .query_row(
+            "SELECT spec_json FROM instances WHERE id = ?1",
+            params![current_id],
+            |row| {
+                let raw: String = row.get(0)?;
+                Ok(serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})))
+            },
+        )
+        .map_err(StoreError::from)?;
+    if let Some(spec) = request.spec.as_object_mut() {
+        for key in ["permissionMode", "permissionEffective"] {
+            let missing = spec.get(key).is_none_or(Value::is_null);
+            if missing
+                && let Some(value) = predecessor_spec.get(key).filter(|value| !value.is_null())
+            {
+                spec.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+    let host =
+        load_host(&tx, &request.host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
+    let connectivity = if host.online {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    // 4. Successor: continuation edge, delegation and restart copied.
+    let scope_json = serde_json::to_string(&current.scope)?;
+    let grants_json = serde_json::to_string(&current.grants)?;
+    let restart_json = current
+        .restart
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let successor_delegation = InstanceDelegation {
+        role: current.role.clone(),
+        scope: current.scope.clone(),
+        grants: current.grants.clone(),
+        task_id: current.task_id.clone(),
+        enforce_tree: false,
+        restart: current
+            .restart
+            .clone()
+            .and_then(|value| serde_json::from_value(value).ok()),
+    };
+    // The predecessor is fenced inside this same transaction, so the copied
+    // seat grants do not collide with it.
+    enforce_grant_uniqueness(&tx, &successor_delegation)?;
+    tx.execute(
+        "INSERT INTO instances
+            (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
+             title, journal_id, durable_seq, spec_json, created_at, updated_at,
+             role, scope_json, grants_json, task_id,
+             lineage_id, generation, chapter_cause, fenced_at, restart_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
+                 ?7, ?8, 0, ?9, ?10, ?10,
+                 ?11, ?12, ?13, ?14,
+                 ?15, ?16, 'owner-resume', NULL, ?17)",
+        params![
+            successor_id,
+            current.host_id,
+            current.workspace_id,
+            current.kind,
+            current.driver,
+            connectivity,
+            request.title,
+            journal_id,
+            request.spec.to_string(),
+            now,
+            current.role,
+            scope_json,
+            grants_json,
+            current.task_id,
+            lineage_id,
+            successor_generation,
+            restart_json,
+        ],
+    )?;
+    // 5. Queue the successor's resume create (forwarded after commit).
+    let initial_input = request
+        .prompt
+        .as_ref()
+        .map(|text| json!({ "type": "prompt", "text": text }));
+    let payload = json!({
+        "origin": request.origin,
+        "instanceId": successor_id,
+        "spec": request.spec,
+        "initialInput": initial_input,
+    });
+    tx.execute(
+        "INSERT INTO commands
+            (id, instance_id, host_id, operation, state, resolution, forwarded,
+             payload_json, idempotency_key, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, NULL, ?6, ?6)",
+        params![
+            command_id,
+            successor_id,
+            current.host_id,
+            request.operation,
+            payload.to_string(),
+            now
+        ],
+    )?;
+    let fenced = load_instance(&tx, &current_id)?
+        .ok_or_else(|| StoreError::Id("fenced chapter missing".into()))?;
+    let successor = load_instance(&tx, &successor_id)?
+        .ok_or_else(|| StoreError::Id("successor insert missing".into()))?;
+    let command = load_command(&tx, &command_id)?
+        .ok_or_else(|| StoreError::Id("successor command missing".into()))?;
+    tx.commit()?;
+    Ok(ContinuationResumeResult::Resumed(Box::new(
+        ContinuationResumed {
+            lineage_id,
+            fenced: Box::new(fenced),
+            successor,
+            command,
+        },
+    )))
 }
 
 impl InstanceRecord {
@@ -2051,15 +2588,17 @@ impl Store {
     /// Hub-owned projection only: never forge a Node journal cursor or native completion.
     pub async fn expire_lost_hosts(&self, grace_ms: u64) -> Result<usize, StoreError> {
         self.run_named("expire_lost_hosts", move |conn| {
+            let now = now_rfc3339();
             let changed = conn.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                    connectivity = 'disconnected', last_error = 'host-lost', updated_at = ?1
+                    connectivity = 'disconnected', last_error = 'host-lost',
+                    updated_at = ?1, ended_at = COALESCE(ended_at, ?1)
                  WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
                     SELECT id FROM hosts WHERE state != 'online' AND
                     (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
                     (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
                  )",
-                params![now_rfc3339(), grace_ms.min(i64::MAX as u64) as i64],
+                params![now, grace_ms.min(i64::MAX as u64) as i64],
             )?;
             Ok(changed)
         }).await
@@ -2924,7 +3463,8 @@ impl Store {
             for id in &lost {
                 conn.execute(
                     "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                        last_error = ?1, updated_at = ?2 WHERE id = ?3",
+                        last_error = ?1, updated_at = ?2, ended_at = COALESCE(ended_at, ?2)
+                     WHERE id = ?3",
                     params![&reason, &now, id],
                 )?;
             }
@@ -2957,7 +3497,8 @@ impl Store {
             for (id, _) in &stale {
                 conn.execute(
                     "UPDATE instances SET lifecycle = 'failed', activity = 'idle',
-                        last_error = 'create-never-acknowledged', updated_at = ?1
+                        last_error = 'create-never-acknowledged', updated_at = ?1,
+                        ended_at = COALESCE(ended_at, ?1)
                      WHERE id = ?2 AND lifecycle = 'requested'",
                     params![&now, id],
                 )?;
@@ -2982,7 +3523,7 @@ impl Store {
         self.run_named("settle_instance_exited", move |conn| {
             let changed = conn.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                    last_error = ?1, updated_at = ?2
+                    last_error = ?1, updated_at = ?2, ended_at = COALESCE(ended_at, ?2)
                  WHERE id = ?3 AND lifecycle NOT IN ('exited', 'failed')",
                 params![reason, now_rfc3339(), instance_id],
             )?;
@@ -3204,14 +3745,20 @@ impl Store {
             };
             let scope_json = serde_json::to_string(&delegation.scope)?;
             let grants_json = serde_json::to_string(&delegation.grants)?;
+            let restart_json = match &delegation.restart {
+                Some(policy) => Some(serde_json::to_string(policy)?),
+                None => None,
+            };
             conn.execute(
                 "INSERT INTO instances
                     (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                      title, journal_id, durable_seq, spec_json, created_at, updated_at,
-                     role, scope_json, grants_json, task_id)
+                     role, scope_json, grants_json, task_id,
+                     lineage_id, generation, chapter_cause, fenced_at, restart_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
                          ?7, ?8, 0, ?9, ?10, ?10,
-                         ?11, ?12, ?13, ?14)",
+                         ?11, ?12, ?13, ?14,
+                         ?1, 1, NULL, NULL, ?15)",
                 params![
                     instance_id,
                     host_id,
@@ -3227,8 +3774,27 @@ impl Store {
                     scope_json,
                     grants_json,
                     delegation.task_id,
+                    restart_json,
                 ],
             )?;
+            // D-057 §5: a lineage row exists for every continuity instance —
+            // one that holds any grant or carries a restart policy. Plain
+            // instances need none.
+            let continuity = !delegation.grants.is_empty() || delegation.restart.is_some();
+            if continuity {
+                let origin = spec.get("origin").cloned().unwrap_or(json!("agent"));
+                let origin_spec_ref = serde_json::to_string(&json!({
+                    "origin": origin,
+                    "spec": spec,
+                }))?;
+                conn.execute(
+                    "INSERT INTO lineages
+                        (lineage_id, current_instance_id, generation, state,
+                         paused_by_json, paused_at, restart_json, origin_spec_ref, updated_at)
+                     VALUES (?1, ?1, 1, 'starting', NULL, NULL, ?2, ?3, ?4)",
+                    params![instance_id, restart_json, origin_spec_ref, now],
+                )?;
+            }
             load_instance(conn, &instance_id)?
                 .ok_or_else(|| StoreError::Id("instance insert missing".into()))
         })
@@ -3320,11 +3886,13 @@ impl Store {
         last_error: String,
     ) -> Result<(), StoreError> {
         self.run_named("fail_instance", move |conn| {
+            let now = now_rfc3339();
             conn.execute(
                 "UPDATE instances
-                 SET lifecycle = 'failed', last_error = ?1, updated_at = ?2
+                 SET lifecycle = 'failed', last_error = ?1, updated_at = ?2,
+                     ended_at = COALESCE(ended_at, ?2)
                  WHERE id = ?3",
-                params![last_error, now_rfc3339(), instance_id],
+                params![last_error, now, instance_id],
             )?;
             Ok(())
         })
@@ -3368,6 +3936,104 @@ impl Store {
         instance_id: String,
     ) -> Result<Option<InstanceRecord>, StoreError> {
         self.run_named("get_instance", move |conn| {
+            load_instance(conn, &instance_id)
+        })
+        .await
+    }
+
+    /// D-057 §5: lineage row for `lineage_id`, if the instance is a continuity
+    /// lineage. Plain instances have no row.
+    pub async fn get_lineage(
+        &self,
+        lineage_id: String,
+    ) -> Result<Option<LineageRecord>, StoreError> {
+        self.read("get_lineage", move |conn| load_lineage(conn, &lineage_id))
+            .await
+    }
+
+    /// Chapters of a lineage in generation order, for `GET /v1/lineages/{id}`.
+    pub async fn list_lineage_chapters(
+        &self,
+        lineage_id: String,
+    ) -> Result<Vec<LineageChapter>, StoreError> {
+        self.read("list_lineage_chapters", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, generation, chapter_cause, created_at, ended_at, fenced_at
+                 FROM instances
+                 WHERE COALESCE(lineage_id, id) = ?1
+                 ORDER BY generation ASC, created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![lineage_id], |row| {
+                    let ended_at: Option<String> = row.get(4)?;
+                    Ok(LineageChapter {
+                        instance_id: row.get(0)?,
+                        generation: row.get(1)?,
+                        chapter_cause: row.get(2)?,
+                        created_at: row.get(3)?,
+                        // ma-lineage round 2: the immutable end-event
+                        // timestamp, never the mutable updated_at.
+                        ended_at,
+                        fenced_at: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// D-057 §5: async edge used by `owns()`, the D-051 route and the
+    /// `GET /v1/lineages/{id}` read predicate. See [`lineage_owns_conn`].
+    pub async fn lineage_owns(
+        &self,
+        caller_instance_id: String,
+        target_instance_id: String,
+    ) -> Result<bool, StoreError> {
+        self.read("lineage_owns", move |conn| {
+            lineage_owns_conn(conn, &caller_instance_id, &target_instance_id)
+        })
+        .await
+    }
+
+    /// Stamped lineage id of an instance (its own id for a plain instance).
+    pub async fn lineage_id_for_instance(
+        &self,
+        instance_id: String,
+    ) -> Result<Option<String>, StoreError> {
+        self.read("lineage_id_for_instance", move |conn| {
+            lineage_id_of(conn, &instance_id)
+        })
+        .await
+    }
+
+    /// D-057 §5/§7.2 (ma-lineage): continuation resume in ONE writer
+    /// transaction, with a compare-and-set on the lineage generation.
+    ///
+    /// Fences the lineage's current chapter, deletes every device row bound
+    /// to it, bumps the generation, and inserts the successor chapter with the
+    /// copied delegation plus its queued resume-create command. A
+    /// continuation edge is not a delegation edge: the successor's parent is
+    /// its predecessor's parent. `ma-fence` replaces this with the full
+    /// `fence_lineage` transaction.
+    pub async fn continuation_resume(
+        &self,
+        request: ContinuationResumeRequest,
+    ) -> Result<ContinuationResumeResult, StoreError> {
+        self.run_named("continuation_resume", move |conn| {
+            continuation_resume_tx(conn, request)
+        })
+        .await
+    }
+
+    /// Read-only point load of one instance on the reader pool, for handlers
+    /// that must keep observing committed state while a writer transaction is
+    /// held open by a test hook.
+    pub async fn get_instance_read(
+        &self,
+        instance_id: String,
+    ) -> Result<Option<InstanceRecord>, StoreError> {
+        self.read("get_instance_read", move |conn| {
             load_instance(conn, &instance_id)
         })
         .await
@@ -3750,6 +4416,73 @@ impl Store {
     ) -> Result<Option<CommandRecord>, StoreError> {
         self.run_named("get_command", move |conn| load_command(conn, &command_id))
             .await
+    }
+
+    /// c-dirpicker r7 item 1: settle a `queued`/`accepted` workspace mutation
+    /// command as `rejected` after the Node acked an abort. Unlike
+    /// [`Self::reject_command`] this also moves an `accepted` row (prepare
+    /// landed, commit never did) — the abort is positive evidence the unbind
+    /// did not execute.
+    pub async fn settle_workspace_command_aborted(
+        &self,
+        command_id: String,
+        reason: String,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        self.run_named("settle_workspace_command_aborted", move |conn| {
+            let now = now_rfc3339();
+            let changed = conn.execute(
+                "UPDATE commands
+                 SET state = 'settled', resolution = 'clear',
+                     settlement_outcome = 'rejected', settlement_reason = ?1,
+                     updated_at = ?2
+                 WHERE id = ?3 AND state IN ('queued', 'accepted')",
+                params![reason, now, command_id],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            load_command(conn, &command_id)
+        })
+        .await
+    }
+
+    /// c-dirpicker r7 item 1: `workspace.unregister` commands for a host that
+    /// never reached `settled` (prepare landed but commit did not, or the
+    /// frame was queued when a link died). The hello reconnect path aborts
+    /// them so the Node's durable unbinding mark is released.
+    ///
+    /// r9 item 2: only rows created strictly before `created_before` (the new
+    /// link's hello instant). A DELETE accepted on the NEW link is created at
+    /// or after that instant; aborting it would kill an in-flight removal the
+    /// operator just issued. Timestamps are fixed-width millisecond UTC
+    /// RFC3339 (see [`crate::config::now_rfc3339`]), so the lexical SQL
+    /// comparison is chronological.
+    pub async fn list_unsettled_workspace_unregisters(
+        &self,
+        host_id: &str,
+        created_before: &str,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        let host = host_id.to_owned();
+        let cutoff = created_before.to_owned();
+        self.run_named("list_unsettled_workspace_unregisters", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
+                        payload_json, idempotency_key, created_at, updated_at,
+                        settlement_outcome, settlement_reason,
+                        settlement_http_status, settlement_http_body
+                 FROM commands
+                 WHERE host_id = ?1
+                   AND operation = 'workspace.unregister'
+                   AND state IN ('queued', 'accepted')
+                   AND created_at < ?2
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![host, cutoff], command_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Recent commands for one instance, newest first, bounded by `limit`.
@@ -5147,6 +5880,90 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "configure_seq",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // D-057 (ma-lineage): every instance belongs to a lineage (its own id by
+    // default); a continuity lineage's chapters carry a generation and cause.
+    // `fenced_at` marks a chapter whose authority moved to its successor, and
+    // `restart_json` is the C1 restart policy set at create time.
+    ensure_column(&conn, "instances", "lineage_id", "TEXT")?;
+    ensure_column(
+        &conn,
+        "instances",
+        "generation",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(&conn, "instances", "chapter_cause", "TEXT")?;
+    ensure_column(&conn, "instances", "fenced_at", "TEXT")?;
+    ensure_column(&conn, "instances", "restart_json", "TEXT")?;
+    // ma-lineage round 2: an immutable timestamp for the chapter's real end
+    // event (a transition into exited/failed/closed), kept separate from the
+    // mutable `updated_at`. Written once by [`stamp_ended_at`].
+    ensure_column(&conn, "instances", "ended_at", "TEXT")?;
+    // Rows written before the column existed: a transition to exited/closed is
+    // itself process-end evidence, so backfill those once from updated_at. A
+    // `failed` row is NOT trusted — round 3 (OA6) failed can be a turn-level
+    // error the process survived, and without the original event there is no
+    // way to distinguish; leave its ended_at null rather than fabricate one.
+    conn.execute(
+        "UPDATE instances SET ended_at = updated_at
+         WHERE ended_at IS NULL
+           AND lifecycle IN ('exited', 'closed')",
+        [],
+    )?;
+    // Rows written before the column existed are each their own lineage.
+    conn.execute(
+        "UPDATE instances SET lineage_id = id WHERE lineage_id IS NULL",
+        [],
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS lineages (
+            lineage_id TEXT PRIMARY KEY,
+            current_instance_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            paused_by_json TEXT,
+            paused_at TEXT,
+            restart_json TEXT,
+            origin_spec_ref TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS lineages_current ON lineages(current_instance_id);",
+    )?;
+    // D-057 §5 (ma-lineage round 2): rows written before ma-lineage got their
+    // lineage_id stamped above but no lineage ROW, so a holder's resume fell
+    // back to the plain D-026 path and dropped every continuity property.
+    // Backfill one lineage per existing continuity ROOT — an instance that
+    // holds any grant or carries a restart policy and is itself the FIRST
+    // chapter of its lineage. Only true roots qualify: a row with no stamped
+    // lineage_id (a pre-ma-lineage row) or one whose lineage_id equals its own
+    // id (a lineage root created by current code). A SUCCESSOR chapter carries
+    // lineage_id = its predecessor's id together with copied grants/restart;
+    // selecting it by its own id and inserting a lineage keyed by that id
+    // would manufacture a phantom second lineage for one continuation. The
+    // NOT EXISTS guard therefore checks the STAMPED lineage id. Idempotent on
+    // every open.
+    conn.execute(
+        "INSERT INTO lineages
+            (lineage_id, current_instance_id, generation, state,
+             paused_by_json, paused_at, restart_json, origin_spec_ref, updated_at)
+         SELECT COALESCE(i.lineage_id, i.id), i.id, 1,
+                CASE WHEN i.lifecycle IN ('requested','preparing','starting')
+                     THEN 'starting' ELSE 'running' END,
+                NULL, NULL, i.restart_json,
+                json_object(
+                    'origin', COALESCE(json_extract(i.spec_json, '$.origin'), 'agent'),
+                    'spec', json(i.spec_json)
+                ),
+                i.updated_at
+           FROM instances i
+          WHERE (i.restart_json IS NOT NULL
+                 OR (i.grants_json IS NOT NULL AND i.grants_json != '[]'))
+            AND (i.lineage_id IS NULL OR i.lineage_id = i.id)
+            AND NOT EXISTS (
+                SELECT 1 FROM lineages l
+                 WHERE l.lineage_id = COALESCE(i.lineage_id, i.id)
+            )",
+        [],
+    )?;
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
     ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
@@ -5487,12 +6304,25 @@ fn apply_instance_projection(
             .get("severity")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let failed = severity == "error"
-            || native_name.contains("error")
-            || native_name == "exit"
-            || native_name.contains("gone")
-            || native_name.contains("agent_not_ready")
-            || native_name.contains("shell");
+        let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
+        // ma-lineage round 3 item 2 (OA6): a native event folds the lifecycle
+        // to `failed` ONLY from explicit process-end evidence, never from a
+        // turn/configure/hook/diagnostic error or a bare error severity the
+        // process survived. This is independent of the Node/c-cardsettle split
+        // so a turn error can never stamp the row (or ended_at) terminal.
+        let start_failure = is_start_failure_reason(
+            payload
+                .pointer("/relatedIds/reasonCode")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ) || native_name == "native-driver-start-failed"
+            || native_name.contains("start-fail");
+        let process_exit = matches!(
+            native_name.as_str(),
+            "exit" | "gone" | "agent_not_ready" | "shell"
+        ) || native_name.contains("exit")
+            || native_name.contains("gone");
+        let failed = topic == "session" && (start_failure || (severity == "error" && process_exit));
         if failed {
             lifecycle = Some("failed");
             last_error = payload
@@ -5514,6 +6344,9 @@ fn apply_instance_projection(
              WHERE id = ?5",
             params![seq, lifecycle, last_error, now, instance_id],
         )?;
+        // ma-lineage round 3 item 2: ended_at is stamped ONLY at explicit
+        // process-end evidence; a `ready`/`running` entity event clears it.
+        apply_ended_at_from_event(conn, instance_id, lifecycle, event, now)?;
         // D-027: a terminal instance can never consume a staged attachment
         // again, and the Node drops its own copy at the same point.
         if matches!(lifecycle, "exited" | "failed") {
@@ -8124,7 +8957,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
                 mode, promoted_at, launched_by,
-                role, scope_json, grants_json, task_id, api_route_json, configure_seq
+                role, scope_json, grants_json, task_id, api_route_json, configure_seq,
+                lineage_id, generation, chapter_cause, fenced_at, restart_json
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -8167,6 +9001,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
             // value and reads as `None` — a direct session, truthfully.
             let model = spec
                 .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let permission_mode = spec
+                .get("permissionMode")
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let effort = spec.get("effort");
@@ -8269,6 +9107,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 provider_source_hint,
                 api_route,
                 model,
+                permission_mode,
                 tui: spec
                     .get("tui")
                     .and_then(|value| serde_json::from_value(value.clone()).ok()),
@@ -8313,6 +9152,16 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 grants,
                 task_id,
                 usage_rollup,
+                lineage_id: {
+                    let stamped: Option<String> = row.get(24)?;
+                    stamped.unwrap_or_else(|| row.get::<_, String>(0).unwrap_or_default())
+                },
+                generation: row.get(25)?,
+                chapter_cause: row.get(26)?,
+                fenced_at: row.get(27)?,
+                restart: row
+                    .get::<_, Option<String>>(28)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
             })
         },
     )
@@ -8587,6 +9436,92 @@ fn knowledge_value(value: Option<&Value>) -> Option<&str> {
         .or_else(|| value.get("value").and_then(Value::as_str))
 }
 
+/// D-057 OA6 (ma-lineage round 3, items 2+3): the SINGLE predicate for
+/// "explicit process-end evidence". A chapter is over only when one of these
+/// is present on a journal event:
+///
+/// * an entity lifecycle `exited` or `closed` (a real process exit the Node
+///   observed);
+/// * an entity lifecycle `failed` whose reason is an attested launch failure
+///   (the launch never started — `native-driver-start-failed` / `start-fail`);
+/// * a `topic=session` native event naming a process exit (`exit`, `gone`,
+///   `agent_not_ready`, `shell`) or that the launch never started
+///   (`native-driver-start-failed` / `start-fail`).
+///
+/// Everything else is NOT process end: a TURN result error (`topic=turn`, even
+/// with `affectsCompletion=true`), a transient error-severity session event
+/// with no exit name, and configure/hook/task/plan/diagnostic failures. The
+/// process is still alive in all of those, so no `ended_at` is stamped and a
+/// sessionless resume is refused rather than recovered (item 3).
+pub(crate) fn event_is_explicit_process_end(event: &Value) -> bool {
+    let payload = event.get("payload").unwrap_or(event);
+    let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    if payload_type == "entity" {
+        return match payload.get("state").and_then(Value::as_str) {
+            Some("exited" | "closed") => true,
+            Some("failed") => {
+                let reason = payload
+                    .get("reasonCode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                is_start_failure_reason(reason)
+                    || payload
+                        .pointer("/entity/lastError")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("start"))
+            }
+            _ => false,
+        };
+    }
+    if payload_type != "native" || payload.get("topic").and_then(Value::as_str) != Some("session") {
+        return false;
+    }
+    let name = payload
+        .get("nativeName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let reason = payload
+        .pointer("/relatedIds/reasonCode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    is_start_failure_reason(reason)
+        || name == "native-driver-start-failed"
+        || name.contains("start-fail")
+        || name == "exit"
+        || name.contains("exit")
+        || name.contains("gone")
+        || name.contains("agent_not_ready")
+        || name.contains("shell")
+}
+
+/// Whether a reason string attests that the launch never started (process-end
+/// evidence even though no process ever ran).
+fn is_start_failure_reason(reason: &str) -> bool {
+    reason == "native-driver-start-failed" || reason.contains("start-fail")
+}
+
+/// Lifecycles that mean the process (or launch attempt) has ended.
+fn lifecycle_is_terminal(lifecycle: &str) -> bool {
+    matches!(lifecycle, "exited" | "failed" | "closed")
+}
+
+/// D-057 OA6 row-level predicate for the continuation resume gate (ma-lineage
+/// round 3 item 3): does this chapter's row carry evidence the process is gone
+/// (or never launched)?
+///
+/// * `exited` / `closed` — a real observed process end;
+/// * `failed` — an attested launch failure (the launch never started) or a
+///   process death; round 3 item 2 guarantees a row reaches `failed` only from
+///   such evidence, never a turn error.
+///
+/// Everything else (`requested`/`starting`/`ready`/`running`) is a LIVE
+/// chapter, which with no native session must be refused rather than quietly
+/// relaunched.
+pub(crate) fn instance_row_has_process_end_evidence(record: &InstanceRecord) -> bool {
+    lifecycle_is_terminal(record.lifecycle.as_str())
+}
+
 fn lifecycle_rank(state: &str) -> i32 {
     match state {
         "requested" => 0,
@@ -8676,11 +9611,25 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         .or_else(|| knowledge_value(payload.pointer("/entity/activity")))
         .or_else(|| event.get("activity").and_then(Value::as_str));
 
-    let start_failed = reason == "native-driver-start-failed"
-        || native_name == "native-driver-start-failed"
-        || native_name.contains("start-fail")
-        || status.is_some_and(|s| s == "failed" || s == "error")
-        || entity_state == Some("failed");
+    // ma-lineage round 3 item 2 (OA6): `failed` is set ONLY from explicit
+    // process-end / launch-failure evidence, never from a turn result error or
+    // a bare error severity the process survived. A native event qualifies on
+    // topic=session with an exit/gone name or a start-fail reason (same rule
+    // as apply_instance_projection); turn/hook/task/plan/configuration/
+    // diagnostic topics never fail the row.
+    let native_topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
+    let native_process_failure = payload_type == "native"
+        && native_topic == "session"
+        && (is_start_failure_reason(reason)
+            || native_name == "native-driver-start-failed"
+            || native_name.contains("start-fail")
+            || native_name == "exit"
+            || native_name.contains("exit")
+            || native_name.contains("gone")
+            || native_name.contains("agent_not_ready")
+            || native_name.contains("shell"));
+    let start_failed = (payload_type == "native" && native_process_failure)
+        || (payload_type == "entity" && entity_state == Some("failed"));
     if start_failed && (kind == "lifecycle" || payload_type == "native" || payload_type == "entity")
     {
         return (Some("failed"), None);
@@ -8713,7 +9662,14 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
                 activity = normalize_activity(status);
             }
             "exited" => lifecycle = Some("exited"),
-            "failed" | "error" => lifecycle = Some("failed"),
+            // ma-lineage round 3 item 2 (OA6): a literal failed/error native
+            // STATUS never maps to a failed lifecycle here. Genuine process /
+            // launch failures are caught earlier by `native_process_failure`
+            // (explicit exit/start-fail evidence), and an entity state=failed
+            // is normalized to failed above. A turn result error or a
+            // transient session error reaches this arm while the process is
+            // alive and must leave the row running.
+            "failed" | "error" => {}
             _ => {}
         }
     }
@@ -8749,6 +9705,70 @@ fn apply_instance_lifecycle(
     conn.execute(
         "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
         params![lifecycle, activity, now, instance_id],
+    )?;
+    // ma-lineage round 3 item 2: ended_at is set only at explicit process-end
+    // evidence and CLEARED when a later entity event brings the chapter back
+    // to ready/running (so a live chapter can never keep a stale endedAt).
+    apply_ended_at_from_event(conn, instance_id, lifecycle, event, &now)?;
+    Ok(())
+}
+
+/// Lifecycles that are a real end event (ma-lineage round 2).
+const ENDED_LIFECYCLES: &str = "'exited', 'failed', 'closed'";
+
+/// Stamp or clear the immutable `ended_at` from one journal event according to
+/// the OA6 process-end rule (ma-lineage round 3 items 2+3).
+///
+/// * a resulting `ready`/`running`/`starting` lifecycle CLEARS `ended_at`
+///   (a live chapter carries no end time, even after an earlier transient
+///   failure);
+/// * a terminal lifecycle is stamped ONLY when the event itself is
+///   [`event_is_explicit_process_end`] — a turn error that happens to derive
+///   `failed` never stamps it;
+/// * `COALESCE` keeps the first real end timestamp: a close ACK landing after
+///   the process-exit event must not rewrite it.
+///
+/// Direct scheduler writes that are process-end by construction (host loss,
+/// inventory loss, stale create, explicit settle, Node-rejected create) call
+/// [`stamp_ended_at`] directly.
+fn apply_ended_at_from_event(
+    conn: &Connection,
+    instance_id: &str,
+    resulting_lifecycle: &str,
+    event: &Value,
+    now: &str,
+) -> Result<(), StoreError> {
+    if matches!(resulting_lifecycle, "ready" | "running" | "starting") {
+        conn.execute(
+            "UPDATE instances SET ended_at = NULL WHERE id = ?1",
+            params![instance_id],
+        )?;
+        return Ok(());
+    }
+    if lifecycle_is_terminal(resulting_lifecycle) && event_is_explicit_process_end(event) {
+        let at = event
+            .get("observedAt")
+            .and_then(Value::as_str)
+            .filter(|at| !at.is_empty())
+            .unwrap_or(now);
+        stamp_ended_at(conn, instance_id, at)?;
+    }
+    Ok(())
+}
+
+/// Stamp the immutable `ended_at` once, for a write that is process-end
+/// evidence by construction (scheduler / settle / Node-rejected launch).
+///
+/// `COALESCE` keeps the first end timestamp: a close ACK landing after the
+/// process-exit event (or any later journal row) must not rewrite it, and the
+/// value must not track the mutable `updated_at`.
+fn stamp_ended_at(conn: &Connection, instance_id: &str, at: &str) -> Result<(), StoreError> {
+    conn.execute(
+        &format!(
+            "UPDATE instances SET ended_at = COALESCE(ended_at, ?1)
+             WHERE id = ?2 AND lifecycle IN ({ENDED_LIFECYCLES})"
+        ),
+        params![at, instance_id],
     )?;
     Ok(())
 }

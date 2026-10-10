@@ -53,6 +53,61 @@ listener. Device/bootstrap credentials follow the existing CLI resolution;
 a configured Hub bootstrap secret is also supported. Use a device token or
 access-code/bootstrap file; do not place credentials in URLs.
 
+### Bootstrap access code lifetime (`remuda dev`)
+
+When the Hub starts under `remuda dev --access-code-file F` (or with
+`REMUDA_BOOTSTRAP_TOKEN` set), the provided code is persisted into the dev
+Hub data directory (`<data-dir>/dev-hub/bootstrap-token`) together with an
+issue timestamp, and a provenance marker
+(`bootstrap-token-source-explicit`) records that the code's source of truth is
+the file/env. `F` must be a separate operator-managed file: pointing
+`bootstrapToken = "file:…/bootstrap-token"` back at the Hub's own minted file
+marks it explicit and blocks `rotate-bootstrap` on the normal
+stop → rotate → start flow. It must also live **outside the Hub data
+directory** (a separate read-only secrets mount): a `cp -r`/`scp -r` restore
+of the data dir copies the access file with a fresh mtime newer than the
+restored issued stamp, which would revive an expired code once on the next
+start. In the m1 image the mount is `/data00/remuda/secrets` → `/secrets`,
+so the reference is `bootstrapToken = "file:/secrets/access-code"`.
+
+An explicit code does **not** skip the TTL. The code is trimmed of
+surrounding whitespace/newlines before use; an empty or whitespace-only value
+is refused before anything is written. On disk the issue stamp is written
+**before** the token (so a crash between the two leaves the old token with the
+new stamp and is repaired on retry). On a restart the stamp is re-written as
+follows:
+
+- **Fresh stamp (code considered newly issued)** only when the supplied code
+  differs from the persisted token, or — for a file source — the access-code
+  file's mtime is strictly newer than the parsed stamp (a redeploy that
+  touched it). There is deliberately no comparison against the token file's
+  own mtime: the token is written after the stamp on every healthy persist, so
+  it is normally fractionally newer, and reading that as "reissue" revived
+  expired codes on every restart.
+- **Backfill to "now"** on an otherwise unchanged code when there is no
+  *usable* stamp — a missing, empty, or whitespace-only
+  `bootstrap-issued-at` (a crash during the write, a pre-D-018 dir, or a
+  hand-provisioned token). A non-empty but malformed stamp is **not**
+  backfilled; it is treated as already expired.
+- Otherwise an untouched file or an unchanged env value leaves the stamp
+  byte-for-byte in place, so the code still expires after
+  `bootstrap_ttl_hours` (default **24**; set to `0` to disable expiry
+  entirely). Expiry is enforced at `/v1/login`; an expired code returns 401
+  until the operator replaces the source or rotates.
+
+`remuda hub rotate-bootstrap --data-dir D` detects the dev layout and writes
+to `D/dev-hub/` unless `--standalone` names `D` directly. If both
+`D/bootstrap-token` and `D/dev-hub/bootstrap-token` exist it refuses without
+`--dev` or `--standalone`, rather than guessing which Hub owns the code. It
+refuses (non-zero exit, token and stamp untouched) when the target directory
+has no persisted `bootstrap-token`, or when the explicit-source marker is
+present — in that case the running Hub uses an operator-supplied
+`--access-code-file` / env and rotation cannot change it: stop the Hub,
+replace the file/env, and restart. A hub-generated token — including a
+restored data dir with a token and no explicit source — rotates normally.
+Starting the Hub once with no explicit code removes the marker and adopts the
+persisted token as hub-generated.
+
 ## Live instances across hosts
 
 ```sh
@@ -82,15 +137,17 @@ for a single listing, or compact newline-delimited snapshots when watching,
 with `items`, `stream`, and `stale`. Instance rows retain IDs, host link state,
 and separate lifecycle/activity/connectivity fields for automation.
 
-## Planned: seating and dispatch permission flags (D-057)
+## Seating and dispatch permission flags (D-057)
 
-Planned, not yet implemented. The `instance create` flags land with the
-Phase 1 task `ma-seat-cli`; `dispatch --permission-mode` lands with
-`ma-admission`. Until then the CLI rejects them as unknown arguments. The
-design is [main-agent.md §3.2 and §4.2](./main-agent.md#32-seating).
+The `instance create` seating flags landed with the Phase 1 task
+`ma-seat-cli`; `dispatch --permission-mode` still lands with `ma-admission`
+and is rejected as an unknown argument until then. The design is
+[main-agent.md §3.2 and §4.2](./main-agent.md#32-seating).
 
-`remuda instance create` gains flags for fields `CreateInstanceBody` already
-accepts, plus `restart`:
+`remuda instance create` maps these flags one-to-one onto fields
+`CreateInstanceBody` accepts (plus `restart`); an omitted flag is omitted
+from the request, so a create without them is byte-identical to older
+clients:
 
 | Flag | Body field | Meaning |
 | --- | --- | --- |
@@ -99,15 +156,21 @@ accepts, plus `restart`:
 | `--scope-project <prj_…>` | `scope.projectIds` | Repeatable. Scope only narrows along the delegation tree. |
 | `--scope-host <hst_…>` | `scope.hostIds` | Repeatable. |
 | `--scope-workspace <wsp_…>` | `scope.workspaceIds` | Repeatable. |
-| `--project <prj_…>` | `projectId` | Single-project shortcut when no explicit project scope is given. |
-| `--permission-mode <mode>` | `permissionMode` | A value from the harness's own vocabulary. For an Agent caller, a mode that switches the harness's own permission control off is admitted only if the caller itself runs with it off, and an omitted mode inherits the caller's own mode (D-057). |
+| `--project <prj_…>` | `projectId` | Single-project shortcut. Mutually exclusive with the three `--scope-*` flags: the Hub ignores `projectId` whenever an explicit `scope` object is present, so combining them is a CLI usage error (exit 2) before any request is sent. |
+| `--permission-mode <mode>` | `permissionMode` | A value from the harness's own vocabulary. The "never beyond the creator" rule (a control-off mode is admitted only when the Agent caller itself runs control-off) and omitted-mode inheritance land with `ma-admission`; until then an Agent caller is restricted to `manual`/`plan` and an omitted mode defaults to `manual` (D-057, OA1). |
 | `--model <id>` | `model` | Model id. |
-| `--restart process-loss:<max-per-hour>` | `restart` | Sets `{onProcessLoss: true, maxPerHour}`. Human devices only; Agent and Bot callers get 403. The suggested cap is 3 per hour. |
+| `--restart <none\|process-loss:N>` | `restart` | `process-loss:N` sets `{onProcessLoss: true, maxPerHour: N}` with N >= 1; `none` omits the field. Parsed client-side, so a bad value is a usage error (exit 2) before any request. Human devices only; Agent and Bot callers get 403 and the CLI prints the Hub's reason. The suggested cap is 3 per hour. |
 
 The existing `--host`, `--workspace-id`, `--kind`, `--driver`, `--name`,
-`--title` and `--prompt-file` flags are unchanged.
+`--title` and `--prompt-file` flags are unchanged. A Hub refusal is rendered
+with the Hub's own reason: for example a second live `address-owner` holder
+gets 409 and the CLI surfaces the conflict text instead of a JSON dump. A
+429 `SUPPLY_DEFERRED` keeps the full decision on stderr — every
+`rejected[].reasons`, `ranked`, `deferredUntil` and `retryable` field is
+printed, not only the top-level headline.
 
-`remuda dispatch` gains `--permission-mode <mode>` with the same vocabulary.
+`remuda dispatch` will gain `--permission-mode <mode>` with the same
+vocabulary when `ma-admission` lands.
 A Human-origin dispatch without it keeps today's default byte for byte. An
 Agent-origin dispatch without it inherits the caller's own mode; the
 framework picks no new mode.

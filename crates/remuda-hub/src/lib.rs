@@ -21,6 +21,7 @@ mod devices;
 mod error;
 mod fleet;
 mod gatequeue;
+mod host_dirs;
 mod host_files;
 mod hosts;
 mod http;
@@ -29,6 +30,9 @@ mod interactions;
 /// Test-only seam for the D-051 delegated-decisions feature switch.
 #[doc(hidden)]
 pub use interactions::delegated_decisions_test_support;
+/// Test-only seam for the D-057 continuation-resume race.
+#[doc(hidden)]
+pub use store::lineage_test_support;
 mod inventory;
 mod maintenance;
 mod model_catalog;
@@ -62,7 +66,9 @@ mod workspaces;
 mod ws;
 
 use crate::alerts::{BlockedWatch, Followers};
-use crate::auth::{persist_listen, resolve_bootstrap};
+use crate::auth::{
+    BootstrapResolution, adopt_bootstrap_after_bind, persist_listen, resolve_bootstrap,
+};
 use crate::store::Store;
 use crate::ws::Bus;
 use axum::Router;
@@ -79,10 +85,11 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 pub use agent_scope::instance_token;
-pub use auth::{bootstrap_issued_at, rotate_bootstrap};
+pub use auth::{bootstrap_issued_at, persist_bootstrap, rotate_bootstrap};
 pub use config::{
-    DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_BOOTSTRAP_TTL_HOURS, DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
-    DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS,
+    BootstrapSource, DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_BOOTSTRAP_TTL_HOURS,
+    DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS, DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig,
+    MIN_CREATE_SETTLE_TIMEOUT_MS,
 };
 pub use error::HubError;
 pub use maintenance::migrate;
@@ -114,6 +121,9 @@ pub struct AppState {
     /// When the pinned-ref retention sweep last ran. Per-Hub rather than a
     /// process static so concurrent instances (tests) never starve each other.
     gate_ref_swept_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Round 6 item 3: test-only park points in the real unregister/task-bind
+    /// handlers; empty (no-op) in production.
+    pub(crate) race_barriers: crate::workspaces::RaceBarriers,
 }
 
 impl AppState {
@@ -137,6 +147,9 @@ pub mod store_test_support {
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
 
+    /// D-057 continuation-resume inputs/outcomes for the race suite.
+    pub use crate::store::{ContinuationResumeRequest, ContinuationResumeResult};
+
     /// A leaf-worker delegation scoped to one project.
     pub fn leaf_delegation(project_id: &str) -> Result<InstanceDelegation, String> {
         let project = remuda_protocol::ProjectId::try_from(project_id.to_string())
@@ -150,6 +163,7 @@ pub mod store_test_support {
             grants: Vec::new(),
             task_id: None,
             enforce_tree: true,
+            restart: None,
         })
     }
 
@@ -514,6 +528,55 @@ impl RunningHub {
         crate::gatequeue::reconcile(&self.state).await;
     }
 
+    /// Test helper: run the node.hello unregister reconciliation (c-dirpicker
+    /// r7 item 1) — aborts every still-unsettled workspace.unregister command
+    /// on `host_id` created before the current instant (r9 item 2: commands a
+    /// live new-link DELETE just created are excluded).
+    #[doc(hidden)]
+    pub async fn test_reconcile_unsettled_unregisters(&self, host_id: &str) {
+        crate::workspaces::abort_unsettled_unregisters_on_reconnect(
+            &self.state,
+            host_id,
+            &crate::config::now_rfc3339(),
+        )
+        .await
+        .expect("reconcile unsettled unregisters");
+    }
+
+    /// Test helper (round 6 item 3): arm a one-shot park point in the REAL
+    /// unregister DELETE handler (`unregister == true`; right after the
+    /// occupancy query, before the prepare RPC) or the REAL POST /v1/tasks
+    /// handler (`false`; after the per-workspace guard is acquired, before the
+    /// binding is published). Returns `(reached, release)`: the handler
+    /// notifies `reached` when it parks and continues once `release` is sent.
+    #[doc(hidden)]
+    pub fn test_arm_race_barrier(
+        &self,
+        unregister: bool,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let phase = if unregister {
+            crate::workspaces::RacePhase::Unregister
+        } else {
+            crate::workspaces::RacePhase::TaskBind
+        };
+        self.state.race_barriers.insert(
+            phase,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into
@@ -558,6 +621,128 @@ impl RunningHub {
                 if let Some(watch) = row.watch.as_mut() {
                     watch.last_activity_at = Some(stamp);
                 }
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Test-only seam: mark one Hub-side instance row as having exited, so a
+    /// guard that distinguishes live from ended sessions can be exercised
+    /// without driving a real close/journal sequence.
+    #[doc(hidden)]
+    pub async fn test_mark_instance_exited(&self, instance_id: &str) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let instance_id = instance_id.to_owned();
+        store
+            .run_named("test_mark_instance_exited", move |conn| {
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'exited', activity = 'idle', updated_at = ?1
+                     WHERE id = ?2",
+                    ["2026-10-05T00:00:00Z", instance_id.as_str()],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Test-only seam: mark one Hub-side instance row as having failed with
+    /// an error exit, so the occupancy guard's ended treatment of `failed`
+    /// (and the Node's independent liveness) can be exercised.
+    #[doc(hidden)]
+    pub async fn test_mark_instance_failed(&self, instance_id: &str) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let instance_id = instance_id.to_owned();
+        store
+            .run_named("test_mark_instance_failed", move |conn| {
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'failed', activity = 'idle', \
+                     last_error = 'test error exit', updated_at = ?1 WHERE id = ?2",
+                    ["2026-10-05T00:00:00Z", instance_id.as_str()],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Test-only seam: insert a running task bound to a workspace, so the
+    /// unregister occupancy guard's task branch can be exercised without the
+    /// full create/lease flow.
+    #[doc(hidden)]
+    pub async fn test_insert_bound_task(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        host_id: &str,
+        workspace_id: &str,
+        state: &str,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let (task_id, project_id, host_id, workspace_id, state) = (
+            task_id.to_owned(),
+            project_id.to_owned(),
+            host_id.to_owned(),
+            workspace_id.to_owned(),
+            state.to_owned(),
+        );
+        store
+            .run_named("test_insert_bound_task", move |conn| {
+                conn.execute(
+                    "INSERT INTO tasks (id, project_id, title, state, doc_json, created_at, updated_at)
+                     VALUES (?1, ?2, 'bound', ?3, ?4, '2026-10-05T00:00:00Z', '2026-10-05T00:00:00Z')",
+                    rusqlite::params![
+                        task_id,
+                        project_id,
+                        state,
+                        serde_json::json!({
+                            "workspaceBinding": {
+                                "hostId": host_id,
+                                "workspaceId": workspace_id,
+                                "mode": "reuse"
+                            }
+                        })
+                        .to_string()
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Test helper: mark a directly-inserted bound task done and archived so
+    /// the workspace occupancy query no longer counts it.
+    #[doc(hidden)]
+    pub async fn test_finish_bound_task(&self, task_id: &str) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let task_id = task_id.to_owned();
+        store
+            .run_named("test_finish_bound_task", move |conn| {
+                conn.execute(
+                    "UPDATE tasks SET state = 'done',
+                        doc_json = json_set(doc_json, '$.archivedAt', '2026-10-08T00:00:00Z'),
+                        updated_at = '2026-10-08T00:00:00Z'
+                     WHERE id = ?1",
+                    rusqlite::params![task_id],
+                )?;
                 Ok(())
             })
             .await
@@ -683,7 +868,7 @@ async fn spawn_inner(
     supervise::mark_started();
     proxy::configure_public_origin(&mut config)?;
     std::fs::create_dir_all(&config.data_dir)?;
-    resolve_bootstrap(&mut config)?;
+    let bootstrap_resolution = resolve_bootstrap(&mut config)?;
     let bootstrap_token = config.bootstrap_token.clone();
     let store = Store::open(&config.data_dir)?;
     store
@@ -725,6 +910,7 @@ async fn spawn_inner(
         agent_approvals: agent_approvals::AgentApprovals::new()?,
         challenges: passkeys::ChallengeStore::default(),
         gate_ref_swept_at: Arc::new(std::sync::Mutex::new(None)),
+        race_barriers: crate::workspaces::RaceBarriers::default(),
     };
     store.expire_lost_hosts(config.host_lost_grace_ms).await?;
     // A Hub restart must not inherit yesterday's unacknowledged creates: they
@@ -738,6 +924,13 @@ async fn spawn_inner(
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     persist_listen(&config.data_dir, addr)?;
+    // Bind established: a no-source start may now adopt an explicit-marker'd
+    // persisted token, or commit the in-memory mint of a token-less recovery
+    // path. A failed bind above aborts before this, leaving the provenance
+    // marker (and rotation refusal) intact.
+    if bootstrap_resolution == BootstrapResolution::AdoptAfterBind {
+        adopt_bootstrap_after_bind(&config.data_dir, &config.bootstrap_token)?;
+    }
     let (tx, rx) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         let shutdown = async {
@@ -829,6 +1022,7 @@ pub fn router(state: AppState) -> Router {
         .merge(agent_scope::routes())
         .merge(objects::routes(state.config.attachment_max_bytes))
         .merge(host_files::routes(state.config.attachment_max_bytes))
+        .merge(host_dirs::routes())
         .merge(attachments::routes())
         .merge(workspaces::routes())
         .merge(workers::routes())

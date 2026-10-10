@@ -367,3 +367,23 @@ describe("PhoneNav (UO-2a)", () => {
     expect(within(bar).getByTestId("phone-nav-more")).toHaveAttribute("data-active", "1");
   });
 });
+
+describe("ShellNotify — e2e seam gating (c-composerpop r2 item 4)", () => {
+  afterEach(() => {
+    delete (window as unknown as { __remudaE2E?: boolean }).__remudaE2E;
+    delete (window as unknown as { __notifyLab?: unknown }).__notifyLab;
+  });
+
+  it("does not install window.__notifyLab in a production session", () => {
+    render(<ShellNotify />);
+    expect((window as unknown as { __notifyLab?: unknown }).__notifyLab).toBeUndefined();
+  });
+
+  it("installs window.__notifyLab only when the e2e marker is set", () => {
+    (window as unknown as { __remudaE2E?: boolean }).__remudaE2E = true;
+    render(<ShellNotify />);
+    const lab = (window as unknown as { __notifyLab?: { notify: unknown } }).__notifyLab;
+    expect(lab).toBeTruthy();
+    expect(typeof lab?.notify).toBe("function");
+  });
+});

@@ -342,10 +342,15 @@ test("real Node: register a project, create a shell in it, close and unregister"
   // and a subsequent stale poll must not undo the newer journal revision.
   await observer.route("**/v1/hosts", (route) => route.fulfill({ json: frozenHosts }));
   await page.getByTestId("workspace-add").click();
-  await page.getByTestId("workspace-register-path").fill(path!);
+  const browser = page.getByTestId("dir-browser");
+  await expect(browser).toBeVisible();
+  // The absolute path is supplied by the environment; reach it through the
+  // browser's advanced manual entry (c-dirpicker keeps path typing available).
+  await page.getByTestId("dir-browser-manual-toggle").click();
+  await page.getByTestId("dir-browser-manual-path").fill(path!);
   const registered = page.waitForResponse((response) => response.request().method() === "POST"
     && new URL(response.url()).pathname === `/v1/hosts/${hostId}/workspaces`);
-  await page.getByTestId("workspace-register-submit").click();
+  await page.getByTestId("dir-browser-manual-submit").click();
   const registration = await registered;
   expect(registration.ok()).toBe(true);
   const snapshot = await registration.json();
@@ -385,6 +390,7 @@ test("real Node: register a project, create a shell in it, close and unregister"
   await expect(row).toBeVisible();
   const unregistered = page.waitForResponse((response) => response.request().method() === "DELETE"
     && new URL(response.url()).pathname === `/v1/hosts/${hostId}/workspaces`);
+  page.on("dialog", (dialog) => void dialog.accept());
   await row.getByRole("button", { name: `移除目录 ${workspace.root}`, exact: true }).click();
   expect((await unregistered).ok()).toBe(true);
   await expect(row).toHaveCount(0);

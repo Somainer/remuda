@@ -15,9 +15,9 @@
 //! Every process the probe starts directly is in the ledger
 //! `PROBE_DIR/pids.txt`: the probe itself, each claude session (at spawn and
 //! at confirmed termination), and every short helper (`claude --version`,
-//! `hostname`, `scutil`, the pre-kill `ps`/`lsof`), which all go through
-//! [`run_logged`]. Processes claude starts itself, such as its hook scripts,
-//! are not in the ledger.
+//! `hostname`, `scutil`, the pre-kill `ps`, plus a `/proc/<pid>/cwd` read),
+//! which all go through [`run_logged`]. Processes claude starts itself, such
+//! as its hook scripts, are not in the ledger.
 //!
 //! Output per session, under `PROBE_DIR/<case>/`: the raw transcript copy,
 //! the rendered vt100 screens and `actions.json` (per-step verdicts, dialog
@@ -694,20 +694,22 @@ fn group_alive(pgid: u32) -> bool {
 }
 
 fn describe_pid(ledger: &Path, pid: u32) {
-    let pid = pid.to_string();
-    for (tool, args) in [
-        ("ps", ["-o", "pid=,command=", "-p", pid.as_str()].as_slice()),
-        (
-            "lsof",
-            ["-a", "-d", "cwd", "-Fn", "-p", pid.as_str()].as_slice(),
-        ),
-    ] {
-        if let Ok(out) = run_logged(ledger, tool, args) {
-            println!(
-                "before kill ({tool}): {}",
-                String::from_utf8_lossy(&out.stdout).trim()
-            );
-        }
+    let pid_str = pid.to_string();
+    if let Ok(out) = run_logged(
+        ledger,
+        "ps",
+        ["-o", "pid=,command=", "-p", pid_str.as_str()].as_slice(),
+    ) {
+        println!(
+            "before kill (ps): {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+    }
+    // Read the cwd straight from /proc instead of shelling out to a host-wide
+    // inspection tool: one pid, one symlink, nothing scans the machine.
+    match std::fs::read_link(format!("/proc/{pid_str}/cwd")) {
+        Ok(cwd) => println!("before kill (cwd): {}", cwd.display()),
+        Err(error) => println!("before kill (cwd): <{error}>"),
     }
 }
 

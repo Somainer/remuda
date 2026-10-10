@@ -484,3 +484,75 @@ fn a_later_turn_workflow_intermediate_with_nonzero_index_does_not_settle() {
 // publication task:
 // `an_older_buffered_result_cannot_settle_a_newer_outstanding_input_through_the_publication_task`
 // in tests/claude_sdk_process.rs.
+
+/// ma-sdk-state r6 item 5: turn A completes while a newer turn B is still
+/// outstanding (A's result is deferred and carries no settledRootTurn); when
+/// B's write later fails on the live child and B is rolled back, the rollback
+/// EMITS the settle it blocked (a `result` lifecycle with settledRootTurn +
+/// deferredSettle), so the root idles instead of staying working until another
+/// turn arrives.
+#[test]
+fn a_failed_newer_write_releases_the_older_turn_deferred_settle() {
+    let result_a = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": "A done",
+        "stop_reason": "end_turn",
+        "session_id": SESSION,
+        "result_index": 0
+    });
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
+    // Two sends in flight: A in front, B outstanding.
+    mapper.begin_turn();
+    mapper.begin_turn();
+
+    // A's result maps while B is open: deferred, no settle.
+    let obs_a = mapper.map(result_a).expect("map A result");
+    let result_a = obs_a
+        .iter()
+        .find_map(|o| match &o.body {
+            ObservationPayload::Lifecycle(p) => match p.as_ref() {
+                LifecyclePayload::Native(n) if n.native_name == "result" => Some(n),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("A result lifecycle");
+    assert!(
+        !result_a.related_ids.contains_key("settledRootTurn"),
+        "A is deferred behind B: no settledRootTurn"
+    );
+
+    // B's write fails on a live child: rolling B back releases A's settle.
+    let settle = mapper
+        .cancel_turn()
+        .expect("cancel is infallible")
+        .expect("the rollback emits the deferred settle");
+    let native = match &settle.body {
+        ObservationPayload::Lifecycle(p) => match p.as_ref() {
+            LifecyclePayload::Native(n) => n,
+            _ => panic!("deferred settle must be a native lifecycle"),
+        },
+        _ => panic!("deferred settle must be a lifecycle"),
+    };
+    assert_eq!(native.native_name, "result");
+    assert_eq!(
+        native
+            .related_ids
+            .get("settledRootTurn")
+            .map(String::as_str),
+        Some("true"),
+        "the released settle idles the root"
+    );
+    assert_eq!(
+        native.related_ids.get("deferredSettle").map(String::as_str),
+        Some("true")
+    );
+
+    // Rolling back again releases nothing.
+    assert!(
+        mapper.cancel_turn().expect("second cancel").is_none(),
+        "the deferred settle is one-shot"
+    );
+}

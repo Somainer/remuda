@@ -1474,3 +1474,53 @@ async fn a_failing_exit_observation_build_still_closes_the_run_handle_to_eof() {
         "RunHandle must reach EOF after close even when the exit build errors: {drain:?}"
     );
 }
+
+/// ma-sdk-state r6 item 5 (live): turn A completes normally, then the child
+/// closes its stdin after that turn and parks alive; turn B's write therefore
+/// fails on the LIVE child. The ordered cancel must roll B's empty book back
+/// without emitting a B turn_started, leave the child alive (not process loss),
+/// and close cleanly.
+#[tokio::test]
+async fn a_successful_turn_then_a_failed_live_write_rolls_back_without_a_b_start() {
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS".to_owned(),
+        "1".to_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::TwoTurn, env);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Turn A completes (the child answers turn 1, then closes its stdin).
+    driver
+        .send(prompt_id("first", "msg-r5-live-a"))
+        .await
+        .expect("A sends");
+    let _a = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+
+    // Give the child a beat to close its stdin after turn A.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Turn B's write fails on the live child.
+    let b = driver.send(prompt_id("second", "msg-r5-live-b")).await;
+    assert!(b.is_err(), "B's write must fail on the closed stdin: {b:?}");
+    assert!(
+        !driver.process_gone().await,
+        "the child is still alive after the failed write"
+    );
+
+    // No second turn_started leaked, and close still reaches EOF.
+    let mut starts_after = 0usize;
+    while let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(300), handle.recv()).await
+    {
+        if lifecycle_named(&obs) == Some("turn_started") {
+            starts_after += 1;
+        }
+    }
+    assert_eq!(starts_after, 0, "the failed B send leaked no turn_started");
+
+    driver.close().await.expect("close");
+}

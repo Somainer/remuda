@@ -63,6 +63,14 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // the driver itself initiates and maps to ControlUnavailable. This is the
     // only way to exercise "the write itself errored" deterministically.
     let close_stdin = std::env::var("FAKE_CLAUDE_CLOSE_STDIN").is_ok_and(|value| value == "1");
+    // `FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS=<n>`: behave normally (answer turns)
+    // for the first n POST-handshake inbound frames, then close stdin and park
+    // alive. Turn n therefore completes normally while the NEXT prompt's write
+    // fails on the still-live child — the live-child write-failure after a
+    // successful earlier turn (ma-sdk-state r6 item 5).
+    let close_stdin_after_turns = std::env::var("FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
     // `FAKE_CLAUDE_STDOUT_FLOOD=1`: after the handshake, never read stdin again
     // and keep emitting frames on stdout forever. Bidirectional pipe pressure:
     // the parent must keep draining stdout while a write is blocked on the
@@ -123,6 +131,8 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     session.emit_init()?;
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
+    // Count post-handshake inbound frames for CLOSE_STDIN_AFTER_TURNS.
+    let mut post_handshake_frames = 0usize;
     while let Some(line) = lines.next() {
         let line = line?;
         let trimmed = line.trim();
@@ -135,6 +145,20 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         }
         let was_initialized = session.saw_initialize;
         session.handle_incoming(incoming, &mut lines)?;
+        // ma-sdk-state r6 item 5: after the Nth POST-handshake frame is fully
+        // handled (so its turn completed and its frames were emitted), close
+        // stdin and park alive — the NEXT prompt's write fails while this child
+        // stays up.
+        if was_initialized {
+            post_handshake_frames += 1;
+        }
+        if close_stdin_after_turns == Some(post_handshake_frames) && was_initialized {
+            #[cfg(unix)]
+            {
+                let _ = nix::unistd::close(0);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(300));
+        }
         // ma-sdk-state r4 item 3: FAKE_CLAUDE_CLOSE_STDIN closes the read end
         // on the SAME iteration that completes the handshake — the first
         // prompt must never be consumed, so its write fails while the child

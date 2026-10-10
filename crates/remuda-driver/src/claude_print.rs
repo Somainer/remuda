@@ -185,6 +185,12 @@ struct TurnBook {
     /// result included) is published behind its start. `None` once the write
     /// commits or is rolled back.
     reserved: Option<u64>,
+    /// ma-sdk-state r6 item 5: a completed turn's settle is deferred while a
+    /// NEWER locally-written turn is still outstanding (its result popped but
+    /// did not settle the root). If that newer turn's write later fails and it
+    /// is rolled back, the deferred settle is released so the root idles
+    /// instead of staying working forever.
+    deferred_settle: bool,
     next_seq: u64,
 }
 
@@ -217,7 +223,11 @@ impl TurnBook {
     /// `seq`, and clear `reserved` only when it names `seq`. Keying on the seq
     /// means a rollback for an older/dropped reservation can never remove a
     /// NEWER turn a concurrent send already began.
-    fn cancel_turn(&mut self, seq: u64) {
+    ///
+    /// Returns true when removing this turn drained the last outstanding local
+    /// turn and thereby RELEASED a deferred root settle (r6 item 5): an earlier
+    /// completed turn's result is now owed an idle.
+    fn cancel_turn(&mut self, seq: u64) -> bool {
         if self.outstanding.back().is_some_and(|turn| turn.seq == seq)
             && let Some(turn) = self.outstanding.pop_back()
         {
@@ -227,6 +237,12 @@ impl TurnBook {
         }
         if self.reserved == Some(seq) {
             self.reserved = None;
+        }
+        if self.deferred_settle && self.outstanding.is_empty() {
+            self.deferred_settle = false;
+            true
+        } else {
+            false
         }
     }
 
@@ -268,7 +284,24 @@ impl TurnBook {
             }
         }
     }
+}
 
+/// The effect of mapping one `result` frame on the root-turn book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootSettle {
+    /// This result settles the root (the completed turn is popped and nothing
+    /// newer/outstanding gates it): publish it with `settledRootTurn`.
+    Settled,
+    /// The completed turn was popped but the root stays open because a NEWER
+    /// locally-written turn is outstanding. The settle is recorded as deferred;
+    /// it is released only if that newer turn is rolled back.
+    Deferred,
+    /// The front turn's workflows are still open, or a native follow-up turn is
+    /// queued, or there is no local turn: the root keeps working.
+    NotSettled,
+}
+
+impl TurnBook {
     /// Whether a `result` frame SETTLES THE ROOT TURN.
     ///
     /// `queued` is the native `queued_turn_count` (0/omitted = nothing queued).
@@ -277,23 +310,37 @@ impl TurnBook {
     /// emits result 0 then result 1 for the SAME user frame). Otherwise the
     /// front turn completes here; the root settles only when no newer locally
     /// written turn remains outstanding.
-    fn result_settles_root(&mut self, queued: u64) -> bool {
+    fn result_settles_root(&mut self, queued: u64) -> RootSettle {
         let front_open = self
             .outstanding
             .front()
             .is_some_and(|front| !front.open_workflows.is_empty());
         if front_open {
-            return false;
+            return RootSettle::NotSettled;
         }
         if self.outstanding.pop_front().is_some() {
             // Defense in depth: workflows observed before any locally-written
             // turn (pure replay/hydration) live in the implicit bucket; they
             // still gate settlement even when a synthetic turn is popped.
-            queued == 0 && self.outstanding.is_empty() && self.implicit_workflows.is_empty()
-        } else {
+            if queued != 0 || !self.implicit_workflows.is_empty() {
+                return RootSettle::NotSettled;
+            }
+            if self.outstanding.is_empty() {
+                // Any prior deferral is now superseded by a real settle.
+                self.deferred_settle = false;
+                RootSettle::Settled
+            } else {
+                // The turn completed but a newer locally-written turn is still
+                // outstanding; remember that its settle is owed (r6 item 5).
+                self.deferred_settle = true;
+                RootSettle::Deferred
+            }
+        } else if queued == 0 && self.implicit_workflows.is_empty() {
             // No locally-known turn (pure replay): native queue evidence plus
             // the implicit workflow bucket.
-            queued == 0 && self.implicit_workflows.is_empty()
+            RootSettle::Settled
+        } else {
+            RootSettle::NotSettled
         }
     }
 }
@@ -343,6 +390,17 @@ struct Mapper {
     /// locally-written turns rather than a process-global counter or
     /// `result_index`.
     turns: TurnBook,
+    /// ma-sdk-state r6 item 5: status/error text of the most recent completed
+    /// turn whose settle was deferred behind a newer outstanding turn, used to
+    /// emit the deferred settle if that newer turn's write fails.
+    deferred_result: Option<DeferredResult>,
+}
+
+/// The shape of a completed turn whose root settle is deferred (r6 item 5).
+#[derive(Clone)]
+struct DeferredResult {
+    status: &'static str,
+    last_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -598,6 +656,7 @@ impl ClaudePrintDriver {
                     channel: SourceChannel::Stdout,
                     media_stager,
                     turns: TurnBook::default(),
+                    deferred_result: None,
                 }),
                 publish: Mutex::new(None),
                 write_seq: tokio::sync::Mutex::new(()),
@@ -728,6 +787,7 @@ impl ClaudePrintDriver {
                 channel: SourceChannel::Stdout,
                 media_stager: self.options.media_stager.clone(),
                 turns: TurnBook::default(),
+                deferred_result: None,
             };
         }
         *self.inner.policy.lock().await = policy;
@@ -1006,12 +1066,14 @@ impl Driver for ClaudePrintDriver {
                         Ok(DriverAck::transport_written())
                     }
                     Err(error) => {
-                        // The guard's Drop cancels the parked ticket (no
-                        // turn_started is ever emitted for the unwritten prompt)
-                        // and rolls the empty book back, keyed to this seq.
-                        // Frames queued behind it flow unchanged and map against
-                        // the pre-opened (then removed) book, which the next
-                        // successful turn's FIFO ordering supersedes.
+                        // Roll the empty book back BEFORE resolving the parked
+                        // ticket, emitting any deferred settle the cancelled turn
+                        // blocked (r6 item 5); no turn_started is emitted for the
+                        // unwritten prompt. Frames queued behind it flow
+                        // unchanged against the rolled-back book.
+                        if let Err(settle_error) = guard.fail().await {
+                            warn!(%settle_error, "deferred settle emission failed after a failed write");
+                        }
                         Err(map_wire(error))
                     }
                 }
@@ -1482,7 +1544,7 @@ impl TurnReservation {
 struct ReservationGuard {
     inner: Arc<Inner>,
     reservation: Arc<TurnReservation>,
-    committed: bool,
+    resolved: bool,
 }
 
 impl ReservationGuard {
@@ -1490,34 +1552,51 @@ impl ReservationGuard {
         Self {
             inner,
             reservation,
-            committed: false,
+            resolved: false,
         }
     }
 
     /// The write succeeded: keep the reservation (the worker emits the start);
     /// the matching `Drop` is then a no-op.
     fn commit(mut self) {
-        self.committed = true;
+        self.resolved = true;
         self.reservation.commit();
+    }
+
+    /// The write failed on a live child. Roll the book back BEFORE resolving the
+    /// ticket (r6 item 5 ordering), emitting the deferred root settle the
+    /// cancelled turn blocked, then unblock the worker. Consumes the guard so
+    /// `Drop` is a no-op.
+    async fn fail(self) -> DriverResult<()> {
+        let deferred = {
+            let mut mapper = self.inner.mapper.lock().await;
+            mapper.cancel_turn_reservation(self.reservation.seq)?
+        };
+        // Resolve the ticket only after the book is rolled back, so the worker
+        // waking on it maps subsequent frames against the rolled-back book.
+        self.reservation.cancel();
+        if let Some(observation) = deferred {
+            emit_all(&self.inner, vec![observation]).await?;
+        }
+        std::mem::forget(self);
+        Ok(())
     }
 }
 
 impl Drop for ReservationGuard {
     fn drop(&mut self) {
-        if self.committed {
+        if self.resolved {
             return;
         }
-        // Wake any parked worker BEFORE returning from drop so the publication
-        // pipeline cannot stay wedged.
+        // Safety net for an unexpected drop (panic/task cancellation): wake the
+        // parked worker immediately, then roll the book back best-effort. This
+        // path does not emit a deferred settle; the explicit `fail` does.
         self.reservation.cancel();
-        // The mapper lock is async, so run the seq-keyed rollback as a task.
-        // cancel_turn(seq) pops the book only if it is still the back turn, so
-        // a newer turn that already began is left intact.
         let inner = self.inner.clone();
         let seq = self.reservation.seq;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                inner.mapper.lock().await.cancel_turn_reservation(seq);
+                let _ = inner.mapper.lock().await.cancel_turn_reservation(seq);
             });
         }
     }
@@ -2458,9 +2537,21 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
     // turns on the long-lived sdk child, so a workflow intermediate in a later
     // turn must not be read from it.
     let queued = result.queued_turn_count.unwrap_or(0);
-    let settles_root_turn = mapper.turns.result_settles_root(queued);
-    if settles_root_turn {
-        related.insert("settledRootTurn".into(), "true".into());
+    match mapper.turns.result_settles_root(queued) {
+        RootSettle::Settled => {
+            related.insert("settledRootTurn".into(), "true".into());
+            // A real settle supersedes any stashed deferral.
+            mapper.deferred_result = None;
+        }
+        RootSettle::Deferred => {
+            // Remember this completed turn so a later rollback of the newer
+            // outstanding turn can emit the settle it blocked (r6 item 5).
+            mapper.deferred_result = Some(DeferredResult {
+                status,
+                last_error: related.get("lastError").cloned(),
+            });
+        }
+        RootSettle::NotSettled => {}
     }
     let session_id = mapper.session_id.clone();
     let mut out = vec![mapper.lifecycle_related(
@@ -2820,9 +2911,34 @@ impl Mapper {
         self.turns.turn_committed(seq);
     }
 
-    /// Roll back the reservation for `seq` when its write fails.
-    fn cancel_turn_reservation(&mut self, seq: u64) {
-        self.turns.cancel_turn(seq);
+    /// Roll back the reservation for `seq` when its write fails. When that
+    /// rollback releases a deferred root settle (r6 item 5), build the owed
+    /// settled-turn observation so the caller can emit it.
+    fn cancel_turn_reservation(&mut self, seq: u64) -> DriverResult<Option<Observation>> {
+        if !self.turns.cancel_turn(seq) {
+            return Ok(None);
+        }
+        let Some(deferred) = self.deferred_result.take() else {
+            return Ok(None);
+        };
+        let mut related = std::collections::BTreeMap::new();
+        if let Some(error) = deferred.last_error {
+            related.insert("lastError".into(), error);
+        }
+        // The blocked newer turn vanished (its write failed), so the earlier
+        // completed turn now settles the root. resultIndex is intentionally
+        // absent: this is a settlement correction, not a new native result.
+        related.insert("settledRootTurn".into(), "true".into());
+        related.insert("deferredSettle".into(), "true".into());
+        let session_id = self.session_id.clone();
+        Ok(Some(self.lifecycle_related(
+            LifecycleTopic::Turn,
+            "result",
+            Knowledge::Known { value: session_id },
+            deferred.status,
+            related,
+            false,
+        )?))
     }
 
     /// Build the turn_started observation WITHOUT touching the book — used
@@ -2844,6 +2960,10 @@ impl Mapper {
         )
     }
 
+    /// Stream/replay equivalent of the live write-completed start. Only the
+    /// test-stub mapper wrapper calls it; the live reader uses the
+    /// begin-commit/turn_started_observation pair.
+    #[cfg(any(test, feature = "test-stub"))]
     fn turn_started(&mut self, client_message_id: &str) -> DriverResult<Observation> {
         let seq = self.turns.begin_turn();
         // A start derived directly from the stream (replay/hydration) has no
@@ -3567,6 +3687,7 @@ impl StdoutMapper {
                 channel: SourceChannel::Stdout,
                 media_stager: None,
                 turns: TurnBook::default(),
+                deferred_result: None,
             },
         }
     }
@@ -3584,10 +3705,14 @@ impl StdoutMapper {
 
     /// Roll back the most recently opened turn when its prompt write fails
     /// (replay/test helper). Seq-safe: it cancels exactly the current back.
-    pub fn cancel_turn(&mut self) {
+    /// Returns the deferred root-settle observation this rollback releases, if
+    /// any (r6 item 5).
+    pub fn cancel_turn(&mut self) -> DriverResult<Option<Observation>> {
         let seq = self.mapper.turns.outstanding.back().map(|turn| turn.seq);
         if let Some(seq) = seq {
-            self.mapper.cancel_turn_reservation(seq);
+            self.mapper.cancel_turn_reservation(seq)
+        } else {
+            Ok(None)
         }
     }
 
@@ -3683,6 +3808,7 @@ impl TranscriptMapper {
                 channel: SourceChannel::Transcript,
                 media_stager: None,
                 turns: TurnBook::default(),
+                deferred_result: None,
             },
             group: records::Group::default(),
             seen_prompts: std::collections::HashSet::new(),
@@ -4498,6 +4624,7 @@ pub mod review {
                     channel: SourceChannel::Stdout,
                     media_stager: None,
                     turns: TurnBook::default(),
+                    deferred_result: None,
                 },
             }
         }
@@ -4529,6 +4656,7 @@ pub mod review {
             channel: SourceChannel::Stdout,
             media_stager: None,
             turns: TurnBook::default(),
+            deferred_result: None,
         };
         map_outbound(&mut mapper, &frame)
     }
@@ -5362,5 +5490,39 @@ mod turn_book_reserved_seq_tests {
         assert_eq!(book.reserved, Some(c));
         book.turn_committed(c);
         assert_eq!(book.reserved, None);
+    }
+
+    /// ma-sdk-state r6 item 5: turn A completes while newer turn B is
+    /// outstanding (its result is deferred), then B's write fails and is rolled
+    /// back. The rollback must release A's deferred settle so the root idles
+    /// instead of staying working.
+    #[test]
+    fn rolling_back_the_newer_turn_releases_the_older_deferred_settle() {
+        let mut book = TurnBook::default();
+        book.begin_turn(); // A
+        book.begin_turn(); // B
+
+        // A's result pops A but cannot settle behind B.
+        assert_eq!(book.result_settles_root(0), RootSettle::Deferred);
+        assert!(book.deferred_settle);
+        assert_eq!(book.outstanding.len(), 1, "only B remains outstanding");
+
+        // B's failed write rolls B back and releases the owed settle.
+        let released = {
+            let back = book.outstanding.back().expect("B is the back").seq;
+            book.cancel_turn(back)
+        };
+        assert!(released, "rolling B back releases A's deferred settle");
+        assert!(book.outstanding.is_empty());
+        assert!(!book.deferred_settle);
+
+        // A genuinely-queued/native result is NOT deferred, so cancelling a
+        // blocker later releases nothing.
+        book.begin_turn(); // C
+        book.begin_turn(); // D
+        assert_eq!(book.result_settles_root(1), RootSettle::NotSettled);
+        assert!(!book.deferred_settle, "a queued result is not deferred");
+        let back = book.outstanding.back().expect("D is the back").seq;
+        assert!(!book.cancel_turn(back), "no deferred settle to release");
     }
 }

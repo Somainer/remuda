@@ -21,6 +21,7 @@ fn mapper() -> Mapper {
         channel: SourceChannel::Stdout,
         media_stager: None,
         turns: TurnBook::default(),
+        deferred_result: None,
     }
 }
 

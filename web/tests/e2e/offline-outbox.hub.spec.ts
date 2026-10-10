@@ -414,102 +414,6 @@ async function expectDelivered(page: Page, commandId: string | null) {
   await expect(bubble).toHaveCount(0);
 }
 
-// ── TEMPORARY c-reconnfu gate-7b diagnostic — remove with the follow-up fix ─
-const __jstateLog: string[] = [];
-test.afterEach(async ({}: { page: Page }, testInfo: { title: string; status: string; attach: (n: string, o: object) => Promise<void> }) => {
-  if (!__jstateLog.length) return;
-  const body = __jstateLog.join("\n");
-  console.log(`\n----- JSTATE2 SEQUENCE (${testInfo.status}: ${testInfo.title}) -----\n${body}\n`);
-  try {
-    await testInfo.attach("jstate2-sequence", { body, contentType: "text/plain" });
-  } catch {
-    /* diagnostic only */
-  }
-  __jstateLog.length = 0;
-});
-
-async function installConnectionProbe2(page: Page) {
-  page.on("console", (msg) => {
-    const text = msg.text();
-    if (text.startsWith("JS2|")) __jstateLog.push(text.slice(4));
-  });
-  await page.addInitScript(() => {
-    const rec = (m: string) => {
-      try {
-        console.log("JS2|" + m + " @" + Date.now());
-      } catch {
-        /* probe only */
-      }
-    };
-    for (const ev of ["online", "offline", "focus", "pageshow", "visibilitychange"]) {
-      window.addEventListener(ev, () => rec("win:" + ev), true);
-    }
-    const W = window.WebSocket;
-    const Patched = function (this: unknown, url: string | URL, protocols?: string | string[]) {
-      const ws = protocols === undefined ? new W(url) : new W(url, protocols);
-      const tag = "ws(" + String(url).replace(/^wss?:\/\/[^/]+/, "") + ")";
-      rec(tag + ":construct");
-      ws.addEventListener("open", () => rec(tag + ":open"));
-      ws.addEventListener("close", (e) => rec(tag + ":close:" + e.code));
-      ws.addEventListener("error", () => rec(tag + ":error"));
-      let n = 0;
-      ws.addEventListener("message", () => {
-        n += 1;
-        if (n <= 2 || n % 100 === 0) rec(tag + ":msg#" + n);
-      });
-      return ws;
-    } as unknown as typeof WebSocket;
-    Patched.prototype = W.prototype;
-    Object.assign(Patched, W);
-    window.WebSocket = Patched;
-    // Trace the connection probe's journal reads (status + duration decide the
-    // quiet-stale vs offline settlement).
-    const origFetch = window.fetch.bind(window);
-    window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("/journal") && !url.includes("follow")) {
-        const t0 = Date.now();
-        return origFetch(input, init).then(
-          (res) => {
-            rec("probe:" + res.status + ":" + (Date.now() - t0) + "ms");
-            return res;
-          },
-          (err) => {
-            rec("probe:ERR:" + String(err).slice(0, 40) + ":" + (Date.now() - t0) + "ms");
-            throw err;
-          },
-        );
-      }
-      return origFetch(input, init);
-    };
-    const bannerSnap = () => {
-      const el = document.querySelector('[data-testid="journal-banner"]');
-      return el ? el.getAttribute("data-state") + ":" + JSON.stringify(el.textContent ?? "") : "MISSING";
-    };
-    const installObserver = () => {
-      if (!document.documentElement) {
-        requestAnimationFrame(installObserver);
-        return;
-      }
-      let last = "";
-      new MutationObserver(() => {
-        const s = bannerSnap();
-        if (s !== last) {
-          last = s;
-          rec("banner:" + s);
-        }
-      }).observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ["data-state", "data-testid"],
-      });
-    };
-    installObserver();
-    rec("probe2:installed");
-  });
-}
-
 test("offline sends are queued and delivered exactly once after reconnect", async ({ page }) => {
   const instanceId = await createSession(page, "offline outbox seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
@@ -955,7 +859,6 @@ test.use({
 
 test.describe("full offline SW restore (PNA/LNA loopback exemption for this harness case)", () => {
   test("an offline-queued message survives a reload with the browser context STILL offline and sends once after", async ({ page }) => {
-    await installConnectionProbe2(page);
     const instanceId = await createSession(page, "full offline reload seed");
     await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
     const api = await hubApi(page);

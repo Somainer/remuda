@@ -14,3 +14,8 @@ node_modules/
 
 # local-only denylist for the private-token scanner
 scripts/ci/private-tokens.local
+
+# Worker-local scratch (e2e data dirs, logs, one-off scripts) and the shared
+# gate lock file — ephemeral host-local state, never part of a delivery.
+/scratch/
+/locks/

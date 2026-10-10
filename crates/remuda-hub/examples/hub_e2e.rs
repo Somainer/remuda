@@ -593,9 +593,13 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
                 "maxInstances": 8,
                 // Inventory only: this harness never launches herdr.
                 "herdr": { "version": "e2e-fake" },
+                // Report the current decoupled build: the effort-sync suite
+                // drives the orthogonal switch (flag on at any tier without
+                // moving the slider) and the live version gate derives from
+                // this inventory when the instance carries no own snapshot.
                 "cli": [{
                     "kind": "claude",
-                    "version": "2.1.268",
+                    "version": "2.1.289",
                     "absolutePath": "/usr/bin/claude",
                     "authState": "logged_in"
                 }, {

@@ -619,9 +619,59 @@ test.describe("notification stack does not cover menus (item 8)", () => {
   // than guessing how many rows reach which band, raise distinct standing
   // errors (distinct subjects = distinct keys, BLOCKING_LIMIT 5) until the
   // menu∩standing-error intersection actually contains an inert probe point.
+  // One scanner shared by the raise loop and the test below: the loop stops
+  // as soon as it finds an inert point and the test clicks the SAME point
+  // class, so their probe grids must agree (r6 item 4 — the loop probed
+  // +2/2 px and the click probe +4/4 px, so a blocker top landing in
+  // [menu.y+3, menu.y+5) stopped the loop yet made the probe return
+  // "no inert point").
+  const INTERACTIVE =
+    'button,input,select,textarea,a[href],[role="button"],[role="slider"],[role="switch"],[tabindex]';
+
+  type InertPoint = { ok: true; x: number; y: number } | { ok: false; reason: string };
+
+  /** Find a REAL-clickable INERT point in the menu; with withBlocker the
+   *  search is constrained to the menu∩standing-error intersection. The
+   *  4 px inset / 4 px grid keeps every hit off the rounded border. */
+  const findInertPoint = (page: Page, menuTestId: string, withBlocker: boolean) =>
+    page.evaluate(
+      ({ testId, interactive, useBlocker }) => {
+        const rectOf = (el: Element) => {
+          const r = el.getBoundingClientRect();
+          return { x: r.x, y: r.y, w: r.width, h: r.height };
+        };
+        const menu = document.querySelector<HTMLElement>(`[data-testid='${testId}']`);
+        if (!menu) return { ok: false as const, reason: "missing menu" };
+        const a = rectOf(menu);
+        let region = a;
+        if (useBlocker) {
+          const blocker = document.querySelector<HTMLElement>("[data-testid='blocking-errors']");
+          if (!blocker) return { ok: false as const, reason: "missing blocker" };
+          const b = rectOf(blocker);
+          const x1 = Math.max(a.x, b.x);
+          const y1 = Math.max(a.y, b.y);
+          const x2 = Math.min(a.x + a.w, b.x + b.w);
+          const y2 = Math.min(a.y + a.h, b.y + b.h);
+          if (x2 - x1 < 8 || y2 - y1 < 8) return { ok: false as const, reason: "no overlap" };
+          region = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+        }
+        for (let yy = region.y + 4; yy < region.y + region.h - 4; yy += 4) {
+          for (let xx = region.x + 4; xx < region.x + region.w - 4; xx += 4) {
+            const el = document.elementFromPoint(xx, yy);
+            if (
+              el?.closest(`[data-testid='${testId}']`) &&
+              !(el as HTMLElement).closest(interactive)
+            ) {
+              return { ok: true as const, x: xx, y: yy };
+            }
+          }
+        }
+        return { ok: false as const, reason: "no inert point" };
+      },
+      { testId: menuTestId, interactive: INTERACTIVE, useBlocker: withBlocker },
+    ) as Promise<InertPoint>;
+
   const raiseBlockersUntilInertOverlap = async (page: Page, menuTestId: string) => {
-    const interactive =
-      'button,input,select,textarea,a[href],[role="button"],[role="slider"],[role="switch"],[tabindex]';
     for (let n = 1; n <= 5; n++) {
       // Raise the nth distinct standing error (distinct subject = distinct
       // key; BLOCKING_LIMIT 5) and keep the legacy hubStore.toast fresh (2.4 s
@@ -639,40 +689,9 @@ test.describe("notification stack does not cover menus (item 8)", () => {
         (count) => document.querySelectorAll("[data-testid='blocking-error']").length === count,
         n,
       );
-      const hasInertOverlap = await page.evaluate(
-        ({ testId, interactive }) => {
-          const rectOf = (el: Element) => {
-            const r = el.getBoundingClientRect();
-            return { x: r.x, y: r.y, w: r.width, h: r.height };
-          };
-          const menu = document.querySelector<HTMLElement>(`[data-testid='${testId}']`);
-          const blocker = document.querySelector<HTMLElement>("[data-testid='blocking-errors']");
-          if (!menu || !blocker) return false;
-          const a = rectOf(menu);
-          const b = rectOf(blocker);
-          const region = {
-            x: Math.max(a.x, b.x),
-            y: Math.max(a.y, b.y),
-            w: Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x),
-            h: Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y),
-          };
-          if (region.w < 8 || region.h < 8) return false;
-          for (let yy = region.y + 2; yy < region.y + region.h - 2; yy += 2) {
-            for (let xx = region.x + 2; xx < region.x + region.w - 2; xx += 2) {
-              const el = document.elementFromPoint(xx, yy);
-              if (
-                el?.closest(`[data-testid='${testId}']`) &&
-                !(el as HTMLElement).closest(interactive)
-              ) {
-                return true;
-              }
-            }
-          }
-          return false;
-        },
-        { testId: menuTestId, interactive },
-      );
-      if (hasInertOverlap) return;
+      // The point that satisfies the loop is the point the test clicks.
+      const point = await findInertPoint(page, menuTestId, true);
+      if (point.ok) return { x: point.x, y: point.y };
     }
     throw new Error(`standing-error stack never produced an inert overlap with ${menuTestId}`);
   };
@@ -685,48 +704,12 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     // pointer-events is "auto". Fixed: popover above the stack, .stack
     // pointer-events:none with only .blocking auto — the hit lands on the
     // menu.
-    // Find a REAL-clickable INERT point — panel/menu chrome, never a control
-    // (whose own click would close or change something). When useBlocker is
-    // set the point is constrained to the menu∩standing-error intersection:
-    // elementFromPoint resolving inside the menu THERE proves both z-order
-    // and that the click reaches the menu, and a real click at that point must
-    // leave the menu open.
-    const inertPoint = (menuTestId: string, useBlocker: boolean) =>
-      page.evaluate(
-        ({ testId, withBlocker }) => {
-          const rectOf = (el: Element) => {
-            const r = el.getBoundingClientRect();
-            return { x: r.x, y: r.y, w: r.width, h: r.height };
-          };
-          const menu = document.querySelector<HTMLElement>(`[data-testid='${testId}']`);
-          if (!menu) return { ok: false as const, reason: "missing menu" };
-          const a = rectOf(menu);
-          let region = a;
-          if (withBlocker) {
-            const blocker = document.querySelector<HTMLElement>("[data-testid='blocking-errors']");
-            if (!blocker) return { ok: false as const, reason: "missing blocker" };
-            const b = rectOf(blocker);
-            const x1 = Math.max(a.x, b.x);
-            const y1 = Math.max(a.y, b.y);
-            const x2 = Math.min(a.x + a.w, b.x + b.w);
-            const y2 = Math.min(a.y + a.h, b.y + b.h);
-            if (x2 - x1 < 8 || y2 - y1 < 8) return { ok: false as const, reason: "no overlap" };
-            region = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
-          }
-          const interactive =
-            'button,input,select,textarea,a[href],[role="button"],[role="slider"],[role="switch"],[tabindex]';
-          for (let yy = region.y + 4; yy < region.y + region.h - 4; yy += 4) {
-            for (let xx = region.x + 4; xx < region.x + region.w - 4; xx += 4) {
-              const el = document.elementFromPoint(xx, yy);
-              if (el?.closest(`[data-testid='${testId}']`) && !(el as HTMLElement).closest(interactive)) {
-                return { ok: true as const, x: xx, y: yy };
-              }
-            }
-          }
-          return { ok: false as const, reason: "no inert point" };
-        },
-        { testId: menuTestId, withBlocker: useBlocker },
-      );
+    // raiseBlockersUntilInertOverlap returns a REAL-clickable INERT point —
+    // panel/menu chrome, never a control (whose own click would close or
+    // change something) — constrained to the menu∩standing-error
+    // intersection: elementFromPoint resolving inside the menu THERE proves
+    // both z-order and that the click reaches the menu, and a real click at
+    // that point must leave the menu open.
 
     const styleGuarantees = (page: Page) =>
       page.evaluate(() => {
@@ -780,14 +763,10 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     await page.getByTestId("permission-chip").click();
     const permMenu = page.getByTestId("permission-menu");
     await expect(permMenu).toBeVisible();
-    await raiseBlockersUntilInertOverlap(page, "permission-menu");
+    const permPoint = await raiseBlockersUntilInertOverlap(page, "permission-menu");
     await expect(page.getByText("standing error").first()).toBeVisible();
-    const permPoint = await inertPoint("permission-menu", true);
-    expect(permPoint.ok, permPoint.ok ? "" : permPoint.reason).toBe(true);
-    if (permPoint.ok) {
-      await page.mouse.click(permPoint.x!, permPoint.y!);
-      await expect(permMenu).toBeVisible();
-    }
+    await page.mouse.click(permPoint.x, permPoint.y);
+    await expect(permMenu).toBeVisible();
     await clear(page);
     await page.keyboard.press("Escape");
     await expect(permMenu).toHaveCount(0);
@@ -798,7 +777,7 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     await page.getByTestId("model-effort-chip").click();
     const sliderPanel = page.getByTestId("effort-slider-panel");
     await expect(sliderPanel).toBeVisible();
-    await raiseBlockersUntilInertOverlap(page, "effort-slider-panel");
+    const effortPoint = await raiseBlockersUntilInertOverlap(page, "effort-slider-panel");
     await expect(page.getByText("standing error").first()).toBeVisible();
 
     // Token guarantees (fail deterministically on base).
@@ -809,14 +788,10 @@ test.describe("notification stack does not cover menus (item 8)", () => {
     expect(styles!.panelZ).toBeGreaterThan(styles!.stackZ);
 
     // Prove the panel is interactive INSIDE its overlap with the standing
-    // stack: a REAL click on inert panel chrome at an intersection point
-    // reaches the panel and leaves it open while the standing error is up.
-    const effortPoint = await inertPoint("effort-slider-panel", true);
-    expect(effortPoint.ok, effortPoint.ok ? "" : effortPoint.reason).toBe(true);
-    if (effortPoint.ok) {
-      await page.mouse.click(effortPoint.x!, effortPoint.y!);
-      await expect(sliderPanel).toBeVisible();
-    }
+    // stack: a REAL click on the inert point the raise loop found reaches the
+    // panel and leaves it open while the standing error is up.
+    await page.mouse.click(effortPoint.x, effortPoint.y);
+    await expect(sliderPanel).toBeVisible();
     if (process.env.REMUDA_EVIDENCE === "1") {
       // 1440 desktop evidence paired with the 390 shots in the r3 item-1 suite.
       await page.screenshot({ path: "test-results/composerpop-r5-menu-above-notify-1440.png", animations: "disabled" });

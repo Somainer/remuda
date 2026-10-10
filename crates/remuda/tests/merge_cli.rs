@@ -1,11 +1,13 @@
 //! Real local Git refs, worktrees and pushes; only gate executables are stubbed.
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -52,6 +54,7 @@ struct Repo {
     source: PathBuf,
     stub: PathBuf,
     trace: PathBuf,
+    tmp: PathBuf,
     base: String,
     branch_commit: String,
 }
@@ -66,6 +69,10 @@ impl Repo {
         let source = parent.join("source worktree");
         let stub = parent.join("gate stub.py");
         let trace = parent.join("trace.jsonl");
+        // Private TMPDIR for every merge child so its remuda-mq-* scratch roots
+        // can never share a temp directory with another test or a real gate.
+        let tmp = parent.join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
         fs::create_dir_all(root.join("scripts/ci")).unwrap();
         fs::create_dir_all(root.join("web/src/lib")).unwrap();
         fs::create_dir_all(&origin).unwrap();
@@ -147,6 +154,7 @@ impl Repo {
             source,
             stub,
             trace,
+            tmp,
             base,
             branch_commit,
         }
@@ -158,6 +166,7 @@ impl Repo {
             .current_dir(&self.root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("TMPDIR", &self.tmp)
             .env("REMUDA_MERGE_GATE_COMMAND", &self.stub)
             .env("REMUDA_TEST_GATE_TRACE", &self.trace)
             // Merge must ignore the worker's inherited Cargo target.
@@ -216,7 +225,39 @@ impl Repo {
             "merge created scratch inside the repo: {:?}",
             self.root.join("data")
         );
+        assert_no_scratch_leftovers(&self.tmp);
     }
+}
+
+/// Assert a TMPDIR holds no leftover `remuda-mq-*` scratch root.
+fn assert_no_scratch_leftovers(tmp: &Path) {
+    let leftovers: Vec<_> = fs::read_dir(tmp)
+        .unwrap_or_else(|error| panic!("read {tmp:?}: {error}"))
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("remuda-mq-")
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "scratch roots leaked in {tmp:?}: {leftovers:?}"
+    );
+}
+
+/// Snapshot the `remuda-mq-*` names directly under the ambient temp dir.
+fn ambient_scratch_names() -> BTreeSet<String> {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("remuda-mq-"))
+        .collect()
 }
 
 fn step<'a>(report: &'a Value, name: &str) -> &'a Value {
@@ -370,9 +411,10 @@ fn merge_pushes_verified_no_ff_commit_and_preserves_worker_edits() {
             .iter()
             .all(|event| event["target"] == repo.root.join("target-gate").to_str().unwrap())
     );
-    // The gate worktree lives under an OS-temp remuda-mq-* scratch root,
-    // never inside the repository checkout.
-    let scratch_prefix = std::env::temp_dir().canonicalize().unwrap();
+    // The gate worktree lives under the fixture's isolated TMPDIR in an
+    // OS-temp remuda-mq-* scratch root, never in the ambient temp dir or in
+    // the repository checkout.
+    let scratch_prefix = repo.tmp.canonicalize().unwrap();
     assert!(trace.iter().all(|event| {
         let cwd = Path::new(event["cwd"].as_str().unwrap());
         cwd.starts_with(&scratch_prefix)
@@ -765,6 +807,67 @@ fn cleanup_removes_scratch_even_when_temp_dir_is_a_symlink() {
         .count();
     assert_eq!(leftovers, 0);
     assert!(!repo.root.join("data").exists());
+}
+
+#[test]
+fn gate_run_creates_no_scratch_root_in_the_ambient_temp_dir() {
+    let repo = Repo::new();
+    commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let before = ambient_scratch_names();
+    let child = repo
+        .command()
+        .args(["merge", "topic", "--gate", "--no-push", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+    // Wait until the gate is actually running from its scratch worktree: the
+    // first stub invocation appends a trace event while that worktree exists.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = fs::read_to_string(&repo.trace)
+            && !text.trim().is_empty()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "gate never started");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Two snapshots taken while the gate runs: a scratch root this merge
+    // creates spans both, while a neighbour unit test's sub-millisecond root
+    // cannot.
+    let during_a = ambient_scratch_names();
+    std::thread::sleep(Duration::from_millis(150));
+    let during_b = ambient_scratch_names();
+    let output = child.wait_with_output().unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!("JSON {error}: {}", String::from_utf8_lossy(&output.stderr))
+    });
+    assert_exit(&output, &report, 0);
+    let after = ambient_scratch_names();
+    let owned_by_child =
+        |name: &str| name.starts_with(&format!("remuda-mq-{child_pid}-"));
+    assert!(
+        during_a
+            .iter()
+            .chain(&during_b)
+            .chain(&after)
+            .all(|name| !owned_by_child(name)),
+        "merge child {child_pid} created an ambient scratch root:\na={during_a:?}\nb={during_b:?}\nafter={after:?}"
+    );
+    // Independent of pid attribution: no name present in BOTH in-flight
+    // snapshots may be new — a leaked root lives for whole seconds.
+    let persistent_new: Vec<&String> = during_b
+        .intersection(&during_a)
+        .filter(|name| !before.contains(*name))
+        .collect();
+    assert!(
+        persistent_new.is_empty(),
+        "new ambient scratch roots survived the whole gate window: {persistent_new:?}"
+    );
+    repo.assert_cleaned();
 }
 
 #[test]

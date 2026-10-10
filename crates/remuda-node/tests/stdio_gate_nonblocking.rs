@@ -53,6 +53,7 @@ struct Fixture {
     lane: std::path::PathBuf,
     target: std::path::PathBuf,
     bin: std::path::PathBuf,
+    tmp: std::path::PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -115,11 +116,18 @@ JSON
     let target = dir.path().join("target");
     std::fs::create_dir_all(&target).unwrap();
 
+    // Private TMPDIR: the Node whitelists TMPDIR into its gate child's env, so
+    // the fake merge's remuda-mq-* scratch stays inside the fixture and can
+    // never be tailed by or collide with a real gate on the host.
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+
     Fixture {
         _dir: dir,
         lane,
         target,
         bin,
+        tmp,
     }
 }
 
@@ -133,7 +141,7 @@ struct Node {
 }
 
 impl Node {
-    fn spawn(home: &std::path::Path) -> Self {
+    fn spawn(home: &std::path::Path, tmp: &std::path::Path) -> Self {
         // Inherit the ambient PATH so the Node's own git pre-steps (fetch / ff)
         // use whatever git the harness provides, then guarantee the base system
         // dirs the gate child needs (bash, mktemp, sleep) are present too.
@@ -148,6 +156,7 @@ impl Node {
             .arg(home.join("data"))
             .env("PATH", path)
             .env("HOME", home)
+            .env("TMPDIR", tmp)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -228,7 +237,7 @@ fn gate_run_params(fixture: &Fixture) -> Value {
 /// Drive the hello handshake, start a gate, and return the started Node so the
 /// caller can prove the carrier stays live while the gate runs.
 fn start_gate(home: &std::path::Path, fixture: &Fixture) -> Node {
-    let mut node = Node::spawn(home);
+    let mut node = Node::spawn(home, &fixture.tmp);
     let hello = node
         .wait_for(Instant::now() + Duration::from_secs(10), |frame| {
             frame["method"] == json!("node.hello")

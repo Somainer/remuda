@@ -53,6 +53,7 @@ struct QueueRepo {
     work_a: PathBuf,
     work_b: PathBuf,
     trace: PathBuf,
+    tmp: PathBuf,
     base: String,
 }
 
@@ -66,6 +67,10 @@ impl QueueRepo {
         let work_b = parent.join("work-b");
         let stub = parent.join("queue-gate.py");
         let trace = parent.join("trace.jsonl");
+        // Private TMPDIR: the queue parent and every lane child keep their
+        // remuda-mq-* scratch roots away from other tests and real gates.
+        let tmp = parent.join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
         fs::create_dir_all(root.join("scripts/ci")).unwrap();
         fs::create_dir_all(root.join("web/src/lib")).unwrap();
         fs::create_dir_all(&origin).unwrap();
@@ -158,6 +163,7 @@ impl QueueRepo {
             work_a,
             work_b,
             trace,
+            tmp,
             base,
         }
     }
@@ -168,6 +174,7 @@ impl QueueRepo {
             .current_dir(&self.root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("TMPDIR", &self.tmp)
             .env("REMUDA_MERGE_GATE_COMMAND", self.stub_path())
             .env("REMUDA_MERGE_BIN", env!("CARGO_BIN_EXE_remuda"))
             .env("REMUDA_TEST_GATE_TRACE", &self.trace);
@@ -209,6 +216,22 @@ impl QueueRepo {
             !self.root.join("data").exists(),
             "merge created scratch inside the repo: {:?}",
             self.root.join("data")
+        );
+        let leftovers: Vec<_> = fs::read_dir(&self.tmp)
+            .unwrap_or_else(|error| panic!("read {:?}: {error}", self.tmp))
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("remuda-mq-")
+            })
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "scratch roots leaked in {:?}: {leftovers:?}",
+            self.tmp
         );
     }
 }

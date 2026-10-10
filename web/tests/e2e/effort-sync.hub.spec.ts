@@ -38,6 +38,15 @@ async function createSession(page: Page, prompt: string, kind = "claude"): Promi
   expect(hostId).toBeTruthy();
   await hostPicker.selectOption(hostId!);
   await page.getByTestId(`new-session-kind-${kind}`).click();
+  // c-effortui r5 item 3: effort switch tests require the Herdr claude-pty
+  // carrier — shell-pty cannot type version-gated ultracode words and the
+  // switch is intentionally locked for it. The fake node reports both; the
+  // New Session default is the native shell-pty, so open advanced and select
+  // claude-pty.
+  if (kind === "claude") {
+    await page.getByTestId("new-session-advanced").click();
+    await page.getByTestId("new-session-driver-claude-pty").click();
+  }
   await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0, {
     timeout: 20_000,
   });

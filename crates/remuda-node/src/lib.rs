@@ -11,6 +11,7 @@ mod config;
 #[cfg(unix)]
 mod daemon;
 mod diagnostics;
+mod dir_browser;
 mod driver;
 mod enroll;
 mod entity;

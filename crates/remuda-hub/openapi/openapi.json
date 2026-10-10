@@ -6292,7 +6292,7 @@
     },
     "/v1/hosts/{id}/workspaces": {
       "delete": {
-        "description": "Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection.",
+        "description": "Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection. Unbind only — files are never deleted. Returns 409 while a live session or an active (non-archived, non-done/failed) task still uses the workspace; ended sessions keep their history and do not block removal. The Node enforces the same live-session guard at prepare.",
         "operationId": "hostWorkspaceUnregister",
         "parameters": [
           {
@@ -6341,7 +6341,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Unregister a directory without deleting files or stopping sessions",
+        "summary": "Unregister a directory without deleting files (refused while in use)",
         "tags": [
           "hosts"
         ]
@@ -10758,6 +10758,69 @@
           },
           "409": {
             "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/hosts/{id}/dirs": {
+      "get": {
+        "tags": [
+          "host-files"
+        ],
+        "operationId": "hostDirsList",
+        "summary": "Browse host directories for one to register (read-only, human-only)",
+        "description": "Human operator origin only; Bot and Agent origins are 403. Proxied to the addressed online Node's host.dirs.list RPC. The Node lists directories only, never follows symlinks, confines every path to its configured workspace_roots allowlist, hides dot-directories unless showHidden=true, and caps the reply (truncated=true past the cap). Never cached. Invalid query paths (relative, outside the Node allowlist, missing, or not a directory) return 400 with the Node's reason.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "description": "Absolute Node directory to list; absent names the default start (home inside the allowlist, else the first allowed root).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "showHidden",
+            "in": "query",
+            "required": false,
+            "description": "Include dot-directories; default false.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Node answer"
           }
         }
       }

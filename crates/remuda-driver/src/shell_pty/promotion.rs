@@ -3359,7 +3359,7 @@ mod tests {
         let seq = Arc::new(AtomicU64::new(0));
 
         let (tx, mut rx) = mpsc::channel::<Observation>(64);
-        let (_flush_done, _flusher) =
+        let (flush_done, flusher) =
             spawn_test_flusher(&pending, &notify, tx.clone(), Arc::clone(&seq), ctx.clone());
 
         // Ordinary poll cycle: content is journaled, but usage with no
@@ -3380,6 +3380,11 @@ mod tests {
 
         // Close/exit/demotion all route through finalize_hydrator now.
         finalize_hydrator(&hydrator, &pending, &notify, &tx, &seq, &ctx).await;
+        // Cooperative shutdown: release and join the streaming flusher, like
+        // the production loop does, so no detached task outlives the test.
+        flush_done.store(true, Ordering::SeqCst);
+        notify.notify_one();
+        flusher.await.expect("flusher exits after the queue drains");
         drop(tx);
 
         let mut finalised = Vec::new();
@@ -3456,7 +3461,7 @@ mod tests {
         let notify = Arc::new(Notify::new());
         let seq = Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = mpsc::channel::<Observation>(128);
-        let (flush_done, _flusher) =
+        let (flush_done, flusher) =
             spawn_test_flusher(&pending, &notify, tx.clone(), Arc::clone(&seq), ctx.clone());
 
         // One poll: content flows, no-stop usage stays buffered. Drain the
@@ -3527,5 +3532,14 @@ mod tests {
         assert_eq!(known(&payload.output_tokens), 13);
         // After the guard ran, the slot is empty (finalised once).
         assert!(slot_lock(&slot).is_none());
+
+        // The guard already delivered synchronously; nothing remains for the
+        // flusher, so release and join it (the dropped tx below would
+        // otherwise leave the task wedged waiting for a permit).
+        flush_done.store(true, Ordering::SeqCst);
+        notify.notify_one();
+        flusher
+            .await
+            .expect("flusher exits once the queue is drained");
     }
 }

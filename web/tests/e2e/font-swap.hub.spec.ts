@@ -405,50 +405,57 @@ async function waitAnchorViewport(
 
 
 /**
- * Poll the persisted reading record (no fixed sleep) until its anchorId is the
- * row currently holding the viewport top, stable across two reads. The save is
- * debounced 250 ms and can be delayed under load, so reading it after a fixed
- * wait can pick up the pre-park record.
+ * Poll the persisted reading record (no fixed sleep) until the PARK's own
+ * debounced flush has landed: a parsable non-pinned record whose signature
+ * (anchorId/offset/follow) differs from the record present just before the
+ * park, then STABLE across several reads spanning more than the 250 ms debounce.
+ *
+ * We do NOT require the saved anchorId to equal the row straddling the DOM
+ * viewport top: in a bounded long journal the unmounted prefix is placed by the
+ * row estimate, so indexAtOffset maps the saved top to a (correct, stable) event
+ * that need not be the exact real-DOM holder. The row-CLASS the park must save
+ * is asserted separately (wrap row for short journals, a burst row below it for
+ * the bounded tail).
  */
-async function waitForParkedAnchor(
+async function waitForParkedRecord(
   page: Page,
-  scroller: Locator,
   key: string,
+  preParkRecord: string | null,
   timeoutMs = 15_000,
 ): Promise<string> {
-  const viewportTopHolder = () =>
-    scroller.evaluate((el) => {
-      const top = el.getBoundingClientRect().top;
-      const holder = Array.from(el.querySelectorAll<HTMLElement>("[data-anchor]")).find((row) => {
-        const box = row.getBoundingClientRect();
-        return box.top <= top && box.bottom > top;
-      });
-      return holder?.dataset.anchor ?? null;
-    });
-  const readAnchorId = () =>
-    page.evaluate((k) => {
-      const raw = localStorage.getItem(k);
-      if (!raw) return null;
-      try {
-        return (JSON.parse(raw) as { anchorId?: unknown }).anchorId as string | null;
-      } catch {
-        return null;
-      }
-    }, key);
-  const want = await viewportTopHolder();
-  expect(want, "the park left no transcript row holding the viewport top").not.toBeNull();
-  const deadline = Date.now() + timeoutMs;
-  let last: string | null = null;
-  while (Date.now() < deadline) {
-    const id = await readAnchorId();
-    if (id === want) {
-      await page.waitForTimeout(60);
-      if ((await readAnchorId()) === want) return id as string;
+  const signature = (raw: string | null): { sig: string; id: string } | null => {
+    if (!raw) return null;
+    try {
+      const r = JSON.parse(raw) as { anchorId?: unknown; offset?: unknown; follow?: unknown };
+      if (typeof r.anchorId !== "string" || r.follow !== false) return null;
+      return { sig: `${r.anchorId}:${String(r.offset)}:${String(r.follow)}`, id: r.anchorId };
+    } catch {
+      return null;
     }
-    last = id;
-    await page.waitForTimeout(50);
+  };
+  const read = async () =>
+    signature(await page.evaluate((k) => localStorage.getItem(k), key));
+  const pre = signature(preParkRecord);
+  const deadline = Date.now() + timeoutMs;
+  let stableId: string | null = null;
+  let same = 0;
+  while (Date.now() < deadline) {
+    const cur = await read();
+    if (cur && (pre === null || cur.sig !== pre.sig)) {
+      if (cur.id === stableId) {
+        same += 1;
+        if (same >= 4) return cur.id; // ~280ms > 250ms debounce
+      } else {
+        stableId = cur.id;
+        same = 1;
+      }
+    } else {
+      stableId = null;
+      same = 0;
+    }
+    await page.waitForTimeout(70);
   }
-  throw new Error(`the parked reading record never named the viewport-top row (want ${want}, last ${last})`);
+  throw new Error("the parked reading record never changed-and-stabilized after the park");
 }
 
 /**
@@ -780,6 +787,11 @@ async function savedPositionSurvivesSwap(
   //    strictly BELOW the growing block. That block is a mounted row above the
   //    anchor, so disabling re-anchoring makes the anchor drift by the growth.
   const PARK = longBurst > 0 ? { mode: "above" as const, gap: 16 } : { mode: "above" as const, gap: 4 };
+  const readingKey0 = `runtime.reading.v1.${instanceId}`;
+  // The record in place an instant before the park scroll. The post-park read
+  // (below) waits until persistence has overwritten it, so a slow 250 ms
+  // debounce cannot leave us comparing against this pre-park position.
+  const preParkRecord = await page.evaluate((key) => localStorage.getItem(key), readingKey0);
   await scroller.evaluate((el, park) => {
     const block = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='code-block']")).find((b) =>
       b.querySelector("[data-testid='code-code']")?.textContent?.trim().startsWith("⁄".repeat(20)),
@@ -795,13 +807,10 @@ async function savedPositionSurvivesSwap(
     }
     el.dispatchEvent(new Event("scroll", { bubbles: true }));
   }, PARK);
-  // Read the saved anchor WITHOUT a fixed sleep: the 250 ms persistence
-  // debounce can be delayed under gate load, so a 450 ms wait could read the
-  // pre-park record. Compute the anchor the park MUST have saved (the row
-  // holding the viewport top) directly from the DOM and poll localStorage until
-  // the persisted record names exactly that row, stable across two reads.
-  const readingKey0 = `runtime.reading.v1.${instanceId}`;
-  const savedAnchorId = await waitForParkedAnchor(page, scroller, readingKey0);
+  // Read the saved anchor WITHOUT a fixed sleep: poll until the park's own
+  // debounced persistence flush has replaced the pre-park record and the new
+  // record stays stable (see waitForParkedRecord).
+  const savedAnchorId = await waitForParkedRecord(page, readingKey0, preParkRecord);
   const anchor: AnchorRef = `id:${savedAnchorId}`;
   // Whether the saved anchor IS the growing wrap-block row (short journals):
   // its own top must match across control / fallback / settled.

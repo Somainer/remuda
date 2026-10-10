@@ -481,3 +481,157 @@ async fn two_turns_publish_each_start_before_its_own_result_with_per_turn_attrib
     assert_eq!(engine.last(), Some(&Activity::Idle), "settles idle last");
     assert_store_working_then_idle(&observations, "r5-two-turn").await;
 }
+
+/// ma-sdk-state r5 item 6 (5a): A's result is BUFFERED while turn B is
+/// published (the item-1 two-gate barrier puts B's reservation in the queue
+/// before the worker maps A's result). The per-turn attribution must hold on
+/// BOTH projections: when A's result is folded with B outstanding,
+/// engine_turn_activity yields no Idle and the Hub durable row stays working;
+/// only B's own settled result idles. Assertions are made at the exact point
+/// A's result (resultIndex 0) is observed, before B's result (resultIndex 1).
+#[tokio::test]
+async fn buffered_turn_a_result_keeps_the_row_working_until_turn_b_settles() {
+    let _barrier_lock = BARRIER_TEST_LOCK.lock().await;
+    let (_tmp, driver, mut handle) = launch(ScriptKind::TwoTurn).await;
+
+    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    let send_both = tokio::spawn(async move {
+        driver.send(prompt_id("first", "msg-5a-a")).await?;
+        driver.send(prompt_id("second", "msg-5a-b")).await?;
+        Ok::<ClaudeSdkDriver, remuda_driver::DriverError>(driver)
+    });
+    barrier
+        .wait_until_reserve_parked(Duration::from_secs(5))
+        .await;
+    // Commit A (start_A emitted) but hold the worker at the ticket while B
+    // registers, then let the worker map the buffered A result with B's book
+    // already open.
+    barrier.release_send();
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+    barrier.resume_worker();
+
+    // A real Hub projection, fed the real observations in emission order.
+    let hub_dir = tempfile::tempdir().unwrap();
+    let (store, host_id) = store_test_support::open_with_host(hub_dir.path(), "r5-5a-buffered")
+        .await
+        .expect("hub store + host");
+
+    let mut instance_id: Option<String> = None;
+    let mut engine: Option<Activity> = None;
+    let mut a_seen = false;
+    let mut activity_at_a: Option<String> = None;
+    let mut engine_at_a: Option<Activity> = None;
+
+    // Drain until A's result (resultIndex 0) has been folded.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !a_seen {
+        let obs = tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            handle.recv(),
+        )
+        .await
+        .expect("timeout waiting for turn A result")
+        .expect("stream closed");
+        if instance_id.is_none() {
+            let id = obs.instance_id.as_id().to_string();
+            store
+                .ensure_instance(host_id.clone(), id.clone())
+                .await
+                .expect("ensure");
+            instance_id = Some(id);
+        }
+        let id = instance_id.clone().unwrap();
+        let mut to_append = obs.clone();
+        to_append.instance_id = remuda_protocol::InstanceId::try_from(id.clone()).unwrap();
+        let event =
+            serde_json::to_value(JournalEvent::Instance(Box::new(to_append))).expect("event");
+        store
+            .append_journal(host_id.clone(), id.clone(), None, event)
+            .await
+            .expect("append");
+        if let Some(activity) = engine_turn_activity(&obs) {
+            engine = Some(activity);
+        }
+        let is_a_result = is_turn(&obs, "result") && result_index_of(&obs).as_deref() == Some("0");
+        if is_a_result {
+            a_seen = true;
+            let row = store.get_instance(id).await.expect("get").expect("row");
+            activity_at_a = Some(row.activity.clone());
+            engine_at_a = engine;
+        }
+    }
+
+    assert_eq!(
+        engine_at_a,
+        Some(Activity::Working),
+        "the Node engine must not idle on buffered turn A while B is outstanding"
+    );
+    assert_eq!(
+        activity_at_a.as_deref(),
+        Some("working"),
+        "the Hub row stays working through buffered turn A's result"
+    );
+
+    // Drain B's result and confirm the final settle.
+    let mut final_engine = engine_at_a;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let obs = match tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            handle.recv(),
+        )
+        .await
+        {
+            Ok(Some(obs)) => obs,
+            _ => break,
+        };
+        if let Some(activity) = engine_turn_activity(&obs) {
+            final_engine = Some(activity);
+        }
+        let id = instance_id.clone().unwrap();
+        let mut to_append = obs.clone();
+        to_append.instance_id = remuda_protocol::InstanceId::try_from(id.clone()).unwrap();
+        let event =
+            serde_json::to_value(JournalEvent::Instance(Box::new(to_append))).expect("event");
+        store
+            .append_journal(host_id.clone(), id.clone(), None, event)
+            .await
+            .expect("append");
+        if is_turn(&obs, "result") && result_index_of(&obs).as_deref() == Some("1") {
+            break;
+        }
+    }
+    assert_eq!(
+        final_engine,
+        Some(Activity::Idle),
+        "turn B settles the engine idle"
+    );
+    let row = store
+        .get_instance(instance_id.unwrap())
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(
+        row.activity, "idle",
+        "turn B's settled result idles the Hub row"
+    );
+    assert_eq!(row.lifecycle, "running", "the sdk process is still alive");
+    store.close().await;
+
+    let driver = send_both.await.expect("send task").expect("both sends ack");
+    driver.close().await.expect("close");
+}
+
+fn result_index_of(obs: &Observation) -> Option<String> {
+    match &obs.body {
+        ObservationPayload::Lifecycle(p) => match p.as_ref() {
+            LifecyclePayload::Native(n) if n.native_name == "result" => {
+                n.related_ids.get("resultIndex").cloned()
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}

@@ -119,3 +119,114 @@ fn engine_activity_follows_a_real_mapper_local_root_turn() {
         "the settled result for the locally-opened book idles"
     );
 }
+
+/// ma-sdk-state r5 item 6 (5b): the Node replay opens a REAL workflow against a
+/// REAL per-turn book. Two root turns are opened with the live `begin_turn`
+/// (A then B) and a local_workflow task starts against A. While it is open A's
+/// result cannot settle; after the workflow terminates A's result STILL does
+/// not idle (B is outstanding); only B's final result idles. The workflow frames
+/// are the real `system/task_started` / `task_notification` stream frames.
+///
+/// Deleting `begin_turn` collapses both turns into the implicit replay bucket:
+/// once the workflow terminates A's result then sees an empty bucket and idles
+/// immediately — an ownership regression this test fails on.
+#[test]
+fn an_open_workflow_on_turn_a_keeps_results_working_until_turn_b_settles() {
+    let system = |subtype: &str, extra: Value| {
+        let mut frame = serde_json::json!({
+            "type": "system",
+            "subtype": subtype,
+            "session_id": SESSION,
+            "uuid": "11111111-1111-4111-8111-111111111111",
+        });
+        if let (Some(obj), Some(extra_obj)) = (frame.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra_obj {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        frame
+    };
+    let result = |index: u64| {
+        serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": format!("step {index}"),
+            "stop_reason": "end_turn",
+            "num_turns": 1,
+            "result_index": index,
+            "session_id": SESSION,
+            "uuid": "22222222-2222-4222-8222-222222222222",
+        })
+    };
+
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
+    // Two locally-written turns outstanding, A in front.
+    mapper.begin_turn();
+    mapper.begin_turn();
+
+    let map_results = |mapper: &mut StdoutMapper, frame: Value| -> Option<Activity> {
+        mapper
+            .map(frame)
+            .expect("map frame")
+            .into_iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
+                    LifecyclePayload::Native(native) if native.native_name == "result" => {
+                        engine_turn_activity(&obs)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+    };
+
+    // A background workflow opens on the front turn A.
+    mapper
+        .map(system(
+            "task_started",
+            serde_json::json!({
+                "task_id": "task_5b_wf",
+                "tool_use_id": "toolu_5b_wf",
+                "task_type": "local_workflow",
+                "workflow_name": "5b-wf",
+                "description": "turn A workflow",
+            }),
+        ))
+        .expect("map task_started");
+
+    // A's result while the workflow is open: not settled.
+    let at_open = map_results(&mut mapper, result(0));
+    assert_eq!(
+        at_open, None,
+        "a result with the workflow open keeps working"
+    );
+
+    // The workflow terminates on its own real notification.
+    mapper
+        .map(system(
+            "task_notification",
+            serde_json::json!({
+                "task_id": "task_5b_wf",
+                "tool_use_id": "toolu_5b_wf",
+                "status": "completed",
+                "summary": "workflow done",
+            }),
+        ))
+        .expect("map task_notification");
+
+    // A's result now, but B is still outstanding: still not the root settle.
+    let a_after_workflow = map_results(&mut mapper, result(1));
+    assert_eq!(
+        a_after_workflow, None,
+        "turn A's result cannot idle while turn B is outstanding"
+    );
+
+    // B's result settles the last outstanding turn.
+    let b_final = map_results(&mut mapper, result(2));
+    assert_eq!(
+        b_final,
+        Some(Activity::Idle),
+        "turn B settles the root idle"
+    );
+}

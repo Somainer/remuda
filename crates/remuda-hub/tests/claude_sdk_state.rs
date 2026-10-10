@@ -830,14 +830,46 @@ async fn recorded_fixtures_fold_to_the_right_activity_per_result() -> Result<()>
     Ok(())
 }
 
-/// ma-sdk-state r4 item 5(b): a LOCALLY-WRITTEN root turn opened with the
-/// REAL mapper (`begin_turn` + `turn_started_observation`, exactly as the
-/// live send path does before the write) folds through the Hub store:
-/// turn_started projects working, then the turn's settled result idles —
-/// no hand-made start fixture.
+/// ma-sdk-state r5 item 6 (5b): BOTH turns and BOTH results are built with the
+/// REAL mapper and folded through the Hub. Turn A's result is mapped while turn
+/// B's book is already outstanding (the buffered-result interleave), so only
+/// B's result may carry settledRootTurn and idle — A's keeps the row working.
+/// No field is hand-set: deleting the mapper's `begin_turn` opens no
+/// per-turn book, so A's first result would settle the empty book and idle
+/// immediately, which this test fails on.
 #[tokio::test]
 async fn a_replay_local_root_turn_from_the_real_mapper_projects_working_then_idle() -> Result<()> {
     use remuda_driver::{DriverKind, StdoutMapper};
+    use serde_json::json;
+
+    fn sdk_result(index: u64) -> Value {
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": format!("turn {index} done"),
+            "stop_reason": "end_turn",
+            "session_id": SESSION,
+            "result_index": index
+        })
+    }
+
+    /// The result observation the REAL mapper emits for a native result frame.
+    fn mapped_result(mapper: &mut StdoutMapper, index: u64) -> Value {
+        mapper
+            .map(sdk_result(index))
+            .expect("map result")
+            .into_iter()
+            .find(|o| {
+                serde_json::to_value(o)
+                    .ok()
+                    .and_then(|v| v.pointer("/payload/nativeName").cloned())
+                    .as_ref()
+                    == Some(&json!("result"))
+            })
+            .map(|o| serde_json::to_value(&o).expect("serialize"))
+            .expect("a result lifecycle observation")
+    }
 
     let ctx = Ctx::boot().await;
     let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await;
@@ -846,28 +878,57 @@ async fn a_replay_local_root_turn_from_the_real_mapper_projects_working_then_idl
     ctx.wait_until(&id, |v| v["lifecycle"] == json!("running"))
         .await;
 
-    // Open the settlement book and build the start exactly like the live
-    // publication path (not a hand-made lifecycle).
     let mut mapper = StdoutMapper::new(DriverKind::ClaudeSdk, SESSION);
+    // Open two root turns up front (A then B), exactly as two sends do.
     mapper.begin_turn();
-    let started = mapper
-        .turn_started_observation("msg-local-replay")
-        .expect("turn_started observation");
-    let start_event = serde_json::to_value(&started).expect("serialize");
-    let seq0 = ctx.durable_seq(&id).await;
-    node.append(&id, start_event);
-    ctx.after_append(&id, seq0).await;
+    mapper.begin_turn();
+
+    // Turn A starts (working) — the real turn_started observation.
+    let start_a = mapper
+        .turn_started_observation("msg-5b-a")
+        .expect("start A");
+    let seq = ctx.durable_seq(&id).await;
+    node.append(&id, serde_json::to_value(&start_a).expect("serialize"));
+    ctx.after_append(&id, seq).await;
+    assert_eq!(ctx.get_instance(&id).await["activity"], json!("working"));
+
+    // A's result is mapped while B is still outstanding: it is NOT settled.
+    let result_a = mapped_result(&mut mapper, 0);
+    assert_eq!(
+        result_a.pointer("/payload/relatedIds/settledRootTurn"),
+        None,
+        "buffered A cannot settle while B is outstanding"
+    );
+    let seq = ctx.durable_seq(&id).await;
+    node.append(&id, result_a);
+    ctx.after_append(&id, seq).await;
     assert_eq!(
         ctx.get_instance(&id).await["activity"],
         json!("working"),
-        "a real-mapper local turn start projects working"
+        "A's buffered result must not idle the row while B is open"
     );
 
-    // The settled first-turn result for the opened book idles.
-    node.append(&id, first_turn_result("turn_done", None));
+    // Turn B starts, then its own result settles and idles.
+    let start_b = mapper
+        .turn_started_observation("msg-5b-b")
+        .expect("start B");
+    let seq = ctx.durable_seq(&id).await;
+    node.append(&id, serde_json::to_value(&start_b).expect("serialize"));
+    ctx.after_append(&id, seq).await;
+
+    let result_b = mapped_result(&mut mapper, 1);
+    assert_eq!(
+        result_b.pointer("/payload/relatedIds/settledRootTurn"),
+        Some(&json!("true")),
+        "B is the last outstanding turn: its result settles"
+    );
+    let seq = ctx.durable_seq(&id).await;
+    node.append(&id, result_b);
     ctx.wait_until(&id, |v| v["activity"] == json!("idle"))
         .await;
     let view = ctx.get_instance(&id).await;
+    assert_eq!(view["activity"], json!("idle"));
     assert_eq!(view["lifecycle"], json!("running"), "process still live");
+    assert_eq!(node.task_error().await, None, "fake-node task panicked");
     Ok(())
 }

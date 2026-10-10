@@ -1204,55 +1204,15 @@ async fn a_permission_response_is_written_before_a_later_prompt_on_one_fifo() {
     driver.close().await.expect("close");
 }
 
-/// ma-sdk-state r4 item 5(a): through the REAL publication task, turn A's
-/// result mapped while turn B's prompt write is in flight is attributed to
-/// turn A by the per-turn book — it settles A (idle, end of A) but B stays
-/// outstanding (the row never idles B). The existing two-turn live test
-/// covers sequential prompts; this forces the write-flight interleave via
-/// the item-1 barrier: A is answered in the race window, B's reservation is
-/// held, and B's own completion later idles again.
-#[tokio::test]
-async fn buffered_result_a_then_published_b_sets_activity_per_turn_through_the_publication_task() {
-    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
-    let mut handle = driver.start(spec).await.expect("start");
-
-    // Turn A completes.
-    driver.send(prompt("first")).await.expect("first send");
-    let first = collect_until(&mut handle, Duration::from_secs(5), |obs| {
-        turn_done_count(obs) >= 1
-    })
-    .await;
-    assert_eq!(turn_done_count(&first), 1);
-
-    // Turn B: write, then observe its start working.
-    driver.send(prompt("second")).await.expect("second send");
-    let working = collect_until(&mut handle, Duration::from_secs(5), |obs| {
-        obs.iter()
-            .any(|o| lifecycle_named(o) == Some("turn_started"))
-    })
-    .await;
-    assert!(
-        working
-            .iter()
-            .any(|o| lifecycle_status(o) == Some("working")),
-        "turn B reaches working"
-    );
-    // Turn B settles idle and the process survives for another turn.
-    let second = collect_until(&mut handle, Duration::from_secs(5), |obs| {
-        turn_done_count(obs) >= 1
-    })
-    .await;
-    assert_eq!(
-        turn_done_count(&second),
-        1,
-        "only B's result completes here"
-    );
-
-    let pid = handle.ack().native_ids.get("pid").cloned().expect("pid");
-    assert!(process_alive(&pid), "the sdk child survives both turns");
-    driver.close().await.expect("close");
-}
-
+// NOTE ma-sdk-state r5 item 6 (5a): the former r4 5a test here ran the two
+// prompts SEQUENTIALLY (A fully drained before B), so it never armed the
+// item-1 barrier and could not observe a buffered result. Its per-turn
+// attribution claim now lives in the node barrier suite, which forces A's
+// result to be buffered while B is published and folds the stream through
+// engine_turn_activity AND the Hub derive:
+// `buffered_turn_a_result_keeps_the_row_working_until_turn_b_settles` in
+// crates/remuda-node/tests/sdk_turn_publication_barrier.rs. Plain sequential
+// two-turn coverage remains in `the_sdk_child_survives_a_second_prompt`.
 /// ma-sdk-state r5 item 1 (replaces the old hand-mapped
 /// `an_older_buffered_result_cannot_settle_a_newer_outstanding_input`): drive
 /// two turns through the REAL publication task with turn A's ticket parked

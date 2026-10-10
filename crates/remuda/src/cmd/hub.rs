@@ -4,6 +4,7 @@
 //! web/dist when present and otherwise uses the crate's fallback page.
 
 use crate::{Shutdown, config::Config, dispatcher};
+use anyhow::Context;
 use clap::{Args as ClapArgs, Subcommand};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -39,7 +40,17 @@ pub(crate) enum HubCommand {
     /// Replace the device pairing access code and print the new one.
     ///
     /// Paired devices keep their tokens; only future pairing is affected.
-    RotateBootstrap,
+    RotateBootstrap(RotateBootstrapArgs),
+}
+
+#[derive(ClapArgs)]
+pub(crate) struct RotateBootstrapArgs {
+    /// Rotate in `<data-dir>/dev-hub`, the layout `remuda dev` writes.
+    #[arg(long, conflicts_with = "standalone")]
+    dev: bool,
+    /// Rotate directly in `<data-dir>` (standalone Hub).
+    #[arg(long)]
+    standalone: bool,
 }
 
 impl Args {
@@ -54,10 +65,53 @@ impl Args {
 }
 
 /// `remuda hub rotate-bootstrap`: mint a new device pairing access code.
-fn rotate_bootstrap(config: &Config) -> anyhow::Result<()> {
-    let token = remuda_hub::rotate_bootstrap(&config.data_dir)?;
+///
+/// c-bootstrap-dev (b): if the data dir contains a `dev-hub/` subdirectory
+/// (the layout `remuda dev` writes), rotate there, not in the outer dev
+/// root. Refuse when the target directory has no persisted bootstrap-token
+/// (the running hub relies on an explicit `--access-code-file`, which
+/// rotation cannot change).
+///
+/// Round 4 item 5: when BOTH `<data-dir>/bootstrap-token` and
+/// `<data-dir>/dev-hub/bootstrap-token` exist the layout is ambiguous —
+/// silently picking dev-hub would rotate the wrong Hub for an operator
+/// revoking a leaked standalone code. Require an explicit `--dev` or
+/// `--standalone` in that case.
+fn rotate_bootstrap(config: &Config, args: &RotateBootstrapArgs) -> anyhow::Result<()> {
+    let outer_token = config.data_dir.join("bootstrap-token");
+    let dev_hub = config.data_dir.join("dev-hub");
+    let dev_token = dev_hub.join("bootstrap-token");
+    let both_present = outer_token.is_file() && dev_token.is_file();
+    let target_dir = if args.dev {
+        dev_hub
+    } else if args.standalone {
+        config.data_dir.clone()
+    } else if both_present {
+        anyhow::bail!(
+            "both {} and {} exist; refusing to guess which Hub owns the code \
+             to rotate — pass --dev for the remuda dev Hub or --standalone for \
+             the Hub rooted at the data directory",
+            outer_token.display(),
+            dev_token.display()
+        );
+    } else if dev_token.is_file() {
+        // Auto-detect the remuda dev layout only when the standalone code is
+        // absent, so the choice is never ambiguous.
+        tracing::debug!(
+            path = %dev_hub.display(),
+            "rotating in remuda dev hub data directory"
+        );
+        dev_hub
+    } else {
+        config.data_dir.clone()
+    };
+    let token_file = target_dir.join("bootstrap-token");
+    // rotate_bootstrap performs the authoritative provenance-marker check and
+    // refuses (without writing) when no token exists or an explicit file/env
+    // governs the persisted code.
+    let token = remuda_hub::rotate_bootstrap(&target_dir)?;
     tracing::info!(
-        path = %config.data_dir.join("bootstrap-token").display(),
+        path = %token_file.display(),
         "rotated device pairing access code"
     );
     println!("{token}");
@@ -65,17 +119,44 @@ fn rotate_bootstrap(config: &Config) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn start(config: &Config) -> anyhow::Result<remuda_hub::RunningHub> {
-    let bootstrap_token = config
-        .hub
-        .bootstrap_token
-        .as_ref()
-        .map(|reference| reference.resolve().map(|secret| secret.into_string()))
-        .transpose()?
-        .unwrap_or_default();
+    // c-bootstrap-dev round 2/3: resolve through SecretRef::resolve so
+    // trailing-whitespace normalisation and empty-secret rejection apply
+    // uniformly (a manual read regressed both). The secret value is NEVER put
+    // in an error: SecretRef::resolve names only the env var / file path, and
+    // the file context adds the path only. Provenance travels explicitly as a
+    // BootstrapSource so a caller-supplied code cannot silently gain rotation
+    // authority.
+    let (bootstrap_token, bootstrap_source) = match config.hub.bootstrap_token.as_ref() {
+        Some(crate::config::SecretRef::File(path)) => {
+            let secret = crate::config::SecretRef::File(path.clone())
+                .resolve()
+                .with_context(|| format!("cannot read access-code file {}", path.display()))?;
+            (
+                secret.into_string(),
+                remuda_hub::BootstrapSource::ExplicitFile(path.clone()),
+            )
+        }
+        Some(crate::config::SecretRef::Env(_var)) => {
+            // Re-resolve the same reference; the error names only the env
+            // var, never its value.
+            let secret = config
+                .hub
+                .bootstrap_token
+                .as_ref()
+                .expect("matched Some")
+                .resolve()?;
+            (
+                secret.into_string(),
+                remuda_hub::BootstrapSource::ExplicitEnv,
+            )
+        }
+        None => (String::new(), remuda_hub::BootstrapSource::Generated),
+    };
     remuda_hub::spawn(remuda_hub::HubConfig {
         data_dir: config.data_dir.clone(),
         listen: config.hub.listen,
         bootstrap_token,
+        bootstrap_source,
         cookie_secure: config.hub.cookie_secure,
         public_origin: config.hub.public_origin.clone(),
         trusted_proxies: config.hub.trusted_proxies.clone(),
@@ -100,9 +181,9 @@ pub(crate) async fn run(
     args: Args,
     mut shutdown: Shutdown,
 ) -> anyhow::Result<()> {
-    if let Some(HubCommand::RotateBootstrap) = args.command {
+    if let Some(HubCommand::RotateBootstrap(rotate_args)) = args.command {
         config.validate()?;
-        return rotate_bootstrap(&config);
+        return rotate_bootstrap(&config, &rotate_args);
     }
     let with_dispatcher = args.with_dispatcher;
     let healthcheck = args.healthcheck;

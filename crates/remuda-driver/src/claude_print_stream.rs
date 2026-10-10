@@ -350,6 +350,13 @@ fn overlay_usage_patch(base: &Value, patch: &Value) -> Value {
             }
             Value::Object(merged)
         }
+        // An explicit JSON null at the scalar/root level is the gateway
+        // spelling of "field absent in this delta" (e.g. Bedrock serializes
+        // None as {"input_tokens":null,...,"output_tokens":30}). Overlaying it
+        // would turn the revision-1 bucket into zero and get revision 2
+        // rejected as a decrease; treat null as "no change", like an omitted
+        // key (c-usagefu r4 item 5).
+        (base, Value::Null) => base.clone(),
         _ => patch.clone(),
     }
 }

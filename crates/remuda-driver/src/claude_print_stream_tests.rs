@@ -722,6 +722,61 @@ fn message_delta_with_only_output_tokens_overlays_the_revision1_buckets() {
 }
 
 #[test]
+fn message_delta_with_explicit_null_buckets_keeps_the_revision1_values() {
+    // r4 item 5: gateways serializing missing fields as explicit nulls send
+    // {"input_tokens":null,"cache_read_input_tokens":null,
+    //  "cache_creation_input_tokens":null,"output_tokens":30}. Null means
+    // "absent", not zero: overlaying it must leave the revision-1 buckets.
+    let mut mapper = mapper();
+    event(
+        &mut mapper,
+        json!({"type": "message_start", "message": {
+            "id": "msg_null", "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    let assistant = map(
+        &mut mapper,
+        json!({"type": "assistant", "uuid": "u1", "message": {
+            "id": "msg_null", "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    let delta = event(
+        &mut mapper,
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": null, "cache_read_input_tokens": null,
+                      "cache_creation_input_tokens": null, "output_tokens": 30}}),
+    );
+
+    let mut usage: Vec<_> = assistant
+        .into_iter()
+        .chain(delta)
+        .filter_map(|obs| match obs.body {
+            ObservationPayload::Usage(payload) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage.len(),
+        2,
+        "nulls are skipped, not emitted as a decrease"
+    );
+    let rev2 = usage.pop().unwrap();
+    let rev1 = usage.pop().unwrap();
+    assert_eq!(rev2.output_tokens, Knowledge::Known { value: U64(30) });
+    assert_eq!(rev2.input_tokens, rev1.input_tokens);
+    assert_eq!(rev2.cache_read_tokens, rev1.cache_read_tokens);
+    assert_eq!(rev2.cache_write_tokens, rev1.cache_write_tokens);
+
+    event(&mut mapper, json!({"type": "message_stop"}));
+}
+
+#[test]
 fn nested_message_delta_emits_no_usage() {
     let mut mapper = mapper();
     let start = nested_event(

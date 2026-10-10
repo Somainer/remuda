@@ -72,10 +72,25 @@ so the reference is `bootstrapToken = "file:/secrets/access-code"`.
 
 An explicit code does **not** skip the TTL. The code is trimmed of
 surrounding whitespace/newlines before use; an empty or whitespace-only value
-is refused before anything is written. On disk the issue stamp is written
-**before** the token (so a crash between the two leaves the old token with the
-new stamp and is repaired on retry). On a restart the stamp is re-written as
-follows:
+is refused before anything is written. The durable write ORDER differs by
+path — there is no single "stamp-first" rule:
+
+| Path | Durable order |
+| --- | --- |
+| Explicit file/env, code **changed** | provenance marker (fsync'd) → stamp → atomic token (before bind) |
+| Explicit file/env, code unchanged | marker (fsync'd); stamp re-written only when touched/backfilled (below) |
+| Hub mint, explicit marker present (crash recovery) | mint in memory → **bind** → atomic token → stamp → marker removed |
+| Hub mint, fresh unmarked data dir | atomic token → stamp (before bind) |
+| `rotate-bootstrap` | atomic token → stamp |
+
+The explicit path is stamp-before-token so a crash between the two leaves the
+old token paired with the new stamp and the next start self-heals via the
+code-change check. Mints and rotates are token-before-stamp so an interrupted
+write fails CLOSED (a new token with the old/missing stamp pairs neither
+code), never granting the old code another TTL. A crash between the explicit
+marker fsync and the token write leaves marker + no-token: a no-source start
+then mints only in memory and commits token, stamp and marker-removal together
+only AFTER a successful bind. On a restart the stamp is re-written as follows:
 
 - **Fresh stamp (code considered newly issued)** only when the supplied code
   differs from the persisted token, or — for a file source — the access-code

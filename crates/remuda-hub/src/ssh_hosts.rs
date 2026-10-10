@@ -875,6 +875,21 @@ mod tests {
             )
             .await
             .unwrap();
+        // c-dirpicker r11 item 4: the stale intent really was FORWARDED over
+        // the dead previous link, so mark it with THAT link's generation.
+        // A managed host no hello has ever adopted sits at generation 0; the
+        // bridge hello below must bump it to 1. Without this mark the row
+        // relied on the sweep's NULL arm and this test would have passed even
+        // if the SSH hello path never bumped.
+        assert_eq!(
+            store.host_link_generation(host.clone()).await.unwrap(),
+            0,
+            "no hello has adopted a link yet"
+        );
+        store
+            .mark_forward_intent(command.command_id.clone(), 0)
+            .await
+            .unwrap();
 
         let (to_node_tx, mut to_node_rx) = mpsc::unbounded_channel::<Value>();
         let (from_node_tx, from_node_rx) = mpsc::unbounded_channel::<Value>();
@@ -996,6 +1011,16 @@ mod tests {
         assert_eq!(seen[0]["path"], json!(ROOT));
         assert_eq!(seen[0]["workspaceId"], json!(WSP));
         assert_eq!(seen[0]["commandId"], json!(command.command_id));
+
+        // r11 item 4: the SSH bridge hello runs the SAME adoption bump as the
+        // WSS carrier — exactly once, 0 → 1 — and the abort above proves the
+        // sweep selected the row through its stamped generation (0 < 1), not
+        // the NULL arm.
+        assert_eq!(
+            store.host_link_generation(host.clone()).await.unwrap(),
+            1,
+            "the SSH stdio hello bumps the host link generation"
+        );
 
         // r10 item 3: the create-after-abort assertion used to be vacuous —
         // the scripted Node answered every create OK, so it passed even if

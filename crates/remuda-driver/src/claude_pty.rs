@@ -1485,6 +1485,7 @@ fn spawn_transcript_pump(
                     .map(PathBuf::from)
                     .filter(|path| path.is_file());
                 if let Some(path) = path {
+                    let path_for_bind = path.clone();
                     info!(session = %ctx.session_id, "hydrating claude-pty from native transcript");
                     let mut mapper = TranscriptMapper::new(
                         ctx.driver,
@@ -1546,6 +1547,37 @@ fn spawn_transcript_pump(
                         tail: crate::claude_transcript::TranscriptTail::new(path),
                         mapper,
                     });
+                    // Mirror the shell-pty promoter's `transcript_bound`: emit
+                    // the lightweight bind fact BEFORE the (potentially
+                    // minute-long) first-bind replay map, so consumers learn
+                    // the bound transcript exists without waiting for mapped
+                    // frames. Emitted once: this block only runs on first bind.
+                    let payload = ObservationPayload::Lifecycle(Box::new(
+                        LifecyclePayload::Native(Box::new(NativeLifecycle {
+                            topic: LifecycleTopic::Hook,
+                            native_name: "transcript_bound".into(),
+                            native_id: Knowledge::Known {
+                                value: ctx.session_id.clone(),
+                            },
+                            status: Knowledge::NotApplicable,
+                            related_ids: BTreeMap::from([(
+                                "transcriptPath".into(),
+                                path_for_bind.to_string_lossy().into_owned(),
+                            )]),
+                            data_ref: None,
+                            severity: Severity::Info,
+                            affects_completion: false,
+                        })),
+                    ));
+                    let _ = emit_obs(
+                        &tx,
+                        &seq,
+                        &ctx,
+                        SourceChannel::Transcript,
+                        Completeness::Structured,
+                        payload,
+                    )
+                    .await;
                 }
             }
             // c-ctxusage r6 item 4c: blocking collection. The hydrator moves

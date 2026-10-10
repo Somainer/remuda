@@ -1773,7 +1773,7 @@ async fn maintain_binding(
     notify: &Arc<Notify>,
     announced: &mut Option<String>,
     events: &mpsc::Sender<Observation>,
-    seq: &Arc<AtomicU64>,
+    seq: &AtomicU64,
     effort_bridge: Option<&Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<EffortSelection>,
     model: Option<&ModelSync>,
@@ -1911,56 +1911,50 @@ async fn maintain_binding(
         );
         if let Some(opened) = opened {
             *slot_lock(hydrator) = Some(opened);
+            // Announce the bind BEFORE the first (potentially minute-long)
+            // replay pump: this is a lightweight identity fact, and emitting
+            // it only after the map meant observers learned about the bound
+            // transcript as late as the pump completed.
+            announce(
+                announced,
+                TRANSCRIPT_BOUND,
+                bound_lifecycle(&binding),
+                events,
+                seq,
+                ctx,
+            )
+            .await;
         }
     }
     if slot_lock(hydrator).is_some() {
-        // The transcript pump runs DETACHED from the promoter loop: a big
-        // first-bind replay can block-map for tens of seconds, and awaiting it
-        // here would starve the 800 ms detection/binding tick. It shares the
-        // hydrator slot; on a vanished file it degrades + finalises itself.
-        let pump_slot = Arc::clone(hydrator);
-        let pump_pending = Arc::clone(pending);
-        let pump_notify = Arc::clone(notify);
-        let pump_events = events.clone();
-        let pump_seq = seq.clone();
-        let pump_ctx = ctx.clone();
-        let pump_bindings = Arc::clone(&bindings.inner);
-        tokio::spawn(async move {
-            match pump(
-                &pump_slot,
-                &pump_pending,
-                &pump_notify,
-                &pump_events,
-                &pump_seq,
-                &pump_ctx,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(()) => {
-                    // The bound file vanished: degrade, never silently rebind.
-                    // A reading finalise is intentionally NOT run here: the
-                    // vanished file makes the last poll authoritative.
-                    let mut slot = pump_bindings
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if slot.binding.is_some() {
-                        slot.degraded = true;
-                        slot.degraded_reason = "bound transcript file vanished".to_owned();
-                    }
-                }
+        // In-loop awaited blocking collection: tail polling and mapping are
+        // serialized per hydrator (never two concurrent polls of one file),
+        // matching the pre-r6 pump ordering. A large first-bind replay blocks
+        // this tick, which is correct — close aborts the task and the
+        // FinaliseGuard finishes the detached blocking map's retained run.
+        match pump(hydrator, pending, notify, events, seq, ctx).await {
+            Ok(()) => {}
+            Err(()) => {
+                // The bound file vanished: degrade, never silently rebind.
+                bindings.mark_degraded("bound transcript file vanished");
+                finalize_hydrator(hydrator, pending, notify, events, seq, ctx).await;
+                let related = BTreeMap::from([
+                    ("sessionId".to_owned(), binding.session_id.clone()),
+                    ("source".to_owned(), binding.source.as_wire().to_owned()),
+                    ("reason".to_owned(), "vanished".to_owned()),
+                ]);
+                announce(
+                    announced,
+                    TRANSCRIPT_DEGRADED,
+                    diagnostic_lifecycle(TRANSCRIPT_DEGRADED, "bound transcript vanished", related),
+                    events,
+                    seq,
+                    ctx,
+                )
+                .await;
             }
-        });
+        }
     }
-    announce(
-        announced,
-        TRANSCRIPT_BOUND,
-        bound_lifecycle(&binding),
-        events,
-        seq,
-        ctx,
-    )
-    .await;
 }
 
 /// Emit `payload` only when this epoch has not announced `name` yet.

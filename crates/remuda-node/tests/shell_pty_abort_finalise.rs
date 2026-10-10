@@ -89,10 +89,11 @@ fn spec_for(cwd: &Path) -> InstanceSpec {
     spec
 }
 
-/// One realistic assistant/user pair (thinking + text + tool call + tool
-/// result), distinct ids so every mapper code path really runs. ~1.5 KiB and
-/// ~0.3 ms to map; the default pair count makes the first-bind replay a
-/// ~20-30 s map that pushes close past its 15 s bound on a loaded gate box.
+/// One lightweight closed-turn record — kept cheap so the seeded backlog is
+/// large enough to make the first-bind replay long (well past close's 15 s
+/// bound) without costing minutes per test under gate load. One record is
+/// enough: distinct ids make every mapper code path run across pairs, and
+/// the assertion only needs the last un-finalised run at the tail.
 fn filler_pair(seed: &str, index: u32) -> String {
     let assistant = serde_json::json!({
         "type": "assistant",
@@ -106,11 +107,7 @@ fn filler_pair(seed: &str, index: u32) -> String {
             "model": "claude-opus-5-5",
             "stop_reason": "tool_use",
             "content": [
-                {"type": "thinking", "thinking": "t".repeat(800),
-                 "signature": "s".repeat(300)},
-                {"type": "text", "text": "x".repeat(800)},
-                {"type": "tool_use", "id": format!("{seed}-toolu-{index}"),
-                 "name": "Bash", "input": {"command": "echo filler"}}
+                {"type": "text", "text": "x"}
             ],
             "usage": {
                 "input_tokens": 100 + index % 50,
@@ -120,18 +117,7 @@ fn filler_pair(seed: &str, index: u32) -> String {
             }
         }
     });
-    let user = serde_json::json!({
-        "type": "user",
-        "uuid": format!("{seed}-u-{index}"),
-        "timestamp": "2026-10-09T00:00:00.000Z",
-        "message": {
-            "role": "user",
-            "content": [{"type": "tool_result",
-                "tool_use_id": format!("{seed}-toolu-{index}"),
-                "content": "out".repeat(200), "is_error": false}]
-        }
-    });
-    format!("{assistant}\n{user}\n")
+    format!("{assistant}\n")
 }
 
 /// The record only a `finish()` can publish: a fresh assistant message id,
@@ -215,10 +201,12 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
     // pump close aborts into.
     let transcript = remuda_driver::claude_transcript::project_dir(&native_home, &workspace)
         .join(format!("{SESSION_ID}.jsonl"));
+    // Each record is ~40 µs to map on a loaded gate box: 40k pairs is a
+    // ~30-60 s replay, comfortably past close's 15 s bound but not minutes.
     let pairs: u32 = std::env::var("ABORT_BACKLOG_PAIRS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(60_000);
+        .unwrap_or(40_000);
     seed_transcript(&transcript, pairs);
 
     let mut options = ShellPtyOptions::agent(

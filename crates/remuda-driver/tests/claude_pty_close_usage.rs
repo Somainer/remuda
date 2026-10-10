@@ -1,0 +1,235 @@
+//! c-ctxusage r6 item 4(c): `ClaudePtyDriver::close` finalises a buffered
+//! transcript run whose LAST assistant record carries usage with NO
+//! stop_reason — only the mapper's `finish()` (the cooperative shutdown or
+//! the abort-path AbortTranscriptGuard) can publish it, never a poll flush.
+//!
+//! The transcript is seeded before the SessionStart hook is simulated, sized
+//! so the first-bind replay block-map runs well past close's 2 s bound on a
+//! loaded gate box; the assertion is identical whether close catches the
+//! cooperative finalise or the guard finishes the detached blocking map.
+
+use remuda_driver::{
+    BinarySource, ClaudePtyDriver, ClaudePtyOptions, Delegation, Driver, DriverKind, LaunchOrigin,
+    ProviderHealth, ProviderKind, ProviderProfile, pin_binary,
+};
+use remuda_protocol::{
+    ContentBlock, DriverInput, InputOrigin, InstanceSpec, Knowledge, ObservationPayload,
+    PromptInput, PromptMode, TextBlock, U64,
+};
+use remuda_testing::{
+    FakeHerdrOptions, FakeHerdrServer, ShortTempDir, ensure_workspace_bin, install_executable,
+};
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+
+const FINAL_MSG_ID: &str = "msg_claude_pty_final_usage";
+
+fn profile() -> ProviderProfile {
+    ProviderProfile {
+        id: "pvp_01993ab0-0000-7000-8000-000000000005".parse().unwrap(),
+        kind: ProviderKind::Anthropic,
+        base_url: String::new(),
+        delegation: Delegation::None,
+        secret_ref: None,
+        models: vec!["haiku".into()],
+        health: ProviderHealth::Healthy,
+    }
+}
+
+fn spec(cwd: &Path) -> InstanceSpec {
+    let mut spec: InstanceSpec =
+        serde_json::from_str(include_str!("fixtures/instance-spec.json")).unwrap();
+    spec.driver = DriverKind::ClaudePty;
+    spec.cwd = cwd.to_string_lossy().into_owned();
+    spec.model_id = Some("haiku".into());
+    spec
+}
+
+#[allow(dead_code)]
+fn prompt(text: &str) -> DriverInput {
+    DriverInput::Prompt(Box::new(PromptInput {
+        mode: PromptMode::NewTurn,
+        blocks: vec![ContentBlock::Text(Box::new(TextBlock {
+            text: text.into(),
+        }))],
+        origin: InputOrigin::Human,
+        native_client_message_id: "m1".into(),
+    }))
+}
+
+/// Cheap closed-turn filler; 30k pairs makes the replay map well past the
+/// 2 s close bound on a loaded box while keeping the test around 20 s.
+fn filler(index: u32) -> String {
+    let record = serde_json::json!({
+        "type": "assistant",
+        "uuid": format!("c-a-{index}"),
+        "timestamp": "2026-10-09T00:00:00.000Z",
+        "isSidechain": false,
+        "message": {
+            "id": format!("c-msg-{index}"),
+            "role": "assistant",
+            "type": "message",
+            "model": "claude-opus-5-5",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "x"}],
+            "usage": {"input_tokens": 11, "cache_read_input_tokens": 22,
+                      "cache_creation_input_tokens": 1, "output_tokens": 3}
+        }
+    });
+    format!("{record}\n")
+}
+
+fn final_record() -> String {
+    let record = serde_json::json!({
+        "type": "assistant",
+        "uuid": "c-final-record",
+        "timestamp": "2026-10-09T00:01:00.000Z",
+        "isSidechain": false,
+        "message": {
+            "id": FINAL_MSG_ID,
+            "role": "assistant",
+            "type": "message",
+            "model": "claude-opus-5-5",
+            "stop_reason": null,
+            "content": [{"type": "text", "text": "UNFINISHED"}],
+            "usage": {
+                "input_tokens": 432,
+                "cache_read_input_tokens": 654,
+                "cache_creation_input_tokens": 5,
+                "output_tokens": 7,
+                "cache_creation": {"ephemeral_5m_input_tokens": 5,
+                                   "ephemeral_1h_input_tokens": 0}
+            }
+        }
+    });
+    format!("{record}\n")
+}
+
+fn seed_transcript(path: &Path, pairs: u32) {
+    use std::io::Write;
+    let mut file = fs::File::create(path).expect("create transcript");
+    for index in 0..pairs {
+        file.write_all(filler(index).as_bytes()).unwrap();
+    }
+    file.write_all(final_record().as_bytes()).unwrap();
+    file.sync_all().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claude_pty_close_finalises_the_no_stop_usage_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.as_ref().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_workspace_bin("fake-herdr");
+    let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
+
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let claude = install_executable(
+        tmp.path(),
+        "claude",
+        "#!/bin/sh\necho '2.1.268 (Claude Code)'\n",
+    );
+
+    let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        instance_id: None,
+        media_stager: None,
+        profile: profile(),
+        launch_dir: launch.clone(),
+        native_home: home,
+        binary: BinarySource::Pinned(pin_binary(&claude).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-test".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker::env_only()),
+        extra_env: Default::default(),
+        agent_mcp: None,
+        setting_sources: None,
+        agent_start_timeout_ms: 5_000,
+        inherit_default_config: false,
+        settings_overlay_path: None,
+        auto_trust_registered_workspace: false,
+        seed_onboarding: true,
+        host_claude_config: None,
+    });
+
+    let mut handle = driver.start(spec(&cwd)).await.expect("start");
+
+    // Seed the transcript BEFORE simulating SessionStart so the first-bind
+    // replay is the long map close aborts into.
+    let transcript = launch.join("transcript.jsonl");
+    let pairs: u32 = std::env::var("ABORT_BACKLOG_PAIRS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30_000);
+    seed_transcript(&transcript, pairs);
+    fs::write(
+        launch.join("session-meta.json"),
+        serde_json::json!({
+            "session_id": "fixture-session",
+            "transcript_path": transcript,
+            "hook_event_name": "SessionStart",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // The bound lifecycle proves the hydrator exists and the replay started;
+    // close immediately after, while the backlog map is (very likely) still
+    // running past the 2 s bound.
+    let mut bound = false;
+    let bound_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < bound_deadline {
+        let obs = match tokio::time::timeout(Duration::from_millis(500), handle.recv()).await {
+            Ok(Some(obs)) => obs,
+            _ => continue,
+        };
+        if let ObservationPayload::Lifecycle(payload) = &obs.body
+            && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_ref()
+            && native.native_name == "transcript_bound"
+        {
+            bound = true;
+            break;
+        }
+    }
+    assert!(bound, "transcript never bound before close");
+
+    driver.close().await.expect("close");
+
+    // Drain the rest; the final no-stop usage must have been finalised.
+    let mut rescued = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while tokio::time::Instant::now() < deadline {
+        let obs = match tokio::time::timeout(Duration::from_secs(5), handle.recv()).await {
+            Ok(Some(obs)) => obs,
+            _ => break,
+        };
+        if let ObservationPayload::Usage(payload) = &obs.body
+            && payload.scope_id == FINAL_MSG_ID
+        {
+            rescued = Some(obs);
+            break;
+        }
+    }
+    let rescued = rescued.expect("close did not finalise the no-stop usage");
+    let payload = match rescued.body {
+        ObservationPayload::Usage(payload) => payload,
+        _ => unreachable!(),
+    };
+    assert_eq!(payload.scope_id, FINAL_MSG_ID);
+    let known = |value: Knowledge<U64>| match value {
+        Knowledge::Known { value } => Some(value.0),
+        _ => None,
+    };
+    assert_eq!(known(payload.input_tokens), Some(432));
+    assert_eq!(known(payload.output_tokens), Some(7));
+    assert_eq!(known(payload.cache_read_tokens), Some(654));
+    assert_eq!(known(payload.cache_write_tokens), Some(5));
+}

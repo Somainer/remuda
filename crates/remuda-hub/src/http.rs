@@ -578,22 +578,22 @@ pub async fn delete_instance(
         // being deleted and some OTHER chapter (typically a predecessor whose
         // exit never arrived after the continuation close) is still live, the
         // request refuses here — BEFORE the addressed chapter is stopped and
-        // before any lease return, purge or audit (ma-lineage r7 item 1). The
-        // caller must settle every chapter first; the store transaction
-        // re-checks as a backstop and returns the same 409.
-        let only_addressed_live = live.len() == 1 && live[0].instance_id == instance_id;
+        // before the store delete, lease return, purge or audit
+        // (ma-lineage r7 item 1). The caller must settle every chapter first;
+        // the store transaction re-checks as a backstop and returns the same
+        // 409.
+        let offenders: Vec<String> = live
+            .iter()
+            .filter(|chapter| chapter.instance_id != instance_id)
+            .map(|chapter| format!("{} ({})", chapter.instance_id, chapter.lifecycle))
+            .collect();
         if !force {
             return Err(HubError::Conflict(format!(
                 "instance is {}; stop it first or retry with ?force=1",
                 instance.lifecycle
             )));
         }
-        if !only_addressed_live {
-            let offenders: Vec<String> = live
-                .iter()
-                .filter(|chapter| chapter.instance_id != instance_id)
-                .map(|chapter| format!("{} ({})", chapter.instance_id, chapter.lifecycle))
-                .collect();
+        if !offenders.is_empty() {
             return Err(HubError::Conflict(format!(
                 "refusing to delete the lineage: chapter(s) still live: {}; \
                  ?force=1 only stops the addressed chapter — stop every chapter first",
@@ -626,16 +626,66 @@ pub async fn delete_instance(
         }
     }
 
+    // r8 item 2: Hub truth is removed BEFORE any best-effort Node side
+    // effect. A continuation landing between the plan and here appends a
+    // successor chapter and moves the lineage current pointer; the delete
+    // transaction re-checks that and returns 409, which must surface BEFORE
+    // worktree.return/instance.purge/audit ran for the old chapter set. The
+    // lease-return and purge loops below therefore run only on the success
+    // path of this delete.
+    //
+    // The audit row outlives the journal it describes. ma-lineage r7 item 2:
+    // record EVERY deleted chapter, not only the addressed one.
+    let mut lease_returns = Vec::new();
+    let mut lease_keys_seen = std::collections::HashSet::new();
+    let mut purge_outcomes = serde_json::Map::new();
+    let chapter_details: Vec<Value> = chapters
+        .iter()
+        .map(|chapter| {
+            json!({
+                "instanceId": chapter.instance_id,
+                "hostId": chapter.host_id,
+                "lifecycle": chapter.lifecycle,
+            })
+        })
+        .collect();
+    let deleted = state
+        .store
+        .delete_instance(instance_id.clone())
+        .await
+        .map_err(map_store)?;
+    if !deleted {
+        return Err(HubError::NotFound);
+    }
+    // The audit row outlives the journal it describes; append it only once
+    // the delete committed, so a re-check 409 (a continuation advanced the
+    // lineage between plan and delete) leaves no false "deleted" record.
+    // ma-lineage r7 item 2: it records EVERY deleted chapter.
+    state
+        .store
+        .append_audit(
+            device.id.clone(),
+            "instance.delete".into(),
+            Some(instance_id.clone()),
+            json!({
+                "hostId": instance.host_id,
+                "lifecycle": instance.lifecycle,
+                "forced": force,
+                "lineageId": instance.lineage_id,
+                "chapters": chapter_details,
+            }),
+        )
+        .await
+        .map_err(map_store)?;
+
     // t-pool: a deleted session must not leave its worktree lease pinned.
     // Key on the instance's task (not the attach-lock holder, which is only
     // populated once the binding task attaches a session): return every active
-    // lease this task holds on the host before any Node reclaim. Pool slots
-    // park warm; reuse dirs are untouched. Best effort like the purge below —
-    // an offline Node reconciles on reconnect, and the delete transaction
-    // clears holder_instance_id regardless. Every chapter of the lineage
-    // copied the task, so walk each (host, task) pair exactly once.
-    let mut lease_returns = Vec::new();
-    let mut lease_keys_seen = std::collections::HashSet::new();
+    // lease this task holds on the host. Pool slots park warm; reuse dirs are
+    // untouched. Best effort — an offline Node reconciles on reconnect, and
+    // the delete transaction already cleared holder_instance_id. Every
+    // chapter of the lineage copied the task, so walk each (host, task) pair
+    // exactly once.
     for chapter in &chapters {
         let Some(task_id) = chapter.task_id.as_deref() else {
             continue;
@@ -704,12 +754,11 @@ pub async fn delete_instance(
     }
 
     // Ask EVERY chapter's Node to drop its own copy (ma-lineage r7 item 2):
-    // the store transaction removes every chapter row, so purging only the
+    // the store transaction removed every chapter row, so purging only the
     // addressed/current one would orphan its predecessors' data directories
     // for good. A Node that is offline or has never heard of the instance
     // must not block the delete: the Hub row is what the user asked to
     // remove, and the Node reconciles on reconnect.
-    let mut purge_outcomes = serde_json::Map::new();
     for chapter in &chapters {
         let outcome = match state
             .nodes
@@ -761,47 +810,6 @@ pub async fn delete_instance(
         .unwrap_or("purged")
         .to_string();
 
-    // The audit row outlives the journal it describes, so write it first.
-    // ma-lineage r7 item 2: record EVERY deleted chapter, not only the
-    // addressed one — the audit must account for all rows the transaction
-    // removes.
-    let chapter_details: Vec<Value> = chapters
-        .iter()
-        .map(|chapter| {
-            json!({
-                "instanceId": chapter.instance_id,
-                "hostId": chapter.host_id,
-                "lifecycle": chapter.lifecycle,
-            })
-        })
-        .collect();
-    state
-        .store
-        .append_audit(
-            device.id.clone(),
-            "instance.delete".into(),
-            Some(instance_id.clone()),
-            json!({
-                "hostId": instance.host_id,
-                "lifecycle": instance.lifecycle,
-                "forced": force,
-                "nodePurge": purge,
-                "lineageId": instance.lineage_id,
-                "chapters": chapter_details,
-                "chapterPurges": Value::Object(purge_outcomes.clone()),
-            }),
-        )
-        .await
-        .map_err(map_store)?;
-
-    let deleted = state
-        .store
-        .delete_instance(instance_id.clone())
-        .await
-        .map_err(map_store)?;
-    if !deleted {
-        return Err(HubError::NotFound);
-    }
     tracing::info!(
         %instance_id,
         device_id = %device.id,

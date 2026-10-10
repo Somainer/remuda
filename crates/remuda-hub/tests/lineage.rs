@@ -3806,3 +3806,177 @@ async fn an_existing_grant_holder_gets_a_backfilled_lineage_and_then_resumes_as_
     assert_eq!(params["spec"]["resumeSessionId"], json!(SESSION));
     Ok(())
 }
+
+/// A Node whose `instance.purge` RPC replies stay parked until the test opens
+/// the gate — the deterministic interleave point for a continuation arriving
+/// while a whole-lineage delete is purging (r8 item 2).
+struct GatedNode {
+    frames: tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
+    release: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for GatedNode {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl GatedNode {
+    async fn connect(hub: &remuda_hub::RunningHub, host: &str, token: &str) -> Result<Self> {
+        let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse()?);
+        let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
+        node.send(Message::Text(
+            json!({
+                "jsonrpc":"2.0", "id":"hello", "method":"node.hello",
+                "params":{"hostId":host,"host":{
+                    "hostname":"lineage-gated","workspaces":[],"workspaceRevision":0,
+                    "herdr":{"path":"/usr/bin/herdr"},
+                    "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged_in"}]
+                }}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        let hello_text = node.next().await.context("hello")??.into_text()?;
+        let hello: Value = serde_json::from_str(&hello_text)?;
+        assert!(hello.get("result").is_some(), "hello failed: {hello}");
+
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release, mut released) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                let frame = node.next();
+                tokio::select! {
+                    frame = frame => match frame {
+                        Some(Ok(Message::Text(text))) => {
+                            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                                continue;
+                            };
+                            let Some(method) = frame["method"].as_str() else {
+                                continue;
+                            };
+                            if frame_tx.send((method.to_owned(), frame["params"].clone())).is_err() {
+                                break;
+                            }
+                            // Park purge replies until the test opens the gate.
+                            if method == "instance.purge" {
+                                let _ = released.wait_for(|open| *open).await;
+                            }
+                            if node.send(Message::Text(json!({
+                                "jsonrpc":"2.0","id":frame["id"],
+                                "result":{"purged":true}
+                            }).to_string().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(_)) | Some(Err(_)) => {}
+                    },
+                }
+            }
+        });
+        Ok(Self {
+            frames: frame_rx,
+            release,
+            task,
+        })
+    }
+
+    async fn next_frame(&mut self) -> Result<(String, Value)> {
+        tokio::time::timeout(Duration::from_secs(5), self.frames.recv())
+            .await?
+            .context("frame")
+    }
+}
+
+/// r8 item 2: a continuation resume landing WHILE the lineage delete is in
+/// its purge loop can no longer race the store delete. The Hub rows are
+/// removed (re-check included) BEFORE the first purge RPC, so the resume sees
+/// a gone lineage (404) and the delete completes 200 — no 409-after-purge,
+/// no false/duplicate audit.
+#[tokio::test]
+async fn resume_during_the_purge_loop_finds_the_lineage_already_gone() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut setup, _token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let (x, _) = ctx.seat(&mut setup, None).await?;
+    // X terminal, then continue to Y; bring Y to exited as well, so the
+    // whole-lineage delete is a no-force, no-stop delete of two terminal
+    // chapters and the first side effect is the X purge.
+    ctx.report_session(&setup, &x, true).await?;
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = setup.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    ctx.report_session(&setup, &y, true).await?;
+    setup.disconnect().await;
+
+    let mut node = GatedNode::connect(&ctx.hub, &ctx.host, &_token.expect("node token")).await?;
+
+    let delete = {
+        let http = ctx.http.clone();
+        let base = ctx.base();
+        let human = ctx.human.clone();
+        let y = y.clone();
+        tokio::spawn(async move {
+            http.delete(format!("{base}/v1/instances/{y}"))
+                .bearer_auth(human)
+                .send()
+                .await
+        })
+    };
+
+    // The delete reaches the purge loop ONLY after the store delete
+    // committed (r8 item 2). Wait until the first purge is parked.
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.purge");
+    let purged_first = params["instanceId"].as_str().unwrap().to_owned();
+    assert!(
+        purged_first == x || purged_first == y,
+        "unexpected purge target {purged_first}"
+    );
+
+    // A continuation of Y landing now finds the lineage gone.
+    let raced = ctx.resume(&y, &ctx.human).await?;
+    assert_eq!(
+        raced.status(),
+        404,
+        "the lineage rows are already deleted; a mid-purge resume cannot append a successor"
+    );
+
+    node.release.send(true).ok();
+    let deleted = delete.await??.error_for_status()?;
+    let body: Value = deleted.json().await?;
+    assert_eq!(body["deleted"], json!(true));
+    let chapters = body["chapterIds"].as_array().unwrap();
+    assert_eq!(chapters.len(), 2, "both chapters were purged: {body}");
+
+    // The purge loop then drives the second chapter's purge.
+    let (method, _) = tokio::time::timeout(Duration::from_secs(5), node.frames.recv())
+        .await?
+        .context("second purge frame")?;
+    assert_eq!(method, "instance.purge");
+
+    // One audit row, recorded for the successful delete only.
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    let audits: i64 = db.query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'instance.delete'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        audits, 1,
+        "exactly one delete audit: no refused-attempt row"
+    );
+    Ok(())
+}

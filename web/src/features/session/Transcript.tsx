@@ -589,18 +589,9 @@ function TranscriptInner({
    * restore armed (repinning the click-time row) and the estimate frozen
    * forever. The new navigation's own index pending is installed by the
    * caller and is left intact; only that request's restore pending/anchor
-   * are retired. Returns true when a restore was cancelled.
+   * are retired. Returns void.
    */
   const cancelLoadRestoreRef = useRef<() => void>(() => {});
-  /**
-   * Write scrollTop programmatically. `fromRestore` marks a load-earlier /
-   * saved-position restore's OWN write: its dispatched scroll event is
-   * recorded (target + seq) so the listener recognizes the echo. Writes from
-   * every other caller (j/k, search, 跳到最新, pin/resize re-pins, growth
-   * anchoring) are intentional navigation: they retire any armed restore
-   * synchronously and invalidate the echo record. A rAF drops a record when
-   * the browser dispatched no event.
-   */
   /**
    * Mark the coalesced scroll event dispatched by the re-anchor machinery's
    * OWN just-performed write. Both own-write latches are armed together: the
@@ -625,6 +616,16 @@ function TranscriptInner({
       }
     });
   }, []);
+  /**
+   * Write scrollTop programmatically.
+   * - fromRestore=false (intentional navigation: j/k via scrollToIndex, a
+   *   search hit via gotoMatch, 跳到最新): synchronously retire any armed
+   *   restore and invalidate the echo record before the write.
+   * - fromRestore=true (the re-anchor machinery's own writes: load-earlier /
+   *   saved restore corrections and the growth-anchor self-correction): arm
+   *   the echo so the dispatched scroll event is recognised as our own.
+   * A rAF drops a record when the browser dispatched no event.
+   */
   const programmaticScroll = useCallback(
     (el: HTMLElement, top: number, fromRestore = false) => {
       if (fromRestore) {
@@ -675,14 +676,6 @@ function TranscriptInner({
     const req = loadReqRef.current;
     if (req?.reqId === held.reqId && req.done) loadReqRef.current = null;
   }, []);
-  /**
-   * Synchronously retire the current load-earlier restore from an intentional
-   * navigation — independent of whether the upcoming write changes scrollTop
-   * (a single j at the top writes an unchanged value and dispatches no scroll
-   * event, so onScroll alone can never do this). Marks the in-flight request
-   * cancelled, releases the held anchor and the restore pending, and unfreezes
-   * the estimate. The request identity stays until the click's finally runs.
-   */
   /** Switch growth anchoring off after a cancel, bounded by a re-arm timer. */
   const suppressGrowthHold = useCallback(() => {
     growthHoldSuppressedRef.current = true;
@@ -703,6 +696,14 @@ function TranscriptInner({
     growthHoldSuppressedRef.current = false;
     setGrowthHoldAttr();
   }, []);
+  /**
+   * Synchronously retire the current load-earlier restore from an intentional
+   * navigation — independent of whether the upcoming write changes scrollTop
+   * (a single j at the top writes an unchanged value and dispatches no scroll
+   * event, so onScroll alone can never do this). Marks the in-flight request
+   * cancelled, releases the held anchor and the restore pending, and unfreezes
+   * the estimate. The request identity stays until the click's finally runs.
+   */
   const cancelLoadRestore = useCallback(() => {
     const req = loadReqRef.current;
     if (!req || req.cancelled) return;
@@ -1439,12 +1440,13 @@ function TranscriptInner({
       setReflowHoldAttr();
       // The hold is retargeted, not abandoned: growth anchoring stays active
       // (cancelLoadRestore would have suppressed it), and the first jump is
-      // the restore's own write.
-      growthHoldSuppressedRef.current = false;
+      // the restore's own write. Re-arm via the helper so any pending bounded
+      // re-arm timer is cleared and data-growth-hold is updated.
+      rearmGrowthHold();
       applyOffset(destIndex, 0, true);
       return true;
     },
-    [applyOffset],
+    [applyOffset, rearmGrowthHold],
   );
 
   // Refine an estimated scroll (search hit, saved position) as the window

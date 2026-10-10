@@ -2879,11 +2879,14 @@ describe("load-earlier anchor lifecycle round 5", () => {
         geo.setTotal(25);
         await resolvePage();
         // The retargeted hold parks turn 0 at the viewport top after the
-        // 5-row prepend (its settle write moves to 5*ROW); the click-time
-        // anchor never gets a separate write.
+        // 5-row prepend (its settle write moves to 5*ROW). The retarget
+        // destination and the click-time anchor are the same row here, so a
+        // distinct negative write value does not exist; assert the real guard
+        // — the park write actually happens (a dropped/cancelled hold would
+        // leave the scroller at its pre-prepend top).
         await geo.nextFrame();
         await act(async () => {});
-        expect(writes).not.toContain(5 * ROW - ROW);
+        expect(writes).toContain(5 * ROW);
         const top = Math.round(
           geo.scroller().querySelector<HTMLElement>('[data-anchor="n_1001_user_insJZero"]')!.getBoundingClientRect().top
             - geo.scroller().getBoundingClientRect().top,

@@ -187,6 +187,48 @@ describe("Outbox", () => {
     expect(storage.map.get("cmd_foreign")?.state).toBe("inflight");
   });
 
+  it("GATE9 item 6: tabOwner writes sessionStorage and leaves localStorage untouched", () => {
+    const session = new Map<string, string>();
+    const local = new Map<string, string>();
+    const make = (m: Map<string, string>): Storage =>
+      ({
+        getItem: (k: string) => m.get(k) ?? null,
+        setItem: (k: string, v: string) => void m.set(k, v),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: () => null,
+        length: 0,
+      }) as Storage;
+    Object.defineProperty(globalThis, "sessionStorage", {
+      value: make(session),
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(globalThis, "localStorage", {
+      value: make(local),
+      configurable: true,
+      writable: true,
+    });
+    const a = Outbox.tabOwner();
+    const b = Outbox.tabOwner();
+    expect(a).toBe(b);
+    expect(a.startsWith("owner_")).toBe(true);
+    expect(session.has("remuda-outbox-owner")).toBe(true);
+    expect(local.size).toBe(0);
+  });
+
+  it("GATE9 item 6: two tabs with distinct sessionStorage mint distinct owners (explicit-owner path)", async () => {
+    // In production each tab's tabOwner() reads its own (separate)
+    // sessionStorage; in jsdom that storage is shared, so simulate the two-tab
+    // boundary with the explicit-owner argument Outbox.load accepts (the same
+    // string each tab derives from its own sessionStorage).
+    const storeA = new MemStorage();
+    const a = await Outbox.load(storeA, "owner_tab_a");
+    const b = await Outbox.load(storeA, "owner_tab_b");
+    expect(a.ownerId).toBe("owner_tab_a");
+    expect(b.ownerId).toBe("owner_tab_b");
+  });
+
   it("GATE8 item 4: tabOwner is stable across reload/SW restore (sessionStorage) but unique per tab", () => {
     const a = Outbox.tabOwner();
     const b = Outbox.tabOwner();

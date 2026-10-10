@@ -830,7 +830,7 @@ function SessionPageBody({
             the read-only tag live in the ⋯ menu (a single testid each). */}
         <div className={annCss.floatLayer}>
           <div data-testid="annotation-dock" className={annCss.annotationBar}>
-            <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
+            <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} floating />
           </div>
         </div>
         {pending.length > 0 ? (

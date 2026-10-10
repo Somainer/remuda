@@ -37,13 +37,43 @@
   color: var(--mute);
 }
 
-/* The dock's 批注行 (ui-spec §2.2 item 5): a quiet 24px row in the dock's own
-   flow, only while drafts exist. The entry point is the ⋯ menu's 加批注. */
+/* The quiet 批注行 in the dock's in-flow strip (ui-spec §2.2 item 5): a
+   borderless 24px row, only while drafts exist. The entry point is the ⋯
+   menu's 加批注; the floating variant (.floatBadgeRow) rides above the dock. */
 .badgeRow {
   display: flex;
   align-items: center;
   height: 24px;
   min-width: 0;
+}
+
+/* Floating over the transcript edge (inside .annotationBar): a bordered chip
+   with its own surface so it neither collides with the last transcript lines
+   nor catches stray clicks on transparent pixels. */
+.floatBadgeRow {
+  display: inline-flex;
+  align-items: center;
+  pointer-events: auto;
+}
+
+.floatBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  color: var(--paper);
+  font-family: var(--font);
+  font-size: var(--text-aux);
+  cursor: pointer;
+}
+
+.floatBadge[data-active="1"] {
+  border-color: var(--dust);
+  color: var(--dust);
 }
 
 .badge {

@@ -155,10 +155,19 @@ export function useAnnotationDrafts(instanceId: string | null | undefined): Anno
 export function AnnotationBadge({
   instanceId,
   readonly = false,
+  floating = false,
 }: {
   instanceId: string;
   /** Archived-task sessions and terminal segments offer no entry point. */
   readonly?: boolean;
+  /**
+   * Render as the bordered chip that floats over the transcript edge
+   * (annotationBar) instead of the quiet in-flow 批注行 (badgeRow). The two
+   * placements need distinct styles: the in-flow chip is transparent and
+   * borderless; the floating one needs its own surface so it does not collide
+   * with transcript text or swallow stray clicks.
+   */
+  floating?: boolean;
 }) {
   const { openPanel, panel, closePanel } = useAnnotationsContext();
   const drafts = useAnnotationDrafts(instanceId);
@@ -166,15 +175,17 @@ export function AnnotationBadge({
   if (count === 0) return null;
 
   const open = panel?.instanceId === instanceId;
-  // The dock's 批注行 (ui-spec §2.2 item 5): one 24px quiet row, only while
-  // drafts exist. Read-only (archived) sessions may still OPEN the panel to
-  // review or remove drafts created before the read-only state resolved; the
-  // row is only absent when there is nothing to open.
+  // The quiet in-flow 批注行 (ui-spec §2.2 item 5) renders a borderless 24px
+  // control; the over-transcript floating dock renders the same button with
+  // the bordered .floatBadge chip surface.
   return (
-    <div className={css.badgeRow} data-testid="annotation-badge-row">
+    <div
+      className={floating ? css.floatBadgeRow : css.badgeRow}
+      data-testid={floating ? "annotation-badge-float" : "annotation-badge-row"}
+    >
       <button
         type="button"
-        className={css.badge}
+        className={floating ? css.floatBadge : css.badge}
         data-testid="annotation-badge"
         data-active={open ? "1" : "0"}
         data-readonly={readonly ? "1" : "0"}

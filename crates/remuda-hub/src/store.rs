@@ -28,6 +28,49 @@ use tokio::sync::{Semaphore, oneshot};
 #[path = "store_auth_tests.rs"]
 mod auth_tests;
 
+/// Test-only fault injection for post-commit best-effort paths. Gated
+/// behind the `test-faults` feature (enabled via the crate's own
+/// dev-dependency), so the production `remuda-hub` lib contains no fault
+/// flag, check or error variant. The flags are PER STORE (not process
+/// globals): arming one test's Store cannot fail lookups for any other
+/// Store in the same test binary.
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) mod test_faults {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Per-Store injected-fault flags. The whole struct, the Store field and
+    /// every call site are cfg-gated out of non-fault builds; with the
+    /// `test-faults` feature the Store owns an `Arc<FaultFlags>` shared by all
+    /// its clones.
+    #[derive(Default)]
+    pub(crate) struct FaultFlags {
+        pub lease_lookup_failure: AtomicBool,
+    }
+
+    /// Make every `active_worktree_leases_for_task` call on THIS store fail
+    /// until [`clear`] runs.
+    pub fn arm_lease_lookup_failure(flags: &FaultFlags) {
+        flags.lease_lookup_failure.store(true, Ordering::Release);
+    }
+
+    /// Clear every injected fault for this store.
+    pub fn clear(flags: &FaultFlags) {
+        flags.lease_lookup_failure.store(false, Ordering::Release);
+    }
+
+    pub(super) fn lease_lookup_injected_failure(
+        flags: &FaultFlags,
+    ) -> Result<(), crate::store::StoreError> {
+        if flags.lease_lookup_failure.load(Ordering::Acquire) {
+            Err(crate::store::StoreError::FaultInjected(
+                "active_worktree_leases_for_task".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// SQLite or actor failures.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -52,6 +95,10 @@ pub enum StoreError {
     /// A passkey with the same credential id is already registered.
     #[error("duplicate credential")]
     DuplicateCredential,
+    /// An injected test fault (`test-faults` feature only).
+    #[cfg(any(test, feature = "test-faults"))]
+    #[error("injected store fault: {0}")]
+    FaultInjected(String),
 }
 
 fn sqlite_is_busy(err: &rusqlite::Error) -> bool {
@@ -208,6 +255,18 @@ pub struct Store {
     readers: Arc<ReaderPool>,
     /// Joins the writer thread after the last clone drops its channel sender.
     _join: Arc<StoreJoin>,
+    /// Per-Store test fault flags (`test-faults` feature only). Shared via
+    /// [`Arc`] so every clone of the store arms the SAME flags.
+    #[cfg(any(test, feature = "test-faults"))]
+    faults: Arc<test_faults::FaultFlags>,
+}
+
+impl Store {
+    /// Per-Store test fault flags (`test-faults` feature only).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn fault_flags(&self) -> &Arc<test_faults::FaultFlags> {
+        &self.faults
+    }
 }
 
 /// Delete one chapter's rows and write its interaction tombstones /
@@ -2286,6 +2345,8 @@ impl Store {
             _join: Arc::new(StoreJoin {
                 thread: Mutex::new(Some(thread)),
             }),
+            #[cfg(any(test, feature = "test-faults"))]
+            faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
 
@@ -3543,6 +3604,8 @@ impl Store {
         host_id: String,
         task_id: String,
     ) -> Result<Vec<WorktreeLeaseRow>, StoreError> {
+        #[cfg(any(test, feature = "test-faults"))]
+        test_faults::lease_lookup_injected_failure(&self.faults)?;
         self.run_named("active_worktree_leases_for_task", move |conn| {
             // Match the task on the decoded array so `task_ids_json` stays an
             // internal detail rather than leaking a JSON1 expression to callers.
@@ -12243,7 +12306,12 @@ mod tests {
         // The Node comes back under a NEW epoch and holds nothing for this
         // instance (empty attested inventory).
         let (lost, settlement) = store
-            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".to_string(), true)
+            .reconcile_reported_instances(
+                host.clone(),
+                vec![],
+                "node-epoch-changed".to_string(),
+                true,
+            )
             .await
             .expect("new-epoch reconcile");
         assert_eq!(lost, vec![instance.instance_id.clone()]);

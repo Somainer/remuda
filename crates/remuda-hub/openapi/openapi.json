@@ -6745,14 +6745,14 @@
     },
     "/v1/instances/{id}": {
       "delete": {
-        "description": "Removes the Hub record (journal, commands, interactions, fleet membership) and asks the owning Node to purge its per-instance data directory. The agent's own native transcripts under the user's home are never touched. Human and Bot devices only; agents receive 403. A live Instance is refused with 409 unless `force=1`, which stops it and settles it as `exited` first. A repeated delete returns 404, so the call is idempotent.",
+        "description": "Removes the Hub record (journal, commands, interactions, fleet membership) and, after the Hub rows are gone, asks the owning Nodes to purge their per-instance data directories (best effort). The agent's own native transcripts under the user's home are never touched. Human and Bot devices only; agents receive 403. Deleting the current chapter of a lineage deletes every chapter of that lineage. `force=1` stops only the ADDRESSED chapter before the delete; when another chapter of the lineage is still live the request refuses with 409 whether or not force is set — settle every chapter first. A repeated delete returns 404, so the call is idempotent.",
         "operationId": "instanceDelete",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdPath"
           },
           {
-            "description": "`force=1` stops a live Instance before deleting it.",
+            "description": "`force=1` stops the addressed (live) chapter before deleting it. It cannot stop other chapters of the same lineage; the delete still refuses with 409 while any other chapter is live.",
             "in": "query",
             "name": "force",
             "required": false,

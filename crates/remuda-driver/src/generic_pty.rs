@@ -673,6 +673,14 @@ impl Driver for GenericPtyDriver {
         prompt_when_ready(&client, &agent_name, &text).await?;
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+        // Record the sent prompt for the codex file adapter: discovery may
+        // bind only a rollout whose first user message is an input THIS driver
+        // dispatched, so an idle Remuda pane can never bind a codex the
+        // operator ran by hand in the same cwd (c-usagefu r5 item 5).
+        crate::adapters::codex_discovery::record_input(
+            &std::path::PathBuf::from(&live.recipe.cwd),
+            &text,
+        );
         // D-027: grok has no remote image input at all — not a flag, not a
         // content block, not a path its tooling will open as an image. The
         // prompt still carries the path, but say plainly that this agent will

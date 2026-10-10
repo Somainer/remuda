@@ -528,6 +528,11 @@ fn locate_by_cwd_skips_a_fresh_file_when_its_date_directory_predates_the_floor()
             "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"prune-dir\",\"session_id\":\"prune-dir\",\"cwd\":\"/projects/prune-dir\",\"timestamp\":\"{started}\"}}}}"
         )
         .unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"prune prompt\"}}]}}}}"
+        )
+        .unwrap();
         // The FILE is newer than the floor ...
         file.set_modified(SystemTime::now() + std::time::Duration::from_secs(120))
             .unwrap();
@@ -539,7 +544,7 @@ fn locate_by_cwd_skips_a_fresh_file_when_its_date_directory_predates_the_floor()
         .unwrap();
 
     let floor = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
-    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false);
+    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false, &|_, _, _| true);
     assert!(
         matches!(found, CwdRollout::NotYet),
         "the stale date directory prunes a fresh, content-matching file: {found:?}"
@@ -548,7 +553,7 @@ fn locate_by_cwd_skips_a_fresh_file_when_its_date_directory_predates_the_floor()
     // A floor older than the forced directory mtime finds the same file
     // normally (its mtime is stale by construction for this test).
     let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(4000);
-    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false);
+    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false, &|_, _, _| true);
     assert!(
         matches!(found, CwdRollout::Found { .. }),
         "past floor binds"
@@ -580,6 +585,11 @@ fn locate_by_cwd_skips_an_old_file_even_under_a_fresh_non_date_directory() {
             "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"prune-file\",\"session_id\":\"prune-file\",\"cwd\":\"/projects/prune-file\",\"timestamp\":\"{started}\"}}}}"
         )
         .unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"prune prompt\"}}]}}}}"
+        )
+        .unwrap();
     }
     // The non-date directory is fresh; the FILE itself predates the floor.
     File::open(&dir)
@@ -592,14 +602,14 @@ fn locate_by_cwd_skips_an_old_file_even_under_a_fresh_non_date_directory() {
         .unwrap();
 
     let floor = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
-    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false);
+    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false, &|_, _, _| true);
     assert!(
         matches!(found, CwdRollout::NotYet),
         "the per-file mtime filter skips a content-matching file: {found:?}"
     );
 
     let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(4000);
-    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false);
+    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false, &|_, _, _| true);
     assert!(
         matches!(found, CwdRollout::Found { .. }),
         "past floor binds"

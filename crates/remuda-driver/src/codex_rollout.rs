@@ -283,6 +283,36 @@ pub struct RolloutTail {
     partial: Vec<u8>,
 }
 
+/// Read the rollout's first REAL user message (the operator's prompt),
+/// skipping codex's injected `environment_context` block. A genuine prompt is
+/// a `response_item/message` with role `user` whose content has an
+/// `input_text` block; the injected environment block is the first such item
+/// in real 0.154 sessions and carries metadata
+/// `content_item_kinds: ["environments.environment_context"]`. Scans at most
+/// the first megabyte of the file (the prompt is in the opening turn).
+pub fn first_user_text(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file).take(1024 * 1024);
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut buf).ok()?;
+    for line in buf.lines() {
+        let Ok(CodexRolloutRecord {
+            event: CodexRolloutEvent::Message { role, text, .. },
+            ..
+        }) = parse_rollout_line(line)
+        else {
+            continue;
+        };
+        if role == "user" && !text.trim().is_empty() && !text.contains("<environment_context>") {
+            return Some(text);
+        }
+        // Parser fallback shape: Message events only carry the first text
+        // block, so the environment item (input_text only) arrives here too;
+        // the marker check above covers both real sessions and fixtures.
+    }
+    None
+}
+
 impl RolloutTail {
     /// Start following a rollout at byte zero.
     #[must_use]
@@ -475,6 +505,10 @@ pub fn locate_rollout_by_cwd(
     cwd: &Path,
     launched_at: time::OffsetDateTime,
     exclude: &dyn Fn(&Path) -> bool,
+    // Ownership gate beyond cwd + timestamp: a candidate is accepted only
+    // when this returns true for (file, session start, first user message).
+    // The driver passes the sent-input match (r5 item 5); tests pass accept-all.
+    input_gate: &dyn Fn(&Path, time::OffsetDateTime, &str) -> bool,
 ) -> CwdRollout {
     let floor = launched_at - LAUNCH_TIME_SLACK;
     // Wall-clock form of the floor for mtime comparisons.
@@ -572,6 +606,20 @@ pub fn locate_rollout_by_cwd(
                 continue;
             };
             if started >= floor {
+                // Ownership proof (r5 item 5): once the rollout carries its
+                // first REAL user prompt, that prompt must be an input THIS
+                // driver dispatched — a hand-run codex in the same cwd fails
+                // and is left alone. A header-only file (lazy 0.154 creation
+                // before the prompt lands) yields None and simply waits: it
+                // can match later once its real prompt appears.
+                match first_user_text(entry.path().as_path()) {
+                    Some(first_prompt) => {
+                        if !input_gate(entry.path().as_path(), started, &first_prompt) {
+                            continue;
+                        }
+                    }
+                    None => continue,
+                }
                 // Distinguish a strictly post-launch session (safe to
                 // hydrate from byte zero) from an in-slack candidate (a
                 // possible relaunch — tail from EOF).

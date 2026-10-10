@@ -361,16 +361,9 @@ use time::format_description::well_known::Rfc3339;
 /// Write one active rollout with a session_meta header carrying the thread id,
 /// working directory and session-start time, under a date-sharded dir.
 fn write_rollout(home: &Path, date: &str, id: &str, cwd: &str, started: &str) {
-    let session_dir = home.join("sessions").join(date);
-    std::fs::create_dir_all(&session_dir).unwrap();
-    let path = session_dir.join(format!("rollout-{id}.jsonl"));
-    std::fs::write(
-        path,
-        format!(
-            "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"session_id\":\"{id}\",\"cwd\":\"{cwd}\",\"timestamp\":\"{started}\"}}}}\n"
-        ),
-    )
-    .unwrap();
+    // Discovery ownership requires a real first user prompt (r5 item 5); the
+    // unit-test driver "sent" the fixture prompt for these launches.
+    write_rollout_with_prompt(home, date, id, cwd, started, "fixture driver prompt");
 }
 
 /// The c-usagefu r3 item 1 regression: on generic-pty the adapter tails the
@@ -426,7 +419,9 @@ fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
         "no foreign session may bind, got {bound:?}"
     );
 
-    // The pane's own session registers shortly after launch.
+    // The pane's own session registers shortly after launch; the driver
+    // dispatched its prompt just before that.
+    send_fixture_prompt(cwd, "fixture driver prompt", now);
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -453,6 +448,7 @@ fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(10);
     let rfc = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+    send_fixture_prompt(cwd, "fixture driver prompt", now);
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -512,8 +508,11 @@ fn a_rollout_appearing_long_after_launch_binds_when_the_first_prompt_is_late() {
         "NotYet never gives up; the poll loop keeps discovering until bound"
     );
 
-    // First prompt at t+200 s: the rollout's session started just now.
-    let started = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+    // First prompt at t+200 s: the driver dispatches it and the rollout's
+    // session starts just now.
+    let now = OffsetDateTime::now_utc();
+    send_fixture_prompt(cwd, "fixture driver prompt", now);
+    let started = now.format(&Rfc3339).unwrap();
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -558,6 +557,35 @@ fn a_fresh_file_carrying_a_pre_launch_session_never_binds() {
     assert!(adapter.binding().is_none());
 }
 
+/// Write a rollout that mirrors real 0.154 ordering: injected environment
+/// context, then the REAL first user prompt as an `input_text` item.
+fn write_rollout_with_prompt(
+    home: &Path,
+    date: &str,
+    id: &str,
+    cwd: &str,
+    started: &str,
+    prompt: &str,
+) {
+    let session_dir = home.join("sessions").join(date);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let path = session_dir.join(format!("rollout-{id}.jsonl"));
+    let env_block = "<environment_context> <cwd>/x</cwd> </environment_context>";
+    std::fs::write(
+        path,
+        format!(
+            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"session_id\":\"{id}\",\"cwd\":\"{cwd}\",\"timestamp\":\"{started}\"}}}}\n             {{\"timestamp\":\"{started}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_env\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{env_block}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"environments.environment_context\"]}}}}}}\n             {{\"timestamp\":\"{started}\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Record a driver-sent prompt (as generic_pty.send does) for unit tests.
+/// `cwd` must be the same path given to the adapter's `AdapterHome`.
+fn send_fixture_prompt(cwd: &Path, prompt: &str, at: OffsetDateTime) {
+    crate::adapters::codex_discovery::record_input_at(cwd, prompt, at);
+}
+
 /// Build an unbound driver-launch adapter (with an open discovery window).
 fn launch_adapter(home: &Path, cwd: &str, floor: OffsetDateTime) -> CodexAdapter {
     CodexAdapter::new(AdapterHome {
@@ -584,6 +612,11 @@ fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own
         .format(&Rfc3339)
         .unwrap();
 
+    send_fixture_prompt(
+        Path::new(cwd),
+        "fixture driver prompt",
+        now - time::Duration::seconds(50),
+    );
     let mut a = launch_adapter(home.path(), cwd, floor_a);
     write_rollout(home.path(), "2026/09/14", "A-thread", cwd, &a_started);
     assert!(a.discover().unwrap(), "A binds its unique rollout");
@@ -605,7 +638,13 @@ fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own
     );
     assert!(b.binding().is_none());
 
-    // B's own lazily-created rollout appears; unique and unclaimed → binds.
+    // B's own lazily-created rollout appears after B's prompt; unique and
+    // unclaimed -> binds.
+    send_fixture_prompt(
+        Path::new(cwd),
+        "fixture driver prompt",
+        now - time::Duration::seconds(2),
+    );
     let later = (now - time::Duration::seconds(2)).format(&Rfc3339).unwrap();
     write_rollout(home.path(), "2026/09/14", "B-thread", cwd, &later);
     assert!(b.discover().unwrap());
@@ -646,6 +685,7 @@ fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
 
     // A's rollout appears and A wins it; B and C must not latch give-up and
     // must not touch A's file.
+    send_fixture_prompt(Path::new(cwd), "fixture driver prompt", now);
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -705,6 +745,8 @@ fn an_idle_unbound_instance_does_not_block_a_later_second_instance() {
     drop(a);
 
     let now = OffsetDateTime::now_utc();
+    // B dispatched its own prompt before the rollout was created.
+    send_fixture_prompt(Path::new(cwd), "fixture driver prompt", now);
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -736,17 +778,31 @@ fn a_strictly_post_launch_match_hydrates_its_own_first_turn_from_byte_zero() {
     let session_dir = home.path().join("sessions/2026/09/14");
     std::fs::create_dir_all(&session_dir).unwrap();
     let path = session_dir.join("rollout-strict.jsonl");
-    std::fs::write(
-        &path,
-        format!(
-            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"strict\",\"session_id\":\"strict\",\"cwd\":\"{cwd}\",\"timestamp\":\"{started}\"}}}}
-             {{\"timestamp\":\"{started}\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"first-turn\"}}}}
-"
-        ),
-    )
-    .unwrap();
+    // Real 0.154 first turn: env context + the dispatched user prompt ...
+    write_rollout_with_prompt(
+        home.path(),
+        "2026/09/14",
+        "strict",
+        cwd,
+        &started,
+        "fixture driver prompt",
+    );
+    // ... plus the turn's first task_started, which byte-zero hydration must
+    // surface.
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":3,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"first-turn\"}}}}"
+        )
+        .unwrap();
+    }
 
     let mut adapter = launch_adapter(home.path(), cwd, floor);
+    send_fixture_prompt(Path::new(cwd), "fixture driver prompt", now);
     assert!(
         adapter.discover().unwrap(),
         "the strict post-floor file matches"
@@ -792,17 +848,28 @@ fn an_in_slack_match_tails_from_end_and_skips_pre_bind_records() {
     let session_dir = home.path().join("sessions/2026/09/14");
     std::fs::create_dir_all(&session_dir).unwrap();
     let path = session_dir.join("rollout-slack.jsonl");
-    std::fs::write(
-        &path,
-        format!(
-            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"slack\",\"session_id\":\"slack\",\"cwd\":\"{cwd}\",\"timestamp\":\"{started}\"}}}}
-             {{\"timestamp\":\"{started}\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"old-turn\"}}}}
-"
-        ),
-    )
-    .unwrap();
+    write_rollout_with_prompt(
+        home.path(),
+        "2026/09/14",
+        "slack",
+        cwd,
+        &started,
+        "fixture driver prompt",
+    );
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":3,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"old-turn\"}}}}"
+        )
+        .unwrap();
+    }
 
     let mut adapter = launch_adapter(home.path(), cwd, floor);
+    send_fixture_prompt(Path::new(cwd), "fixture driver prompt", now);
     assert!(
         adapter.discover().unwrap(),
         "the in-slack file still matches"
@@ -830,4 +897,67 @@ fn an_in_slack_match_tails_from_end_and_skips_pre_bind_records() {
         .filter_map(|obs| obs.turn_id.clone())
         .collect();
     assert_eq!(turns, vec!["new-turn"]);
+}
+
+#[test]
+fn a_hand_run_codex_in_the_same_cwd_is_never_bound_by_an_idle_instance() {
+    // r5 item 5: an unprompted Remuda codex pane launched in /proj sits idle;
+    // hours later the operator runs codex BY HAND in /proj. The foreign
+    // session is post-floor and same-cwd (and unique), but its first user
+    // message is not an input this driver sent -> discovery never binds it.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r5-handrun";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let mut adapter = launch_adapter(home.path(), cwd, floor);
+
+    // The operator's hand-run session, created "now" with the operator's own
+    // prompt. The driver never sent anything in this cwd.
+    let started = now.format(&Rfc3339).unwrap();
+    write_rollout_with_prompt(
+        home.path(),
+        "2026/09/14",
+        "hand-run",
+        cwd,
+        &started,
+        "do the thing by hand",
+    );
+    assert!(
+        !adapter.discover().unwrap(),
+        "a foreign hand-run prompt must not bind"
+    );
+    assert!(adapter.binding().is_none());
+
+    // Still foreign on later polls (no unbounded-discovery leak).
+    assert!(!adapter.discover().unwrap());
+    assert!(adapter.binding().is_none());
+}
+
+#[test]
+fn a_rollout_whose_first_prompt_matches_a_driver_sent_input_binds() {
+    // Positive control: the SAME setup binds once the driver records sending
+    // that prompt (as generic_pty.send does), provided the timing lines up.
+    use crate::adapters::codex_discovery::record_input_at;
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd_dir = home.path().join("proj-r5-sent");
+    std::fs::create_dir_all(&cwd_dir).unwrap();
+    let cwd = cwd_dir.to_str().unwrap();
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let prompt = "remuda dispatched this";
+
+    let mut adapter = launch_adapter(home.path(), cwd, floor);
+    // The driver sent the prompt slightly before the rollout was created.
+    record_input_at(&cwd_dir, prompt, now);
+    let started = (now - time::Duration::seconds(1)).format(&Rfc3339).unwrap();
+    write_rollout_with_prompt(home.path(), "2026/09/14", "sent-one", cwd, &started, prompt);
+    assert!(
+        adapter.discover().unwrap(),
+        "a matching driver-sent prompt binds the own session"
+    );
+    assert_eq!(
+        adapter.binding().map(|binding| binding.session_id.as_str()),
+        Some("sent-one")
+    );
 }

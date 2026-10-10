@@ -254,6 +254,13 @@ impl CodexAdapter {
             &self.home.cwd,
             launched_at,
             &|path: &Path| crate::adapters::codex_discovery::is_claimed(path),
+            &|_path, started, first_prompt| {
+                crate::adapters::codex_discovery::matches_sent_input(
+                    &self.home.cwd,
+                    first_prompt,
+                    started,
+                )
+            },
         ) {
             // A unique UNCLAIMED match is ours even while another window is
             // open: files the other adapter bound are excluded above, so the

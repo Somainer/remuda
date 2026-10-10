@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use time::OffsetDateTime;
 
 #[derive(Default)]
 struct WindowEntry {
@@ -128,3 +129,90 @@ impl Drop for DiscoveryWindow {
         self.release();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sent-input evidence (c-usagefu r5 item 5)
+// ---------------------------------------------------------------------------
+
+/// How close to a driver-sent prompt a lazily-created rollout may appear and
+/// still count as that prompt's session. The first turn writes session_meta,
+/// the user item and usage within well under a second of the keystroke in
+/// practice; this is the generous outer bound.
+pub(crate) const INPUT_MATCH_WINDOW: time::Duration = time::Duration::seconds(300);
+
+#[derive(Clone)]
+struct SentInput {
+    /// Whitespace-trimmed prompt text as the driver sent it.
+    text: String,
+    /// When the driver sent it.
+    at: time::OffsetDateTime,
+}
+
+static SENT_INPUTS: LazyLock<Mutex<HashMap<PathBuf, Vec<SentInput>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whitespace-trimmed comparison form (codex stores the prompt verbatim in
+/// the `input_text` item).
+fn normalize_input(text: &str) -> String {
+    text.trim().to_owned()
+}
+
+/// Record that THIS driver process sent `text` in `cwd` (generic-pty prompt
+/// dispatched). Only inputs recorded here may bind a rollout: a codex the
+/// OPERATOR ran by hand in the same cwd never appears in the registry and can
+/// never be claimed by an idle Remuda pane.
+pub(crate) fn record_input(cwd: &Path, text: &str) {
+    put_input(cwd, text, OffsetDateTime::now_utc());
+}
+
+/// Test seam: record an input with an explicit timestamp.
+#[cfg(test)]
+pub(crate) fn record_input_at(cwd: &Path, text: &str, at: OffsetDateTime) {
+    put_input(cwd, text, at);
+}
+
+fn put_input(cwd: &Path, text: &str, at: OffsetDateTime) {
+    let key = canonical(cwd);
+    let entry = SentInput {
+        text: normalize_input(text),
+        at,
+    };
+    let mut map = SENT_INPUTS.lock().expect("codex sent inputs");
+    let inputs = map.entry(key).or_default();
+    if !inputs.iter().any(|existing| existing.text == entry.text) {
+        inputs.push(entry);
+        // Bound the retained history per cwd.
+        if inputs.len() > 32 {
+            let excess = inputs.len() - 32;
+            inputs.drain(0..excess);
+        }
+    }
+}
+
+/// Whether a rollout created at `session_started` carrying first-user-message
+/// text `rollout_text` is evidence of an input this driver sent in `cwd`:
+/// exact trimmed-text match and creation within [`INPUT_MATCH_EPSILON`] before
+/// / [`INPUT_MATCH_WINDOW`] after the keystroke.
+pub(crate) fn matches_sent_input(
+    cwd: &Path,
+    rollout_text: &str,
+    session_started: OffsetDateTime,
+) -> bool {
+    let wanted = normalize_input(rollout_text);
+    if wanted.is_empty() {
+        return false;
+    }
+    let map = SENT_INPUTS.lock().expect("codex sent inputs");
+    let Some(inputs) = map.get(&canonical(cwd)) else {
+        return false;
+    };
+    inputs.iter().any(|input| {
+        input.text == wanted
+            && session_started >= input.at - LAUNCH_TIME_SLACK_SENT
+            && session_started <= input.at + INPUT_MATCH_WINDOW
+    })
+}
+
+/// Small pre-keystroke slack (the session row can precede the recorded send by
+/// a scheduler tick).
+const LAUNCH_TIME_SLACK_SENT: time::Duration = time::Duration::seconds(5);

@@ -239,6 +239,10 @@ async function setupPerCallSeeds() {
     [JOURNAL_B]: [],
   };
   const hooks = new Map<string, Hooks>();
+  const onAttemptFinish = vi.fn();
+  const ready = new Map<string, number>();
+  ready.set(JOURNAL_A, 1);
+  ready.set(JOURNAL_B, 1);
   const subscribed: string[] = [];
   const nextSeed = (j: string): DeferredSeed => {
     const d = deferred<Seed>();
@@ -281,7 +285,7 @@ async function setupPerCallSeeds() {
         durableSeq: "0",
         windowFromSeq: null,
         reachedAfterSeq: true,
-        getReadyState: () => 1,
+        getReadyState: () => ready.get(journalId) ?? 0,
         snapshot: {
           projectionVersion: "v1",
           projectionEpoch: `epoch_${journalId}`,
@@ -302,6 +306,8 @@ async function setupPerCallSeeds() {
     api,
     hubStore,
     hooks,
+    ready,
+    onAttemptFinish,
     seedCall: (j: string, i: number) => {
       const d = queues[j]?.[i];
       if (!d) throw new Error(`seed ${j}[${i}] not queued (have ${queues[j]?.length ?? 0})`);
@@ -314,7 +320,7 @@ async function setupPerCallSeeds() {
 }
 
 it("an obsolete duplicate seed's scoped handoff never retires the live mount's attempt (B's late failure drives offline)", async () => {
-  const { hubStore, hooks, seedCall, waitQueued, waitSubscribed } = await setupPerCallSeeds();
+  const { api, hubStore, hooks, ready, seedCall, waitQueued, waitSubscribed } = await setupPerCallSeeds();
 
   // Rapid A → B → A → B: every follow queues its own seed read.
   const mountA1 = hubStore.follow(INSTANCE_A);
@@ -343,18 +349,38 @@ it("an obsolete duplicate seed's scoped handoff never retires the live mount's a
   await mountA2.catch(() => undefined);
   await new Promise((r) => setTimeout(r, 10));
 
-  // B's duplicate seed (the CURRENT mount's catch-up) rejects. Under the
-  // gate-7 policy a failed resume READ must not tear down B's already
-  // frame-certified follow socket: the link stays live, healing via live
-  // frames under the frame watchdog (a rejected REST catch-up is not a dead
-  // link). A's obsolete handoff still must not have retired B's attempt.
+  // B's duplicate seed (the CURRENT mount's catch-up) rejects. Make B's
+  // follow UNFRAMED at this point (getReadyState 1 alone does not certify;
+  // followSocketLive needs a fresh frame): this discriminates the bug —
+  // with B's follow dead the rejected catch-up must drive the machine off
+  // the happy path (settles via the REST probe), whereas a framed B socket
+  // would certify live. A's obsolete handoff still must not have retired
+  // B's attempt (asserted below via B receiving its own failure callback).
+  // B's duplicate seed (the CURRENT mount's catch-up) rejects. Make B's
+  // socket UNFRAMED while still bound/open (ready 1, no fresh frame): the
+  // rejected catch-up over a dead-transcript link must not keep false live.
+  // This is the gate-8 item 6 discrimination — with B framed (default
+  // snapshot frame) state is live either way; only the unframed case proves
+  // B's failure — not A's obsolete handoff — is what decides the outcome.
+  hubStore.setFollowLiveForTest(true, false);
+  ready.set(JOURNAL_B, 0);
+  // The failure-settle probe issues another eventsRead; resolve every further
+  // B read successfully so the settle promise isn't left dangling.
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    (async () => seedPage) as Api["eventsRead"],
+  );
   seedCall(JOURNAL_B, 1).reject(new Error("JOURNAL_B_DUP_SEED_FAILED"));
   await expect(mountB2).rejects.toThrow("JOURNAL_B_DUP_SEED_FAILED");
   await expect(mountB1).resolves.toBeUndefined();
-  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"));
+  await new Promise((r) => setTimeout(r, 10));
+  await vi.waitFor(() => expect(hubStore.connectionState).not.toBe("live"));
+  expect(["stale", "offline", "recovering"]).toContain(hubStore.connectionState);
 
-  // A genuine socket drop on the CURRENT mount is still authoritative: the
-  // follow's own close drives the machine offline.
+  // A genuine socket drop on the CURRENT mount is still authoritative.
+  hooks.get(JOURNAL_B)?.onClose?.();
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("offline"));
+
+  // A genuine socket drop on the CURRENT mount is still authoritative.
   hooks.get(JOURNAL_B)?.onClose?.();
   await vi.waitFor(() => expect(hubStore.connectionState).toBe("offline"));
 

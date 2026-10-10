@@ -59,6 +59,15 @@ impl Bridge {
         self.inner.has_pending()
     }
 
+    /// c-effortui r5 item 1: the observed-or-requested proven selection a live
+    /// configure would classify against.
+    #[must_use]
+    pub fn proven_selection(&self) -> Option<(remuda_protocol::EffortName, Option<bool>)> {
+        self.inner
+            .proven_selection()
+            .map(|selection| (selection.name, selection.ultracode))
+    }
+
     /// Give up on a generation without a verdict (bounded timeout / reject).
     pub fn fail(&self, generation: u64) {
         self.inner.fail(generation);

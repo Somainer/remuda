@@ -1095,3 +1095,79 @@ fn real_21289_recordings_are_jsonl_with_an_effort_slash_and_a_verdict() {
         assert!(mirrored == body, "{name}: journal mirror differs");
     }
 }
+
+/// c-effortui r5 item 1: a TERMINAL-typed `/effort max` (slash record + its
+/// stdout verdict) drives the real TranscriptMapper and updates the bridge's
+/// observed selection. After that, proven_selection reports {max,false}; a
+/// subsequent {high,false} Remuda configure classifies as a TIER MOVE (plain
+/// "high") and {high,true} at the same tier as a TOGGLE ("ultracode on") —
+/// the exact behaviour the inline r4 unit tests could not pin without the
+/// mapper-to-bridge path.
+#[tokio::test]
+async fn r5_terminal_effort_updates_bridge_observed_and_classifies_configure() {
+    let bridge = std::sync::Arc::new(remuda_driver::test_support::Bridge::new());
+    let mut mapper = remuda_driver::test_support::mapper_with_bridge(
+        bridge.clone(),
+        "effort-session",
+        "2.1.289",
+    );
+
+    // Nothing observed yet.
+    assert!(bridge.proven_selection().is_none());
+
+    // The user types /effort max in the terminal: slash arm + stdout verdict.
+    mapper.map_line(&slash("max", 1)).expect("slash maps");
+    let verdict = stdout_record_version("Set effort level to max", 2, "2.1.289");
+    let mapped: Vec<_> = mapper
+        .map_line(&verdict)
+        .expect("verdict maps")
+        .into_iter()
+        .chain(mapper.flush().expect("flush"))
+        .collect();
+    assert!(
+        mapped.iter().any(|observation| matches!(
+            &observation.body,
+            ObservationPayload::Effort(payload) if payload.effective.name == Some(remuda_protocol::EffortName::Max)
+        )),
+        "the terminal verdict emits a max edge"
+    );
+
+    // The bridge now observes max (flag not yet reported → None).
+    assert_eq!(
+        bridge.proven_selection(),
+        Some((remuda_protocol::EffortName::Max, None)),
+        "terminal /effort max updates bridge.observed()"
+    );
+
+    // A subsequent terminal `/effort ultracode on` + sparse verdict drives the
+    // flag to on at max through the mapper. A terminal-typed slash is
+    // Slash-sourced (it sets the tracker latch but does not ARM the bridge);
+    // the stdout verdict emits the edge and note_observed updates the bridge.
+    mapper
+        .map_line(&slash("ultracode on", 4))
+        .expect("terminal slash maps");
+    let mut toggle_edges: Vec<_> = mapper
+        .map_line(&stdout_record_version(
+            "Ultracode on (this session only): dynamic workflows on every task. Effort stays max.",
+            5,
+            "2.1.289",
+        ))
+        .expect("toggle verdict maps");
+    toggle_edges.extend(mapper.flush().expect("flush"));
+    assert!(
+        toggle_edges.iter().any(|observation| matches!(
+            &observation.body,
+            ObservationPayload::Effort(payload)
+                if payload.effective.name == Some(remuda_protocol::EffortName::Max)
+                    && payload.effective.ultracode == Some(true)
+        )),
+        "the sparse terminal toggle verdict emits {{max, ultracode on}}"
+    );
+    // The bridge observed the flag on at max (provenance for the next
+    // Remuda configure classification).
+    assert_eq!(
+        bridge.proven_selection(),
+        Some((remuda_protocol::EffortName::Max, Some(true))),
+        "the terminal toggle updates bridge.observed() to {{max, on}}"
+    );
+}

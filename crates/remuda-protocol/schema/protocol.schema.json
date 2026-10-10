@@ -3361,7 +3361,7 @@
           "description": "When the observation was made."
         },
         "readbackAvailable": {
-          "description": "D-056 (4): whether effort read-back is available for this process.\n`Some(false)` means a resume boundary that was verified became\nunverifiable mid-run (transcript shrink/replacement/EOF, or a backward\nclock step): consumers must clear any projected effective level/flag\n(the UI renders `?`) and must not treat a pending switch as applied.\nNormal observations omit it (`None` = available). A session-local exec\nthat keeps the shell pid is NOT a withdrawal trigger; it preserves the\nverified boundary until an actual shrink/replacement/EOF occurs.",
+          "description": "D-056 (4): whether effort read-back is available for this process.\n`Some(false)` means a resume boundary that was verified became\nunverifiable mid-run (transcript shrink/replacement/EOF, or a backward\nclock step): consumers must clear any projected effective level/flag\n(the UI renders `?`) and must not treat a pending switch as applied.\nNormal observations omit it (`None` = available).\n\nNOTE: a session-local `exec` that keeps the shell pid is NOT itself a\nwithdrawal trigger any more: exec preserves the verified boundary\n(c-effortread r8 item 4e); only a subsequent shrink/replacement/EOF\nactually invalidates read-back.",
           "type": [
             "boolean",
             "null"

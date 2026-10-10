@@ -313,25 +313,45 @@ impl EffortRequest {
         }
     }
 
+    /// The provenance choice for a live configure classification
+    /// (c-effortui r5 item 1): observed read-back wins; the launch REQUESTED
+    /// selection is the only fallback. Centralised here (and on the bridge) so
+    /// the Herdr carrier and the classifier can never disagree, and unit
+    /// tests can pin the exact observed-or-requested behaviour without a
+    /// PTY/herdr end-to-end harness.
+    ///
+    /// Returns `None` only when there is neither a read-back nor a launch
+    /// request — a true cold start.
+    pub(crate) fn classify_provenance(
+        observed: Option<ObservedSelection>,
+        requested: Option<EffortSelection>,
+    ) -> Option<ObservedSelection> {
+        observed.or(requested.map(|selection| ObservedSelection {
+            name: selection.name,
+            ultracode: Some(selection.ultracode),
+        }))
+    }
+
     /// Build the in-session request for a LIVE configure from the two D-056
     /// axes (`{name, ultracode}`) and the reported build semantics.
     ///
-    /// Classification (c-effortui r4 item 2) is against the driver's latest
-    /// OBSERVED effective selection (`current`): that is real read-back state
-    /// shared from the transcript mapper, so a terminal-typed `/effort`, a
-    /// resume and an unpinned launch are all reflected. The launch-only
-    /// `requested` provenance is consulted only when there is NO read-back
-    /// yet, and only to keep the very first cold-start toggle working.
+    /// Classification (c-effortui r4 item 2, tightened in r5 item 1) is
+    /// against the driver's latest OBSERVED effective selection, falling back
+    /// to the launch REQUESTED selection — never a guessed toggle with no
+    /// provenance:
     ///
     /// - Coupled (2.1.203–2.1.283): a flag-on request is the single bare
     ///   `/effort ultracode` — on those builds that word IS the xhigh-tier
     ///   command; anything else is a plain level word. The UI guarantees it
     ///   never asks for `{non-xhigh, true}`.
-    /// - Decoupled (≥2.1.284): same tier as observed → the orthogonal toggle
-    ///   (`/effort ultracode on|off`); a different tier is a level move and a
-    ///   plain `/effort <level>` (the ortho flag stays where read-back puts
-    ///   it). With NO observed/requested state, a flag-on at the carried tier
-    ///   is the cold-start toggle; flag-off with no provenance is a level.
+    /// - Decoupled (≥2.1.284): same tier as the proven selection → the
+    ///   orthogonal toggle (`/effort ultracode on|off`); a different tier is
+    ///   a level move and a plain `/effort <level>` (the ortho flag stays
+    ///   where read-back puts it). With NO observed AND NO requested state,
+    ///   a flag-on request is typed as the plain LEVEL word (no cold guess):
+    ///   the first proven selection always comes from launch argv or
+    ///   read-back, and a toggle with no same-tier provenance cannot be known
+    ///   to target this session's flag.
     /// - Legacy/unknown: a flag-on request is rejected by the caller's version
     ///   gate; here only plain level words are produced.
     pub(crate) fn for_configure(
@@ -339,6 +359,7 @@ impl EffortRequest {
         ultracode: Option<bool>,
         semantics: remuda_protocol::EffortSemantics,
         observed: Option<ObservedSelection>,
+        requested: Option<EffortSelection>,
     ) -> Option<Self> {
         let normalized = level.trim().to_ascii_lowercase();
         if semantics == remuda_protocol::EffortSemantics::Coupled && ultracode == Some(true) {
@@ -346,10 +367,11 @@ impl EffortRequest {
         }
         if semantics == remuda_protocol::EffortSemantics::Decoupled {
             let target_name = parse_plain_effort_name(&normalized);
-            // Same OBSERVED tier: the only possible axis change is the flag,
-            // so type the explicit toggle (the level itself does not move).
+            // The proven selection (observed, else requested). None = true
+            // cold start — no toggle guess.
+            let proven = Self::classify_provenance(observed, requested);
             if let Some(name) =
-                target_name.filter(|name| observed.is_some_and(|obs| obs.name == *name))
+                target_name.filter(|name| proven.as_ref().is_some_and(|obs| obs.name == *name))
             {
                 return Some(Self {
                     name,
@@ -359,21 +381,6 @@ impl EffortRequest {
                     } else {
                         "ultracode off"
                     },
-                });
-            }
-            // Tier move (observed tier differs, or never read back with a
-            // launch/requested tier of a DIFFERENT name): a plain level word,
-            // which leaves the ortho flag untouched. Only the true cold start
-            // — no observation AND no requested provenance, flag asked on at
-            // the carried tier — is the first toggle.
-            if observed.is_none()
-                && ultracode == Some(true)
-                && let Some(name) = target_name
-            {
-                return Some(Self {
-                    name,
-                    ultracode: true,
-                    word: "ultracode on",
                 });
             }
         }
@@ -570,11 +577,19 @@ impl EffortBridge {
         self.lock().requested
     }
 
-    /// c-effortui r4 item 2: latest OBSERVED effective selection (read-back),
-    /// which the live configure path uses to tell a flag toggle from a tier
-    /// move. Updated by the mapper from every settled effort edge.
-    pub(crate) fn observed(&self) -> Option<ObservedSelection> {
-        self.lock().observed
+    /// c-effortui r5 item 1: the proven selection for classifying a live
+    /// configure — OBSERVED read-back if present, else the launch REQUESTED
+    /// selection. This is the single source the Herdr carrier uses (no inline
+    /// `observed ?? requested` that can drift from the classifier).
+    pub(crate) fn proven_selection(&self) -> Option<ObservedSelection> {
+        let state = self.lock();
+        EffortRequest::classify_provenance(
+            state.observed,
+            state.requested.map(|request| EffortSelection {
+                name: request.name,
+                ultracode: request.ultracode,
+            }),
+        )
     }
 
     /// Mapper side: record the latest effective selection observed in the
@@ -1260,30 +1275,38 @@ mod sync_tests {
         use remuda_protocol::EffortSemantics::{Coupled, Decoupled, Unknown};
 
         // Coupled: {xhigh,true} is the single bare word.
-        let coupled_on = EffortRequest::for_configure("xhigh", Some(true), Coupled, None).unwrap();
+        let coupled_on =
+            EffortRequest::for_configure("xhigh", Some(true), Coupled, None, None).unwrap();
         assert_eq!(coupled_on.command_word(), "ultracode");
         assert_eq!(coupled_on.name, EffortName::Xhigh);
         // Coupled: a plain level never gains the flag, even with a stale true.
         let coupled_level =
-            EffortRequest::for_configure("max", Some(false), Coupled, None).unwrap();
+            EffortRequest::for_configure("max", Some(false), Coupled, None, None).unwrap();
         assert_eq!(coupled_level.command_word(), "max");
 
-        // Decoupled, no provenance: a first flag-OFF is the plain level (never
-        // a guessed `ultracode off` that could toggle a live flag)…
-        let cold = EffortRequest::for_configure("high", Some(false), Decoupled, None).unwrap();
+        // Decoupled, no provenance: neither flag direction can be a toggle —
+        // the driver has no same-tier evidence (c-effortui r5 item 1 drops the
+        // cold-start guess). Both post the plain level word; the first proven
+        // selection comes from launch argv or read-back.
+        let cold =
+            EffortRequest::for_configure("high", Some(false), Decoupled, None, None).unwrap();
         assert_eq!(cold.command_word(), "high");
-        // …but a first flag-ON can only be the switch flip at the carried tier.
-        let cold_on = EffortRequest::for_configure("high", Some(true), Decoupled, None).unwrap();
-        assert_eq!(cold_on.command_word(), "ultracode on");
-        assert_eq!(cold_on.name, EffortName::High);
+        let cold_on =
+            EffortRequest::for_configure("high", Some(true), Decoupled, None, None).unwrap();
+        assert_eq!(
+            cold_on.command_word(),
+            "high",
+            "no cold toggle guess — plain level"
+        );
 
         // Decoupled, same tier as the OBSERVED selection: the flag toggle words.
         let obs_high_off = ObservedSelection {
             name: EffortName::High,
             ultracode: Some(false),
         };
-        let on = EffortRequest::for_configure("high", Some(true), Decoupled, Some(obs_high_off))
-            .unwrap();
+        let on =
+            EffortRequest::for_configure("high", Some(true), Decoupled, Some(obs_high_off), None)
+                .unwrap();
         assert_eq!(on.command_word(), "ultracode on");
         assert_eq!(
             on.name,
@@ -1294,8 +1317,9 @@ mod sync_tests {
             name: EffortName::High,
             ultracode: Some(true),
         };
-        let off = EffortRequest::for_configure("high", Some(false), Decoupled, Some(obs_high_on))
-            .unwrap();
+        let off =
+            EffortRequest::for_configure("high", Some(false), Decoupled, Some(obs_high_on), None)
+                .unwrap();
         assert_eq!(off.command_word(), "ultracode off");
         assert_eq!(off.name, EffortName::High);
 
@@ -1306,18 +1330,19 @@ mod sync_tests {
             ultracode: Some(true),
         };
         let drag =
-            EffortRequest::for_configure("max", Some(true), Decoupled, Some(obs_high_on)).unwrap();
+            EffortRequest::for_configure("max", Some(true), Decoupled, Some(obs_high_on), None)
+                .unwrap();
         assert_eq!(drag.command_word(), "max");
         assert_eq!(drag.name, EffortName::Max);
 
         // Unknown gate: only levels are produced.
         assert_eq!(
-            EffortRequest::for_configure("xhigh", Some(false), Unknown, None)
+            EffortRequest::for_configure("xhigh", Some(false), Unknown, None, None)
                 .unwrap()
                 .command_word(),
             "xhigh"
         );
-        assert!(EffortRequest::for_configure("bogus", None, Coupled, None).is_none());
+        assert!(EffortRequest::for_configure("bogus", None, Coupled, None, None).is_none());
     }
 
     /// c-effortui r4 item 2 trigger A: Remuda drags high→max; the USER then
@@ -1334,7 +1359,8 @@ mod sync_tests {
             ultracode: Some(false),
         };
         let req =
-            EffortRequest::for_configure("high", Some(false), Decoupled, Some(observed)).unwrap();
+            EffortRequest::for_configure("high", Some(false), Decoupled, Some(observed), None)
+                .unwrap();
         assert_eq!(req.command_word(), "high");
         assert_eq!(req.name, EffortName::High);
         assert!(!req.ultracode);
@@ -1350,12 +1376,12 @@ mod sync_tests {
     fn r4_trigger_b_unpinned_flag_on_launch_drag_to_max_is_a_level_word() {
         use remuda_protocol::EffortSemantics::Decoupled;
         // Simulate the caller fallback: observed None, requested {high,true}.
-        let requested = ObservedSelection {
+        let requested = EffortSelection {
             name: EffortName::High,
-            ultracode: Some(true),
+            ultracode: true,
         };
-        let req =
-            EffortRequest::for_configure("max", Some(true), Decoupled, Some(requested)).unwrap();
+        let req = EffortRequest::for_configure("max", Some(true), Decoupled, None, Some(requested))
+            .unwrap();
         assert_eq!(req.command_word(), "max");
         assert_eq!(req.name, EffortName::Max);
     }
@@ -1374,8 +1400,8 @@ mod sync_tests {
             name: EffortName::High,
             ultracode: Some(false),
         };
-        let req =
-            EffortRequest::for_configure("max", Some(true), Decoupled, Some(observed)).unwrap();
+        let req = EffortRequest::for_configure("max", Some(true), Decoupled, Some(observed), None)
+            .unwrap();
         assert_eq!(req.command_word(), "max");
         assert_eq!(req.name, EffortName::Max);
     }
@@ -1395,13 +1421,96 @@ mod sync_tests {
             name: EffortName::Max,
             ultracode: Some(false),
         });
-        let observed = bridge.observed().expect("observed recorded");
+        let observed = bridge.proven_selection().expect("observed recorded");
         assert_eq!(observed.name, EffortName::Max);
         // A subsequent {high,false} configure is a tier move vs the observed
         // max even though the launch requested was high.
         let req =
-            EffortRequest::for_configure("high", Some(false), Decoupled, Some(observed)).unwrap();
+            EffortRequest::for_configure("high", Some(false), Decoupled, Some(observed), None)
+                .unwrap();
         assert_eq!(req.command_word(), "high");
+    }
+
+    /// c-effortui r5 item 1: classify_provenance observes read-back first and
+    /// falls back to the launch REQUESTED selection; proven_selection on the
+    /// bridge returns the same. With neither, a flag-on configure is a plain
+    /// level (no cold toggle guess).
+    #[test]
+    fn r5_provenance_observed_first_then_requested_and_no_cold_toggle() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let requested = EffortSelection {
+            name: EffortName::High,
+            ultracode: false,
+        };
+        // Observed wins.
+        let observed = ObservedSelection {
+            name: EffortName::Max,
+            ultracode: Some(true),
+        };
+        let proven =
+            EffortRequest::classify_provenance(Some(observed), Some(requested)).expect("proven");
+        assert_eq!(proven.name, EffortName::Max);
+        assert_eq!(proven.ultracode, Some(true));
+        // Requested fallback.
+        let proven = EffortRequest::classify_provenance(
+            None,
+            Some(EffortSelection {
+                name: EffortName::High,
+                ultracode: true,
+            }),
+        )
+        .expect("requested fallback");
+        assert_eq!(proven.name, EffortName::High);
+        assert_eq!(proven.ultracode, Some(true));
+        // Neither → None.
+        assert!(EffortRequest::classify_provenance(None, None).is_none());
+        // The bridge exposes the same choice.
+        let bridge = EffortBridge::new();
+        bridge.note_launch_request(EffortRequest::from_selection(EffortSelection {
+            name: EffortName::High,
+            ultracode: false,
+        }));
+        assert_eq!(
+            bridge.proven_selection().map(|s| s.name),
+            Some(EffortName::High),
+            "requested is the provenance before read-back"
+        );
+        bridge.note_observed(remuda_protocol::ObservedEffort {
+            name: EffortName::Max,
+            ultracode: Some(false),
+        });
+        assert_eq!(
+            bridge.proven_selection().map(|s| s.name),
+            Some(EffortName::Max),
+            "observed replaces requested"
+        );
+        // A same-tier flag flip with REQUESTED high,false types the toggle.
+        let on = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            Decoupled,
+            None,
+            Some(EffortSelection {
+                name: EffortName::High,
+                ultracode: false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(on.command_word(), "ultracode on");
+        // True cold start (no observed, no requested): plain level, never a
+        // guessed toggle — for BOTH flag directions.
+        assert_eq!(
+            EffortRequest::for_configure("high", Some(true), Decoupled, None, None)
+                .unwrap()
+                .command_word(),
+            "high"
+        );
+        assert_eq!(
+            EffortRequest::for_configure("high", Some(false), Decoupled, None, None)
+                .unwrap()
+                .command_word(),
+            "high"
+        );
     }
 
     #[tokio::test]

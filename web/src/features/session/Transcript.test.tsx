@@ -3775,5 +3775,118 @@ describe("font reflow compensator", () => {
     expect(padTop(), "the measured height was lost on a second window shift").toBe(expectedPadTop());
   });
 
+  it("r7 item 2: a clamped no-op second internal write keeps the own-scroll latch armed", async () => {
+    // Two internal writes land before the ONE coalesced scroll event: the
+    // first moves (and arms reflowOwnScrollRef), the second is clamped at the
+    // scroll max and moves nothing. An assign-style latch
+    // (`latch = moved`) CLEARS it on the no-op, so the first write's event
+    // then retires reflowAnchorRef as if the reader had scrolled. The latch
+    // must arm only and stay armed; the anchor survives its own event.
+    const geo = installGeo(40);
+    const events = buildLongObservations({
+      instanceId: "insLatch" as Id,
+      journalId: "obj_insLatch" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insLatch",
+      // n_32 restored flush with the viewport top: target top 2976, 144px
+      // below the clamp line (40*ROW - VIEW = 3120), far enough that
+      // follow-pin (which arms within 64px of the bottom) does not grab it.
+      JSON.stringify({ anchorId: "obj_long_n_32", offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insLatch"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insLatch");
+    expect(geo.top()).toBe(2976);
+    const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold");
+    expect(hold()).toBe("1");
+    await act(async () => {
+      // ONE font layout resizes two mounted rows above the anchor before any
+      // per-row observer delivers (geometry is preset for both; total drift
+      // 200 pushes well past the 144px clamp margin).
+      geo.presetHeight("obj_long_n_30", ROW + 72);
+      geo.presetHeight("obj_long_n_31", ROW + 128);
+      // First delivery: the anchor drifted 200px in the DOM; the write for the
+      // full drift clamps at the scroll max (3120), moving +144 and queueing
+      // the coalesced event.
+      geo.fireMeasure("obj_long_n_31");
+      // Second delivery in the same synchronous batch (React has not flushed
+      // the first write's state yet): the remaining DOM drift is 56px but the
+      // write clamps to 3120 again — a NO-OP that must not clear the latch
+      // the first write armed.
+      geo.fireMeasure("obj_long_n_30");
+    });
+    // Deliver the queued event. With the old assign-on-write latch the event
+    // finds the latch false and retires the anchor (data-reflow-hold flips to
+    // "0" on the resulting render); arm-only keeps it held.
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(hold(), "the no-op second write disarmed the latch before the first write's own event").toBe("1");
+    expect(geo.top()).toBe(3120);
+  });
+
+  it("r7 item 3: a streamed commit that already held the row is not double-counted by the row's RO delivery", async () => {
+    // A React commit changing nodes/sizes (a streamed event) lands between the
+    // font swap's LAYOUT (rows already resized in the DOM) and the per-row
+    // ResizeObserver deliveries: with the resized row ABOVE the sampled
+    // reading anchor, the commit's generic hold counter-scrolls the drift, and
+    // row A's observer must not add its ledger height delta a SECOND time. The
+    // explicit reflow correction is the anchor's DOM-relative drift, which is
+    // 0 after the generic hold.
+    const geo = installGeo(40);
+    const opts = { instanceId: "insStream" as Id, journalId: "obj_insStream" as Id, hostId: "hst_1" as Id };
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insStream",
+      // n_12 at saved offset 300 -> restore top 756; n_6 sits strictly ABOVE
+      // the viewport then, so a later grow of n_6 drifts the on-screen anchor
+      // and the sizes-commit generic hold compensates it.
+      JSON.stringify({ anchorId: "obj_long_n_12", offset: 300, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    // Stateful driver INSIDE the route (a rerendered MemoryRouter would not
+    // propagate new props): bumping the count simulates a streamed nodes
+    // commit exactly as SessionPage's event subscription would.
+    let bump!: () => void;
+    function Driver() {
+      const [count, setCount] = useState(40);
+      bump = () => setCount((n) => n + 1);
+      return <Transcript events={buildLongObservations({ ...opts, count })} compact={false} />;
+    }
+    render(
+      <MemoryRouter initialEntries={["/s/insStream"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insStream");
+    const before = geo.top();
+    expect(before).toBe(756);
+    // The swap resizes n_6 (strictly above the anchor) in the DOM, then a
+    // streamed nodes commit lands BEFORE n_6's observer delivery: the
+    // commit's generic hold counter-scrolls the 40px drift.
+    geo.presetHeight("obj_long_n_6", ROW + 40);
+    await act(async () => {
+      bump();
+      await Promise.resolve();
+    });
+    expect(geo.top(), "the streamed commit holds the drifted anchor").toBe(before + 40);
+    // n_6's own observer delivers after that commit: the reflow anchor's DOM
+    // drift is now 0 and the ledger height delta must not be added again.
+    await act(async () => {
+      geo.fireMeasure("obj_long_n_6");
+      await geo.nextFrame();
+    });
+    expect(geo.top(), "the row's RO delivery double-counted the drift the streamed commit held").toBe(before + 40);
+  });
 
 });

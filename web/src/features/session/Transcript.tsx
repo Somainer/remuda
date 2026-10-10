@@ -427,9 +427,12 @@ function TranscriptInner({
   /**
    * The row a saved-position restore settled on, kept stable across a later
    * font reflow of rows above it (unlike readingAnchorRef, which scroll events
-   * re-sample to the topmost visible row). Cleared on route change / nav.
+   * re-sample to the topmost visible row). Holds the row id and the viewport
+   * offset it was restored to, so a correction is the row's DOM-relative drift
+   * from that offset — idempotent if a same-commit generic hold already moved
+   * scrollTop by the same amount. Cleared on route change / nav.
    */
-  const reflowAnchorRef = useRef<{ id: string } | null>(null);
+  const reflowAnchorRef = useRef<{ id: string; offset: number } | null>(null);
   /** Set for one sizes commit when the reflow self-correction held the anchor. */
   const reflowCorrectedThisCommitRef = useRef(false);
   /**
@@ -932,19 +935,21 @@ function TranscriptInner({
   // Programmatic write made by the re-anchor machinery (a growth counter-scroll,
   // a font reflow self-correction, or a pending-restore correction). Browsers
   // dispatch NO scroll event when a write leaves scrollTop unchanged (already
-  // at the target, or clamped), so arming reflowOwnScrollRef unconditionally
-  // would leave it latched: the reader's NEXT real scroll would then be
-  // mistaken for this own write and fail to retire reflowAnchorRef. Arm the
-  // latch ONLY when the write actually moved scrollTop (and therefore a
-  // coalesced scroll event really is coming).
+  // at the target, or clamped), so this only ARMS the latches when the write
+  // actually moved scrollTop (a coalesced scroll event is really coming). It
+  // never CLEARS an armed latch either: two internal writes can land before the
+  // one coalesced event (the second clamped at 0/max, or the restore's
+  // estimated-index path recomputing the same top), and clearing here would
+  // make the first write's event cancel the restore / retire the reflow anchor
+  // as though the reader had scrolled. Both latches arm together (see
+  // armOwnScrollEcho): the write must keep the reflow anchor AND be
+  // recognised as an in-flight load-earlier restore's own echo.
   const ownScrollWrite = useCallback(
     (next: number) => {
       const el = scrollerRef.current;
       if (!el) return;
       const before = el.scrollTop;
       el.scrollTop = next;
-      // Arm BOTH own-write latches: this write must keep the reflow anchor AND
-      // be recognised as an in-flight load-earlier restore's own echo.
       armOwnScrollEcho(before);
       scrollTopRef.current = el.scrollTop;
     },
@@ -1047,7 +1052,18 @@ function TranscriptInner({
           // and after it finalizes (the generic anchor holds it).
           const resizedDoc = el.scrollTop + resized.getBoundingClientRect().top - el.getBoundingClientRect().top;
           const anchorDoc = el.scrollTop + anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top;
-          if (resizedDoc < anchorDoc) selfDelta = height - prevHeight;
+          if (resizedDoc < anchorDoc) {
+            // Hold the anchor at its SAVED viewport offset by measuring how
+            // far it has drifted RIGHT NOW, instead of adding the resized row's
+            // ledger height delta. A React commit changing nodes/sizes (a
+            // streamed event) that lands between the font layout and this
+            // ResizeObserver delivery can already have counter-scrolled the
+            // drift via the generic hold: the DOM-relative drift is 0 then, so
+            // the anchor is corrected exactly once whichever path runs first.
+            const drift =
+              anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top - reflow.offset;
+            if (Math.abs(drift) >= 1) selfDelta = drift;
+          }
         }
       }
     }
@@ -1315,7 +1331,7 @@ function TranscriptInner({
         // Pin the reflow anchor to the restored row for the WHOLE restore
         // (including a restoreProbe-held restore that is still pending when a
         // font swap lands), so height changes of rows above it hold this row.
-        reflowAnchorRef.current = { id: pending.anchorId };
+        reflowAnchorRef.current = { id: pending.anchorId, offset: pending.offset };
         const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - pending.offset;
         // Finalize only once the row actually sits at the saved offset. Seed
         // the generic reading anchor with the restored row + offset so that a
@@ -1724,6 +1740,11 @@ function TranscriptInner({
         // switch). Read from the ref at render; the quiet timer bumps loadTick
         // so the "0" is reflected without a later scroll.
         data-prepend-hold={prependAnchorRef.current ? "1" : "0"}
+        // Inert observability for tests: "1" while the reflow anchor armed by a
+        // restore is still holding (it outlives the restore itself and is
+        // retired only by reader input / route change). Read from the ref at
+        // render; every scroll event re-renders the scroller.
+        data-reflow-hold={reflowAnchorRef.current ? "1" : "0"}
         onScroll={(event) => {
           const el = event.currentTarget;
           setScrollTop(el.scrollTop);

@@ -672,7 +672,7 @@ type MaterializedLaunch = {
 - 触发撤回的边界变化（verified→不可证明）只有四类：**cursor 之下的 transcript shrink、文件 identity（dev/inode）变化、head 指纹变化（同路径重写）、任意一次 ENOENT**（哪怕只持续一个 poll；恢复时若 head 一致则从旧 offset 继续、内容不同则锚到新 EOF，但两种恢复都**不会**重新打开 gate）。exec 保留 shell pid、时钟回拨、缺进程启动证据这些情形从会话一开始就是 Unverified（不发撤回边，gate 本来就没开过）。
 - wire 上撤回边**省略** `name` 与 `ultracode`（`skip_serializing_if`：字段不存在，而不是显式 `null`）；Hub/web 解析器以「有效 name 缺失 + `readbackAvailable:false`」识别它。
 - `readbackAvailable` 缺省/`null`/`true` = 回读可用；只有字面 `false` 是撤回。
-- Hub 收到 `false` 时把实例的 `effortEffective` 投影**置空**（不存占位），web 的投影解析器对该边返回 null；UI 回退到 `?`，不再显示撤回前的档/开关。撤回是粘性的：乱序（observedAt 早于当前投影，如后加载的历史）到达的撤回边被忽略；轮询只在 Hub 自己的记录从有投影变为空时撤回，不由「updatedAt 更新但从未投影过」触发；待决 push-down 期间 chip 显示 `?` 而不是待决词。
+- Hub 收到 `false` 时把实例的 `effortEffective` 投影**置空**（不存占位），web 的投影解析器对该边返回 null；UI 回退到 `?`，不再显示撤回前的档/开关。撤回是粘性的：乱序（observedAt 早于当前投影，如后加载的历史）到达的撤回边被忽略；轮询只在 Hub 自己的记录从有投影变为空时撤回，不由「updatedAt 更新但从未投影过」触发；web 单独记录 withdrawn 标记，待决 push-down **仅在收到过显式撤回边**时 chip 显示 `?` 而不是待决词，从未回读过的会话仍显示待决词。
 - 撤回**不结算**任何待决 configure：既不标 Applied 也不拒绝；待决开关由后续 configure 的结果或有界超时收场。driver 同时丢掉自己一侧的 armed generation，防止 displaced transcript 里的迟到 verdict 把它结算成 Applied。
 - 同一进程不会 respawn，撤回是粘性的、整条边只发一次。
 

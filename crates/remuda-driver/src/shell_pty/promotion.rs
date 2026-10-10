@@ -27,9 +27,9 @@ use super::{PROMOTE_POLL, PtyState};
 use crate::claude_print::TranscriptMapper;
 use crate::claude_pty::now_ts;
 use crate::claude_transcript::{
-    ResumeMode, SessionStartReport, TailProvenance, TranscriptBinding, TranscriptCandidate,
-    TranscriptTail, bind_by_pid_file, bind_by_session_id, bind_manual, cwd_matches,
-    list_candidates, recorded_cwd, transcript_belongs_to_cwd,
+    ResumeBoundary, ResumeMode, SessionStartReport, TailProvenance, TranscriptBinding,
+    TranscriptCandidate, TranscriptTail, bind_by_pid_file, bind_by_session_id, bind_manual,
+    cwd_matches, list_candidates, recorded_cwd, transcript_belongs_to_cwd,
 };
 use crate::error::{DriverError, DriverResult};
 use crate::promote::{
@@ -1007,6 +1007,7 @@ pub(super) fn spawn(
                         &binding.session_id,
                         binding.transcript_path.as_deref().map(std::path::Path::new),
                         pre_resume_mode,
+                        found.as_ref().expect("matched foreground"),
                     );
                 }
                 if let Some(path) = binding.transcript_path {
@@ -1628,19 +1629,33 @@ impl SessionModeTable {
         session_id: &str,
         transcript_path: Option<&std::path::Path>,
         pre_resume_mode: Option<ResumeMode>,
+        found: &Detected,
     ) -> StickySessionMode {
         let key = (pid, session_id.to_owned());
         if let Some(entry) = self.modes.get(&key) {
             return *entry;
         }
-        let at_report = transcript_path
-            .map(ResumeMode::rebound_mode)
-            .unwrap_or(ResumeMode::Fresh);
         let first_for_pid = self.first_pid.insert(pid);
         let (mode, rebound) = if first_for_pid {
-            (pre_resume_mode.unwrap_or(at_report), false)
+            // The launched process's own FIRST reported session. A pre-spawn
+            // capture (a Remuda-launched resume) wins. Without one the mode
+            // comes from ARGV PROVENANCE, never from the file's size at this
+            // instant: an instance.create with an initial prompt writes the
+            // transcript before the poller ingests SessionStart, and sizing
+            // it here made every such launch a permanent Unverified.
+            (
+                pre_resume_mode.unwrap_or_else(|| first_session_mode(found, transcript_path)),
+                false,
+            )
         } else {
-            (at_report, true)
+            // A later in-TUI session (/resume, /clear): bounded from THIS
+            // session's transcript as it is at the authenticated report.
+            (
+                transcript_path
+                    .map(ResumeMode::rebound_mode)
+                    .unwrap_or(ResumeMode::Fresh),
+                true,
+            )
         };
         let entry = StickySessionMode { mode, rebound };
         self.modes.insert(key, entry);
@@ -1739,6 +1754,26 @@ fn epoch_mode(
             detected
         }
     }
+}
+
+/// Boundary for a pid's FIRST session that has no pre-spawn capture.
+///
+/// The decision is argv provenance, not the transcript size when the
+/// SessionStart report is ingested (an initial prompt races the 800 ms poll
+/// and may already have written records):
+/// - a non-resume argv (`claude`, `claude --session-id <id>`) is
+///   [`ResumeMode::Fresh`] however many bytes the file already holds;
+/// - a resume argv (`--resume`, `--continue`, `-c`) is a known resume
+///   without a proven boundary: an unverified EOF anchor when the file
+///   exists, bare [`ResumeMode::Unverified`] (retry next tick, never byte 0)
+///   when it is still absent.
+fn first_session_mode(found: &Detected, transcript_path: Option<&Path>) -> ResumeMode {
+    if !found.resume {
+        return ResumeMode::Fresh;
+    }
+    transcript_path
+        .and_then(ResumeBoundary::unverified_eof)
+        .map_or(ResumeMode::Unverified, ResumeMode::Boundary)
 }
 
 /// Epoch resume mode for an agent the terminal did NOT launch (a hand-typed
@@ -1893,9 +1928,22 @@ async fn maintain_binding(
         // r7 item 1: the sticky boundary is keyed by the session ACTUALLY
         // BOUND this tick — not by the argv session id, which stays the launch
         // session after an in-TUI /resume or /clear and is absent altogether
-        // for a hand-typed claude. A session without a recorded SessionStart
-        // (pid-file/argv-only detection) falls back to epoch_mode's detected
-        // provenance.
+        // for a hand-typed claude. A pid-file/argv bind with no hook report
+        // records its first mode here, from ARGV provenance (r7 item 2): a
+        // non-empty transcript at bind time must not make a fresh launch
+        // Unverified.
+        if session_modes
+            .mode_for(found.pid, &binding.session_id)
+            .is_none()
+        {
+            session_modes.record(
+                found.pid,
+                &binding.session_id,
+                Some(&binding.path),
+                pre_resume_mode,
+                found,
+            );
+        }
         let sticky = session_modes.mode_for(found.pid, &binding.session_id);
         let mut bound_found = found.clone();
         bound_found.session_id = Some(binding.session_id.clone());
@@ -3820,16 +3868,20 @@ mod tests {
         let newer = slug_session(dir.path(), &cwd, BUSY_OTHER, "");
         let mut table = SessionModeTable::default();
         let pre = Some(ResumeMode::Unverified);
+        let own_found = detected_claude(7, Some(CORRECT));
         // First report for the pid = the launched session: keeps the
         // pre-spawn mode, rebound=false.
-        let first = table.record(7, CORRECT, None, pre);
+        let first = table.record(7, CORRECT, None, pre, &own_found);
         assert!(!first.rebound);
         assert_eq!(first.mode, ResumeMode::Unverified);
         // Idempotent: a repeat report cannot flip it.
-        assert_eq!(table.record(7, CORRECT, Some(&older), pre), first);
+        assert_eq!(
+            table.record(7, CORRECT, Some(&older), pre, &own_found),
+            first
+        );
         // A later /resume session with an existing transcript: Unverified
         // EOF, rebound=true.
-        let rebound = table.record(7, LATE_STARTER, Some(&older), pre);
+        let rebound = table.record(7, LATE_STARTER, Some(&older), pre, &own_found);
         assert!(rebound.rebound);
         assert!(
             matches!(rebound.mode, ResumeMode::Boundary(b) if !b.verified),
@@ -3837,7 +3889,7 @@ mod tests {
             rebound.mode
         );
         // A later /clear session whose file is EMPTY at the report: Fresh.
-        let clear = table.record(7, BUSY_OTHER, Some(&newer), pre);
+        let clear = table.record(7, BUSY_OTHER, Some(&newer), pre, &own_found);
         assert!(clear.rebound);
         assert_eq!(clear.mode, ResumeMode::Fresh);
         // Lookup.
@@ -3863,8 +3915,15 @@ mod tests {
         // The poller's hook block: first SessionStart is the launched (new,
         // transcript-less) session; the SECOND is the in-TUI /resume target.
         let mut table = SessionModeTable::default();
-        let _launched = table.record(7, BUSY_OTHER, None, None);
-        let rebound = table.record(7, PUMP_SESSION, Some(&fx.binding.path), None);
+        let launched_found = detected_claude(7, Some(BUSY_OTHER));
+        let _launched = table.record(7, BUSY_OTHER, None, None, &launched_found);
+        let rebound = table.record(
+            7,
+            PUMP_SESSION,
+            Some(&fx.binding.path),
+            None,
+            &launched_found,
+        );
         assert!(rebound.rebound, "the bound session is a rebound");
         let bridge = std::sync::Arc::new(crate::effort::EffortBridge::new());
         let mut hydrator = open_hydrator(&fx, rebound.mode, Some(&bridge));
@@ -3905,10 +3964,17 @@ mod tests {
         let mut fx = pump_fixture(dir.path(), "");
         std::fs::remove_file(&fx.binding.path).expect("file does not exist at SessionStart");
         let mut table = SessionModeTable::default();
+        let launched_found = detected_claude(7, Some(BUSY_OTHER));
         // First report is the launched session; the second (same pid, new
         // session id) is /clear, recorded while its file is absent.
-        let _launched = table.record(7, BUSY_OTHER, None, None);
-        let clear = table.record(7, PUMP_SESSION, Some(&fx.binding.path), None);
+        let _launched = table.record(7, BUSY_OTHER, None, None, &launched_found);
+        let clear = table.record(
+            7,
+            PUMP_SESSION,
+            Some(&fx.binding.path),
+            None,
+            &launched_found,
+        );
         assert_eq!(clear.mode, ResumeMode::Fresh);
         // The file then appears WITH content (Claude created it lazily).
         append_line(
@@ -3937,6 +4003,87 @@ mod tests {
                 .is_some(),
             "the new session settles its own switch"
         );
+    }
+
+    /// r7 item 2: argv provenance, not poll-time file size, decides a pid's
+    /// FIRST session. A fresh launch whose transcript already holds the
+    /// initial prompt turn when its first SessionStart is ingested stays
+    /// Fresh: the gate opens and the turn's effort read-back publishes.
+    #[tokio::test]
+    async fn item2_nonempty_first_session_with_a_fresh_argv_stays_fresh() {
+        // instance.create with an initial prompt: the pty queue delivers it
+        // before the first 800 ms tick, so the transcript already carries the
+        // whole first turn (slash + verdict + assistant read-back) at ingest.
+        let first_turn = format!(
+            "{}{}{}",
+            slash_line("max", 1),
+            stdout_verdict("Set effort level to max", 2),
+            assistant_line(Some("max"), 3),
+        );
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &first_turn);
+        let found = detected_claude(7, Some(PUMP_SESSION));
+        let mut table = SessionModeTable::default();
+        let first = table.record(7, PUMP_SESSION, Some(&fx.binding.path), None, &found);
+        assert!(!first.rebound);
+        assert_eq!(first.mode, ResumeMode::Fresh, "a fresh argv is Fresh");
+        let mut launch = LaunchModeBinding::Unbound;
+        let mode = epoch_mode(&mut launch, None, Some(first), &found);
+        assert_eq!(mode, ResumeMode::Fresh);
+        let bridge = std::sync::Arc::new(crate::effort::EffortBridge::new());
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        let mut hydrator = open_hydrator(&fx, mode, Some(&bridge));
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert_eq!(
+            effort_rows(&observations),
+            vec![(Some(remuda_protocol::EffortName::Max), None)],
+            "the pre-tick turn is current: the gate opens and read-back publishes: {observations:?}"
+        );
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_millis(150))
+                .await
+                .is_some(),
+            "the initial prompt's own verdict settles Applied"
+        );
+    }
+
+    /// r7 item 2 unit: resume argv → unverified however the file looks;
+    /// fresh argv → Fresh even with a non-empty file; size never decides.
+    #[test]
+    fn item2_first_session_mode_follows_argv_provenance_not_file_size() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let non_empty = tmp.path().join("started.jsonl");
+        write(&non_empty, "{\"already\":\"here\"}\n");
+        let absent = tmp.path().join("never.jsonl");
+        let resume = Detected {
+            resume: true,
+            ..detected_claude(7, Some(PUMP_SESSION))
+        };
+        let fresh = Detected {
+            resume: false,
+            ..detected_claude(7, Some(PUMP_SESSION))
+        };
+        // Fresh argv: size is irrelevant.
+        assert_eq!(
+            first_session_mode(&fresh, Some(&non_empty)),
+            ResumeMode::Fresh
+        );
+        assert_eq!(first_session_mode(&fresh, Some(&absent)), ResumeMode::Fresh);
+        assert_eq!(first_session_mode(&fresh, None), ResumeMode::Fresh);
+        // Resume argv, file present: an unverified EOF anchor (never Fresh).
+        match first_session_mode(&resume, Some(&non_empty)) {
+            ResumeMode::Boundary(boundary) => assert!(!boundary.verified),
+            other => panic!("expected unverified boundary, got {other:?}"),
+        }
+        // Resume argv, file still absent: bare Unverified so the pump retries
+        // rather than opening a byte-0 live tail when the file appears.
+        assert_eq!(
+            first_session_mode(&resume, Some(&absent)),
+            ResumeMode::Unverified
+        );
+        assert_eq!(first_session_mode(&resume, None), ResumeMode::Unverified);
     }
 
     /// r6 item 5: an unverified anchor captured at the SessionStart instant is

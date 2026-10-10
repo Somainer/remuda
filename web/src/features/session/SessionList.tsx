@@ -804,6 +804,17 @@ export function SessionList({
                         } else {
                           titleParts.push("实际档位尚未从会话回读");
                         }
+                        const suffixUltra = (() => {
+                          // c-effortui r3 item 6: three explicit states for
+                          // the SWITCH axis. A known level with an UNKNOWN flag
+                          // (e.g. resumed before any flag verdict) renders
+                          // `· ?`, never the explicit-off look; only Claude
+                          // has the flag axis.
+                          if (!effective) return "";
+                          if (effective.ultracode === true) return " · ultracode";
+                          if (effective.ultracode === false) return "";
+                          return instance.kind === "claude" ? " · ?" : "";
+                        })();
                         return (
                           <>
                             <span className={css.sep}>·</span>
@@ -824,12 +835,8 @@ export function SessionList({
                               data-effort-mismatch={mismatch ? "1" : "0"}
                               title={titleParts[0]}
                             >
-                              {effectiveName ?? "?"}
-                              {effective?.ultracode === true
-                                ? " · ultracode"
-                                : effectiveName
-                                  ? ""
-                                  : " · ?"}
+                              {effectiveName}
+                              {suffixUltra}
                             </span>
                           </>
                         );

@@ -696,4 +696,18 @@ describe("SessionList effort suffix (c-effortui r2 item 9)", () => {
       expect(node).toHaveAttribute("data-ultracode-effective", "off");
     }
   });
+
+  it("item 6: a known level with an UNKNOWN flag renders `· ?`, not explicit off", () => {
+    // e.g. after resume: the durable projection carries {high, flag null} —
+    // effectiveName is truthy but the switch axis was never observed.
+    for (const id of ["ins_a", "ins_b"]) {
+      effortEffectiveState[id] = { name: "high", ultracode: null, source: "launch", observedAt: "2026-10-06T00:00:00Z" };
+    }
+    renderList();
+    for (const node of screen.getAllByTestId("session-effort")) {
+      expect(node.textContent).toBe("high · ?");
+      expect(node).toHaveAttribute("data-ultracode-effective", "unknown");
+      expect(node.textContent).not.toContain("ultracode");
+    }
+  });
 });

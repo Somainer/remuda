@@ -894,24 +894,47 @@ async fn hello_reconcile_exits_then_replayed_request_never_reopens_the_card() ->
         "a replayed request never re-blocks an ended instance"
     );
 
+    // r9 item 4(b): POSITIVELY prove the watcher is the socket nodes.insert
+    // routes host RPCs to. A GET /v1/interactions fans `interaction.list`
+    // out to every connected owner node, so require THIS watcher to service
+    // one before the answer window. Without that proof a watcher installed on
+    // a socket that got swapped before the window would record nothing at all
+    // and make the "no interaction.answer" assertion below vacuous.
+    let proof_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen_list = reconnect_methods
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == "interaction.list");
+        if seen_list {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < proof_deadline,
+            "the reconnect watcher never serviced interaction.list — it is not the live-routed socket"
+        );
+        // The watcher replies {ok:true}; the merge treats that as no items.
+        let _ = http(addr, "GET", "/v1/interactions", &cookie, None).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     // An answer now gets the existing not-pending rejection and never reaches
-    // the Node. r8 item 5: assert against the RECONNECT socket the Hub routes
-    // to after the second hello — watching the original FakeNode socket here
-    // was vacuous.
+    // the Node. r8 item 5 / r9 item 4(b): against the RECONNECT socket,
+    // proven above to be the one the Hub routes to after the second hello.
     let (status, answer_body) = post_answer(addr, &cookie, &late_id).await?;
     assert_eq!(status, 404, "late answer rejected: {answer_body}");
     tokio::time::sleep(NO_FORWARD_WINDOW).await;
     node.assert_no_answer_forwarded()?;
-    let forwarded_to_reconnect: Vec<String> = reconnect_methods
+    let answers_on_reconnect: usize = reconnect_methods
         .lock()
         .unwrap()
         .iter()
         .filter(|method| method.as_str() == "interaction.answer")
-        .cloned()
-        .collect();
-    assert!(
-        forwarded_to_reconnect.is_empty(),
-        "a 404 late answer must never be forwarded to the reconnected Node: {forwarded_to_reconnect:?}"
+        .count();
+    assert_eq!(
+        answers_on_reconnect, 0,
+        "a 404 late answer must never be forwarded to the reconnected Node"
     );
     reconnect_watch.abort();
 

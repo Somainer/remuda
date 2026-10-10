@@ -156,11 +156,12 @@ impl AppState {
     /// follower converges against the durable (already-invalidated) rows
     /// regardless, so a missed notice is self-healing.
     ///
-    /// r7 item 3: notices are sent in the vector's order, which the store
-    /// produces as ascending `(updated_at, id)` (the rows of one sweep share a
-    /// timestamp and sort by id). The follower's delivery max-cursor and its
-    /// strict-forward lag recovery both rely on that monotonic publication
-    /// order — never reorder or sort these before sending.
+    /// r9 item 3: notices are sent in the vector's order, which the store
+    /// produces as ascending `settlement_events.seq` (AUTOINCREMENT assigned
+    /// inside the settling transaction; one sweep's rows are selected by id).
+    /// The follower's delivery max-seq cursor and its strict-forward lag
+    /// recovery both rely on that monotonic publication order — never reorder
+    /// or sort these before sending.
     /// Acquire the settlement publication-order lock (r8 item 4) for a
     /// settling transaction whose publication happens inline (the journal
     /// append batch), rather than through [`Self::publish_settlement`].
@@ -215,7 +216,7 @@ impl AppState {
                 interaction_id: settled.interaction_id.clone(),
                 state: "invalidated".to_string(),
                 reason: "generation-ended".to_string(),
-                updated_at: settled.updated_at.clone(),
+                seq: settled.seq,
             });
         }
     }
@@ -621,11 +622,12 @@ impl RunningHub {
         crate::gatequeue::reconcile(&self.state).await;
     }
 
-    /// Test helper (c-cardsettle r8 item 3): backdate interactions'
-    /// `updated_at` to a fixed RFC3339 timestamp, so an integration test can
-    /// create settlement history outside the 5-minute connect-replay window
-    /// and prove the follower lag drain seeds at the durable max instead of
-    /// walking the whole history.
+    /// Test helper (c-cardsettle r8 item 3 / r9 item 3): backdate settlement
+    /// history to a fixed RFC3339 timestamp — both the interactions'
+    /// `updated_at` and their `settlement_events.created_at` log entries — so
+    /// an integration test can create settlement history outside the
+    /// 5-minute connect-replay window and prove the follower lag drain seeds
+    /// at the durable max seq instead of walking the whole history.
     #[doc(hidden)]
     pub async fn test_backdate_interactions(
         &self,
@@ -641,6 +643,10 @@ impl RunningHub {
                 for id in &interaction_ids {
                     conn.execute(
                         "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
+                        rusqlite::params![ts, id],
+                    )?;
+                    conn.execute(
+                        "UPDATE settlement_events SET created_at = ?1 WHERE interaction_id = ?2",
                         rusqlite::params![ts, id],
                     )?;
                 }

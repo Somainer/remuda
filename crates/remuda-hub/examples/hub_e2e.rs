@@ -1369,18 +1369,19 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    // c-ghostbadge round 2: a GENUINELY live hook approval
-                    // with a short known deadline. The card is journaled
-                    // durably AND held in the live broker, so badge and
-                    // inbox both show 1/1 while the agent is blocked. The
-                    // spec then ends the instance through a REAL node
-                    // restart (instance.send sentinel `GHOSTNODE_RESTART`):
-                    // the new epoch omits the instance, the Hub's
-                    // reconcile_reported_instances settles it exited, the
-                    // new process serves no interaction.list for it, and
-                    // once the deadline crosses the shared projection drops
-                    // the durable pending row to expired — 0/0 with no
-                    // reload. Nothing here is pre-ended.
+                    // c-ghostbadge round 2 / c-cardsettle r9: a GENUINELY
+                    // live hook approval with a short KNOWN deadline. The
+                    // card is journaled durably AND held in the live broker,
+                    // so badge and inbox both show 1/1 while the agent is
+                    // blocked. The spec then ends the instance through a
+                    // REAL node restart (instance.send sentinel
+                    // `GHOSTNODE_RESTART`): the new epoch omits the instance,
+                    // the Hub's reconcile_reported_instances settles it
+                    // exited AND invalidates the card in the SAME
+                    // transaction regardless of its still-open deadline (r9
+                    // item 1; the Hub has no deadline sweeper), and the
+                    // settlement control frame flips badge/inbox 0/0 in
+                    // place with no reload.
                     if prompt.contains("ghostbadge-live") {
                         let iid = InteractionId::new();
                         // Long enough that the e2e's create -> restart ->

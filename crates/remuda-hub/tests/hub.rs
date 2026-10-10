@@ -27,35 +27,43 @@ async fn offline_host_exits_in_background_and_is_only_listed_in_history() -> Res
         .headers_mut()
         .insert("Authorization", format!("Bearer {enroll}").parse()?);
     let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
-    let instance_id = InstanceId::new();
-    node.send(Message::Text(json!({"jsonrpc":"2.0", "id":"1", "method":"node.hello",
+    node.send(Message::Text(json!({"jsonrpc":"2.0", "id":"0", "method":"node.hello",
         "params":{"hostId":HostId::new().as_id().as_str(), "nodeVersion":"test", "label":"reclaim-test"}
     }).to_string().into())).await?;
     assert!(recv_json(&mut node).await?.get("result").is_some());
-    let event: Value = serde_json::from_str(include_str!("fixtures/journal-event.json"))?;
-    node.send(Message::Text(
-        json!({"jsonrpc":"2.0", "id":"2", "method":"journal.append",
-            "params":{"instanceId":instance_id.as_id().as_str(), "event":event}
-        })
-        .to_string()
-        .into(),
-    ))
-    .await?;
-    assert!(recv_json(&mut node).await?.get("result").is_some());
-    // ma-lineage r6 item 3(c): host-loss sweeps only chapters that reached a
-    // live lifecycle — bring the instance to running before disconnecting.
-    node.send(Message::Text(
-        json!({"jsonrpc":"2.0", "id":"3", "method":"journal.append",
-            "params":{"instanceId":instance_id.as_id().as_str(), "event":{
-                "kind":"lifecycle",
-                "payload":{"type":"entity","entityType":"instance","state":"ready"}
-            }}
-        })
-        .to_string()
-        .into(),
-    ))
-    .await?;
-    assert!(recv_json(&mut node).await?.get("result").is_some());
+    // r8 item 1: two live chapters — the sweep marks both with the NEW
+    // host-contact-lost marker; one is then re-stamped with the LEGACY
+    // host-lost spelling to prove the default list hides BOTH.
+    let mut instance_ids = Vec::new();
+    let seed_event: Value = serde_json::from_str(include_str!("fixtures/journal-event.json"))?;
+    for seq in ["1", "3"] {
+        let instance_id = InstanceId::new();
+        node.send(Message::Text(
+            json!({"jsonrpc":"2.0", "id":seq, "method":"journal.append",
+                "params":{"instanceId":instance_id.as_id().as_str(), "event":seed_event}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        assert!(recv_json(&mut node).await?.get("result").is_some());
+        // ma-lineage r6 item 3(c): host-loss sweeps only chapters that
+        // reached a live lifecycle — bring each instance to ready.
+        let next_seq = if seq == "1" { "2" } else { "4" };
+        node.send(Message::Text(
+            json!({"jsonrpc":"2.0", "id":next_seq, "method":"journal.append",
+                "params":{"instanceId":instance_id.as_id().as_str(), "event":{
+                    "kind":"lifecycle",
+                    "payload":{"type":"entity","entityType":"instance","state":"ready"}
+                }}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        assert!(recv_json(&mut node).await?.get("result").is_some());
+        instance_ids.push(instance_id);
+    }
     let (_, _, body) = http(
         hub.addr,
         "GET",
@@ -69,7 +77,7 @@ async fn offline_host_exits_in_background_and_is_only_listed_in_history() -> Res
             .as_array()
             .unwrap()
             .len(),
-        1
+        2
     );
     node.close(None).await?;
     tokio::time::timeout(TIMEOUT, async {
@@ -94,6 +102,31 @@ async fn offline_host_exits_in_background_and_is_only_listed_in_history() -> Res
         Ok::<_, anyhow::Error>(())
     })
     .await??;
+    // Rewrite one swept row to the LEGACY marker rows written before r7 carry
+    // (a second SQLite connection, exactly like an upgraded on-disk DB).
+    let legacy_id = instance_ids[0].as_id().as_str();
+    let db = rusqlite::Connection::open(dir.path().join("data").join("hub.sqlite"))?;
+    db.execute(
+        "UPDATE instances SET last_error = 'host-lost' WHERE id = ?1",
+        [legacy_id],
+    )?;
+    drop(db);
+    // Default list still hides BOTH spellings.
+    let (_, _, body) = http(
+        hub.addr,
+        "GET",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert!(
+        serde_json::from_str::<Value>(&body)?["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a legacy host-lost row must not reappear in the default list: {body}"
+    );
     let (_, _, body) = http(
         hub.addr,
         "GET",
@@ -103,12 +136,26 @@ async fn offline_host_exits_in_background_and_is_only_listed_in_history() -> Res
     )
     .await?;
     let history: Value = serde_json::from_str(&body)?;
-    assert_eq!(history["items"][0]["lifecycle"], "exited");
-    assert_eq!(history["items"][0]["lastError"], "host-contact-lost");
+    let items = history["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "history keeps both swept rows: {history}");
+    let marker_of = |id: &str| {
+        items
+            .iter()
+            .find(|item| item["instanceId"] == id)
+            .and_then(|item| item["lastError"].as_str())
+    };
+    assert_eq!(marker_of(legacy_id), Some("host-lost"));
+    assert_eq!(
+        marker_of(instance_ids[1].as_id().as_str()),
+        Some("host-contact-lost")
+    );
+    for item in items {
+        assert_eq!(item["lifecycle"], "exited");
+    }
     let (status, _, _) = http(
         hub.addr,
         "GET",
-        &format!("/v1/instances/{}", instance_id.as_id()),
+        &format!("/v1/instances/{}", legacy_id),
         &[("Cookie", &cookie)],
         None,
     )

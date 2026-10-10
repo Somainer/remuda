@@ -3567,8 +3567,11 @@ describe("font reflow compensator", () => {
     // guard and the current code — it asserts the end-to-end sequence (do not
     // finalize while >2px off; finish AT the offset) but is not a red-on-prefix
     // proof. The guard is defense-in-depth for a clamped/interleaved
-    // correction, which this ROW-based harness cannot physically drive (the
-    // clamp and the rect ledger use different coordinate systems).
+    // correction; that specific sequence is not driven here (clamped reflow
+    // writes themselves ARE reachable — see the r7-item-2 clamp test and
+    // installGeo.setTotal — but not the combination of a held, clamped,
+    // off-saved-offset reflow that only becomes reachable after the range
+    // grows).
     const geo = installGeo(40);
     let fontReady = false;
     const fakeFonts = {
@@ -3635,8 +3638,10 @@ describe("font reflow compensator", () => {
       active() === "1" || Math.abs(anchorOffset() - SAVED_OFFSET) <= 2,
       "the reflow correction finalized the restore at an unfinished offset",
     ).toBe(true);
-    // It then runs the pending offset correction and finalizes AT the saved
-    // offset — not 30px short of it (the pre-e6dc324d behaviour).
+    // It then runs the pending offset correction and finalizes at the saved
+    // offset. Under the old ledger-delta compensator the same sequence could
+    // finalize ~30px short; at the tip (89623ff4 DOM-relative compensator)
+    // both branches land at SAVED_OFFSET — see the coverage note above.
     for (let i = 0; i < 30; i += 1) await tick();
     expect(active(), "the restore finalizes once the saved offset is reached").toBe("0");
     expect(
@@ -3763,15 +3768,19 @@ describe("font reflow compensator", () => {
     //
     // It does NOT drive the exact stale-mirror interleaving described in
     // 5ad38bd7 (a passive state->ref mirror running with a stale closure
-    // between a synchronous ledger write and its queued render). That window
-    // is not reachable in this ROW-based jsdom harness: the layout-effect
-    // setState's sync re-render commits inside the same commit, and React
-    // drains the pending passive effect before the next discrete event, so a
-    // stale closure never observes a newer ledger write. Both an
-    // installGeo by-id mount-height preset and a scheduler/unstable_mock
-    // remount (under which the saved-position restore cannot settle) were
-    // tried without reproducing the rollback; the guarded behaviour stays
-    // deleted rather than re-proven red.
+    // between a synchronous ledger write and its queued render). The window is
+    // real in React 19 — the layout-effect setState schedules a SEPARATE
+    // commit, and React flushes the prior commit's pending passive effects
+    // before rendering it (exactly what 5ad38bd7 / Transcript.tsx guards
+    // against) — but it could not be constructed in THIS harness: fresh rows
+    // report ROW (identical to the estimate), so the sync re-render following
+    // a window-shift ledger write mounts no further rows, and the
+    // window-shift commit's own render changed no rowHeights, leaving no
+    // mirror pending. Attempts: (a) an installGeo by-id mount-height preset
+    // over scroll-up window shifts; (b) a scheduler/unstable_mock remount
+    // (under which the saved-position restore cannot settle). Neither
+    // reproduced the rollback; the guarded behaviour stays deleted rather
+    // than re-proven red.
     const geo = installGeo(40);
     renderRestored("insLedger", 5);
     await settle(geo, "insLedger");
@@ -3844,21 +3853,23 @@ describe("font reflow compensator", () => {
     await act(async () => {
       // ONE font layout resizes two mounted rows above the anchor before any
       // per-row observer delivers (geometry is preset for both; total drift
-      // 248 pushes well past the 144px clamp margin). n_31 alone grows by
-      // 200 — already more than the 144px margin — so the FIRST delivery
-      // clamps under BOTH compensator forms (the old ledger-delta form adds
-      // height - prevHeight = +200; the DOM-relative form computes the same
-      // full drift here).
+      // 248 pushes well past the 144px clamp margin). n_31 alone contributes a
+      // +200 ledger delta — already more than the 144px margin — so the FIRST
+      // delivery clamps under BOTH compensator forms (the old ledger-delta
+      // form would add height - prevHeight = +200; the DOM-relative form
+      // measures the full 248 drift, since both preset rows are already grown
+      // in the DOM).
       geo.presetHeight("obj_long_n_30", ROW + 48);
       geo.presetHeight("obj_long_n_31", ROW + 200);
       // First delivery: the anchor drifted 248px in the DOM but the write
-      // clamps at the scroll max (3120), moving exactly +144 and queueing
-      // the coalesced event.
+      // clamps at the scroll max (3120), moving only +144 and queueing the
+      // coalesced event.
       geo.fireMeasure("obj_long_n_31");
       // Second delivery in the same synchronous batch (React has not flushed
-      // the first write's state yet): the remaining DOM drift is 48px but the
-      // write clamps to 3120 again — a true NO-OP in either compensator form,
-      // which must not clear the latch the first write armed.
+      // the first write's state yet): the anchor is still 248-144 = 104px off
+      // (48 of that is n_30's ledger delta under the old form), but the write
+      // clamps to 3120 again — a true NO-OP in either compensator form, which
+      // must not clear the latch the first write armed.
       geo.fireMeasure("obj_long_n_30");
     });
     // Deliver the queued event. With the old assign-on-write latch the event
@@ -3917,10 +3928,12 @@ describe("font reflow compensator", () => {
       await Promise.resolve();
     });
     expect(geo.top(), "the streamed commit holds the drifted anchor").toBe(before + 40);
-    // The reflow anchor must still be armed at this point: if an earlier
-    // gesture/navigation had retired it, neither the streamed hold nor the
-    // row's own correction would engage and this expectation would pass for
-    // the wrong reason (nothing compensated at all).
+    // The reflow anchor must still be armed at this point. Note the commit-level
+    // generic hold is NOT gated on reflowAnchorRef, so it would still move the
+    // +40 here with the anchor retired; the real risk is that n_6's later RO
+    // delivery would then go through holdReadingAnchor instead of the reflow
+    // compensator, and the double-count branch the test targets would never
+    // run — the +40 expectation would pass without exercising the reflow path.
     expect(
       screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold"),
       "the reflow anchor retired before the row's RO delivery",

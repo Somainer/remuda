@@ -530,12 +530,17 @@ impl RunningHub {
 
     /// Test helper: run the node.hello unregister reconciliation (c-dirpicker
     /// r7 item 1) — aborts every still-unsettled workspace.unregister command
-    /// on `host_id`.
+    /// on `host_id` created before the current instant (r9 item 2: commands a
+    /// live new-link DELETE just created are excluded).
     #[doc(hidden)]
     pub async fn test_reconcile_unsettled_unregisters(&self, host_id: &str) {
-        crate::workspaces::abort_unsettled_unregisters_on_reconnect(&self.state, host_id)
-            .await
-            .expect("reconcile unsettled unregisters");
+        crate::workspaces::abort_unsettled_unregisters_on_reconnect(
+            &self.state,
+            host_id,
+            &crate::config::now_rfc3339(),
+        )
+        .await
+        .expect("reconcile unsettled unregisters");
     }
 
     /// Test helper (round 6 item 3): arm a one-shot park point in the REAL

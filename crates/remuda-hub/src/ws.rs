@@ -348,7 +348,11 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                             // before this reply) and after the reply is queued;
                             // inline it would find no link / deadlock the read
                             // loop on its own reply.
-                            crate::workspaces::spawn_unregister_abort_sweep(&state, h);
+                            crate::workspaces::spawn_unregister_abort_sweep(
+                                &state,
+                                h,
+                                now_rfc3339(),
+                            );
                         }
                     }
                     Ok(None) => {}

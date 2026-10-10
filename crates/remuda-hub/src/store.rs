@@ -4450,11 +4450,20 @@ impl Store {
     /// never reached `settled` (prepare landed but commit did not, or the
     /// frame was queued when a link died). The hello reconnect path aborts
     /// them so the Node's durable unbinding mark is released.
+    ///
+    /// r9 item 2: only rows created strictly before `created_before` (the new
+    /// link's hello instant). A DELETE accepted on the NEW link is created at
+    /// or after that instant; aborting it would kill an in-flight removal the
+    /// operator just issued. Timestamps are fixed-width millisecond UTC
+    /// RFC3339 (see [`crate::config::now_rfc3339`]), so the lexical SQL
+    /// comparison is chronological.
     pub async fn list_unsettled_workspace_unregisters(
         &self,
         host_id: &str,
+        created_before: &str,
     ) -> Result<Vec<CommandRecord>, StoreError> {
         let host = host_id.to_owned();
+        let cutoff = created_before.to_owned();
         self.run_named("list_unsettled_workspace_unregisters", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
@@ -4465,10 +4474,11 @@ impl Store {
                  WHERE host_id = ?1
                    AND operation = 'workspace.unregister'
                    AND state IN ('queued', 'accepted')
+                   AND created_at < ?2
                  ORDER BY created_at ASC, id ASC",
             )?;
             let rows = stmt
-                .query_map(params![host], command_from_row)?
+                .query_map(params![host, cutoff], command_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })

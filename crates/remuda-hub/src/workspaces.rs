@@ -796,10 +796,17 @@ async fn abort_unregister(
 /// behind the hello reply on the bounded FIFO, and commands whose abort is not
 /// delivered stay `queued`/`accepted` and are retried by the sweep on the
 /// NEXT hello.
-pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String) {
+///
+/// r9 item 2: `connected_at` is the reconnect instant (captured by the
+/// carrier just after the hello). A DELETE accepted on the NEW link has a
+/// command row created at/after that instant and must not be aborted — its
+/// prepare/commit are in flight on the very link the sweep is using.
+pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String, connected_at: String) {
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(error) = abort_unsettled_unregisters_on_reconnect(&state, &host_id).await {
+        if let Err(error) =
+            abort_unsettled_unregisters_on_reconnect(&state, &host_id, &connected_at).await
+        {
             tracing::warn!(%host_id, %error, "post-hello unregister abort sweep failed");
         }
     });
@@ -807,16 +814,20 @@ pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String) {
 
 /// Reconcile unregister commands left unsettled across a Node (re)connect
 /// (r7 item 1): for every `workspace.unregister` command on this host still
-/// `queued` or `accepted`, send the idempotent abort so the Node drops a
-/// durable unbinding mark a dead previous connection prepared. Called from
-/// the authenticated `node.hello` path.
+/// `queued` or `accepted` that was queued BEFORE this link's hello
+/// (`connected_at`), send the idempotent abort so the Node drops a durable
+/// unbinding mark a dead previous connection prepared. Commands created at
+/// or after `connected_at` belong to in-flight DELETEs on the new link and
+/// are left strictly alone (r9 item 2). Called from the authenticated
+/// `node.hello` path of both carriers.
 pub async fn abort_unsettled_unregisters_on_reconnect(
     state: &AppState,
     host_id: &str,
+    connected_at: &str,
 ) -> Result<(), HubError> {
     let pending = state
         .store
-        .list_unsettled_workspace_unregisters(host_id)
+        .list_unsettled_workspace_unregisters(host_id, connected_at)
         .await?;
     for command in pending {
         let node_path = command
@@ -1248,5 +1259,152 @@ mod tests {
             count_workspace_users(&fresh, "hst_a", "wsp_x").unwrap(),
             (0, 0)
         );
+    }
+
+    /// Records every RPC the sweep forwards; answers unregister aborts as the
+    /// Node would once it released the mark (phase "aborted", membership
+    /// intact).
+    #[derive(Default)]
+    struct RecordingAbortNode {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::transport::NodeTransport for RecordingAbortNode {
+        fn kind(&self) -> crate::transport::TransportKind {
+            crate::transport::TransportKind::SshStdio
+        }
+
+        fn call(
+            &self,
+            method: &str,
+            params: Value,
+            _timeout: std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<Value>, HubError>> + Send + '_>,
+        > {
+            let command_id = params
+                .get("commandId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_owned(), command_id));
+            Box::pin(async move { Ok(Some(json!({"phase": "aborted"}))) })
+        }
+
+        fn notify(
+            &self,
+            _method: &str,
+            _params: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, HubError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    /// r9 item 2: the post-reconnect sweep must abort only DELETEs a dead
+    /// previous link left behind. A command created on the NEW link — a DELETE
+    /// whose prepare/commit are in flight while the post-hello sweep runs —
+    /// must never be aborted.
+    #[tokio::test]
+    async fn reconnect_sweep_skips_unregisters_created_on_the_new_link() {
+        use crate::HubConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hub = crate::spawn(HubConfig::for_test(dir.path().join("data")))
+            .await
+            .unwrap();
+        let state = hub.state.clone();
+        let store = state.store.clone();
+        let host = crate::config::new_id("hst").unwrap();
+        hub.test_insert_host(&host).await.unwrap();
+
+        let (old, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/old", "workspaceId": "wsp_old"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let (new, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/new", "workspaceId": "wsp_new"}),
+                None,
+            )
+            .await
+            .unwrap();
+        // The old command belongs to the dead previous link (created before
+        // the hello); the NEW one is post-dated to model a DELETE accepted on
+        // the new link while the post-hello sweep is running.
+        let new_id = new.command_id.clone();
+        store
+            .run_named("test_postdate_new_command", move |conn| {
+                conn.execute(
+                    "UPDATE commands SET created_at = '2099-01-01T00:00:00.000Z' WHERE id = ?1",
+                    params![new_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let node = Arc::new(RecordingAbortNode::default());
+        hub.test_set_node_transport(&host, node.clone()).await;
+
+        abort_unsettled_unregisters_on_reconnect(&state, &host, &crate::config::now_rfc3339())
+            .await
+            .unwrap();
+
+        // Exactly one abort, for the OLD command: the in-flight new-link
+        // DELETE is untouched.
+        let calls = node.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, "workspace.unregister");
+        assert_eq!(calls[0].1, old.command_id);
+        assert_ne!(calls[0].1, new.command_id);
+
+        let old_row = store
+            .get_command(old.command_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_row.state, "settled");
+        assert_eq!(old_row.settlement_outcome.as_deref(), Some("rejected"));
+        let new_row = store
+            .get_command(new.command_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            new_row.state, "queued",
+            "a DELETE accepted on the new link must not be aborted by the sweep"
+        );
+
+        // The cutoff is strict: a cutoff before both rows selects nothing.
+        let before_both = store
+            .list_unsettled_workspace_unregisters(&host, "2000-01-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        assert!(before_both.is_empty(), "{before_both:?}");
+        // A cutoff after both timestamps still returns only the new row: the
+        // old one is settled now and filtered by state.
+        let later = store
+            .list_unsettled_workspace_unregisters(&host, "2100-01-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        assert_eq!(later.len(), 1, "{later:?}");
+        assert_eq!(later[0].command_id, new.command_id);
+
+        hub.shutdown().await;
     }
 }

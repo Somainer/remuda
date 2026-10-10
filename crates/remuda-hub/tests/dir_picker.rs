@@ -1874,7 +1874,11 @@ async fn reconnect_after_dropped_prepare_aborts_on_the_new_socket_and_unblocks_t
     first.await??;
 
     let store = hub.store().expect("store");
-    let pending = store.list_unsettled_workspace_unregisters(&host).await?;
+    // Model the reconnect cutoff (r9 item 2): any instant after the stuck
+    // command was created and before the new link's hello.
+    let pending = store
+        .list_unsettled_workspace_unregisters(&host, "2099-01-01T00:00:00.000Z")
+        .await?;
     assert_eq!(pending.len(), 1, "{pending:?}");
     let stuck_command = pending[0].command_id.clone();
 

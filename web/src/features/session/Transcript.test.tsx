@@ -1767,4 +1767,49 @@ describe("font reflow compensator", () => {
     });
     expect(geo.top(), "the committed delta is applied once").toBe(before + 40);
   });
+  it("item 3: a measured height above the window survives fresh rows mounting on a window shift", async () => {
+    // The height ledger is the single source of truth: when a window shift
+    // mounts brand-new rows (their mount layout effect reports a size built on
+    // the ledger) it must never roll a previously committed height back to an
+    // older snapshot. A passive state->ref mirror could run stale between a
+    // synchronous ledger write and its queued render and drop the earlier row;
+    // the measured n_2 (above the shifted window) must keep contributing its
+    // +40 to padTop.
+    const geo = installGeo(40);
+    renderRestored("insLedger", 5);
+    await settle(geo, "insLedger");
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    const padTop = () => {
+      const list = geo.scroller().firstElementChild;
+      const spacer = Array.from(list?.children ?? []).find((c) => c.getAttribute("aria-hidden") === "true") as
+        | HTMLElement
+        | undefined;
+      return Number.parseFloat(spacer?.style.height ?? "0") || 0;
+    };
+    // Expected padTop: `start` rows above the window at ROW each, plus n_2's
+    // +40 (its index 1 is above any start >= 2), derived from the first mounted
+    // row so it holds at any scroll position.
+    const expectedPadTop = () => {
+      const first = geo.scroller().querySelector<HTMLElement>("[data-anchor]");
+      const k = Number(/obj_long_n_(\d+)/.exec(first?.dataset.anchor ?? "")?.[1] ?? 0);
+      const start = k - 1;
+      return start * ROW + (start >= 2 ? 40 : 0);
+    };
+    // Shift the window so n_2 is above it while fresh tail rows mount.
+    act(() => geo.readerScroll(1300));
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(padTop(), "the measured above-window row's height was dropped from the ledger").toBe(expectedPadTop());
+    // Further shifts that mount more fresh rows must still retain it.
+    act(() => geo.readerScroll(1600));
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(padTop(), "the measured height was lost on a second window shift").toBe(expectedPadTop());
+  });
+
+
 });

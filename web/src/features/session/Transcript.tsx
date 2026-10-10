@@ -249,11 +249,14 @@ function TranscriptInner({
   // Row heights keyed by STABLE NODE ID, never array index (see the `sizes`
   // memo below); reset per session in the route-reset block.
   const [rowHeights, setRowHeights] = useState<Map<string, number>>(new Map());
-  // Mirror of rowHeights for the before-paint setRowSize height-delta hold.
+  // Synchronous ledger of the last COMMITTED per-row heights, read before paint
+  // by setRowSize. It is the single source of truth and is written together
+  // with the state above on every measurement (setRowSize) and cleared together
+  // on route reset — there is deliberately NO passive effect mirroring state
+  // back into this ref: such a mirror can run with a STALE state between a
+  // synchronous ledger write and its queued render and roll a fresh height back
+  // to the previous commit (losing the measurement forever).
   const rowHeightsRef = useRef(rowHeights);
-  useEffect(() => {
-    rowHeightsRef.current = rowHeights;
-  }, [rowHeights]);
 
   // The route keeps this component mounted while the reader moves directly
   // between sessions (tab switch). Per-instance refs must therefore reset on
@@ -561,11 +564,11 @@ function TranscriptInner({
     const el = scrollerRef.current;
     // Compare against the last COMMITTED height (the synchronous ledger in
     // rowHeightsRef), not a stale value: the same row can be measured twice in
-    // one commit (initial layout effect + ResizeObserver) before the passive
-    // effect that mirrors state back into the ref has run, and comparing
-    // against the pre-commit height twice would scroll the reader by the same
-    // delta on every measurement tick. Sub-pixel jitter (<1px) is ignored
-    // entirely — it is not a real layout change and must not scroll.
+    // one commit (initial layout effect + ResizeObserver) before React renders
+    // the queued state, and comparing against the pre-commit height twice would
+    // scroll the reader by the same delta on every measurement tick. Sub-pixel
+    // jitter (<1px) is ignored entirely — it is not a real layout change and
+    // must not scroll.
     const prevHeight = rowHeightsRef.current.get(id);
     const heightChanged = prevHeight === undefined || Math.abs(height - prevHeight) >= 1;
     let selfDelta = 0;
@@ -627,8 +630,8 @@ function TranscriptInner({
       // scrolls (clearing reflowAnchorRef) the generic hold owns position again.
       holdReadingAnchor();
     }
-    // Commit the height once. Update the ref synchronously (the state mirror
-    // effect only runs after commit) so same-commit re-measurements compare
+    // Commit the height once. The ref is the synchronous ledger and is updated
+    // in the same breath as the state, so same-commit re-measurements compare
     // against THIS value. Sub-pixel reports neither scroll nor commit.
     if (heightChanged) {
       const next = new Map(rowHeightsRef.current);

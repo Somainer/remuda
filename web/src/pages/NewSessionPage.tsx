@@ -387,7 +387,19 @@ export function NewSessionPage() {
       : effortAt(activeKind as EffortKind, defaultEffortIndex(activeKind));
   // What the form shows/sends: a pinned draft, else the model default
   // (unpinned — no effort fields on create).
-  const sessionEffort = mappedEffort;
+  // D-056 §2 fail-closed (c-effortui r3 item 10): a remembered pref
+  // ("ultracode") or a pinned {xhigh,on} draft on a host whose Claude is
+  // older than 2.1.203, or whose version is UNREPORTED, must never launch
+  // with the flag — the preview, the create payload and the remembered
+  // success all carry ultracode:false even though the stored pref still says
+  // on. The switch renders off and disabled (with the named gate reason).
+  const launchUltraClosed =
+    (activeKind as string) === "claude" &&
+    (launchGate === "legacy" || launchGate === "unknown");
+  const sessionEffort: EffortSelection =
+    launchUltraClosed && mappedEffort.ultracode === true
+      ? { ...mappedEffort, ultracode: false }
+      : mappedEffort;
   const effortPinned = effort !== null;
   // Switching harness is an explicit interaction: the kind button carries the
   // displayed tier onto the new table by ratio (pins the draft for the new

@@ -3335,23 +3335,27 @@ impl Store {
     /// tombstones chapters that actually existed on a Node).
     pub async fn purge_requested_instance(&self, instance_id: String) -> Result<(), StoreError> {
         self.run_named("purge_requested_instance", move |conn| {
-            conn.execute(
+            // All seven cascade statements are one IMMEDIATE transaction: a
+            // SQLite I/O error or crash mid-purge must not leave half the
+            // chapter behind (an orphaned row/slot/lineage seat).
+            let tx = immediate_tx(conn)?;
+            tx.execute(
                 "DELETE FROM journal WHERE instance_id = ?1",
                 params![&instance_id],
             )?;
-            conn.execute(
+            tx.execute(
                 "DELETE FROM commands WHERE instance_id = ?1",
                 params![&instance_id],
             )?;
-            conn.execute(
+            tx.execute(
                 "DELETE FROM interactions WHERE instance_id = ?1",
                 params![&instance_id],
             )?;
-            conn.execute(
+            tx.execute(
                 "DELETE FROM fleet_members WHERE instance_id = ?1",
                 params![&instance_id],
             )?;
-            conn.execute(
+            tx.execute(
                 "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
                  WHERE holder_instance_id = ?1",
                 params![&instance_id, now_rfc3339()],
@@ -3363,12 +3367,13 @@ impl Store {
             // lineage pointing at a purged chapter (and keep its seat
             // counted). The instance row still exists at this point; the
             // lineage id is read from it.
-            conn.execute(
+            tx.execute(
                 "DELETE FROM lineages
                   WHERE lineage_id = (SELECT lineage_id FROM instances WHERE id = ?1)",
                 params![&instance_id],
             )?;
-            conn.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
+            tx.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
+            tx.commit()?;
             Ok(())
         })
         .await

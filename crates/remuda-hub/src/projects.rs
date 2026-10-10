@@ -727,13 +727,18 @@ impl Store {
         #[cfg(any(test, feature = "test-faults"))]
         let armed_fence = self.take_test_project_patch_fence();
         self.run_named("patch_project_with_route", move |conn| {
+            // The doc UPDATE and the route-override upsert/delete are ONE
+            // IMMEDIATE transaction: an I/O error or crash between them must
+            // not leave a project doc without its override (or an override
+            // for a doc that never updated).
+            let tx = crate::store::immediate_tx(conn)?;
             #[cfg(any(test, feature = "test-faults"))]
             if let Some(fenced_instance) = armed_fence {
-                crate::store::test_apply_fence(conn, &fenced_instance)?;
+                crate::store::test_apply_fence(&tx, &fenced_instance)?;
             }
             let (initiator, device_id) = authority.as_check();
-            crate::store::check_initiator(conn, initiator, device_id)?;
-            let Some(mut project) = load_project(conn, &project_id)? else {
+            crate::store::check_initiator(&tx, initiator, device_id)?;
+            let Some(mut project) = load_project(&tx, &project_id)? else {
                 return Ok(None);
             };
             mutate(&mut project)?;
@@ -743,7 +748,7 @@ impl Store {
                 remuda_protocol::Timestamp::try_from(now.clone())
                     .map_err(|err| StoreError::Id(format!("bad timestamp: {err}")))?;
             let doc = serde_json::to_string(&project)?;
-            conn.execute(
+            tx.execute(
                 "UPDATE projects SET doc_json = ?1, name = ?2, revision = revision + 1, updated_at = ?3
                  WHERE id = ?4",
                 params![doc, project.name, now, project_id],
@@ -751,7 +756,7 @@ impl Store {
             if let Some(route) = route {
                 match route {
                     Some(doc) => {
-                        conn.execute(
+                        tx.execute(
                             "INSERT INTO project_route_overrides (project_id, doc_json)
                              VALUES (?1, ?2)
                              ON CONFLICT(project_id) DO UPDATE SET doc_json = excluded.doc_json",
@@ -759,14 +764,16 @@ impl Store {
                         )?;
                     }
                     None => {
-                        conn.execute(
+                        tx.execute(
                             "DELETE FROM project_route_overrides WHERE project_id = ?1",
                             params![project_id],
                         )?;
                     }
                 }
             }
-            load_project(conn, &project_id)
+            let updated = load_project(&tx, &project_id)?;
+            tx.commit()?;
+            Ok(updated)
         })
         .await
     }

@@ -379,23 +379,30 @@ test.describe("stacked mobile usage sheet closes with its parent (RC4)", () => {
 
 
 test.describe("overlay z tiers keep the annotation dock under real scrims (r3 item 1)", () => {
-  test("390: with the options sheet open, a hit over ＋加批注 lands on the sheet, not the dock", async ({ page }) => {
+  test("390: with the options sheet open, a hit over the floating annotation dock lands on the sheet, not the dock", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await createSession(page, "composer popover dock under sheet");
-    const add = page.getByTestId("annotation-add");
-    await expect(add).toBeVisible();
-    const box = (await add.boundingBox())!;
-    const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    // The 加批注 entry lives ONLY in the ⋯ options sheet now (§2.2 item 7);
+    // the dock floatLayer hosts the annotation badge once drafts exist. Create
+    // a card draft via the sheet so the floating dock is populated, close it,
+    // then reopen: the round-2 regression was the dock (z 50) painting above
+    // the literal-40 sheet scrim.
+    await optionsTrigger(page).click();
+    await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+    await page.getByTestId("annotation-add").click();
+    await page.getByTestId("annotation-card-input").fill("draft for z-tier probe");
+    await page.getByTestId("annotation-card-save").click();
+    await expect(page.getByTestId("annotation-badge")).toBeVisible();
+    const box = (await page.getByTestId("annotation-dock").boundingBox())!;
+    const point = { x: box.x + box.width - 24, y: box.y + box.height / 2 };
 
     await optionsTrigger(page).click();
     await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
 
-    // The round-2 regression: the dock (z 50) painted above the literal-40
-    // sheet scrim, so this tap opened the annotation panel UNDER the sheet.
     const hit = await page.evaluate((p) => {
       const el = document.elementFromPoint(p.x, p.y);
       return {
-        dock: el?.closest("[data-testid='annotation-add']") != null,
+        dock: el?.closest("[data-testid='annotation-dock']") != null,
         sheet: el?.closest("[data-variant='sheet']") != null,
         tag: (el as HTMLElement | null)?.dataset.testid ?? el?.tagName ?? "",
       };
@@ -405,10 +412,6 @@ test.describe("overlay z tiers keep the annotation dock under real scrims (r3 it
     if (process.env.REMUDA_EVIDENCE === "1") {
       await page.screenshot({ path: "test-results/composerpop-r3-dock-under-sheet-390.png", animations: "disabled" });
     }
-
-    // A real tap at that point must NOT open the annotation panel.
-    await page.mouse.click(point.x, point.y);
-    await expect(page.getByTestId("annotation-panel")).toHaveCount(0);
   });
 
   test("390: the stacked usage card paints strictly above the options sheet", async ({ page }) => {

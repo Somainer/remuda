@@ -25,6 +25,18 @@
   right: 18px;
   bottom: calc(100% + 6px);
   display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  pointer-events: auto;
+}
+
+.readonlyTag {
+  font-size: var(--text-aux);
+  color: var(--mute);
+}
+
 /* The dock's 批注行 (ui-spec §2.2 item 5): a quiet 24px row in the dock's own
    flow, only while drafts exist. The entry point is the ⋯ menu's 加批注. */
 .badgeRow {

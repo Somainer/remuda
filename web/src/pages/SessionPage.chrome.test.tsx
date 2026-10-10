@@ -94,6 +94,11 @@ it("desktop ⋯ lists the §2.2 items in order and never the switch, 文件 or S
   expect(within(menu).queryByTestId("view-switch")).toBeNull();
   expect(within(menu).queryByRole("button", { name: "Stop" })).toBeNull();
 
+  // §2.2 item 7: annotation-add has exactly ONE node on the page — the ⋯ item;
+  // the floating annotation-dock must not render a second add/readonly entry
+  // (Playwright strict-mode would fail the e2e otherwise).
+  expect(screen.getAllByTestId("annotation-add")).toHaveLength(1);
+
   fireEvent.keyDown(menu, { key: "Escape" });
   expect(screen.queryByTestId("session-more-popover")).toBeNull();
   expect(screen.getByTestId("session-more-open")).toHaveFocus();

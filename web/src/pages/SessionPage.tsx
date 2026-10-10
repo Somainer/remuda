@@ -819,24 +819,12 @@ function SessionPageBody({
       ) : <div ref={setDockEl} className={session.dock} data-testid="session-dock">
         {/* Zero-flow floating chip row anchored at the dock top (c-composerpop
             r2/r3): rests just above the composer over the transcript edge and
-            never shrinks the session body's measured viewport share. */}
+            never shrinks the session body's measured viewport share. It carries
+            ONLY the annotation badge; per §2.2 item 7 the 加批注 entry point and
+            the read-only tag live in the ⋯ menu (a single testid each). */}
         <div className={annCss.floatLayer}>
           <div data-testid="annotation-dock" className={annCss.annotationBar}>
             <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
-            {annotationAllowed ? (
-              <button
-                type="button"
-                className={annCss.badge}
-                data-testid="annotation-add"
-                onClick={() => annotationPanel.openPanel(instance.id, "card", null)}
-              >
-                ＋ 加批注
-              </button>
-            ) : annotationReadonly ? (
-              <span className={annCss.readonlyTag} data-testid="annotation-readonly-tag">
-                只读预览 · 不可批注
-              </span>
-            ) : null}
           </div>
         </div>
         {pending.length > 0 ? (

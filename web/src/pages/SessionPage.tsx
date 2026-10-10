@@ -887,6 +887,7 @@ export function SessionPage({
           modelCatalog={hubStore.modelCatalogOf(instance.id)}
           effort={hubStore.effortOf(instance.id, instance.kind)}
           effortEffective={hubStore.effortEffectiveOf(instance.id)}
+          effortReadbackWithdrawn={hubStore.effortReadbackWithdrawnOf(instance.id)}
           effortPending={hubStore.effortPendingOf(instance.id)}
           ultraGate={instance.kind === "claude" ? hubStore.effortVersionGate(instance.id) : undefined}
           ultraBlocked={

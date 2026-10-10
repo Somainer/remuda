@@ -3343,22 +3343,36 @@
       "type": "object"
     },
     "EffortEffective": {
-      "description": "Effective effort, read back from a Claude assistant transcript record\n(`effort` / `perTurnEffort`); D-028 §9.1.\n\nThis is the *observed* tier, never the requested one. Claude reports\n`ultracode` sessions as level `xhigh` and does not repeat the workflow flag\non assistant records, so `ultracode` is `None` unless the observation path\nhas positive evidence (e.g. an immediately preceding `/effort ultracode`\nswitch the driver itself made).",
+      "description": "Effective effort, read back from a Claude assistant transcript record\n(`effort` / `perTurnEffort`); D-028 §9.1 / D-056.\n\nThis is the *observed* tier, never the requested one. Claude never repeats\nthe ultracode workflow flag on assistant records: it is read from the\n`/effort` verdicts and the `ultra_effort_enter` / `ultra_effort_exit`\nattachments instead. On coupled builds (2.1.203–2.1.283) the flag implies\nxhigh; on decoupled builds (≥ 2.1.284) it is an orthogonal toggle that\nlatches at every level. `ultracode` is `None` until this process has\npositive evidence either way.",
       "properties": {
         "name": {
-          "$ref": "#/$defs/EffortName",
-          "description": "Observed level name."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EffortName"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Observed level name. `None` ONLY on the read-back-unavailable edge\n(`readback_available == Some(false)`): a verified resume boundary\nbecame unverifiable mid-run, so the previously projected level is\nwithdrawn and consumers must render `?` rather than keep the stale\ntier. Normal observations always carry `Some(name)`."
         },
         "observedAt": {
           "$ref": "#/$defs/Timestamp",
           "description": "When the observation was made."
+        },
+        "readbackAvailable": {
+          "description": "D-056 (4): whether effort read-back is available for this process.\n`Some(false)` means a resume boundary that was verified became\nunverifiable mid-run (shrink/replacement/EOF, an exec keeping the shell\npid, a backward clock step): consumers must clear any projected\neffective level/flag (the UI renders `?`) and must not treat a pending\nswitch as applied. Normal observations omit it (`None` = available).",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "source": {
           "$ref": "#/$defs/EffortSource",
           "description": "What established this level."
         },
         "ultracode": {
-          "description": "Observed dynamic-workflow flag; `None` when the transcript does not\nexpose it (the common case).",
+          "description": "Observed dynamic-workflow flag; `None` when the transcript does not\nexpose it (the common case), and also withdrawn on the\nread-back-unavailable edge.",
           "type": [
             "boolean",
             "null"
@@ -3366,7 +3380,6 @@
         }
       },
       "required": [
-        "name",
         "source",
         "observedAt"
       ],
@@ -13546,7 +13559,7 @@
           "description": "Observed level."
         },
         "ultracode": {
-          "description": "Observed dynamic-workflow flag; positively true after\n`Set effort level to ultracode`, positively false after a plain level\naccept, `None` until a verdict says either way.",
+          "description": "Observed dynamic-workflow flag; positively true after an ultracode-on\nverdict/attachment, positively false after an ultracode-off verdict,\na slider ` · Ultracode off` suffix or a coupled plain-level accept, and\n`None` until this process has evidence either way.",
           "type": [
             "boolean",
             "null"

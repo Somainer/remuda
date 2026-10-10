@@ -31,21 +31,32 @@ export type EffortObservationPayload = {
   payload: {
     requested?: { name?: string; ultracode?: boolean } | null;
     effective: {
-      name: string;
+      name?: string | null;
       ultracode?: boolean | null;
       source?: string;
       observedAt?: string;
-    };
+      /** D-056 (4): false withdraws the projected level/flag. */
+      readbackAvailable?: boolean | null;
+    } | null;
     raw?: string | null;
   };
 };
 
-const SOURCES = new Set(["launch", "slash", "remuda", "unknown"]);
+/** Whether an effective record withdraws read-back (D-056 (4)). */
+function readbackWithdrawn(record: Record<string, unknown>): boolean {
+  return record.readbackAvailable === false;
+}
 
-/** Normalize an `effortEffective` object off a Hub-record/frame into a view. */
+const SOURCES: ReadonlySet<string> = new Set(["launch", "slash", "remuda", "unknown"]);
+
+/** Normalize an `effortEffective` object off a Hub InstanceRecord.
+ *  Returns null both before the first observation AND when the driver
+ *  withdraws read-back (`readbackAvailable:false`, name/flag null) — the UI
+ *  renders `?` and a pending switch is never treated as applied. */
 export function effectiveFromRecord(value: unknown): EffortEffectiveView | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
+  if (readbackWithdrawn(record)) return null;
   if (typeof record.name !== "string" || !record.name) return null;
   const source =
     typeof record.source === "string" && SOURCES.has(record.source)
@@ -59,31 +70,64 @@ export function effectiveFromRecord(value: unknown): EffortEffectiveView | null 
   };
 }
 
-/** Extract effective effort from an observation. Accepts the wire envelope
- *  ({payload:{kind,payload:{effective}}}), a bare body
- *  ({kind:"effort",payload:{effective}}), and a straight body
- *  ({effective}). */
-export function effectiveFromObservation(
-  observation: unknown,
-): { effective: EffortEffectiveView; requested?: { name?: string; ultracode?: boolean } } | null {
+/** Result of folding one `effort` observation. */
+export type EffortObservationResult = {
+  /** The projected effective state, or null when still unknown/withdrawn. */
+  effective: EffortEffectiveView | null;
+  /** True on the read-back-unavailable edge: the driver withdrew the previous
+   *  projection; consumers must clear it WITHOUT settling or deleting a
+   *  pending switch. */
+  withdrawn: boolean;
+  /** Timestamp carried by a withdrawn edge, for stale/ordering checks. */
+  observedAt?: string;
+  requested?: { name?: string; ultracode?: boolean };
+};
+
+/** Extract effective effort from an observation, when it is an `effort` event.
+ *  Accepts the wire envelope (`{body:{payload:{kind,payload:{effective}}}}`),
+ *  a bare body (`{kind:"effort",payload:{effective}}`), and a flattened body
+ *  (`{effective}`). An effort event whose effective is the
+ *  read-back-unavailable edge returns `{effective:null, withdrawn:true}`. */
+export function effectiveFromObservation(observation: unknown): EffortObservationResult | null {
   if (!observation || typeof observation !== "object") return null;
   const record = observation as Record<string, unknown>;
   const payload =
-    (record.payload as { payload?: { effective?: unknown }; effective?: unknown; kind?: string } | undefined) ?? null;
+    (record.payload as
+      | { payload?: { effective?: unknown; requested?: unknown }; effective?: unknown; kind?: string }
+      | undefined) ?? null;
   const candidates: unknown[] = [];
   if (record.kind === "effort") candidates.push(record);
   if (payload && (payload.kind === "effort" || "effective" in payload)) candidates.push(payload);
   if (payload && typeof payload.payload === "object") candidates.push(payload.payload);
   for (const candidate of candidates) {
     if (!candidate || typeof candidate !== "object") continue;
-    const body = candidate as { effective?: unknown; requested?: unknown };
-    const effective = effectiveFromRecord(body.effective);
-    if (effective) {
-      const requested =
-        body.requested && typeof body.requested === "object"
-          ? (body.requested as { name?: string; ultracode?: boolean })
-          : undefined;
-      return { effective, requested };
+    const body = candidate as {
+      effective?: unknown;
+      requested?: unknown;
+    };
+    const effectiveRecord =
+      body.effective && typeof body.effective === "object"
+        ? (body.effective as Record<string, unknown>)
+        : null;
+    if (!effectiveRecord) continue;
+    const withdrawn = readbackWithdrawn(effectiveRecord);
+    const view = effectiveFromRecord(effectiveRecord);
+    const requested =
+      body.requested && typeof body.requested === "object"
+        ? (body.requested as { name?: string; ultracode?: boolean })
+        : undefined;
+    if (withdrawn) {
+      const observedAt =
+        typeof effectiveRecord.observedAt === "string" ? effectiveRecord.observedAt : undefined;
+      return {
+        effective: null,
+        withdrawn: true,
+        ...(observedAt ? { observedAt } : {}),
+        ...(requested ? { requested } : {}),
+      };
+    }
+    if (view) {
+      return { effective: view, withdrawn: false, ...(requested ? { requested } : {}) };
     }
   }
   return null;
@@ -105,64 +149,4 @@ export function effectiveUltraWord(effective: EffortEffectiveView | null | undef
   if (effective?.ultracode === true) return "on";
   if (effective?.ultracode === false) return "off";
   return "?";
-}
-
-/** Level-axis mismatch: the observed tier differs from the requested one. */
-export function effortLevelMismatch(
-  requestedName: string | null | undefined,
-  effective: EffortEffectiveView | null | undefined,
-): { requested: string; effective: string } | null {
-  if (!effective || !requestedName) return null;
-  return requestedName === effective.name
-    ? null
-    : { requested: requestedName, effective: effective.name };
-}
-
-/** How the observed switch differs from what was requested; null when it agrees. */
-export type EffortFlagMismatch =
-  /** Requested ON but the process positively reports off. */
-  | { requested: "on"; observed: "off" }
-  /** Requested ON and no process-local switch evidence yet. */
-  | { requested: "on"; observed: "unknown" }
-  /** Requested OFF while the process reports on. */
-  | { requested: "off"; observed: "on" };
-
-export function effortFlagMismatch(
-  requestedUltracode: boolean,
-  effective: EffortEffectiveView | null | undefined,
-): EffortFlagMismatch | null {
-  if (!effective) return null;
-  if (requestedUltracode) {
-    if (effective.ultracode === true) return null;
-    return { requested: "on", observed: effective.ultracode === false ? "off" : "unknown" };
-  }
-  return effective.ultracode === true ? { requested: "off", observed: "on" } : null;
-}
-
-/** Whether an observed flag value delivers a definitive outcome for the
- *  switch axis. Any POSITIVE value (on OR off) settles — an opposite value is
- *  the delivered refusal (the mismatch renders); an unreported flag (null)
- *  proves nothing and keeps the indicator pending. Stale-vs-current is
- *  separately guarded by the request threshold. */
-export function effortFlagSettles(observed: boolean | null | undefined): boolean {
-  return observed === true || observed === false;
-}
-
-/**
- * Both axes at once, for the popover's per-axis hint lines.
- * `requestedWord` is the requested native level; `requestedUltracode` is the
- * switch state. (Kept under the old name as the single call site helper.)
- */
-export function effortMismatch(
-  requestedWord: string | null | undefined,
-  requestedUltracode: boolean,
-  effective: EffortEffectiveView | null | undefined,
-): {
-  level: { requested: string; effective: string } | null;
-  flag: EffortFlagMismatch | null;
-} {
-  return {
-    level: effortLevelMismatch(requestedWord, effective),
-    flag: effortFlagMismatch(requestedUltracode, effective),
-  };
 }

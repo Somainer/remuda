@@ -119,6 +119,7 @@ export function Composer({
   onEffort,
   onUltracode,
   effortEffective,
+  effortReadbackWithdrawn = false,
   effortPending,
   ultraGate,
   ultraBlocked,
@@ -190,6 +191,11 @@ export function Composer({
   onUltracode?: (on: boolean) => void;
   /** §9.1 transcript-read-back level; null/undefined = unobserved (`?`). */
   effortEffective?: EffortEffectiveView | null;
+  /** r7 item 4(a): true ONLY after an explicit readbackAvailable:false edge
+   *  (or a Hub projection going level→null). A never-read-back session stays
+   *  false even though effortEffective is null, so a pending push-down there
+   *  shows the pending word rather than a withdrawn "?". */
+  effortReadbackWithdrawn?: boolean;
   /** A push-down in flight (chip shows 切换中 / 排队中 until BOTH axes settle). */
   effortPending?: {
     name: string;
@@ -898,20 +904,25 @@ export function Composer({
   // 切换中 / 排队中 tag instead of going ambiguous.
   const effectiveUnknown = isEffortUnknown(effortEffective);
   const pending = effortPending ?? null;
+  // r7 item 4(a): "?" during a pending push-down ONLY after an explicit
+  // read-back withdrawal; a never-read-back session keeps the pending word.
+  const withdrawnPending = effortReadbackWithdrawn === true && Boolean(pending);
   const pendingLevel = pending && !pending.levelSettled ? pending.name : null;
   const pendingFlag =
     pending && !pending.flagSettled ? (pending.ultracode ? "ultracode" : null) : null;
-  const effectiveLevelWord = pendingLevel ?? effectiveLabel(effortEffective);
+  const effectiveLevelWord =
+    withdrawnPending || pendingLevel ? (withdrawnPending ? "?" : pendingLevel) : effectiveLabel(effortEffective);
   const effectiveFlagWord = (() => {
+    if (withdrawnPending) return "?";
     if (pendingFlag) return pendingFlag;
     if (!effortEffective) return null;
     const word = effectiveUltraWord(effortEffective);
     return word === "on" ? "ultracode" : word === "off" ? null : "ultracode?";
   })();
-  const levelMismatch = caps.effort && !pendingLevel
+  const levelMismatch = caps.effort && !pendingLevel && !withdrawnPending
     ? effortLevelMismatch(effortWire, effortEffective)
     : null;
-  const flagMismatch = caps.effort && !pendingFlag && harness === "claude"
+  const flagMismatch = caps.effort && !pendingFlag && !withdrawnPending && harness === "claude"
     ? effortFlagMismatch(ultraOn, effortEffective)
     : null;
   const mismatchLines: string[] = [];
@@ -932,18 +943,20 @@ export function Composer({
       ? `排队中：${pending.name}${pending.ultracode ? " · ultracode" : ""} 将在本回合结束后生效`
       : `切换中：${pending.name}${pending.ultracode ? " · ultracode" : ""}`
     : "";
-  const effortChipTitle = pending
-    ? pendingTitle
-    : effectiveUnknown
-      ? "实际档位：等待会话回读（？）"
-      : mismatchLines.length
-        ? mismatchLines.join("\n")
-        : [
-            `实际档位 ${effectiveLevelWord}（来源 ${effortEffective?.source ?? "unknown"}）`,
-            harness === "claude" && effortEffective
-              ? `ultracode：${effectiveUltraWord(effortEffective)}`
-              : "",
-          ].filter(Boolean).join("\n");
+  const effortChipTitle = withdrawnPending
+    ? "回读不可用：实际档位未知（？），切换结果等待本次 configure"
+    : pending
+      ? pendingTitle
+      : effectiveUnknown
+        ? "实际档位：等待会话回读（？）"
+        : mismatchLines.length
+          ? mismatchLines.join("\n")
+          : [
+              `实际档位 ${effectiveLevelWord}（来源 ${effortEffective?.source ?? "unknown"}）`,
+              harness === "claude" && effortEffective
+                ? `ultracode：${effectiveUltraWord(effortEffective)}`
+                : "",
+            ].filter(Boolean).join("\n");
   const primaryLabel = sending ? "发送中" : controls.primary.label;
   const primaryTestId =
     controls.primary.kind === "queue" ? "composer-queue" : "composer-send";
@@ -1091,7 +1104,7 @@ export function Composer({
   const effortWordNode = (
     <>
       <span className={css.chipModel} data-testid="model-effort-chip-label">
-        {pendingLevel ?? (effectiveUnknown ? "?" : effectiveLevelWord)}
+        {effectiveLevelWord}
       </span>
       {effectiveFlagWord ? (
         <span
@@ -1214,7 +1227,15 @@ export function Composer({
         data-permission={caps.permission ? liveMode : undefined}
         data-permission-danger={caps.permission && permDanger ? "1" : "0"}
         data-effort-effective={
-          caps.effort ? (pendingLevel ? "pending" : effectiveUnknown ? "unknown" : effectiveLevelWord) : undefined
+          caps.effort
+            ? withdrawnPending
+              ? "unknown"
+              : pendingLevel
+                ? "pending"
+                : effectiveUnknown
+                  ? "unknown"
+                  : effectiveLevelWord
+            : undefined
         }
         data-ultracode-effective={caps.effort && harness === "claude" ? (effortEffective?.ultracode ? "on" : effortEffective?.ultracode === false ? "off" : "unknown") : undefined}
         data-effort-pending={caps.effort && pendingAny ? (pending?.queued ? "queued" : "switching") : "0"}
@@ -1521,7 +1542,7 @@ export function Composer({
                 className={`${css.chip} ${ember ? css.ember : ""} ${pendingAny ? css.chipEffortPending : ""}`}
                 data-testid="model-effort-chip"
                 data-ember={ember ? "1" : "0"}
-                data-effort-effective={pendingLevel ? "pending" : effectiveUnknown ? "unknown" : effectiveLevelWord}
+                data-effort-effective={withdrawnPending ? "unknown" : pendingLevel ? "pending" : effectiveUnknown ? "unknown" : effectiveLevelWord}
                 data-ultracode-effective={harness === "claude" ? (effortEffective?.ultracode ? "on" : effortEffective?.ultracode === false ? "off" : "unknown") : undefined}
                 data-effort-pending={pendingAny ? (pending?.queued ? "queued" : "switching") : "0"}
                 data-effort-source={effortEffective?.source ?? "unknown"}

@@ -285,6 +285,14 @@ impl ClaudePtyDriver {
             reject_bot_bypass(&spec)?;
         }
         let session_id = session.session_id().to_string();
+        // Capture the resume session id before `session` moves into the
+        // materialize request; the boundary itself is taken after the final
+        // child env is assembled (so it uses the effective CLAUDE_CONFIG_DIR,
+        // including any extra_env/MCP override) but before the agent runs.
+        let resume_id: Option<String> = match &session {
+            crate::materializer::SessionAction::Resume { session_id } => Some(session_id.clone()),
+            crate::materializer::SessionAction::New { .. } => None,
+        };
         let request = MaterializeRequest {
             spec: &spec,
             profile: &self.options.profile,
@@ -359,6 +367,27 @@ impl ClaudePtyDriver {
         if let Some(context) = &self.options.agent_mcp {
             env.extend(context.environment()?);
         }
+
+        // D-056 (4), r4 item 3: snapshot the resume boundary from the FINAL
+        // child config dir (an extra_env/MCP CLAUDE_CONFIG_DIR override wins
+        // over the registered home; otherwise the registered native home the
+        // recipe pins), and before the agent runs so even records written
+        // between exec and hydration are read as current.
+        let config_dir = env
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| self.options.native_home.clone());
+        // r4: a resume whose transcript is present is verified; one whose file
+        // is not (or which cannot otherwise be bounded) is Unverified — never
+        // the fresh byte-0 path.
+        let resume_mode = match resume_id.as_deref() {
+            Some(id) => crate::claude_transcript::ResumeBoundary::mode_for(
+                &config_dir,
+                std::path::Path::new(&spec.cwd),
+                id,
+            ),
+            None => crate::claude_transcript::ResumeMode::Fresh,
+        };
 
         // §9.1 model list: discover the gateway cache / settings the launched
         // session can actually switch to, before the pane exists. The scoped
@@ -547,10 +576,7 @@ impl ClaudePtyDriver {
         // through the same transcript pump below.
         let effort_bridge = Arc::new(crate::effort::EffortBridge::new());
         if let Some(effort) = spec.effort {
-            effort_bridge.note_launch_request(crate::effort::EffortRequest {
-                name: effort.name,
-                ultracode: effort.ultracode,
-            });
+            effort_bridge.note_launch_request(crate::effort::EffortRequest::from_selection(effort));
         }
         let effort_queue = Arc::new(crate::effort::EffortQueue::new());
         // §9.1: /model switches share the pane I/O and transcript pump but
@@ -587,6 +613,7 @@ impl ClaudePtyDriver {
             Some(Arc::clone(&permission_bridge)),
             launch_permission,
             self.options.media_stager.clone(),
+            resume_mode,
         );
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
             client: client.clone(),
@@ -726,7 +753,7 @@ impl ClaudePtyDriver {
             // and hoped about). The Node surfaces the rejection in the UI.
             return Err(DriverError::CapabilityUnsupported(format!(
                 "claude /effort does not accept {level:?} in-session; \
-                 valid: low, medium, high, xhigh, max, ultracode"
+                 valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
             )));
         };
         let (pane_id, session_id, queue, ready, io) = {
@@ -1363,6 +1390,8 @@ fn spawn_transcript_pump(
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
+    // Fresh / verified-resume / unverifiable-resume for this launch.
+    resume_mode: crate::claude_transcript::ResumeMode,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
@@ -1437,7 +1466,11 @@ fn spawn_transcript_pump(
                         mapper =
                             mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
                     }
-                    hydrator = Some((crate::claude_transcript::TranscriptTail::new(path), mapper));
+                    // D-056 (4): the mode decides fresh vs proven vs
+                    // unverifiable resume; an unverifiable resume whose
+                    // transcript is still absent leaves the hydrator unbound
+                    // until the file appears — never a byte-0/current tail.
+                    hydrator = resume_mode.open_tail(&path).map(|tail| (tail, mapper));
                 }
             }
             if let Some(hydrated) = hydrator.take() {
@@ -1452,14 +1485,38 @@ fn spawn_transcript_pump(
                         TranscriptMapper,
                         Vec<Result<Vec<Observation>, DriverError>>,
                     ) {
+                        use crate::claude_transcript::TailProvenance;
                         let (mut tail, mut mapper) = hydrated;
-                        let lines = tail.poll().unwrap_or_default();
+                        // The tail reports whether these bytes are provenanced
+                        // to the current process; an unverified batch maps for
+                        // conversation only, and a verified→unverified
+                        // transition emits an explicit read-back-unavailable
+                        // edge that clears the projected effective state.
+                        let (provenance, poll_failed) = match tail.poll() {
+                            Ok(read) => (read.provenance, read.lines),
+                            Err(error) => {
+                                tracing::debug!(%error, "transcript tail unreadable this poll");
+                                let p = if tail.verified() {
+                                    TailProvenance::Current
+                                } else {
+                                    TailProvenance::Unverified
+                                };
+                                (p, Vec::new())
+                            }
+                        };
+                        let gate_edges = mapper
+                            .apply_effort_provenance(provenance == TailProvenance::Current)
+                            .expect("gate provenance is infallible");
                         // Flush the buffered assistant run at the end of the
                         // batch: the mapper holds a run open until superseded,
                         // so the final message of a finished turn would
                         // otherwise wait for the next record to arrive.
-                        let mut batches: Vec<_> =
-                            lines.iter().map(|line| mapper.map_line(line)).collect();
+                        let mut batches: Vec<Result<Vec<Observation>, DriverError>> =
+                            Vec::new();
+                        if !gate_edges.is_empty() {
+                            batches.push(Ok(gate_edges));
+                        }
+                        batches.extend(poll_failed.iter().map(|line| mapper.map_line(line)));
                         batches.push(mapper.flush());
                         (tail, mapper, batches)
                     })
@@ -1477,16 +1534,9 @@ fn spawn_transcript_pump(
                         }
                     };
                     for observation in mapped {
-                        if emit_obs(
-                            &tx,
-                            &seq,
-                            &ctx,
-                            SourceChannel::Transcript,
-                            observation.completeness,
-                            observation.body,
-                        )
-                        .await
-                        .is_err()
+                        if emit_mapped_obs(&tx, &seq, &ctx, SourceChannel::Transcript, observation)
+                            .await
+                            .is_err()
                         {
                             return;
                         }
@@ -1622,6 +1672,33 @@ async fn emit_obs(
 ) -> DriverResult<()> {
     let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
     tx.send(build_observation(ctx, n, channel, completeness, payload)?)
+        .await
+        .map_err(|_| DriverError::ControlUnavailable)?;
+    Ok(())
+}
+
+/// Emit a mapper-produced observation while PRESERVING the deterministic
+/// `event_id` the transcript mapper minted.
+///
+/// §9.1: an effort edge's id is derived from the native record (assistant
+/// message id or the verdict/attachment record uuid), and the journal tailer
+/// derives the same id for the same native edge. The TUI pump rebuilds every
+/// other field with this run's identity, but rebuilding the event id with a
+/// fresh random [`EventId::new`] — as [`emit_obs`] does — would publish a
+/// different id live than the one the journal later derives, breaking live/
+/// journal parity.
+async fn emit_mapped_obs(
+    tx: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &ObsCtx,
+    channel: SourceChannel,
+    mapped: Observation,
+) -> DriverResult<()> {
+    let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let event_id = mapped.event_id;
+    let mut observation = build_observation(ctx, n, channel, mapped.completeness, mapped.body)?;
+    observation.event_id = event_id;
+    tx.send(observation)
         .await
         .map_err(|_| DriverError::ControlUnavailable)?;
     Ok(())
@@ -2461,6 +2538,309 @@ mod tests {
         assert!(refuse_bare(&["--model".into(), "haiku".into()]).is_ok());
         assert!(refuse_bare(&["--bare".into()]).is_err());
         assert!(refuse_bare(&["--continue".into()]).is_err());
+    }
+
+    /// c-effortread r2: the deterministic effort edge id the transcript mapper
+    /// mints must survive live publication. The TUI pump used to rebuild every
+    /// observation (including a fresh random event id), so the published id did
+    /// not match the journal tailer's derived id.
+    #[tokio::test]
+    async fn mapped_effort_observation_keeps_its_deterministic_event_id() {
+        let instance = InstanceId::new();
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+        // First assistant record always emits one effort edge with a
+        // deterministic id derived from the native message id.
+        let line = json!({
+            "type": "assistant",
+            "uuid": "msg-1",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-1",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+            "effort": "high",
+            "perTurnEffort": null,
+        })
+        .to_string();
+        let mapped = mapper
+            .map_line(&line)
+            .expect("map")
+            .into_iter()
+            .find(|obs| matches!(obs.body, ObservationPayload::Effort(_)))
+            .expect("an effort edge");
+        let deterministic = mapped.event_id.clone();
+
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            session_id: "effort-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let seq = Arc::new(AtomicU64::new(0));
+        emit_mapped_obs(&tx, &seq, &ctx, SourceChannel::Transcript, mapped)
+            .await
+            .expect("emit");
+        let published = rx.try_recv().expect("the observation was published");
+        assert_eq!(
+            published.event_id, deterministic,
+            "the live TUI channel must publish the mapper's deterministic id"
+        );
+    }
+
+    /// c-r3 item 4: the claude-pty transcript pump driven through its REAL
+    /// output channel (the spawned pump task + mpsc receiver), not by calling
+    /// the emit helper on a hand-built observation. An effort edge read off the
+    /// channel carries the mapper/journal-derived deterministic event id.
+    #[tokio::test]
+    async fn the_transcript_pump_publishes_effort_ids_on_its_real_channel() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let transcript = dir.path().join("effort-session.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::to_string(&json!({
+                "type": "assistant",
+                "uuid": "msg-pump",
+                "sessionId": "effort-session",
+                "version": "2.1.289",
+                "message": {
+                    "id": "msg-pump",
+                    "role": "assistant",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "ok"}],
+                },
+                "effort": "high",
+                "perTurnEffort": null,
+            }))
+            .expect("json")
+                + "\n",
+        )
+        .expect("write transcript");
+
+        let instance = InstanceId::new();
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            session_id: "effort-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        // The id the journal tailer derives for the same record — the pump's
+        // real output must match it.
+        // The mapper prefixes the bare message id internally as
+        // `effort:<message-id>:<name>`, so the journal derivation takes the id.
+        let expected = remuda_protocol::effort_event_id(
+            instance.as_id().as_str(),
+            "msg-pump",
+            remuda_protocol::EffortName::High,
+        );
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let seq = Arc::new(AtomicU64::new(0));
+        let slot: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(Some(
+            transcript.to_string_lossy().into_owned(),
+        )));
+        // A live (new-session) boundary: the pump reads from byte 0 as current.
+        let task = spawn_transcript_pump(
+            slot,
+            tx,
+            ctx,
+            seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::claude_transcript::ResumeMode::Fresh,
+        );
+
+        // Drain the real channel until the effort edge arrives.
+        let mut found: Option<Observation> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(obs)) if matches!(obs.body, ObservationPayload::Effort(_)) => {
+                    found = Some(obs);
+                    break;
+                }
+                Ok(Some(_)) | Err(_) => continue,
+                Ok(None) => break,
+            }
+        }
+        task.abort();
+        let effort = found.expect("the real pump published an effort observation");
+        assert_eq!(
+            effort.event_id, expected,
+            "the pump's real channel carries the journal-derived deterministic id"
+        );
+        let ObservationPayload::Effort(payload) = effort.body else {
+            panic!("effort payload");
+        };
+        assert_eq!(
+            payload.effective.name,
+            Some(remuda_protocol::EffortName::High)
+        );
+    }
+
+    /// c-effortread r4 item 5, claude-pty pump: a VERIFIED resume whose bound
+    /// transcript is replaced emits the explicit read-back-unavailable edge
+    /// (clearing the projected `high`) on the pump's REAL channel, and a
+    /// pending Remuda switch is never settled Applied by a verdict that lands
+    /// after provenance is lost.
+    #[tokio::test]
+    async fn the_transcript_pump_clears_effective_state_when_provenance_is_lost() {
+        use crate::claude_transcript::{ResumeBoundary, ResumeMode};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let transcript = dir.path().join("effort-session.jsonl");
+        let history = "{\"type\":\"user\",\"sessionId\":\"effort-session\"}\n";
+        std::fs::write(&transcript, history).expect("history");
+        let boundary = ResumeBoundary::snapshot(&transcript).expect("pre-spawn EOF");
+
+        let instance = InstanceId::new();
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            session_id: "effort-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let bridge = Arc::new(crate::effort::EffortBridge::new());
+        let (tx, rx) = mpsc::channel(64);
+        let seq = Arc::new(AtomicU64::new(0));
+        let slot: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(Some(
+            transcript.to_string_lossy().into_owned(),
+        )));
+        let task = spawn_transcript_pump(
+            slot,
+            tx,
+            ctx,
+            seq,
+            Some(Arc::clone(&bridge)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            ResumeMode::Boundary(boundary),
+        );
+        let mut rx = rx;
+
+        let append = |line: serde_json::Value| {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("open");
+            writeln!(file, "{line}").expect("append");
+        };
+        let effort_names = |obs: &[Observation]| {
+            obs.iter()
+                .filter_map(|o| match &o.body {
+                    ObservationPayload::Effort(payload) => {
+                        Some((payload.effective.name, payload.effective.readback_available))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A current-process high edge after the verified boundary.
+        append(json!({
+            "type": "assistant",
+            "uuid": "msg-1",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-1",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+            "effort": "high",
+            "perTurnEffort": null,
+        }));
+        let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
+        assert_eq!(
+            effort_names(&obs),
+            vec![(Some(remuda_protocol::EffortName::High), None)]
+        );
+
+        // A Remuda switch is armed; its slash record is a current record.
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        append(json!({
+            "type": "user",
+            "uuid": "cmd-2",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n<command-args>max</command-args>",
+            },
+        }));
+        let _ = drain_for(&mut rx, Duration::from_millis(400)).await;
+        assert!(bridge.has_pending());
+
+        // The transcript is replaced by something shorter: boundary lost.
+        std::fs::write(&transcript, "{\"rotated\":true}\n").expect("rotate");
+        let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
+        assert_eq!(
+            effort_names(&obs),
+            vec![(None, Some(false))],
+            "the pump publishes one read-back-unavailable edge: {obs:?}"
+        );
+        assert!(bridge.has_pending());
+
+        // The max verdict in the recreated file cannot settle it.
+        append(json!({
+            "type": "user",
+            "uuid": "cmd-3",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": "<local-command-stdout>Set effort level to max</local-command-stdout>",
+            },
+        }));
+        let obs = drain_for(&mut rx, Duration::from_millis(800)).await;
+        assert!(
+            effort_names(&obs).is_empty(),
+            "no edge from an unverified verdict: {obs:?}"
+        );
+        assert!(bridge.has_pending(), "the switch is never resolved Applied");
+        let settled = bridge.wait(generation, Duration::from_millis(150)).await;
+        assert!(settled.is_none());
+
+        task.abort();
+    }
+
+    /// Collect everything the real pump emits within `window`.
+    async fn drain_for(rx: &mut mpsc::Receiver<Observation>, window: Duration) -> Vec<Observation> {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut out = Vec::new();
+        while let Ok(Some(observation)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            out.push(observation);
+        }
+        out
     }
 }
 

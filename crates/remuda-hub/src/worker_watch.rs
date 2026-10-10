@@ -975,7 +975,9 @@ enum ModelVerdict {
 fn read_model_verdict(lines: &[String], requested: &str) -> Option<ModelVerdict> {
     for line in lines.iter().rev().take(12) {
         match remuda_protocol::parse_model_stdout(line) {
-            remuda_protocol::ModelStdout::Accepted(observed) => {
+            remuda_protocol::ModelStdout::Accepted {
+                model: observed, ..
+            } => {
                 let id = observed.id;
                 let same = id == requested
                     || id.ends_with(&format!("/{requested}"))

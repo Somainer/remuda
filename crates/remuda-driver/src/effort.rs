@@ -15,7 +15,13 @@
 //! * **Live two-way sync** — below the launch section: Remuda → Claude writes
 //!   `/effort <level>` and waits for transcript read-back; Claude → Remuda
 //!   feeds assistant records through `remuda_protocol::EffortTracker`.
-//!   Measured on claude 2.1.221 (`docs/design/evidence/effort-sync-1.md`).
+//!   Measured on claude 2.1.221 (`docs/design/evidence/effort-sync-1.md`) and
+//!   re-measured on 2.1.272/2.1.273 (coupled) and 2.1.289 (decoupled
+//!   ultracode, `effort-sync-2.md`…`effort-sync-4.md`, ADR D-056). On
+//!   ≥ 2.1.284 the toggle is its own `/effort ultracode on|off` command and
+//!   its verdict ("Effort stays <level>") settles the bridge without a level
+//!   await; on coupled builds the bare `/effort ultracode` is the xhigh
+//!   level-plus-flag command.
 //!
 //! One rule for the live direction: the transcript is the only authority on
 //! what is actually in effect.
@@ -125,6 +131,39 @@ fn grok_reasoning_value(name: EffortName) -> DriverResult<&'static str> {
     }
 }
 
+/// D-056 (2) launch gate for the Claude ultracode flag.
+///
+/// Refuse `ultracode: true` unless the PINNED binary is a build that has the
+/// feature: coupled `2.1.203–2.1.283` or decoupled `≥ 2.1.284`. A build below
+/// `2.1.203` prints `Unknown --effort value 'ultracode'` and starts at the
+/// default level, and a version that cannot be determined fails closed rather
+/// than guessing. Plain levels (`ultracode: false`) are unaffected at any
+/// version. `pinned_version` is the first line of the binary's `--version`
+/// (e.g. `2.1.277 (Claude Code)`).
+pub fn ensure_claude_ultracode_version(
+    pinned_version: &str,
+    effort: Option<EffortSelection>,
+) -> DriverResult<()> {
+    if !effort.is_some_and(|selection| selection.ultracode) {
+        return Ok(());
+    }
+    let supported = remuda_protocol::parse_effort_version(pinned_version)
+        .map(remuda_protocol::ultracode_supported)
+        .unwrap_or(false);
+    if supported {
+        return Ok(());
+    }
+    Err(DriverError::InvalidLaunchSpec(format!(
+        "ultracode requires Claude Code 2.1.203–2.1.283 (coupled) or 2.1.284+ (decoupled); the \
+         pinned binary reports {} and does not accept it",
+        if pinned_version.trim().is_empty() {
+            "an undetermined version"
+        } else {
+            pinned_version.trim()
+        }
+    )))
+}
+
 /// Reject effort flags a caller smuggled through `spec.args`: the materializer
 /// owns this axis per-kind, and a hand-written flag would either repeat the
 /// emitted token or use the wrong vocabulary (codex parses no `--effort` at
@@ -188,9 +227,15 @@ pub(crate) const IN_SESSION_LEVELS: &[&str] =
 /// What the switch was asked to change to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EffortRequest {
-    /// Level to type (`ultracode` spelled out so `/effort ultracode` works).
+    /// Level to type. For a decoupled flag-only switch this is unused on the
+    /// wire (the toggle keeps the current level); the configure writer is
+    /// expected to send the current level alongside in real use (D-056).
     pub(crate) name: EffortName,
+    /// Desired ultracode flag state for a flag toggle.
     pub(crate) ultracode: bool,
+    /// Exact argument word(s) after `/effort `: a level word, the bare
+    /// `ultracode`, or `ultracode on` / `ultracode off`.
+    pub(crate) word: &'static str,
 }
 
 impl EffortRequest {
@@ -199,49 +244,79 @@ impl EffortRequest {
             "low" => Some(Self {
                 name: EffortName::Low,
                 ultracode: false,
+                word: "low",
             }),
             "medium" => Some(Self {
                 name: EffortName::Medium,
                 ultracode: false,
+                word: "medium",
             }),
             "high" => Some(Self {
                 name: EffortName::High,
                 ultracode: false,
+                word: "high",
             }),
             "xhigh" => Some(Self {
                 name: EffortName::Xhigh,
                 ultracode: false,
+                word: "xhigh",
             }),
             "max" => Some(Self {
                 name: EffortName::Max,
                 ultracode: false,
+                word: "max",
             }),
+            // Coupled input alias AND the decoupled bare toggle. The version
+            // gate decides what the word means (see `awaits_level`).
             "ultracode" => Some(Self {
                 name: EffortName::Xhigh,
                 ultracode: true,
+                word: "ultracode",
+            }),
+            "ultracode on" => Some(Self {
+                name: EffortName::Xhigh,
+                ultracode: true,
+                word: "ultracode on",
+            }),
+            "ultracode off" => Some(Self {
+                name: EffortName::Xhigh,
+                ultracode: false,
+                word: "ultracode off",
             }),
             _ => None,
         }
     }
 
-    /// The native spelling to type after `/effort ` — `ultracode` is its own
-    /// word; the five levels spell themselves.
-    pub(crate) fn command_word(&self) -> &'static str {
-        if self.ultracode {
-            "ultracode"
-        } else {
-            match self.name {
-                EffortName::Low => "low",
-                EffortName::Medium => "medium",
-                EffortName::High => "high",
-                EffortName::Xhigh => "xhigh",
-                EffortName::Max => "max",
-                // Neither the legacy `minimal` nor Codex `ultra` is a Claude
-                // `/effort` level; EffortRequest::from_level produces neither.
-                EffortName::Minimal => "minimal",
-                EffortName::Ultra => "ultra",
-            }
+    /// Whether this switch is the decoupled flag-only toggle
+    /// (`/effort ultracode on|off`, or the bare word on ≥ 2.1.284).
+    fn is_flag_only(&self, semantics: remuda_protocol::EffortSemantics) -> bool {
+        if semantics == remuda_protocol::EffortSemantics::Coupled {
+            // On coupled builds the bare word is the xhigh level command.
+            return false;
         }
+        self.ultracode || self.word == "ultracode off"
+    }
+
+    /// Build the launch-time request from a protocol [`EffortSelection`].
+    ///
+    /// This is launch provenance for a shell-pty launch that can target ANY
+    /// harness: a codex launch legitimately carries `ultra` (and an older
+    /// Claude launch `minimal`), neither of which is a Claude `/effort` word.
+    /// Map the fields directly instead of round-tripping through
+    /// [`Self::from_level`], which panics on those words — a panic here ran
+    /// AFTER the child was spawned and orphaned it.
+    pub(crate) fn from_selection(selection: EffortSelection) -> Self {
+        Self {
+            name: selection.name,
+            ultracode: selection.ultracode,
+            word: selection.flag_value(),
+        }
+    }
+
+    /// The native spelling to type after `/effort ` — a level word,
+    /// `ultracode`, or `ultracode on` / `ultracode off`.
+    pub(crate) fn command_word(&self) -> &'static str {
+        self.word
     }
 
     /// The whole slash command body, without the submitting CR.
@@ -271,11 +346,13 @@ impl EffortRequest {
     }
 
     /// Level the transcript must report for this switch to count as observed.
-    ///
-    /// `ultracode` reads back as `xhigh` — Claude does not repeat the workflow
-    /// flag on assistant records.
-    pub(crate) fn observed_name(&self) -> EffortName {
-        self.name
+    /// On coupled builds the bare `ultracode` word is the xhigh level command,
+    /// so it awaits xhigh; decoupled flag toggles await no level.
+    pub(crate) fn awaits_level(
+        &self,
+        semantics: remuda_protocol::EffortSemantics,
+    ) -> Option<EffortName> {
+        (!self.is_flag_only(semantics)).then_some(self.name)
     }
 }
 
@@ -313,10 +390,11 @@ impl SwitchOutcome {
 pub enum Readback {
     /// The stdout verdict accepted the level; this is what is now in effect.
     Applied(remuda_protocol::ObservedEffort),
-    /// Claude refused the switch (dialog dismissed with Esc, invalid argument)
-    /// and the journaled reason names why.
+    /// Claude refused the switch and the journaled reason names why:
+    /// `dialog-kept`, `invalid-argument`, `ultracode-workflows-disabled`,
+    /// `ultracode-unavailable-for-model`, or `env-override` (D-056).
     Rejected {
-        /// Stable reason code (`dialog-kept`, `invalid-argument`).
+        /// Stable reason code.
         reason: String,
     },
 }
@@ -875,6 +953,64 @@ mod argv_tests {
     }
 
     #[test]
+    fn launch_ultracode_version_gate_refuses_below_the_floor_or_unknown() {
+        // D-056 (2): only 2.1.203–2.1.283 (coupled) and >=2.1.284 (decoupled)
+        // pinned builds accept the ultracode flag at launch.
+        let on = Some(sel(EffortName::Xhigh, true));
+        for version in [
+            "2.1.289",
+            "2.1.289 (Claude Code)",
+            "2.1.284",
+            "2.1.283",
+            "2.1.277",
+        ] {
+            assert!(
+                ensure_claude_ultracode_version(version, on).is_ok(),
+                "{version} supports ultracode"
+            );
+        }
+        for version in ["2.1.202", "2.1.180", "stub", "", "unpinned"] {
+            assert!(
+                matches!(
+                    ensure_claude_ultracode_version(version, on),
+                    Err(DriverError::InvalidLaunchSpec(_))
+                ),
+                "{version:?} must refuse ultracode"
+            );
+        }
+        // Plain levels are never gated, even below the floor.
+        for version in ["2.1.180", "stub", ""] {
+            assert!(
+                ensure_claude_ultracode_version(version, Some(sel(EffortName::High, false)))
+                    .is_ok(),
+                "plain high on {version:?} must launch"
+            );
+        }
+        assert!(ensure_claude_ultracode_version("2.1.180", None).is_ok());
+    }
+
+    #[test]
+    fn launch_provenance_never_panics_on_non_claude_words() {
+        // c-effortread r2: from_selection runs after the child has been
+        // spawned for a shell-pty launch, which can target any harness. A
+        // codex `ultra` launch (and a legacy `minimal`) used to panic here and
+        // orphan the spawned child.
+        let ultra = EffortRequest::from_selection(sel(EffortName::Ultra, false));
+        assert_eq!(ultra.name, EffortName::Ultra);
+        assert!(!ultra.ultracode);
+        assert_eq!(ultra.word, "ultra");
+        let minimal = EffortRequest::from_selection(sel(EffortName::Minimal, false));
+        assert_eq!(minimal.name, EffortName::Minimal);
+        assert_eq!(minimal.word, "minimal");
+        let flag = EffortRequest::from_selection(sel(EffortName::Xhigh, true));
+        assert_eq!(flag.name, EffortName::Xhigh);
+        assert!(flag.ultracode);
+        assert_eq!(flag.word, "ultracode");
+        let plain = EffortRequest::from_selection(sel(EffortName::Max, false));
+        assert_eq!(plain.word, "max");
+    }
+
+    #[test]
     fn codex_maps_one_to_one_onto_the_config_overlay() {
         let tiers = [
             (EffortName::Low, "low"),
@@ -962,11 +1098,44 @@ mod sync_tests {
         ] {
             let request = EffortRequest::from_level(level).expect(level);
             assert_eq!(request.command_body(), word);
-            assert_eq!(request.observed_name(), observed);
+            assert_eq!(request.name, observed);
+        }
+        for (word, body) in [
+            ("ultracode on", "/effort ultracode on"),
+            ("ultracode off", "/effort ultracode off"),
+        ] {
+            let request = EffortRequest::from_level(word).expect(word);
+            assert_eq!(request.command_body(), body);
         }
         assert!(EffortRequest::from_level("bogus").is_none());
         assert!(EffortRequest::from_level("auto").is_none());
         assert!(EffortRequest::from_level("ultra").is_none());
+    }
+
+    #[test]
+    fn flag_toggles_await_no_level_when_decoupled() {
+        use remuda_protocol::EffortSemantics::{Coupled, Decoupled};
+        // Levels await in both eras.
+        let high = EffortRequest::from_level("high").unwrap();
+        assert_eq!(high.awaits_level(Decoupled), Some(EffortName::High));
+        assert_eq!(high.awaits_level(Coupled), Some(EffortName::High));
+        // The bare word awaits xhigh only on coupled builds.
+        let bare = EffortRequest::from_level("ultracode").unwrap();
+        assert_eq!(bare.awaits_level(Coupled), Some(EffortName::Xhigh));
+        assert_eq!(bare.awaits_level(Decoupled), None);
+        // Explicit on/off never await a level.
+        assert_eq!(
+            EffortRequest::from_level("ultracode on")
+                .unwrap()
+                .awaits_level(Decoupled),
+            None
+        );
+        assert_eq!(
+            EffortRequest::from_level("ultracode off")
+                .unwrap()
+                .awaits_level(Decoupled),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1081,7 +1250,11 @@ mod switch_tests {
                 bridge.resolve(
                     generation,
                     remuda_protocol::ObservedEffort {
-                        name: request.observed_name(),
+                        // These mock switches model the coupled (2.1.272)
+                        // dialog behaviour the switch tests exercise.
+                        name: request
+                            .awaits_level(remuda_protocol::EffortSemantics::Coupled)
+                            .unwrap_or(request.name),
                         ultracode: None,
                     },
                 );

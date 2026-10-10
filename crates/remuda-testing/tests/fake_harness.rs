@@ -89,8 +89,8 @@ fn claude_artifacts_parse_with_the_transcript_mapper() {
 
     // The production tail sees the same whole lines.
     let mut tail = TranscriptTail::new(path.clone());
-    let lines = tail.poll().expect("poll");
-    assert_eq!(lines.len(), records.len());
+    let read = tail.poll().expect("poll");
+    assert_eq!(read.lines.len(), records.len());
 }
 
 #[test]

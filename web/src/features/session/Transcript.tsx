@@ -294,10 +294,15 @@ function TranscriptInner({
   // it explicitly (collapse must re-fold even a previously expanded row).
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
 
-  // TEST-ONLY: the font-swap e2e passes ?restoreProbe=1 to observe the
-  // pending-restore phase via a scroller attribute. No product effect.
+  // TEST-ONLY: the font-swap mid-restore e2e arms a held-font restore probe by
+  // navigating to ?restoreProbe=1 with window.__fontSwapRestoreProbeArmed set
+  // (installed via addInitScript). Both are required: a bare ?restoreProbe=1
+  // URL has NO product effect (no held restore, the visit behaves normally),
+  // and no probe is armed without the query either.
   const restoreProbe =
-    typeof window !== "undefined" && new URLSearchParams(window.location.search).has("restoreProbe");
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).has("restoreProbe") &&
+    (window as unknown as { __fontSwapRestoreProbeArmed?: boolean }).__fontSwapRestoreProbeArmed === true;
   // TEST-ONLY seam for the pinned-tail fail-proof. The document is opened with
   // ?noSizePin=1 and the e2e arms window.__fontSwapNoSizePinArmed immediately
   // before releasing the held font; from then on BOTH programmatic pin-
@@ -316,11 +321,14 @@ function TranscriptInner({
   // Row heights keyed by STABLE NODE ID, never array index (see the `sizes`
   // memo below); reset per session in the route-reset block.
   const [rowHeights, setRowHeights] = useState<Map<string, number>>(new Map());
-  // Mirror of rowHeights for the before-paint setRowSize height-delta hold.
+  // Synchronous ledger of the last COMMITTED per-row heights, read before paint
+  // by setRowSize. It is the single source of truth and is written together
+  // with the state above on every measurement (setRowSize) and cleared together
+  // on route reset — there is deliberately NO passive effect mirroring state
+  // back into this ref: such a mirror can run with a STALE state between a
+  // synchronous ledger write and its queued render and roll a fresh height back
+  // to the previous commit (losing the measurement forever).
   const rowHeightsRef = useRef(rowHeights);
-  useEffect(() => {
-    rowHeightsRef.current = rowHeights;
-  }, [rowHeights]);
 
   // The route keeps this component mounted while the reader moves directly
   // between sessions (tab switch). Per-instance refs must therefore reset on
@@ -424,6 +432,23 @@ function TranscriptInner({
   const reflowAnchorRef = useRef<{ id: string } | null>(null);
   /** Set for one sizes commit when the reflow self-correction held the anchor. */
   const reflowCorrectedThisCommitRef = useRef(false);
+  /**
+   * True only between the reflow compensator's own scrollTop write and the
+   * coalesced scroll event it dispatches, so onScroll does not mistake that
+   * write for a reader scroll (which would retire reflowAnchorRef).
+   */
+  const reflowOwnScrollRef = useRef(false);
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  // Restore-active DOM flag: written IMPERATIVELY whenever a saved/load-earlier
+  // restore arms/finalizes — the layout effect clears restoringRef in the same
+  // frame without a setState, so a render-time attribute would lag the ref by up
+  // to a second. Always present on the scroller (a constant "0" in JSX) so the
+  // late-swap arm can gate on the real restore state too. Declared before the
+  // per-instance reset block below, which also writes the attribute.
+  const setRestoreActiveAttr = () => {
+    const el = scrollerRef.current;
+    if (el) el.setAttribute("data-restore-active", restoringRef.current ? "1" : "0");
+  };
   // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
   // click on a held transcript row posts exactly once.
   const steeringRef = useRef<Set<string>>(new Set());
@@ -436,10 +461,12 @@ function TranscriptInner({
     prependAnchorRef.current = null;
     loadReqRef.current = null;
     restoringRef.current = false;
+    setRestoreActiveAttr();
     restoreEchoRef.current = null;
     restoreEchoSeqRef.current = 0;
     growthHoldSuppressedRef.current = false;
     reflowAnchorRef.current = null;
+    reflowOwnScrollRef.current = false;
     if (prependSettleTimerRef.current !== null) {
       window.clearTimeout(prependSettleTimerRef.current);
       prependSettleTimerRef.current = null;
@@ -501,7 +528,6 @@ function TranscriptInner({
     () => nodes.map((node) => rowHeights.get(node.id) ?? 0),
     [nodes, rowHeights],
   );
-  const scrollerRef = useRef<HTMLDivElement>(null);
   /**
    * Retire an armed/settling load-earlier restore synchronously, called from
    * an INTENTIONAL navigation (j/k, a search hit, 跳到最新) BEFORE its own
@@ -522,26 +548,51 @@ function TranscriptInner({
    * synchronously and invalidate the echo record. A rAF drops a record when
    * the browser dispatched no event.
    */
-  const programmaticScroll = useCallback((el: HTMLElement, top: number, fromRestore = false) => {
-    if (fromRestore) {
-      const seq = restoreEchoSeqRef.current + 1;
-      restoreEchoSeqRef.current = seq;
-      el.scrollTop = top;
-      // Record the value the BROWSER kept, read back AFTER the write, not the
-      // requested one: a short tail (earlierFloor > 1) can clamp the restore
-      // write, so a requested-target echo would mismatch the clamped event by
-      // more than the tolerance and make the restore cancel its own echo.
-      restoreEchoRef.current = { top: el.scrollTop, seq };
-      requestAnimationFrame(() => {
-        if (restoreEchoRef.current?.seq === seq) restoreEchoRef.current = null;
-      });
-    } else {
-      cancelLoadRestoreRef.current();
-      restoreEchoRef.current = null;
-      el.scrollTop = top;
-    }
-    scrollTopRef.current = el.scrollTop;
+  /**
+   * Mark the coalesced scroll event dispatched by the re-anchor machinery's
+   * OWN just-performed write. Both own-write latches are armed together: the
+   * event must neither cancel an armed load-earlier restore (restoreEchoRef)
+   * nor retire the reflow anchor (reflowOwnScrollRef) — either machinery can
+   * write while the other is armed (a font reflow landing mid load-earlier,
+   * a settle repin after a saved restore). Armed ONLY when the write moved
+   * scrollTop: an unchanged/clamped write dispatches no event, and the rAF
+   * below invalidates the latches when the browser never answers.
+   */
+  const armOwnScrollEcho = useCallback((before: number) => {
+    const el = scrollerRef.current;
+    if (!el || el.scrollTop === before) return;
+    const seq = restoreEchoSeqRef.current + 1;
+    restoreEchoSeqRef.current = seq;
+    restoreEchoRef.current = { top: el.scrollTop, seq };
+    reflowOwnScrollRef.current = true;
+    requestAnimationFrame(() => {
+      if (restoreEchoRef.current?.seq === seq) {
+        restoreEchoRef.current = null;
+        reflowOwnScrollRef.current = false;
+      }
+    });
   }, []);
+  const programmaticScroll = useCallback(
+    (el: HTMLElement, top: number, fromRestore = false) => {
+      if (fromRestore) {
+        const before = el.scrollTop;
+        el.scrollTop = top;
+        // Record the value the BROWSER kept, read back AFTER the write, not
+        // the requested one: a short tail (earlierFloor > 1) can clamp the
+        // restore write, so a requested-target echo would mismatch the
+        // clamped event by more than the tolerance and make the restore
+        // cancel its own echo.
+        armOwnScrollEcho(before);
+      } else {
+        cancelLoadRestoreRef.current();
+        restoreEchoRef.current = null;
+        reflowOwnScrollRef.current = false;
+        el.scrollTop = top;
+      }
+      scrollTopRef.current = el.scrollTop;
+    },
+    [armOwnScrollEcho],
+  );
   /**
    * Retire a held load-earlier anchor: clear its quiet timer, the pending
    * restore for the same request (its estimate freeze and correction loop end
@@ -560,6 +611,7 @@ function TranscriptInner({
     if (pending?.kind === "restore" && pending.reqId === held.reqId) {
       pendingScroll.current = null;
       restoringRef.current = false;
+      setRestoreActiveAttr();
     }
     const req = loadReqRef.current;
     if (req?.reqId === held.reqId && req.done) loadReqRef.current = null;
@@ -586,6 +638,7 @@ function TranscriptInner({
     const pending = pendingScroll.current;
     if (pending?.kind === "restore" && pending.reqId === req.reqId) pendingScroll.current = null;
     restoringRef.current = false;
+    setRestoreActiveAttr();
     // Drop the pre-navigation reading anchor: it was sampled above the row
     // the incoming prepend will move, so without this the growth-anchor hold
     // would compensate for that prepend and re-jump to the click-time row
@@ -821,6 +874,7 @@ function TranscriptInner({
     const prevNodes = nodesRef.current.slice();
     if (anchorId) {
       restoringRef.current = true;
+      setRestoreActiveAttr();
       pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0, awaitIndex: armedIndex, reqId, prevNodes };
       // Keep repinning as the prepended (unmeasured) rows settle; the
       // one-shot restore effect alone stops before the average converges.
@@ -862,6 +916,7 @@ function TranscriptInner({
           if (pending?.kind === "restore" && pending.reqId === reqId) {
             pendingScroll.current = null;
             restoringRef.current = false;
+            setRestoreActiveAttr();
           }
           loadReqRef.current = null;
         } else if (prependAnchorRef.current?.reqId !== reqId) {
@@ -873,6 +928,28 @@ function TranscriptInner({
       }
     }
   }, [instanceId, loadingEarlier, canLoadEarlier, range.start, releasePrependAnchor]);
+
+  // Programmatic write made by the re-anchor machinery (a growth counter-scroll,
+  // a font reflow self-correction, or a pending-restore correction). Browsers
+  // dispatch NO scroll event when a write leaves scrollTop unchanged (already
+  // at the target, or clamped), so arming reflowOwnScrollRef unconditionally
+  // would leave it latched: the reader's NEXT real scroll would then be
+  // mistaken for this own write and fail to retire reflowAnchorRef. Arm the
+  // latch ONLY when the write actually moved scrollTop (and therefore a
+  // coalesced scroll event really is coming).
+  const ownScrollWrite = useCallback(
+    (next: number) => {
+      const el = scrollerRef.current;
+      if (!el) return;
+      const before = el.scrollTop;
+      el.scrollTop = next;
+      // Arm BOTH own-write latches: this write must keep the reflow anchor AND
+      // be recognised as an in-flight load-earlier restore's own echo.
+      armOwnScrollEcho(before);
+      scrollTopRef.current = el.scrollTop;
+    },
+    [armOwnScrollEcho],
+  );
 
   // Reading anchor: the first row in view, its offset from the scroller top,
   // and the scrollTop it was sampled at (on every scroll). A row above it that
@@ -919,9 +996,10 @@ function TranscriptInner({
     }
     const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) < 1) return;
-    programmaticScroll(el, el.scrollTop + delta);
+    // Internal growth-anchor write, not a reader scroll: keep reflowAnchorRef.
+    ownScrollWrite(el.scrollTop + delta);
     held.top = el.scrollTop;
-  }, [sampleReadingAnchor, programmaticScroll]);
+  }, [sampleReadingAnchor, ownScrollWrite]);
 
   // Stable per-row size reporter keyed by node id. The identity MUST stay
   // constant across parent re-renders (scroll fires setScrollTop on every
@@ -941,29 +1019,45 @@ function TranscriptInner({
     // tall block above (or wrapping) the held message node, so hold the
     // restored row explicitly against the measured height delta.
     const el = scrollerRef.current;
+    // Compare against the last COMMITTED height (the synchronous ledger in
+    // rowHeightsRef), not a stale value: the same row can be measured twice in
+    // one commit (initial layout effect + ResizeObserver) before React renders
+    // the queued state, and comparing against the pre-commit height twice would
+    // scroll the reader by the same delta on every measurement tick. Sub-pixel
+    // jitter (<1px) is ignored entirely — it is not a real layout change and
+    // must not scroll.
+    const prevHeight = rowHeightsRef.current.get(id);
+    const heightChanged = prevHeight === undefined || Math.abs(height - prevHeight) >= 1;
     let selfDelta = 0;
     // Note: allowed even while a saved-position restore is still pending (the
     // mid-restore font-swap arm) — the reflow anchor IS that pending restore's
     // target, and the restore correction alone converges to the wrong (post-
     // reflow) spot without this height-delta compensation.
-    if (reanchor && el && !pinRef.current && !prependAnchorRef.current) {
+    if (reanchor && heightChanged && el && !pinRef.current && !prependAnchorRef.current) {
       const reflow = reflowAnchorRef.current;
-      if (reflow) {
-        const prevHeight = rowHeightsRef.current.get(id);
+      if (reflow && prevHeight !== undefined) {
         const resized = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(id)}"]`);
         const anchorRow = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(reflow.id)}"]`);
-        if (prevHeight !== undefined && resized && anchorRow) {
-          // Compensate only when the resized row sits above (or is) the
-          // restored anchor row — its height change moves the anchor.
+        if (resized && anchorRow && resized !== anchorRow) {
+          // Compensate only for a DIFFERENT row strictly ABOVE the restored
+          // anchor. A row's OWN growth never moves its own top, so counter-
+          // scrolling it would push that top off the saved spot (the r5 item-1
+          // bug): the anchor row's own top is held without a write, both while
+          // a restore is active (its top is layout-stable across self-growth)
+          // and after it finalizes (the generic anchor holds it).
           const resizedDoc = el.scrollTop + resized.getBoundingClientRect().top - el.getBoundingClientRect().top;
           const anchorDoc = el.scrollTop + anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top;
-          if (resizedDoc <= anchorDoc + 1) selfDelta = height - prevHeight;
+          if (resizedDoc < anchorDoc) selfDelta = height - prevHeight;
         }
       }
     }
     if (reanchor && selfDelta !== 0 && el) {
-      el.scrollTop += selfDelta;
-      scrollTopRef.current = el.scrollTop;
+      // This write is the compensator's OWN re-anchor, not a reader scroll:
+      // keep reflowAnchorRef across its coalesced scroll event (see the
+      // own-scroll flag consumed in onScroll). The latch arms only if the
+      // write moves scrollTop (ownScrollWrite), so a clamped no-op cannot
+      // leave it stuck to swallow the reader's next real scroll.
+      ownScrollWrite(el.scrollTop + selfDelta);
       const held = readingAnchorRef.current;
       if (held) held.top = el.scrollTop;
       // Align the generic reading anchor with the post-correction restored row
@@ -983,19 +1077,26 @@ function TranscriptInner({
         // (it would undo the hold and converge to the reflowed position).
         reflowCorrectedThisCommitRef.current = true;
       }
-    } else if (reanchor) {
+    } else if (reanchor && !reflowAnchorRef.current) {
+      // While a reflow anchor is active the explicit above-row compensation is
+      // the SOLE hold. Falling through to holdReadingAnchor here would double
+      // count a swap that resizes two rows in RO-creation order: a row at/below
+      // the anchor measured first would let the generic hold correct the drift
+      // a strictly-above row already moved in the DOM, after which that above
+      // row's own delta would scroll the reader a SECOND time. Once the reader
+      // scrolls (clearing reflowAnchorRef) the generic hold owns position again.
       holdReadingAnchor();
     }
-    // Sub-pixel tolerance: measured heights jitter by fractions of a px
-    // between frames; ignore deltas under 1 instead of thrashing state.
-    setRowHeights((prev) => {
-      const last = prev.get(id);
-      if (last !== undefined && Math.abs(last - height) < 1) return prev;
-      const next = new Map(prev);
+    // Commit the height once. The ref is the synchronous ledger and is updated
+    // in the same breath as the state, so same-commit re-measurements compare
+    // against THIS value. Sub-pixel reports neither scroll nor commit.
+    if (heightChanged) {
+      const next = new Map(rowHeightsRef.current);
       next.set(id, height);
-      return next;
-    });
-  }, [holdReadingAnchor]);
+      rowHeightsRef.current = next;
+      setRowHeights(next);
+    }
+  }, [holdReadingAnchor, ownScrollWrite]);
 
   // Converge the unmeasured-row estimate on this visit's real average so
   // offsets outside the window (search hits, saved position) stop drifting.
@@ -1179,6 +1280,7 @@ function TranscriptInner({
           if (req && req.reqId === pending.reqId && req.done) {
             pendingScroll.current = null;
             restoringRef.current = false;
+            setRestoreActiveAttr();
             if (prependAnchorRef.current?.reqId === pending.reqId) prependAnchorRef.current = null;
             loadReqRef.current = null;
           }
@@ -1199,33 +1301,53 @@ function TranscriptInner({
       // restore provably pending (data-restore-active="1") until the e2e arm
       // releases the font, so the swap deterministically lands while the
       // restore is active. Zero effect without the query parameter.
+      //
+      // Probe at a NON-STANDARD 12px: the 13px used by the app is matched by
+      // the font stack's generic `monospace` fallback, so fonts.check at 13px
+      // returns true even with IBM Plex Mono unloaded and would finalize on
+      // the fallback face. 12px is not a metric the generic face is declared
+      // for, so the check stays false until the real Plex woff2 is in.
       const probeFontReady = () =>
         !restoreProbe || typeof document === "undefined"
           ? true
-          : document.fonts.check('400 13px "IBM Plex Mono"');
+          : document.fonts.check('400 12px "IBM Plex Mono"');
       if (rowEl) {
         // Pin the reflow anchor to the restored row for the WHOLE restore
         // (including a restoreProbe-held restore that is still pending when a
         // font swap lands), so height changes of rows above it hold this row.
         reflowAnchorRef.current = { id: pending.anchorId };
-        // A font-metrics reflow self-correction already held the anchor this
-        // commit; trust that placement and finalize instead of re-correcting
-        // against the post-reflow geometry (which would undo the hold).
-        if (reflowCorrected) {
-          if (probeFontReady()) {
-            pendingScroll.current = null;
-            restoringRef.current = false;
-          }
-          return;
-        }
         const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - pending.offset;
-        if (Math.abs(delta) <= 2) {
-          if (!probeFontReady()) return;
+        // Finalize only once the row actually sits at the saved offset. Seed
+        // the generic reading anchor with the restored row + offset so that a
+        // LATER growth of the row itself (which the above-row compensator does
+        // not scroll for) is held by the generic anchor.
+        const finalizeRestore = () => {
+          readingAnchorRef.current = {
+            id: pending.anchorId,
+            offset: pending.offset,
+            top: el.scrollTop,
+          };
           pendingScroll.current = null;
           restoringRef.current = false;
+          setRestoreActiveAttr();
+        };
+        // A font-metrics reflow was self-corrected this commit (rows ABOVE the
+        // anchor counter-scrolled). That does not prove the anchor reached its
+        // saved offset — an estimate miss or a second same-commit correction can
+        // still leave |delta| large. Run the offset correction rather than
+        // finalizing at an unfinished position; finalize only at |delta| <= 2.
+        if (reflowCorrected && Math.abs(delta) > 2) {
+          // Own restore write: its scroll event must not retire reflowAnchorRef.
+          ownScrollWrite(el.scrollTop + delta);
+          pending.tries += 1;
           return;
         }
-        programmaticScroll(el, el.scrollTop + delta, true);
+        if (Math.abs(delta) <= 2) {
+          if (!probeFontReady()) return;
+          finalizeRestore();
+          return;
+        }
+        ownScrollWrite(el.scrollTop + delta);
       } else {
         // The anchor is not mounted yet: jump toward its estimated offset so
         // the window mounts it, then later passes correct against the real
@@ -1236,7 +1358,7 @@ function TranscriptInner({
         if (index >= 0) {
           const { offsets } = rowOffsets(nodes.length, sizes, estimate);
           const top = Math.round((offsets[index] ?? 0) + pending.offset);
-          programmaticScroll(el, top, true);
+          ownScrollWrite(top);
         }
       }
       pending.tries += 1;
@@ -1249,6 +1371,7 @@ function TranscriptInner({
         // 24 tries exactly as before.
         pendingScroll.current = null;
         restoringRef.current = false;
+        setRestoreActiveAttr();
         if (pending.kind === "restore" && pending.reqId !== undefined) {
           const held = prependAnchorRef.current;
           if (held?.reqId === pending.reqId) releasePrependAnchor(held);
@@ -1264,7 +1387,7 @@ function TranscriptInner({
       return;
     }
     pending.tries += 1;
-  }, [sizes, nodes, estimate, applyOffset, loadTick, releasePrependAnchor, restoreProbe]);
+  }, [sizes, nodes, estimate, applyOffset, loadTick, releasePrependAnchor, restoreProbe, ownScrollWrite]);
 
   // A commit that moves rows above the anchor (padTop re-estimated, a row
   // inserted above) holds the reader the same way a measured growth does. A
@@ -1330,6 +1453,10 @@ function TranscriptInner({
     pinRef.current = false;
     restoringRef.current = true;
     pendingScroll.current = { kind: "restore", anchorId: saved.anchorId, offset: saved.offset, tries: 0 };
+    // The pending-scroll layout effect runs next and also writes the
+    // attribute; set it here too so an effect that samples it between arm and
+    // the first correction sees "1".
+    setRestoreActiveAttr();
     restoredRef.current = true;
   }, [nodes, saved]);
 
@@ -1591,9 +1718,7 @@ function TranscriptInner({
         ref={scrollerRef}
         className={css.scroller}
         data-testid="transcript-scroller"
-        data-restore-active={
-          restoreProbe ? (pendingScroll.current?.kind === "restore" ? "1" : "0") : undefined
-        }
+        data-restore-active="0"
         // Inert observability for the load-earlier hold: "1" while its anchor
         // is armed, "0" once retired (quiet window, gesture, navigation, route
         // switch). Read from the ref at render; the quiet timer bumps loadTick
@@ -1604,6 +1729,16 @@ function TranscriptInner({
           setScrollTop(el.scrollTop);
           scrollTopRef.current = el.scrollTop;
           pinRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+          // The reflow anchor re-anchors only until the reader moves. A reflow
+          // compensator / restore-correction write dispatches the event marked
+          // with its own latch (armed together with the load-restore echo);
+          // every OTHER scroll (wheel, touch, keys, a programmatic jump) means
+          // the reader owns the place again, so retire it.
+          const reflowOwn = reflowOwnScrollRef.current;
+          reflowOwnScrollRef.current = false;
+          if (!reflowOwn) {
+            reflowAnchorRef.current = null;
+          }
           // A reader who navigates manually while an older page is in flight
           // OR while its restore is still settling owns the position: release
           // that click's held anchors immediately so neither the pending
@@ -1627,6 +1762,7 @@ function TranscriptInner({
               if (pending?.kind === "restore" && pending.reqId === req.reqId) {
                 pendingScroll.current = null;
                 restoringRef.current = false;
+                setRestoreActiveAttr();
               }
               // A finished request's identity is released now; an in-flight
               // one is finalized by its click's finally.

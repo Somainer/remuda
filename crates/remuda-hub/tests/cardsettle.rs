@@ -1896,6 +1896,20 @@ async fn follower_parked_after_kth_live_notice_drains_the_tail_of_a_then_b_in_se
     let epoch3 =
         sweep_with_new_epoch(&addr, &node, &host_id, "cs-r11-epoch-3", json!([]), 2).await?;
 
+    // r12 item 1: make the ordering discrimination REAL. B commits AFTER A in
+    // wall-clock time (and seqs keep ascending), but backdate B's settlement
+    // rows (interactions.updated_at AND settlement_events.created_at — the
+    // columns a legacy (updated_at,id) / timestamp cursor would read) to a
+    // fixed timestamp BEFORE the test started. A strictly-forward timestamp
+    // cursor seeded mid-A would then never recover B (ts_B < cursor), and a
+    // composite (ts,id) cursor would misorder/skip it — while the monotonic
+    // seq cursor drains it correctly. Without this backdate ts_B > ts_A and
+    // the two cursor orders coincide, so the test would prove nothing against
+    // the old cursor (the r10 item-2 failure shape).
+    const BACKDATED_BEFORE_TEST: &str = "2000-01-01T00:00:00.000Z";
+    hub.test_backdate_interactions(cards_b.clone(), BACKDATED_BEFORE_TEST)
+        .await?;
+
     // Release the park: the pump's next bus poll observes Lagged and drains.
     release
         .send(())
@@ -1968,8 +1982,13 @@ async fn follower_parked_after_kth_live_notice_drains_the_tail_of_a_then_b_in_se
         drained, want_drain,
         "the drain delivers tail-of-A then B in settlement_events.seq order"
     );
-    // At the A->B boundary seq keeps ascending while ids DESCEND — the order
-    // is expressible only by the monotonic seq cursor, not timestamp+id.
+    // At the A->B boundary seq keeps ascending while BOTH the ids DESCEND
+    // (int_zzz-r11-a-00039 > int_aaa-r11-b-00000) AND B's settlement
+    // timestamps are years OLDER than A's (backdated above). Neither an id
+    // cursor nor a (updated_at,id) cursor could produce this order: a
+    // timestamp cursor seeded mid-A (ts > BACKDATED_BEFORE_TEST) would skip
+    // every B row as already-seen, yet the seq drain delivers all 120 of
+    // them after the A tail. The monotonic seq is therefore load-bearing.
     assert!(
         drained[36] > drained[37],
         "A's last id is lexically greater than B's first while seq order continues"
@@ -1977,6 +1996,20 @@ async fn follower_parked_after_kth_live_notice_drains_the_tail_of_a_then_b_in_se
     assert_eq!(
         settlement_gaps, 1,
         "one settlement-backpressure gap closes recovery"
+    );
+
+    // Prove the backdated B rows really carry the older timestamp the drain
+    // ignores: the durable page (which the lag drain uses) orders by seq and
+    // still surfaces B; a timestamp-only walk from the A cursor would find
+    // nothing after it. Assert one B row's stored timestamp is the backdate.
+    let b_page = store.invalidated_interactions_after(None).await?;
+    let b_first = b_page
+        .iter()
+        .find(|(_, id, _, _)| id == "int_aaa-r11-b_00000")
+        .expect("B's first row is in the durable settlement log");
+    assert_eq!(
+        b_first.2, "generation-ended",
+        "the backdated B row still carries its reason through the log"
     );
 
     // The B cards are durably invalidated with the generation-ended reason.

@@ -145,7 +145,13 @@ export class ConnectionMachine {
   private setState(next: ConnectionState, detail?: { pendingCount?: number }) {
     if (next === this.state) return;
     this.state = next;
-    if (next === "live") this.staleDeadlineAt = 0;
+    // Gate 9 item 1: the stale-entry deadline must not survive stale itself.
+    // Clearing it ONLY on live leaked it across offline/recovering: a
+    // REST-proven link that cycled stale→offline→recovering→stale computed
+    // offlineMs=0, went immediately offline and storm-reconnected. It is a
+    // bound on ONE quiet-stale episode, seeded on entry, discarded the moment
+    // the machine leaves stale.
+    if (next !== "stale") this.staleDeadlineAt = 0;
     this.deps.onState?.(next, detail);
   }
 
@@ -202,18 +208,40 @@ export class ConnectionMachine {
       this.beginResume();
       return;
     }
-    // gate 8 items 3 & 5:
+    // gate 8 items 3 & 5, gate 9 item 2:
     //  - a rebind from LOUD OFFLINE has no REST proof: do nothing (never
     //    enter stale and hide the banner; the offline reconnect path owns
     //    recovery).
-    //  - a rebind while a resume/quiet reopen is in flight, or while already
-    //    quiet stale, must not arm a loud second beginResume: the in-flight
-    //    attempt owns the socket and settles (frame → live, reject → stale).
-    if (opts.rebind && (this.state === "offline" || this.state === "stale" || this.resumeInFlight)) {
+    //  - a rebind while quiet stale, with NO in-flight attempt, must RE-ARM
+    //    the stale timers: a navigation into a mounted session can happen
+    //    after noteBinding retired the previous quiet attempt and cleared the
+    //    watchdog (bind was the only timer and the rebind early-return used to
+    //    strand stale with zero timers forever).
+    //  - a rebind while a resume/quiet reopen is still in flight owns nothing
+    //    new: the attempt settles (frame → live, reject → stale re-arms).
+    if (opts.rebind && (this.state === "offline" || this.resumeInFlight)) {
       if (this.deps.isFollowLive()) this.armFrameWatchdog();
       return;
     }
-    const wasLive = this.state === "live";
+    if (opts.rebind && this.state === "stale") {
+      this.armStaleProbeTimers();
+      return;
+    }
+    // gate 9 item 3: the REAL reopen path (openFollowSocket → followBound()
+    // with NO rebind) can arrive while the machine is quiet stale — the
+    // resume's own socket is opening. Skip arming a competing `bind` timer
+    // (it would beginResume 15 s later and flash the recovering banner on
+    // every blocked-upgrade cycle); the resume watchdog already owns this
+    // attempt.
+    if (!opts.rebind && this.resumeInFlight) {
+      if (this.deps.isFollowLive()) this.armFrameWatchdog();
+      return;
+    }
+    // gate 9 item 3: from quiet stale a bind deadline certifies via the SAME
+    // quiet probe path (treat stale as wasLive), never beginResume — the
+    // upgrade refusal / snapshot timeout must not produce a loud recovering
+    // cycle.
+    const wasLive = this.state === "live" || this.state === "stale";
     this.timers.set(
       "bind",
       this.schedule(() => {
@@ -326,13 +354,17 @@ export class ConnectionMachine {
           return;
         }
         const gen = this.resumeBindGen;
+        const closed = this.closedDuringResume;
         this.resumeInFlight = false;
         this.resumeRetiredOffline = false;
+        // Gate 9 item 4: the latch is consumed by THIS completion — a later
+        // healthy framed follow whose read times out must stay live again.
+        this.closedDuringResume = false;
         this.clearTimer("watchdog");        if (event.ok) {
           this.attempt = 0;
           this.setState("live");
           this.armFrameWatchdog();
-        } else if (!this.closedDuringResume && this.deps.isFollowLive()) {
+        } else if (!closed && this.deps.isFollowLive()) {
           // The resume ACTION rejected (a resume-side REST catch-up read
           // timed out under load), but the follow socket it opened is still
           // OPEN and proven live by its own frames. Frames are healing the
@@ -345,11 +377,15 @@ export class ConnectionMachine {
           this.attempt = 0;
           this.setState("live");
           this.armFrameWatchdog();
-        } else if (this.state === "stale" && !this.closedDuringResume) {
+        } else if (this.state === "stale" && !closed) {
           // This was a QUIET reopen out of a REST-proven stale state (see
           // quietReopen): REST already answered, so the failed follow re-open
           // stays quiet stale and the stale probe/offline timers keep
-          // ticking — no loud recovering/offline banner blip.
+          // ticking — no loud recovering/offline banner blip. Clear the bind
+          // deadline the real openFollowSocket path armed (gate 9 item 3):
+          // leaving it would beginResume 15 s later and flash recovering even
+          // though the attempt already settled to stale.
+          this.clearTimer("bind");
           this.attempt = 0;
           this.armStaleProbeTimers();
         } else {
@@ -357,8 +393,8 @@ export class ConnectionMachine {
           // latched closed (gate 8 item 2): leave the loud recovery state to
           // the REST probe, which settles stale/offline. Drop the latched
           // "live" label first so the settle probe is allowed to act.
-          if (this.closedDuringResume && this.state === "live") this.setState("recovering");
-          this.settleResumeFailureViaProbe();
+          if (closed && this.state === "live") this.setState("recovering");
+          this.settleResumeFailureViaProbe(closed);
         }
         // Bind match is defence in depth: noteBinding retires a superseded
         // attempt before its completion can arrive, so only a current-binding
@@ -415,7 +451,20 @@ export class ConnectionMachine {
    * and any deadline carried from an earlier stale cycle (quiet reopens), so
    * total quiet-stale time is bounded even with repeated blocked upgrades.
    */
+  /**
+   * The quiet-state retry timers: probe REST, reopening the follow when it
+   * answers, and giving up to loud offline at the end of ONE stale episode.
+   *
+   * Gate 9: the 30 s deadline is carried across re-arms DURING the same stale
+   * episode (probe cycles and quiet reopens call this without leaving stale)
+   * but re-seeded whenever the machine has actually left stale and returned —
+   * setState cleared it then, so a missing value here means a fresh entry.
+   */
   private armStaleProbeTimers() {
+    // Gate 9 item 1: seed only while IN stale. The quiet-reopen watchdog
+    // (state recovering) must not manufacture a deadline that then fires at
+    // 0 when the failed reopen lands back in stale.
+    if (this.state !== "stale") return;
     const now = this.clockNow();
     if (!this.staleDeadlineAt) {
       this.staleDeadlineAt = now + STALE_TO_OFFLINE_MS;
@@ -450,21 +499,21 @@ export class ConnectionMachine {
    * rejected, c-reconnfu gate 8) and unreachable stays loud offline with the
    * reconnect clock armed.
    */
-  private settleResumeFailureViaProbe() {
+  private settleResumeFailureViaProbe(closed: boolean = false) {
     void this.deps
       .probe()
       .then((ok) => {
         // A newer attempt owns the state.
         if (this.resumeInFlight) return;
-        // A genuinely frame-live, still-open follow owns itself. A latched
-        // close (gate 8) disqualifies that verdict even if frame timestamps
-        // are still fresh.
-        if (!this.closedDuringResume && this.deps.isFollowLive()) return;
-        // A "live" label with NO frame proof and no latched close is still
-        // trusted (the frame watchdog will age it) — only a resume failure
-        // with a provably dead/unframed link reaches the settle with live and
-        // is allowed to leave it (gate 8 item 6: resume false + unframed
-        // follow must settle, not sit on false 已连接).
+        // A genuinely frame-live follow owns itself — but NOT when the live
+        // label has no frame backing (isFollowLive false): a resume failure on
+        // an unframed socket that nevertheless sits labelled live (an earlier
+        // snapshot that was revoked) must settle via the probe rather than
+        // hold a false 已连接 (gate 8 item 6 / gate 9 item 4).
+        if (!closed && this.deps.isFollowLive()) return;
+        // An unframed live (or a latched-closed live) leaves the label for the
+        // probe decision; framed-open without a latch stays live above.
+        if (this.state === "live") this.setState("recovering");
         if (ok) {
           this.attempt = 0;
           this.setState("stale");
@@ -544,8 +593,15 @@ export class ConnectionMachine {
 
   /** beginResume variant that keeps a REST-proven stale state banner-less. */
   private armResumeAttemptQuiet(gen: number): number {
-    this.clearTimers("stale", "offline", "probe", "reconnect");
+    // Gate 9 item 5: keep the stale-entry `offline` deadline armed across the
+    // quiet reopen (real bound ≈ 15 s probe + read + 20 s watchdog; dropping
+    // it left quiet stale unbounded when upgrades stayed blocked). Only the
+    // stale/probe/reconnect timers are replaced; the watchdog bounds THIS
+    // attempt, and on settle armStaleProbeTimers re-arms everything using the
+    // carried deadline.
+    this.clearTimers("stale", "probe", "reconnect");
     // NOTE: no setState("recovering") — stay in quiet stale.
+    this.closedDuringResume = false; // gate 9 item 4: fresh attempt, clean latch
     this.resumeInFlight = true;
     this.resumeBindGen = gen;
     const attemptId = ++this.resumeAttemptId;
@@ -672,6 +728,9 @@ export class ConnectionMachine {
   private armResumeAttempt(gen: number = this.latestBindGen): number {
     this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog");
     this.resumeRetiredOffline = false;
+    // Gate 9 item 4: every NEW attempt starts with a clean latch. A close
+    // latched by a previous attempt must not poison later healthy resumes.
+    this.closedDuringResume = false;
     this.setState("recovering");
     this.resumeInFlight = true;
     this.resumeBindGen = gen;

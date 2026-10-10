@@ -294,6 +294,12 @@ pub struct Store {
     /// `patch_project_with_route` writer job (atomic project PATCH).
     #[cfg(any(test, feature = "test-faults"))]
     test_fence_before_project_patch: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: a fence applied inside the NEXT
+    /// `mark_forward_intent` writer job, immediately before its stamped
+    /// initiator re-check — the window between create-command admission and
+    /// the forward-intent mark (ma-initiator r6 item 1).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_fence_before_forward_intent: Arc<std::sync::Mutex<Option<String>>>,
     /// Per-Store test fault flags (`test-faults` feature only). Shared via
     /// [`Arc`] so every clone of the store arms the SAME flags.
     #[cfg(any(test, feature = "test-faults"))]
@@ -2381,6 +2387,8 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             test_fence_before_project_patch: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-faults"))]
+            test_fence_before_forward_intent: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
@@ -2558,6 +2566,20 @@ impl Store {
             .lock()
             .expect("project patch seam lock")
             .take()
+    }
+
+    /// Test-only: arm a fence applied inside the NEXT `mark_forward_intent`
+    /// writer job, immediately before its stamped-initiator re-check. This is
+    /// the window after the create command was admitted but before (or in)
+    /// the forward-intent mark — the row is `requested`, holds its slot and
+    /// any continuity lineage seat, and no frame has reached a Node.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_fence_before_forward_intent(&self, instance_id: String) {
+        *self
+            .test_fence_before_forward_intent
+            .lock()
+            .expect("forward intent seam lock") = Some(instance_id);
     }
 
     /// Run a read on the read-only pool instead of the writer thread.
@@ -5036,7 +5058,21 @@ impl Store {
     /// inside the writer job. A same-id replay of a held row by a since-fenced
     /// initiator is refused here, before any frame is written to a Node.
     pub async fn mark_forward_intent(&self, command_id: String) -> Result<bool, StoreError> {
+        // Drain the test-only fence seam before entering the writer job; the
+        // fence is applied at the top of the job below.
+        #[cfg(any(test, feature = "test-faults"))]
+        let armed_fence = self
+            .test_fence_before_forward_intent
+            .lock()
+            .expect("forward intent seam lock")
+            .take();
         self.run_named("mark_forward_intent", move |conn| {
+            // Test-only seam (ma-initiator r6 item 1): a fence landing after
+            // create-command admission but before the forward-intent mark.
+            #[cfg(any(test, feature = "test-faults"))]
+            if let Some(fenced_instance) = armed_fence {
+                test_apply_fence(conn, &fenced_instance)?;
+            }
             let Some(row) = load_command(conn, &command_id)? else {
                 return Err(StoreError::Id("unknown command".into()));
             };

@@ -620,7 +620,34 @@ pub async fn spawn_on_host(
         }
         Err(error) => return Err(crate::http::map_store(error)),
     };
-    let command = crate::http::forward_if_online(state, command, true).await?;
+    let command = match crate::http::forward_if_online(state, command, true).await {
+        Ok(command) => command,
+        // ma-initiator r6 item 1: the fence landed in `mark_forward_intent` —
+        // its writer re-checked the stamped initiator and refused before any
+        // frame was written to a Node. The `requested` instance row (with its
+        // slot), a continuity child's `starting` lineages row (its lineage
+        // seat) and the queued create command are all still behind. Purging
+        // them here is mandatory: otherwise expire_stale_requested eventually
+        // settles the chapter `create_never_acknowledged` — a terminal for a
+        // chapter that never existed on any Node (OA6). This Fenced can only
+        // originate in the pre-send intent mark: every path after a frame was
+        // sent returns other errors (or Ok), never Fenced.
+        Err(HubError::Fenced) => {
+            if let Err(error) = state
+                .store
+                .purge_requested_instance(instance.instance_id.clone())
+                .await
+            {
+                tracing::warn!(
+                    instance_id = %instance.instance_id,
+                    %error,
+                    "fenced forward intent: requested-instance purge failed"
+                );
+            }
+            return Err(HubError::Fenced);
+        }
+        Err(error) => return Err(error),
+    };
     // D-048: once the instance exists and create was forwarded, install the
     // egress context (credential, base URL, headers) on the proxy Node for a
     // hub-relay route. The credential rides api.egress, never api.open; this

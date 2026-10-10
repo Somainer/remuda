@@ -1891,6 +1891,100 @@ async fn fenced_project_patch_writes_neither_the_doc_nor_the_route_override() {
     );
 }
 
+// ── 9d. A fence in mark_forward_intent purges the requested chapter instead
+//      of letting expire_stale_requested settle a never-Node chapter (OA6) ──
+
+#[tokio::test]
+async fn fenced_forward_intent_purges_the_requested_instance_and_its_command() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+
+    // The fence lands INSIDE the mark_forward_intent writer job: the create
+    // command was already admitted and the instance row holds its slot, but
+    // the stamped-initiator re-check refuses before any frame is sent.
+    ctx.store()
+        .test_arm_fence_before_forward_intent(ctx.instance.clone());
+
+    let (status, body) = ctx
+        .agent_post(
+            "/v1/instances",
+            json!({"hostId":ctx.host,"kind":"claude","driver":"claude-print",
+                   "permissionMode":"manual","prompt":"fenced at forward intent"}),
+        )
+        .await;
+    assert_fenced(status, &body);
+
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    let instance_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(instance_count, 1, "only the boot chapter survives: {body}");
+    // The queued create behind the purged row must be gone too
+    // (purge_requested_instance deletes commands by instance_id).
+    let orphan_commands: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM commands
+              WHERE instance_id IS NOT NULL
+                AND instance_id NOT IN (SELECT id FROM instances)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        orphan_commands, 0,
+        "the queued create command must be purged with the requested row"
+    );
+    // The held slot is derived from the instances row (INSERT_SLOT_COUNT_SQL),
+    // so instance_count == 1 also proves the requested slot was released.
+    // No frame reached the Node: the forward-intent writer refused first.
+    node.assert_next_frame_is_sentinel(&ctx).await;
+}
+
+// ── 9e. Same fence for a CONTINUITY child: its `starting` lineage seat is
+//      purged as well, not left holding the lineage after the chapter ──────
+
+#[tokio::test]
+async fn fenced_forward_intent_on_a_continuity_child_purges_its_lineage_seat() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+
+    let lineages_before: i64 = {
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        db.query_row("SELECT COUNT(*) FROM lineages", [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        lineages_before, 1,
+        "the boot coordinator owns the one lineage"
+    );
+
+    // A grant-bearing child creates a SECOND lineage row at insert time; the
+    // fence then lands in mark_forward_intent before a frame is sent.
+    ctx.store()
+        .test_arm_fence_before_forward_intent(ctx.instance.clone());
+    let (status, body) = ctx
+        .agent_post(
+            "/v1/instances",
+            json!({"hostId":ctx.host,"projectId":ctx.project,"kind":"claude",
+                   "driver":"claude-print","grants":["land"],
+                   "permissionMode":"manual","prompt":"continuity child fenced at intent"}),
+        )
+        .await;
+    assert_fenced(status, &body);
+
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    let instances: i64 = db
+        .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(instances, 1, "only the boot chapter survives: {body}");
+    let lineages_after: i64 = db
+        .query_row("SELECT COUNT(*) FROM lineages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        lineages_after, 1,
+        "the child's `starting` lineage seat must be purged, not left holding a dead chapter"
+    );
+    node.assert_next_frame_is_sentinel(&ctx).await;
+}
+
 // ── 10. Worker routes stay 403 for Agents; the node_ops admission boundary ─
 //      still covers worker.provision at the helper/store level (ma-admission
 //      owns the route opening: main-agent.md §15 task 7). ───────────────────

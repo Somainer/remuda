@@ -70,6 +70,17 @@ restored issued stamp, which would revive an expired code once on the next
 start. In the m1 image the mount is `/data00/remuda/secrets` → `/secrets`,
 so the reference is `bootstrapToken = "file:/secrets/access-code"`.
 
+**Precedence:** a configured explicit file/env always wins over the Hub's own
+token, even when the path *is* `<data-dir>/bootstrap-token` (an operator
+pasting a previously minted code back in). The explicit source is the sole
+code — it is never silently reminted, the marker is written, and
+`rotate-bootstrap` refuses on every restart with that config. We deliberately
+do NOT reject the self-reference: the operator may intentionally pin the file
+the Hub itself manages, and an error would block the adoption/restart flow. To
+hand the code back to the Hub (regain rotation), remove the explicit source
+and start once without it; that start adopts the persisted token as
+hub-generated and clears the marker.
+
 An explicit code does **not** skip the TTL. The code is trimmed of
 surrounding whitespace/newlines before use; an empty or whitespace-only value
 is refused before anything is written. The durable write ORDER differs by

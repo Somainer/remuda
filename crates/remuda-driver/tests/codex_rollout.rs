@@ -528,7 +528,7 @@ fn locate_by_cwd_skips_files_and_date_dirs_older_than_the_launch_floor() {
 
     // Floor in the future: both the file and its date directory predate it.
     let future = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
-    let found = locate_rollout_by_cwd(home.path(), cwd, future);
+    let found = locate_rollout_by_cwd(home.path(), cwd, future, &|_| false);
     assert!(
         matches!(found, CwdRollout::NotYet),
         "old mtime skips parsing even though the content matches: {found:?}"
@@ -536,7 +536,7 @@ fn locate_by_cwd_skips_files_and_date_dirs_older_than_the_launch_floor() {
 
     // A normal (past) floor parses the same file and binds.
     let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(10);
-    let found = locate_rollout_by_cwd(home.path(), cwd, past);
+    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false);
     assert!(
         matches!(found, CwdRollout::Found { .. }),
         "fresh mtime binds"
@@ -566,7 +566,7 @@ fn locate_by_cwd_skips_old_files_inside_a_non_date_directory() {
         .unwrap();
     }
     let future = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
-    let found = locate_rollout_by_cwd(home.path(), cwd, future);
+    let found = locate_rollout_by_cwd(home.path(), cwd, future, &|_| false);
     assert!(
         matches!(found, CwdRollout::NotYet),
         "the per-file mtime filter skips a parseable match: {found:?}"

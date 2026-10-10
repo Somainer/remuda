@@ -31,7 +31,7 @@
 //!   channel (P5); the rollout only shows the resulting rejection string.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use remuda_protocol::{AgentKind, Id, ObservationPayload, Timestamp, ToolOutcome, UsageScope};
 
@@ -77,17 +77,15 @@ pub struct CodexAdapter {
     usage_totals: UsageAggregator,
     /// Optional fallback model for usage records whose turn had no context.
     fallback_model: Option<String>,
-    /// Discovery was proven impossible for this launch: two same-cwd
-    /// post-launch rollouts exist at the same time (ambiguous, fail closed).
-    /// When set, the poller stops scanning the home forever. A mere "nothing
-    /// matched yet" does NOT set this: codex 0.154 writes `session_meta`
-    /// lazily on the first turn, which can arrive minutes after launch, so the
-    /// adapter keeps discovering (cheaply, via the locator's mtime/date
-    /// pruning — c-usagefu r4 item 2/6) until it binds or the instance closes.
+    /// Discovery proven impossible: TWO unclaimed valid rollouts exist at
+    /// once for this same cwd and this input (duplicate own prompts —
+    /// genuinely indistinguishable), or a claim race left two identical
+    /// candidates. A transient "another window overlaps" does NOT latch: the
+    /// adapter keeps discovering until it binds or the instance closes, and
+    /// the window is released either way (c-usagefu r5 item 1).
     discovery_gave_up: bool,
     /// Process-wide same-cwd launch window for a driver launch. None for a
-    /// promoted/attach adapter (no launch floor); when two windows overlap
-    /// the cwd is ambiguous and this adapter fails closed (r4 item 3).
+    /// promoted/attach adapter (no launch floor); released on bind/give-up.
     window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
 }
 
@@ -124,9 +122,12 @@ impl CodexAdapter {
     /// Seed a model used to price usage when `turn_context` never reported one.
     #[must_use]
     pub fn with_fallback_model(mut self, model: impl Into<String>) -> Self {
+        // Replace in place: CodexAdapter has a Drop impl, so moving the usage
+        // field out of `&mut self` is not allowed.
+        let previous = std::mem::replace(&mut self.usage, CodexUsage::new());
         let model = model.into();
         self.fallback_model = Some(model.clone());
-        self.usage = self.usage.with_fallback_model(model);
+        self.usage = previous.with_fallback_model(model);
         self
     }
 
@@ -152,14 +153,19 @@ impl CodexAdapter {
         }
     }
 
-    /// Bind the rollout tail for a discovered session.
-    fn bind(&mut self, session_id: String, path: PathBuf) {
-        // A driver launch binds a session and must read only what is appended
-        // AFTER the bind — never byte zero, or a crash-loop relaunch within
-        // the clock slack re-journals the previous rollout (r4 item 3).
-        // Hook-confirmed / promoted attaches still hydrate from byte zero
-        // (their durable dedupe makes the replay harmless and the history is
-        // wanted).
+    /// Bind the rollout tail for a discovered or hook-confirmed session.
+    ///
+    /// Claims the file process-wide (no other adapter may bind it) and, for a
+    /// driver launch, releases the same-cwd discovery window so a later
+    /// launch is not tainted by this instance (c-usagefu r5 item 1).
+    fn bind(&mut self, session_id: String, path: PathBuf) -> bool {
+        // Two adapters polling in parallel can race for the same file; a lost
+        // claim means the candidate is someone else's — don't bind.
+        if !crate::adapters::codex_discovery::claim(&path) {
+            return false;
+        }
+        // Tail position is chosen by the driver-launch floor rules; promoted
+        // and hook-confirmed attaches hydrate from byte zero.
         let tail = if self.home.launched_at.is_some() {
             RolloutTail::new_at_end(path.clone()).unwrap_or_else(|_| RolloutTail::new(path.clone()))
         } else {
@@ -171,6 +177,20 @@ impl CodexAdapter {
             directory: path.parent().map(|parent| parent.to_path_buf()),
             main_file: Some(path),
         });
+        // Bound: stop counting against later launches in this cwd.
+        if let Some(mut window) = self.window.take() {
+            window.release();
+        }
+        true
+    }
+
+    /// Give up discovery permanently (real file-level ambiguity) and release
+    /// the overlap window; the claim set is untouched (nothing was bound).
+    fn give_up(&mut self) {
+        self.discovery_gave_up = true;
+        if let Some(mut window) = self.window.take() {
+            window.release();
+        }
     }
 
     /// Find the session's rollout.
@@ -202,8 +222,7 @@ impl CodexAdapter {
         }
         if let Some(id) = self.confirmed.clone() {
             if let Some(path) = locate_rollout_in(&self.home.home, &id) {
-                self.bind(id, path);
-                return Ok(true);
+                return Ok(self.bind(id, path));
             }
             return Ok(false);
         }
@@ -211,31 +230,42 @@ impl CodexAdapter {
             if let Some(id) = newest_indexed(&self.home.home)
                 && let Some(path) = locate_rollout_in(&self.home.home, &id)
             {
-                self.bind(id, path);
-                return Ok(true);
+                return Ok(self.bind(id, path));
             }
             return Ok(false);
         };
         // No time deadline: the rollout can appear on a first prompt minutes
         // after launch. Old pre-launch rollouts are filtered by timestamp AND
         // skipped cheaply via mtime/date pruning in the locator.
-        // Cross-instance same-cwd: another launch window overlapping this cwd
-        // makes ownership unprovable for both, permanently.
-        if self.window.as_ref().is_some_and(|window| window.tainted()) {
-            self.discovery_gave_up = true;
-            return Ok(false);
-        }
-        match locate_rollout_by_cwd(&self.home.home, &self.home.cwd, launched_at) {
+        let overlapping = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.overlapping());
+        match locate_rollout_by_cwd(
+            &self.home.home,
+            &self.home.cwd,
+            launched_at,
+            &|path: &Path| crate::adapters::codex_discovery::is_claimed(path),
+        ) {
+            // A unique UNCLAIMED match is ours even while another window is
+            // open: files the other adapter bound are excluded above, so the
+            // "A bound first" race resolves cleanly (a parallel claim race
+            // returns false here and we keep discovering).
             CwdRollout::Found { id, path } => {
                 self.confirmed = Some(id.clone());
-                self.bind(id, path);
-                Ok(true)
+                Ok(self.bind(id, path))
             }
-            // Two same-cwd sessions started within the launch window: ownership
-            // is unprovable, never pick one and never reconsider.
+            // Two UNCLAIMED same-cwd sessions exist at once. While a partner
+            // window is still open one of them may be theirs — wait (never
+            // latch). After the overlap ends the two are genuinely
+            // indistinguishable: fail closed.
             CwdRollout::Ambiguous => {
-                self.discovery_gave_up = true;
-                Ok(false)
+                if overlapping {
+                    Ok(false)
+                } else {
+                    self.give_up();
+                    Ok(false)
+                }
             }
             CwdRollout::NotYet => Ok(false),
         }
@@ -537,6 +567,20 @@ impl CodexAdapter {
                 .with_native_at(native_at),
         );
         out
+    }
+}
+
+impl Drop for CodexAdapter {
+    fn drop(&mut self) {
+        // Release the claimed rollout when the instance closes, so a relaunch
+        // may bind the same physical file again.
+        if let Some(binding) = self.binding.take()
+            && let Some(path) = binding.main_file
+        {
+            crate::adapters::codex_discovery::release_claim(&path);
+        }
+        // The window's own Drop covers the unbound case (and the bound case if
+        // bind() was bypassed in tests).
     }
 }
 

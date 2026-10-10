@@ -569,81 +569,154 @@ fn launch_adapter(home: &Path, cwd: &str, floor: OffsetDateTime) -> CodexAdapter
 }
 
 #[test]
-fn overlapping_same_cwd_launch_windows_fail_closed_for_both() {
-    // r4 item 3: two generic-pty codex instances in the same cwd seconds
-    // apart. A is unbound (its rollout not created yet) when B launches; the
-    // overlap must make both adapters fail closed even if only one rollout
-    // ever appears — B must never bind A's thread.
+fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own() {
+    // r5 item 1: A binds at 10:01 and its window must not linger; B launched
+    // in the same cwd later is never tainted, and A's claimed rollout is
+    // invisible to B, so B binds B's own file.
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/race-overlap";
+    let cwd = "/projects/r5-sequential";
     let now = OffsetDateTime::now_utc();
-    let floor = now - time::Duration::seconds(5);
+    // Relative timing: A launched long ago; B launches a little later and
+    // both session timestamps are real (past) so file mtime pruning does not
+    // shadow the assertion. B's floor is strictly after A's session start.
+    let floor_a = now - time::Duration::seconds(60);
+    let a_started = (now - time::Duration::seconds(50))
+        .format(&Rfc3339)
+        .unwrap();
 
-    let mut a = launch_adapter(home.path(), cwd, floor);
-    assert!(!a.discover().unwrap(), "nothing exists yet: NotYet");
-    assert!(!a.discovery_gave_up);
-
-    let mut b = launch_adapter(home.path(), cwd, floor);
+    let mut a = launch_adapter(home.path(), cwd, floor_a);
+    write_rollout(home.path(), "2026/09/14", "A-thread", cwd, &a_started);
+    assert!(a.discover().unwrap(), "A binds its unique rollout");
     assert!(
-        b.window.as_ref().is_some_and(|window| window.tainted()),
-        "B opened into A's still-open window"
+        a.window.is_none(),
+        "binding releases the discovery window immediately"
     );
-    assert!(!b.discover().unwrap());
-    assert!(b.discovery_gave_up, "B fails closed immediately");
+
+    // B launches later with a fresh floor after A's session started.
+    let floor_b = now - time::Duration::seconds(10);
+    let mut b = launch_adapter(home.path(), cwd, floor_b);
+    assert!(
+        !b.window.as_ref().is_some_and(|window| window.overlapping()),
+        "A is no longer discovering: B opens clean"
+    );
+    assert!(
+        !b.discover().unwrap(),
+        "A's claimed rollout must not bind to B"
+    );
     assert!(b.binding().is_none());
 
-    // A becomes ambiguous too while still unbound; its own rollout appearing
-    // does not rescue either adapter.
-    assert!(!a.discover().unwrap());
-    write_rollout(
-        home.path(),
-        "2026/09/14",
-        "A-only",
-        cwd,
-        &now.format(&Rfc3339).unwrap(),
+    // B's own lazily-created rollout appears; unique and unclaimed → binds.
+    let later = (now - time::Duration::seconds(2)).format(&Rfc3339).unwrap();
+    write_rollout(home.path(), "2026/09/14", "B-thread", cwd, &later);
+    assert!(b.discover().unwrap());
+    assert_eq!(
+        b.binding().map(|binding| binding.session_id.as_str()),
+        Some("B-thread")
     );
-    assert!(!a.discover().unwrap());
-    assert!(a.binding().is_none());
-
-    // When both windows close, a LATER launch in the same cwd starts clean.
-    drop(a);
-    drop(b);
-    let fresh = launch_adapter(home.path(), cwd, OffsetDateTime::now_utc());
-    assert!(
-        !fresh.window.as_ref().is_some_and(|window| window.tainted()),
-        "the registry refcount cleared with the two windows"
-    );
-}
-
-#[test]
-fn a_second_instance_never_binds_the_firsts_already_bound_rollout() {
-    // The original race shape: A was prompted first and bound its unique
-    // rollout; B opens before its own (lazy) rollout exists. Even though the
-    // locator sees exactly one matching file, B's overlapping window forbids
-    // binding it.
-    let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/race-bound";
-    let now = OffsetDateTime::now_utc();
-    let floor = now - time::Duration::seconds(5);
-
-    let mut a = launch_adapter(home.path(), cwd, floor);
-    write_rollout(
-        home.path(),
-        "2026/09/14",
-        "A-thread",
-        cwd,
-        &now.format(&Rfc3339).unwrap(),
-    );
-    assert!(a.discover().unwrap());
+    // And A still owns A.
     assert_eq!(
         a.binding().map(|binding| binding.session_id.as_str()),
         Some("A-thread")
     );
+}
+
+#[test]
+fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
+    // Three generic-pty codex panes in one cwd launched together: while they
+    // overlap, an ambiguity (two files appearing) must WAIT, never give up
+    // permanently; the claimed set keeps an already-bound file out of the
+    // match set; closing seekers un-taints the survivors.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r5-three";
+    let floor = OffsetDateTime::now_utc() - time::Duration::seconds(5);
+    let now = OffsetDateTime::now_utc();
+
+    let mut a = launch_adapter(home.path(), cwd, floor);
+    let mut b = launch_adapter(home.path(), cwd, floor);
+    let mut c = launch_adapter(home.path(), cwd, floor);
+    for adapter in [&a, &b, &c] {
+        assert!(
+            adapter
+                .window
+                .as_ref()
+                .is_some_and(|window| window.overlapping()),
+            "three seekers overlap"
+        );
+    }
+
+    // A's rollout appears and A wins it; B and C must not latch give-up and
+    // must not touch A's file.
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "A1",
+        cwd,
+        &now.format(&Rfc3339).unwrap(),
+    );
+    // Exactly one poll across the three claims A1 (others see zero unclaimed
+    // or a lost claim); drive a couple of ticks so the claim resolves.
+    let mut bound = None;
+    for adapter in [&mut a, &mut b, &mut c] {
+        if adapter.discover().unwrap() {
+            bound = Some(
+                adapter
+                    .binding()
+                    .map(|binding| binding.session_id.clone())
+                    .unwrap(),
+            );
+        }
+    }
+    assert_eq!(bound.as_deref(), Some("A1"), "exactly one adapter binds A1");
+    for adapter in [&b, &c] {
+        assert!(
+            !adapter.discovery_gave_up,
+            "overlap never latches a permanent give-up"
+        );
+        assert!(adapter.binding().is_none());
+    }
+
+    // Idle B closes without ever binding: C un-taints but A is already bound
+    // (window released), so C alone may wait for its own file.
+    drop(b);
+    assert!(
+        !c.window.as_ref().is_some_and(|window| window.overlapping()),
+        "closing an idle seeker clears the overlap"
+    );
+}
+
+#[test]
+fn an_idle_unbound_instance_does_not_block_a_later_second_instance() {
+    // A launched but never prompted (idle, window still open). B launches in
+    // the same cwd; while both overlap B waits, but when A is closed B binds
+    // its own rollout — A's lingering window cannot poison B for its life.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r5-idle";
+    let floor = OffsetDateTime::now_utc() - time::Duration::seconds(5);
+    let mut a = launch_adapter(home.path(), cwd, floor);
+    assert!(!a.discover().unwrap(), "A has no rollout yet");
 
     let mut b = launch_adapter(home.path(), cwd, floor);
-    assert!(!b.discover().unwrap(), "one file, but two live windows");
-    assert!(b.binding().is_none());
-    assert!(b.discovery_gave_up);
+    assert!(
+        b.window.as_ref().is_some_and(|window| window.overlapping()),
+        "B overlaps the still-idle A"
+    );
+
+    // A is closed (instance torn down without ever being prompted).
+    drop(a);
+
+    let now = OffsetDateTime::now_utc();
+    write_rollout(
+        home.path(),
+        "2026/09/14",
+        "B-only",
+        cwd,
+        &now.format(&Rfc3339).unwrap(),
+    );
+    assert!(b.discover().unwrap());
+    assert_eq!(
+        b.binding().map(|binding| binding.session_id.as_str()),
+        Some("B-only")
+    );
 }
 
 #[test]

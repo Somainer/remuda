@@ -468,6 +468,7 @@ pub fn locate_rollout_by_cwd(
     codex_home: &Path,
     cwd: &Path,
     launched_at: time::OffsetDateTime,
+    exclude: &dyn Fn(&Path) -> bool,
 ) -> CwdRollout {
     let floor = launched_at - LAUNCH_TIME_SLACK;
     // Wall-clock form of the floor for mtime comparisons.
@@ -518,6 +519,7 @@ pub fn locate_rollout_by_cwd(
                     .path()
                     .extension()
                     .is_none_or(|value| value != "jsonl")
+                || exclude(entry.path().as_path())
             {
                 continue;
             }

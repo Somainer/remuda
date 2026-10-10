@@ -94,14 +94,17 @@ fn fixture() -> Fixture {
     git(&lane, &["config", "user.name", "T"]);
     git(&lane, &["fetch", "-q", "origin"]);
 
-    // The fake merge CLI: flush one step to a `remuda-mq-*/gate.jsonl` (what the
-    // real gate does, and what `stream_gate_report` tails to emit gate.event
-    // steps), then sleep ~10s, then print the verdict JSON. Fake shas are fine
-    // for a verify — pinning the merge only warns when the object is absent.
+    // The fake merge CLI: flush one step to a `remuda-mq-<its own pid>-*/gate.jsonl`
+    // (what the real gate does, and what `stream_gate_report` tails to emit
+    // gate.event steps), then sleep ~10s, then print the verdict JSON. The
+    // scratch is pid-named so only this run tails it and is removed on exit.
+    // Fake shas are fine for a verify — pinning the merge only warns when the
+    // object is absent.
     let bin = dir.path().join("fake-merge.sh");
     let script = r#"#!/bin/bash
 set -eu
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-fake.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-$$-0-XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
 echo '{"name":"secret-scan","status":"ok","durationMs":11,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
 echo 'gate: secret-scan' >&2
 sleep 10

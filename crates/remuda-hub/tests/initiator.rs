@@ -1553,6 +1553,75 @@ async fn cancel_of_a_job_finished_between_preread_and_writer_is_409_and_sends_no
     node.assert_next_frame_is_sentinel(&ctx).await;
 }
 
+/// A cancel request committing strictly between `apply_result`'s pre-read
+/// and its writer job must not be overwritten. The stale pre-read saw
+/// Running; inside the writer the row is Canceling. A land `base-moved`
+/// verdict used to rewrite that Canceling row back to Queued (re-queue for
+/// another verify+land), so the job ran again and could land although the
+/// cancel caller already held a 200.
+#[tokio::test]
+async fn a_cancel_between_a_result_preread_and_its_writer_keeps_the_row_canceling() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+
+    // A LAND job, queued then claimed to Running exactly like a tick claim
+    // (no lane is configured, so the real tick never dispatches it).
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/cancel-vs-result","mode":"land"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job_id = body["id"].as_str().unwrap().to_owned();
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("the queued land job claims to running");
+    assert_eq!(claimed["state"], json!("running"), "{claimed}");
+
+    // Deterministic seam: the cancel commits Running -> Canceling INSIDE
+    // the result's mutate_gate_job writer job, before the doc loads.
+    ctx.store()
+        .test_arm_cancel_before_gate_mutate(job_id.clone());
+
+    // The real apply_result path: pre-read sees Running, the seam then
+    // commits the cancel, and the writer re-checks the live state.
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id,
+                "status": "base-moved",
+                "currentMainSha": "0123456789abcdef0123456789abcdef01234567"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let doc = ctx
+        .hub
+        .test_get_gate_job(&job_id)
+        .await
+        .unwrap()
+        .expect("job exists");
+    assert_ne!(
+        doc["state"],
+        json!("queued"),
+        "the stale pre-read rewrote the Canceling row to Queued; the job would run and land again: {doc}"
+    );
+    assert_eq!(
+        doc["state"],
+        json!("canceled"),
+        "the writer-observed Canceling state must settle the base-moved verdict as canceled: {doc}"
+    );
+    assert!(
+        !doc["cancelRequestedAt"].is_null(),
+        "the cancel stamp must survive the result: {doc}"
+    );
+}
+
 // ── 6c. A narrowed Bot token acts for the live chapter (CLI path) ─────────
 
 #[tokio::test]

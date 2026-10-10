@@ -300,6 +300,12 @@ pub struct Store {
     /// the forward-intent mark (ma-initiator r6 item 1).
     #[cfg(any(test, feature = "test-faults"))]
     test_fence_before_forward_intent: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: the NEXT `mutate_gate_job` writer job commits a
+    /// Running -> Canceling transition on the named job BEFORE loading its
+    /// doc — a cancel request committing strictly between a result's
+    /// pre-read and its writer (ma-initiator r6 item 5).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_cancel_before_gate_mutate: Arc<std::sync::Mutex<Option<String>>>,
     /// Per-Store test fault flags (`test-faults` feature only). Shared via
     /// [`Arc`] so every clone of the store arms the SAME flags.
     #[cfg(any(test, feature = "test-faults"))]
@@ -2389,6 +2395,8 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             test_fence_before_forward_intent: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-faults"))]
+            test_cancel_before_gate_mutate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
@@ -2557,6 +2565,27 @@ impl Store {
             .test_fence_before_project_patch
             .lock()
             .expect("project patch seam lock") = Some(instance_id);
+    }
+
+    /// Test-only: arm a cancel (Running -> Canceling) that the NEXT
+    /// `mutate_gate_job` writer job for `job_id` commits before loading the
+    /// job doc — the window between `apply_result`'s pre-read and its writer.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_cancel_before_gate_mutate(&self, job_id: String) {
+        *self
+            .test_cancel_before_gate_mutate
+            .lock()
+            .expect("gate mutate cancel seam lock") = Some(job_id);
+    }
+
+    /// Test-only: drain (at most) the armed pre-mutate cancel.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn take_test_cancel_before_gate_mutate(&self) -> Option<String> {
+        self.test_cancel_before_gate_mutate
+            .lock()
+            .expect("gate mutate cancel seam lock")
+            .take()
     }
 
     /// Test-only: drain (at most) the armed project-patch fence.

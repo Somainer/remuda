@@ -884,9 +884,10 @@ pub(crate) async fn on_event(
     Ok(())
 }
 
-/// Apply the terminal verdict (event or RPC reply). Idempotent: only a running
-/// job transitions.
-async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
+/// Apply a gate run verdict (RPC reply or terminal event). Idempotent: only a
+/// running/canceling job transitions. `pub(crate)` for the deterministic
+/// pre-read-vs-writer race test in the initiator suite.
+pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
     // The terminal `finished` event and the `gate.run` reply carry the same
     // verdict; this read makes the second arrival a no-op before it would
     // replace the stored log object.
@@ -927,6 +928,9 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
     // main moved, so we keep `landed` and record the cancel arrived too late
     // (honesty over tidiness). Everything else canceling ends `canceled`,
     // keeping mergeSha/mergeRef/steps, with no home-host handoff.
+    // The state at the pre-read decides the (awaited) home-land plan; the
+    // mutate closure below re-checks the state INSIDE its writer job, because
+    // a cancel request can commit between this read and the writer.
     let is_canceling = existing.state == GateJobState::Canceling;
     let home_land = if !is_canceling && existing.mode == GateMode::Land && result.status == "passed"
     {
@@ -935,10 +939,22 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
         None
     };
     let landing = home_land.clone();
+    // Set by the writer when the row is found Canceling INSIDE the mutate
+    // job (a cancel that committed after the pre-read above). The post-writer
+    // side effects must treat that the same as a pre-read Canceling row.
+    let fresh_canceling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fresh_canceling_writer = fresh_canceling.clone();
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row| {
-            if is_canceling {
+            // Re-read the live state inside the writer job: the pre-read
+            // above can be stale by one cancel commit. Without this, a land
+            // `base-moved` verdict arriving in the same window would rewrite
+            // the Canceling row back to Queued — the job runs again and can
+            // land although the caller already received 200 canceling.
+            let canceling = row.state == GateJobState::Canceling;
+            if canceling {
+                fresh_canceling_writer.store(true, std::sync::atomic::Ordering::Relaxed);
                 // The lane's `gate.run` RPC stays outstanding across a
                 // `pushFrom: home` handoff. If a home push is in flight, stand
                 // down: land_from_home owns the terminal write and records the
@@ -1072,7 +1088,12 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
         return;
     };
     // A claimed handoff: verified on the lane, now push from the home host.
-    if let Some(plan) = home_land {
+    // The closure keeps the row `running` ONLY while the handoff still
+    // stands: a cancel the writer found after the pre-check ended the row
+    // (Canceled/Landed), so a plan from the stale pre-read must not fire.
+    if let Some(plan) = home_land
+        && job.state == GateJobState::Running
+    {
         journal(state, &job.requested_by, "gate.verified", &job).await;
         let state = state.clone();
         let job_id = job.id.as_id().to_string();
@@ -1096,10 +1117,12 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
     // A canceled job's pinned merge will never be landed; a lane-side land
     // already consumed its own pin. Either way the refs go now rather than
     // waiting for retention. The exception is a job canceled after it verified
-    // (`is_canceling`): it keeps its pinned merge so an operator can still land
-    // it by hand, and retention drops the ref later like any unlanded verify.
+    // (the row was Canceling at the pre-read OR the writer found it
+    // Canceling): it keeps its pinned merge so an operator can still land it
+    // by hand, and retention drops the ref later like any unlanded verify.
+    let canceling = is_canceling || fresh_canceling.load(std::sync::atomic::Ordering::Relaxed);
     if matches!(job.state, GateJobState::Landed)
-        || (job.state == GateJobState::Canceled && !is_canceling)
+        || (job.state == GateJobState::Canceled && !canceling)
     {
         drop_job_refs(state, &job).await;
     }
@@ -1726,7 +1749,30 @@ impl Store {
         F: FnOnce(&mut GateJob) -> Option<()> + Send + 'static,
     {
         let id = id.to_owned();
+        // Test-only seam: a cancel request commits Running -> Canceling
+        // before this writer loads the doc (drained outside, applied inside).
+        #[cfg(any(test, feature = "test-faults"))]
+        let armed_cancel = self.take_test_cancel_before_gate_mutate();
         self.run_named("mutate_gate_job", move |conn| {
+            #[cfg(any(test, feature = "test-faults"))]
+            if let Some(cancel_job) = armed_cancel
+                && cancel_job == id
+            {
+                // Same transition request_gate_job_cancel commits: state,
+                // stamped doc fields and revision, only for a still-Running
+                // job (a terminal row is never dragged back).
+                conn.execute(
+                    "UPDATE gate_jobs
+                        SET state = 'canceling',
+                            doc_json = json_set(
+                                json_set(doc_json, '$.state', 'canceling'),
+                                '$.cancelRequestedAt', ?2),
+                            revision = revision + 1,
+                            updated_at = ?2
+                      WHERE id = ?1 AND state = 'running'",
+                    params![id, now()],
+                )?;
+            }
             let Some(mut job) = conn
                 .query_row(
                     "SELECT doc_json FROM gate_jobs WHERE id = ?1",

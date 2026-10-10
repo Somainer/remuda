@@ -638,6 +638,20 @@ impl RunningHub {
         crate::gatequeue::tick(&self.state).await;
     }
 
+    /// Test-only: apply a gate run verdict through the real `apply_result`
+    /// path (pre-read + writer job), for the cancel-vs-result race suite.
+    #[doc(hidden)]
+    pub async fn test_apply_gate_result(
+        &self,
+        job_id: &str,
+        result: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let result: remuda_protocol::GateRunResult =
+            serde_json::from_value(result).map_err(|err| anyhow::anyhow!("{err}"))?;
+        crate::gatequeue::apply_result(&self.state, job_id, result).await;
+        Ok(())
+    }
+
     /// Test-only: the current stored gate job doc.
     #[doc(hidden)]
     pub async fn test_get_gate_job(

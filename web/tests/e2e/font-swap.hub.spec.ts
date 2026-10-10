@@ -373,21 +373,6 @@ async function rowOffset(scroller: Locator, anchor: AnchorRef): Promise<number |
 }
 
 /**
- * ABSOLUTE document top (scrollTop + scroller-relative top) of the anchor
- * row — used only to wait for the row to MOUNT.
- */
-async function anchorDocTop(scroller: Locator, anchor: AnchorRef): Promise<number | null> {
-  return scroller.evaluate(
-    (el, ref) => {
-      const row = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(ref.slice(3))}"]`);
-      if (!row) return null;
-      return el.scrollTop + row.getBoundingClientRect().top - el.getBoundingClientRect().top;
-    },
-    anchor,
-  );
-}
-
-/**
  * The anchor's SCROLLER-RELATIVE VIEWPORT offset, or null when it is mounted
  * but off-screen. This is the re-anchor oracle: holdReadingAnchor changes
  * scrollTop and the viewport top by equal/opposite amounts, so an ABSOLUTE
@@ -418,6 +403,53 @@ async function waitAnchorViewport(
   }
 }
 
+
+/**
+ * Poll the persisted reading record (no fixed sleep) until its anchorId is the
+ * row currently holding the viewport top, stable across two reads. The save is
+ * debounced 250 ms and can be delayed under load, so reading it after a fixed
+ * wait can pick up the pre-park record.
+ */
+async function waitForParkedAnchor(
+  page: Page,
+  scroller: Locator,
+  key: string,
+  timeoutMs = 15_000,
+): Promise<string> {
+  const viewportTopHolder = () =>
+    scroller.evaluate((el) => {
+      const top = el.getBoundingClientRect().top;
+      const holder = Array.from(el.querySelectorAll<HTMLElement>("[data-anchor]")).find((row) => {
+        const box = row.getBoundingClientRect();
+        return box.top <= top && box.bottom > top;
+      });
+      return holder?.dataset.anchor ?? null;
+    });
+  const readAnchorId = () =>
+    page.evaluate((k) => {
+      const raw = localStorage.getItem(k);
+      if (!raw) return null;
+      try {
+        return (JSON.parse(raw) as { anchorId?: unknown }).anchorId as string | null;
+      } catch {
+        return null;
+      }
+    }, key);
+  const want = await viewportTopHolder();
+  expect(want, "the park left no transcript row holding the viewport top").not.toBeNull();
+  const deadline = Date.now() + timeoutMs;
+  let last: string | null = null;
+  while (Date.now() < deadline) {
+    const id = await readAnchorId();
+    if (id === want) {
+      await page.waitForTimeout(60);
+      if ((await readAnchorId()) === want) return id as string;
+    }
+    last = id;
+    await page.waitForTimeout(50);
+  }
+  throw new Error(`the parked reading record never named the viewport-top row (want ${want}, last ${last})`);
+}
 
 /**
  * After a font release, poll the wrap block's row HEIGHT until it differs from
@@ -763,13 +795,13 @@ async function savedPositionSurvivesSwap(
     }
     el.dispatchEvent(new Event("scroll", { bubbles: true }));
   }, PARK);
-  // Let the 250 ms persistence flush write the record, then read the exact
-  // anchor the restore will target.
-  await page.waitForTimeout(450);
+  // Read the saved anchor WITHOUT a fixed sleep: the 250 ms persistence
+  // debounce can be delayed under gate load, so a 450 ms wait could read the
+  // pre-park record. Compute the anchor the park MUST have saved (the row
+  // holding the viewport top) directly from the DOM and poll localStorage until
+  // the persisted record names exactly that row, stable across two reads.
   const readingKey0 = `runtime.reading.v1.${instanceId}`;
-  const parkedRecord = await page.evaluate((key) => localStorage.getItem(key), readingKey0);
-  expect(parkedRecord, "the park wrote a reading position").not.toBeNull();
-  const savedAnchorId = JSON.parse(parkedRecord!).anchorId as string;
+  const savedAnchorId = await waitForParkedAnchor(page, scroller, readingKey0);
   const anchor: AnchorRef = `id:${savedAnchorId}`;
   // Whether the saved anchor IS the growing wrap-block row (short journals):
   // its own top must match across control / fallback / settled.
@@ -797,6 +829,13 @@ async function savedPositionSurvivesSwap(
   const original = await page.evaluate((key) => localStorage.getItem(key), readingKey);
   expect(original, "the first visit saved a reading position").not.toBeNull();
   expect(JSON.parse(original!).follow, "the saved position is not pinned").toBe(false);
+  // The reinstated `original` the control and gated arms restore from must be
+  // the SAME record the park wrote (the debounce under load can otherwise leave
+  // a stale pre-park anchor in one and the parked anchor in the other).
+  expect(
+    JSON.parse(original!).anchorId as string,
+    "the reinstated saved record does not match the parked anchor",
+  ).toBe(savedAnchorId);
   await page.addInitScript((key) => {
     (window as unknown as { __readingInput?: string | null }).__readingInput = localStorage.getItem(key);
   }, readingKey);
@@ -806,12 +845,15 @@ async function savedPositionSurvivesSwap(
   const consumed = () =>
     page.evaluate(() => (window as unknown as { __readingInput?: string | null }).__readingInput ?? null);
 
-  // Control: restore with the font already cached, so no swap happens.
+  // Control: restore with the font already cached, so no swap happens. Read
+  // its offset with the SAME settled-stability gate the gated arm uses (restore
+  // finalized + offset held across measurement cycles) — never after a fixed
+  // sleep, which under load could sample a still-running restore and loosen the
+  // |settled - control| bound.
   await reinstate();
   await page.goto(`/s/${instanceId}`);
-  await expect.poll(() => anchorDocTop(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
-  await afterSwap(page, scroller);
-  const control = await waitAnchorViewport(scroller, anchor, 15_000, "control anchor off-screen");
+  await waitFontLoaded(page, scroller, "control visit font");
+  const control = await waitAnchorStable(scroller, anchor, { phase: "settled" });
   const controlInput = await consumed();
   const blockControl = wrapProbe ? await wrapBlockRowHeight(scroller) : null;
 

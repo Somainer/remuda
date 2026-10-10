@@ -1354,8 +1354,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Dead-link intent #2: a pre-upgrade row (NULL stamp), also
-        // postdated. NULL means "no link generation recorded", which the
+        // Dead-link intent #2: a genuine pre-upgrade row (NULL stamp), also
+        // postdated. r11 stamps the generation at INSERT, so the NULL has to be
+        // forced through the test seam: an unmarked row queued THIS instant is
+        // NOT a pre-upgrade row — it carries the current link's generation and
+        // must be spared. NULL means "no link generation recorded", which the
         // sweep must keep reconciling rather than hide behind a cutoff.
         let (legacy, _) = store
             .queue_command(
@@ -1366,6 +1369,10 @@ mod tests {
                 json!({"path": "/srv/legacy", "workspaceId": "wsp_legacy"}),
                 None,
             )
+            .await
+            .unwrap();
+        store
+            .test_set_command_link_generation(legacy.command_id.clone(), None)
             .await
             .unwrap();
 
@@ -1467,6 +1474,100 @@ mod tests {
             .unwrap();
         assert_eq!(later.len(), 1, "{later:?}");
         assert_eq!(later[0].command_id, new.command_id);
+
+        hub.shutdown().await;
+    }
+
+    /// r11 item 1: the queue→mark window is closed at INSERT. A fresh DELETE
+    /// committed by `queue_command` after a reconnect hello adopted the new
+    /// link, but on which `mark_forward_intent` has not run yet, carries the
+    /// CURRENT generation from the INSERT — the post-hello sweep must skip it.
+    /// Before the fix the row had a NULL stamp and was aborted, so the Node
+    /// wrote an aborted tombstone for a command the new link was about to run
+    /// and the operator received a spurious 409/400. Only a genuine pre-upgrade
+    /// NULL row remains abortable in the same window.
+    #[tokio::test]
+    async fn queued_unmarked_command_on_current_link_is_skipped_by_sweep() {
+        use crate::HubConfig;
+
+        const FUTURE: &str = "2099-01-01T00:00:00.000Z";
+
+        let dir = tempfile::tempdir().unwrap();
+        let hub = crate::spawn(HubConfig::for_test(dir.path().join("data")))
+            .await
+            .unwrap();
+        let store = hub.state.store.clone();
+        let host = crate::config::new_id("hst").unwrap();
+        hub.test_insert_host(&host).await.unwrap();
+
+        // Two hellos have adopted links; the row is queued on link generation 2.
+        assert_eq!(
+            store.bump_host_link_generation(host.clone()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            store.bump_host_link_generation(host.clone()).await.unwrap(),
+            2
+        );
+
+        let (fresh, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/fresh", "workspaceId": "wsp_fresh"}),
+                None,
+            )
+            .await
+            .unwrap();
+        // Deliberately NO mark_forward_intent: the forward is still queued.
+        store
+            .test_set_command_created_at(fresh.command_id.clone(), FUTURE.to_owned())
+            .await
+            .unwrap();
+
+        // The post-hello sweep at the CURRENT generation skips it, even
+        // postdated.
+        assert!(
+            store
+                .list_unsettled_workspace_unregisters(&host, 2)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unmarked row stamped at INSERT with the current generation must not be swept"
+        );
+        // It surfaces once the host adopts a LATER link (stamp 2 < 3), proving
+        // the INSERT stamp really is the current generation rather than NULL.
+        let after_next_hello = store
+            .list_unsettled_workspace_unregisters(&host, 3)
+            .await
+            .unwrap();
+        assert_eq!(after_next_hello.len(), 1, "{after_next_hello:?}");
+        assert_eq!(after_next_hello[0].command_id, fresh.command_id);
+
+        // A genuine pre-upgrade NULL row in the same window is still aborted.
+        let (legacy, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/legacy2", "workspaceId": "wsp_legacy2"}),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .test_set_command_link_generation(legacy.command_id.clone(), None)
+            .await
+            .unwrap();
+        let listed = store
+            .list_unsettled_workspace_unregisters(&host, 2)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].command_id, legacy.command_id);
 
         hub.shutdown().await;
     }

@@ -4175,11 +4175,22 @@ impl Store {
                 None => new_id("cmd").map_err(|e| StoreError::Id(e.to_string()))?,
             };
             let now = now_rfc3339();
+            // c-dirpicker r11 item 1: stamp the host's CURRENT link generation
+            // at INSERT, not only at mark_forward_intent. Queue and mark run as
+            // separate writer jobs: a reconnect hello that bumps the generation
+            // between them used to leave a fresh DELETE with a NULL stamp, so
+            // the post-hello sweep aborted an operator command the NEW link was
+            // about to forward (a regression to the old created_at window).
+            // mark_forward_intent still re-stamps with the generation the
+            // forwarding attempt pinned, which covers a bump between INSERT and
+            // mark. A missing host row stamps NULL, which the sweep treats as
+            // dead-link intent (the conservative choice).
             conn.execute(
                 "INSERT INTO commands
                     (id, instance_id, host_id, operation, state, resolution, forwarded,
-                     payload_json, idempotency_key, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7)",
+                     payload_json, idempotency_key, created_at, updated_at, link_generation)
+                 VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7,
+                         (SELECT link_generation FROM hosts WHERE id = ?3))",
                 params![
                     command_id,
                     instance_id,
@@ -4288,6 +4299,26 @@ impl Store {
             conn.execute(
                 "UPDATE commands SET created_at = ?1 WHERE id = ?2",
                 params![created_at, command_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Test-only seam (c-dirpicker r11 item 1): overwrite a command's
+    /// `link_generation`. r11 stamps the generation at INSERT, so a test that
+    /// needs a genuine PRE-UPGRADE row (the NULL the sweep must keep aborting)
+    /// has to NULL it explicitly — an unmarked freshly queued row is not one.
+    #[doc(hidden)]
+    pub async fn test_set_command_link_generation(
+        &self,
+        command_id: String,
+        generation: Option<i64>,
+    ) -> Result<(), StoreError> {
+        self.run_named("test_set_command_link_generation", move |conn| {
+            conn.execute(
+                "UPDATE commands SET link_generation = ?1 WHERE id = ?2",
+                params![generation, command_id],
             )?;
             Ok(())
         })

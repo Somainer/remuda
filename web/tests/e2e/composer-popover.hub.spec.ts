@@ -379,25 +379,28 @@ test.describe("stacked mobile usage sheet closes with its parent (RC4)", () => {
 
 
 test.describe("overlay z tiers keep the annotation dock under real scrims (r3 item 1)", () => {
-  test("390: with the options sheet open, a hit over the floating annotation dock lands on the sheet, not the dock", async ({ page }) => {
+  test("390: with the composer options sheet open, a hit over the floating annotation dock lands on the sheet, not the dock", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await createSession(page, "composer popover dock under sheet");
-    // The 加批注 entry lives ONLY in the ⋯ options sheet now (§2.2 item 7);
-    // the dock floatLayer hosts the annotation badge once drafts exist. Create
-    // a card draft via the sheet so the floating dock is populated, close it,
-    // then reopen: the round-2 regression was the dock (z 50) painting above
-    // the literal-40 sheet scrim.
-    await optionsTrigger(page).click();
-    await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+    // TWO distinct mobile sheets exist:
+    //  - the Composer options sheet (data-options-trigger) = attach/harness/
+    //    context/permission/effort only; and
+    //  - the ⋯ SessionMoreMenu (session-more-open), the ONLY home of
+    //    annotation-add (§2.2 item 7).
+    // First create a card draft through the ⋯ menu so the floating annotation
+    // dock is populated with the badge…
+    await page.getByTestId("session-more-open").click();
     await page.getByTestId("annotation-add").click();
     await page.getByTestId("annotation-card-input").fill("draft for z-tier probe");
     await page.getByTestId("annotation-card-save").click();
     await expect(page.getByTestId("annotation-badge")).toBeVisible();
-    const box = (await page.getByTestId("annotation-dock").boundingBox())!;
-    const point = { x: box.x + box.width - 24, y: box.y + box.height / 2 };
-
+    // …then open the COMPOSER options sheet. The round-2 regression was the
+    // dock (z 50) painting above the literal-40 sheet scrim, so a tap over the
+    // floating annotation-dock opened something under the sheet.
     await optionsTrigger(page).click();
     await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+    const box = (await page.getByTestId("annotation-dock").boundingBox())!;
+    const point = { x: box.x + box.width - 24, y: box.y + box.height / 2 };
 
     const hit = await page.evaluate((p) => {
       const el = document.elementFromPoint(p.x, p.y);

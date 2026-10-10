@@ -12,6 +12,7 @@ import {
   taskAwaitsHuman,
   taskCardSignal,
   taskNextStep,
+  taskRowSignature,
   taskSpaceId,
   type TaskListGroup,
   type TaskRow,
@@ -431,5 +432,49 @@ describe("board card signal line (ui-spec §2.9)", () => {
     expect(
       taskCardSignal({ task: pending, needsHuman: false, sessionCount: 0 }),
     ).toEqual({ kind: "next-step", text: "待派发" });
+  });
+});
+
+describe("taskRowSignature", () => {
+  it("is stable across an equal re-derivation with fresh object identities", () => {
+    const tasks = [task("p1"), task("p2", { state: "placed" })];
+    const first = new Map(groups2rows(build(tasks)).map((row) => [row.id, row]));
+    const second = new Map(groups2rows(build(tasks.map((t) => ({ ...t })))).map((row) => [row.id, row]));
+    for (const [id, row] of first) {
+      expect(taskRowSignature(row)).toBe(taskRowSignature(second.get(id)!));
+    }
+  });
+
+  it("flips when any painted input changes", () => {
+    const base = task("t1");
+    const before = groups2rows(build([base]))[0]!;
+    const rename = groups2rows(build([{ ...base, title: "new title" }]))[0]!;
+    const move = groups2rows(build([{ ...base, state: "placed" }]))[0]!;
+    const reason = groups2rows(
+      build([{ ...base, blockedReason: "需要重试" }]),
+    )[0]!;
+    expect(taskRowSignature(rename)).not.toBe(taskRowSignature(before));
+    expect(taskRowSignature(move)).not.toBe(taskRowSignature(before));
+    expect(taskRowSignature(reason)).not.toBe(taskRowSignature(before));
+  });
+
+  it("flips when a session count or primary session changes", () => {
+    const t = task("t1", { state: "placed" });
+    const before = groups2rows(build([t], [session("s1", t.id)]))[0]!;
+    const after = groups2rows(build([{ ...t }], [session("s1", t.id), session("s2", t.id)]))[0]!;
+    expect(taskRowSignature(after)).not.toBe(taskRowSignature(before));
+  });
+
+  it("flips the PARENT signature when a nested child changes", () => {
+    const parent = task("parent");
+    const childA = task("child", { parentTaskId: parent.id });
+    const parentRow = () => groups2rows(build([parent, childA]))[0]!;
+    const before = parentRow();
+    // Same parent row content, changed child: parent sig must still flip so a
+    // memoized parent can never mask a changed subtree.
+    const changedChild = groups2rows(
+      build([{ ...parent }, { ...childA, title: "child renamed" }]),
+    )[0]!;
+    expect(taskRowSignature(changedChild)).not.toBe(taskRowSignature(before));
   });
 });

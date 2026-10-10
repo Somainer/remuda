@@ -477,6 +477,13 @@ struct Inner {
     write_seq: tokio::sync::Mutex<()>,
     policy: Mutex<PermissionPolicy>,
     events: Mutex<Option<mpsc::Sender<Observation>>>,
+    /// ma-sdk-state r4 item 4: ONE channel slot reserved for the terminal
+    /// session-exit event for the life of a launch. When the stdout reader is
+    /// wedged against a full `events` channel (a flooding child nobody drains)
+    /// and `close` aborts the publication worker, this permit still delivers
+    /// exactly one exit observation ahead of stream EOF. It is re-acquired on
+    /// every launch (start resets exit_emitted).
+    exit_permit: Mutex<Option<mpsc::OwnedPermit<Observation>>>,
     closed: AtomicBool,
     /// Whether the `exited` session lifecycle has already been emitted, so the
     /// reader task and [`Driver::close`] cannot both emit it (§2.3: exactly once).
@@ -508,6 +515,19 @@ pub struct ClaudePrintDriver {
 }
 
 impl ClaudePrintDriver {
+    /// Test-only (`test-stub`): true when the bounded observation channel is
+    /// full and the publication worker is parked — the close-under-pressure
+    /// test uses it to reach the saturated state deterministically.
+    #[cfg(feature = "test-stub")]
+    pub async fn publication_is_saturated(&self) -> bool {
+        // The exit permit permanently holds one of 256 slots; capacity is
+        // therefore 255.
+        let Some(tx) = self.inner.events.lock().await.clone() else {
+            return false;
+        };
+        tx.capacity() == 0
+    }
+
     /// Build a driver from explicit options.
     pub fn new(options: ClaudePrintOptions) -> Self {
         Self::with_carrier(options, DriverKind::ClaudePrint)
@@ -561,6 +581,7 @@ impl ClaudePrintDriver {
                 write_seq: tokio::sync::Mutex::new(()),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
+                exit_permit: Mutex::new(None),
                 closed: AtomicBool::new(false),
                 exit_emitted: AtomicBool::new(false),
                 last_spec: Mutex::new(None),
@@ -654,6 +675,17 @@ impl ClaudePrintDriver {
         let run_id = RunId::new();
         let journal_id = Id::new("obj")?;
         let (tx, rx) = mpsc::channel(256);
+        // r4 item 4: reserve the one terminal-event slot NOW, before the
+        // launch proceeds. Effective capacity for observations is 255; the
+        // exit permit is never taken by ordinary frames. If the child floods
+        // and the publication worker parks (or is aborted by close), the
+        // exit still has a guaranteed slot in the same FIFO channel.
+        let exit_permit = tx.clone().try_reserve_owned().map_err(|error| {
+            DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("cannot reserve exit slot: {error}"),
+            ))
+        })?;
         {
             let mut mapper = self.inner.mapper.lock().await;
             *mapper = Mapper {
@@ -674,6 +706,7 @@ impl ClaudePrintDriver {
         }
         *self.inner.policy.lock().await = policy;
         *self.inner.events.lock().await = Some(tx);
+        *self.inner.exit_permit.lock().await = Some(exit_permit);
         *self.inner.last_spec.lock().await = Some(spec.clone());
         self.inner.closed.store(false, Ordering::SeqCst);
         self.inner.exit_emitted.store(false, Ordering::SeqCst);
@@ -1782,6 +1815,15 @@ async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
             false,
         )?
     };
+    // r4 item 4: deliver on the reserved terminal slot first. The permit
+    // occupies a position in the SAME bounded channel behind every
+    // observation already queued, so FIFO order is preserved even though the
+    // publication worker may be blocked or aborted by close. Fall back to the
+    // ordinary sender only if the permit is gone.
+    if let Some(permit) = inner.exit_permit.lock().await.take() {
+        permit.send(observation);
+        return Ok(());
+    }
     emit_all(inner, vec![observation]).await
 }
 

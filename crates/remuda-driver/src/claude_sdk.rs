@@ -65,6 +65,13 @@ impl ClaudeSdkDriver {
     pub async fn kill(&self) -> DriverResult<DriverAck> {
         self.inner.kill().await
     }
+
+    /// Test-only (`test-stub`): re-exported so SDK tests can detect
+    /// publication saturation.
+    #[cfg(feature = "test-stub")]
+    pub async fn publication_is_saturated(&self) -> bool {
+        self.inner.publication_is_saturated().await
+    }
 }
 
 #[async_trait]

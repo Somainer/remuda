@@ -1036,3 +1036,61 @@ async fn a_live_child_that_closed_its_stdin_errors_the_send_without_any_turn_sta
         "close still reaps the live child through the ladder"
     );
 }
+
+/// ma-sdk-state r4 item 4: when the child floods stdout and nobody drains
+/// the event channel, `close` aborts the blocked publication worker — yet
+/// the terminal session-exit must still be delivered on a reserved channel
+/// slot, and it must be exactly ONE, ordered after every buffered frame and
+/// before stream EOF. Without the reserved permit the exit was dropped when
+/// the worker was aborted (events sender taken), so a later drain saw
+/// buffered frames then EOF with no exit.
+#[tokio::test]
+async fn close_under_output_pressure_still_delivers_exactly_one_terminal_exit() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = driver.start(spec).await.expect("start");
+
+    // Do NOT drain handle at all. Wait until the 255-slot observation channel
+    // is saturated (the publication worker is parked on emit). The child
+    // floods fast; give the saturation a bounded window.
+    let saturated = async {
+        for _ in 0..200 {
+            if driver.publication_is_saturated().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("publication never saturated with a flooding child");
+    };
+    tokio::time::timeout(Duration::from_secs(10), saturated)
+        .await
+        .expect("saturation window");
+
+    // Close under pressure: it aborts the blocked worker and reaps the child
+    // through its bounded ladder, and must not hang.
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(20), driver.close())
+        .await
+        .expect("close hung under output pressure")
+        .expect("close ack");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "close took {:?} under output pressure",
+        started.elapsed()
+    );
+
+    // Now drain everything until EOF.
+    let mut terminal = Vec::new();
+    while let Some(obs) = handle.recv().await {
+        if lifecycle_named(&obs) == Some("session") && lifecycle_status(&obs) == Some("exited") {
+            terminal.push(obs);
+        }
+    }
+    assert_eq!(
+        terminal.len(),
+        1,
+        "exactly one terminal session/exited event survives the saturated \
+         channel + aborted worker"
+    );
+}

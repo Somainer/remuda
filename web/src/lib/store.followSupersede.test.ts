@@ -239,7 +239,6 @@ async function setupPerCallSeeds() {
     [JOURNAL_B]: [],
   };
   const hooks = new Map<string, Hooks>();
-  const onAttemptFinish = vi.fn();
   const ready = new Map<string, number>();
   ready.set(JOURNAL_A, 1);
   ready.set(JOURNAL_B, 1);
@@ -307,7 +306,6 @@ async function setupPerCallSeeds() {
     hubStore,
     hooks,
     ready,
-    onAttemptFinish,
     seedCall: (j: string, i: number) => {
       const d = queues[j]?.[i];
       if (!d) throw new Error(`seed ${j}[${i}] not queued (have ${queues[j]?.length ?? 0})`);
@@ -350,13 +348,6 @@ it("an obsolete duplicate seed's scoped handoff never retires the live mount's a
   await new Promise((r) => setTimeout(r, 10));
 
   // B's duplicate seed (the CURRENT mount's catch-up) rejects. Make B's
-  // follow UNFRAMED at this point (getReadyState 1 alone does not certify;
-  // followSocketLive needs a fresh frame): this discriminates the bug —
-  // with B's follow dead the rejected catch-up must drive the machine off
-  // the happy path (settles via the REST probe), whereas a framed B socket
-  // would certify live. A's obsolete handoff still must not have retired
-  // B's attempt (asserted below via B receiving its own failure callback).
-  // B's duplicate seed (the CURRENT mount's catch-up) rejects. Make B's
   // socket UNFRAMED while still bound/open (ready 1, no fresh frame): the
   // rejected catch-up over a dead-transcript link must not keep false live.
   // This is the gate-8 item 6 discrimination — with B framed (default
@@ -375,10 +366,6 @@ it("an obsolete duplicate seed's scoped handoff never retires the live mount's a
   await new Promise((r) => setTimeout(r, 10));
   await vi.waitFor(() => expect(hubStore.connectionState).not.toBe("live"));
   expect(["stale", "offline", "recovering"]).toContain(hubStore.connectionState);
-
-  // A genuine socket drop on the CURRENT mount is still authoritative.
-  hooks.get(JOURNAL_B)?.onClose?.();
-  await vi.waitFor(() => expect(hubStore.connectionState).toBe("offline"));
 
   // A genuine socket drop on the CURRENT mount is still authoritative.
   hooks.get(JOURNAL_B)?.onClose?.();

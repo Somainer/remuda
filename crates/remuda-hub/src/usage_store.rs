@@ -723,55 +723,70 @@ pub enum BudgetStatus {
 
 /// Cost column for an aggregate query.
 ///
-/// Stock vs flow, per session then per instance (c-usagefu r4 item 1):
-/// - a priced `session` row is a CUMULATIVE STOCK; the billable value is the
-///   NEWEST accepted point per `(instance_id, scope_id)` (legacy NULL-scope
-///   rows chain as one partition), and those per-session stocks are SUMMED.
-///   A single global `ORDER BY seq DESC LIMIT 1` let one instance's $5 answer
-///   for ten on a profile, and interleaving sessions flip the number;
-/// - per-call (`turn`/`message`) rows are FLOW estimates; they count only for
-///   an INSTANCE that has no priced session stock at all (turn rows carry no
-///   session key, so — like the token coverage rule — fallback granularity is
-///   the instance). A per-call-only SDK session on a profile is therefore not
-///   wiped by a priced session on another instance.
+/// Stock vs flow, per session then per instance (c-usagefu r4 item 1; r5
+/// item 3):
+/// - a `session` row is a CUMULATIVE STOCK. The billable value is the NEWEST
+///   accepted point per `(instance_id, scope_id)` and those per-session
+///   stocks are SUMMED — a single global newest row let one instance answer
+///   for ten, and interleaving sessions flipped the number;
+/// - newest points are ranked over ALL session rows, including NULL costs.
+///   When ANY of an instance's session partitions has a NULL newest point
+///   (the driver-priced running cost went Unknown after an unpriced turn —
+///   sticky Unknown, r5 item 4), the instance is treated as STOCK-LESS for
+///   billing: its per-call FLOW estimates are summed instead, so the budget
+///   band keeps advancing rather than freezing at the last priced stock;
+/// - per-call (`turn`/`message`) rows therefore count for exactly the
+///   instances not in the stock-eligible set (a per-call-only SDK session on
+///   a profile is never wiped by a priced session on another instance).
 ///
-/// `?1`/`?2` are the aggregate predicate's bound columns (instance id, or
-/// profile + model); each subquery repeats them with fresh placeholder numbers
-/// supplied by the caller (`cost_params`).
-const COST_STOCK_SUMSQL: &str = "(SELECT COALESCE(SUM(cost), 0.0) FROM (
-        SELECT CAST(cost_usd AS REAL) AS cost,
-               ROW_NUMBER() OVER (
-                   PARTITION BY instance_id, scope_id ORDER BY seq DESC
-               ) AS rn
-        FROM usage_events
-        WHERE {predicate} AND scope = 'session' AND cost_usd IS NOT NULL
-     )
-     WHERE rn = 1)";
-
-const COST_FLOW_SUMSQL: &str = "(SELECT COALESCE(SUM(CAST(flow.cost_usd AS REAL)), 0.0)
-      FROM usage_events flow
-      WHERE {predicate_flow} AND flow.scope != 'session'
-        AND NOT EXISTS (
-            SELECT 1 FROM usage_events stock
-            WHERE stock.instance_id = flow.instance_id
-              AND stock.scope = 'session'
-              AND stock.cost_usd IS NOT NULL
-        ))";
+/// Each aggregate builds one statement with two CTEs (`r5_` prefix avoids
+/// clashes with other callers): `r5_newest_stock` and
+/// `r5_stock_instances`.
+fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate: &str) -> String {
+    format!(
+        "WITH r5_newest_stock AS (
+            SELECT instance_id, scope_id, cost FROM (
+                SELECT instance_id, scope_id,
+                       CAST(cost_usd AS REAL) AS cost,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY instance_id, scope_id ORDER BY seq DESC
+                       ) AS rn
+                FROM usage_events
+                WHERE {stock_predicate} AND scope = 'session'
+            )
+            WHERE rn = 1
+         ),
+         r5_stock_instances AS (
+            SELECT instance_id FROM r5_newest_stock
+            GROUP BY instance_id
+            HAVING COUNT(cost) = COUNT(*)
+         )
+         SELECT COUNT(*),
+                COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                (SELECT COALESCE(SUM(cost), 0.0) FROM r5_newest_stock
+                 WHERE instance_id IN (SELECT instance_id FROM r5_stock_instances))
+                +
+                (SELECT COALESCE(SUM(CAST(flow.cost_usd AS REAL)), 0.0)
+                 FROM usage_events flow
+                 WHERE {flow_predicate} AND flow.scope != 'session'
+                   AND flow.instance_id NOT IN (
+                       SELECT instance_id FROM r5_stock_instances
+                   ))
+         FROM usage_events WHERE {outer_predicate}"
+    )
+}
 
 /// Aggregate all persisted events for one instance.
 pub fn aggregate_instance(
     conn: &Connection,
     instance_id: &str,
 ) -> rusqlite::Result<UsageAggregate> {
-    let stock = COST_STOCK_SUMSQL.replace("{predicate}", "instance_id = ?1");
-    let flow = COST_FLOW_SUMSQL.replace("{predicate_flow}", "flow.instance_id = ?2");
-    let sql = format!(
-        "SELECT COUNT(*),
-                COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(input_tokens), 0),
-                COALESCE(SUM(output_tokens), 0),
-                {stock} + {flow}
-         FROM usage_events WHERE instance_id = ?3",
+    let sql = cost_select_sql(
+        "instance_id = ?1",
+        "flow.instance_id = ?2",
+        "instance_id = ?3",
     );
     conn.query_row(
         &sql,
@@ -794,20 +809,12 @@ pub fn aggregate_supply(
     profile_id: &str,
     model: &str,
 ) -> rusqlite::Result<UsageAggregate> {
-    // Six bindings: stock (profile, model), flow (profile, model on flow),
-    // outer count/token totals (profile, model).
-    let stock = COST_STOCK_SUMSQL.replace("{predicate}", "profile_id = ?1 AND model = ?2");
-    let flow = COST_FLOW_SUMSQL.replace(
-        "{predicate_flow}",
+    // Six bindings: stock CTE (profile, model), flow subquery (profile,
+    // model), outer count/token totals (profile, model).
+    let sql = cost_select_sql(
+        "profile_id = ?1 AND model = ?2",
         "flow.profile_id = ?3 AND flow.model = ?4",
-    );
-    let sql = format!(
-        "SELECT COUNT(*),
-                COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(input_tokens), 0),
-                COALESCE(SUM(output_tokens), 0),
-                {stock} + {flow}
-         FROM usage_events WHERE profile_id = ?5 AND model = ?6"
+        "profile_id = ?5 AND model = ?6",
     );
     conn.query_row(
         &sql,
@@ -1815,6 +1822,87 @@ mod tests {
             None => json!({ "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] }),
         };
         rec
+    }
+
+    #[test]
+    fn a_null_newest_session_point_switches_the_instance_to_flow_billing() {
+        // r5 item 3 exact regression sequence (r4 sticky-Unknown driver):
+        //   turn 1: priced session stock 0.50 (turn row 0.10)
+        //   turn 2: unpriced model -> session point NULL (turn row unpriced)
+        //   turn 3: priced again -> session point STILL NULL (sticky Unknown),
+        //            turn row 0.20
+        // r4 ranked only priced session rows, so the stock stayed 0.50 and
+        // the instance was excluded from flow: /usage froze and the stop band
+        // was unreachable. Now a NULL newest point makes the instance
+        // stock-LESS and the priced per-call flow (0.10 + 0.20) is the bill.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let project = |rec: &JournalRecord| {
+            project_usage_event(rec, Some("pvp_sticky"), Some("gw/sticky")).unwrap()
+        };
+        // Turn 1: priced stock + priced turn estimate.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&priced_turn_record("ins_sticky", 1, "msg_1", "0.10"))
+            )
+            .unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&tokenless_session_record_for(
+                    "ins_sticky",
+                    2,
+                    "s1",
+                    1,
+                    Some("0.50")
+                ))
+            )
+            .unwrap()
+        );
+        assert!(
+            (aggregate_instance(&conn, "ins_sticky").unwrap().cost_usd - 0.50).abs() < 1e-9,
+            "before the reset the priced stock is the bill"
+        );
+        // Turn 2: unpriced session point becomes the newest point.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&tokenless_session_record_for(
+                    "ins_sticky",
+                    3,
+                    "s1",
+                    2,
+                    None
+                ))
+            )
+            .unwrap()
+        );
+        // Turn 3: session still NULL-cost, but a priced per-call row arrives.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&priced_turn_record("ins_sticky", 4, "msg_3", "0.20"))
+            )
+            .unwrap()
+        );
+        // (The NULL point at seq 3 is already the newest session point; a
+        // second identical NULL point is frozen as a duplicate.)
+
+        let agg = aggregate_instance(&conn, "ins_sticky").unwrap();
+        assert!(
+            (agg.cost_usd - 0.30).abs() < 1e-9,
+            "sticky-NULL newest stock -> flow 0.10 + 0.20, got {}",
+            agg.cost_usd
+        );
+        // The supply aggregate follows the same instance-level rule.
+        let supply = aggregate_supply(&conn, "pvp_sticky", "gw/sticky").unwrap();
+        assert!(
+            (supply.cost_usd - 0.30).abs() < 1e-9,
+            "supply advances on flow after the NULL newest point, got {}",
+            supply.cost_usd
+        );
     }
 
     /// A result-frame session point: no token buckets (the SDK result omits

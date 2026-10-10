@@ -2468,6 +2468,10 @@ async fn journal_resume_link(
     let event = json!({
         "kind": "lifecycle",
         "observedAt": now,
+        // ma-lineage r7 item 3: this is a Hub-authored link, not a Node
+        // observation — it must not count as a Node ack of a `requested`
+        // successor chapter in the stale-create reaper.
+        "origin": "hub",
         "payload": {
             "type": "native",
             "topic": "session",
@@ -3357,6 +3361,7 @@ async fn journal_agent_message(
         let outbound = json!({
             "kind": "message",
             "observedAt": now,
+            "origin": "hub",
             "payload": {
                 "role": "user",
                 "origin": "agent",
@@ -3384,6 +3389,7 @@ async fn journal_agent_message(
     let inbound = json!({
         "kind": "message",
         "observedAt": now,
+        "origin": "hub",
         "payload": {
             "role": "user",
             "origin": "agent",

@@ -3558,10 +3558,10 @@ impl Store {
     /// Only for instances the Node has abandoned (epoch changed, create never
     /// acknowledged, stop for an instance the Node does not know): the Hub
     /// takes the next seq, which is safe precisely because that Node will never
-    /// emit another observation for the row. The event carries
-    /// `payload.origin = "hub"` so a reader never mistakes it for a Node
-    /// observation. Returns the appended record, or `None` when the instance is
-    /// gone.
+    /// emit another observation for the row. The event carries the envelope
+    /// `origin = "hub"` (and `payload.origin = "hub"`) so a reader, and the
+    /// stale-create reaper, never mistakes it for a Node observation. Returns
+    /// the appended record, or `None` when the instance is gone.
     pub async fn append_hub_diagnostic(
         &self,
         instance_id: String,
@@ -3583,6 +3583,7 @@ impl Store {
                 "seq": seq.to_string(),
                 "instanceId": instance_id,
                 "kind": "lifecycle",
+                "origin": HUB_JOURNAL_ORIGIN,
                 "payload": {
                     "type": "native",
                     "topic": "diagnostic",
@@ -3618,7 +3619,9 @@ impl Store {
     /// per-stream counter record on `api.end`): counters and routing facts
     /// only, never bodies or headers. Same idempotent seq discipline as
     /// [`Self::append_hub_diagnostic`]; returns `None` when the instance is
-    /// unknown or an event with this seq already exists.
+    /// unknown or an event with this seq already exists. The envelope carries
+    /// `origin = "hub"` so the stale-create reaper never reads it as a Node
+    /// acknowledgement of a `requested` row.
     pub async fn append_hub_event(
         &self,
         instance_id: String,
@@ -3640,6 +3643,7 @@ impl Store {
                 "seq": seq.to_string(),
                 "instanceId": instance_id,
                 "kind": kind,
+                "origin": HUB_JOURNAL_ORIGIN,
                 "payload": payload,
             });
             conn.execute(
@@ -3774,7 +3778,7 @@ impl Store {
         .await
     }
 
-    /// Expire `requested` instances that never produced a Node receipt.
+    /// Expire `requested` instances the Node never acknowledged.
     ///
     /// A create the Node never acknowledged keeps occupying a placement slot
     /// forever otherwise. Returns `(host_id, instance_id)` for each expiry so
@@ -3783,6 +3787,15 @@ impl Store {
     /// forever otherwise. Returns `(host_id, instance_id)` for each expiry so
     /// the caller can publish a diagnostic, plus the [`Settlement`] (c-cardsettle:
     /// such a row never journaled a card, so it is normally empty).
+    ///
+    /// ma-lineage r7 item 3: the ownership test is "no NODE-AUTHORED journal
+    /// event", NOT `durable_seq = 0`. A continuation successor gets a
+    /// Hub-authored `resumed-from` link (and possibly route observations)
+    /// appended while it is still `requested`, which advances durable_seq
+    /// past zero; gating the sweep on that cursor let such a row live forever
+    /// when its host dropped before the Node acked — holding the
+    /// address-owner seat and fan-out slots and replaying forever. Hub events
+    /// carry the envelope `origin = "hub"` marker and do not count.
     pub async fn expire_stale_requested(
         &self,
         window_ms: u64,
@@ -3792,9 +3805,15 @@ impl Store {
             let now = now_rfc3339();
             let window = window_ms.min(i64::MAX as u64) as i64;
             let mut stmt = tx.prepare(
-                "SELECT id, host_id FROM instances
-                 WHERE lifecycle = 'requested' AND durable_seq = 0 AND
-                    (julianday(?1) - julianday(created_at)) * 86400000 >= ?2",
+                "SELECT i.id, i.host_id FROM instances i
+                 WHERE i.lifecycle = 'requested'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM journal j
+                        WHERE j.instance_id = i.id
+                          AND COALESCE(json_extract(j.payload_json, '$.origin'), 'node')
+                              <> 'hub'
+                   )
+                   AND (julianday(?1) - julianday(i.created_at)) * 86400000 >= ?2",
             )?;
             let stale: Vec<(String, String)> = stmt
                 .query_map(params![&now, window], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -10857,6 +10876,113 @@ mod tests {
         store.close().await;
     }
 
+    /// ma-lineage r7 item 3: a `requested` row whose durable_seq advanced
+    /// ONLY through Hub-authored journal events (the continuation successor's
+    /// `resumed-from` link, a route observation) is still reaped: those events
+    /// carry the envelope `origin = "hub"` marker and are not a Node ack.
+    #[tokio::test]
+    async fn stale_requested_row_with_only_hub_authored_events_is_reaped() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r7-hubevents").await;
+        let instance = seed_instance(&store, &host).await;
+        // Hub-authored observation: durable_seq 1, no Node ack.
+        store
+            .append_hub_event(
+                instance.instance_id.clone(),
+                "lifecycle",
+                json!({"type": "apiRoute", "via": "direct"}),
+            )
+            .await
+            .expect("hub event")
+            .expect("appended");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.lifecycle, "requested");
+        assert!(row.durable_seq.parse::<i64>().unwrap() > 0);
+        backdate_instance(&store, &instance.instance_id, 60).await;
+
+        let (expired, _) = store
+            .expire_stale_requested(REQUESTED_SLOT_WINDOW_MS)
+            .await
+            .expect("sweep");
+        assert_eq!(expired, vec![(host, instance.instance_id.clone())]);
+        let row = store
+            .get_instance(instance.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.lifecycle, "failed");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some(CREATE_NEVER_ACKNOWLEDGED_MARKER)
+        );
+        assert!(
+            store
+                .instance_has_process_end_evidence(&row)
+                .await
+                .expect("evidence check"),
+            "an attested launch failure is process-end evidence"
+        );
+        store.close().await;
+    }
+
+    /// ma-lineage r7 item 3: a `requested` row the Node HAS journaled to —
+    /// even a non-lifecycle observation that leaves it `requested` — is owned
+    /// by the Node and must never be reaped as create-never-acknowledged.
+    #[tokio::test]
+    async fn requested_row_with_a_node_authored_event_is_not_reaped() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r7-nodeevent").await;
+        let instance = seed_instance(&store, &host).await;
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "message",
+                    "payload": {
+                        "role": "user", "origin": "user", "direction": "inbound", "text": "hi"
+                    }
+                }),
+            )
+            .await
+            .expect("node event");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.lifecycle, "requested",
+            "a non-lifecycle node event leaves the row requested"
+        );
+        backdate_instance(&store, &instance.instance_id, 60).await;
+
+        let (expired, _) = store
+            .expire_stale_requested(REQUESTED_SLOT_WINDOW_MS)
+            .await
+            .expect("sweep");
+        assert!(
+            expired.is_empty(),
+            "a Node-observed requested row is not reaped"
+        );
+        let row = store
+            .get_instance(instance.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.lifecycle, "requested");
+        store.close().await;
+    }
+
     /// c-cardsettle (host-lost sweep): expire_lost_hosts settles the instances
     /// of an unreachable host and invalidates their still-pending interactions
     /// in the same transaction.
@@ -12346,6 +12472,16 @@ fn stamp_ended_at(conn: &Connection, instance_id: &str, at: &str) -> Result<(), 
 pub(crate) const CREATE_NEVER_ACKNOWLEDGED_MARKER: &str = "create-never-acknowledged";
 
 pub(crate) const HOST_LOST_MARKER: &str = "host-lost";
+
+/// Top-level envelope `origin` value stamped on every Hub-AUTHORED journal
+/// event (diagnostics, route observations, resume links, Hub-composed
+/// messages). A Node-emitted event never carries this field. The stale-create
+/// reaper treats a `requested` row as Node-acknowledged only once it has a
+/// journal event whose envelope origin is NOT this value: Hub events
+/// (notably the successor's `resumed-from` link, appended before the Node
+/// ever sees the create) advance `durable_seq` without being an ack
+/// (ma-lineage r7 item 3).
+pub(crate) const HUB_JOURNAL_ORIGIN: &str = "hub";
 
 /// `last_error` markers that ATTEST a launch never started even when an older
 /// row has no `ended_at` yet (ma-lineage r4 item 1).

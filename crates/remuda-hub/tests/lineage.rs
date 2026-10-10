@@ -2174,6 +2174,154 @@ async fn a_swept_never_acknowledged_create_with_the_real_marker_recovers_fresh()
     Ok(())
 }
 
+/// ma-lineage r7 item 3: a continuation successor Y is still `requested` when
+/// its host drops before the Node acks. Its durable_seq is already 1 from the
+/// Hub-authored `resumed-from` link, so the stale-create sweep used to skip
+/// it forever. The host-lost sweep must leave the requested row alone; the
+/// stale-create sweep then reaps it (failed / create-never-acknowledged),
+/// after which a resume continues the lineage instead of replaying dead Y.
+#[tokio::test]
+async fn a_requested_successor_with_only_the_hub_resume_link_is_reaped_then_continued() -> Result<()>
+{
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let node_token = node_token.context("node token")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // Continue X → Y. The Node never acknowledges Y (no journal from it).
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    // Y's durable cursor advanced ONLY because the Hub journaled the
+    // resumed-from link; Y is still requested.
+    let y_view = ctx.wait_seq_advances(&y, "0").await?;
+    assert_eq!(
+        y_view["lifecycle"],
+        json!("requested"),
+        "the successor is requested with a Hub-authored journal event only"
+    );
+
+    // Host drops before the Node acks.
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
+    let (swept, _) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
+    assert_eq!(
+        swept, 1,
+        "the host-lost sweep ends the live predecessor X only"
+    );
+    let (expired, _) = ctx
+        .hub
+        .store()
+        .expect("store")
+        .expire_stale_requested(0)
+        .await?;
+    assert!(
+        expired.iter().any(|(_host, id)| id == &y),
+        "the requested successor is reaped despite durable_seq > 0: {expired:?}"
+    );
+    let y_view = ctx.get_instance(&y, &ctx.human).await?;
+    assert_eq!(y_view["lifecycle"], json!("failed"));
+    assert_eq!(
+        y_view["lastError"],
+        json!("create-never-acknowledged"),
+        "the row keeps its attested launch-failure marker"
+    );
+    let ended_at: Option<String> = {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.query_row(
+            "SELECT ended_at FROM instances WHERE id = ?1",
+            rusqlite::params![y],
+            |row| row.get(0),
+        )?
+    };
+    assert!(
+        ended_at.is_some(),
+        "the reaped row carries process-end evidence"
+    );
+
+    // Reconnect: a resume addressed to the older chapter X (or the lineage
+    // id) must CONTINUE — a new chapter, instance.resume — never replay the
+    // dead requested-then-failed Y forever.
+    let mut node = FakeNode::connect_with_token(&ctx.hub, &ctx.host, &node_token).await?;
+    let response = ctx.resume(&x, &ctx.human).await?.error_for_status()?;
+    let third: Value = response.json().await?;
+    assert_ne!(third["replayed"], json!(true), "dead Y is not replayed");
+    let z = third["instance"]["instanceId"].as_str().unwrap().to_owned();
+    assert_ne!(z, y);
+    assert_eq!(third["instance"]["generation"], json!(3));
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume", "Z resumes the known session");
+    assert_eq!(params["spec"]["resumeSessionId"], json!(SESSION));
+    Ok(())
+}
+
+/// ma-lineage r7 item 3: once the requested-then-reaped successor is failed
+/// with the launch-failure marker, it releases the address-owner seat so a
+/// replacement holder can be created.
+#[tokio::test]
+async fn a_reaped_requested_successor_releases_the_address_owner_seat() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let node_token = node_token.context("node token")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    ctx.wait_seq_advances(&y, "0").await?;
+
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
+    ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
+    let (expired, _) = ctx
+        .hub
+        .store()
+        .expect("store")
+        .expire_stale_requested(0)
+        .await?;
+    assert!(expired.iter().any(|(_host, id)| id == &y));
+
+    let _node = FakeNode::connect_with_token(&ctx.hub, &ctx.host, &node_token).await?;
+    let second = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-pty",
+            "grants": ["address-owner"], "prompt": "replacement seat"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        second.status(),
+        200,
+        "the reaped successor no longer holds the address-owner seat"
+    );
+    Ok(())
+}
+
 /// r3 item 4: an immediate retry of a sessionless fresh recovery returns the
 /// SAME successor (replayed) before the successor reports a session — no new
 /// generation and no extra command.

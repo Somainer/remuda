@@ -690,10 +690,7 @@ fn processes_with_cmdline(needle: &[u8]) -> Vec<(u32, String)> {
         if let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline"))
             && cmdline.windows(needle.len()).any(|window| window == needle)
         {
-            found.push((
-                pid,
-                String::from_utf8_lossy(&cmdline).replace('\0', " "),
-            ));
+            found.push((pid, String::from_utf8_lossy(&cmdline).replace('\0', " ")));
         }
     }
     found

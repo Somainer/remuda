@@ -1139,11 +1139,7 @@ async fn stream_gate_report(
         let temp = std::env::temp_dir();
         if let Ok(entries) = std::fs::read_dir(&temp) {
             for entry in entries.flatten() {
-                if !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(&own_prefix)
-                {
+                if !entry.file_name().to_string_lossy().starts_with(&own_prefix) {
                     continue;
                 }
                 let report = entry.path().join("gate.jsonl");
@@ -2188,9 +2184,7 @@ JSON
         }
         std::fs::remove_dir_all(&foreign).ok();
         assert!(
-            streamed
-                .iter()
-                .all(|name| name != "foreign-other-gate"),
+            streamed.iter().all(|name| name != "foreign-other-gate"),
             "a foreign gate's step leaked into this job's stream: {streamed:?}"
         );
         assert!(

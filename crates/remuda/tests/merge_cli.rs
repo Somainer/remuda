@@ -780,7 +780,11 @@ fn gate_cannot_publish_a_tree_it_mutated() {
 
 #[test]
 fn gate_e2e_ports_prefer_the_flag_and_otherwise_keep_inherited_env() {
-    fn port_trace(repo: &Repo, flags: &[&str], env: &[(&str, &str)]) -> Vec<(String, String, String)> {
+    fn port_trace(
+        repo: &Repo,
+        flags: &[&str],
+        env: &[(&str, &str)],
+    ) -> Vec<(String, String, String)> {
         let (output, report) = repo.merge(flags, env);
         assert_exit(&output, &report, 0);
         repo.trace()
@@ -926,8 +930,7 @@ fn gate_run_creates_no_scratch_root_in_the_ambient_temp_dir() {
     });
     assert_exit(&output, &report, 0);
     let after = ambient_scratch_names();
-    let owned_by_child =
-        |name: &str| name.starts_with(&format!("remuda-mq-{child_pid}-"));
+    let owned_by_child = |name: &str| name.starts_with(&format!("remuda-mq-{child_pid}-"));
     assert!(
         during_a
             .iter()

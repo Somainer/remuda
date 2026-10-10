@@ -549,11 +549,7 @@ fn cleanup_queue_pins(ctx: &QueueCtx) {
 /// Without the pid allowlist a queue on a shared host could delete another
 /// queue's live scratch root (they all use the same OS temp dir). The
 /// registration guard closes the pid-reuse hole that allowlist alone leaves.
-fn cleanup_temp_worktrees(
-    repo: &std::path::Path,
-    tmp: &std::path::Path,
-    lane_pids: &[u32],
-) {
+fn cleanup_temp_worktrees(repo: &std::path::Path, tmp: &std::path::Path, lane_pids: &[u32]) {
     let list = git(repo, &["worktree", "list", "--porcelain"]).unwrap_or_default();
     let mut registered_paths = std::collections::HashSet::new();
     for line in list.lines().filter(|line| line.starts_with("worktree ")) {
@@ -572,9 +568,12 @@ fn cleanup_temp_worktrees(
             continue;
         }
         // Restrict to pids this queue actually spawned.
-        let owned = lane_pids
-            .iter()
-            .any(|pid| name.starts_with(&format!("{}{pid}-", crate::cmd::merge::scratch::SCRATCH_PREFIX)));
+        let owned = lane_pids.iter().any(|pid| {
+            name.starts_with(&format!(
+                "{}{pid}-",
+                crate::cmd::merge::scratch::SCRATCH_PREFIX
+            ))
+        });
         if !owned {
             continue;
         }
@@ -1604,7 +1603,14 @@ mod tests {
         // Register the worktree against the OTHER repo.
         reap_git(
             other.path(),
-            &["worktree", "add", "-q", "--detach", foreign_worktree.to_str().unwrap(), "main"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                foreign_worktree.to_str().unwrap(),
+                "main",
+            ],
         );
 
         // Same recycled pid, but a root this OWNER registered (a dead lane of
@@ -1616,7 +1622,14 @@ mod tests {
         std::fs::create_dir_all(&own_worktree).unwrap();
         reap_git(
             owner.path(),
-            &["worktree", "add", "-q", "--detach", own_worktree.to_str().unwrap(), "main"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                own_worktree.to_str().unwrap(),
+                "main",
+            ],
         );
 
         // A lane that died before registering its worktree: directory absent,
@@ -1642,14 +1655,21 @@ mod tests {
             "a root without a worktree directory must be reaped"
         );
         // The foreign registration is intact, not pruned.
-        assert!(reap_git(other.path(), &["worktree", "list"])
-            .contains(foreign_worktree.to_str().unwrap()));
+        assert!(
+            reap_git(other.path(), &["worktree", "list"])
+                .contains(foreign_worktree.to_str().unwrap())
+        );
 
         // Tear the foreign root down explicitly; nothing the reaper created may
         // leak out of the test.
         reap_git(
             other.path(),
-            &["worktree", "remove", "--force", foreign_worktree.to_str().unwrap()],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                foreign_worktree.to_str().unwrap(),
+            ],
         );
         std::fs::remove_dir_all(&foreign_root).ok();
     }

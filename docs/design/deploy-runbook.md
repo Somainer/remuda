@@ -57,7 +57,11 @@ SG x86_64，并用明确 tag 或摘要标识实际部署构建。
    `prepare`、`apply` 与 `rollback` 路径，
    包括原配置备份、仅限 Remuda 的 diff、验证、重启及健康检查；等待批准。
    首次登录 access code 保存于 `/data00/remuda/secrets/access-code`，模式 0600，
-   不进入 argv、URL、日志或证据文档。
+   不进入 argv、URL、日志或证据文档。容器以非 root uid/gid 65532 运行
+   （compose `user: "65532:65532"`，distroless nonroot）：secrets 目录
+   `/data00/remuda/secrets` 必须属主为 `65532:65532`、模式 `0700`，access-code
+   文件属主同为 `65532:65532`、模式 `0600`——root 属主的 0700 目录对 65532 是
+   EACCES。完整权限矩阵见 [m1/README.md A2](../../../deploy/m1/README.md)。
 
 主机上的脚本名为 `~/astergate/deploy/remuda-caddy-change.py`。私有设置文件
 `.remuda-caddy-change.json` 使用 0600，包含 `gateway_health_url`、`hub_health_url`、

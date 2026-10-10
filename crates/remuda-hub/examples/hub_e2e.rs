@@ -31,13 +31,32 @@ async fn main() -> Result<()> {
         .init();
 
     let dir = tempfile::tempdir().context("e2e data dir")?;
-    // r8 item 5: a per-run, owned browse root (never the shared /tmp path).
-    // Env-provided (caller-owned) or, by default, inside this run's TempDir so
-    // it is removed with the data dir; cleanup_dir_picker_fixtures also removes
-    // it on normal shutdown.
-    let dirpicker_root = std::env::var_os("HUB_E2E_DIR_PICKER_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| dir.path().join("dirpicker-browse"));
+    // r8 item 5 / r9 item 3: a per-run, owned browse root (never the shared
+    // /tmp path). With no env override it lives inside this run's TempDir (it
+    // dies with the data dir); when HUB_E2E_DIR_PICKER_ROOT names a
+    // caller-owned base, the harness creates and serves its OWN per-run
+    // subdirectory under it — the caller's directory is never deleted on
+    // exit, even when the dir-picker trigger is off.
+    let dirpicker_root = match std::env::var_os("HUB_E2E_DIR_PICKER_ROOT") {
+        Some(base) => {
+            let base = std::path::PathBuf::from(base);
+            let owned = base.join(format!(
+                "remuda-dirpicker-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&owned).context("create owned dir-picker root")?;
+            owned
+        }
+        None => {
+            let owned = dir.path().join("dirpicker-browse");
+            std::fs::create_dir_all(&owned).context("create dir-picker root")?;
+            owned
+        }
+    };
     set_dir_picker_root(dirpicker_root);
     let origins = std::env::var("HUB_E2E_ORIGINS").unwrap_or_else(|_| {
         "http://127.0.0.1:4179,http://localhost:4179,http://127.0.0.1:4177".into()
@@ -156,8 +175,13 @@ async fn main() -> Result<()> {
     // (see wait_frame_ack), or a dropped socket used to surface later as
     // unrelated offline/status flakes; instead print the causal error and exit
     // non-zero so the gate reports the real failure. Normal shutdown is ctrl-c.
+    // r9 item 3: the Playwright webServer launcher stops this process with
+    // SIGTERM (it does not deliver ctrl-c), so wait for both — otherwise
+    // the graceful shutdown path below never runs and the per-run browse
+    // tree (and the TempDir data dir) leak on every suite exit.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
+        _ = wait_for_sigterm() => {}
         outcome = &mut node => {
             let detail = match outcome {
                 Ok(Ok(())) => "fake Node task completed unexpectedly while the harness was running".to_string(),
@@ -166,6 +190,9 @@ async fn main() -> Result<()> {
             };
             eprintln!("FATAL hub_e2e fake Node exited before shutdown: {detail}");
             let _ = io::stderr().flush();
+            // process::exit skips TempDir drops: remove the owned browse tree
+            // explicitly (r9 item 3).
+            cleanup_dir_picker_fixtures();
             std::process::exit(1);
         }
     }
@@ -179,9 +206,28 @@ async fn main() -> Result<()> {
         host_b.abort();
     }
     drop(hub);
-    // r8 item 5: remove the per-run browse tree (the owned TempDir would also
-    // remove the default root; this also clears an env-provided one).
+    // r8 item 5 / r9 item 3: remove the per-run browse tree. This is always
+    // the harness-OWNED path (a per-run subdir of an env-provided base, or a
+    // directory inside the TempDir), so a caller-provided base itself is
+    // never deleted; the TempDir drop that follows removes the data dir.
     cleanup_dir_picker_fixtures();
+    Ok(())
+}
+
+/// Completes when the process receives SIGTERM — the stop signal the
+/// Playwright webServer launcher sends (r9 item 3). Pending forever on
+/// non-unix, where ctrl-c stays the only graceful path.
+#[cfg(unix)]
+async fn wait_for_sigterm() -> std::io::Result<()> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
+        .recv()
+        .await;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm() -> std::io::Result<()> {
+    std::future::pending::<()>().await;
     Ok(())
 }
 
@@ -3530,13 +3576,12 @@ fn dir_picker_enabled() -> bool {
     std::env::var("HUB_E2E_DIR_PICKER").as_deref() == Ok("1")
 }
 
-/// Per-run browse allowlist root for the c-dirpicker spec (r8 item 5). It must
-/// NOT be a shared, hard-coded host `/tmp` path: every parallel worker would
-/// collide and nothing ever cleaned it. `main` sets this to an env-provided
-/// path (HUB_E2E_DIR_PICKER_ROOT, owned by the caller) or, by default, a
-/// directory inside the harness-owned per-run TempDir (auto-removed when the
-/// harness exits); `cleanup_dir_picker_fixtures` best-effort removes it on
-/// shutdown either way.
+/// Per-run browse allowlist root for the c-dirpicker spec (r8 item 5, r9
+/// item 3). It is always harness-OWNED: a per-run subdirectory of an
+/// env-provided base (HUB_E2E_DIR_PICKER_ROOT) or, by default, a directory
+/// inside the harness TempDir. It must never be a shared, hard-coded host
+/// `/tmp` path, and the caller's env-provided base itself must never be
+/// deleted — [`cleanup_dir_picker_fixtures`] removes only the owned path.
 static DIRPICKER_BROWSE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 fn set_dir_picker_root(path: std::path::PathBuf) {
@@ -3558,9 +3603,10 @@ fn seed_dir_picker_fixtures() -> Result<()> {
     Ok(())
 }
 
-/// Best-effort removal of the browse tree on shutdown. The default root lives
-/// inside the harness TempDir (which also removes it); this additionally
-/// cleans an env-provided root so no per-run directory is left behind.
+/// Best-effort removal of the OWNED browse tree on shutdown. The owned path
+/// is a per-run subdirectory the harness itself created (under the
+/// env-provided base or the harness TempDir), so removing it never touches
+/// caller data; an env-provided base is left intact (r9 item 3).
 fn cleanup_dir_picker_fixtures() {
     if let Some(root) = DIRPICKER_BROWSE_ROOT.get() {
         let _ = std::fs::remove_dir_all(root);

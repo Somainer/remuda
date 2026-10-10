@@ -663,10 +663,8 @@ fn assistant_error_event(message: &str) -> Value {
     })
 }
 
-/// The print driver's turn-result frame: `result` with status `error`. Per
-/// c-cardsettle r4 (OA6) this ends the TURN only — it does NOT mark the
-/// instance lifecycle failed. The driver emits a SEPARATE native session
-/// exit (`session_exit_event`) when the one-shot process actually ends.
+/// The print driver's turn-result frame: `result` with status `error` (this is
+/// the event that also drives the Hub instance lifecycle to `failed`).
 fn turn_error_event() -> Value {
     json!({
         "kind": "lifecycle",
@@ -681,13 +679,9 @@ fn turn_error_event() -> Value {
     })
 }
 
-/// The REAL process-end evidence the print/SDK driver emits from `emit_exit`
-/// (crates/remuda-driver/src/claude_print.rs, both call sites): exactly
-/// `topic=session, nativeName="session", status="exited", severity=info,
-/// affectsCompletion=false`. The driver has no non-zero exit frame — it always
-/// emits "exited" (the print driver ends when stdout closes). It follows the
-/// turn-result error; THIS — not the turn result — is the process end, and the
-/// instance settles Exited.
+/// The driver's REAL process-exit observation (print/SDK topic=session,
+/// nativeName=session, status=exited): the only evidence a failed turn's
+/// process actually ended.
 fn session_exit_event() -> Value {
     json!({
         "kind": "lifecycle",
@@ -718,9 +712,6 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
             .unwrap()
             .to_string()
     };
-    // ── Stage 1: the failed TURN only ──────────────────────────────────────
-    // The print driver reports the errored result frame; the process itself
-    // is still alive (the driver emits a SEPARATE session exit only later).
     ctx.node.append_journal(
         &instance_id,
         &[

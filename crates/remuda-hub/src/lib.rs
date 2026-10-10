@@ -116,6 +116,15 @@ pub struct AppState {
     /// one-shot "your card was invalidated" notice (settlements are rare and
     /// tiny, so this channel effectively never lags).
     settlement_bus: tokio::sync::broadcast::Sender<crate::ws::SettlementNotice>,
+    /// c-cardsettle r8 item 4: publication-order lock for settlements. Held
+    /// across the settling transaction AND the bus publish, so notices from
+    /// two concurrent settles (a journal exit and an HTTP delete, or two
+    /// sweeps in the same millisecond) always enter the follower ring in the
+    /// order they committed — a lagging follower's strictly-forward cursor
+    /// can then never skip a lower-ordered row of an earlier transaction. The
+    /// bus send is synchronous (it never awaits a reader), so the section
+    /// only serialises two settling writers for the duration of the send.
+    settlement_publish: Arc<tokio::sync::Mutex<()>>,
     tty: crate::ws::TtyRelay,
     /// D-048 relay stream registry (per-Hub-process).
     api_relay: crate::api_relay::ApiRelay,
@@ -142,6 +151,55 @@ impl AppState {
     /// into a journal or make a follower mark its journal stale. A fresh
     /// follower converges against the durable (already-invalidated) rows
     /// regardless, so a missed notice is self-healing.
+    ///
+    /// r7 item 3: notices are sent in the vector's order, which the store
+    /// produces as ascending `(updated_at, id)` (the rows of one sweep share a
+    /// timestamp and sort by id). The follower's delivery max-cursor and its
+    /// strict-forward lag recovery both rely on that monotonic publication
+    /// order — never reorder or sort these before sending.
+    /// Acquire the settlement publication-order lock (r8 item 4) for a
+    /// settling transaction whose publication happens inline (the journal
+    /// append batch), rather than through [`Self::publish_settlement`].
+    pub(crate) async fn settlement_publish_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.settlement_publish.lock().await
+    }
+
+    /// Run a settlement-producing store operation and publish its settlement
+    /// under the per-Hub publication-order lock (c-cardsettle r8 item 4). The
+    /// guard is acquired BEFORE the commit and released after the bus send, so
+    /// notices can never overtake an earlier settlement's publication even
+    /// when two settles race from different tasks (a journal exit vs an HTTP
+    /// delete; same-millisecond sweeps).
+    pub(crate) async fn publish_settlement<Fut, T>(
+        &self,
+        op: Fut,
+    ) -> Result<T, crate::store::StoreError>
+    where
+        Fut: std::future::Future<
+                Output = Result<(T, crate::store::Settlement), crate::store::StoreError>,
+            >,
+    {
+        let _guard = self.settlement_publish.lock().await;
+        let (value, settlement) = op.await?;
+        self.broadcast_settlement(&settlement);
+        Ok(value)
+    }
+
+    /// Same publication ordering for an operation that produces only a
+    /// [`Settlement`].
+    pub(crate) async fn publish_settlement_unit<Fut>(
+        &self,
+        op: Fut,
+    ) -> Result<(), crate::store::StoreError>
+    where
+        Fut: std::future::Future<Output = Result<crate::store::Settlement, crate::store::StoreError>>,
+    {
+        let _guard = self.settlement_publish.lock().await;
+        let settlement = op.await?;
+        self.broadcast_settlement(&settlement);
+        Ok(())
+    }
+
     pub(crate) fn broadcast_settlement(&self, settlement: &Settlement) {
         for settled in &settlement.interactions {
             // Publish on the DEDICATED settlement bus (not the journal bus): a
@@ -559,6 +617,35 @@ impl RunningHub {
         crate::gatequeue::reconcile(&self.state).await;
     }
 
+    /// Test helper (c-cardsettle r8 item 3): backdate interactions'
+    /// `updated_at` to a fixed RFC3339 timestamp, so an integration test can
+    /// create settlement history outside the 5-minute connect-replay window
+    /// and prove the follower lag drain seeds at the durable max instead of
+    /// walking the whole history.
+    #[doc(hidden)]
+    pub async fn test_backdate_interactions(
+        &self,
+        interaction_ids: Vec<String>,
+        rfc3339: &str,
+    ) -> anyhow::Result<()> {
+        let Some(store) = self.store.as_ref() else {
+            anyhow::bail!("hub store already closed");
+        };
+        let ts = rfc3339.to_string();
+        store
+            .run_named("test_backdate_interactions", move |conn| {
+                for id in &interaction_ids {
+                    conn.execute(
+                        "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
+                        rusqlite::params![ts, id],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into
@@ -762,6 +849,7 @@ async fn spawn_inner(
             let (tx, _rx) = tokio::sync::broadcast::channel(64);
             tx
         },
+        settlement_publish: Arc::new(tokio::sync::Mutex::const_new(())),
         tty: crate::ws::TtyRelay::default(),
         api_relay: crate::api_relay::ApiRelay::new(),
         push,
@@ -777,8 +865,18 @@ async fn spawn_inner(
         challenges: passkeys::ChallengeStore::default(),
         gate_ref_swept_at: Arc::new(std::sync::Mutex::new(None)),
     };
-    let (_, lost_settlement) = store.expire_lost_hosts(config.host_lost_grace_ms).await?;
-    state.broadcast_settlement(&lost_settlement);
+    if let Err(err) = state
+        .publish_settlement_unit(async {
+            Ok(state
+                .store
+                .expire_lost_hosts(config.host_lost_grace_ms)
+                .await?
+                .1)
+        })
+        .await
+    {
+        tracing::error!(error = %err, "startup host-lost sweep failed");
+    }
     // A Hub restart must not inherit yesterday's unacknowledged creates: they
     // would keep holding placement slots with no Node that can ever settle them.
     expire_stale_requested(&state, config.requested_grace_ms).await;
@@ -819,11 +917,19 @@ async fn spawn_inner(
                     break;
                 }
                 _ = interval.tick() => {
-                    match reaper_state.store.expire_lost_hosts(config.host_lost_grace_ms).await {
-                        Ok((_, settlement)) => {
-                            // c-cardsettle: even the background reaper announces
-                            // the cards it invalidated.
-                            reaper_state.broadcast_settlement(&settlement);
+                    let sweep = reaper_state
+                        .publish_settlement(async {
+                            reaper_state
+                                .store
+                                .expire_lost_hosts(config.host_lost_grace_ms)
+                                .await
+                        })
+                        .await;
+                    match sweep {
+                        Ok(swept) => {
+                            if swept > 0 {
+                                tracing::debug!(swept, "host-lost sweep marked contact loss");
+                            }
                         }
                         Err(err) => tracing::error!(error = %err, "host-lost sweep failed"),
                     }
@@ -848,14 +954,16 @@ async fn spawn_inner(
 /// Each expiry gets a Hub-authored journal diagnostic so the row explains
 /// itself, and stops counting toward the host's `maxInstances` ceiling.
 async fn expire_stale_requested(state: &AppState, window_ms: u64) {
-    let (expired, settlement) = match state.store.expire_stale_requested(window_ms).await {
+    let expired = match state
+        .publish_settlement(state.store.expire_stale_requested(window_ms))
+        .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::error!(%error, "stale-requested sweep failed");
             return;
         }
     };
-    state.broadcast_settlement(&settlement);
     for (host_id, instance_id) in expired {
         tracing::warn!(
             %host_id,

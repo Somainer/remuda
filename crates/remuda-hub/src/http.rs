@@ -845,14 +845,14 @@ async fn stop_before_delete(
             );
         }
     }
-    let (changed, settlement) = state
-        .store
-        .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
+    let changed = state
+        .publish_settlement(
+            state
+                .store
+                .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into()),
+        )
         .await
         .map_err(map_store)?;
-    // c-cardsettle: cards invalidated by the delete leave open inboxes
-    // immediately.
-    state.broadcast_settlement(&settlement);
     if changed {
         state
             .api_relay
@@ -4200,11 +4200,12 @@ pub(crate) async fn forward_if_online(
                     "instance.create" | "instance.resume"
                 ) && let Some(instance_id) = command.instance_id.clone()
                 {
-                    let settlement = state
-                        .store
-                        .fail_instance(instance_id, err.to_string())
+                    state
+                        .publish_settlement_unit(state.store.fail_instance(
+                            instance_id,
+                            err.to_string(),
+                        ))
                         .await?;
-                    state.broadcast_settlement(&settlement);
                 } else if command.operation == "instance.configure" {
                     // Persist the 503 (and its body) WITH the terminal row: a
                     // configure is non-replayable, so a same-id retry must
@@ -4280,14 +4281,14 @@ async fn settle_stop_for_unknown_instance(
         operation = %command.operation,
         "node does not know this instance; settling the stop as exited"
     );
-    let (changed, settlement) = state
-        .store
-        .settle_instance_exited(instance_id.clone(), "node-lost-instance".into())
+    let changed = state
+        .publish_settlement(
+            state
+                .store
+                .settle_instance_exited(instance_id.clone(), "node-lost-instance".into()),
+        )
         .await
         .map_err(map_store)?;
-    // c-cardsettle: the Node already forgot this generation; invalidate its
-    // cards for followers in the same breath.
-    state.broadcast_settlement(&settlement);
     if changed {
         state
             .api_relay
@@ -4331,11 +4332,9 @@ async fn fail_unaccepted_create(
     if command.operation == "instance.create"
         && let Some(instance_id) = command.instance_id.clone()
     {
-        let settlement = state
-            .store
-            .fail_instance(instance_id, message.clone())
+        state
+            .publish_settlement_unit(state.store.fail_instance(instance_id, message.clone()))
             .await?;
-        state.broadcast_settlement(&settlement);
         return Err(HubError::BadRequest(message));
     }
     // An explicit Node error reply is positive evidence the command did not

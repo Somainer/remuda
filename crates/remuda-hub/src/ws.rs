@@ -517,14 +517,12 @@ pub(crate) async fn handle_node_method(
                 .await?;
             crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
             if params["daemon"] == true {
-                let settlement = state
-                    .store
-                    .reconcile_daemon_instances(
+                state
+                    .publish_settlement_unit(state.store.reconcile_daemon_instances(
                         host.host_id.clone(),
                         params["instances"].as_array().cloned().unwrap_or_default(),
-                    )
+                    ))
                     .await?;
-                state.broadcast_settlement(&settlement);
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
             let generation = state
@@ -649,6 +647,11 @@ pub(crate) async fn handle_node_method(
             // cannot smuggle one long transaction past the count cap
             // (hub-store-1).
             for range in crate::store::journal_append_chunks(&events) {
+                // r8 item 4: hold the settlement publication lock across the
+                // batch transaction AND the settlement sends, so a concurrent
+                // delete/sweep can never publish before a journal exit that
+                // committed earlier.
+                let _settlement_order = state.settlement_publish_lock().await;
                 let appended_chunk = state
                     .store
                     .append_journal_batch(
@@ -662,10 +665,6 @@ pub(crate) async fn handle_node_method(
                 for appended in appended_chunk {
                     if !appended.replayed {
                         publish_journal(&state.bus, &appended.record);
-                        // c-cardsettle: cards this terminal journal event
-                        // invalidated commit with the append; tell followers
-                        // immediately (a seq-less settlement control frame).
-                        state.broadcast_settlement(&appended.settlement);
                         crate::alerts::observe(state, &appended.record);
                         crate::usage_store::observe_journal(state, &appended.record).await;
                         crate::supply::observe_journal_text(state, &appended.record).await;
@@ -673,6 +672,14 @@ pub(crate) async fn handle_node_method(
                             instance_terminated = true;
                         }
                     }
+                    // c-cardsettle: cards a terminal transaction invalidated
+                    // commit with the append; tell followers immediately
+                    // (a seq-less settlement control frame). Broadcast even
+                    // for REPLAYED rows: a request replayed by a Node after
+                    // the hello reconcile ended its owner is invalidated
+                    // during replay (r7 item 1), and that notice has no other
+                    // publication path (no fresh journal event follows it).
+                    state.broadcast_settlement(&appended.settlement);
                     next_seq = Some(appended.record.seq.saturating_add(1));
                     last = Some(appended);
                 }
@@ -979,6 +986,14 @@ async fn reconcile_lost_instances(
         .record_node_epoch(host_id.to_string(), epoch)
         .await?;
     if !changed {
+        // c-cardsettle r8 item 2 (OA6): a SAME-epoch hello means the SAME Node
+        // process reconnected after a contact loss — not a restart. The host
+        // sweep may have marked still-running rows exited/host-lost while the
+        // link was down. Revive the rows this inventory reports LIVE BEFORE
+        // anything else (journal catch-up / card dispatch): host loss is
+        // contact loss, never process end, and a new approval from the revived
+        // process must stay pending and answerable.
+        revive_live_inventory(state, host_id, params).await?;
         return Ok(());
     }
     let Some(reported) = params.get("instances").and_then(Value::as_array) else {
@@ -1007,18 +1022,14 @@ async fn reconcile_lost_instances(
                 .map(str::to_string)
         })
         .collect();
-    let (lost, settlement) = state
-        .store
-        .reconcile_reported_instances(
+    let lost = state
+        .publish_settlement(state.store.reconcile_reported_instances(
             host_id.to_string(),
             reported,
             NODE_EPOCH_CHANGED.to_string(),
             true,
-        )
+        ))
         .await?;
-    // c-cardsettle: announce the invalidated cards the same transaction
-    // produced, so an open inbox/session drops them without waiting a poll.
-    state.broadcast_settlement(&settlement);
     for instance_id in lost {
         tracing::warn!(
             %host_id,
@@ -1039,6 +1050,70 @@ async fn reconcile_lost_instances(
             "node epoch changed; instance lost",
         )
         .await;
+    }
+    Ok(())
+}
+
+/// Extract the instances a hello inventory reports as LIVE
+/// (`ready`/`running`) as `(id, activity)` pairs, the input to
+/// [`Store::revive_host_lost_instances`].
+fn live_inventory_entries(params: &Value) -> Vec<(String, String)> {
+    params
+        .get("instances")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| !entry_is_terminal(item))
+        .filter_map(|item| {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("instanceId"))
+                .and_then(Value::as_str)?
+                .to_string();
+            // Only rows the Node claims are live revive a host-lost row.
+            let lifecycle = item.get("lifecycle").and_then(Value::as_str).unwrap_or("");
+            if !matches!(lifecycle, "ready" | "running") {
+                return None;
+            }
+            let activity = match item
+                .get("activity")
+                .and_then(Value::as_str)
+                .or_else(|| item.pointer("/activity/value").and_then(Value::as_str))
+            {
+                Some("waiting-interaction") => "blocked",
+                Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
+                _ => "idle",
+            };
+            Some((id, activity.to_string()))
+        })
+        .collect()
+}
+
+/// Same-epoch reconnect: revive host-lost rows the reconnecting Node still
+/// reports live (c-cardsettle r8 item 2). Runs on BOTH daemon and plain
+/// runtime hellos — the daemon inventory overlay
+/// (`reconcile_daemon_instances`) already rewrites the rows it names, and the
+/// host-lost predicate revival here is idempotent for those and the only
+/// revival path for a non-daemon runtime link.
+async fn revive_live_inventory(
+    state: &AppState,
+    host_id: &str,
+    params: &Value,
+) -> Result<(), HubError> {
+    let live = live_inventory_entries(params);
+    if live.is_empty() {
+        return Ok(());
+    }
+    let revived = state
+        .store
+        .revive_host_lost_instances(host_id.to_string(), &live)
+        .await?;
+    for instance_id in revived {
+        tracing::info!(
+            %host_id,
+            %instance_id,
+            "same-epoch reconnect reports a host-lost instance live; revived without settling cards"
+        );
     }
     Ok(())
 }
@@ -1321,6 +1396,15 @@ enum FollowMsg {
 /// per-instance follower). Notices are sent before the trailing gap frame, so
 /// the client pins all of them before reconciling. A query error or a dead
 /// writer returns Err and the caller closes the follower (never a bare gap).
+///
+/// r7 item 3 PUBLICATION-ORDER INVARIANT: the live broadcast path publishes a
+/// sweep in ascending `(updated_at, id)` order (the store's settle select
+/// orders it so and every row of one sweep shares `updated_at`). That ordering
+/// is what lets the composite max-cursor and this strict-forward `>` recovery
+/// coexist: a dropped low-id row of the current batch always sits BEHIND the
+/// cursor's timestamp only with a lower id, and is still recovered because no
+/// higher-id row of the same batch was published ahead of it. Keep both paths
+/// ascending; out-of-order publication would permanently skip rows here.
 async fn drain_settlement_lag(
     store: &crate::store::Store,
     instance_ids: &[String],
@@ -1375,10 +1459,22 @@ async fn follow_session(
     let mut rx = state.bus.subscribe();
     // c-cardsettle: separate receiver on the dedicated settlement bus.
     let mut settlement_rx = state.settlement_bus.subscribe();
-    // c-cardsettle r5 item 6: this follower's durable delivery cursor — the
-    // updated_at of the newest settlement row already recovered to it. Lag
-    // pages strictly forward from it, bounded by SETTLEMENT_LAG_PAGE.
-    let mut settlement_cursor: Option<String> = None;
+    // c-cardsettle r8 item 3: seed the durable delivery cursor at the
+    // position committed at SUBSCRIBE time. The subscription above is taken
+    // FIRST, so a settlement committing around subscribe is delivered by the
+    // bus as well (client de-dupes); every older settlement is already in the
+    // client's initial list and the connect replay, and the backpressure lag
+    // drain must never walk the entire life-of-database history from a `None`
+    // cursor (which stalls the single writer with hundreds of windowless
+    // pages). Erroring closed here is correct: a follower that could not read
+    // its start position cannot safely de-dupe either.
+    let mut settlement_cursor: Option<String> = match state.store.max_settlement_cursor().await {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            tracing::error!(%error, "could not seed the settlement lag cursor; closing follower");
+            return;
+        }
+    };
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
     for id in &instance_ids {
         state.followers.watch(device_id.clone(), id.clone()).await;
@@ -1542,6 +1638,15 @@ async fn follow_session(
                             // row the bus passes — including rows filtered out
                             // for this follower — so a later lag drain never
                             // re-scans or skips past it.
+                            //
+                            // r7 item 3 INVARIANT: the rows of one settlement
+                            // sweep are published in ascending
+                            // `(updated_at, id)` cursor order (the store's
+                            // settle select orders them so), so advancing this
+                            // max-cursor past a published row can never exclude
+                            // a lower-id row of the SAME batch that backpressure
+                            // dropped. Lag recovery pages strictly forward from
+                            // this cursor; see drain_settlement_lag.
                             settlement_cursor = Some(crate::store::Store::settlement_max_cursor(
                                 settlement_cursor.as_deref(),
                                 &notice.updated_at,
@@ -2140,6 +2245,209 @@ mod tests {
         assert!(cursor.is_some(), "the cursor advanced past the tail");
     }
 
+    /// c-cardsettle r8 item 4: cross-`settle` publication ORDER. A follower
+    /// that has already drained part of a FIRST settlement batch (its cursor
+    /// ends MID the settlement history) must not be able to permanently skip
+    /// rows of a SECOND settle whose notices overrun the broadcast ring.
+    /// Concretely:
+    ///   1. settle A (5 rows); drain A partially — receive 3, cursor mid-A.
+    ///   2. settle B (70 rows > the 64-notice ring) with NO live delivery
+    ///      (its out channel is dropped, as a backpressured socket behaves).
+    ///   3. resume draining from the mid-A cursor: all remaining A rows AND all
+    ///      B rows must be recovered, in ascending `(updated_at, id)` order,
+    ///      each once, before the gap.
+    ///
+    /// The strictly-forward cursor alone can lose B rows here: B shares one
+    /// `updated_at`, so a row skipped because of a stale same-timestamp read
+    /// is not recovered by `(updated_at, id) > cursor`. The store's settled
+    /// set is therefore forced through the publication-order lock and the
+    /// ORDER BY below is what keeps the drain complete; this test locks the
+    /// observed delivery to that order at the cross-settle boundary.
+    #[tokio::test]
+    async fn settlement_cursor_mid_first_batch_recovers_a_later_overring_sweep() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = Store::open(dir.path()).expect("store");
+        let host = format!("hst_{}", uuid::Uuid::now_v7());
+        store
+            .run_named("r8_enroll_host", {
+                let host = host.clone();
+                move |conn| {
+                    let now = crate::config::now_rfc3339();
+                    conn.execute(
+                        "INSERT INTO hosts (id, label, token_hash, state, last_seen_at,
+                            node_version, cli_json, capabilities_json, created_at, transport,
+                            labels_json, max_instances, hostname)
+                         VALUES (?1, ?1, 'x', 'online', ?2, '0.1.0-test', '[]', '{}', ?2,
+                                 'outbound-wss', '[]', 8, 'r8-order')",
+                        rusqlite::params![host, now],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("enroll");
+
+        // Seed one live instance per settle with pending cards, through the
+        // same public APIs the node socket handler uses.
+        let seed = |n: u32, cards: u32| {
+            let store = store.clone();
+            let host = host.clone();
+            async move {
+                let instance_id = format!("ins_r8order_{n}");
+                store
+                    .ensure_instance(host.clone(), instance_id.clone())
+                    .await
+                    .expect("ensure instance");
+                store
+                    .append_journal(
+                        host.clone(),
+                        instance_id.clone(),
+                        None,
+                        json!({
+                            "kind": "lifecycle",
+                            "payload": {
+                                "type": "entity", "entityType": "instance", "state": "ready"
+                            }
+                        }),
+                    )
+                    .await
+                    .expect("ready entity");
+                let mut ids = Vec::new();
+                for c in 0..cards {
+                    let id = format!("int_r8order_{n}_{c:05}");
+                    store
+                        .append_journal(
+                            host.clone(),
+                            instance_id.clone(),
+                            None,
+                            json!({
+                                "kind": "interaction.requested",
+                                "payload": {
+                                    "interactionKind": "approval",
+                                    "interaction": {
+                                        "id": id,
+                                        "kind": "approval",
+                                        "state": "pending",
+                                        "blocking": true,
+                                        "answerable": true,
+                                        "carrier": "harness-hook",
+                                        "deadline": { "state": "unknown" },
+                                        "resolution": { "state": "unknown" },
+                                        "request": {
+                                            "kind": "approval",
+                                            "title": "Bash",
+                                            "description": "r8 order",
+                                            "options": []
+                                        }
+                                    }
+                                }
+                            }),
+                        )
+                        .await
+                        .expect("approval request");
+                    ids.push(id);
+                }
+                (instance_id, ids)
+            }
+        };
+        // Batch A settles FIRST (older timestamp) but its ids sort AFTER B's
+        // (instance number 2 vs 1), so id order and the composite
+        // (updated_at, id) order disagree: an id-ordered page from a mid-A
+        // cursor returns B first and would skip A's remaining rows.
+        let (inst_a, mut cards_a) = seed(2, 5).await;
+        let (inst_b, cards_b) = seed(1, 70).await;
+
+        // Settle A, then B (distinct instants so the cross-batch cursor order
+        // is total); B never publishes live to this follower.
+        store
+            .settle_instance_exited(inst_a.clone(), "r8-order-a".into())
+            .await
+            .expect("settle A");
+        // Force A's settlement timestamp strictly older than B's: otherwise
+        // both stamps can land in the same millisecond and id order coincides
+        // with the composite order, hiding an ORDER BY regression.
+        store
+            .run_named("r8_backdate_a", {
+                let inst_a = inst_a.clone();
+                move |conn| {
+                    conn.execute(
+                        "UPDATE interactions SET updated_at = '2000-01-01T00:00:00.000Z'
+                         WHERE instance_id = ?1",
+                        rusqlite::params![inst_a],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("backdate A");
+        store
+            .settle_instance_exited(inst_b.clone(), "r8-order-b".into())
+            .await
+            .expect("settle B");
+
+        // PART 1: the follower received the first three A rows live, so its
+        // durable cursor is the composite token on the third row.
+        let page = store
+            .invalidated_interactions_after(None)
+            .await
+            .expect("page");
+        let first_three: Vec<String> = page
+            .iter()
+            .take(3)
+            .map(|(_, id, _, _)| id.clone())
+            .collect();
+        let mid_cursor = {
+            let (_, id, _, ts) = page
+                .iter()
+                .find(|(_, id, _, _)| id == &first_three[2])
+                .expect("third row present");
+            Store::settlement_cursor_of(ts, id)
+        };
+
+        // PART 2: fresh drain from the MID cursor recovers the rest in order.
+        // Concurrently receive: the batch exceeds the channel capacity, so the
+        // drain task must run while this test reads (mirrors the real pump).
+        let mut cursor = Some(mid_cursor);
+        let (tx, mut rx) = mpsc::channel::<FollowMsg>(16);
+        let drainer =
+            tokio::spawn(async move { drain_settlement_lag(&store, &[], &mut cursor, &tx).await });
+        let mut recovered = Vec::new();
+        let mut gaps = 0;
+        while let Some(FollowMsg::Text(text)) = rx.recv().await {
+            let frame: Value = serde_json::from_str(&text).expect("json");
+            match frame["type"].as_str() {
+                Some("settlement") => {
+                    recovered.push(frame["interactionId"].as_str().unwrap().to_string())
+                }
+                Some("gap") => gaps += 1,
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        drainer.await.expect("drain task").expect("drain ok");
+
+        // Expect A's remaining two followed by all 70 B rows, total order.
+        cards_a.sort();
+        let mut expected: Vec<String> = first_three.to_vec();
+        expected.extend(recovered.iter().cloned());
+        let mut want = Vec::new();
+        want.append(&mut cards_a.clone());
+        let mut cards_b = cards_b;
+        cards_b.sort();
+        want.append(&mut cards_b);
+        assert_eq!(
+            expected, want,
+            "mid-cursor drain completes both batches in order"
+        );
+        assert_eq!(gaps, 1, "one gap closes the drain");
+        // No duplicates across the two drain phases.
+        let mut unique = expected.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), want.len(), "no row delivered twice");
+        let _ = inst_a;
+        let _ = inst_b;
+    }
+
     /// r6 item 2: a per-instance follower advances its cursor past rows
     /// filtered out for it, so those rows are neither sent nor re-scanned on a
     /// follow-up drain.
@@ -2164,7 +2472,7 @@ mod tests {
             })
             .await
             .expect("seed");
-        let (tx, mut rx) = mpsc::channel::<FollowMsg>(8);
+        let (tx, rx) = mpsc::channel::<FollowMsg>(8);
         let filter = vec!["ins_owned".to_string()];
         let mut cursor: Option<String> = None;
         drain_settlement_lag(&store, &filter, &mut cursor, &tx)
@@ -2173,6 +2481,7 @@ mod tests {
         drop(tx);
         let mut ids = Vec::new();
         let mut gaps = 0;
+        let mut rx = rx;
         while let Some(FollowMsg::Text(text)) = rx.recv().await {
             let frame: Value = serde_json::from_str(&text).unwrap();
             match frame["type"].as_str() {

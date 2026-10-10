@@ -4837,7 +4837,10 @@ async fn configure_replay_in_flight_is_409_then_returns_stored_original() -> Res
         node,
         sends.clone(),
         configures.clone(),
-        Duration::from_millis(500),
+        // Generous hold: the test asserts the 409 against a durable
+        // in-flight row, so scheduling latency on a loaded box must not let
+        // the Node settle first.
+        Duration::from_secs(3),
     );
     let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
     let path = format!("/v1/instances/{instance_id}/commands");
@@ -4857,7 +4860,27 @@ async fn configure_replay_in_flight_is_409_then_returns_stored_original() -> Res
     let first = tokio::spawn(async move {
         http(addr, "POST", &path1, &[("Cookie", &cookie1)], Some(&body1)).await
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait DETERMINISTICALLY for in-flight instead of racing a fixed sleep
+    // against the Node's accept delay under a loaded test machine: the fake
+    // Node has RECEIVED the configure (counts it) but is still holding its
+    // reply, and the first HTTP POST has not returned. The command row is only
+    // durably registered after accept, so the received-frame counter is the
+    // precise in-flight signal.
+    for _ in 0..400 {
+        if configures.load(Ordering::Relaxed) == 1 && !first.is_finished() {
+            break;
+        }
+        assert!(
+            !first.is_finished(),
+            "the first configure returned before the Node held it"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(configures.load(Ordering::Relaxed), 1);
+    assert!(
+        !first.is_finished(),
+        "the first configure is held open by the Node before the replay"
+    );
 
     // Replay while the forward is in flight: a clear 409, never a merge.
     let (status, _, conflict) =

@@ -570,17 +570,17 @@ async fn connect_once(
         &pending,
     )
     .await?;
-    let settlement = state
-        .store
-        .reconcile_daemon_instances(
-            managed.id.clone(),
-            hello["params"]["instances"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
+    state
+        .publish_settlement_unit(
+            state.store.reconcile_daemon_instances(
+                managed.id.clone(),
+                hello["params"]["instances"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
         )
         .await?;
-    state.broadcast_settlement(&settlement);
     carrier
         .send_json(&crate::error::rpc_ok(
             hello["id"].clone(),

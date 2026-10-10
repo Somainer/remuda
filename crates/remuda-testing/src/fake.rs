@@ -134,6 +134,19 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
             record_stdin_marker(path, &incoming);
         }
         session.handle_incoming(incoming, &mut lines)?;
+        // c-cardsettle r8 item 1: a test can ask the child to leave on its OWN
+        // once the scripted conversation is exhausted — WITHOUT stdin EOF and
+        // WITHOUT an `instance.close` (whose explicit-close entity ends the
+        // instance through a different path). This reproduces a real child
+        // process dying after its last turn: the SDK/print reader sees stdout
+        // EOF and emits the driver's own `session`/exited lifecycle, which is
+        // the ONLY evidence the Hub is then allowed to terminal-settle on.
+        if session.script_exhausted()
+            && std::env::var_os("FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+        {
+            return Ok(0);
+        }
         if session.saw_initialize && (close_stdin || stdout_flood || stop_reading) {
             // All three knobs park here with the process alive and stdout open;
             // the parent-death watch reaps us when the test goes away.
@@ -259,6 +272,13 @@ impl Session {
                 Ok(())
             }
         }
+    }
+
+    /// Whether every scripted step has been played (the scripted conversation
+    /// is exhausted). Used by the `FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE` test
+    /// hook to end the child after its own last turn, without a stdin EOF.
+    fn script_exhausted(&self) -> bool {
+        self.cursor >= self.steps.len()
     }
 
     fn play_turn(

@@ -2812,10 +2812,6 @@ impl Store {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             let grace = grace_ms.min(i64::MAX as u64) as i64;
-            // Find the rows this sweep is about to end so their pending
-            // interactions are invalidated in the SAME transaction
-            // (c-cardsettle).
-            //
             // ma-lineage r6 item 3(c): ONLY a chapter that actually reached a
             // LIVE lifecycle may become host-lost. `requested` rows belong to
             // expire_stale_requested (they keep their attested
@@ -2823,24 +2819,15 @@ impl Store {
             // terminal `failed` row (an attested launch failure) is left alone
             // — rewriting either to exited/host-lost would destroy the
             // evidence and block the seat and fresh recovery forever.
-            let lost: Vec<String> = {
-                let mut stmt = tx.prepare(
-                    "SELECT id FROM instances
-                     WHERE lifecycle IN ('starting','preparing','ready','running','closing','reconciling')
-                       AND host_id IN (
-                        SELECT id FROM hosts WHERE state != 'online' AND
-                        (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
-                        (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
-                     )",
-                )?;
-                let rows = stmt.query_map(params![&now, grace], |row| row.get::<_, String>(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            // ma-lineage r5/r6 item 1+3: host loss is CONTACT loss, not process
-            // end (D-019) — no ended_at. r6 uses a NEW marker constant
-            // (HOST_LOST_MARKER) distinct from any legacy value, so rows
-            // written before this change keep their old ended meaning; the
-            // backfill stamps end evidence for those.
+            //
+            // ma-lineage r5/r6 item 1+3 + c-cardsettle r8 item 2 (OA6): host
+            // loss is CONTACT loss, not process end (D-019) — no ended_at, and
+            // the sweep does NOT settle cards: the child may still be running
+            // and a pending approval must stay answerable when the host
+            // returns (revive_host_lost_instances). r7 item 5(b) writes a NEW
+            // marker (HOST_LOST_MARKER), distinct from the legacy spelling, so
+            // rows written before contact-loss semantics keep their old ended
+            // meaning.
             let changed = tx.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                     connectivity = 'disconnected', last_error = ?3,
@@ -2853,9 +2840,12 @@ impl Store {
                  )",
                 params![&now, grace, HOST_LOST_MARKER],
             )?;
-            let settlement = settle_instance_interactions(&tx, &lost, &now)?;
+            // r8 item 2(c): the host-lost sweep must NOT settle cards — the
+            // process behind the lost contact may still be live and a new
+            // approval from it must stay answerable after reconnect. Only a
+            // real process end settles a generation.
             tx.commit()?;
-            Ok((changed, settlement))
+            Ok((changed, Settlement::default()))
         }).await
     }
 
@@ -3815,10 +3805,55 @@ impl Store {
                     )?;
                 }
             }
-            // A generation that ended owns no still-answerable request.
-            let settlement = settle_instance_interactions(&tx, &lost, &now)?;
+            // A generation that ended owns no still-answerable request —
+            // but a node-epoch reconcile is an interruption, so a card with
+            // a known future deadline stays pending for its deadline
+            // (c-ghostbadge).
+            let settlement = settle_interactions_after_reconcile(&tx, &lost, &now)?;
             tx.commit()?;
             Ok((lost, settlement))
+        })
+        .await
+    }
+
+    /// Same-epoch reconnect revival (c-cardsettle r8 item 2, OA6): bring rows
+    /// the contact-loss sweep marked `exited` with HOST_LOST_MARKER back to
+    /// `running` when the SAME Node reports them live in its hello inventory.
+    ///
+    /// Host loss is CONTACT loss, never process end: the child kept running
+    /// while the Hub could not see the host, the sweep only marked the row
+    /// contact-lost (no `ended_at`, cards untouched), and on reconnect the
+    /// live process's own inventory is the evidence that the chapter never
+    /// ended. Only rows with exactly that shape revive — a real exit
+    /// (`ended_at` set, a legacy/other marker) is never resurrected.
+    ///
+    /// Returns the revived instance ids.
+    pub async fn revive_host_lost_instances(
+        &self,
+        host_id: String,
+        live_inventory: &[(String, String)],
+    ) -> Result<Vec<String>, StoreError> {
+        let live: Vec<(String, String)> = live_inventory.to_vec();
+        self.run_named("revive_host_lost_instances", move |conn| {
+            let tx = immediate_tx(conn)?;
+            let now = now_rfc3339();
+            let mut revived = Vec::new();
+            for (id, activity) in &live {
+                let changed = tx.execute(
+                    "UPDATE instances SET lifecycle = 'running', activity = ?3,
+                        connectivity = 'connected', last_error = NULL, updated_at = ?4
+                     WHERE id = ?1 AND host_id = ?2
+                       AND lifecycle = 'exited'
+                       AND last_error = ?5
+                       AND ended_at IS NULL",
+                    params![id, &host_id, activity, &now, HOST_LOST_MARKER],
+                )?;
+                if changed > 0 {
+                    revived.push(id.clone());
+                }
+            }
+            tx.commit()?;
+            Ok(revived)
         })
         .await
     }
@@ -5260,8 +5295,14 @@ impl Store {
     pub async fn recent_invalidated_interactions(
         &self,
     ) -> Result<Vec<(String, String, String)>, StoreError> {
+        // r7 item 2: a cursor-less WINDOW page returns the NEWEST settlements
+        // (DESC). A Node restart or multi-session sweep with more than
+        // SETTLEMENT_LAG_PAGE invalidations inside the window must still
+        // replay the newest ones — the rows a page navigation just missed —
+        // not the oldest 512, whose miss an older in-flight response could
+        // resurrect. Only the windowless lag-drain walk below is ascending.
         let rows = self
-            .invalidated_interactions_page(Some(5), None, SETTLEMENT_LAG_PAGE)
+            .invalidated_interactions_page(Some(5), None, SETTLEMENT_LAG_PAGE, false)
             .await?;
         Ok(rows
             .into_iter()
@@ -5269,6 +5310,39 @@ impl Store {
                 (instance_id, interaction_id, reason)
             })
             .collect())
+    }
+
+    /// c-cardsettle r8 item 3: the durable settlement position at follower
+    /// SUBSCRIBE time — the max `(updated_at, id)` over invalidated live rows
+    /// AND tombstones.
+    ///
+    /// A fresh inbox follower's lag cursor starts HERE, not at `None`:
+    /// historical settlement rows are already covered by the client's initial
+    /// interaction list and the connect-time recent-invalidations replay, so a
+    /// node-epoch reconcile that invalidates hundreds of cards can never make
+    /// the backpressure drain walk the ENTIRE history (every tombstone for the
+    /// life of the database) in 512-row windowless pages on the single writer.
+    /// The caller subscribes to the settlement bus BEFORE reading this so a
+    /// settlement committed around subscribe is delivered live as well; the
+    /// client de-dupes by interaction id.
+    pub async fn max_settlement_cursor(&self) -> Result<Option<String>, StoreError> {
+        self.run_named("max_settlement_cursor", |conn| {
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT updated_at, id FROM (
+                        SELECT updated_at, id FROM interactions WHERE state = 'invalidated'
+                        UNION ALL
+                        SELECT updated_at, id FROM interaction_tombstones WHERE state = 'invalidated'
+                     )
+                     ORDER BY updated_at DESC, id DESC
+                     LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            Ok(row.map(|(updated_at, id)| Self::settlement_cursor_of(&updated_at, &id)))
+        })
+        .await
     }
 
     /// c-cardsettle r6 item 2: one BOUNDED page (at most
@@ -5286,7 +5360,9 @@ impl Store {
         &self,
         cursor: Option<String>,
     ) -> Result<Vec<(String, String, String, String)>, StoreError> {
-        self.invalidated_interactions_page(None, cursor, SETTLEMENT_LAG_PAGE)
+        // The lag drain is the only ASCENDING walk: it pages strictly forward
+        // from a per-follower delivery cursor (r6 item 2).
+        self.invalidated_interactions_page(None, cursor, SETTLEMENT_LAG_PAGE, true)
             .await
     }
 
@@ -5324,24 +5400,38 @@ impl Store {
     }
 
     /// Shared bounded page over live invalidated rows UNION ALL tombstones.
-    /// The reconnect snapshot is bounded by a recent WINDOW; the lag cursor
-    /// path is windowless (an older lost settlement is still authoritative)
-    /// and pages forward from the cursor. Rows are always ASCENDING so a
-    /// multi-page drain reaches the oldest missed rows; `limit` bounds rows
-    /// AND tombstones together.
+    /// The reconnect snapshot is bounded by a recent WINDOW and returns the
+    /// NEWEST page (`ascending == false`); the lag cursor path is windowless
+    /// (an older lost settlement is still authoritative), starts at the
+    /// cursor and walks ASCENDING (`ascending == true`, always cursor-less
+    /// callers excluded). `limit` bounds rows AND tombstones together.
+    ///
+    /// The ordering token is a Rust-matched `ASC`/`DESC` literal, never an
+    /// external string, so the single parameterised statement cannot be
+    /// steered by input.
     async fn invalidated_interactions_page(
         &self,
         window_mins: Option<i64>,
         cursor: Option<String>,
         limit: u32,
+        ascending: bool,
     ) -> Result<Vec<(String, String, String, String)>, StoreError> {
         let limit = i64::from(limit);
         self.run_named("invalidated_interactions_page", move |conn| {
-            // r6 item 2: composite cursor + bounded LIMIT; always oldest-first
-            // so repeated pages drain the ENTIRE backlog. A token present but
-            // unparseable behaves like "no durable position".
+            // r6 item 2: composite cursor + bounded LIMIT; the lag drain pages
+            // oldest-first so repeated pages drain the ENTIRE backlog. r7
+            // item 2: a cursor-less window page is newest-first, so a burst
+            // larger than one page still replays the settlements a reconnect
+            // most recently missed. A token present but unparseable behaves
+            // like "no durable position".
             let (cursor_ts, cursor_id) = Self::parse_settlement_cursor(cursor.as_deref());
-            let sql = "SELECT instance_id, id, COALESCE(
+            // Only the ASC lag walk supplies a cursor; DESC snapshot callers
+            // are cursor-less, so the `?2 IS NULL` predicate stays valid for
+            // both directions.
+            debug_assert!(ascending || cursor_ts.is_none());
+            let direction: &'static str = if ascending { "ASC" } else { "DESC" };
+            let sql = format!(
+                "SELECT instance_id, id, COALESCE(
                     json_extract(payload_json, '$.payload.reasonCode'),
                     json_extract(payload_json,
                         '$.payload.entity.resolution.value.reason'),
@@ -5361,9 +5451,10 @@ impl Store {
                  WHERE state = 'invalidated'
                    AND (?1 IS NULL OR julianday(updated_at) >= julianday('now','-' || ?1 || ' minutes'))
                    AND (?2 IS NULL OR (updated_at, id) > (?2, ?3))
-                 ORDER BY updated_at ASC, id ASC
-                 LIMIT ?4";
-            let mut stmt = conn.prepare(sql)?;
+                 ORDER BY updated_at {direction}, id {direction}
+                 LIMIT ?4"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(
                 params![window_mins, cursor_ts, cursor_id, limit],
                 |row| {
@@ -6473,6 +6564,14 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        -- c-cardsettle r8 item 3: the settlement lag drain filters
+        -- state='invalidated' AND (updated_at, id) > (?,?) with no window;
+        -- a composite index keeps a follower recovery from full-scanning the
+        -- (life-of-database) interactions and tombstones tables.
+        CREATE INDEX IF NOT EXISTS interactions_settlement_cursor
+            ON interactions(state, updated_at, id);
+        CREATE INDEX IF NOT EXISTS interaction_tombstones_settlement_cursor
+            ON interaction_tombstones(state, updated_at, id);
         CREATE TABLE IF NOT EXISTS provider_profiles (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -6641,26 +6740,27 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     if backfill_version < 2 {
         // r6 item 3(b) ONE-TIME legacy fallback (guarded by PRAGMA
         // user_version): evidence-less historical rows that already reached a
-        // live lifecycle, and LEGACY 'host-lost'-marked rows (the pre-r7
-        // marker — genuine ends), are stamped from updated_at. Rows that
-        // never reached live (requested / attested launch failures) stay
-        // NULL.
+        // live lifecycle are stamped from updated_at. Rows that never reached
+        // live (requested / attested launch failures) stay NULL.
+        //
+        // c-cardsettle r8 item 2 follow-up: a NULL-ended_at
+        // last_error='host-lost'/'host-contact-lost' row is CONTACT loss (the
+        // sweep stopped stamping ends), so it is NEVER backfilled here —
+        // stamping it would fabricate process-end evidence and block the
+        // same-epoch revive.
         conn.execute(
             "UPDATE instances SET ended_at = updated_at
              WHERE ended_at IS NULL
                AND lifecycle IN ('exited', 'failed')
-               AND (
-                    last_error = ?1
-                    OR (last_error IS NULL
-                        AND lifecycle = 'exited'
-                        AND EXISTS (
-                            SELECT 1 FROM journal
-                             WHERE journal.instance_id = instances.id
-                               AND json_extract(journal.payload_json,
-                                   '$.payload.state') IN ('ready','running')
-                        ))
+               AND last_error IS NULL
+               AND lifecycle = 'exited'
+               AND EXISTS (
+                    SELECT 1 FROM journal
+                     WHERE journal.instance_id = instances.id
+                       AND json_extract(journal.payload_json,
+                           '$.payload.state') IN ('ready','running')
                )",
-            params![LEGACY_HOST_LOST_MARKER],
+            [],
         )?;
         conn.execute_batch("PRAGMA user_version = 2;")?;
     }
@@ -8999,6 +9099,368 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r7 item 3: the settlement vector one terminal write
+    /// publishes must be MONOTONIC in the follower's delivery cursor key
+    /// `(updated_at, id)` — ascending id within one sweep (all rows share the
+    /// call's `now`), ascending timestamp across two sweeps. A high id before
+    /// a low id of the same batch would advance a backpressured follower's
+    /// max-cursor past it, and the lag drain's strict `(updated_at, id) >
+    /// cursor` filter would then skip the dropped row forever.
+    #[tokio::test]
+    async fn settle_publication_is_monotonic_in_the_cursor_key() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "settle-order").await;
+        let inst_a = seed_acknowledged_instance(&store, &host).await;
+        let inst_b = seed_acknowledged_instance(&store, &host).await;
+
+        // Insert pending rows with deliberately NON-sorted ids so SQLite's
+        // natural (rowid) return order would be wrong without the ORDER BY.
+        async fn make_rows(store: &Store, instance: &str, ids: [&'static str; 3]) {
+            store
+                .run_named("r7_seed_pending_for_order", {
+                    let instance = instance.to_string();
+                    move |conn| {
+                        for id in ids {
+                            conn.execute(
+                                "INSERT INTO interactions
+                                    (id, instance_id, host_id, kind, state, blocking,
+                                     payload_json, created_at, updated_at)
+                                 VALUES (?1, ?2, 'hst_order', 'approval', 'pending', 1,
+                                     '{}', '2026-10-08T00:00:00.000Z',
+                                            '2026-10-08T00:00:00.000Z')",
+                                params![id, instance],
+                            )?;
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+                .expect("seed pending rows");
+        }
+        make_rows(
+            &store,
+            &inst_a.instance_id,
+            ["int_ord_z", "int_ord_a", "int_ord_m"],
+        )
+        .await;
+        make_rows(
+            &store,
+            &inst_b.instance_id,
+            ["int_ord_q", "int_ord_b", "int_ord_t"],
+        )
+        .await;
+
+        async fn settle(store: &Store, ids: Vec<String>, now: &str) -> Settlement {
+            let now = now.to_string();
+            store
+                .run_named("r7_settle_for_order", move |conn| {
+                    settle_instance_interactions(conn, &ids, &now)
+                })
+                .await
+                .expect("settle")
+        }
+        // inst_b settles at an EARLIER timestamp than inst_a: its rows must
+        // sort first in the merged publication key.
+        let mut published = settle(
+            &store,
+            vec![inst_b.instance_id.clone()],
+            "2026-10-08T12:00:00.000Z",
+        )
+        .await;
+        published.merge(
+            settle(
+                &store,
+                vec![inst_a.instance_id.clone()],
+                "2026-10-08T12:00:00.001Z",
+            )
+            .await,
+        );
+
+        let keys: Vec<(String, String)> = published
+            .interactions
+            .iter()
+            .map(|s| (s.updated_at.clone(), s.interaction_id.clone()))
+            .collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(
+            keys, sorted_keys,
+            "publication follows the (updated_at, id) cursor order"
+        );
+        // Within the same-timestamp sweep ids are ascending, not rowid order.
+        let within_a: Vec<&str> = keys
+            .iter()
+            .filter(|(_, id)| ["int_ord_z", "int_ord_a", "int_ord_m"].contains(&id.as_str()))
+            .map(|(_, id)| id.as_str())
+            .collect();
+        assert_eq!(
+            within_a,
+            vec!["int_ord_a", "int_ord_m", "int_ord_z"],
+            "one sweep publishes ascending id despite insert order"
+        );
+        // The earlier sweep precedes the later one regardless of id.
+        assert_eq!(keys.first().unwrap().1, "int_ord_b");
+        store.close().await;
+    }
+
+    /// c-cardsettle r7 item 2: with more than SETTLEMENT_LAG_PAGE settlements
+    /// inside the 5-minute reconnect window, the cursor-less snapshot must be
+    /// the NEWEST page (DESC) — after a Node restart or multi-session sweep the
+    /// rows a page navigation just missed are the newest ones; an oldest-first
+    /// page would never replay/pin them and an in-flight pending response would
+    /// resurrect those cards.
+    #[tokio::test]
+    async fn reconnect_window_returns_the_newest_settlements_when_over_one_page() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let count = SETTLEMENT_LAG_PAGE + 112; // 624 > one 512-row page
+        store
+            .run_named("r7_seed_window_burst", move |conn| {
+                use time::format_description::well_known::Rfc3339;
+                use time::{Duration, OffsetDateTime};
+                let stamp = |t: OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
+                let base = OffsetDateTime::now_utc();
+                // One aged settlement well outside the window.
+                let aged = stamp(base - Duration::seconds(400));
+                conn.execute(
+                    "INSERT INTO interactions
+                        (id, instance_id, host_id, kind, state, blocking,
+                         payload_json, created_at, updated_at)
+                     VALUES ('int_r7_AGED', 'ins_r7', 'hst_r7', 'approval', 'invalidated', 0,
+                         '{}', ?1, ?1)",
+                    params![aged],
+                )?;
+                // `count` settlements across the present window, ascending
+                // timestamps so the largest n is the NEWEST settlement.
+                let mut stmt = conn.prepare(
+                    "INSERT INTO interactions
+                        (id, instance_id, host_id, kind, state, blocking,
+                         payload_json, created_at, updated_at)
+                     VALUES (?1, 'ins_r7', 'hst_r7', 'approval', 'invalidated', 0, '{}',
+                         ?2, ?2)",
+                )?;
+                for n in 0..count {
+                    stmt.execute(params![
+                        format!("int_r7_{n:05}"),
+                        stamp(base + Duration::milliseconds(i64::from(n)))
+                    ])?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed window burst");
+
+        let recent = store
+            .recent_invalidated_interactions()
+            .await
+            .expect("recent window page");
+        assert_eq!(
+            recent.len(),
+            SETTLEMENT_LAG_PAGE as usize,
+            "the snapshot is one bounded page"
+        );
+        let ids: Vec<&str> = recent.iter().map(|(_, id, _)| id.as_str()).collect();
+        let newest = format!("int_r7_{:05}", count - 1);
+        assert_eq!(
+            ids.first(),
+            Some(&newest.as_str()),
+            "the newest settlement leads the newest-first page"
+        );
+        assert!(
+            ids.contains(&newest.as_str()),
+            "the reconnect replay contains the newest settlement"
+        );
+        assert!(
+            !ids.contains(&"int_r7_00000"),
+            "the oldest in-window settlement drops off a newest-first page"
+        );
+        assert!(
+            !ids.contains(&"int_r7_AGED"),
+            "the window still excludes aged settlements"
+        );
+        store.close().await;
+    }
+
+    /// c-cardsettle r8 item 3: a fresh follower seeds its lag cursor from the
+    /// durable max settlement position, so a pre-existing backlog (more rows
+    /// than one page, including old timestamps) is never replayed as "lag" —
+    /// only settlements committed AFTER subscribe drain.
+    #[tokio::test]
+    async fn seeded_settlement_cursor_skips_pre_existing_history() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r8-seed-cursor").await;
+
+        // Pre-populate MORE than one lag page of old settlements at an old
+        // timestamp (the life-of-database history the old None-cursor drain
+        // walked).
+        let old_count = (SETTLEMENT_LAG_PAGE as usize) + 32;
+        let mut newest_old_id = String::new();
+        let mut newest_old_ts = String::new();
+        for n in 0..old_count {
+            let instance = seed_acknowledged_instance(&store, &host).await;
+            let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+            store
+                .settle_instance_exited(instance.instance_id, "old-history".into())
+                .await
+                .expect("settle old");
+            // Backdate every old row a day, with a strictly increasing
+            // timestamp per row so the last inserted is the durable max.
+            let ts = format!("2000-01-01T00:00:{:02}.{:03}Z", n / 60, (n % 60) * 10);
+            store
+                .run_named("r8_backdate_old", {
+                    let int_id = int_id.clone();
+                    let ts = ts.clone();
+                    move |conn| {
+                        conn.execute(
+                            "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
+                            params![ts, int_id],
+                        )?;
+                        Ok(())
+                    }
+                })
+                .await
+                .expect("backdate old");
+            newest_old_id = int_id;
+            newest_old_ts = ts;
+        }
+
+        // Subscribe position: the durable max over the backlog.
+        let seed = store
+            .max_settlement_cursor()
+            .await
+            .expect("max settlement cursor")
+            .expect("a backlog exists");
+        assert_eq!(
+            seed,
+            Store::settlement_cursor_of(&newest_old_ts, &newest_old_id),
+            "the seed is the newest old (updated_at, id)"
+        );
+        // Draining from the seed immediately is empty — the history is covered
+        // by list + connect replay, never replayed as lag.
+        assert!(
+            store
+                .invalidated_interactions_after(Some(seed.clone()))
+                .await
+                .expect("drain from seed")
+                .is_empty(),
+            "no historical settlement drains past the seed"
+        );
+
+        // Settlements committed AFTER subscribe (a new sweep) DO drain, and
+        // none of the old backlog comes with them.
+        let mut new_ids = Vec::new();
+        for _ in 0..(SETTLEMENT_LAG_PAGE as usize + 5) {
+            let instance = seed_acknowledged_instance(&store, &host).await;
+            let pending = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+            store
+                .settle_instance_exited(instance.instance_id, "new-sweep".into())
+                .await
+                .expect("settle new");
+            new_ids.push(pending);
+        }
+        let mut drained_ids = Vec::new();
+        let mut cursor = Some(seed);
+        loop {
+            let page = store
+                .invalidated_interactions_after(cursor.clone())
+                .await
+                .expect("drain page");
+            if page.is_empty() {
+                break;
+            }
+            for (_, id, _, ts) in &page {
+                assert!(
+                    new_ids.iter().any(|want| want == id),
+                    "an OLD settlement drained past the seed: {id}"
+                );
+                drained_ids.push(id.clone());
+                cursor = Some(Store::settlement_max_cursor(cursor.as_deref(), ts, id));
+            }
+        }
+        drained_ids.sort();
+        let mut want = new_ids.clone();
+        want.sort();
+        assert_eq!(drained_ids, want, "exactly the post-subscribe sweep drains");
+        store.close().await;
+    }
+
+    /// c-cardsettle r8 (c-ghostbadge split): the node-epoch reconcile is an
+    /// interruption. A pending card with a KNOWN deadline still in the future
+    /// is deadline-owned and STAYS pending through the reconcile (the shared
+    /// deadline projection retires it in place); a card with no deadline is
+    /// invalidated generation-ended as before.
+    #[tokio::test]
+    async fn reconcile_keeps_open_deadline_cards_but_invalidates_deadlineless() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r8-deadline").await;
+
+        let open_deadline = seed_acknowledged_instance(&store, &host).await;
+        let no_deadline = seed_acknowledged_instance(&store, &host).await;
+        let open_card = seed_pending_interaction(&store, &host, &open_deadline.instance_id).await;
+        let plain_card = seed_pending_interaction(&store, &host, &no_deadline.instance_id).await;
+        // Attach a known future deadline to one card.
+        store
+            .run_named("r8_set_open_deadline", {
+                let open_card = open_card.clone();
+                move |conn| {
+                    conn.execute(
+                        r#"UPDATE interactions
+                             SET payload_json = json_set(payload_json,
+                                 '$.interaction.deadline',
+                                 json('{"state":"known","value":"2999-01-01T00:00:00.000Z"}'))
+                           WHERE id = ?1"#,
+                        params![open_card],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("set deadline");
+
+        // A new epoch reports neither instance: the reconcile settles the
+        // generation but respects the open deadline.
+        let (_lost, settlement) = store
+            .reconcile_reported_instances(host, vec![], "node-epoch-changed".to_string(), true)
+            .await
+            .expect("reconcile");
+
+        let state_of = |id: String| {
+            let store = store.clone();
+            async move {
+                store
+                    .run_named("r8_read_card", move |conn| {
+                        let (state, blocking): (String, i64) = conn.query_row(
+                            "SELECT state, blocking FROM interactions WHERE id = ?1",
+                            params![id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?;
+                        Ok((state, blocking))
+                    })
+                    .await
+                    .expect("read card")
+            }
+        };
+        let (open_state, open_blocking) = state_of(open_card.clone()).await;
+        assert_eq!((open_state.as_str(), open_blocking), ("pending", 1));
+        let (plain_state, plain_blocking) = state_of(plain_card.clone()).await;
+        assert_eq!((plain_state.as_str(), plain_blocking), ("invalidated", 0));
+        // Only the deadlineless card is announced as a settlement.
+        let settled: Vec<String> = settlement
+            .interactions
+            .iter()
+            .map(|s| s.interaction_id.clone())
+            .collect();
+        assert!(settled.contains(&plain_card));
+        assert!(!settled.contains(&open_card));
+        store.close().await;
+    }
+
     /// c-cardsettle r5 item 6: the lag recovery cursor replaces the fixed
     /// 5-minute window for a follower that MISSED notices. An older lost
     /// settlement (beyond the reconnect snapshot window) is still recovered on
@@ -9993,12 +10455,13 @@ mod tests {
         store.close().await;
     }
 
-    /// ma-lineage r7 item 5(b)/(c): the legacy `"host-lost"` marker is an
-    /// ENDED row and gets its ended_at from the one-time user_version
-    /// migration; the NEW `"host-contact-lost"` marker stays potentially live
-    /// (no ended_at) across reopens.
+    /// ma-lineage r7 item 5(b) + c-cardsettle r8 item 2 follow-up: a
+    /// NULL-ended_at host-lost row is CONTACT loss under BOTH the legacy
+    /// `"host-lost"` spelling (rows swept while the no-ended_at sweep was
+    /// deployed) and the NEW `"host-contact-lost"` marker — the one-time
+    /// user_version migration fabricates no process-end evidence for either.
     #[tokio::test]
-    async fn legacy_host_lost_marker_migrates_but_new_marker_stays_live() {
+    async fn host_lost_markers_stay_evidence_less_across_migration() {
         let dir = tempfile::tempdir().expect("dir");
         let store = Store::open(dir.path()).expect("store");
         let host = new_id("hst").expect("host");
@@ -10049,10 +10512,10 @@ mod tests {
                 .unwrap()
             }
         };
-        assert_eq!(
-            ended_at(&legacy.instance_id).await.as_deref(),
-            Some("2026-09-01T08:00:00.000Z"),
-            "the legacy marker takes its old ended meaning from updated_at"
+        assert!(
+            ended_at(&legacy.instance_id).await.is_none(),
+            "c-cardsettle r8: a NULL-ended_at legacy host-lost row is contact \
+             loss and is never backfilled"
         );
         assert!(
             ended_at(&new.instance_id).await.is_none(),
@@ -10417,6 +10880,134 @@ mod tests {
             state, "invalidated",
             "a stray status never revives the card"
         );
+        store.close().await;
+    }
+
+    /// c-cardsettle r7 item 1: the hello reconcile can mark an instance exited
+    /// BEFORE the Node's journal catch-up replays an approval it journaled
+    /// while the Hub link was down. The late, unseen `interaction.requested`
+    /// must land directly as invalidated/generation-ended (the exact payload
+    /// the settle path writes), must NOT flip activity back to blocked, and
+    /// returns exactly one settlement notice. The badge (pending-only list)
+    /// never counts it; it appears only in the departed inbox presentation.
+    #[tokio::test]
+    async fn late_request_after_owner_exited_is_invalidated_and_never_pending() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cardsettle-late-request").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+
+        // The owner ends (real process-end entity event) with no card yet.
+        let end = store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{"type":"entity","entityType":"instance","state":"exited"}}),
+            )
+            .await
+            .expect("append exit");
+        assert!(end.settlement.is_empty(), "nothing was pending yet");
+        let owner = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get owner")
+            .expect("owner row");
+        assert_eq!(owner.lifecycle, "exited");
+        let activity_before = owner.activity.clone();
+
+        // The Node catch-up now replays an approval it journaled before dying.
+        let late_id = new_id("int").expect("late interaction id");
+        let appended = store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": late_id,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "resolution": { "state": "unknown" },
+                            "request": {
+                                "kind": "approval",
+                                "title": "Bash",
+                                "description": "journaled while the hub link was down",
+                                "options": [],
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("replay late request");
+
+        // Exactly one settlement notice, shaped like every other settle.
+        assert_eq!(
+            appended.settlement.interactions.len(),
+            1,
+            "the late request yields one settlement notice: {:?}",
+            appended.settlement.interactions
+        );
+        let notice = &appended.settlement.interactions[0];
+        assert_eq!(notice.instance_id, instance.instance_id);
+        assert_eq!(notice.interaction_id, late_id);
+        assert!(!notice.updated_at.is_empty());
+
+        let (state, reason) = interaction_state_and_reason(&store, &late_id).await;
+        assert_eq!(state, "invalidated", "the card is never pending");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+
+        // Activity is untouched (never flipped back to blocked).
+        let owner_after = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get owner after")
+            .expect("owner row");
+        assert_eq!(
+            owner_after.activity, activity_before,
+            "a late request never re-blocks an ended instance"
+        );
+        assert_ne!(owner_after.activity, "blocked");
+
+        // The badge (actionable, pending-only) never counts it.
+        let pending = store
+            .list_interactions(None, Some(instance.instance_id.clone()), None, true)
+            .await
+            .expect("pending list");
+        assert!(
+            pending.iter().all(|r| r.interaction_id != late_id),
+            "the late card is not actionable: {pending:?}"
+        );
+
+        // It is also idempotent: a second replay settles nothing new.
+        let again = store
+            .append_journal(
+                host,
+                instance.instance_id.clone(),
+                Some(appended.record.seq + 1),
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": { "id": late_id, "kind": "approval", "state": "pending" }
+                    }
+                }),
+            )
+            .await
+            .expect("replay late request twice");
+        assert!(
+            again.settlement.is_empty(),
+            "a replay of an already-invalidated request settles nothing"
+        );
+        let (state, _) = interaction_state_and_reason(&store, &late_id).await;
+        assert_eq!(state, "invalidated");
         store.close().await;
     }
 
@@ -11445,12 +12036,12 @@ mod tests {
         assert_eq!(row.lifecycle, "requested");
         store.close().await;
     }
-
-    /// c-cardsettle (host-lost sweep): expire_lost_hosts settles the instances
-    /// of an unreachable host and invalidates their still-pending interactions
-    /// in the same transaction.
+    /// c-cardsettle r8 item 2 (OA6): the host-lost sweep marks the ROW
+    /// exited/contact-lost but host loss is CONTACT loss, not process end — it
+    /// does NOT invalidate pending cards and does NOT stamp `ended_at`. The
+    /// row is the potentially-live shape the same-epoch revive clears.
     #[tokio::test]
-    async fn expire_lost_hosts_invalidates_pending_interactions() {
+    async fn expire_lost_hosts_marks_contact_loss_without_settling_cards() {
         let dir = tempfile::tempdir().expect("dir");
         let store = Store::open(dir.path()).expect("store");
         let host = new_id("hst").expect("host");
@@ -11464,19 +12055,65 @@ mod tests {
             .expect("offline");
         let (swept, settlement) = store.expire_lost_hosts(0).await.expect("host-lost sweep");
         assert_eq!(swept, 1);
-        assert_eq!(settlement.interactions.len(), 1, "one card settled");
-        assert_eq!(settlement.interactions[0].instance_id, instance.instance_id);
-        assert_eq!(settlement.interactions[0].interaction_id, int_id);
-        assert!(!settlement.interactions[0].updated_at.is_empty());
+        assert!(
+            settlement.interactions.is_empty(),
+            "contact loss never settles cards: {settlement:?}"
+        );
         let row = store
-            .get_instance(instance.instance_id)
+            .get_instance(instance.instance_id.clone())
             .await
             .expect("get")
             .expect("row");
         assert_eq!(row.lifecycle, "exited");
+        assert_eq!(row.last_error.as_deref(), Some(HOST_LOST_MARKER));
+        let ended_at_id = instance.instance_id.clone();
+        let ended_at: Option<String> = store
+            .run_named("r8_ended_at_check", move |conn| {
+                conn.query_row(
+                    "SELECT ended_at FROM instances WHERE id = ?1",
+                    params![&ended_at_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+            })
+            .await
+            .expect("query ended_at")
+            .flatten();
+        assert!(
+            ended_at.is_none(),
+            "contact loss must not stamp process-end evidence"
+        );
+        // The card is untouched: still pending, still blocking.
         let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
-        assert_eq!(state, "invalidated");
-        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        assert_eq!(state, "pending");
+        assert!(
+            reason.is_none(),
+            "no generation-ended resolution: {reason:?}"
+        );
+
+        // A same-epoch inventory reporting the instance live revives the row;
+        // the pending card survives the revival too.
+        let revived = store
+            .revive_host_lost_instances(
+                host.clone(),
+                &[(instance.instance_id.clone(), "idle".to_string())],
+            )
+            .await
+            .expect("revive");
+        assert_eq!(revived, vec![instance.instance_id.clone()]);
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "running");
+        assert!(
+            row.last_error.is_none(),
+            "revival clears host-lost: {row:?}"
+        );
+        let (state, _reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "pending", "the card stays pending through revival");
         store.close().await;
     }
 
@@ -12564,7 +13201,11 @@ fn append_loaded_event(
 ) -> Result<JournalAppend, StoreError> {
     let seq = cursor.next_hint.unwrap_or(cursor.expected_next);
     if let Some(existing) = load_journal_row(conn, instance_id, seq)? {
-        apply_interaction_event(conn, host_id, instance_id, &existing.event)?;
+        // r7 item 1: even a REPLAYED request is checked against the owner's
+        // current lifecycle — the hello reconcile can have ended the instance
+        // before the journal catch-up replayed the request. The settlement
+        // rides the (replayed) append result so the ws layer broadcasts it.
+        let settlement = apply_interaction_event(conn, host_id, instance_id, &existing.event)?;
         // A replay hands the next event this existing row's seq + 1, just as
         // the old per-event loop derived its next hint from the returned
         // record. The durable cursor does not move.
@@ -12573,7 +13214,7 @@ fn append_loaded_event(
             record: existing,
             replayed: true,
             durable_seq: cursor.durable,
-            settlement: Settlement::default(),
+            settlement,
         });
     }
     if seq != cursor.expected_next {
@@ -12608,7 +13249,10 @@ fn append_loaded_event(
     apply_instance_projection(conn, instance_id, &event, seq, &now, &mut settlement)?;
     apply_native_session_projection(conn, instance_id, &event, &now)?;
     apply_command_projection(conn, host_id, instance_id, &event, &now)?;
-    apply_interaction_event(conn, host_id, instance_id, &event)?;
+    // r7 item 1: a fresh request on an already-ended owner is inserted
+    // invalidated and its settlement notice is folded in with any settlement
+    // this event's own terminal transition produced.
+    settlement.merge(apply_interaction_event(conn, host_id, instance_id, &event)?);
     apply_instance_lifecycle(conn, instance_id, &event, &mut settlement)?;
     cursor.expected_next = seq + 1;
     cursor.durable = seq;
@@ -12712,7 +13356,7 @@ fn apply_interaction_event(
     host_id: &str,
     instance_id: &str,
     event: &Value,
-) -> Result<(), StoreError> {
+) -> Result<Settlement, StoreError> {
     let kind = event
         .get("kind")
         .and_then(Value::as_str)
@@ -12769,7 +13413,7 @@ fn apply_interaction_event(
             conn.execute("UPDATE interactions SET state = ?1, blocking = 0, payload_json = ?2, updated_at = ?3 WHERE id = ?4",
                 params![state, payload_json, now_rfc3339(), id])?;
         }
-        return Ok(());
+        return Ok(Settlement::default());
     }
     let id = event
         .get("interactionId")
@@ -12785,9 +13429,10 @@ fn apply_interaction_event(
                 .and_then(Value::as_str)
         });
     let Some(id) = id.filter(|id| !id.is_empty()) else {
-        return Ok(());
+        return Ok(Settlement::default());
     };
     let now = now_rfc3339();
+    let mut settlement = Settlement::default();
     if kind == "interaction.requested" || kind == "interactionRequested" {
         let ikind = event
             .get("interactionKind")
@@ -12799,45 +13444,98 @@ fn apply_interaction_event(
                     .and_then(Value::as_str)
             })
             .unwrap_or("permission");
-        // c-cardsettle r2 item 6: a replayed `interaction.requested` (e.g. a
-        // lost-ack replay) must not overwrite an already-terminal row. The old
-        // upsert rewrote payload_json unconditionally, stripping the
-        // generation-ended/invalidated resolution (and re-stamping a
-        // terminal card's activity), which made the desktop mislabel it as
-        // 已在其它设备处理. Keep the existing payload/state when the row is
-        // already invalidated or expired; only a pending (or non-terminal) row
-        // absorbs the replay.
-        conn.execute(
-            "INSERT INTO interactions
-                (id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?6)
-             ON CONFLICT(id) DO UPDATE SET
-                payload_json = CASE
-                    WHEN interactions.state IN ('invalidated', 'expired')
-                        THEN interactions.payload_json
-                    ELSE excluded.payload_json
-                END,
-                updated_at = CASE
-                    WHEN interactions.state IN ('invalidated', 'expired')
-                        THEN interactions.updated_at
-                    ELSE excluded.updated_at
-                END,
-                state = CASE WHEN interactions.state = 'pending' THEN 'pending' ELSE interactions.state END",
-            params![id, instance_id, host_id, ikind, event.to_string(), now],
-        )?;
-        // A terminal interaction never puts the instance back to blocked.
-        let already_terminal: bool = conn
-            .query_row(
-                "SELECT state IN ('invalidated', 'expired') FROM interactions WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap_or(false);
-        if !already_terminal {
+        // c-cardsettle r7 item 1: a request whose owner is already ended can
+        // never be answered by a live process. Trigger: a Node loses the Hub,
+        // journals an approval and then the exit, and reconnects — the hello
+        // reconcile marks the instance exited BEFORE the journal catch-up
+        // replays the request. In the SAME transaction as the insert, read
+        // the owner's lifecycle (an absent or deleted row also counts as
+        // ended): write the card directly in the settle path's
+        // invalidated / generation-ended shape, do NOT touch activity, and
+        // return a settlement notice so ws broadcasts it exactly like every
+        // other terminal path. A non-terminal owner keeps the pending +
+        // blocked behaviour below.
+        //
+        // c-ghostbadge exception: a card with a KNOWN deadline still open is
+        // deadline-owned (see interaction_deadline_is_open); it survives the
+        // ended owner so the deadline projection can retire it in place.
+        if !interaction_deadline_is_open(event, &now) && owner_instance_ended(conn, instance_id)? {
+            let prior_state: Option<String> = conn
+                .query_row(
+                    "SELECT state FROM interactions WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match prior_state.as_deref() {
+                // An already non-pending row (answered/resolved/expired/
+                // invalidated) is settled business: mirror the settle path's
+                // idempotency and leave it untouched.
+                Some(state) if state != "pending" => {}
+                // Unseen request, or a still-pending row on an ended owner.
+                _ => {
+                    let mut stamped = event.clone();
+                    invalidate_interaction_payload(&mut stamped, &now);
+                    conn.execute(
+                        "INSERT INTO interactions
+                            (id, instance_id, host_id, kind, state, blocking,
+                             payload_json, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 'invalidated', 0, ?5, ?6, ?6)
+                         ON CONFLICT(id) DO UPDATE SET
+                            state = 'invalidated',
+                            blocking = 0,
+                            payload_json = excluded.payload_json,
+                            updated_at = excluded.updated_at",
+                        params![id, instance_id, host_id, ikind, stamped.to_string(), now],
+                    )?;
+                    settlement.interactions.push(SettledInteraction {
+                        instance_id: instance_id.to_owned(),
+                        interaction_id: id.to_owned(),
+                        updated_at: now.clone(),
+                    });
+                }
+            }
+        } else {
+            // c-cardsettle r2 item 6: a replayed `interaction.requested` (e.g.
+            // a lost-ack replay) must not overwrite an already-terminal row.
+            // The old upsert rewrote payload_json unconditionally, stripping
+            // the generation-ended/invalidated resolution (and re-stamping a
+            // terminal card's activity), which made the desktop mislabel it as
+            // 已在其它设备处理. Keep the existing payload/state when the row is
+            // already invalidated or expired; only a pending (or non-terminal)
+            // row absorbs the replay.
             conn.execute(
-                "UPDATE instances SET activity = 'blocked', updated_at = ?1 WHERE id = ?2",
-                params![now, instance_id],
+                "INSERT INTO interactions
+                    (id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    payload_json = CASE
+                        WHEN interactions.state IN ('invalidated', 'expired')
+                            THEN interactions.payload_json
+                        ELSE excluded.payload_json
+                    END,
+                    updated_at = CASE
+                        WHEN interactions.state IN ('invalidated', 'expired')
+                            THEN interactions.updated_at
+                        ELSE excluded.updated_at
+                    END,
+                    state = CASE WHEN interactions.state = 'pending' THEN 'pending' ELSE interactions.state END",
+                params![id, instance_id, host_id, ikind, event.to_string(), now],
             )?;
+            // A terminal interaction never puts the instance back to blocked.
+            let already_terminal: bool = conn
+                .query_row(
+                    "SELECT state IN ('invalidated', 'expired') FROM interactions WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false);
+            if !already_terminal {
+                conn.execute(
+                    "UPDATE instances SET activity = 'blocked', updated_at = ?1 WHERE id = ?2",
+                    params![now, instance_id],
+                )?;
+            }
         }
     } else if kind == "interaction.answered"
         || kind == "interactionAnswered"
@@ -12854,7 +13552,7 @@ fn apply_interaction_event(
             params![state, now, id],
         )?;
     }
-    Ok(())
+    Ok(settlement)
 }
 
 fn knowledge_value(value: Option<&Value>) -> Option<&str> {
@@ -12948,9 +13646,13 @@ pub(crate) const CREATE_NEVER_ACKNOWLEDGED_MARKER: &str = "create-never-acknowle
 
 pub(crate) const HOST_LOST_MARKER: &str = "host-contact-lost";
 
-/// The legacy host-loss marker, stamped by code before contact-loss
-/// semantics (ma-lineage r7 item 5(b)): such a row means a genuine end. The
-/// migration stamps `ended_at` on evidence-less rows carrying this spelling.
+/// The legacy host-loss marker, stamped by older sweeps
+/// (ma-lineage r7 item 5(b)). Its meaning after the c-cardsettle r8 merge:
+/// a NULL-ended_at row carrying this spelling is a CONTACT-loss row swept
+/// while the no-ended_at sweep was deployed, so the one-time migration must
+/// NOT fabricate an end for it. Retained as the vocabulary reference; no code
+/// path stamps it anymore.
+#[allow(dead_code)]
 pub(crate) const LEGACY_HOST_LOST_MARKER: &str = "host-lost";
 
 /// Top-level envelope `origin` value stamped on every Hub-AUTHORED journal
@@ -13059,6 +13761,59 @@ pub(crate) fn native_payload_is_subagent(payload: &Value) -> bool {
 /// queue.
 const TERMINAL_INSTANCE_LIFECYCLES: &[&str] = &["exited", "failed", "closed"];
 
+/// c-cardsettle r7 item 1: whether an interaction request's owner is already
+/// ended at insert time. An ABSENT instances row also counts as ended — the
+/// owner is deleted (its row deleted together with the instance) or was never
+/// known to the Hub — so a request replayed by a Node after the hello
+/// reconcile can never be inserted as a live, answerable card.
+///
+/// r8 item 2 (OA6): a terminal-shaped row carrying NO process-end evidence —
+/// the `exited`/host-lost sweep marker with no `ended_at` — is NOT an ended
+/// owner: the process behind the lost contact may still run and the row is
+/// revived on a same-epoch reconnect.
+/// c-ghostbadge: a pending interaction carrying a KNOWN deadline still in the
+/// future is retired by the shared deadline projection, NOT by instance
+/// lifecycle settlement. It survives a node-epoch reconcile (an interruption
+/// whose process may resume) and a journal replay after one, so the badge can
+/// flip 1 -> 0 in place when the deadline crosses. Cards with no deadline, an
+/// UNKNOWN deadline, or an already-past deadline follow the normal
+/// generation-ended settlement.
+fn interaction_deadline_is_open(event: &Value, now: &str) -> bool {
+    let deadline = event
+        .pointer("/interaction/deadline")
+        .or_else(|| event.get("deadline"))
+        .or_else(|| event.pointer("/payload/interaction/deadline"))
+        .or_else(|| event.pointer("/payload/deadline"));
+    let Some(deadline) = deadline else {
+        return false;
+    };
+    if deadline.get("state").and_then(Value::as_str) != Some("known") {
+        return false;
+    }
+    deadline
+        .get("value")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value > now)
+}
+
+fn owner_instance_ended(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
+    let row: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT lifecycle, last_error, ended_at FROM instances WHERE id = ?1",
+            params![instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((lifecycle, last_error, ended_at)) = row else {
+        return Ok(true);
+    };
+    Ok(lifecycle_has_process_end_evidence(
+        &lifecycle,
+        last_error.as_deref(),
+        ended_at.as_deref(),
+    ))
+}
+
 /// Open a write transaction that takes the RESERVED lock immediately
 /// (`BEGIN IMMEDIATE`). A read-then-write job MUST use this rather than a
 /// deferred transaction: a deferred tx first acquires a SHARED lock on the
@@ -13091,13 +13846,44 @@ pub(crate) fn settle_instance_interactions(
     instance_ids: &[String],
     now: &str,
 ) -> Result<Settlement, StoreError> {
+    // Every lifecycle terminal write settles cards regardless of their own
+    // deadline, EXCEPT a node-epoch reconcile, which is an interruption:
+    // known-future-deadline cards there are deadline-owned (c-ghostbadge).
+    settle_instance_interactions_inner(conn, instance_ids, now, false)
+}
+
+/// Node-epoch reconcile variant: pending cards with a KNOWN deadline still in
+/// the future stay pending and are retired by the deadline projection.
+pub(crate) fn settle_interactions_after_reconcile(
+    conn: &Connection,
+    instance_ids: &[String],
+    now: &str,
+) -> Result<Settlement, StoreError> {
+    settle_instance_interactions_inner(conn, instance_ids, now, true)
+}
+
+fn settle_instance_interactions_inner(
+    conn: &Connection,
+    instance_ids: &[String],
+    now: &str,
+    respect_open_deadline: bool,
+) -> Result<Settlement, StoreError> {
     if instance_ids.is_empty() {
         return Ok(Settlement::default());
     }
     let placeholders = vec!["?"; instance_ids.len()].join(",");
+    // r7 item 3: publication order MUST be monotonic in the follower's
+    // delivery cursor `(updated_at, id)`. Every row this call settles is
+    // stamped with the SAME `now`, so the resulting cursor key is
+    // `(now, id)`; ordering the select by `id` therefore publishes the
+    // sweep in ascending cursor order. A high id published first would
+    // advance the follower's cursor past the lower ids of the same batch,
+    // and the lag recovery's `(updated_at, id) > cursor` filter would
+    // exclude those dropped notices permanently. Never select unordered.
     let sql = format!(
         "SELECT id, instance_id, payload_json FROM interactions
-         WHERE state = 'pending' AND instance_id IN ({placeholders})"
+         WHERE state = 'pending' AND instance_id IN ({placeholders})
+         ORDER BY id ASC"
     );
     let params: Vec<&dyn rusqlite::types::ToSql> = instance_ids
         .iter()
@@ -13116,6 +13902,14 @@ pub(crate) fn settle_instance_interactions(
     };
     let mut settlement = Settlement::default();
     for (id, owner_instance_id, payload_json) in pending {
+        if respect_open_deadline {
+            let card: Value = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
+            if interaction_deadline_is_open(&card, now) {
+                // Deadline-owned: leave the row pending for the shared
+                // deadline projection to retire.
+                continue;
+            }
+        }
         let mut event: Value = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
         invalidate_interaction_payload(&mut event, now);
         let changed = conn.execute(
@@ -13312,7 +14106,9 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
     // ma-lineage/ma-sdk-state: process-end via the SHARED classifier. Native
     // event → process_end_value(); instance entity → entity_process_end().
     // Anything else (turn result/StopFailure, configure/diagnostic, subagent,
-    // workflow member) is NOT a process end.
+    // workflow member) is NOT a process end. This supersedes the ma-lineage r3
+    // name/severity heuristic; ended_at discipline still rides on
+    // apply_ended_at_from_event below.
     let native_end: Option<remuda_protocol::process_end::ProcessEnd> =
         if payload_type == "native" && !subagent_scoped {
             remuda_protocol::process_end::process_end_value(payload)
@@ -13347,19 +14143,20 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         == Some("true");
     if payload_type == "native" && topic == "turn" && !subagent_scoped {
         if (native_name, status) == ("turn_started", Some("working")) {
-            return (None, Some("working"));
+            return (Some("running"), Some("working"));
         }
         if native_name == "result" {
-            // Settled result (success or turn failure): the turn is over.
+            // Settled result (success or turn failure): the turn is over, the
+            // process is still running (c-cardsettle r5 item 4).
             if settled_root_turn && matches!(status, Some("error" | "turn_done")) {
-                return (None, Some("idle"));
+                return (Some("running"), Some("idle"));
             }
             // c-cardsettle r5 item 4: an UNSETTLED root result that reports a
             // failed turn outcome still frees the composer (idle, retryable);
             // lifecycle stays running. An unsettled SUCCESS intermediate
             // (open workflow) changes neither.
             if root_turn_failed(payload, native_name, status) {
-                return (None, Some("idle"));
+                return (Some("running"), Some("idle"));
             }
             // An intermediate successful result changes neither.
             return (None, None);

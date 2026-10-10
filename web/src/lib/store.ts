@@ -3848,11 +3848,14 @@ class HubStore {
       // has already replaced it, and reverting would clobber the newer choice.
       const stillCurrent =
         (this.state.effortPending[instanceId]?.nonce ?? -1) === nonce;
-      const nextPatch: Partial<HubState> = {
-        effortPending: { ...this.state.effortPending },
-      };
-      delete nextPatch.effortPending![instanceId];
+      const nextPatch: Partial<HubState> = {};
       if (stillCurrent) {
+        // The pending indicator belongs to THIS request — clear it, and roll
+        // the optimistic axes back to the last observed state. A replaced
+        // request's late failure must not touch B's 切换中 indicator
+        // (c-effortui r3 item 8).
+        nextPatch.effortPending = { ...this.state.effortPending };
+        delete nextPatch.effortPending[instanceId];
         const effective = this.state.effortEffective[instanceId];
         const effState = { ...this.state.effort };
         if (effective) {
@@ -3870,10 +3873,14 @@ class HubStore {
           delete effState[instanceId];
         }
         nextPatch.effort = effState;
+        this.emit(nextPatch);
       }
-      this.emit(nextPatch);
+      // A replaced request still gets its failure surfaced (no silent loss),
+      // but the toast never names the newer in-flight request as failed.
       this.toast(
-        `effort 切换失败：${error instanceof Error ? error.message : String(error)}`,
+        stillCurrent
+          ? `effort 切换失败：${error instanceof Error ? error.message : String(error)}`
+          : `上一次 effort 切换失败：${error instanceof Error ? error.message : String(error)}`,
       );
       // Do NOT rethrow: the UI already shows the failure via the toast and the
       // rolled-back state; an unhandled promise rejection would crash tests.

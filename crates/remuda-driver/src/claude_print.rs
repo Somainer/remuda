@@ -177,6 +177,16 @@ struct TurnBook {
     workflow_owner: HashMap<String, WorkflowOwner>,
     /// Workflows seen with no locally-known owning turn (replay bucket).
     implicit_workflows: HashSet<String>,
+    /// Seq of the turn whose prompt write is in flight (book opened before
+    /// the write, ma-sdk-state r4 item 1). A result that settles THIS seq while
+    /// the reservation is held must wait for the write and then publish the
+    /// turn_started first; a result settling an OLDER seq must never wait on
+    /// it. Cleared when the write fails.
+    reserved: Option<u64>,
+    /// Set by [`Self::result_settles_root`] when the result it just handled
+    /// consumed the currently-reserved turn; consumed by the publication
+    /// worker once per mapped batch.
+    last_consumed_reserved: bool,
     next_seq: u64,
 }
 
@@ -184,21 +194,38 @@ impl TurnBook {
     fn begin_turn(&mut self) {
         let seq = self.next_seq;
         self.next_seq += 1;
+        self.reserved = Some(seq);
+        self.last_consumed_reserved = false;
         self.outstanding.push_back(RootTurn {
             seq,
             open_workflows: HashSet::new(),
         });
     }
 
-    /// Roll back the most recent [`Self::begin_turn`] when its prompt write
-    /// failed: the prompt never reached the child, so the unstarted turn must
-    /// not make later results look intermediate.
+    /// Whether the just-mapped result consumed the turn whose prompt write is
+    /// still in flight. Read once per mapped batch.
+    fn take_last_consumed_reserved(&mut self) -> bool {
+        std::mem::take(&mut self.last_consumed_reserved)
+    }
+
+    /// Roll back the reservation opened by [`Self::begin_turn`] when its prompt
+    /// write failed. The prompt never reached the child, so the back turn —
+    /// always the reserved one, and always still empty (no frame for it can
+    /// exist before the write lands) — is removed; an OLDER outstanding turn
+    /// must be left untouched.
     fn cancel_latest_turn(&mut self) {
-        if let Some(turn) = self.outstanding.pop_front() {
+        if self
+            .outstanding
+            .back()
+            .is_some_and(|turn| self.reserved == Some(turn.seq))
+            && let Some(turn) = self.outstanding.pop_back()
+        {
             for id in turn.open_workflows {
-                self.implicit_workflows.remove(&id);
+                self.workflow_owner.remove(&id);
             }
         }
+        self.reserved = None;
+        self.last_consumed_reserved = false;
     }
 
     /// Track a freshly-opened background workflow against the root turn the
@@ -256,7 +283,11 @@ impl TurnBook {
         if front_open {
             return false;
         }
-        if self.outstanding.pop_front().is_some() {
+        if let Some(front) = self.outstanding.pop_front() {
+            // r4 item 1: record whether THIS result consumed the turn whose
+            // write is still in flight, so the publication worker can park it
+            // and publish turn_started first.
+            self.last_consumed_reserved = self.reserved == Some(front.seq);
             // Defense in depth: workflows observed before any locally-written
             // turn (pure replay/hydration) live in the implicit bucket; they
             // still gate settlement even when a synthetic turn is popped.
@@ -878,6 +909,11 @@ impl Driver for ClaudePrintDriver {
                 let write = writer.send_user(prompt_content(&prompt.blocks)?).await;
                 match write {
                     Ok(()) => {
+                        // test-stub only: deterministically park HERE (write
+                        // acked, turn_started not yet enqueued) so a test can
+                        // deliver the child's result into the race window.
+                        #[cfg(feature = "test-stub")]
+                        test_barrier::hold_write_commit().await;
                         reservation.commit();
                         *self.inner.pending_turn.lock().await = None;
                         let publisher = self.inner.publish.lock().await.clone();
@@ -1329,15 +1365,118 @@ impl TurnReservation {
     }
 }
 
-/// Whether a mapped observation batch is a turn `result` that must wait for
-/// the turn's write to commit before it can be published.
-fn batch_has_uncommitted_result(observations: &[Observation]) -> bool {
-    observations.iter().any(|obs| {
-        matches!(&obs.body,
-            ObservationPayload::Lifecycle(p) if matches!(p.as_ref(),
-                LifecyclePayload::Native(n)
-                    if n.topic == LifecycleTopic::Turn && n.native_name == "result"))
-    })
+/// Test-only publication barrier (feature `test-stub`).
+///
+/// Deterministically recreates the r4-item-1 race: a prompt write has acked
+/// but the send task has not committed the reservation/enqueued
+/// `turn_started`, while the reader has already mapped and queued the child's
+/// result. Without this hook the window is scheduler luck; with it a test can
+/// park the send, wait until the result batch is queued in the worker, then
+/// release and assert start-before-result.
+///
+/// One barrier per process is sufficient (each test binary runs the race
+/// alone); [`Drop`] releases and disarms so a failed assertion can never hang
+/// the send task forever.
+#[cfg(feature = "test-stub")]
+pub mod test_barrier {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+
+    struct State {
+        write_reached: AtomicBool,
+        result_parked: AtomicBool,
+        released: AtomicBool,
+        release: tokio::sync::Notify,
+    }
+
+    static BARRIER: OnceLock<Mutex<Option<Arc<State>>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<Arc<State>>> {
+        BARRIER.get_or_init(|| Mutex::new(None))
+    }
+
+    /// An armed write-commit barrier. Disarms and releases on drop.
+    pub struct WriteCommitBarrier {
+        state: Arc<State>,
+    }
+
+    /// Arm the barrier for the next successful prompt write.
+    #[must_use]
+    pub fn arm() -> WriteCommitBarrier {
+        let state = Arc::new(State {
+            write_reached: AtomicBool::new(false),
+            result_parked: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        });
+        *slot().lock().expect("barrier lock") = Some(state.clone());
+        WriteCommitBarrier { state }
+    }
+
+    /// Send-task hook: after the write ack, block until the test releases.
+    pub(super) async fn hold_write_commit() {
+        let state = slot().lock().expect("barrier lock").clone();
+        let Some(state) = state else {
+            return;
+        };
+        state.write_reached.store(true, Ordering::Release);
+        if state.released.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = state.release.notified();
+        if state.released.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    /// Worker hook: the racing result batch is queued and about to park on the
+    /// reservation's commit.
+    pub(super) fn note_result_parked() {
+        if let Some(state) = slot().lock().expect("barrier lock").clone() {
+            state.result_parked.store(true, Ordering::Release);
+        }
+    }
+
+    impl WriteCommitBarrier {
+        /// Block until the send has parked post-write AND the reader's result
+        /// batch is queued in the worker — i.e. the race window is provably
+        /// occupied.
+        pub async fn wait_until_result_parked(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.write_reached.load(Ordering::Acquire)
+                    && self.state.result_parked.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for the race \
+                         (write_reached={}, result_parked={})",
+                        self.state.write_reached.load(Ordering::Acquire),
+                        self.state.result_parked.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// Let the send task commit and enqueue `turn_started`.
+        pub fn release(&self) {
+            if !self.state.released.swap(true, Ordering::AcqRel) {
+                self.state.release.notify_waiters();
+            }
+        }
+    }
+
+    impl Drop for WriteCommitBarrier {
+        fn drop(&mut self) {
+            self.release();
+            *slot().lock().expect("barrier lock") = None;
+        }
+    }
 }
 
 /// Single drainer of [`Inner::publish`]: map + emit strictly in enqueue order.
@@ -1351,26 +1490,38 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                     {
                         return handle_can_use_tool(&inner, env, req).await;
                     }
-                    let mut observations = {
+                    let (mut observations, consumed_reservation) = {
                         let mut mapper = inner.mapper.lock().await;
-                        map_outbound(&mut mapper, &frame)?
+                        let observations = map_outbound(&mut mapper, &frame)?;
+                        // r4 item 1: true only when THIS batch's result settled
+                        // the very turn whose prompt write is in flight (the
+                        // mapper decides by book identity, not by frame shape,
+                        // so a result for an OLDER outstanding turn never parks
+                        // on the new reservation).
+                        let consumed = mapper.take_last_consumed_reserved();
+                        (observations, consumed)
                     };
-                    // ma-sdk-state r4 item 1: a result for a turn whose write is
-                    // still in flight parks here until the write acks, then emits
-                    // turn_started FIRST. Everything else (messages, flood
-                    // frames) drains without waiting, so stdout never stalls on a
-                    // blocked write.
-                    if batch_has_uncommitted_result(&observations) {
+                    // ma-sdk-state r4 item 1: the reserved turn's result parks
+                    // here until the write acks, then publishes turn_started
+                    // FIRST. Everything else (older-turn results, messages,
+                    // flood frames) drains without waiting, so stdout never
+                    // stalls on a blocked write.
+                    if consumed_reservation {
                         let reservation = inner.pending_turn.lock().await.clone();
-                        if let Some(reservation) = reservation
-                            && reservation.wait_for_commit().await
-                            && reservation.claim_start()
-                        {
-                            let start = {
-                                let mut mapper = inner.mapper.lock().await;
-                                mapper.turn_started_observation(&reservation.client_message_id)?
-                            };
-                            observations.insert(0, start);
+                        if let Some(reservation) = reservation {
+                            // test-stub only: the result is queued ahead of the
+                            // not-yet-enqueued turn_started and is about to park
+                            // on the write ack.
+                            #[cfg(feature = "test-stub")]
+                            test_barrier::note_result_parked();
+                            if reservation.wait_for_commit().await && reservation.claim_start() {
+                                let start = {
+                                    let mut mapper = inner.mapper.lock().await;
+                                    mapper
+                                        .turn_started_observation(&reservation.client_message_id)?
+                                };
+                                observations.insert(0, start);
+                            }
                         }
                     }
                     emit_all(&inner, observations).await
@@ -2362,6 +2513,12 @@ impl Mapper {
     /// blocks (ma-sdk-state r4 item 1), emitting nothing.
     fn begin_turn_reservation(&mut self) {
         self.turns.begin_turn();
+    }
+
+    /// Whether the last mapped batch's result consumed the reserved turn
+    /// (whose write may still be in flight).
+    fn take_last_consumed_reserved(&mut self) -> bool {
+        self.turns.take_last_consumed_reserved()
     }
 
     /// Roll back the latest turn reservation when its write fails.

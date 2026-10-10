@@ -889,45 +889,11 @@ async fn relaunch_after_close_emits_one_exited_per_launch() {
     }
 }
 
-/// D-057 OA6 r2 item 2: every turn's `turn_started` is published before THAT
-/// turn's `result`. The send task (write + turn_started) and the reader task
-/// (map + result) serialize through the driver's turn-order lock; run both
-/// turns so the forced interleave (a result ready while a send emits) is
-/// exercised, and assert the causal ordering on the collected stream.
-#[tokio::test]
-async fn every_turn_started_precedes_its_own_result() {
-    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
-    let mut handle = driver.start(spec).await.expect("start");
-    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
-
-    driver.send(prompt("first")).await.expect("first send");
-    let first = collect_until(&mut handle, Duration::from_secs(5), |obs| {
-        turn_done_count(obs) >= 1
-    })
-    .await;
-    assert_eq!(turn_started_count(&first), 1);
-    let s1 = first_where(&first, |o| lifecycle_named(o) == Some("turn_started"));
-    let r1 = first_where(&first, |o| lifecycle_status(o) == Some("turn_done"));
-    assert!(
-        s1 < r1,
-        "turn 1 start must precede turn 1 result: {s1} >= {r1}"
-    );
-
-    driver.send(prompt("second")).await.expect("second send");
-    let second = collect_until(&mut handle, Duration::from_secs(5), |obs| {
-        turn_done_count(obs) >= 1
-    })
-    .await;
-    assert_eq!(turn_started_count(&second), 1);
-    let s2 = first_where(&second, |o| lifecycle_named(o) == Some("turn_started"));
-    let r2 = first_where(&second, |o| lifecycle_status(o) == Some("turn_done"));
-    assert!(
-        s2 < r2,
-        "turn 2 start must precede turn 2 result: {s2} >= {r2}"
-    );
-
-    driver.close().await.expect("close");
-}
+// The deterministic write-window barrier test
+// (`a_result_queued_during_the_write_window_starts_then_results`, below)
+// replaces the old live-only version of this assertion: it forces the exact
+// start-before-result ordering, including the result arriving while the
+// prompt write is still in flight.
 
 /// D-057 OA6 r2 item 3: `send` resolves only after the user line is WRITTEN,
 /// and propagates the write failure once the child's stdin is gone (closed
@@ -955,4 +921,49 @@ async fn a_send_after_the_child_stdin_closed_is_an_error_not_written() {
         result.is_err(),
         "a prompt after stdin closed must propagate the write failure, got {result:?}"
     );
+}
+
+/// ma-sdk-state r4 item 1 (barrier): the write has acked and the send task is
+/// parked BEFORE it commits the reservation/enqueues turn_started, while the
+/// child's result is already mapped and queued in the publication worker. The
+/// reserved turn's start must still be published before ITS result.
+#[tokio::test]
+async fn a_result_queued_during_the_write_window_starts_then_results() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = remuda_driver::claude_print::test_barrier::arm();
+    let send_task = tokio::spawn(async move {
+        let result = driver.send(prompt("race prompt")).await;
+        (driver, result)
+    });
+
+    // Provably occupy the race window: write acked, result queued in the
+    // worker, turn_started not yet enqueued.
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release();
+
+    let (driver, result) = send_task.await.expect("send task");
+    result.expect("the write acked, so the send resolves Ok");
+
+    let all = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_started_count(obs) >= 1 && turn_done_count(obs) >= 1
+    })
+    .await;
+    assert_eq!(
+        turn_started_count(&all),
+        1,
+        "exactly one turn_started even under the forced race: {all:?}"
+    );
+    let start = first_where(&all, |o| lifecycle_named(o) == Some("turn_started"));
+    let done = first_where(&all, |o| lifecycle_status(o) == Some("turn_done"));
+    assert!(
+        start < done,
+        "turn_started ({start}) must precede its own result ({done})"
+    );
+
+    driver.close().await.expect("close");
 }

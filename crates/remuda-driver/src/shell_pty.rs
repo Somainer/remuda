@@ -3693,6 +3693,198 @@ mod tests {
         );
     }
 
+    /// r7 item 3 (r6 item 1 end to end): with a PARENT driver-process
+    /// CLAUDE_CONFIG_DIR that differs from the child's $HOME/.claude, a real
+    /// agent launch must make the child's EFFECTIVE command-env config dir,
+    /// the resume boundary's directory and PromoteCtx.claude_home ALL THE
+    /// SAME — for both native-home pin values. The parent value never appears.
+    ///
+    /// The workspace forbids unsafe code (edition-2024 `env::set_var`), so the
+    /// driver process's parent env is set by RE-EXECUTING this test binary
+    /// with CLAUDE_CONFIG_DIR on the child Command (same convention as
+    /// remuda config/remuda-signal env tests).
+    #[test]
+    fn item3_one_config_dir_command_env_boundary_promote_ctx_both_pins() {
+        if std::env::var_os(R7_CONFIG_CHILD_MARKER).is_some() {
+            return;
+        }
+        for pin in ["true", "false"] {
+            let parent_dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "shell_pty::tests::item3_config_dir_child_body",
+                    "--nocapture",
+                ])
+                .env(R7_CONFIG_CHILD_MARKER, pin)
+                .env("CLAUDE_CONFIG_DIR", parent_dir.path())
+                .output()
+                .expect("spawn child");
+            assert!(
+                output.status.success(),
+                "pin={pin} child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// Child body for [`item3_one_config_dir_command_env_boundary_promote_ctx_both_pins`].
+    #[tokio::test]
+    async fn item3_config_dir_child_body() {
+        let pin_native_home = match std::env::var(R7_CONFIG_CHILD_MARKER).as_deref() {
+            Ok("true") => true,
+            Ok("false") => false,
+            _ => return,
+        };
+        let parent_home = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("the parent CLAUDE_CONFIG_DIR is set by the re-exec");
+        let dir = tempfile::tempdir().unwrap();
+        let child_home = dir.path().join("child-home");
+        let native_home = dir.path().join("managed-native-home");
+        std::fs::create_dir_all(&child_home).unwrap();
+        std::fs::create_dir_all(&native_home).unwrap();
+        let env_dump = dir.path().join("env.txt");
+        // The stub answers probes, then dumps its REAL environment and sleeps
+        // as the live child.
+        let claude_bin = remuda_testing::install_executable(
+            dir.path(),
+            "claude",
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.289'; exit 0;; esac\n\
+                 env > {dump}\nexec sleep 30\n",
+                dump = env_dump.display(),
+            ),
+        );
+
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Claude;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.effort = None;
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Claude,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["claude".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: dir.path().join("launch"),
+                native_home: native_home.clone(),
+                binary: Some(claude_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: pin_native_home,
+                settings_overlay: None,
+            },
+        );
+        options.pin_native_home = pin_native_home;
+        // Deliberately NO options.claude_home: resolution must come from the
+        // assembled child env, and the parent driver env must not leak in.
+        options.claude_home = None;
+        options
+            .extra_env
+            .insert("HOME".to_owned(), child_home.to_string_lossy().into_owned());
+
+        let driver = ShellPtyDriver::new(options);
+        driver
+            .spawn_at(&spec.cwd, Some(&spec))
+            .await
+            .expect("real agent launch");
+        let dump = async {
+            for _ in 0..100 {
+                if let Ok(text) = std::fs::read_to_string(&env_dump)
+                    && text.contains("HOME=")
+                {
+                    return text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("child env dump never appeared at {}", env_dump.display());
+        }
+        .await;
+        let env: std::collections::BTreeMap<String, String> = dump
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        let ctx = driver
+            .promote_ctx
+            .lock()
+            .await
+            .clone()
+            .expect("promote ctx set on spawn");
+        Driver::close(&driver).await.expect("clean close");
+
+        // 1. The child's effective config dir: its CLAUDE_CONFIG_DIR, or its
+        //    own $HOME/.claude — never the parent driver's value.
+        let child_env_dir = env
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| child_home.join(".claude"));
+        assert_ne!(
+            child_env_dir, parent_home,
+            "pin={pin_native_home}: the parent CLAUDE_CONFIG_DIR must not reach the child"
+        );
+        if pin_native_home {
+            assert_eq!(
+                env.get("CLAUDE_CONFIG_DIR").map(std::path::Path::new),
+                Some(native_home.as_path()),
+                "pin={pin_native_home}: the managed native home is pinned"
+            );
+            assert_eq!(
+                env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+                    .map(String::as_str),
+                Some(""),
+                "pin={pin_native_home}: the macOS keychain namespace is forced"
+            );
+        } else {
+            assert!(
+                !env.contains_key("CLAUDE_CONFIG_DIR"),
+                "pin={pin_native_home}: no dir is invented; the child default applies"
+            );
+            assert_eq!(child_env_dir, child_home.join(".claude"));
+        }
+        // 2. PromoteCtx resolves the SAME directory the child uses.
+        assert_eq!(
+            ctx.claude_home, child_env_dir,
+            "pin={pin_native_home}: PromoteCtx.claude_home must be the child env dir"
+        );
+        // 3. The pre-spawn resume boundary for any session lands under exactly
+        //    that directory (same cwd slug rule the hydrator uses).
+        let session_id = "dddddddd-2222-4333-8444-eeeeeeeeeeee";
+        let cwd = std::path::PathBuf::from(&spec.cwd);
+        let session_path = crate::claude_transcript::ResumeBoundary::session_path(
+            &ctx.claude_home,
+            &cwd,
+            session_id,
+        );
+        assert!(
+            session_path.starts_with(&ctx.claude_home),
+            "pin={pin_native_home}: boundary {session_path:?} must live under {:?}",
+            ctx.claude_home
+        );
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        std::fs::write(&session_path, "").unwrap();
+        let boundary = crate::claude_transcript::ResumeBoundary::for_resume(
+            &ctx.claude_home,
+            &cwd,
+            session_id,
+        );
+        assert!(
+            boundary.is_some(),
+            "pin={pin_native_home}: a resume snapshot resolves through the one config dir"
+        );
+    }
+
+    const R7_CONFIG_CHILD_MARKER: &str = "REMUDA_TEST_R7_CONFIG_CHILD";
+
     /// c-wfdrill2 C. `promote_ctx` minted `InstanceId::new()`, so every id the
     /// driver derived — hook tool nodes through `remuda_signal`, the
     /// transcript replay's `TranscriptMapper` — was scoped to an id nothing

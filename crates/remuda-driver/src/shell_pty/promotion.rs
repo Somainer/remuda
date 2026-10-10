@@ -3552,29 +3552,39 @@ mod tests {
 
     #[tokio::test]
     async fn item2_an_exec_resume_keeping_the_shell_pid_is_never_time_verified() {
-        // `exec claude --resume <id>` replaces the shell but KEEPS its pid and
-        // process start time: the argv says resume, but the boundary cannot be
-        // proven from process time.
-        let argv = "claude --resume dddddddd-2222-4333-8444-eeeeeeeeeeee";
-        let (session_id, is_resume) = crate::promote::resume_provenance(argv);
-        assert_eq!(
-            session_id.as_deref(),
-            Some("dddddddd-2222-4333-8444-eeeeeeeeeeee")
-        );
-        assert!(is_resume);
-        // The production decision, built from the Detected the real detector
-        // produces on that argv: exec-keeps-pid can never be time-verified.
-        let found = Detected {
-            resume: is_resume,
-            ..detected_claude(7, session_id.as_deref())
+        // r7 item 3 (R6-7): the mode is derived exactly as the poller does it
+        // — detect() over the real ProcessRow -> epoch_mode with the detected
+        // provenance -> Hydrator::open — rather than hard-coded into the pump
+        // helper. `exec claude --resume <id>` keeps the shell's pid/start time,
+        // so the uuid resume is still Unverified end to end.
+        let history = assistant_line(Some("high"), 1);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(tmp.path(), &history);
+        let row = ProcessRow {
+            pid: 7,
+            args: format!("claude --resume {PUMP_SESSION}"),
         };
-        assert_eq!(shell_resume_mode(&found), ResumeMode::Unverified);
-        assert_unverified_pump_gates_history(
-            &assistant_line(Some("high"), 1),
-            &assistant_line(Some("max"), 2),
-            "reply 2",
-        )
-        .await;
+        let found = crate::promote::detect(std::slice::from_ref(&row), None)
+            .expect("the exec argv detects as claude");
+        assert_eq!(found.session_id.as_deref(), Some(PUMP_SESSION));
+        assert!(found.resume, "--resume is resume provenance");
+        let mut launch = LaunchModeBinding::Unbound;
+        let mode = epoch_mode(&mut launch, None, None, &found);
+        assert_eq!(mode, ResumeMode::Unverified, "never time-verified");
+        let mut hydrator = open_hydrator(&fx, mode, None);
+        pump_once(&mut hydrator, &fx).await;
+        assert!(
+            drain(&mut fx).is_empty(),
+            "history never replays as current"
+        );
+        append_line(&fx.binding.path, &assistant_line(Some("max"), 2));
+        pump_once(&mut hydrator, &fx).await;
+        let observations = drain(&mut fx);
+        assert!(
+            effort_rows(&observations).is_empty(),
+            "post-anchor records never open the gate: {observations:?}"
+        );
+        assert!(conversation_hydrated(&observations, "reply 2"));
     }
 
     #[test]

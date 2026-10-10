@@ -407,6 +407,14 @@ function TranscriptInner({
         reqId?: number;
         /** Pre-click top-level nodes, for content-based fold-rename retarget. */
         prevNodes?: TranscriptNode[];
+        /**
+         * Set when this restore re-aimed an in-flight load-earlier hold at an
+         * intentional navigation destination (r9). If the bounded page then
+         * lands WITHOUT prepending, the inert restore (it only acts after the
+         * destination's index advances) is converted into an index pending so
+         * the destination is still refined into view.
+         */
+        retargeted?: boolean;
       }
     | null
   >(null);
@@ -1010,11 +1018,24 @@ function TranscriptInner({
           // PREPENDED keeps the anchors until the mounted anchor settles —
           // including the final history page (result.end), whose rows still
           // have to mount and measure before the held offset is correct.
+          // Read the pending BEFORE releasePrependAnchor clears it.
+          const pending = pendingScroll.current;
           const held = prependAnchorRef.current;
           if (held?.reqId === reqId) releasePrependAnchor(held);
-          const pending = pendingScroll.current;
           if (pending?.kind === "restore" && pending.reqId === reqId) {
-            pendingScroll.current = null;
+            if (pending.retargeted) {
+              // No rows prepended, so the retargeted restore (inert until the
+              // destination's index advances) never applied. Fall back to
+              // refining the navigation destination as a normal index jump so
+              // it is still landed, instead of dropping it with the hold.
+              const destIndexNow = nodesRef.current.findIndex((n) => n.id === pending.anchorId);
+              pendingScroll.current =
+                destIndexNow >= 0
+                  ? { kind: "index", index: destIndexNow, offset: pending.offset, tries: 0 }
+                  : null;
+            } else {
+              pendingScroll.current = null;
+            }
             restoringRef.current = false;
             setRestoreActiveAttr();
           }
@@ -1407,9 +1428,15 @@ function TranscriptInner({
         awaitIndex: destIndex,
         reqId: req.reqId,
         prevNodes,
+        retargeted: true,
       };
       restoringRef.current = true;
       setRestoreActiveAttr();
+      // Retarget is intentional navigation: retire any reflow anchor a prior
+      // saved restore armed (the fromRestore jump below must not keep it), so
+      // a later card growth above the destination cannot counter-scroll.
+      reflowAnchorRef.current = null;
+      setReflowHoldAttr();
       // The hold is retargeted, not abandoned: growth anchoring stays active
       // (cancelLoadRestore would have suppressed it), and the first jump is
       // the restore's own write.

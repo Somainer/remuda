@@ -2639,7 +2639,7 @@ describe("load-earlier anchor lifecycle round 5", () => {
   describe("round 6 item 2: in-flight programmatic navigation wins", () => {
     type OlderPage = ReturnType<typeof pageOf>;
 
-    function setup(instanceId: string) {
+    function setup(instanceId: string, opts: { savedAnchorId?: string; savedOffset?: number; noInitialScroll?: boolean } = {}) {
       const user = userEvent.setup();
       const writes: number[] = [];
       const geo = installGeo(50, {
@@ -2662,6 +2662,12 @@ describe("load-earlier anchor lifecycle round 5", () => {
         reg.setFloor[iid]?.(reg.clients[iid]!.retainedFloorSeq);
         return result;
       });
+      if (opts.savedAnchorId) {
+        localStorage.setItem(
+          `runtime.reading.v1.${instanceId}`,
+          JSON.stringify({ anchorId: opts.savedAnchorId, offset: opts.savedOffset ?? 0, ratio: 0, avgRow: ROW, follow: false }),
+        );
+      }
       render(
         <MemoryRouter initialEntries={[`/s/${instanceId}`]}>
           <Routes>
@@ -2670,7 +2676,7 @@ describe("load-earlier anchor lifecycle round 5", () => {
         </MemoryRouter>,
       );
       geo.defineScroll();
-      geo.scrollTo(0);
+      if (!opts.noInitialScroll) geo.scrollTo(0);
       return { user, geo, g, writes, older };
     }
 
@@ -2793,6 +2799,30 @@ describe("load-earlier anchor lifecycle round 5", () => {
         "the search hit did not park at the top after the retargeted prepend",
       ).toBe(0);
       await expectGrowthHolds(geo);
+    });
+
+    it("an in-flight retarget clears a saved restore's reflow anchor via the fromRestore path", async () => {
+      // A prior saved restore leaves a reflow anchor armed for the visit. Then
+      // a load-earlier starts and a j navigation while it is in flight
+      // RETARGETS — the retarget jump is a fromRestore write, so the item-1
+      // non-restore clear must not skip it: the stale saved anchor is retired.
+      const { user, geo, g, older } = setup("insRetargetClearsReflow", {
+        savedAnchorId: "n_1005_user_insRetargetClearsReflow",
+        noInitialScroll: true,
+      });
+      for (let i = 0; i < 8; i += 1) await geo.nextFrame();
+      expect(geo.scroller().getAttribute("data-reflow-hold"), "the seeded restore did not leave a reflow anchor").toBe("1");
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.keyboard("jj");
+      expect(
+        geo.scroller().getAttribute("data-reflow-hold"),
+        "the fromRestore retarget skipped the item-1 navigation clear",
+      ).toBe("0");
+      geo.setTotal(150);
+      await land(geo, g, older);
+      await geo.nextFrame();
+      await act(async () => {});
+      expect(nodeTop(geo, "n_1002_assistant_insRetargetClearsReflow")).toBe(0);
     });
 
     // UO-6a round 7 item 1: cancellation must happen synchronously at the

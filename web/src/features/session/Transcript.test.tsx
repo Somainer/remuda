@@ -1811,5 +1811,63 @@ describe("font reflow compensator", () => {
     expect(padTop(), "the measured height was lost on a second window shift").toBe(expectedPadTop());
   });
 
+  it("r7 item 2: a clamped no-op second internal write keeps the own-scroll latch armed", async () => {
+    // Two internal writes land before the ONE coalesced scroll event: the
+    // first moves (and arms reflowOwnScrollRef), the second is clamped at the
+    // scroll max and moves nothing. An assign-style latch
+    // (`latch = moved`) CLEARS it on the no-op, so the first write's event
+    // then retires reflowAnchorRef as if the reader had scrolled. The latch
+    // must arm only and stay armed; the anchor survives its own event.
+    const geo = installGeo(40);
+    const events = buildLongObservations({
+      instanceId: "insLatch" as Id,
+      journalId: "obj_insLatch" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insLatch",
+      // n_32 restored flush with the viewport top: target top 2976, 144px
+      // below the clamp line (40*ROW - VIEW = 3120), far enough that
+      // follow-pin (which arms within 64px of the bottom) does not grab it.
+      JSON.stringify({ anchorId: "obj_long_n_32", offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insLatch"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insLatch");
+    expect(geo.top()).toBe(2976);
+    const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold");
+    expect(hold()).toBe("1");
+    await act(async () => {
+      // ONE font layout resizes two mounted rows above the anchor before any
+      // per-row observer delivers (geometry is preset for both; total drift
+      // 200 pushes well past the 144px clamp margin).
+      geo.presetHeight("obj_long_n_30", ROW + 72);
+      geo.presetHeight("obj_long_n_31", ROW + 128);
+      // First delivery: the anchor drifted 200px in the DOM; the write for the
+      // full drift clamps at the scroll max (3120), moving +144 and queueing
+      // the coalesced event.
+      geo.fireMeasure("obj_long_n_31");
+      // Second delivery in the same synchronous batch (React has not flushed
+      // the first write's state yet): the remaining DOM drift is 56px but the
+      // write clamps to 3120 again — a NO-OP that must not clear the latch
+      // the first write armed.
+      geo.fireMeasure("obj_long_n_30");
+    });
+    // Deliver the queued event. With the old assign-on-write latch the event
+    // finds the latch false and retires the anchor (data-reflow-hold flips to
+    // "0" on the resulting render); arm-only keeps it held.
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(hold(), "the no-op second write disarmed the latch before the first write's own event").toBe("1");
+    expect(geo.top()).toBe(3120);
+  });
 
 });

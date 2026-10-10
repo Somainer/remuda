@@ -502,16 +502,18 @@ function TranscriptInner({
   // Programmatic write made by the re-anchor machinery (a growth counter-scroll
   // or a pending-restore correction). Browsers dispatch NO scroll event when a
   // write leaves scrollTop unchanged (already at the target, or clamped), so
-  // arming reflowOwnScrollRef unconditionally would leave it latched: the
-  // reader's NEXT real scroll would then be mistaken for this own write and
-  // fail to retire reflowAnchorRef. Arm the latch ONLY when the write actually
-  // moved scrollTop (and therefore a coalesced scroll event really is coming).
+  // this only ARMS the latch when the write actually moved scrollTop (a
+  // coalesced scroll event is really coming). It must never CLEAR an armed
+  // latch either: two internal writes can land before the one coalesced event
+  // (the second clamped at 0/max, or the restore's estimated-index path
+  // recomputing the same top), and clearing here would make the first write's
+  // event retire reflowAnchorRef as though the reader had scrolled.
   const ownScrollWrite = useCallback((next: number) => {
     const el = scrollerRef.current;
     if (!el) return;
     const before = el.scrollTop;
     el.scrollTop = next;
-    reflowOwnScrollRef.current = el.scrollTop !== before;
+    if (el.scrollTop !== before) reflowOwnScrollRef.current = true;
     scrollTopRef.current = el.scrollTop;
   }, []);
 
@@ -1194,6 +1196,11 @@ function TranscriptInner({
         // without waiting for a re-render). "1" only while a saved/load-earlier
         // restore is actively correcting the scroll.
         data-restore-active="0"
+        // Inert observability for tests: "1" while the reflow anchor armed by a
+        // restore is still holding (it outlives the restore itself and is
+        // retired only by reader input / route change). Read from the ref at
+        // render; every scroll event re-renders the scroller.
+        data-reflow-hold={reflowAnchorRef.current ? "1" : "0"}
         onScroll={(event) => {
           const el = event.currentTarget;
           setScrollTop(el.scrollTop);

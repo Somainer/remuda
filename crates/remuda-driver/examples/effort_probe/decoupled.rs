@@ -707,9 +707,14 @@ fn describe_pid(ledger: &Path, pid: u32) {
     }
     // Read the cwd straight from /proc instead of shelling out to a host-wide
     // inspection tool: one pid, one symlink, nothing scans the machine.
-    match std::fs::read_link(format!("/proc/{pid_str}/cwd")) {
-        Ok(cwd) => println!("before kill (cwd): {}", cwd.display()),
-        Err(error) => println!("before kill (cwd): <{error}>"),
+    // /proc is Linux-only (the probe also runs on macOS); omit the line
+    // elsewhere rather than printing a misleading error.
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_link(format!("/proc/{pid_str}/cwd")) {
+            Ok(cwd) => println!("before kill (cwd): {}", cwd.display()),
+            Err(error) => println!("before kill (cwd): <{error}>"),
+        }
     }
 }
 

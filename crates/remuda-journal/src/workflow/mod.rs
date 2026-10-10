@@ -133,6 +133,12 @@ struct RunState {
     note: Option<String>,
     missing_polls: u32,
     launched_ms: Option<u128>,
+    /// c-cardsettle-fu r1 item 1: agent ids whose journal `started` record was
+    /// folded onto an already-terminal member (same attempt: the terminal
+    /// outcome is protected). File catch-up must still CONVERGE with that
+    /// terminal state once; these ids have their member-envelope cache
+    /// invalidated for a single run_envelopes pass, then re-cache and dedup.
+    force_member_refresh: HashSet<String>,
 }
 
 /// One member (one agent invocation; retries share the same key).
@@ -666,7 +672,12 @@ impl WorkflowJournalTailer {
             }
         }
 
-        // Members.
+        // Members. One-shot convergence for terminal members whose file fold
+        // caught up this poll (see RunState::force_member_refresh).
+        let refresh_ids: Vec<String> = self.runs[index].force_member_refresh.drain().collect();
+        for id in refresh_ids {
+            self.runs[index].emitted_member.remove(&id);
+        }
         for snapshot in members {
             let sig = snapshot.sig();
             if self.runs[index].emitted_member.get(&snapshot.agent_id) == Some(&sig) {
@@ -1100,6 +1111,7 @@ impl RunState {
             note: None,
             missing_polls: 0,
             launched_ms,
+            force_member_refresh: HashSet::new(),
         }
     }
 
@@ -1265,10 +1277,34 @@ impl RunState {
                     .position(|member| member.agent_id == agent_id)
                     .expect("member exists");
                 let member = &mut self.members[index];
+                // c-cardsettle-fu item 1: catch-up folds journal lines in
+                // their own (file/seq) order, but a terminal StopFailure can
+                // already have been applied to THIS member from the live
+                // transcript tailer before the catch-up journal fold reaches
+                // the member's older, still-unread `started` line. Folding
+                // that started must never downgrade an already-terminal
+                // member back to running — terminal wins regardless of fold
+                // order. Metadata (key/attempt/label/phase) is still updated.
+                let terminal = member.stopped
+                    || matches!(
+                        member.state,
+                        WorkflowState::Failed | WorkflowState::Completed | WorkflowState::Cancelled
+                    );
+                // A strictly newer attempt (a real retry) is authoritative: it
+                // resurrects an earlier terminal member; a same-attempt
+                // started never downgrades a terminal outcome regardless of
+                // fold order.
+                let is_newer_attempt = attempt > member.attempt;
                 member.key = Some(key.clone());
                 member.attempt = attempt;
-                member.state = WorkflowState::Running;
-                member.stopped = false;
+                if !terminal {
+                    member.state = WorkflowState::Running;
+                    member.stopped = false;
+                } else if !is_newer_attempt {
+                    // Terminal outcome held against a same-attempt started;
+                    // force one file-catch-up convergence emission.
+                    self.force_member_refresh.insert(agent_id.clone());
+                }
                 if member.label.is_none()
                     && let Some(label) = value.get("label").and_then(Value::as_str)
                 {

@@ -437,3 +437,63 @@ fn agent_failed_marks_only_that_workflow_member() {
         "the failed member must be reported Failed, got {states:?}"
     );
 }
+
+/// c-cardsettle-fu item 1: a StopFailure applied to a member before the
+/// catch-up journal fold reaches its (still-unread) `started` record must not
+/// be resurrected to running by that later-folded started.
+#[test]
+fn a_later_folded_started_never_downgrades_a_failed_member() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu_resurrect";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    // The journal carries the member's `started` line but NO failure line: the
+    // failure arrives out-of-band as a transcript StopFailure (live tailer).
+    fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:fu\",\"agentId\":\"a1\",\"label\":\"x\",\"phase\":\"P\"}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(session.join("workflows/scripts")).unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("task1".into()),
+            tool_call_id: Some("toolu_wf".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+
+    // StopFailure beats the journal catch-up: the member exists (created by
+    // agent_failed) and is marked Failed without the started ever being folded.
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // NOW poll: catch-up folds the older, still-unread `started` line. Pre-fix
+    // it flipped the member back to Running.
+    let bodies = bodies(tailer.poll().unwrap());
+    let final_state = bodies
+        .iter()
+        .rev()
+        .find_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .expect("member observed after catch-up");
+    assert_eq!(
+        final_state,
+        WorkflowState::Failed,
+        "the later-folded started must not resurrect a Failed member"
+    );
+}

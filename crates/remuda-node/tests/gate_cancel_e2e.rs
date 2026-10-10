@@ -12,7 +12,6 @@
 //!    Canceling branch (not the Running + canceled branch).
 #![allow(missing_docs)]
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use remuda_hub::HubConfig;
@@ -183,7 +182,7 @@ async fn one_race_iteration(dir: &tempfile::TempDir) -> Value {
 
     // Arm the Node entry hold BEFORE enqueue: the very next gate.run frame
     // parks at the handler entry, before run registration / lane / git.
-    let hold = Arc::new(GateRunHold::new());
+    let hold = GateRunHold::new();
     node.gate_test_arm_run_hold(hold.clone()).await;
 
     // Enqueue: the Hub's scheduler (schedule_once from the POST handler,
@@ -198,15 +197,16 @@ async fn one_race_iteration(dir: &tempfile::TempDir) -> Value {
     )
     .await;
     assert_eq!(status, 200, "enqueue: {enqueued}");
-    let job_id = tokio::time::timeout(TIMEOUT, hold.wait_arrived())
+    let (job_id, generation) = tokio::time::timeout(TIMEOUT, hold.wait_arrived())
         .await
-        .expect("the Hub never dispatched gate.run")
-        .to_owned();
+        .expect("the Hub never dispatched gate.run");
     assert_eq!(
         job_id,
         enqueued["id"].as_str().expect("enqueued id"),
         "the parked frame is for a different job"
     );
+    // First claim = dispatch generation 1.
+    assert_eq!(generation, 1, "the first claim must carry generation 1");
     // Claim committed: the row the cancel writer reads is Running.
     let claimed = get_job(&hub, &job_id).await;
     assert_eq!(claimed["state"], json!("running"), "{claimed}");
@@ -295,4 +295,124 @@ async fn cancel_overtakes_run_over_the_real_carrier_twenty_times() {
             "[{iteration}] the tombstoned run created the target dir"
         );
     }
+}
+
+/// A release that fires BEFORE the gate.run handler parks must not be lost
+/// (the old `Notify::notify_waiters()` dropped its permit in that gap and
+/// left the handler parked forever). With the oneshot hold the handler
+/// passes straight through: the frame still reports arrival, and the job
+/// reaches a terminal state (the missing checkout makes it Failed) instead
+/// of hanging in Running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_before_the_handler_parks_does_not_hang_the_run() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data_dir = dir.path().join("hub-data");
+    let hub = remuda_hub::spawn(HubConfig::for_test(data_dir))
+        .await
+        .expect("hub");
+    let addr = hub.addr;
+    let token = hub
+        .mint_device_token("gate-e2e-human")
+        .await
+        .expect("device token");
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+    )
+    .expect("dev node");
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let workspace_id = node
+        .workspaces()
+        .expect("node workspaces")
+        .into_iter()
+        .next()
+        .expect("at least one announced workspace")
+        .meta
+        .id
+        .as_id()
+        .as_str()
+        .to_owned();
+    let ws_config = WssConfig::loopback(addr, enroll_token(&hub).await, host_id.clone());
+    let _link = tokio::time::timeout(TIMEOUT, WssLink::connect_runtime(ws_config, node.clone()))
+        .await
+        .expect("connect timeout")
+        .expect("runtime wss connect");
+    wait_host_online(addr, &token, &host_id).await;
+
+    let (status, project) = http(
+        addr,
+        "POST",
+        "/v1/projects",
+        &token,
+        Some(json!({
+            "name": "gate-early-release",
+            "members": [{"hostId": host_id, "workspaceId": workspace_id, "role": "build"}],
+            "hosts": [{"hostId": host_id, "maxInstances": 8}],
+            "gate": {
+                "affected": true,
+                "web": "never",
+                "landSerialization": "global-cas",
+                "lanes": [{
+                    "id": "lane1",
+                    "hostId": host_id,
+                    "repoPath": dir.path().join("never-checked-out-repo"),
+                    "targetDir": dir.path().join("never-created-target"),
+                    "ports": "58460-58469",
+                    "env": {},
+                    "lockPath": dir.path().join("gate-e2e.lock"),
+                    "pwEndpoint": "ws://127.0.0.1:0/"
+                }]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "create project: {project}");
+    let project_id = project["id"].as_str().expect("project id");
+
+    // Arm, then release BEFORE the dispatch even exists: the oneshot permit
+    // is stored for the handler's later await.
+    let hold = GateRunHold::new();
+    node.gate_test_arm_run_hold(hold.clone()).await;
+    hold.release();
+
+    let (status, enqueued) = http(
+        addr,
+        "POST",
+        &format!("/v1/projects/{project_id}/gate"),
+        &token,
+        Some(json!({"branch": "wt/gate/early-release", "mode": "verify"})),
+    )
+    .await;
+    assert_eq!(status, 200, "enqueue: {enqueued}");
+    let job_id = enqueued["id"].as_str().expect("job id");
+
+    // The frame still reached the handler entry and announced itself.
+    let (arrived_job, _generation) = tokio::time::timeout(TIMEOUT, hold.wait_arrived())
+        .await
+        .expect("the handler never reached the hold");
+    assert_eq!(arrived_job, job_id);
+
+    // The handler did NOT hang: the run executed against the missing repo
+    // and the job settled Failed within the timeout (never stuck Running).
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let final_doc = loop {
+        let doc = get_job(&hub, job_id).await;
+        if ["passed", "failed", "canceled", "landed"]
+            .iter()
+            .any(|state| doc["state"] == *state)
+        {
+            break doc;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "handler hung in the released hold; job stuck: {doc}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_ne!(
+        final_doc["state"],
+        json!("canceled"),
+        "no cancel was sent; the run simply executed: {final_doc}"
+    );
 }

@@ -301,6 +301,7 @@ async function setupPerCallSeeds() {
   return {
     api,
     hubStore,
+    hooks,
     seedCall: (j: string, i: number) => {
       const d = queues[j]?.[i];
       if (!d) throw new Error(`seed ${j}[${i}] not queued (have ${queues[j]?.length ?? 0})`);
@@ -313,7 +314,7 @@ async function setupPerCallSeeds() {
 }
 
 it("an obsolete duplicate seed's scoped handoff never retires the live mount's attempt (B's late failure drives offline)", async () => {
-  const { hubStore, seedCall, waitQueued, waitSubscribed } = await setupPerCallSeeds();
+  const { hubStore, hooks, seedCall, waitQueued, waitSubscribed } = await setupPerCallSeeds();
 
   // Rapid A → B → A → B: every follow queues its own seed read.
   const mountA1 = hubStore.follow(INSTANCE_A);
@@ -342,11 +343,19 @@ it("an obsolete duplicate seed's scoped handoff never retires the live mount's a
   await mountA2.catch(() => undefined);
   await new Promise((r) => setTimeout(r, 10));
 
-  // B's duplicate seed (the CURRENT mount's catch-up) rejects: its failure must
-  // not have been retired by A's handoff — the machine goes offline.
+  // B's duplicate seed (the CURRENT mount's catch-up) rejects. Under the
+  // gate-7 policy a failed resume READ must not tear down B's already
+  // frame-certified follow socket: the link stays live, healing via live
+  // frames under the frame watchdog (a rejected REST catch-up is not a dead
+  // link). A's obsolete handoff still must not have retired B's attempt.
   seedCall(JOURNAL_B, 1).reject(new Error("JOURNAL_B_DUP_SEED_FAILED"));
   await expect(mountB2).rejects.toThrow("JOURNAL_B_DUP_SEED_FAILED");
   await expect(mountB1).resolves.toBeUndefined();
+  await vi.waitFor(() => expect(hubStore.connectionState).toBe("live"));
+
+  // A genuine socket drop on the CURRENT mount is still authoritative: the
+  // follow's own close drives the machine offline.
+  hooks.get(JOURNAL_B)?.onClose?.();
   await vi.waitFor(() => expect(hubStore.connectionState).toBe("offline"));
 
   hubStore.logout();

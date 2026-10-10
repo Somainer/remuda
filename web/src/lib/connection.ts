@@ -287,6 +287,18 @@ export class ConnectionMachine {
           this.attempt = 0;
           this.setState("live");
           this.armFrameWatchdog();
+        } else if (this.deps.isFollowLive()) {
+          // The resume ACTION rejected (a resume-side REST catch-up read
+          // timed out under load), but the follow socket it opened is already
+          // proven live by its own frames. Frames are healing the journal and
+          // the socket's frame watchdog/close remain the real failure
+          // detectors — forcing offline here would tear down the working
+          // follow, reopen a replacement, and storm offline↔recovering
+          // (c-reconnfu gate 7: the restored page never got its banner to
+          // clear even though delivery and the journal had settled).
+          this.attempt = 0;
+          this.setState("live");
+          this.armFrameWatchdog();
         } else {
           this.goOfflineAndSchedule();
         }
@@ -359,6 +371,20 @@ export class ConnectionMachine {
       "reconnect",
       this.schedule(() => {
         this.timers.delete("reconnect");
+        // AUTONOMOUS retry only: a manual resume/online explicitly demands a
+        // reopen and is dispatched through beginResume directly. The backoff,
+        // by contrast, must never replace a follow that re-certified live
+        // (open + a frame within LIVE_FRAME_MS) while the clock was waiting —
+        // doing so closed the working socket and stormed offline↔recovering
+        // on a restored page (c-reconnfu gate 7). Certify under the frame
+        // watchdog instead; a genuinely dead link is reopened by the frame
+        // watchdog's stale/probe path as usual.
+        if (this.deps.isFollowLive()) {
+          this.attempt = 0;
+          this.setState("live");
+          this.armFrameWatchdog();
+          return;
+        }
         this.beginResume();
       }, delay),
     );
@@ -487,6 +513,18 @@ export class ConnectionMachine {
           this.resumeAttemptId !== attemptId ||
           this.resumeBindGen !== this.latestBindGen
         ) {
+          return;
+        }
+        // A socket already certified live by frames owes no offline
+        // transition: the resume action outlived its watchdog but the follow
+        // demonstrably works — arm the frame watchdog and stay live instead of
+        // replacing the socket (the same offline↔recovering storm as the
+        // resumeAttempt failure arm; c-reconnfu gate 7).
+        if (this.deps.isFollowLive()) {
+          this.resumeInFlight = false;
+          this.attempt = 0;
+          this.setState("live");
+          this.armFrameWatchdog();
           return;
         }
         this.resumeInFlight = false;

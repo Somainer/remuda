@@ -424,20 +424,64 @@ export class Outbox {
     this.owner = owner ?? `owner_${newCommandId()}`;
   }
 
+  /**
+   * Stable per-BROWSER-PROFILE owner id: a reload creates a new JS context,
+   * so a randomly-minted owner per `Outbox.load` made a page's own inflight
+   * claim look like ANOTHER process's lease — unstealable for the full 30 s
+   * TTL after a context destroyed mid-POST (c-reconnfu gate 7: an
+   * offline-reloaded row rendered 已发送，等待确认 although no byte was
+   * sent). A stable identity lets the next context reclaim its own stale
+   * claims immediately. Another TAB shares the profile and therefore the id;
+   * a double-issue there stays exactly-once via the Hub's commandId dedup.
+   */
+  static profileOwner(): Id {
+    const KEY = "remuda-outbox-owner";
+    try {
+      const existing = localStorage.getItem(KEY);
+      if (existing) return existing;
+      const created = `owner_${newCommandId()}`;
+      localStorage.setItem(KEY, created);
+      return created;
+    } catch {
+      // Storage locked down (cookies/site data disabled): fall back to a
+      // per-context owner and the lease-TTL steal path.
+      return `owner_${newCommandId()}`;
+    }
+  }
+
   static async load(storage: OutboxStorage, owner?: Id): Promise<Outbox> {
-    const box = new Outbox(storage, owner);
+    const box = new Outbox(storage, owner ?? Outbox.profileOwner());
     for (const rec of (await storage.all()).filter((r) => commandIdFromKey(r.commandId))) {
       box.cache.set(rec.commandId, rec);
     }
-    // A row left inflight by another (possibly crashed) process is returned to
-    // a deliverable state in THIS cache; the durable lease is re-judged inside
-    // the delivery lock (an expired lease is stealable).
     const now = Date.now();
+    const requeue: Id[] = [];
     for (const [id, rec] of box.cache) {
-      if (rec.state === "inflight" && rec.lease?.owner !== box.owner && (!rec.lease || rec.lease.until <= now)) {
-        box.cache.set(id, { ...rec, state: "pending", lease: undefined });
+      if (rec.state !== "inflight") continue;
+      if (rec.lease?.owner === box.owner) {
+        // This browser profile's PREVIOUS context left the claim: no POST can
+        // still be in flight here (a fresh context owns the fetch lifecycle),
+        // so requeue immediately instead of waiting out the lease TTL.
+        requeue.push(id);
+      } else if (!rec.lease || rec.lease.until <= now) {
+        // A row left inflight by another (possibly crashed) process is
+        // returned to a deliverable state once its lease expires; the durable
+        // lease is re-judged inside the delivery lock.
+        requeue.push(id);
       }
     }
+    // Persist the requeue (refreshDurable re-reads the durable store and
+    // would otherwise resurrect the inflight claim).
+    await Promise.all(
+      requeue.map((id) =>
+        storage
+          .mergeUnlessDone(id, { state: "pending", lease: undefined })
+          .then((stored) => {
+            if (stored) box.cache.set(id, stored);
+          })
+          .catch(() => undefined),
+      ),
+    );
     return box;
   }
 

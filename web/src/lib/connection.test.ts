@@ -43,7 +43,7 @@ function setup() {
   const clock = fakeTimers();
   const resume = vi.fn(() => Promise.resolve());
   const probe = vi.fn(() => Promise.resolve(true));
-  const isFollowLive = vi.fn(() => true);
+  const isFollowLive = vi.fn(() => false);
   const onState = vi.fn();
   const onAttemptFinish = vi.fn();
   const machine = new ConnectionMachine({
@@ -83,7 +83,8 @@ describe("ConnectionMachine", () => {
   });
 
   it("goes offline after the stale window and reconnects on the backoff", async () => {
-    const { clock, machine } = setupTracked();
+    const { clock, machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
     machine.startLive();
     clock.advance(LIVE_FRAME_MS + STALE_TO_OFFLINE_MS);
     expect(machine.state).toBe("offline");
@@ -126,7 +127,8 @@ describe("ConnectionMachine", () => {
   });
 
   it("a failed resume returns to offline, never stays recovering; next success heals", async () => {
-    const { machine } = setupTracked();
+    const { machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
     machine.startLive();
     machine.dispatch({ type: "close" });
     machine.dispatch({ type: "resume" });
@@ -138,8 +140,62 @@ describe("ConnectionMachine", () => {
     expect(machine.state).toBe("live");
   });
 
+  it("GATE7: a failed resume ACTION stays live when its follow socket is already frame-certified", async () => {
+    // The resume-side REST catch-up read can reject/timeout under load after
+    // the follow it opened started streaming frames. Forcing offline there
+    // tears down a working follow and storms offline↔recovering (the restored
+    // page's banner then never cleared). Frames + the frame watchdog own this
+    // link; the failed read must not take it down.
+    const { machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(true); // follow already streaming frames
+    resume.mockRejectedValueOnce(new Error("resume read failed"));
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    // the
+    // rejection settles as live once the microtask runs.
+    await vi.waitFor(() => expect(machine.state).toBe("live"));
+    // The rejected attempt schedules nothing against the certified link.
+    const calls = resume.mock.calls.length;
+    // (clock isn't advanced; no timers in the live state but the frame
+    // watchdog, which is silent here.)
+    expect(calls).toBe(1);
+  });
+
+  it("GATE7: the recovering watchdog certifies live instead of replacing a framed socket", () => {
+    const { clock, machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(true); // follow open + freshly framed
+    resume.mockReturnValue(new Promise<void>(() => {})); // hangs
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    // stay live under the frame watchdog rather
+    // than going offline and scheduling a socket replacement.
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(machine.state).toBe("live");
+    const callsAtCertify = resume.mock.calls.length;
+    clock.advance(MAX_BACKOFF_MS + 1_000);
+    expect(resume.mock.calls.length).toBe(callsAtCertify);
+  });
+
+  it("GATE7: a scheduled reconnect tick never replaces a frame-certified follow", () => {
+    const { clock, machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(true); // follow re-certified before the tick
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    expect(machine.state).toBe("offline");
+    clock.advance(250); // attempt-0 full-jitter delay with random()=0.5
+    expect(machine.state).toBe("live");
+    expect(resume).not.toHaveBeenCalled();
+    clock.advance(MAX_BACKOFF_MS + 1_000);
+    expect(resume).not.toHaveBeenCalled();
+  });
+
   it("the recovering watchdog forces offline if resume hangs", () => {
-    const { clock, machine } = setupTracked();
+    const { clock, machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
     machine.startLive();
     machine.dispatch({ type: "close" });
     machine.dispatch({ type: "resume" });
@@ -156,7 +212,8 @@ describe("ConnectionMachine", () => {
     // while B is still pending, then B fails. A's completion must be dropped
     // (it is not the current attempt) and B's failure must land offline —
     // never a false live certified by the dead attempt A.
-    const { clock, machine, resume } = setupTracked();
+    const { clock, machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
     let resolveA: () => void = () => {};
     let rejectB: (err: Error) => void = () => {};
     resume
@@ -248,7 +305,8 @@ describe("ConnectionMachine", () => {
   });
 
   it("foreground from cached live with an OPEN socket is a no-op (no churn)", () => {
-    const { machine, resume } = setupTracked();
+    const { machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(true); // open + fresh frame
     machine.startLive();
     machine.dispatch({ type: "resume" });
     expect(machine.state).toBe("live");
@@ -304,7 +362,8 @@ describe("ConnectionMachine", () => {
   });
 
   it("followAttempt: an initial journal seed is recovering immediately; failure goes offline and retries", () => {
-    const { clock, machine, resume } = setupTracked();
+    const { clock, machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
     machine.bootstrapLive();
     const id = machine.followAttemptBegin();
     expect(machine.state).toBe("recovering");
@@ -331,7 +390,8 @@ describe("ConnectionMachine", () => {
   });
 
   it("followAttempt: a hung seed is forced offline by the watchdog", () => {
-    const { clock, machine } = setupTracked();
+    const { clock, machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
     machine.bootstrapLive();
     const id = machine.followAttemptBegin();
     clock.advance(RECOVERING_WATCHDOG_MS);

@@ -149,6 +149,51 @@ describe("Outbox", () => {
     expect(reloaded.pending().map((r) => r.commandId)).toEqual(["cmd_a"]);
   });
 
+  it("GATE7: a reload by the SAME profile reclaims its own stale inflight claim immediately", async () => {
+    const owner = "owner_reload_same_profile";
+    const first = await Outbox.load(storage, owner);
+    await first.enqueue(rec({ commandId: "cmd_inflight", instanceId: "ins_1" }));
+    // Claim the durable inflight lease the way a flush does right before its
+    // POST — then the page context is destroyed (no rollback, no finish()).
+    await first.patch("cmd_inflight", {
+      state: "inflight",
+      attempts: 1,
+      lease: { owner, until: Date.now() + LEASE_TTL_MS },
+    });
+    expect(storage.map.get("cmd_inflight")?.state).toBe("inflight");
+
+    // New context, same browser profile (stable owner id): the claim cannot
+    // have a POST in flight any more, so it is requeued immediately, both in
+    // the cache and durably — no waiting out the 30 s lease TTL.
+    const reloaded = await Outbox.load(storage, owner);
+    expect(reloaded.pendingFor("ins_1").map((r) => r.commandId)).toEqual(["cmd_inflight"]);
+    // A durable re-read must not resurrect the stale claim.
+    expect(storage.map.get("cmd_inflight")?.state).toBe("pending");
+    expect(storage.map.get("cmd_inflight")?.lease).toBeUndefined();
+  });
+
+  it("GATE7: another owner's FRESH inflight lease is never stolen on load", async () => {
+    const tabA = await Outbox.load(storage, "owner_tab_a");
+    await tabA.enqueue(rec({ commandId: "cmd_foreign", instanceId: "ins_1" }));
+    await tabA.patch("cmd_foreign", {
+      state: "inflight",
+      lease: { owner: "owner_tab_a", until: Date.now() + LEASE_TTL_MS },
+    });
+
+    // A different profile/process loads with the other owner's claim still
+    // fresh: it stays inflight and is not deliverable.
+    const tabB = await Outbox.load(storage, "owner_tab_b");
+    expect(tabB.pendingFor("ins_1")).toEqual([]);
+    expect(storage.map.get("cmd_foreign")?.state).toBe("inflight");
+  });
+
+  it("GATE7: profileOwner is stable within a browser profile", () => {
+    const a = Outbox.profileOwner();
+    const b = Outbox.profileOwner();
+    expect(a).toBe(b);
+    expect(a.startsWith("owner_")).toBe(true);
+  });
+
   it("lists pending oldest-first, scoped to one instance, and counts them", async () => {
     await box.enqueue(rec({ commandId: "cmd_2", instanceId: "ins_1", createdAt: 20 }));
     await box.enqueue(rec({ commandId: "cmd_1", instanceId: "ins_1", createdAt: 10 }));

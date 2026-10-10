@@ -187,11 +187,29 @@ describe("Outbox", () => {
     expect(storage.map.get("cmd_foreign")?.state).toBe("inflight");
   });
 
-  it("GATE7: profileOwner is stable within a browser profile", () => {
-    const a = Outbox.profileOwner();
-    const b = Outbox.profileOwner();
+  it("GATE8 item 4: tabOwner is stable across reload/SW restore (sessionStorage) but unique per tab", () => {
+    const a = Outbox.tabOwner();
+    const b = Outbox.tabOwner();
     expect(a).toBe(b);
     expect(a.startsWith("owner_")).toBe(true);
+  });
+
+  it("GATE8 item 4: a SIBLING tab (different owner) never requeues a live tab's fresh inflight claim", async () => {
+    const tabA = await Outbox.load(storage, "owner_tab_a");
+    await tabA.enqueue(rec({ commandId: "cmd_sibling", instanceId: "ins_1" }));
+    await tabA.patch("cmd_sibling", {
+      state: "inflight",
+      lease: { owner: "owner_tab_a", until: Date.now() + LEASE_TTL_MS },
+    });
+
+    // Simulate the real two-tab situation: tab B is a DIFFERENT sessionStorage
+    // owner loading with tab A's claim fresh. It must not requeue/deliver it
+    // (gate 8: the per-profile owner used to make both tabs identical, so load
+    // requeued a live POST and the no-Web-Locks fallback double-delivered).
+    const tabB = await Outbox.load(storage, "owner_tab_b");
+    expect(tabB.pendingFor("ins_1")).toEqual([]);
+    expect(storage.map.get("cmd_sibling")?.state).toBe("inflight");
+    expect(storage.map.get("cmd_sibling")?.lease?.owner).toBe("owner_tab_a");
   });
 
   it("lists pending oldest-first, scoped to one instance, and counts them", async () => {

@@ -425,32 +425,34 @@ export class Outbox {
   }
 
   /**
-   * Stable per-BROWSER-PROFILE owner id: a reload creates a new JS context,
-   * so a randomly-minted owner per `Outbox.load` made a page's own inflight
-   * claim look like ANOTHER process's lease — unstealable for the full 30 s
-   * TTL after a context destroyed mid-POST (c-reconnfu gate 7: an
-   * offline-reloaded row rendered 已发送，等待确认 although no byte was
-   * sent). A stable identity lets the next context reclaim its own stale
-   * claims immediately. Another TAB shares the profile and therefore the id;
-   * a double-issue there stays exactly-once via the Hub's commandId dedup.
+   * Owner id stable across RELOAD/SW RESTORE but unique per TAB:
+   *
+   * `sessionStorage` is per-tab and survives same-document reload and
+   * SW-controlled restore (the offline-outbox scenario), so a destroyed
+   * context's own inflight claim is reclaimed immediately on load while a
+   * LIVE sibling tab is a DIFFERENT owner — its claim is neither stolen nor
+   * requeued (c-reconnfu gate 8 item 4: the per-profile localStorage owner
+   * made every sibling tab identical, so load requeued a live tab's in-flight
+   * POST and the no-Web-Locks fallback let two deliverers run). A genuinely
+   * crashed tab's lease still passes via the 30 s foreign-lease TTL.
    */
-  static profileOwner(): Id {
+  static tabOwner(): Id {
     const KEY = "remuda-outbox-owner";
     try {
-      const existing = localStorage.getItem(KEY);
+      const existing = sessionStorage.getItem(KEY);
       if (existing) return existing;
       const created = `owner_${newCommandId()}`;
-      localStorage.setItem(KEY, created);
+      sessionStorage.setItem(KEY, created);
       return created;
     } catch {
-      // Storage locked down (cookies/site data disabled): fall back to a
-      // per-context owner and the lease-TTL steal path.
+      // Storage locked down (private/cookies disabled): one per context, the
+      // foreign-lease TTL is the only cross-context safety net.
       return `owner_${newCommandId()}`;
     }
   }
 
   static async load(storage: OutboxStorage, owner?: Id): Promise<Outbox> {
-    const box = new Outbox(storage, owner ?? Outbox.profileOwner());
+    const box = new Outbox(storage, owner ?? Outbox.tabOwner());
     for (const rec of (await storage.all()).filter((r) => commandIdFromKey(r.commandId))) {
       box.cache.set(rec.commandId, rec);
     }

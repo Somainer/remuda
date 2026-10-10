@@ -2920,6 +2920,18 @@ mod tests {
         let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A real flusher drains parked frames: without it the "no foreign
+        // content" assertions below would pass even if the degrade path
+        // journaled phase 2, because the pump parks into `pending` and rx
+        // would receive nothing either way.
+        let seq_arc = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (flush_done, residual_done, flusher) = spawn_test_flusher(
+            &pending,
+            &notify,
+            tx.clone(),
+            Arc::clone(&seq_arc),
+            ctx.clone(),
+        );
         let mut announced: Option<String> = None;
         maintain_binding(
             &bindings,
@@ -2931,7 +2943,7 @@ mod tests {
             &in_flight,
             &mut announced,
             &tx,
-            &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            &seq_arc,
             None,
             None,
             None,
@@ -2947,8 +2959,25 @@ mod tests {
             slot_lock(&hydrator).is_some(),
             "the hydrator opened against the claim"
         );
-        // Phase 1 drains only content (no stop_reason -> no usage).
-        while let Ok(_obs) = rx.try_recv() {}
+        // Phase 1 drains only content (no stop_reason -> no usage). The
+        // flusher delivers the OWN content through rx: prove the pump + queue
+        // actually work, so the later absence of EVIL frames is meaningful.
+        let mut saw_own = false;
+        for _ in 0..100 {
+            while let Ok(obs) = rx.try_recv() {
+                if let ObservationPayload::Message(message) = &obs.body {
+                    let rendered = serde_json::to_string(message).unwrap_or_default();
+                    if rendered.contains("OWN") {
+                        saw_own = true;
+                    }
+                }
+            }
+            if saw_own {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(saw_own, "the flusher delivers the legitimate OWN content");
 
         // Phase 2: a foreign-cwd user record, then a finalised assistant turn.
         // Under r4 the reading finalise polled these exact records and
@@ -3008,7 +3037,7 @@ mod tests {
             &in_flight,
             &mut announced,
             &tx,
-            &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            &seq_arc,
             None,
             None,
             None,
@@ -3019,6 +3048,9 @@ mod tests {
         assert!(bindings.degraded(), "the foreign cwd degrades the claim");
         assert!(slot_lock(&hydrator).is_none(), "the hydrator is discarded");
 
+        // Give the flusher a bounded window to deliver any phase-2 frames a
+        // buggy degrade might have parked, then drain.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let mut saw_usage = false;
         let mut saw_foreign_message = false;
         while let Ok(obs) = rx.try_recv() {
@@ -3038,6 +3070,12 @@ mod tests {
             "foreign content must never be journaled"
         );
         assert!(!saw_usage, "foreign usage must never reach usage_events");
+
+        // Release and join the flusher so no task outlives the test.
+        flush_done.store(true, Ordering::SeqCst);
+        residual_done.store(true, Ordering::SeqCst);
+        notify.notify_one();
+        flusher.await.expect("flusher exits");
     }
 
     // ----- deterministic binding, per epoch --------------------------------

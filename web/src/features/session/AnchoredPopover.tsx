@@ -133,35 +133,26 @@ export function computeAnchored(
     placement = !blockedUpByCard && roomAbove > roomBelow ? "up" : "down";
   }
   // When the panel stays UP despite the parked card (below has no room for a
-  // usable panel), it must still be HEIGHT-CAPPED to the card-cleared room so
-  // its bottom edge never overlaps the card — the inner region scrolls.
-  // Using plain viewport room here let a 206px menu cover a parked approval
-  // card by ~28px (composer-effort overlap e2e).
+  // usable panel), it is HEIGHT-CAPPED to the card-cleared room so its bottom
+  // edge never overlaps the card — even a 20–40px cleared strip keeps the
+  // panel clear of the card and the inner region scrolls (composer-effort
+  // overlap e2e pins this: a usable-minimum FLOOR would overlap, which the
+  // card case forbids). The one exception is a LITERAL 0: that used to mean
+  // "no maxHeight" and painted the full-vh panel over everything; cap it to
+  // the plain above-room instead (bounded; overlapping the dismissible card
+  // is then the only remaining lesser evil) — never uncapped.
   const room =
     placement === "up"
       ? blockedUpByCard
         ? roomAboveCleared
         : roomAbove
       : roomBelow;
-  // A 0–40px card-cleared strip is not a usable panel. Below a usable minimum
-  // fall back to the room on the OTHER side (often still larger than the
-  // cleared strip, even when too small to flip the placement outright);
-  // capping at the usable floor rather than the strip keeps every row
-  // reachable — overlapping a DISMISSIBLE parked card is the already-accepted
-  // lesser evil. A literal 0 is never treated as "uncapped" (which painted the
-  // full-vh panel over everything).
-  const PANEL_USABLE_MIN = 120;
-  const rawCap = Math.min(vhCap, room);
-  let capped: number;
-  if (rawCap >= PANEL_USABLE_MIN) {
-    capped = rawCap;
-  } else if (blockedUpByCard) {
-    capped = Math.min(vhCap, Math.max(roomBelow, PANEL_USABLE_MIN));
-  } else {
-    capped = Math.min(vhCap, Math.max(rawCap, PANEL_USABLE_MIN));
+  let cap = Math.min(vhCap, room);
+  if (cap <= 0) {
+    cap = Math.min(vhCap, placement === "up" ? roomAbove : vhCap);
   }
-  const maxHeight = capped > 0 ? capped : Math.min(vhCap, PANEL_USABLE_MIN);
-  const panelHeight = Math.min(need, maxHeight);
+  const maxHeight = cap > 0 ? cap : undefined;
+  const panelHeight = Math.min(need, maxHeight ?? need);
 
   // Horizontal alignment against the trigger, then shift inside the viewport.
   let left: number;

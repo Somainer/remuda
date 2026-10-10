@@ -89,8 +89,7 @@ describe("computeAnchored placement math", () => {
 
   it("stays up when a card blocks up and below cannot host a usable panel", () => {
     // Composer docked at the bottom (no usable room below) with a parked
-    // card: opening down would push controls off-screen, so stay up — the
-    // capped body is reachable even if it covers the dismissible card.
+    // card: opening down would push controls off-screen, so stay up.
     const measured = computeAnchored(
       { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
       { preferredHeight: 131, width: 300 },
@@ -99,24 +98,27 @@ describe("computeAnchored placement math", () => {
     );
     expect(measured.placement).toBe("up");
     expect(measured.top).toBeLessThan(857);
-    // Item 12b: the card-cleared strip here is only ~71px — the panel must
-    // NOT be capped to that unusable strip (and 0 must never mean uncapped).
-    expect(measured.maxHeight).toBeGreaterThanOrEqual(120);
+    // Item 12b: the panel is capped EXACTLY to the card-cleared strip (71px
+    // here: 857 − 8 gap − (770 card + 8 gap)), so its bottom edge clears the
+    // card rather than growing to a "usable" floor that would overlap it.
+    expect(measured.maxHeight).toBe(71);
+    expect(measured.top).toBe(857 - 8 - 71);
   });
 
-  it("item 12b: falls back to the other side's room when the cleared strip is tiny", () => {
-    // Card leaves ~32px cleared above but 104px below (below the dodge floor,
-    // so placement stays up); the cap uses the larger below room instead of a
-    // 20–40px strip.
+  it("item 12b: a literal 0 cleared strip is bounded, never rendered uncapped", () => {
+    // A card reaches the trigger itself (no cleared room above) with no room
+    // below either: stay up, but the 0 must NOT become an absent maxHeight
+    // (which painted a full-vh panel); it falls back to the bounded plain
+    // above-room (and the 60vh absolute cap).
     const measured = computeAnchored(
-      { top: 500, bottom: 530, left: 100, right: 200, width: 100 },
+      { top: 857, bottom: 887, left: 100, right: 200, width: 100 },
       { preferredHeight: 206, width: 300 },
-      { width: 1440, height: 650 },
-      { ...OPTS, avoidBottom: 452 },
+      { width: 1440, height: 900 },
+      { ...OPTS, avoidBottom: 857 },
     );
     expect(measured.placement).toBe("up");
-    expect(measured.maxHeight).toBeGreaterThanOrEqual(100);
-    expect(measured.maxHeight).not.toBeLessThan(100);
+    expect(measured.maxHeight).toBeDefined();
+    expect(measured.maxHeight).toBe(540); // min(841 plain above-room, 60vh)
   });
 
   it("shifts a panel that would overflow the right edge back inside", () => {

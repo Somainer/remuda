@@ -2321,3 +2321,133 @@ async fn pinned_generation_at_insert_keeps_the_row_selectable_in_the_mark_window
     hub.shutdown().await;
     Ok(())
 }
+
+/// Scripted Node for the r12 item 2 forward_if_online test: accepts
+/// `instance.create`. Records every create call so the test can tell which
+/// link the frame reached.
+struct CreateNode {
+    creates: Mutex<Vec<String>>,
+}
+
+impl NodeTransport for CreateNode {
+    fn kind(&self) -> TransportKind {
+        TransportKind::OutboundWss
+    }
+
+    fn call(
+        &self,
+        method: &str,
+        params: Value,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, remuda_hub::HubError>> + Send + '_>>
+    {
+        let method = method.to_owned();
+        Box::pin(async move {
+            if method != "instance.create" {
+                return Err(remuda_hub::HubError::Internal(format!(
+                    "CreateNode got unexpected {method}"
+                )));
+            }
+            let command_id = params
+                .get("commandId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            self.creates.lock().unwrap().push(command_id.clone());
+            Ok(Some(
+                json!({"accepted": true, "instanceId": params["instanceId"]}),
+            ))
+        })
+    }
+
+    fn notify(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, remuda_hub::HubError>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(true)))
+    }
+}
+
+/// r12 item 2: `forward_if_online` (instance.create/resume/send) must resolve
+/// the transport at SEND time, not pin it before mark_forward_intent — the pin
+/// spanned several DB round-trips (mark, instance_token, launch secret), and a
+/// hello replacing the registry slot in that span used to send the frame to
+/// the retired link. A link swapped in the mark→send window must receive the
+/// create. The generation stamp is irrelevant here: the reconnect sweep only
+/// reads it for `workspace.unregister` rows.
+#[tokio::test]
+async fn instance_create_reaches_the_link_installed_between_mark_and_send() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let store = hub.store().expect("store");
+    let host = HostId::new().as_id().as_str().to_owned();
+    hub.test_insert_host(&host).await?;
+    let instance = HostId::new().as_id().as_str().to_owned();
+    store
+        .insert_instance(
+            host.clone(),
+            Some(instance.clone()),
+            "claude".into(),
+            "generic-pty".into(),
+            None,
+            json!({}),
+        )
+        .await?;
+
+    // The link present at mark time.
+    let l1 = Arc::new(CreateNode {
+        creates: Mutex::new(Vec::new()),
+    });
+    hub.test_set_node_transport(&host, l1.clone()).await;
+
+    let command_id = "cmd_r12_item2_create_0001";
+    let payload = json!({"instanceId": instance});
+    let (queued, created) = store
+        .queue_command(
+            Some(command_id.to_owned()),
+            Some(instance.clone()),
+            host.clone(),
+            "instance.create".into(),
+            payload,
+            None,
+            None,
+        )
+        .await?;
+    assert!(created);
+    assert_eq!(queued.command_id, command_id);
+
+    // Park forward_if_online right before the send lookup.
+    let handle = hub.test_handle();
+    let (reached, release) = handle.test_arm_forward_send_barrier(&host, command_id);
+    let handle_for_task = handle.clone();
+    let cid = command_id.to_owned();
+    let forward =
+        tokio::spawn(async move { handle_for_task.test_forward_command_online(&cid).await });
+    reached.notified().await;
+
+    // A hello replaces the slot in the mark→send window.
+    let l2 = Arc::new(CreateNode {
+        creates: Mutex::new(Vec::new()),
+    });
+    handle.test_set_node_transport(&host, l2.clone()).await;
+    release.send(()).expect("release the parked forward");
+
+    let result = forward
+        .await
+        .expect("forward task joined")
+        .expect("forward_if_online succeeds on L2");
+    assert!(
+        l1.creates.lock().unwrap().is_empty(),
+        "the retired L1 must never receive the frame"
+    );
+    assert_eq!(
+        l2.creates.lock().unwrap().as_slice(),
+        &[command_id.to_owned()],
+        "the frame reaches the new link installed before the send"
+    );
+    assert_eq!(result.state, "accepted");
+
+    hub.shutdown().await;
+    Ok(())
+}

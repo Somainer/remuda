@@ -112,6 +112,8 @@ pub(crate) struct RaceBarriers {
     forward_pinned: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
     /// Parks after the command INSERT, before the mark (r12 item 1).
     forward_queued: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks forward_if_online right before the send lookup (r12 item 2).
+    forward_send: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
 }
 
 impl RaceBarriers {
@@ -123,6 +125,7 @@ impl RaceBarriers {
             RacePhase::ForwardMarked => &self.forward_marked,
             RacePhase::ForwardPinned => &self.forward_pinned,
             RacePhase::ForwardQueued => &self.forward_queued,
+            RacePhase::ForwardSend => &self.forward_send,
         };
         table.lock().unwrap().insert(key, slot);
     }
@@ -137,6 +140,7 @@ impl RaceBarriers {
                 RacePhase::ForwardMarked => &self.forward_marked,
                 RacePhase::ForwardPinned => &self.forward_pinned,
                 RacePhase::ForwardQueued => &self.forward_queued,
+                RacePhase::ForwardSend => &self.forward_send,
             };
             table
                 .lock()
@@ -166,6 +170,9 @@ pub(crate) enum RacePhase {
     ForwardPinned,
     /// Parks between the command INSERT and mark_forward_intent (r12 item 1).
     ForwardQueued,
+    /// Parks forward_if_online right before the send-time transport lookup
+    /// (r12 item 2); key is (host_id, command_id).
+    ForwardSend,
 }
 
 /// Stable substrings the Node's unregister prepare emits for occupancy/race

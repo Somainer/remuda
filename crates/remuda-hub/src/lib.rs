@@ -396,11 +396,78 @@ pub struct RunningHub {
     state: AppState,
 }
 
+/// Test-only `'static` handle to a running Hub's state.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct HubTestHandle {
+    state: AppState,
+}
+
+impl HubTestHandle {
+    /// Mount a synthetic Node transport (see
+    /// [`RunningHub::test_set_node_transport`]).
+    pub async fn test_set_node_transport(
+        &self,
+        host_id: &str,
+        transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
+    ) {
+        self.state.nodes.insert(host_id.to_owned(), transport).await;
+    }
+
+    /// Arm the forward_if_online pre-send barrier.
+    pub fn test_arm_forward_send_barrier(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardSend,
+            (host_id.to_owned(), command_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Run one queued command through the real `forward_if_online` send path.
+    pub async fn test_forward_command_online(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<crate::store::CommandRecord> {
+        let command = self
+            .state
+            .store
+            .get_command(command_id.to_owned())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown command {command_id}"))?;
+        Ok(crate::http::forward_if_online(&self.state, command, true).await?)
+    }
+}
+
 impl RunningHub {
     /// Borrow this Hub's store (audit queries, support tooling, tests).
     #[must_use]
     pub fn store(&self) -> Option<&Store> {
         self.store.as_ref()
+    }
+
+    /// Test helper: an owned (`'static` + `Clone`) handle to the Hub state so
+    /// tests can drive a handler from a spawned task while orchestrating link
+    /// swaps on the main task.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_handle(&self) -> HubTestHandle {
+        HubTestHandle {
+            state: self.state.clone(),
+        }
     }
 
     /// Test helper: insert an online host row directly (no WS enroll).

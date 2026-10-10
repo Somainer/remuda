@@ -3832,26 +3832,22 @@ pub(crate) async fn forward_if_online(
     // the active attempt's PUBLISHED settled row (including an `Ok(None)`
     // release), so it can never report a transient `forwarded=1` belonging to
     // this or a later attempt. The durable guard remains the SQLite mark.
-    // c-dirpicker r11 item 2: pin the transport AND its durable link
-    // generation once. The stamp below and the frame sent later in this
-    // attempt must describe the same link; a reconnect between the two must
-    // not move one onto a different generation.
-    let pinned;
+    //
+    // c-dirpicker r12 item 2: these commands are instance.create/resume/send —
+    // NEVER workspace.unregister (that handler pins in `mutate`), and the
+    // reconnect sweep reads the generation stamp only for unregister rows. So
+    // pinning the transport here would protect nothing while widening the
+    // pin→send window across the mark, instance_token and launch-secret DB
+    // round-trips: a hello replacing the slot in that span would send to the
+    // retired L1 (Ok(None) resting queued, or a timeout into reconciling).
+    // Stamp from the durable counter at the mark and resolve the transport at
+    // SEND time, so a replaced link delivers the frame over the new one.
     let mut forward_attempt = match acquire_forward_leader(command.command_id.clone()) {
         Some(attempt) => {
-            pinned = state.nodes.pin(&command.host_id).await;
-            let link_generation = match &pinned {
-                Some(pin) => pin.link_generation(),
-                // No live transport: the frame cannot be queued. Stamp from
-                // the durable host row so the mark is still attributed, then
-                // the Ok(None) arm below releases the intent.
-                None => {
-                    state
-                        .store
-                        .host_link_generation(command.host_id.clone())
-                        .await?
-                }
-            };
+            let link_generation = state
+                .store
+                .host_link_generation(command.host_id.clone())
+                .await?;
             let first = state
                 .store
                 .mark_forward_intent(command.command_id.clone(), link_generation)
@@ -3911,22 +3907,31 @@ pub(crate) async fn forward_if_online(
         object.insert("agentCredential".into(), json!({"token":token}));
         params = crate::providers::with_launch_secret(state, &command.host_id, params).await?;
     }
-    // r11 item 2: the frame rides the SAME pinned transport the intent was
-    // stamped for above — never a fresh registry lookup that could resolve to a
-    // link the next hello installed.
-    let rpc = match &pinned {
-        Some(pin) => {
-            pin.call(
-                &command.operation,
-                params,
-                Duration::from_millis(state.config.command_accept_timeout_ms.max(1)),
-            )
-            .await
-        }
-        None => Ok(None),
-    };
-    match rpc
-    {
+    // r12 item 2: resolve the transport at SEND time. A hello that replaced
+    // the slot during the mark/token/secret round-trips above delivers the
+    // frame over the new link instead of a retired one.
+    //
+    // Test seam: park right before the send lookup (keyed by command id), so
+    // a test can replace the registered link in the mark→send window. No-op in
+    // production.
+    state
+        .race_barriers
+        .wait_if_armed(
+            crate::workspaces::RacePhase::ForwardSend,
+            &command.host_id,
+            &command.command_id,
+        )
+        .await;
+    let rpc = state
+        .nodes
+        .call(
+            &command.host_id,
+            &command.operation,
+            params,
+            Duration::from_millis(state.config.command_accept_timeout_ms.max(1)),
+        )
+        .await;
+    match rpc {
         Ok(Some(response)) if node_accepted(&response, &command.command_id) => {
             // The Node just told us which driver it really built. Record it
             // before anything reads the row back: a create that answers

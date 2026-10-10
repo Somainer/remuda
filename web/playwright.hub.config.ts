@@ -10,6 +10,14 @@ const upstream = process.env.HUB_E2E_UPSTREAM_LISTEN ?? "127.0.0.1:58881";
 // both configs (new-session.spec.ts) separate its hub-live cases from the
 // mock-backed ones.
 process.env.REMUDA_E2E_BACKEND = "hub";
+// The in-process hub_e2e webServer (below) always enrolls the sentinel fake
+// Node. Advertise the trigger to the spec PROCESS too (test.skip reads
+// process.env at collection time, not the server env). Against an external
+// Hub (HUB_E2E_EXTERNAL=1) do not fabricate it — the operator sets it when
+// the external server really is the fake-node harness.
+if (process.env.HUB_E2E_EXTERNAL !== "1" && process.env.HUB_E2E_FAKE_NODE === undefined) {
+  process.env.HUB_E2E_FAKE_NODE = "1";
+}
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -45,6 +53,11 @@ export default defineConfig({
         HUB_E2E_LISTEN: new URL(hubUrl).host,
         HUB_E2E_ORIGINS: `${origin},http://localhost:${webPort}`,
         HUB_E2E_UPSTREAM_LISTEN: upstream,
+        // The in-process hub_e2e always enrolls the sentinel fake Node
+        // (effort-sync.hub.spec's __queued__/__degrade__/__ultra_refuse__
+        // configure words); advertise that trigger to the spec so it runs
+        // here and skips against an external Hub.
+        HUB_E2E_FAKE_NODE: process.env.HUB_E2E_FAKE_NODE ?? "1",
       },
     },
     {

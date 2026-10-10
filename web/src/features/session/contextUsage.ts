@@ -44,6 +44,33 @@ export type UsageRollup = {
 
 type RawRollup = Partial<Record<keyof UsageRollup, unknown>>;
 
+/**
+ * Empty-state rollup shown when the harness has not reported ANY usage yet
+ * (RC3): every channel is unknown and the popover explains why instead of
+ * leaving a dead chip. All counts null, zero turns — distinct from a real
+ * zero-token observation (which still reports known channels).
+ */
+export const EMPTY_USAGE_ROLLUP: UsageRollup = {
+  contextUsedTokens: null,
+  contextWindowTokens: null,
+  contextPct: null,
+  contextPctApproximate: false,
+  sessionInputTokens: null,
+  sessionOutputTokens: null,
+  cacheReadTokens: null,
+  cacheCreationTokens: null,
+  turns: 0,
+  tpmIn60s: null,
+  tpmOut60s: null,
+  tpmIn5m: null,
+  tpmOut5m: null,
+  lastTurnAt: null,
+};
+
+/** Empty-state headline for the context chip / card when no rollup exists. */
+export const EMPTY_USAGE_NOTE = "harness 未上报 usage";
+
+
 /** Numbers come over the wire as JSON integers (the OpenAPI shape); anything
  *  else (string, missing, NaN) is treated as unknown, never coerced to 0. */
 function asCount(value: unknown): number | null {

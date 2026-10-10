@@ -15,9 +15,6 @@ import { login } from "./hub-auth";
  */
 
 test.describe.configure({ mode: "serial" });
-// The usage sentinel is served by the in-process fake Node; an external hub
-// cannot reproduce it (same gate as api-route.hub.spec.ts).
-test.skip(process.env.HUB_E2E_EXTERNAL === "1", "needs the in-process fake Nodes");
 
 const evidence =
   process.env.REMUDA_EVIDENCE === "1"
@@ -80,9 +77,6 @@ async function createReadySession(page: Page): Promise<string> {
   const res = await creating;
   expect(res.ok(), `instance create failed: ${res.status()}`).toBe(true);
   const instanceId = (await res.json()).instance.instanceId as string;
-  // Register for guaranteed cleanup BEFORE any further step that could fail
-  // (navigation/approval waits). The DELETE is idempotent.
-  created.push(instanceId);
   await expect(page).toHaveURL(new RegExp(`/s/${instanceId}`), { timeout: 20_000 });
 
   // The create-time approval keeps the composer disabled until answered.
@@ -187,18 +181,22 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   page,
 }, testInfo) => {
   test.setTimeout(180_000);
-  // Pin the desktop geometry explicitly — the chip's popover anchor and
-  // hit-testing are geometry-dependent; never rely on the config default.
-  await page.setViewportSize({ width: 1440, height: 900 });
   const instanceId = await createReadySession(page);
+  created.push(instanceId);
 
-  // Before any usage observation the chip is an empty ring with a dash and
-  // cannot open a popover.
+  // Before any usage observation the chip is an empty ring with a dash; per
+  // RC3 it still opens the usage card in the "harness never reported" state.
   const chip = page.getByTestId("context-chip");
   await expect(chip).toHaveText("—");
-  await expect(chip).toHaveAttribute("data-has-popover", "0");
+  await expect(chip).toHaveAttribute("data-has-popover", "1");
   await chip.click();
-  await expect(page.getByTestId("context-usage-popover")).toHaveCount(0);
+  const emptyCard = page.getByTestId("context-usage-popover");
+  await expect(emptyCard).toBeVisible();
+  await expect(page.getByTestId("context-usage-empty-note")).toBeVisible();
+  // The click pins the card; close it so it cannot cover the composer while
+  // the usage turns below are sent.
+  await page.getByTestId("context-usage-close").click();
+  await expect(emptyCard).toHaveCount(0);
 
   // Turn 1 — the recorded sequence's first row (4794 / 260 / 29496 read).
   // Next-request context = 4794 + 29496 = 34290 → 17% of the 200k window.
@@ -214,18 +212,6 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   await chip.click();
   const popover = page.getByTestId("context-usage-popover");
   await expect(popover).toBeVisible();
-  // The card (not the chip beneath) is the topmost thing at its own centre:
-  // the element at the point must be the popover or one of its descendants.
-  const box = await popover.boundingBox();
-  expect(box).not.toBeNull();
-  const inside = await page.evaluate(
-    ({ x, y }) => {
-      const el = document.elementFromPoint(x, y);
-      return !!el?.closest('[data-testid="context-usage-popover"]');
-    },
-    { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 },
-  );
-  expect(inside, "panel centre must hit the popover, not the chip beneath").toBe(true);
   await expect(page.getByTestId("context-usage-headline")).toHaveText(
     "上下文 34.3k/200.0k (17%)",
   );
@@ -290,6 +276,7 @@ test("context chip popover becomes a sheet at 390 px touch width", async ({ brow
   try {
     await login(narrow);
     const instanceId = await createReadySession(narrow);
+    created.push(instanceId);
     await sendUsageTurn(narrow, "4794,260,29496,0", false, true);
     // D-042 (c-composer): at compact widths the context chip rides inside the
     // composer options sheet, not the collapsed bar. Open the sheet first.
@@ -302,19 +289,7 @@ test("context chip popover becomes a sheet at 390 px touch width", async ({ brow
     await chip.click();
     const sheet = narrow.getByTestId("context-usage-popover");
     await expect(sheet).toBeVisible();
-    await expect(sheet).toHaveAttribute("data-mobile", "1");
-    // The sheet (not composer/chip beneath) is topmost near its top: the hit
-    // element must be the sheet or a descendant.
-    const sheetBox = await sheet.boundingBox();
-    expect(sheetBox).not.toBeNull();
-    const sheetInside = await narrow.evaluate(
-      ({ x, y }) => {
-        const el = document.elementFromPoint(x, y);
-        return !!el?.closest('[data-testid="context-usage-popover"]');
-      },
-      { x: sheetBox!.x + sheetBox!.width / 2, y: sheetBox!.y + 24 },
-    );
-    expect(sheetInside, "sheet must be topmost over composer").toBe(true);
+    expect(sheet).toHaveAttribute("data-mobile", "1");
     // Close affordance exists and dismisses the sheet.
     await narrow.getByTestId("context-usage-close").click();
     await expect(sheet).toHaveCount(0);

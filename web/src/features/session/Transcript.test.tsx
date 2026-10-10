@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { act, createRef } from "react";
+import { act, createRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { buildLongObservations } from "../../fixtures/session/longEvents";
@@ -1323,5 +1323,652 @@ describe("streaming row (D-053)", () => {
       .map((p) => (p.value as { nodeId: string }).nodeId);
     expect(new Set(rows).size).toBe(1);
     expect((screen.getByTestId("held-queue-steer") as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+// c-fontswap round 5 items 1/2/8: the saved-position height-delta compensator.
+// A browser-like geometry harness (clamping scrollTop, coalesced own-write
+// scroll events, real per-row rects) drives a saved restore so the reflow
+// anchor arms, then grows rows above / at the saved row.
+describe("font reflow compensator", () => {
+  const ROW = 96;
+  const VIEW = 720;
+  type ScrollModel = {
+    total: () => number;
+    getTop: () => number;
+    setTop: (v: number) => void;
+  };
+  let activeScroll: ScrollModel | null = null;
+  let protoInstalled = false;
+  const nativeOwner = (() => {
+    const onH = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop");
+    return onH ? { desc: onH, on: HTMLElement.prototype } : null;
+  })();
+  const restoreNative = () => {
+    if (!protoInstalled || !nativeOwner) return;
+    if (nativeOwner.on === HTMLElement.prototype) Object.defineProperty(HTMLElement.prototype, "scrollTop", nativeOwner.desc);
+    else delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollTop;
+    protoInstalled = false;
+  };
+
+  function installGeo(rowCount: number) {
+    let dynamicTotal = rowCount;
+    const heights = new WeakMap<Element, number>();
+    const observerCbs = new Map<Element, () => void>();
+    const isScroller = (el: unknown) => el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    let top = 0;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? VIEW : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? dynamicTotal * ROW : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      const h = heights.get(el) ?? ROW;
+      if (el.dataset?.testid === "transcript-scroller") {
+        return { top: 0, left: 0, right: 500, bottom: VIEW, width: 500, height: VIEW, x: 0, y: 0, toJSON() {} } as DOMRect;
+      }
+      if (el.dataset?.anchor && el.parentElement) {
+        const list = el.parentElement;
+        const spacer = Array.from(list.children).find((c) => c.getAttribute("aria-hidden") === "true") as HTMLElement | undefined;
+        const pad = Number.parseFloat(spacer?.style.height ?? "0") || 0;
+        let preceding = 0;
+        for (const sib of Array.from(list.querySelectorAll("[data-anchor]"))) {
+          if (sib === el) break;
+          preceding += heights.get(sib) ?? ROW;
+        }
+        const rowTop = pad + preceding - top;
+        return { top: rowTop, left: 0, right: 500, bottom: rowTop + h, width: 500, height: h, x: 0, y: rowTop, toJSON() {} } as DOMRect;
+      }
+      return { top: 0, left: 0, right: 0, bottom: h, width: 0, height: h, x: 0, y: 0, toJSON() {} } as DOMRect;
+    });
+    class GeoRO {
+      private readonly cb: () => void;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe(el: Element) {
+        observerCbs.set(el, this.cb);
+      }
+      unobserve(el: Element) {
+        if (observerCbs.get(el) === this.cb) observerCbs.delete(el);
+      }
+      disconnect() {
+        for (const [el, cb] of observerCbs) if (cb === this.cb) observerCbs.delete(el);
+      }
+    }
+    vi.stubGlobal("ResizeObserver", GeoRO);
+    activeScroll = { total: () => dynamicTotal, getTop: () => top, setTop: (v) => (top = v) };
+    if (!protoInstalled) {
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+        configurable: true,
+        get(this: HTMLElement) {
+          if (isScroller(this) && activeScroll) return activeScroll.getTop();
+          return nativeOwner?.desc.get?.call(this) as number;
+        },
+        set(this: HTMLElement, v: number) {
+          const m = activeScroll;
+          if (!isScroller(this) || !m) {
+            nativeOwner?.desc.set?.call(this, v);
+            return;
+          }
+          // Browser model: clamp, no event when unchanged; a programmatic
+          // write's scroll event is delivered next frame (coalesced).
+          const max = Math.max(0, m.total() * ROW - VIEW);
+          const clamped = Math.max(0, Math.min(v, max));
+          if (clamped === m.getTop()) return;
+          m.setTop(clamped);
+          const el = this;
+          requestAnimationFrame(() => fireEvent.scroll(el));
+        },
+      });
+      protoInstalled = true;
+    }
+    const scroller = () => screen.getByTestId("transcript-scroller") as HTMLElement;
+    const readerScroll = (value: number) => {
+      const max = Math.max(0, dynamicTotal * ROW - VIEW);
+      top = Math.max(0, Math.min(value, max));
+      fireEvent.scroll(scroller());
+    };
+    const growById = (nodeId: string, height: number) => {
+      const el = scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!el) throw new Error(`row ${nodeId} not mounted`);
+      heights.set(el, height);
+      observerCbs.get(el)?.();
+    };
+    // Set a row's geometry WITHOUT delivering its ResizeObserver callback: a
+    // real font swap resizes every mounted row in the SAME layout, then the
+    // per-row observers deliver in observer-CREATION order. Preset the grown
+    // heights first so geometry already reflects the reflow when the first
+    // callback runs, then deliver callbacks in a chosen order.
+    const presetHeight = (nodeId: string, height: number) => {
+      const el = scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!el) throw new Error(`row ${nodeId} not mounted`);
+      heights.set(el, height);
+    };
+    const fireMeasure = (nodeId: string) => {
+      const el = scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!el) throw new Error(`row ${nodeId} not mounted`);
+      observerCbs.get(el)?.();
+    };
+    const nextFrame = () =>
+      new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    // Set scrollTop WITHOUT dispatching a scroll event: models a geometry the
+    // restore has not yet corrected (an estimate miss), with no reader input.
+    const quietTop = (value: number) => {
+      const max = Math.max(0, dynamicTotal * ROW - VIEW);
+      top = Math.max(0, Math.min(value, max));
+    };
+    return {
+      scroller,
+      readerScroll,
+      growById,
+      presetHeight,
+      fireMeasure,
+      quietTop,
+      top: () => top,
+      nextFrame,
+      setTotal: (n: number) => (dynamicTotal = n),
+    };
+  }
+
+  /** Render a non-follow transcript restored to anchor node N (1-based) at 0 offset. */
+  function renderRestored(instanceId: string, anchorN: number, count = 40) {
+    localStorage.clear();
+    const events = buildLongObservations({
+      instanceId: instanceId as Id,
+      journalId: `obj_${instanceId}` as Id,
+      hostId: "hst_1" as Id,
+      count,
+    });
+    localStorage.setItem(
+      `runtime.reading.v1.${instanceId}`,
+      JSON.stringify({ anchorId: `obj_long_n_${anchorN}`, offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    return renderRouted(events, `/s/${instanceId}`, false);
+  }
+
+  /** Flush until the saved restore has settled (attribute flips to 0). */
+  async function settle(geo: ReturnType<typeof installGeo>, instanceId: string) {
+    for (let i = 0; i < 30; i += 1) {
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        await Promise.resolve();
+      });
+      const active = screen.getByTestId("transcript-scroller").getAttribute("data-restore-active");
+      if (active === "0") return;
+    }
+    throw new Error(`restore never settled for ${instanceId} (top=${geo.top()})`);
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    activeScroll = null;
+    restoreNative();
+    localStorage.clear();
+    // The held-probe test puts ?restoreProbe=1 on the real jsdom location.
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("item 8: a row above the restored anchor grows -> scrollTop += delta", async () => {
+    const geo = installGeo(40);
+    renderRestored("insAbove", 5);
+    await settle(geo, "insAbove");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    expect(geo.top(), "compensates for an above-row growth").toBe(before + 40);
+  });
+
+  it("item 3 mid: above-row growth while the held-probe restore is still ARMED is compensated", async () => {
+    // Hold the font (restore stays data-restore-active=1), converge on the
+    // fallback face, then grow an above row exactly like the mid font swap.
+    const geo = installGeo(40);
+    const fakeFonts = {
+      check: () => false,
+      load: async () => [] as FontFace[],
+      ready: Promise.resolve({} as FontFaceSet),
+      status: "loaded" as FontFaceSet["status"],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+      onloading: null,
+      onloadingdone: null,
+      onloadingerror: null,
+    } as unknown as FontFaceSet;
+    Object.defineProperty(document, "fonts", { configurable: true, get: () => fakeFonts });
+    // restoreProbe reads window.location.search (not the in-memory router), so
+    // put the query on the real jsdom location.
+    window.history.replaceState({}, "", "/s/insMid?restoreProbe=1");
+    (window as unknown as { __fontSwapRestoreProbeArmed?: boolean }).__fontSwapRestoreProbeArmed = true;
+    const events = buildLongObservations({
+      instanceId: "insMid" as Id,
+      journalId: "obj_insMid" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    localStorage.setItem(
+      "runtime.reading.v1.insMid",
+      JSON.stringify({ anchorId: "obj_long_n_5", offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insMid?restoreProbe=1"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    // Converge while held: restore stays active but the offset reaches target.
+    for (let i = 0; i < 30; i += 1) {
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        await Promise.resolve();
+      });
+    }
+    const active = screen.getByTestId("transcript-scroller").getAttribute("data-restore-active");
+    expect(active, "the probe keeps the restore armed").toBe("1");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    expect(geo.top(), "an armed mid-restore compensates an above-row growth").toBe(before + 40);
+  });
+
+  it("item 3 mid (below-anchor growth): a mid-restore reflow must not finalize while the anchor is still off its saved offset", async () => {
+    // The growing row is strictly ABOVE the held restore anchor and the anchor
+    // is still 30px short of its saved offset when the font lands (the bounded
+    // long-journal mid arm: saved anchor is a burst row below the wrap block).
+    // The reflow counter-scroll holds the anchor across the above row's growth,
+    // but that MUST NOT finalize the restore at the unfinished spot. The
+    // pending offset correction has to run first; the restore finalizes only
+    // once the anchor actually reaches its saved offset.
+    //
+    // Coverage note (r8): with the DOM-relative compensator the whole drift is
+    // written by the reflow correction itself, so this test now lands on the
+    // saved offset under BOTH the pre-e6dc324d finalize-on-reflowCorrected
+    // guard and the current code — it asserts the end-to-end sequence (do not
+    // finalize while >2px off; finish AT the offset) but is not a red-on-prefix
+    // proof. The guard is defense-in-depth for a clamped/interleaved
+    // correction; that specific sequence is not driven here (clamped reflow
+    // writes themselves ARE reachable — see the r7-item-2 clamp test and
+    // installGeo.setTotal — but not the combination of a held, clamped,
+    // off-saved-offset reflow that only becomes reachable after the range
+    // grows).
+    const geo = installGeo(40);
+    let fontReady = false;
+    const fakeFonts = {
+      check: () => fontReady,
+      load: async () => [] as FontFace[],
+      ready: Promise.resolve({} as FontFaceSet),
+      status: "loaded" as FontFaceSet["status"],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+      onloading: null,
+      onloadingdone: null,
+      onloadingerror: null,
+    } as unknown as FontFaceSet;
+    Object.defineProperty(document, "fonts", { configurable: true, get: () => fakeFonts });
+    window.history.replaceState({}, "", "/s/insMidBelow?restoreProbe=1");
+    (window as unknown as { __fontSwapRestoreProbeArmed?: boolean }).__fontSwapRestoreProbeArmed = true;
+    const events = buildLongObservations({
+      instanceId: "insMidBelow" as Id,
+      journalId: "obj_insMidBelow" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    const SAVED_OFFSET = 60;
+    localStorage.setItem(
+      "runtime.reading.v1.insMidBelow",
+      JSON.stringify({ anchorId: "obj_long_n_5", offset: SAVED_OFFSET, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insMidBelow?restoreProbe=1"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const scrollerEl = () => screen.getByTestId("transcript-scroller");
+    const active = () => scrollerEl().getAttribute("data-restore-active");
+    const anchorOffset = () => {
+      const row = scrollerEl().querySelector<HTMLElement>('[data-anchor="obj_long_n_5"]');
+      if (!row) return NaN;
+      return row.getBoundingClientRect().top - scrollerEl().getBoundingClientRect().top;
+    };
+    const tick = () =>
+      act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        await Promise.resolve();
+      });
+    // Converge on the fallback face while the probe font stays held: the
+    // anchor reaches the saved offset but the restore stays armed.
+    for (let i = 0; i < 30; i += 1) await tick();
+    expect(active(), "the probe keeps the restore armed before release").toBe("1");
+    expect(Math.abs(anchorOffset() - SAVED_OFFSET)).toBeLessThanOrEqual(2);
+    // Release the held font at the same moment the anchor is 30px BELOW its
+    // saved offset (an estimate miss) and a row strictly above it grows.
+    fontReady = true;
+    await act(async () => {
+      geo.quietTop(geo.top() - 30);
+      expect(anchorOffset() - SAVED_OFFSET).toBeGreaterThan(2);
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    // The restore may not finalize while the anchor is still off: it is either
+    // still armed (correcting) or has already reached the saved offset.
+    expect(
+      active() === "1" || Math.abs(anchorOffset() - SAVED_OFFSET) <= 2,
+      "the reflow correction finalized the restore at an unfinished offset",
+    ).toBe(true);
+    // It then runs the pending offset correction and finalizes at the saved
+    // offset. Under the old ledger-delta compensator the same sequence could
+    // finalize ~30px short; at the tip (89623ff4 DOM-relative compensator)
+    // both branches land at SAVED_OFFSET — see the coverage note above.
+    for (let i = 0; i < 30; i += 1) await tick();
+    expect(active(), "the restore finalizes once the saved offset is reached").toBe("0");
+    expect(
+      Math.abs(anchorOffset() - SAVED_OFFSET),
+      "mid-restore reflow finalized away from the saved offset",
+    ).toBeLessThanOrEqual(2);
+  });
+  it("item 1: the restored row ITSELF grows -> its own top is held, no scroll jump", async () => {
+    const geo = installGeo(40);
+    renderRestored("insSelf", 5);
+    await settle(geo, "insSelf");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_5", ROW + 40);
+    });
+    expect(geo.top(), "the saved row's own growth must not scroll by its delta").toBe(before);
+  });
+
+  /** One swap resizes an above and a below row together; observers then fire. */
+  async function twoRowSwapCompensatesOnce(
+    instanceId: string,
+    order: "below-first" | "above-first",
+  ) {
+    const geo = installGeo(40);
+    renderRestored(instanceId, 5);
+    await settle(geo, instanceId);
+    const before = geo.top();
+    const anchorOffset = () => {
+      const row = geo
+        .scroller()
+        .querySelector<HTMLElement>('[data-anchor="obj_long_n_5"]');
+      return row ? row.getBoundingClientRect().top - geo.scroller().getBoundingClientRect().top : NaN;
+    };
+    expect(Math.abs(anchorOffset())).toBeLessThanOrEqual(2);
+    await act(async () => {
+      // The swap resizes BOTH rows in a single layout before any observer
+      // callback is delivered, so geometry already reflects the above row's
+      // growth when the first callback runs.
+      geo.presetHeight("obj_long_n_2", ROW + 40); // strictly ABOVE the anchor
+      geo.presetHeight("obj_long_n_6", ROW + 30); // BELOW the anchor
+      if (order === "below-first") {
+        geo.fireMeasure("obj_long_n_6");
+        geo.fireMeasure("obj_long_n_2");
+      } else {
+        geo.fireMeasure("obj_long_n_2");
+        geo.fireMeasure("obj_long_n_6");
+      }
+    });
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    // The above row's +40 is compensated exactly ONCE regardless of order and
+    // the anchor's viewport spot is held. Note (r8): at the tip the below-row
+    // observer never scrolls (the reflow anchor corrects the strictly-above
+    // row only), so the below-first ordering is redundant by design — the
+    // pre-r6 "before + 80" double count can no longer occur in either order
+    // after the r7 item-3 DOM-relative fix. This gate is retained as the
+    // order-independent anchor-stability regression check.
+    expect(geo.top(), `two-row swap scrolled twice (order ${order})`).toBe(before + 40);
+    expect(Math.abs(anchorOffset()), `anchor drifted (order ${order})`).toBeLessThanOrEqual(2);
+  }
+
+  it("item 2: two rows reflow, below-row observer first -> the drift is corrected once", async () => {
+    await twoRowSwapCompensatesOnce("insOrderBelowFirst", "below-first");
+  });
+
+  it("item 2: two rows reflow, above-row observer first -> the drift is corrected once", async () => {
+    await twoRowSwapCompensatesOnce("insOrderAboveFirst", "above-first");
+  });
+
+  it("item 2: after the reader scrolls up, a row between the new and old anchor does not jump", async () => {
+    const geo = installGeo(40);
+    renderRestored("insScroll", 5);
+    await settle(geo, "insScroll");
+    const restoredTop = geo.top();
+    // Reader scrolls UP: the new reading anchor is a row near the viewport top
+    // (n_2), while the saved row (n_5) is lower. Row n_3 sits BETWEEN them.
+    act(() => geo.readerScroll(restoredTop - 200));
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    const afterReader = geo.top();
+    expect(afterReader).toBe(restoredTop - 200);
+    // n_3 is BELOW the new reading anchor, so generic anchoring ignores its
+    // growth. The sticky-reflow bug kept n_5 as the reflow anchor; n_3 is
+    // strictly above it, so selfDelta jumped by the whole growth and rewrote
+    // the reading anchor back to the saved row.
+    await act(async () => {
+      geo.growById("obj_long_n_3", ROW + 40);
+    });
+    expect(geo.top(), "a reader who navigated owns the position; no reflow jump").toBe(afterReader);
+  });
+
+  it("item 8: a sub-pixel measurement is a no-op", async () => {
+    const geo = installGeo(40);
+    renderRestored("insSub", 5);
+    await settle(geo, "insSub");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 0.5);
+    });
+    expect(geo.top()).toBe(before);
+  });
+
+  it("item 8: repeated same-height reports do not re-apply the delta", async () => {
+    const geo = installGeo(40);
+    renderRestored("insRepeat", 5);
+    await settle(geo, "insRepeat");
+    const before = geo.top();
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+      geo.growById("obj_long_n_2", ROW + 40);
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    expect(geo.top(), "the committed delta is applied once").toBe(before + 40);
+  });
+  it("item 3: a measured height above the window survives fresh rows mounting on a window shift", async () => {
+    // Coverage of the r6 ledger fix (5ad38bd7 "make the row-height ledger the
+    // single source of truth"). The measured n_2 (above the shifted window)
+    // keeps contributing its +40 to padTop across window shifts that mount
+    // brand-new rows, whose mount-layout reports build on the ledger via
+    // new Map(rowHeightsRef.current) — so this test covers the ledger-build
+    // path by construction.
+    //
+    // It does NOT drive the exact stale-mirror interleaving described in
+    // 5ad38bd7 (a passive state->ref mirror running with a stale closure
+    // between a synchronous ledger write and its queued render). The window is
+    // real in React 19 — the layout-effect setState schedules a SEPARATE
+    // commit, and React flushes the prior commit's pending passive effects
+    // before rendering it (exactly what 5ad38bd7 / Transcript.tsx guards
+    // against) — but it could not be constructed in THIS harness: fresh rows
+    // report ROW (identical to the estimate), so the sync re-render following
+    // a window-shift ledger write mounts no further rows, and the
+    // window-shift commit's own render changed no rowHeights, leaving no
+    // mirror pending. Attempts: (a) an installGeo by-id mount-height preset
+    // over scroll-up window shifts; (b) a scheduler/unstable_mock remount
+    // (under which the saved-position restore cannot settle). Neither
+    // reproduced the rollback; the guarded behaviour stays deleted rather
+    // than re-proven red.
+    const geo = installGeo(40);
+    renderRestored("insLedger", 5);
+    await settle(geo, "insLedger");
+    await act(async () => {
+      geo.growById("obj_long_n_2", ROW + 40);
+    });
+    const padTop = () => {
+      const list = geo.scroller().firstElementChild;
+      const spacer = Array.from(list?.children ?? []).find((c) => c.getAttribute("aria-hidden") === "true") as
+        | HTMLElement
+        | undefined;
+      return Number.parseFloat(spacer?.style.height ?? "0") || 0;
+    };
+    // Expected padTop: `start` rows above the window at ROW each, plus n_2's
+    // +40 (its index 1 is above any start >= 2), derived from the first mounted
+    // row so it holds at any scroll position.
+    const expectedPadTop = () => {
+      const first = geo.scroller().querySelector<HTMLElement>("[data-anchor]");
+      const k = Number(/obj_long_n_(\d+)/.exec(first?.dataset.anchor ?? "")?.[1] ?? 0);
+      const start = k - 1;
+      return start * ROW + (start >= 2 ? 40 : 0);
+    };
+    // Shift the window so n_2 is above it while fresh tail rows mount.
+    act(() => geo.readerScroll(1300));
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(padTop(), "the measured above-window row's height was dropped from the ledger").toBe(expectedPadTop());
+    // Further shifts that mount more fresh rows must still retain it.
+    act(() => geo.readerScroll(1600));
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(padTop(), "the measured height was lost on a second window shift").toBe(expectedPadTop());
+  });
+
+  it("r7 item 2: a clamped no-op second internal write keeps the own-scroll latch armed", async () => {
+    // Two internal writes land before the ONE coalesced scroll event: the
+    // first moves (and arms reflowOwnScrollRef), the second is clamped at the
+    // scroll max and moves nothing. An assign-style latch
+    // (`latch = moved`) CLEARS it on the no-op, so the first write's event
+    // then retires reflowAnchorRef as if the reader had scrolled. The latch
+    // must arm only and stay armed; the anchor survives its own event.
+    const geo = installGeo(40);
+    const events = buildLongObservations({
+      instanceId: "insLatch" as Id,
+      journalId: "obj_insLatch" as Id,
+      hostId: "hst_1" as Id,
+      count: 40,
+    });
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insLatch",
+      // n_32 restored flush with the viewport top: target top 2976, 144px
+      // below the clamp line (40*ROW - VIEW = 3120), far enough that
+      // follow-pin (which arms within 64px of the bottom) does not grab it.
+      JSON.stringify({ anchorId: "obj_long_n_32", offset: 0, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/s/insLatch"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insLatch");
+    expect(geo.top()).toBe(2976);
+    const hold = () => screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold");
+    expect(hold()).toBe("1");
+    await act(async () => {
+      // ONE font layout resizes two mounted rows above the anchor before any
+      // per-row observer delivers (geometry is preset for both; total drift
+      // 248 pushes well past the 144px clamp margin). n_31 alone contributes a
+      // +200 ledger delta — already more than the 144px margin — so the FIRST
+      // delivery clamps under BOTH compensator forms (the old ledger-delta
+      // form would add height - prevHeight = +200; the DOM-relative form
+      // measures the full 248 drift, since both preset rows are already grown
+      // in the DOM).
+      geo.presetHeight("obj_long_n_30", ROW + 48);
+      geo.presetHeight("obj_long_n_31", ROW + 200);
+      // First delivery: the anchor drifted 248px in the DOM but the write
+      // clamps at the scroll max (3120), moving only +144 and queueing the
+      // coalesced event.
+      geo.fireMeasure("obj_long_n_31");
+      // Second delivery in the same synchronous batch (React has not flushed
+      // the first write's state yet): the anchor is still 248-144 = 104px off
+      // (48 of that is n_30's ledger delta under the old form), but the write
+      // clamps to 3120 again — a true NO-OP in either compensator form, which
+      // must not clear the latch the first write armed.
+      geo.fireMeasure("obj_long_n_30");
+    });
+    // Deliver the queued event. With the old assign-on-write latch the event
+    // finds the latch false and retires the anchor (data-reflow-hold flips to
+    // "0" on the resulting render); arm-only keeps it held.
+    await act(async () => {
+      await geo.nextFrame();
+    });
+    expect(hold(), "the no-op second write disarmed the latch before the first write's own event").toBe("1");
+    expect(geo.top()).toBe(3120);
+  });
+
+  it("r7 item 3: a streamed commit that already held the row is not double-counted by the row's RO delivery", async () => {
+    // A React commit changing nodes/sizes (a streamed event) lands between the
+    // font swap's LAYOUT (rows already resized in the DOM) and the per-row
+    // ResizeObserver deliveries: with the resized row ABOVE the sampled
+    // reading anchor, the commit's generic hold counter-scrolls the drift, and
+    // row A's observer must not add its ledger height delta a SECOND time. The
+    // explicit reflow correction is the anchor's DOM-relative drift, which is
+    // 0 after the generic hold.
+    const geo = installGeo(40);
+    const opts = { instanceId: "insStream" as Id, journalId: "obj_insStream" as Id, hostId: "hst_1" as Id };
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insStream",
+      // n_12 at saved offset 300 -> restore top 756; n_6 sits strictly ABOVE
+      // the viewport then, so a later grow of n_6 drifts the on-screen anchor
+      // and the sizes-commit generic hold compensates it.
+      JSON.stringify({ anchorId: "obj_long_n_12", offset: 300, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    // Stateful driver INSIDE the route (a rerendered MemoryRouter would not
+    // propagate new props): bumping the count simulates a streamed nodes
+    // commit exactly as SessionPage's event subscription would.
+    let bump!: () => void;
+    function Driver() {
+      const [count, setCount] = useState(40);
+      bump = () => setCount((n) => n + 1);
+      return <Transcript events={buildLongObservations({ ...opts, count })} compact={false} />;
+    }
+    render(
+      <MemoryRouter initialEntries={["/s/insStream"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insStream");
+    const before = geo.top();
+    expect(before).toBe(756);
+    // The swap resizes n_6 (strictly above the anchor) in the DOM, then a
+    // streamed nodes commit lands BEFORE n_6's observer delivery: the
+    // commit's generic hold counter-scrolls the 40px drift.
+    geo.presetHeight("obj_long_n_6", ROW + 40);
+    await act(async () => {
+      bump();
+      await Promise.resolve();
+    });
+    expect(geo.top(), "the streamed commit holds the drifted anchor").toBe(before + 40);
+    // The reflow anchor must still be armed at this point. Note the commit-level
+    // generic hold is NOT gated on reflowAnchorRef, so it would still move the
+    // +40 here with the anchor retired; the real risk is that n_6's later RO
+    // delivery would then go through holdReadingAnchor instead of the reflow
+    // compensator, and the double-count branch the test targets would never
+    // run — the +40 expectation would pass without exercising the reflow path.
+    expect(
+      screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold"),
+      "the reflow anchor retired before the row's RO delivery",
+    ).toBe("1");
+    // n_6's own observer delivers after that commit: the reflow anchor's DOM
+    // drift is now 0 and the ledger height delta must not be added again.
+    await act(async () => {
+      geo.fireMeasure("obj_long_n_6");
+      await geo.nextFrame();
+    });
+    expect(geo.top(), "the row's RO delivery double-counted the drift the streamed commit held").toBe(before + 40);
   });
 });

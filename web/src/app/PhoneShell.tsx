@@ -62,7 +62,7 @@ export function PhoneShell() {
   }, [hub.toast]);
 
   return (
-    <div className={css.shell} data-compact="1">
+    <div className={css.shell} data-compact="1" data-phone-nav="1">
       <div className={css.install}>
         <InstallBar />
       </div>

@@ -2220,3 +2220,65 @@ async fn same_epoch_hello_revives_swept_rows_for_every_mapped_lifecycle() -> Res
     }
     Ok(())
 }
+
+/// r11 item 3: a /v1/follow follower receives the settlement frame for a
+/// card invalidated by a force DELETE (the delete broadcast now runs inside
+/// settlement_publish_lock, so the frame is ordered and never silently lost).
+#[tokio::test]
+async fn follower_receives_the_settlement_frame_after_a_force_delete() -> Result<()> {
+    let r11_tmp = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(r11_tmp.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+    let (instance_id, interaction_id) =
+        seed_live_card(addr, &cookie, &node, &host_id, "r11 delete frame").await?;
+
+    // Follower subscribes before the delete.
+    let mut follow_req = format!("ws://{addr}/v1/follow").into_client_request()?;
+    follow_req.headers_mut().insert("Cookie", cookie.parse()?);
+    let follow_tcp = tokio::net::TcpStream::connect(addr).await?;
+    let (mut follow, _) = tokio_tungstenite::client_async(follow_req, follow_tcp).await?;
+    // Drain one frame so the pump is subscribed before the delete.
+    let _ = tokio::time::timeout(Duration::from_secs(5), follow.next()).await.ok();
+
+    // Force delete without an explicit close settlement first — the card is
+    // settled INSIDE the delete transaction (r10 item 4(d)) and the frame is
+    // published under the publication lock (r11 item 3).
+    let (status, body) = http(
+        addr,
+        "DELETE",
+        &format!("/v1/instances/{instance_id}?force=1"),
+        &cookie,
+        None,
+    )
+    .await?;
+    assert!(
+        status == 200 || status == 204,
+        "force delete: {status} {body}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut got = false;
+    while tokio::time::Instant::now() < deadline {
+        let Some(Ok(msg)) = tokio::time::timeout_at(deadline, follow.next()).await.ok().flatten()
+        else {
+            break;
+        };
+        let Message::Text(text) = msg else { continue };
+        let frame: Value = serde_json::from_str(&text)?;
+        if frame.get("type") == Some(&json!("settlement"))
+            && frame["interactionId"] == json!(interaction_id)
+        {
+            assert_eq!(frame["state"], json!("invalidated"));
+            assert_eq!(frame["reason"], json!("generation-ended"));
+            got = true;
+            break;
+        }
+    }
+    assert!(got, "the follower received the delete transaction's settlement frame");
+
+    hub.shutdown().await;
+    Ok(())
+}

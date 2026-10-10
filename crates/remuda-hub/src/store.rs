@@ -306,6 +306,14 @@ pub struct Store {
     /// pre-read and its writer (ma-initiator r6 item 5).
     #[cfg(any(test, feature = "test-faults"))]
     test_cancel_before_gate_mutate: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: the NEXT `mutate_gate_job` writer job commits a
+    /// Canceling -> Canceled transition on the named job BEFORE loading its
+    /// doc — the terminal write of a duplicate result's first arrival or of
+    /// the cancel-grace finisher landing between a result's pre-read and its
+    /// writer (ma-initiator r7 item 1).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_finish_before_gate_mutate:
+        Arc<std::sync::Mutex<Option<(String, crate::gatequeue::TestGateFinishBeforeWrite)>>>,
     /// Per-Store test fault flags (`test-faults` feature only). Shared via
     /// [`Arc`] so every clone of the store arms the SAME flags.
     #[cfg(any(test, feature = "test-faults"))]
@@ -2397,6 +2405,8 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             test_cancel_before_gate_mutate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-faults"))]
+            test_finish_before_gate_mutate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
@@ -2585,6 +2595,34 @@ impl Store {
         self.test_cancel_before_gate_mutate
             .lock()
             .expect("gate mutate cancel seam lock")
+            .take()
+    }
+
+    /// Test-only: arm a terminal finish (Canceling -> Canceled) that the
+    /// NEXT `mutate_gate_job` writer job for `job_id` commits before loading
+    /// the job doc — the duplicate-verdict/grace-finisher write landing
+    /// between `apply_result`'s pre-read and its writer.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_finish_before_gate_mutate(
+        &self,
+        job_id: String,
+        kind: crate::gatequeue::TestGateFinishBeforeWrite,
+    ) {
+        *self
+            .test_finish_before_gate_mutate
+            .lock()
+            .expect("gate mutate finish seam lock") = Some((job_id, kind));
+    }
+
+    /// Test-only: drain (at most) the armed pre-mutate finish.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn take_test_finish_before_gate_mutate(
+        &self,
+    ) -> Option<(String, crate::gatequeue::TestGateFinishBeforeWrite)> {
+        self.test_finish_before_gate_mutate
+            .lock()
+            .expect("gate mutate finish seam lock")
             .take()
     }
 

@@ -1622,6 +1622,164 @@ async fn a_cancel_between_a_result_preread_and_its_writer_keeps_the_row_cancelin
     );
 }
 
+/// Shared setup: a LAND job claimed to Running and then moved to Canceling
+/// exactly as the cancel writer leaves it (state, lane/host pin, stamp).
+async fn canceling_land_job(ctx: &Ctx) -> String {
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/duplicate-verdict","mode":"land"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job_id = body["id"].as_str().unwrap().to_owned();
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("the queued land job claims to running");
+    assert_eq!(claimed["state"], json!("running"), "{claimed}");
+    // The cancel commit: Running -> Canceling with the pin and stamp the
+    // real cancel writer records (no gate.cancel frame is needed here).
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    db.execute(
+        "UPDATE gate_jobs
+            SET state = 'canceling',
+                doc_json = json_set(
+                    json_set(
+                        json_set(doc_json, '$.state', 'canceling'),
+                        '$.cancelRequestedAt', '2020-01-01T00:00:00.000Z'),
+                    '$.laneId', 'lane1'),
+                revision = revision + 1,
+                updated_at = '2020-01-01T00:00:00.000Z'
+          WHERE id = ?1",
+        rusqlite::params![job_id],
+    )
+    .unwrap();
+    drop(db);
+    job_id
+}
+
+/// A land job in Canceling receives its base-moved verdict TWICE (the Node's
+/// `finished` event AND the gate.run reply, through independent queues). Both
+/// calls pre-read Canceling; the first writer commits Canceled. The second
+/// writer must stand down — it used to fall through and requeue the
+/// terminal row, so the next tick dispatched gate.run again and a
+/// pushFrom-lane land could move main after the cancel was already 200.
+#[tokio::test]
+async fn a_duplicate_base_moved_verdict_after_the_row_is_canceled_never_requeues() {
+    use remuda_hub::store_test_support::TestGateFinishBeforeWrite;
+
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let job_id = canceling_land_job(&ctx).await;
+
+    // Deterministic view of the SECOND writer: its pre-read observed
+    // Canceling (the row is Canceling now), and before its writer loads the
+    // doc the FIRST duplicate arrival commits Canceled — the seam reproduces
+    // that terminal write inside this writer job.
+    ctx.store().test_arm_finish_before_gate_mutate(
+        job_id.clone(),
+        TestGateFinishBeforeWrite::DuplicateVerdict,
+    );
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id,
+                "status": "base-moved",
+                "currentMainSha": "0123456789abcdef0123456789abcdef01234567"
+            }),
+        )
+        .await
+        .unwrap();
+
+    // A genuinely later third delivery now pre-reads Canceled as well and
+    // must be ignored without any seam.
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id,
+                "status": "base-moved",
+                "currentMainSha": "fedcba9876543210fedcba9876543210fedcba98"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("canceled"),
+        "the duplicate verdict requeued the terminal land job: {doc}"
+    );
+    assert!(
+        !doc["finishedAt"].is_null(),
+        "the terminal finish stamp must survive the duplicate: {doc}"
+    );
+
+    // The next scheduler tick must not re-dispatch: the row stays Canceled
+    // and no gate.run frame reaches the Node.
+    ctx.hub.test_gate_tick().await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("canceled"),
+        "a tick requeued/dispatched the canceled job: {doc}"
+    );
+    node.assert_next_frame_is_sentinel(&ctx).await;
+}
+
+/// Same window, different interloper: the cancel-grace finisher
+/// (finish_expired_cancels, which runs on every tick) commits the
+/// Canceling -> Canceled write strictly between a base-moved result's
+/// pre-read and its writer. The result writer must leave the row Canceled.
+#[tokio::test]
+async fn a_grace_expiry_finish_between_a_result_preread_and_its_writer_keeps_the_row_canceled() {
+    use remuda_hub::store_test_support::TestGateFinishBeforeWrite;
+
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let job_id = canceling_land_job(&ctx).await;
+
+    // The seam stands in for finish_expired_cancels's writer committing the
+    // exact terminal transition (state canceled + finishedAt + the grace
+    // error/reason) before this result's writer loads its doc.
+    ctx.store()
+        .test_arm_finish_before_gate_mutate(job_id.clone(), TestGateFinishBeforeWrite::GraceExpiry);
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id,
+                "status": "base-moved",
+                "currentMainSha": "0123456789abcdef0123456789abcdef01234567"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("canceled"),
+        "the grace finish was overwritten by the stale base-moved verdict: {doc}"
+    );
+    assert_eq!(
+        doc["reason"],
+        json!("canceled; run did not stop in time"),
+        "the grace finisher's terminal evidence must survive: {doc}"
+    );
+    ctx.hub.test_gate_tick().await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("canceled"),
+        "tick revived the job: {doc}"
+    );
+    node.assert_next_frame_is_sentinel(&ctx).await;
+}
+
 // ── 6c. A narrowed Bot token acts for the live chapter (CLI path) ─────────
 
 #[tokio::test]

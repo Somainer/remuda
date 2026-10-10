@@ -196,6 +196,11 @@ pub mod store_test_support {
     #[cfg(any(test, feature = "test-faults"))]
     pub use crate::gatequeue::TestGateCancelRace;
 
+    /// Test-only seam: which interloper settles a Canceling gate job inside
+    /// the next `mutate_gate_job` writer (duplicate verdict / grace expiry).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub use crate::gatequeue::TestGateFinishBeforeWrite;
+
     /// Test-only fault guard: arm failures on ONE store (per-Store flags,
     /// `test-faults` feature only) and clear them on drop, so a failed
     /// assertion can never leave a fault armed and other Stores are never

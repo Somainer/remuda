@@ -947,6 +947,20 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row| {
+            // The LIVE row is the authority. A land job in Canceling receives
+            // its base-moved verdict twice — the Node broadcasts `finished`
+            // AND returns it as the gate.run reply, and those travel through
+            // independent queues. Both calls pre-read Canceling; the first
+            // writer commits Canceled. Without this guard the second writer
+            // (whose loaded row is now terminal) would fall through to the
+            // base-moved branch below and requeue the Canceled land job — the
+            // next tick would dispatch gate.run again and a pushFrom-lane land
+            // could move main after the caller already held 200 canceling. The
+            // cancel-grace finisher can commit the same terminal write in this
+            // window. A terminal row never moves again; just stand down.
+            if !matches!(row.state, GateJobState::Running | GateJobState::Canceling) {
+                return None;
+            }
             // Re-read the live state inside the writer job: the pre-read
             // above can be stale by one cancel commit. Without this, a land
             // `base-moved` verdict arriving in the same window would rewrite
@@ -1753,6 +1767,11 @@ impl Store {
         // before this writer loads the doc (drained outside, applied inside).
         #[cfg(any(test, feature = "test-faults"))]
         let armed_cancel = self.take_test_cancel_before_gate_mutate();
+        // Test-only seam: a duplicate verdict's first arrival (or the
+        // cancel-grace finisher) commits Canceling -> Canceled before this
+        // writer loads the doc.
+        #[cfg(any(test, feature = "test-faults"))]
+        let armed_finish = self.take_test_finish_before_gate_mutate();
         self.run_named("mutate_gate_job", move |conn| {
             #[cfg(any(test, feature = "test-faults"))]
             if let Some(cancel_job) = armed_cancel
@@ -1771,6 +1790,40 @@ impl Store {
                             updated_at = ?2
                       WHERE id = ?1 AND state = 'running'",
                     params![id, now()],
+                )?;
+            }
+            #[cfg(any(test, feature = "test-faults"))]
+            if let Some((finished_job, kind)) = armed_finish
+                && finished_job == id
+            {
+                // The terminal write that lands before this writer loads:
+                // state canceled + finishedAt, and the same evidence the
+                // real interloper commits (the duplicate's first arrival via
+                // the Canceling branch, or finish_expired_cancels' text).
+                let (error, reason) = match kind {
+                    crate::gatequeue::TestGateFinishBeforeWrite::DuplicateVerdict => (
+                        "canceled; run ended base-moved",
+                        "canceled; run ended base-moved",
+                    ),
+                    crate::gatequeue::TestGateFinishBeforeWrite::GraceExpiry => (
+                        "canceled; the lane did not answer within the cancel grace",
+                        "canceled; run did not stop in time",
+                    ),
+                };
+                conn.execute(
+                    "UPDATE gate_jobs
+                        SET state = 'canceled',
+                            doc_json = json_set(
+                                json_set(
+                                    json_set(
+                                        json_set(doc_json, '$.state', 'canceled'),
+                                        '$.finishedAt', ?2),
+                                    '$.error', ?3),
+                                '$.reason', ?4),
+                            revision = revision + 1,
+                            updated_at = ?2
+                      WHERE id = ?1 AND state = 'canceling'",
+                    params![id, now(), error, reason],
                 )?;
             }
             let Some(mut job) = conn
@@ -1994,6 +2047,19 @@ pub enum TestGateCancelRace {
     /// A running job reaches a terminal state first (`"passed"`/`"failed"`/
     /// `"landed"`/`"canceled"`).
     Finished { state: &'static str },
+}
+
+/// Test-only seam: WHICH interloper commits Canceling -> Canceled inside a
+/// `mutate_gate_job` writer before its doc loads (ma-initiator r7 item 1).
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestGateFinishBeforeWrite {
+    /// The first of two duplicate verdicts (the Node's `finished` event and
+    /// the gate.run reply carry the same base-moved result) settled the row.
+    DuplicateVerdict,
+    /// The cancel-grace finisher (`finish_expired_cancels`) settled it.
+    GraceExpiry,
 }
 
 #[cfg(any(test, feature = "test-faults"))]

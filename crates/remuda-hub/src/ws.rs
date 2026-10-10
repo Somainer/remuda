@@ -333,26 +333,20 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                         if !id.is_null() {
                             let _ = out_tx.send(rpc_ok(id, result)).await;
                         }
-                        // Re-push api.egress contexts only after the hello
-                        // reply is queued: the egress sends share this bounded
-                        // FIFO, which this same task drains, so awaiting them
-                        // inline would park the reply once a proxy held ~32+
-                        // routed instances (D-048 B.2).
+                        // Re-push api.egress contexts and abort stale
+                        // unbinding marks only after the hello reply is
+                        // queued: the egress sends and the abort frames
+                        // share this bounded FIFO, which this same task
+                        // drains, so awaiting them inline would park the
+                        // reply once a proxy held ~32+ routed instances
+                        // (D-048 B.2); the sweep also needs the transport
+                        // registered below and must not run inside the read
+                        // loop (c-dirpicker r8 item 1 / r9 item 1). Both
+                        // carriers go through this one helper.
                         if is_hello
                             && let Some(h) = host_id.clone()
                         {
-                            spawn_egress_reinstall(&state, h.clone());
-                            // r8 item 1: abort unbinding marks a dead previous
-                            // link prepared. Must run in a spawned task AFTER
-                            // state.nodes.insert (done in the hello handler
-                            // before this reply) and after the reply is queued;
-                            // inline it would find no link / deadlock the read
-                            // loop on its own reply.
-                            crate::workspaces::spawn_unregister_abort_sweep(
-                                &state,
-                                h,
-                                now_rfc3339(),
-                            );
+                            spawn_post_hello_tasks(&state, h);
                         }
                     }
                     Ok(None) => {}
@@ -420,6 +414,24 @@ pub(crate) fn spawn_egress_reinstall(state: &AppState, host_id: String) {
             .reinstall_egress_on_connect(&state, &host_id)
             .await;
     });
+}
+
+/// Post-`node.hello` reconciliation that EVERY carrier must run once the new
+/// transport is registered and the hello reply is queued: the D-048 B.2
+/// egress re-push and the c-dirpicker unregister-abort sweep (r7 item 1,
+/// r8 item 1, r9 item 1).
+///
+/// Both run in spawned tasks: they share the session's bounded outbound
+/// FIFO, which the session task itself drains, so awaiting them inline
+/// would fill the FIFO ahead of the reply (parking the hello behind ~32
+/// routed instances) and the sweep's RPC would deadlock the read loop on
+/// its own reply. The timestamp captured here is the reconnect instant:
+/// the sweep (see [`crate::workspaces::abort_unsettled_unregisters_on_reconnect`])
+/// must not abort DELETEs accepted on THIS new link, so only commands
+/// created before it are touched.
+pub(crate) fn spawn_post_hello_tasks(state: &AppState, host_id: String) {
+    spawn_egress_reinstall(state, host_id.clone());
+    crate::workspaces::spawn_unregister_abort_sweep(state, host_id, crate::config::now_rfc3339());
 }
 
 #[allow(clippy::too_many_arguments)]

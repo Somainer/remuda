@@ -14,6 +14,8 @@ workspace = true
 default = []
 # Embed `web/dist` when present at compile time; otherwise a 404 placeholder.
 embed-web = []
+# Test-only fault injection (Store fault flags, see store::test_faults).
+test-faults = []
 
 [dependencies]
 anyhow.workspace = true
@@ -53,6 +55,9 @@ webauthn-rs-core = "=0.5.5"
 
 [dev-dependencies]
 anyhow.workspace = true
+# Test-only fault injection; self dependency so integration tests compile
+# with the feature without pulling it into the production lib.
+remuda-hub = { path = ".", features = ["test-faults"] }
 base64 = "0.22"
 ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
 # Software ES256 authenticator for the passkey ceremony tests (D-029).

@@ -1771,12 +1771,14 @@ impl Store {
         authority: crate::agent_scope::CallerAuthority,
     ) -> Result<Option<GateJobCancelOutcome>, crate::store::StoreError> {
         let id = id.to_owned();
+        #[cfg(any(test, feature = "test-faults"))]
         let armed_race = self.take_test_gate_cancel_race();
         self.run_named("request_gate_job_cancel", move |conn| {
             let (initiator, device_id) = authority.as_check();
             crate::store::check_initiator(conn, initiator, device_id)?;
             // Test-only seam: a scheduler claim / dispatch finish that
             // commits between the handler's pre-read and this read.
+            #[cfg(any(test, feature = "test-faults"))]
             if let Some(race) = armed_race {
                 race.apply(conn, &id)?;
             }
@@ -1845,8 +1847,10 @@ impl Store {
     ) -> Result<GateJobClaim, crate::store::StoreError> {
         let id = id.to_owned();
         // Test-only seam: fence lands inside this writer job.
+        #[cfg(any(test, feature = "test-faults"))]
         let armed_fence = self.take_test_authority_fence();
         self.run_named("claim_gate_job", move |conn| {
+            #[cfg(any(test, feature = "test-faults"))]
             if let Some(fenced_instance) = armed_fence {
                 crate::store::test_apply_fence(conn, &fenced_instance)?;
             }
@@ -1935,6 +1939,7 @@ pub(crate) enum GateJobCancelOutcome {
 /// job (or the dispatch finishing it) between the handler's pre-read and
 /// the writer. Drained after one fire.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
 #[derive(Debug)]
 pub enum TestGateCancelRace {
     /// The scheduler wins the queued job first: it is claimed to `running`
@@ -1945,6 +1950,7 @@ pub enum TestGateCancelRace {
     Finished { state: &'static str },
 }
 
+#[cfg(any(test, feature = "test-faults"))]
 impl TestGateCancelRace {
     fn apply(&self, conn: &rusqlite::Connection, id: &str) -> Result<(), crate::store::StoreError> {
         match self {

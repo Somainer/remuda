@@ -28,6 +28,49 @@ use tokio::sync::{Semaphore, oneshot};
 #[path = "store_auth_tests.rs"]
 mod auth_tests;
 
+/// Test-only fault injection for post-commit best-effort paths. Gated
+/// behind the `test-faults` feature (enabled via the crate's own
+/// dev-dependency), so the production `remuda-hub` lib contains no fault
+/// flag, check or error variant. The flags are PER STORE (not process
+/// globals): arming one test's Store cannot fail lookups for any other
+/// Store in the same test binary.
+#[cfg(any(test, feature = "test-faults"))]
+pub(crate) mod test_faults {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Per-Store injected-fault flags. The whole struct, the Store field and
+    /// every call site are cfg-gated out of non-fault builds; with the
+    /// `test-faults` feature the Store owns an `Arc<FaultFlags>` shared by all
+    /// its clones.
+    #[derive(Default)]
+    pub(crate) struct FaultFlags {
+        pub lease_lookup_failure: AtomicBool,
+    }
+
+    /// Make every `active_worktree_leases_for_task` call on THIS store fail
+    /// until [`clear`] runs.
+    pub fn arm_lease_lookup_failure(flags: &FaultFlags) {
+        flags.lease_lookup_failure.store(true, Ordering::Release);
+    }
+
+    /// Clear every injected fault for this store.
+    pub fn clear(flags: &FaultFlags) {
+        flags.lease_lookup_failure.store(false, Ordering::Release);
+    }
+
+    pub(super) fn lease_lookup_injected_failure(
+        flags: &FaultFlags,
+    ) -> Result<(), crate::store::StoreError> {
+        if flags.lease_lookup_failure.load(Ordering::Acquire) {
+            Err(crate::store::StoreError::FaultInjected(
+                "active_worktree_leases_for_task".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// SQLite or actor failures.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -57,6 +100,10 @@ pub enum StoreError {
     /// the authenticating device row no longer exists. Maps to 409 `fenced`.
     #[error("fenced")]
     Fenced,
+    /// An injected test fault (`test-faults` feature only).
+    #[cfg(any(test, feature = "test-faults"))]
+    #[error("injected store fault: {0}")]
+    FaultInjected(String),
 }
 
 fn sqlite_is_busy(err: &rusqlite::Error) -> bool {
@@ -213,29 +260,52 @@ pub struct Store {
     readers: Arc<ReaderPool>,
     /// Joins the writer thread after the last clone drops its channel sender.
     _join: Arc<StoreJoin>,
+    // The ma-initiator commit-time race seams below and the ma-lineage
+    // `faults` flags are cfg-gated out of every non-fault build: the
+    // production `remuda-hub` lib carries no seam field, arming function or
+    // call site. The crate's own dev-dependency enables `test-faults`, so
+    // `cargo test` sees them all.
     /// Test-only seam: when armed, the NEXT `queue_command` writer job marks
     /// the named instance fenced (and bumps its lineage generation) BEFORE
     /// running `check_initiator`, deterministically reproducing a fence F that
     /// commits between request authentication and the write. Drained after
-    /// one fire. Always present; production code never arms it.
+    /// one fire.
+    #[cfg(any(test, feature = "test-faults"))]
     test_fence_before_queue: Arc<std::sync::Mutex<Option<String>>>,
     /// Test-only seam, device-specific companion: when armed the NEXT
     /// `queue_command` writer job deletes that device row before the authority
     /// check (the fence F also deletes predecessor devices).
+    #[cfg(any(test, feature = "test-faults"))]
     test_delete_device_before_queue: Arc<std::sync::Mutex<Option<String>>>,
     /// Test-only seam shared by gate-claim and node-op admission: arm a fence
     /// applied at the top of the NEXT such writer job.
+    #[cfg(any(test, feature = "test-faults"))]
     test_fence_before_authority: Arc<std::sync::Mutex<Option<String>>>,
     /// Test-only seam: arm a fence applied at the top of the NEXT
     /// `mutate_task` writer job only (task bind post-lease commit race).
+    #[cfg(any(test, feature = "test-faults"))]
     test_fence_before_task_mutate: Arc<std::sync::Mutex<Option<String>>>,
     /// Test-only seam: a claim/finish transition that the NEXT
     /// `request_gate_job_cancel` writer job applies before its own row read
     /// (cancel handler pre-read vs. writer-observed state race).
+    #[cfg(any(test, feature = "test-faults"))]
     test_gate_cancel_race: Arc<std::sync::Mutex<Option<crate::gatequeue::TestGateCancelRace>>>,
     /// Test-only seam: a fence applied at the top of the NEXT
     /// `patch_project_with_route` writer job (atomic project PATCH).
+    #[cfg(any(test, feature = "test-faults"))]
     test_fence_before_project_patch: Arc<std::sync::Mutex<Option<String>>>,
+    /// Per-Store test fault flags (`test-faults` feature only). Shared via
+    /// [`Arc`] so every clone of the store arms the SAME flags.
+    #[cfg(any(test, feature = "test-faults"))]
+    faults: Arc<test_faults::FaultFlags>,
+}
+
+impl Store {
+    /// Per-Store test fault flags (`test-faults` feature only).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn fault_flags(&self) -> &Arc<test_faults::FaultFlags> {
+        &self.faults
+    }
 }
 
 /// Delete one chapter's rows and write its interaction tombstones /
@@ -965,7 +1035,7 @@ impl Default for InstanceDelegation {
 const SEAT_OCCUPIED_SQL: &str = "(
         lifecycle NOT IN ('exited', 'failed', 'closed')
         OR (lifecycle = 'exited' AND ended_at IS NULL
-            AND COALESCE(last_error, '') = 'host-lost')
+            AND COALESCE(last_error, '') = 'host-contact-lost')
         OR (lifecycle = 'failed' AND ended_at IS NULL
             AND LOWER(COALESCE(last_error, '')) <> 'create-never-acknowledged'
             AND LOWER(COALESCE(last_error, '')) NOT LIKE '%start-fail%'
@@ -1285,7 +1355,7 @@ pub(crate) fn count_active_lineage_children(
            AND (
                 child.lifecycle NOT IN ('exited', 'failed', 'closed')
                 OR (child.lifecycle = 'exited' AND child.ended_at IS NULL
-                    AND COALESCE(child.last_error, '') = 'host-lost')
+                    AND COALESCE(child.last_error, '') = 'host-contact-lost')
                 OR (child.lifecycle = 'failed' AND child.ended_at IS NULL
                     AND LOWER(COALESCE(child.last_error, '')) <> 'create-never-acknowledged'
                     AND LOWER(COALESCE(child.last_error, '')) NOT LIKE '%start-fail%'
@@ -1334,6 +1404,11 @@ pub struct ContinuationResumeRequest {
     pub origin: String,
     /// UI title for the successor.
     pub title: Option<String>,
+    /// Driver the successor launches, resolved by the handler's resume mode
+    /// (`ResumeMode::driver`) — used for the successor ROW so it never starts
+    /// life stamped with the predecessor's driver waiting for the Node to
+    /// correct it (ma-lineage r7 item 6a).
+    pub driver: String,
 }
 
 /// Payload of the winning continuation transaction.
@@ -1548,7 +1623,7 @@ fn continuation_resume_tx(
             current.host_id,
             current.workspace_id,
             current.kind,
-            current.driver,
+            request.driver,
             connectivity,
             request.title,
             journal_id,
@@ -2293,12 +2368,20 @@ impl Store {
             _join: Arc::new(StoreJoin {
                 thread: Mutex::new(Some(thread)),
             }),
+            #[cfg(any(test, feature = "test-faults"))]
             test_fence_before_queue: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
             test_delete_device_before_queue: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
             test_fence_before_authority: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
             test_fence_before_task_mutate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
             test_gate_cancel_race: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
             test_fence_before_project_patch: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-faults"))]
+            faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
 
@@ -2347,6 +2430,7 @@ impl Store {
     /// cancellations, which land in ma-fence). Used by the initiator suite to
     /// put an instance in the post-fence state without the F machinery.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub async fn test_fence_instance(&self, instance_id: String) -> Result<(), StoreError> {
         self.run_named("test_fence_instance", move |conn| {
             test_apply_fence(conn, &instance_id)
@@ -2356,6 +2440,7 @@ impl Store {
 
     /// Test-only: arm the fence-between-authentication-and-commit seam.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_fence_before_queue(&self, instance_id: String) {
         *self
             .test_fence_before_queue
@@ -2366,6 +2451,7 @@ impl Store {
     /// Test-only: arm the device-deletion-between-authentication-and-commit
     /// seam.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_delete_device_before_queue(&self, device_id: String) {
         *self
             .test_delete_device_before_queue
@@ -2376,6 +2462,7 @@ impl Store {
     /// Test-only: delete one device row (the fence F also removes predecessor
     /// Agent devices).
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub async fn test_delete_device(&self, device_id: String) -> Result<(), StoreError> {
         self.run_named("test_delete_device", move |conn| {
             conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
@@ -2389,6 +2476,7 @@ impl Store {
     /// check — a deterministic F between enqueue/admission and the next
     /// admission. Drained after one fire.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_fence_before_authority_check(&self, instance_id: String) {
         *self
             .test_fence_before_authority
@@ -2398,6 +2486,7 @@ impl Store {
 
     /// Test-only: drain (at most) the armed authority-check fence. Called
     /// inside the claim/admission writer jobs.
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn take_test_authority_fence(&self) -> Option<String> {
         self.test_fence_before_authority
             .lock()
@@ -2408,6 +2497,7 @@ impl Store {
     /// Test-only: arm a fence that the NEXT `mutate_task` writer job applies
     /// immediately before its authority check (task bind post-lease race).
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_fence_before_task_mutate(&self, instance_id: String) {
         *self
             .test_fence_before_task_mutate
@@ -2416,6 +2506,7 @@ impl Store {
     }
 
     /// Test-only: drain (at most) the armed task-mutate fence.
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn take_test_task_mutate_fence(&self) -> Option<String> {
         self.test_fence_before_task_mutate
             .lock()
@@ -2428,6 +2519,7 @@ impl Store {
     /// its own read, reproducing the tick/finish committing between the
     /// handler's pre-read and the writer.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_gate_cancel_race(&self, race: crate::gatequeue::TestGateCancelRace) {
         *self
             .test_gate_cancel_race
@@ -2436,6 +2528,7 @@ impl Store {
     }
 
     /// Test-only: drain (at most) the armed gate-cancel writer race.
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn take_test_gate_cancel_race(
         &self,
     ) -> Option<crate::gatequeue::TestGateCancelRace> {
@@ -2450,6 +2543,7 @@ impl Store {
     /// authority check (atomic project PATCH: doc + route override share one
     /// job, so the fence refuses both).
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_fence_before_project_patch(&self, instance_id: String) {
         *self
             .test_fence_before_project_patch
@@ -2458,6 +2552,7 @@ impl Store {
     }
 
     /// Test-only: drain (at most) the armed project-patch fence.
+    #[cfg(any(test, feature = "test-faults"))]
     pub(crate) fn take_test_project_patch_fence(&self) -> Option<String> {
         self.test_fence_before_project_patch
             .lock()
@@ -3736,6 +3831,8 @@ impl Store {
         host_id: String,
         task_id: String,
     ) -> Result<Vec<WorktreeLeaseRow>, StoreError> {
+        #[cfg(any(test, feature = "test-faults"))]
+        test_faults::lease_lookup_injected_failure(&self.faults)?;
         self.run_named("active_worktree_leases_for_task", move |conn| {
             // Match the task on the decoded array so `task_ids_json` stays an
             // internal detail rather than leaking a JSON1 expression to callers.
@@ -3770,10 +3867,10 @@ impl Store {
     /// Only for instances the Node has abandoned (epoch changed, create never
     /// acknowledged, stop for an instance the Node does not know): the Hub
     /// takes the next seq, which is safe precisely because that Node will never
-    /// emit another observation for the row. The event carries
-    /// `payload.origin = "hub"` so a reader never mistakes it for a Node
-    /// observation. Returns the appended record, or `None` when the instance is
-    /// gone.
+    /// emit another observation for the row. The event carries the envelope
+    /// `origin = "hub"` (and `payload.origin = "hub"`) so a reader, and the
+    /// stale-create reaper, never mistakes it for a Node observation. Returns
+    /// the appended record, or `None` when the instance is gone.
     pub async fn append_hub_diagnostic(
         &self,
         instance_id: String,
@@ -3795,6 +3892,7 @@ impl Store {
                 "seq": seq.to_string(),
                 "instanceId": instance_id,
                 "kind": "lifecycle",
+                "origin": HUB_JOURNAL_ORIGIN,
                 "payload": {
                     "type": "native",
                     "topic": "diagnostic",
@@ -3830,7 +3928,9 @@ impl Store {
     /// per-stream counter record on `api.end`): counters and routing facts
     /// only, never bodies or headers. Same idempotent seq discipline as
     /// [`Self::append_hub_diagnostic`]; returns `None` when the instance is
-    /// unknown or an event with this seq already exists.
+    /// unknown or an event with this seq already exists. The envelope carries
+    /// `origin = "hub"` so the stale-create reaper never reads it as a Node
+    /// acknowledgement of a `requested` row.
     pub async fn append_hub_event(
         &self,
         instance_id: String,
@@ -3852,6 +3952,7 @@ impl Store {
                 "seq": seq.to_string(),
                 "instanceId": instance_id,
                 "kind": kind,
+                "origin": HUB_JOURNAL_ORIGIN,
                 "payload": payload,
             });
             conn.execute(
@@ -3961,10 +4062,24 @@ impl Store {
                     // The node epoch changed: the old process is provably
                     // gone — stamp ended_at so the row releases its seat/
                     // fan-out, preserving the reason as context.
+                    //
+                    // ma-lineage r7 item 4: a chapter that was LIVE when the
+                    // Node restarted gets last_error = `node-epoch-changed`
+                    // UNCONDITIONALLY, even when a stale entity error is still
+                    // on the row (the projection keeps a non-null last_error
+                    // via COALESCE after the chapter returned to ready). The
+                    // web keys its "Node restarted" end reason and Resume
+                    // affordance on that exact spelling, so the old error must
+                    // not leak. Only rows that were ALREADY exited/failed keep
+                    // their existing error (COALESCE).
                     tx.execute(
                         "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                             ended_at = COALESCE(ended_at, ?1),
-                            last_error = CASE WHEN last_error IS NULL THEN ?2 ELSE last_error END,
+                            last_error = CASE
+                                WHEN lifecycle IN ('exited', 'failed')
+                                    THEN COALESCE(last_error, ?2)
+                                ELSE ?2
+                            END,
                             updated_at = ?1
                          WHERE id = ?3",
                         params![&now, &reason, id],
@@ -3986,7 +4101,7 @@ impl Store {
         .await
     }
 
-    /// Expire `requested` instances that never produced a Node receipt.
+    /// Expire `requested` instances the Node never acknowledged.
     ///
     /// A create the Node never acknowledged keeps occupying a placement slot
     /// forever otherwise. Returns `(host_id, instance_id)` for each expiry so
@@ -3995,6 +4110,15 @@ impl Store {
     /// forever otherwise. Returns `(host_id, instance_id)` for each expiry so
     /// the caller can publish a diagnostic, plus the [`Settlement`] (c-cardsettle:
     /// such a row never journaled a card, so it is normally empty).
+    ///
+    /// ma-lineage r7 item 3: the ownership test is "no NODE-AUTHORED journal
+    /// event", NOT `durable_seq = 0`. A continuation successor gets a
+    /// Hub-authored `resumed-from` link (and possibly route observations)
+    /// appended while it is still `requested`, which advances durable_seq
+    /// past zero; gating the sweep on that cursor let such a row live forever
+    /// when its host dropped before the Node acked — holding the
+    /// address-owner seat and fan-out slots and replaying forever. Hub events
+    /// carry the envelope `origin = "hub"` marker and do not count.
     pub async fn expire_stale_requested(
         &self,
         window_ms: u64,
@@ -4004,9 +4128,15 @@ impl Store {
             let now = now_rfc3339();
             let window = window_ms.min(i64::MAX as u64) as i64;
             let mut stmt = tx.prepare(
-                "SELECT id, host_id FROM instances
-                 WHERE lifecycle = 'requested' AND durable_seq = 0 AND
-                    (julianday(?1) - julianday(created_at)) * 86400000 >= ?2",
+                "SELECT i.id, i.host_id FROM instances i
+                 WHERE i.lifecycle = 'requested'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM journal j
+                        WHERE j.instance_id = i.id
+                          AND COALESCE(json_extract(j.payload_json, '$.origin'), 'node')
+                              <> 'hub'
+                   )
+                   AND (julianday(?1) - julianday(i.created_at)) * 86400000 >= ?2",
             )?;
             let stale: Vec<(String, String)> = stmt
                 .query_map(params![&now, window], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -4041,9 +4171,17 @@ impl Store {
     ///
     /// Hub projection only: the row moves to `exited` so the slot is released
     /// and the caller never waits on a receipt that will not arrive. Returns
-    /// whether THIS call made the row terminal plus the [`Settlement`] of the
-    /// cards invalidated in that same change (c-cardsettle: explicit
+    /// whether THIS call changed the row plus the [`Settlement`] of the cards
+    /// invalidated in that same change (c-cardsettle: explicit
     /// stop/kill/delete, or a stop for an instance the Node no longer knows).
+    ///
+    /// ma-lineage r7 item 5(a): the Node reporting the instance unknown is
+    /// process-end evidence even when the row is already `exited`/`failed`,
+    /// so an evidence-less terminal row gets its `ended_at` stamped here too
+    /// (lifecycle and last_error are preserved — the existing terminal
+    /// marker, e.g. the contact-loss marker, stays the context). Without this
+    /// an ambiguous terminal row the Node forgot held its seat/fan-out
+    /// forever and "closing did nothing".
     pub async fn settle_instance_exited(
         &self,
         instance_id: String,
@@ -4053,9 +4191,20 @@ impl Store {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             let changed = tx.execute(
-                "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                    last_error = ?1, updated_at = ?2, ended_at = COALESCE(ended_at, ?2)
-                 WHERE id = ?3 AND lifecycle NOT IN ('exited', 'failed')",
+                "UPDATE instances
+                    SET lifecycle = CASE
+                            WHEN lifecycle IN ('exited', 'failed') THEN lifecycle
+                            ELSE 'exited'
+                        END,
+                        activity = 'idle',
+                        last_error = CASE
+                            WHEN lifecycle IN ('exited', 'failed') THEN last_error
+                            ELSE ?1
+                        END,
+                        updated_at = ?2,
+                        ended_at = COALESCE(ended_at, ?2)
+                 WHERE id = ?3
+                   AND (lifecycle NOT IN ('exited', 'failed') OR ended_at IS NULL)",
                 params![reason, &now, &instance_id],
             )?;
             let mut settlement = Settlement::default();
@@ -4777,11 +4926,13 @@ impl Store {
     ) -> Result<(CommandRecord, bool), StoreError> {
         // Drain the test-only fence seam at enqueue time; it is applied at the
         // top of the writer job below.
+        #[cfg(any(test, feature = "test-faults"))]
         let armed_fence = self
             .test_fence_before_queue
             .lock()
             .expect("fence seam lock")
             .take();
+        #[cfg(any(test, feature = "test-faults"))]
         let armed_device_delete = self
             .test_delete_device_before_queue
             .lock()
@@ -4791,9 +4942,11 @@ impl Store {
             // Test-only seam: a fence armed by the test lands inside THIS
             // writer job, immediately before the authority check — a
             // deterministic F-between-authentication-and-commit.
+            #[cfg(any(test, feature = "test-faults"))]
             if let Some(fenced_instance) = armed_fence {
                 test_apply_fence(conn, &fenced_instance)?;
             }
+            #[cfg(any(test, feature = "test-faults"))]
             if let Some(device_id) = armed_device_delete {
                 conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
             }
@@ -6893,29 +7046,25 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // event (a transition into exited/failed/closed), kept separate from the
     // mutable `updated_at`. Written once by [`stamp_ended_at`].
     ensure_column(&conn, "instances", "ended_at", "TEXT")?;
-    // ma-lineage r4 item 3 + r6 item 7: the ended_at backfill runs ONCE,
-    // guarded by a schema PRAGMA marker, not on every Store::open for every
-    // evidence-less terminal row (that set only grows).
+    // ma-lineage r4 item 3 + r6 item 7 + r7 item 5(e): the ended_at
+    // backfills run ONCE per schema PRAGMA marker, not on every Store::open
+    // for every evidence-less terminal row (that set only grows).
     let backfill_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap_or(0);
     if backfill_version < 2 {
         // r6 item 3(b) ONE-TIME legacy fallback (guarded by PRAGMA
         // user_version): evidence-less historical rows that already reached a
-        // live lifecycle, and old 'host-lost'-marked rows, are stamped from
-        // updated_at — they are genuinely dead historical rows from before
-        // the host-lost-is-contact-loss semantics. The new r6 marker keeps
-        // later host-lost rows potentially-live until a nodeEpoch change.
-        // Rows that never reached live (requested / attested launch failures)
-        // stay NULL. (The journal-event backfill below stays unguarded: it
-        // only ever stamps rows WITH a qualifying end event and must still see
-        // journal events written after an earlier open — r6 item 7.)
+        // live lifecycle, and LEGACY 'host-lost'-marked rows (the pre-r7
+        // marker — genuine ends), are stamped from updated_at. Rows that
+        // never reached live (requested / attested launch failures) stay
+        // NULL.
         conn.execute(
             "UPDATE instances SET ended_at = updated_at
              WHERE ended_at IS NULL
                AND lifecycle IN ('exited', 'failed')
                AND (
-                    last_error = 'host-lost'
+                    last_error = ?1
                     OR (last_error IS NULL
                         AND lifecycle = 'exited'
                         AND EXISTS (
@@ -6925,18 +7074,26 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
                                    '$.payload.state') IN ('ready','running')
                         ))
                )",
-            [],
+            params![LEGACY_HOST_LOST_MARKER],
         )?;
         conn.execute_batch("PRAGMA user_version = 2;")?;
     }
-    // ma-lineage r4 item 3: backfill `ended_at` from durable, classifier-
-    // qualified process-end EVENTS in each row's journal — never blindly from
-    // updated_at. A later return-to-live event after the end vetoes it; a row
-    // with no qualifying event keeps NULL. Idempotent and evidence-only, so it
-    // safely re-runs (it can stamp a journal end written after an earlier
-    // open); only the legacy fallback above is one-time (r6 item 7).
-    backfill_ended_at_from_journal(&conn)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    if backfill_version < 3 {
+        // ma-lineage r4 item 3: backfill `ended_at` from durable,
+        // classifier-qualified process-end EVENTS in each row's journal —
+        // never blindly from updated_at. A later return-to-live event after
+        // the end vetoes it; a row with no qualifying event keeps NULL.
+        //
+        // r7 item 5(e): this runs ONCE (user_version 3), not on every open.
+        // It only ever mattered for rows whose ends arrived before the
+        // projection stamped ended_at live; ends observed after the upgrade
+        // are stamped by apply_ended_at at projection time, so re-running the
+        // journal walk on every open was wasted work over a permanently
+        // growing set.
+        backfill_ended_at_from_journal(&conn)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        conn.execute_batch("PRAGMA user_version = 3;")?;
+    }
     // Rows written before the column existed are each their own lineage.
     conn.execute(
         "UPDATE instances SET lineage_id = id WHERE lineage_id IS NULL",
@@ -7897,7 +8054,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(exited.lifecycle, "exited");
-        assert_eq!(exited.last_error.as_deref(), Some("host-lost"));
+        assert_eq!(exited.last_error.as_deref(), Some("host-contact-lost"));
         assert_eq!(
             store.list_instances(None).await.unwrap().len(),
             1,
@@ -9964,7 +10121,7 @@ mod tests {
         let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
         db.execute(
             "UPDATE instances
-                SET lifecycle='exited', ended_at=NULL, last_error='host-lost'
+                SET lifecycle='exited', ended_at=NULL, last_error='host-contact-lost'
               WHERE id=?1",
             rusqlite::params![host_lost.instance_id],
         )
@@ -10019,6 +10176,397 @@ mod tests {
             );
         }
         store.close().await;
+    }
+
+    /// ma-lineage r7 item 4: on a nodeEpoch change, a chapter that was LIVE
+    /// (but still carries a stale entity error — the projection keeps a
+    /// non-null last_error after a return to ready) is exited with
+    /// `node-epoch-changed`, the exact spelling the web keys its Node-restart
+    /// end reason and Resume affordance on. A row already exited/failed keeps
+    /// its existing error.
+    #[tokio::test]
+    async fn epoch_change_replaces_stale_error_on_formerly_live_rows() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "epoch-staleerror").await;
+
+        let recovered = seed_acknowledged_instance(&store, &host).await;
+        let already_failed = seed_acknowledged_instance(&store, &host).await;
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        // A turn/entity error while the chapter was up, followed by a return
+        // to ready: the projection keeps the old last_error via COALESCE.
+        db.execute(
+            "UPDATE instances SET last_error = 'api-error: 429' WHERE id = ?1",
+            rusqlite::params![recovered.instance_id],
+        )
+        .unwrap();
+        // An evidence-less already-failed row carries the same stale error.
+        db.execute(
+            "UPDATE instances SET lifecycle = 'failed', ended_at = NULL,
+                last_error = 'api-error: 429' WHERE id = ?1",
+            rusqlite::params![already_failed.instance_id],
+        )
+        .unwrap();
+        drop(db);
+
+        store
+            .record_node_epoch(host.clone(), Some("a".into()))
+            .await
+            .unwrap();
+        store
+            .record_node_epoch(host.clone(), Some("b".into()))
+            .await
+            .unwrap();
+        let (lost, _) = store
+            .reconcile_reported_instances(host, vec![], "node-epoch-changed".into(), true)
+            .await
+            .unwrap();
+        assert_eq!(lost.len(), 2);
+
+        let recovered = store
+            .get_instance(recovered.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.lifecycle, "exited");
+        assert_eq!(
+            recovered.last_error.as_deref(),
+            Some("node-epoch-changed"),
+            "a formerly-live row gets the restart reason, not the stale error"
+        );
+        assert!(
+            store
+                .instance_has_process_end_evidence(&recovered)
+                .await
+                .unwrap(),
+            "the epoch end stamps end evidence"
+        );
+
+        let already_failed = store
+            .get_instance(already_failed.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            already_failed.last_error.as_deref(),
+            Some("api-error: 429"),
+            "an already-terminal row keeps its existing error"
+        );
+        store.close().await;
+    }
+
+    /// ma-lineage r7 item 5(c): when a nodeEpoch change ends an unreported live
+    /// holder/child WITH ended_at, the address-owner seat and the parent's
+    /// fan-out slot are released.
+    #[tokio::test]
+    async fn epoch_change_end_releases_seat_and_fan_out_slots() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "epoch-release").await;
+
+        // Seat holder.
+        let holder = seed_acknowledged_instance(&store, &host).await;
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute(
+            "UPDATE instances SET grants_json = '[\"address-owner\"]' WHERE id = ?1",
+            rusqlite::params![holder.instance_id],
+        )
+        .unwrap();
+        // Fan-out family: parent P and live child W.
+        let parent = seed_acknowledged_instance(&store, &host).await;
+        let child = seed_acknowledged_instance(&store, &host).await;
+        let parent_id = parent.instance_id.clone();
+        db.execute(
+            "UPDATE instances SET spec_json = json_object('parentInstanceId', ?2)
+             WHERE id = ?1",
+            rusqlite::params![child.instance_id, parent.instance_id],
+        )
+        .unwrap();
+        drop(db);
+
+        let delegation = InstanceDelegation {
+            grants: vec!["address-owner".to_string()],
+            ..Default::default()
+        };
+        store
+            .run_named("seat-before", {
+                let parent_id = parent_id.clone();
+                let delegation = delegation.clone();
+                move |conn| {
+                    assert!(
+                        enforce_grant_uniqueness(conn, &delegation).is_err(),
+                        "the live holder occupies the seat before the epoch end"
+                    );
+                    assert_eq!(count_active_lineage_children(conn, &parent_id)?, 1);
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+
+        store
+            .record_node_epoch(host.clone(), Some("a".into()))
+            .await
+            .unwrap();
+        store
+            .record_node_epoch(host.clone(), Some("b".into()))
+            .await
+            .unwrap();
+        store
+            .reconcile_reported_instances(host, vec![], "node-epoch-changed".into(), true)
+            .await
+            .unwrap();
+
+        let holder_row = store
+            .get_instance(holder.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .instance_has_process_end_evidence(&holder_row)
+                .await
+                .unwrap(),
+            "the epoch end is process-end evidence"
+        );
+        store
+            .run_named("seat-after", {
+                let parent_id = parent_id.clone();
+                move |conn| {
+                    enforce_grant_uniqueness(conn, &delegation)
+                        .expect("the seat is released after the epoch end");
+                    assert_eq!(
+                        count_active_lineage_children(conn, &parent_id)?,
+                        0,
+                        "the ended child releases the fan-out slot"
+                    );
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        store.close().await;
+    }
+
+    /// ma-lineage r7 item 5(a): settle_instance_exited stamps ended_at on
+    /// evidence-less rows that are ALREADY exited/failed when the Node reports
+    /// the instance unknown, preserving their lifecycle and marker.
+    #[tokio::test]
+    async fn settle_instance_exited_stamps_evidence_less_terminal_rows() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "settle-evidenceless").await;
+        let host_lost = seed_acknowledged_instance(&store, &host).await;
+        let ambiguous = seed_acknowledged_instance(&store, &host).await;
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute(
+            "UPDATE instances SET lifecycle='exited', ended_at=NULL,
+                last_error='host-contact-lost' WHERE id=?1",
+            rusqlite::params![host_lost.instance_id],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE instances SET lifecycle='failed', ended_at=NULL,
+                last_error='api-error: 429' WHERE id=?1",
+            rusqlite::params![ambiguous.instance_id],
+        )
+        .unwrap();
+        drop(db);
+
+        for id in [&host_lost.instance_id, &ambiguous.instance_id] {
+            let (changed, _) = store
+                .settle_instance_exited(id.clone(), "node-lost-instance".into())
+                .await
+                .unwrap();
+            assert!(changed, "the evidence-less terminal row is settled: {id}");
+        }
+        let host_lost_row = store
+            .get_instance(host_lost.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(host_lost_row.lifecycle, "exited");
+        assert_eq!(
+            host_lost_row.last_error.as_deref(),
+            Some("host-contact-lost"),
+            "the existing marker is preserved"
+        );
+        assert!(
+            store
+                .instance_has_process_end_evidence(&host_lost_row)
+                .await
+                .unwrap()
+        );
+        let ambiguous_row = store
+            .get_instance(ambiguous.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ambiguous_row.lifecycle, "failed",
+            "failed is not rewritten to exited"
+        );
+        assert!(
+            store
+                .instance_has_process_end_evidence(&ambiguous_row)
+                .await
+                .unwrap()
+        );
+        // Idempotent: a second settle changes nothing.
+        let (changed_again, _) = store
+            .settle_instance_exited(host_lost.instance_id.clone(), "node-lost-instance".into())
+            .await
+            .unwrap();
+        assert!(!changed_again);
+        store.close().await;
+    }
+
+    /// ma-lineage r7 item 5(b)/(c): the legacy `"host-lost"` marker is an
+    /// ENDED row and gets its ended_at from the one-time user_version
+    /// migration; the NEW `"host-contact-lost"` marker stays potentially live
+    /// (no ended_at) across reopens.
+    #[tokio::test]
+    async fn legacy_host_lost_marker_migrates_but_new_marker_stays_live() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "legacy-hostlost").await;
+        let legacy = seed_instance(&store, &host).await;
+        let new = seed_instance(&store, &host).await;
+        store.close().await;
+
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute(
+            "UPDATE instances SET lifecycle='exited', ended_at=NULL,
+                last_error='host-lost', updated_at='2026-09-01T08:00:00.000Z'
+             WHERE id=?1",
+            rusqlite::params![legacy.instance_id],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE instances SET lifecycle='exited', ended_at=NULL,
+                last_error='host-contact-lost', updated_at='2026-09-01T08:00:00.000Z'
+             WHERE id=?1",
+            rusqlite::params![new.instance_id],
+        )
+        .unwrap();
+        // The new row reached ready once (liveness proof), but no process-END
+        // event: the journal backfill must not stamp it.
+        db.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, 1, 'evt_ready',
+              '{\"kind\":\"lifecycle\",\"payload\":{\"type\":\"entity\",\"entityType\":\"instance\",\"state\":\"ready\"}}',
+              '2026-09-01T07:00:00.000Z')",
+            rusqlite::params![new.instance_id],
+        )
+        .unwrap();
+        db.execute_batch("PRAGMA user_version = 1;").unwrap();
+        drop(db);
+
+        let store = Store::open(dir.path()).expect("store");
+        let ended_at = |id: &str| {
+            let dir = dir.path().to_owned();
+            let id = id.to_owned();
+            async move {
+                let db = rusqlite::Connection::open(dir.join("hub.sqlite")).unwrap();
+                db.query_row(
+                    "SELECT ended_at FROM instances WHERE id=?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            ended_at(&legacy.instance_id).await.as_deref(),
+            Some("2026-09-01T08:00:00.000Z"),
+            "the legacy marker takes its old ended meaning from updated_at"
+        );
+        assert!(
+            ended_at(&new.instance_id).await.is_none(),
+            "the new contact-loss marker stays potentially live"
+        );
+        let version: i64 = {
+            let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+            db.query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version, 3);
+        // Another open changes neither row (one-time migration).
+        store.close().await;
+        let _store = Store::open(dir.path()).expect("store");
+        assert!(ended_at(&new.instance_id).await.is_none());
+        _store.close().await;
+    }
+
+    /// ma-lineage r7 item 5(e): the journal backfill is guarded by
+    /// user_version 3 — after migration it never re-runs on open.
+    #[tokio::test]
+    async fn journal_ended_at_backfill_runs_only_under_user_version_three() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "backfill-guard").await;
+        let instance = seed_instance(&store, &host).await;
+        store.close().await;
+
+        // A post-upgrade terminal row whose end event is only in the journal
+        // (normally impossible: the live projection stamps ended_at as the
+        // event arrives — the point is the reopen must not walk journals).
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute(
+            "UPDATE instances SET lifecycle='exited', ended_at=NULL WHERE id=?1",
+            rusqlite::params![instance.instance_id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, 1, 'evt_end',
+              '{\"kind\":\"lifecycle\",\"observedAt\":\"2026-09-01T08:00:00.000Z\",\"payload\":{\"type\":\"entity\",\"state\":\"exited\"}}',
+              '2026-09-01T08:00:00.000Z')",
+            rusqlite::params![instance.instance_id],
+        )
+        .unwrap();
+        drop(db);
+
+        let _store = Store::open(dir.path()).expect("store");
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        let ended_at: Option<String> = db
+            .query_row(
+                "SELECT ended_at FROM instances WHERE id=?1",
+                rusqlite::params![instance.instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ended_at.is_none(),
+            "the journal backfill does not re-run after user_version 3"
+        );
+        // Rolling the version back to a pre-r7 DB runs it once.
+        drop(db);
+        _store.close().await;
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute_batch("PRAGMA user_version = 2;").unwrap();
+        drop(db);
+        let _store = Store::open(dir.path()).expect("store");
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        let ended_at: Option<String> = db
+            .query_row(
+                "SELECT ended_at FROM instances WHERE id=?1",
+                rusqlite::params![instance.instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ended_at.as_deref(),
+            Some("2026-09-01T08:00:00.000Z"),
+            "the one-time v3 migration backfills from the end event"
+        );
+        drop(db);
+        _store.close().await;
     }
 
     /// ma-lineage r6 item 3(c): the host-lost sweep only touches chapters that
@@ -11219,6 +11767,113 @@ mod tests {
                 .is_empty(),
             "a never-launched instance never raised a card"
         );
+        store.close().await;
+    }
+
+    /// ma-lineage r7 item 3: a `requested` row whose durable_seq advanced
+    /// ONLY through Hub-authored journal events (the continuation successor's
+    /// `resumed-from` link, a route observation) is still reaped: those events
+    /// carry the envelope `origin = "hub"` marker and are not a Node ack.
+    #[tokio::test]
+    async fn stale_requested_row_with_only_hub_authored_events_is_reaped() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r7-hubevents").await;
+        let instance = seed_instance(&store, &host).await;
+        // Hub-authored observation: durable_seq 1, no Node ack.
+        store
+            .append_hub_event(
+                instance.instance_id.clone(),
+                "lifecycle",
+                json!({"type": "apiRoute", "via": "direct"}),
+            )
+            .await
+            .expect("hub event")
+            .expect("appended");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.lifecycle, "requested");
+        assert!(row.durable_seq.parse::<i64>().unwrap() > 0);
+        backdate_instance(&store, &instance.instance_id, 60).await;
+
+        let (expired, _) = store
+            .expire_stale_requested(REQUESTED_SLOT_WINDOW_MS)
+            .await
+            .expect("sweep");
+        assert_eq!(expired, vec![(host, instance.instance_id.clone())]);
+        let row = store
+            .get_instance(instance.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.lifecycle, "failed");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some(CREATE_NEVER_ACKNOWLEDGED_MARKER)
+        );
+        assert!(
+            store
+                .instance_has_process_end_evidence(&row)
+                .await
+                .expect("evidence check"),
+            "an attested launch failure is process-end evidence"
+        );
+        store.close().await;
+    }
+
+    /// ma-lineage r7 item 3: a `requested` row the Node HAS journaled to —
+    /// even a non-lifecycle observation that leaves it `requested` — is owned
+    /// by the Node and must never be reaped as create-never-acknowledged.
+    #[tokio::test]
+    async fn requested_row_with_a_node_authored_event_is_not_reaped() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r7-nodeevent").await;
+        let instance = seed_instance(&store, &host).await;
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "message",
+                    "payload": {
+                        "role": "user", "origin": "user", "direction": "inbound", "text": "hi"
+                    }
+                }),
+            )
+            .await
+            .expect("node event");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.lifecycle, "requested",
+            "a non-lifecycle node event leaves the row requested"
+        );
+        backdate_instance(&store, &instance.instance_id, 60).await;
+
+        let (expired, _) = store
+            .expire_stale_requested(REQUESTED_SLOT_WINDOW_MS)
+            .await
+            .expect("sweep");
+        assert!(
+            expired.is_empty(),
+            "a Node-observed requested row is not reaped"
+        );
+        let row = store
+            .get_instance(instance.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.lifecycle, "requested");
         store.close().await;
     }
 
@@ -12494,6 +13149,7 @@ pub(crate) fn check_initiator(
 /// the chapter fenced and bumps its lineage's live generation into `paused`.
 /// The cancellations and device deletions of the real F land in ma-fence.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
 pub(crate) fn test_apply_fence(conn: &Connection, instance_id: &str) -> Result<(), StoreError> {
     let now = now_rfc3339();
     conn.execute(
@@ -12796,11 +13452,33 @@ fn stamp_ended_at(conn: &Connection, instance_id: &str, at: &str) -> Result<(), 
 /// end (D-019: the process keeps running and is reconciled when the host
 /// returns): such an `exited` row is treated as potentially live until it
 /// carries a real `ended_at`.
+///
+/// ma-lineage r7 item 5(b): this is a NEW, distinct marker, NOT the legacy
+/// `"host-lost"` string. Legacy rows stamped before contact-loss semantics
+/// keep their old ENDED meaning — [`lifecycle_has_process_end_evidence`]
+/// treats only THIS marker as potentially live, and the user_version
+/// migration stamps `ended_at` on rows carrying the legacy spelling.
+///
 /// The exact `last_error` marker the stale-create sweep stamps when a create
 /// is never acknowledged by the node. Attests the launch never started.
 pub(crate) const CREATE_NEVER_ACKNOWLEDGED_MARKER: &str = "create-never-acknowledged";
 
-pub(crate) const HOST_LOST_MARKER: &str = "host-lost";
+pub(crate) const HOST_LOST_MARKER: &str = "host-contact-lost";
+
+/// The legacy host-loss marker, stamped by code before contact-loss
+/// semantics (ma-lineage r7 item 5(b)): such a row means a genuine end. The
+/// migration stamps `ended_at` on evidence-less rows carrying this spelling.
+pub(crate) const LEGACY_HOST_LOST_MARKER: &str = "host-lost";
+
+/// Top-level envelope `origin` value stamped on every Hub-AUTHORED journal
+/// event (diagnostics, route observations, resume links, Hub-composed
+/// messages). A Node-emitted event never carries this field. The stale-create
+/// reaper treats a `requested` row as Node-acknowledged only once it has a
+/// journal event whose envelope origin is NOT this value: Hub events
+/// (notably the successor's `resumed-from` link, appended before the Node
+/// ever sees the create) advance `durable_seq` without being an ack
+/// (ma-lineage r7 item 3).
+pub(crate) const HUB_JOURNAL_ORIGIN: &str = "hub";
 
 /// `last_error` markers that ATTEST a launch never started even when an older
 /// row has no `ended_at` yet (ma-lineage r4 item 1).

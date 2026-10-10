@@ -724,8 +724,10 @@ impl Store {
     where
         F: FnOnce(&mut Project) -> Result<(), StoreError> + Send + 'static,
     {
+        #[cfg(any(test, feature = "test-faults"))]
         let armed_fence = self.take_test_project_patch_fence();
         self.run_named("patch_project_with_route", move |conn| {
+            #[cfg(any(test, feature = "test-faults"))]
             if let Some(fenced_instance) = armed_fence {
                 crate::store::test_apply_fence(conn, &fenced_instance)?;
             }

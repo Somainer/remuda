@@ -100,19 +100,37 @@ impl FakeNode {
         host: &str,
         bearer: &str,
     ) -> Result<(Self, Option<String>)> {
+        Self::connect_bearer_hello(hub, host, bearer, json!({})).await
+    }
+
+    /// Like [`Self::connect_bearer`] but merges `extra` into the hello
+    /// params — e.g. `nodeEpoch` + an `instances` inventory that drives the
+    /// node-restart reconcile (ma-lineage r7 item 5c).
+    async fn connect_bearer_hello(
+        hub: &remuda_hub::RunningHub,
+        host: &str,
+        bearer: &str,
+        extra: Value,
+    ) -> Result<(Self, Option<String>)> {
         let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
         request
             .headers_mut()
             .insert("Authorization", format!("Bearer {bearer}").parse()?);
         let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
+        let mut params = json!({ "hostId": host, "host": {
+            "hostname":"lineage-node", "workspaces":[], "workspaceRevision":0,
+            "herdr":{"path":"/usr/bin/herdr"},
+            "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged_in"}]
+        }});
+        if let (Some(object), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
         node.send(Message::Text(
             json!({
                 "jsonrpc":"2.0", "id":"hello", "method":"node.hello",
-                "params": { "hostId": host, "host": {
-                    "hostname":"lineage-node", "workspaces":[], "workspaceRevision":0,
-                    "herdr":{"path":"/usr/bin/herdr"},
-                    "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged_in"}]
-                }}
+                "params": params
             })
             .to_string()
             .into(),
@@ -179,6 +197,19 @@ impl FakeNode {
         bearer: &str,
     ) -> Result<Self> {
         Ok(Self::connect_bearer(hub, host, bearer).await?.0)
+    }
+
+    /// Reconnect with a persistent token and extra hello params (a new
+    /// `nodeEpoch` + inventory to trigger the node-restart reconcile).
+    async fn connect_with_token_hello(
+        hub: &remuda_hub::RunningHub,
+        host: &str,
+        bearer: &str,
+        extra: Value,
+    ) -> Result<Self> {
+        Ok(Self::connect_bearer_hello(hub, host, bearer, extra)
+            .await?
+            .0)
     }
 
     /// Fresh enrollment (new host): enrolls and returns the persistent
@@ -365,11 +396,15 @@ impl Ctx {
     }
 
     async fn resume(&self, id: &str, token: &str) -> Result<reqwest::Response> {
+        self.resume_mode(id, token, "structured").await
+    }
+
+    async fn resume_mode(&self, id: &str, token: &str, mode: &str) -> Result<reqwest::Response> {
         Ok(self
             .http
             .post(format!("{}/v1/instances/{id}/resume", self.base()))
             .bearer_auth(token)
-            .json(&json!({"mode":"structured"}))
+            .json(&json!({ "mode": mode }))
             .send()
             .await?)
     }
@@ -935,6 +970,9 @@ async fn chapter_ended_at_is_the_real_end_event_and_never_tracks_updated_at() ->
              WHERE id = ?1",
             rusqlite::params![x],
         )?;
+        // Simulate a pre-r7 database: the journal backfill is the user_version
+        // 3 one-time migration.
+        db.execute_batch("PRAGMA user_version = 2;")?;
         // Append a later DIAGNOSTIC event (after the exit): it is neither
         // process end nor return-to-live, so the earlier exit must survive.
         db.execute(
@@ -993,6 +1031,9 @@ async fn ended_at_backfill_skips_an_end_followed_by_return_to_live() -> Result<(
     hub.shutdown().await;
     {
         let db = rusqlite::Connection::open(&db_path)?;
+        // Simulate a pre-r7 database so the reopen runs the one-time journal
+        // backfill (user_version 3).
+        db.execute_batch("PRAGMA user_version = 2;")?;
         // Wipe both ended_at and append a LATER ready to x's journal.
         db.execute("UPDATE instances SET ended_at = NULL", rusqlite::params![])?;
         db.execute(
@@ -1053,7 +1094,7 @@ async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -
     assert_eq!(changed, 1, "the seat's row is host-lost");
     let row = ctx.get_instance(&x, &ctx.human).await?;
     assert_eq!(row["lifecycle"], json!("exited"), "{row}");
-    assert_eq!(row["lastError"], json!("host-lost"), "{row}");
+    assert_eq!(row["lastError"], json!("host-contact-lost"), "{row}");
     assert_eq!(
         first_chapter_ended_at(&ctx, &x).await?,
         None,
@@ -1097,7 +1138,9 @@ async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -
 #[tokio::test]
 async fn a_resume_after_a_host_lost_current_chapter_runs_continuation_not_replay() -> Result<()> {
     let ctx = Ctx::boot().await?;
-    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let node_token = node_token.context("node token")?;
     let (x, _token) = ctx.seat(&mut node, None).await?;
     ctx.report_session(&node, &x, true).await?;
 
@@ -1113,26 +1156,18 @@ async fn a_resume_after_a_host_lost_current_chapter_runs_continuation_not_replay
     assert_eq!(method, "instance.resume");
     // Y reaches a live lifecycle (the Node launches and initializes it).
     ctx.report_session(&node, &y, false).await?;
-    {
-        let db = rusqlite::Connection::open(&ctx.db_path)?;
-        db.execute(
-            "UPDATE hosts SET state = 'unreachable', offline_since = '2000-01-01T00:00:00Z'
-             WHERE id = ?1",
-            rusqlite::params![ctx.host],
-        )?;
-    }
+
+    // ma-lineage r7 item 6(b): drop the actual node link instead of flipping
+    // hosts.state in SQLite while the socket stays connected.
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
     let (changed, _) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
     assert_eq!(changed, 1, "Y is host-lost");
 
-    // Bring the node back (same host link; resume endpoint tolerates this via
-    // the continuation's own checks when the link is live in the test).
-    {
-        let db = rusqlite::Connection::open(&ctx.db_path)?;
-        db.execute(
-            "UPDATE hosts SET state = 'online', offline_since = NULL WHERE id = ?1",
-            rusqlite::params![ctx.host],
-        )?;
-    }
+    // Reconnect with the persistent node token on the SAME epoch: Y stays the
+    // ambiguous (potentially live) host-lost chapter.
+    let mut node = FakeNode::connect_with_token(&ctx.hub, &ctx.host, &node_token).await?;
 
     // Resume addressed to the OLD chapter X while the CURRENT chapter Y is
     // host-lost: continuation, not a {replayed} dead Y.
@@ -1154,8 +1189,9 @@ async fn a_resume_after_a_host_lost_current_chapter_runs_continuation_not_replay
     let (method, _) = node.next_frame().await?;
     assert_eq!(method, "instance.resume");
 
-    // Repeating the resume addresses the new current Z (live): an idempotent
-    // replay is correct here, and it must not send more close frames.
+    // Repeating the resume addresses the new current Z (requested until the
+    // node acks): an idempotent replay is correct here, and it must not send
+    // more close frames.
     let replay = ctx.resume(&x, &ctx.human).await?.error_for_status()?;
     assert_eq!(replay.status(), 200);
     let body: Value = replay.json().await?;
@@ -2174,6 +2210,323 @@ async fn a_swept_never_acknowledged_create_with_the_real_marker_recovers_fresh()
     Ok(())
 }
 
+/// ma-lineage r7 item 3: a continuation successor Y is still `requested` when
+/// its host drops before the Node acks. Its durable_seq is already 1 from the
+/// Hub-authored `resumed-from` link, so the stale-create sweep used to skip
+/// it forever. The host-lost sweep must leave the requested row alone; the
+/// stale-create sweep then reaps it (failed / create-never-acknowledged),
+/// after which a resume continues the lineage instead of replaying dead Y.
+#[tokio::test]
+async fn a_requested_successor_with_only_the_hub_resume_link_is_reaped_then_continued() -> Result<()>
+{
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let node_token = node_token.context("node token")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    // Continue X → Y. The Node never acknowledges Y (no journal from it).
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+
+    // Y's durable cursor advanced ONLY because the Hub journaled the
+    // resumed-from link; Y is still requested.
+    let y_view = ctx.wait_seq_advances(&y, "0").await?;
+    assert_eq!(
+        y_view["lifecycle"],
+        json!("requested"),
+        "the successor is requested with a Hub-authored journal event only"
+    );
+
+    // Host drops before the Node acks.
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
+    let (swept, _) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
+    assert_eq!(
+        swept, 1,
+        "the host-lost sweep ends the live predecessor X only"
+    );
+    let (expired, _) = ctx
+        .hub
+        .store()
+        .expect("store")
+        .expire_stale_requested(0)
+        .await?;
+    assert!(
+        expired.iter().any(|(_host, id)| id == &y),
+        "the requested successor is reaped despite durable_seq > 0: {expired:?}"
+    );
+    let y_view = ctx.get_instance(&y, &ctx.human).await?;
+    assert_eq!(y_view["lifecycle"], json!("failed"));
+    assert_eq!(
+        y_view["lastError"],
+        json!("create-never-acknowledged"),
+        "the row keeps its attested launch-failure marker"
+    );
+    let ended_at: Option<String> = {
+        let db = rusqlite::Connection::open(&ctx.db_path)?;
+        db.query_row(
+            "SELECT ended_at FROM instances WHERE id = ?1",
+            rusqlite::params![y],
+            |row| row.get(0),
+        )?
+    };
+    assert!(
+        ended_at.is_some(),
+        "the reaped row carries process-end evidence"
+    );
+
+    // Reconnect: a resume addressed to the older chapter X (or the lineage
+    // id) must CONTINUE — a new chapter, instance.resume — never replay the
+    // dead requested-then-failed Y forever.
+    let mut node = FakeNode::connect_with_token(&ctx.hub, &ctx.host, &node_token).await?;
+    let response = ctx.resume(&x, &ctx.human).await?.error_for_status()?;
+    let third: Value = response.json().await?;
+    assert_ne!(third["replayed"], json!(true), "dead Y is not replayed");
+    let z = third["instance"]["instanceId"].as_str().unwrap().to_owned();
+    assert_ne!(z, y);
+    assert_eq!(third["instance"]["generation"], json!(3));
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume", "Z resumes the known session");
+    assert_eq!(params["spec"]["resumeSessionId"], json!(SESSION));
+    Ok(())
+}
+
+/// ma-lineage r7 item 3: once the requested-then-reaped successor is failed
+/// with the launch-failure marker, it releases the address-owner seat so a
+/// replacement holder can be created.
+#[tokio::test]
+async fn a_reaped_requested_successor_releases_the_address_owner_seat() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let node_token = node_token.context("node token")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    ctx.wait_seq_advances(&y, "0").await?;
+
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
+    ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
+    let (expired, _) = ctx
+        .hub
+        .store()
+        .expect("store")
+        .expire_stale_requested(0)
+        .await?;
+    assert!(expired.iter().any(|(_host, id)| id == &y));
+
+    let _node = FakeNode::connect_with_token(&ctx.hub, &ctx.host, &node_token).await?;
+    let second = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-pty",
+            "grants": ["address-owner"], "prompt": "replacement seat"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        second.status(),
+        200,
+        "the reaped successor no longer holds the address-owner seat"
+    );
+    Ok(())
+}
+
+/// ma-lineage r7 item 5(c): a nodeEpoch change ends an unreported live holder
+/// WITH process-end evidence, so the address-owner seat is released and a
+/// replacement holder can be created (HTTP-level proof).
+#[tokio::test]
+async fn an_epoch_change_end_releases_the_address_owner_seat_end_to_end() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer_hello(
+        &ctx.hub,
+        &ctx.host,
+        &enroll,
+        json!({"nodeEpoch": "epoch-1"}),
+    )
+    .await?;
+    let node_token = node_token.context("node token")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
+
+    // Reconnect under a NEW epoch with an attested empty inventory: the Node
+    // holds nothing, so X ends with node-epoch-changed + endedAt.
+    let mut node = FakeNode::connect_with_token_hello(
+        &ctx.hub,
+        &ctx.host,
+        &node_token,
+        json!({"nodeEpoch": "epoch-2", "instances": [], "instanceStoreFound": true}),
+    )
+    .await?;
+    ctx.wait_until(&x, |view| {
+        view["lifecycle"] == json!("exited") && view["lastError"] == json!("node-epoch-changed")
+    })
+    .await?;
+
+    // The seat is free: a second address-owner holder is accepted and
+    // launched.
+    let second = ctx
+        .http
+        .post(format!("{}/v1/instances", ctx.base()))
+        .bearer_auth(&ctx.human)
+        .json(&json!({
+            "hostId": ctx.host, "kind": "claude", "driver": "claude-pty",
+            "grants": ["address-owner"], "prompt": "replacement seat"
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        second.status(),
+        200,
+        "the epoch-ended holder released the seat"
+    );
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.create");
+    Ok(())
+}
+
+/// ma-lineage r7 item 5(d): a chapter that is terminal WITHOUT process-end
+/// evidence (the host-lost contact-loss marker) derives host-offline while its
+/// host link is down, and starting once the link is live again.
+#[tokio::test]
+async fn an_evidence_less_terminal_chapter_derives_host_offline_then_starting() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) =
+        FakeNode::connect_bearer_hello(&ctx.hub, &ctx.host, &enroll, json!({})).await?;
+    let node_token = node_token.context("node token")?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
+    let (swept, _) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
+    assert_eq!(swept, 1);
+
+    let lineage_state = || async {
+        let lineage: Value = ctx
+            .http
+            .get(format!("{}/v1/lineages/{x}", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::Ok(lineage["state"].as_str().unwrap().to_owned())
+    };
+    assert_eq!(
+        lineage_state().await?,
+        "host-offline",
+        "an evidence-less terminal chapter on a down host derives host-offline"
+    );
+
+    // Same epoch, same token: no epoch change, link live — the ambiguous
+    // chapter reads as starting, not as a genuine running/ended session.
+    let _node = FakeNode::connect_with_token(&ctx.hub, &ctx.host, &node_token).await?;
+    assert_eq!(lineage_state().await?, "starting");
+    Ok(())
+}
+
+/// ma-lineage r7 item 5(d): a `{mode:"terminal"}` continuation of a
+/// claude-sdk session launches claude-pty and keeps the resume session id —
+/// the requested mode's driver is honoured, not the structured default.
+#[tokio::test]
+async fn a_terminal_mode_continuation_launches_claude_pty_with_the_session() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, false).await?;
+
+    let response = ctx.resume_mode(&x, &ctx.human, "terminal").await?;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await?;
+    assert_eq!(body["replayed"], json!(false));
+
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close", "the live predecessor is closed");
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    assert_eq!(
+        params["spec"]["driver"],
+        json!("claude-pty"),
+        "terminal mode maps the successor to claude-pty"
+    );
+    assert_eq!(
+        params["spec"]["resumeSessionId"],
+        json!(SESSION),
+        "the native session is resumed, not relaunched blank"
+    );
+    Ok(())
+}
+
+/// ma-lineage r7 item 6(a): a `{mode:"terminal"}` continuation that takes the
+/// FRESH path (the chapter ended without ever reporting a native session)
+/// launches claude-pty — both in the queued create spec and on the successor
+/// ROW — not the predecessor's claude-sdk driver.
+#[tokio::test]
+async fn a_terminal_mode_fresh_recovery_launches_claude_pty() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // Deliberately report NO session: just a real process-end entity event.
+    node.appends.send((x.clone(), exited()))?;
+    ctx.wait_until(&x, |view| view["lifecycle"] == json!("exited"))
+        .await?;
+
+    let response = ctx.resume_mode(&x, &ctx.human, "terminal").await?;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await?;
+    assert_eq!(
+        body["instance"]["driver"],
+        json!("claude-pty"),
+        "the successor row is stamped with the mode-mapped driver immediately"
+    );
+
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.create", "no session means a fresh launch");
+    assert_eq!(params["spec"]["driver"], json!("claude-pty"));
+    assert!(
+        params["spec"]
+            .get("resumeSessionId")
+            .is_none_or(|v| v.is_null()),
+        "fresh recovery carries no resume session id"
+    );
+    Ok(())
+}
+
 /// r3 item 4: an immediate retry of a sessionless fresh recovery returns the
 /// SAME successor (replayed) before the successor reports a session — no new
 /// generation and no extra command.
@@ -2391,6 +2744,7 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             prompt: None,
             origin: "human".to_owned(),
             title: None,
+            driver: "claude-sdk".to_owned(),
         };
         store1.continuation_resume(req).await
     });
@@ -2419,6 +2773,7 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             prompt: None,
             origin: "human".to_owned(),
             title: None,
+            driver: "claude-sdk".to_owned(),
         };
         store2.continuation_resume(req).await
     });
@@ -3449,5 +3804,374 @@ async fn an_existing_grant_holder_gets_a_backfilled_lineage_and_then_resumes_as_
     let (method, params) = node.next_frame().await?;
     assert_eq!(method, "instance.resume");
     assert_eq!(params["spec"]["resumeSessionId"], json!(SESSION));
+    Ok(())
+}
+
+/// A Node whose `instance.purge` RPC replies stay parked until the test opens
+/// the gate — the deterministic interleave point for a continuation arriving
+/// while a whole-lineage delete is purging (r8 item 2).
+struct GatedNode {
+    frames: tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
+    release: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for GatedNode {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl GatedNode {
+    async fn connect(hub: &remuda_hub::RunningHub, host: &str, token: &str) -> Result<Self> {
+        let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse()?);
+        let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
+        node.send(Message::Text(
+            json!({
+                "jsonrpc":"2.0", "id":"hello", "method":"node.hello",
+                "params":{"hostId":host,"host":{
+                    "hostname":"lineage-gated","workspaces":[],"workspaceRevision":0,
+                    "herdr":{"path":"/usr/bin/herdr"},
+                    "cli":[{"kind":"claude","path":"/usr/bin/claude","auth":"logged_in"}]
+                }}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        let hello_text = node.next().await.context("hello")??.into_text()?;
+        let hello: Value = serde_json::from_str(&hello_text)?;
+        assert!(hello.get("result").is_some(), "hello failed: {hello}");
+
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release, mut released) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                let frame = node.next();
+                tokio::select! {
+                    frame = frame => match frame {
+                        Some(Ok(Message::Text(text))) => {
+                            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                                continue;
+                            };
+                            let Some(method) = frame["method"].as_str() else {
+                                continue;
+                            };
+                            if frame_tx.send((method.to_owned(), frame["params"].clone())).is_err() {
+                                break;
+                            }
+                            // Park purge replies until the test opens the gate.
+                            if method == "instance.purge" {
+                                let _ = released.wait_for(|open| *open).await;
+                            }
+                            if node.send(Message::Text(json!({
+                                "jsonrpc":"2.0","id":frame["id"],
+                                "result":{"purged":true}
+                            }).to_string().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(_)) | Some(Err(_)) => {}
+                    },
+                }
+            }
+        });
+        Ok(Self {
+            frames: frame_rx,
+            release,
+            task,
+        })
+    }
+
+    async fn next_frame(&mut self) -> Result<(String, Value)> {
+        tokio::time::timeout(Duration::from_secs(5), self.frames.recv())
+            .await?
+            .context("frame")
+    }
+}
+
+/// r8 item 2: a continuation resume landing WHILE the lineage delete is in
+/// its purge loop can no longer race the store delete. The Hub rows are
+/// removed (re-check included) BEFORE the first purge RPC, so the resume sees
+/// a gone lineage (404) and the delete completes 200 — no 409-after-purge,
+/// no false/duplicate audit.
+#[tokio::test]
+async fn resume_during_the_purge_loop_finds_the_lineage_already_gone() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut setup, _token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let (x, _) = ctx.seat(&mut setup, None).await?;
+    // X terminal, then continue to Y; bring Y to exited as well, so the
+    // whole-lineage delete is a no-force, no-stop delete of two terminal
+    // chapters and the first side effect is the X purge.
+    ctx.report_session(&setup, &x, true).await?;
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = setup.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    ctx.report_session(&setup, &y, true).await?;
+    setup.disconnect().await;
+
+    let mut node = GatedNode::connect(&ctx.hub, &ctx.host, &_token.expect("node token")).await?;
+
+    let delete = {
+        let http = ctx.http.clone();
+        let base = ctx.base();
+        let human = ctx.human.clone();
+        let y = y.clone();
+        tokio::spawn(async move {
+            http.delete(format!("{base}/v1/instances/{y}"))
+                .bearer_auth(human)
+                .send()
+                .await
+        })
+    };
+
+    // The delete reaches the purge loop ONLY after the store delete
+    // committed (r8 item 2). Wait until the first purge is parked.
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.purge");
+    let purged_first = params["instanceId"].as_str().unwrap().to_owned();
+    assert!(
+        purged_first == x || purged_first == y,
+        "unexpected purge target {purged_first}"
+    );
+
+    // A continuation of Y landing now finds the lineage gone.
+    let raced = ctx.resume(&y, &ctx.human).await?;
+    assert_eq!(
+        raced.status(),
+        404,
+        "the lineage rows are already deleted; a mid-purge resume cannot append a successor"
+    );
+
+    node.release.send(true).ok();
+    let deleted = delete.await??.error_for_status()?;
+    let body: Value = deleted.json().await?;
+    assert_eq!(body["deleted"], json!(true));
+    let chapters = body["chapterIds"].as_array().unwrap();
+    assert_eq!(chapters.len(), 2, "both chapters were purged: {body}");
+
+    // The purge loop then drives the second chapter's purge.
+    let (method, _) = tokio::time::timeout(Duration::from_secs(5), node.frames.recv())
+        .await?
+        .context("second purge frame")?;
+    assert_eq!(method, "instance.purge");
+
+    // One audit row, recorded for the successful delete only — and r9 item
+    // 2: it is appended AFTER the purge loop with nodePurge and
+    // chapterPurges naming the gated chapter's outcome.
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    let audits: i64 = db.query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'instance.delete'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        audits, 1,
+        "exactly one delete audit: no refused-attempt row"
+    );
+    let detail: String = db.query_row(
+        "SELECT detail_json FROM audit_log WHERE action = 'instance.delete'",
+        [],
+        |row| row.get(0),
+    )?;
+    let detail: Value = serde_json::from_str(&detail)?;
+    assert!(
+        detail["nodePurge"].is_string(),
+        "the audit carries the addressed chapter's nodePurge: {detail}"
+    );
+    let purges = detail["chapterPurges"]
+        .as_object()
+        .expect("chapterPurges object on the audit row");
+    assert_eq!(
+        purges.len(),
+        2,
+        "every chapter's purge outcome is audited: {detail}"
+    );
+    for id in [x.as_str(), y.as_str()] {
+        let outcome = purges.get(id).and_then(Value::as_str).unwrap_or("missing");
+        assert_eq!(
+            outcome, "purged",
+            "the gated chapter {id} finished its purge and that outcome is audited, got {outcome}"
+        );
+    }
+    Ok(())
+}
+
+/// r8 item 3: the addressed chapter is already terminal while ANOTHER chapter
+/// of the lineage is still live. The refusal names the live chapters and is
+/// the same with or without force — the old "stop it first or retry with
+/// ?force=1" message led to a force request that 409ed anyway.
+#[tokio::test]
+async fn deleting_a_terminal_current_chapter_with_a_live_predecessor_names_the_live_chapters()
+-> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // X stays LIVE.
+    ctx.report_session(&node, &x, false).await?;
+    // Continue X → Y while X is still running.
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.close");
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    // Y (the addressed, current chapter) becomes terminal; X stays live.
+    ctx.report_session(&node, &y, true).await?;
+
+    for force in ["", "?force=1"] {
+        let response = ctx
+            .http
+            .delete(format!("{}/v1/instances/{y}{force}", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 409, "force={force:?} still refuses");
+        let text = response.text().await?;
+        assert!(
+            text.contains("chapter(s) still live") && text.contains(&x),
+            "the refusal names the live predecessor, got: {text}"
+        );
+        assert!(
+            !text.contains("stop it first"),
+            "a terminal addressed chapter must not be told to stop itself: {text}"
+        );
+    }
+    assert!(
+        node.has_no_pending_frames().await,
+        "the refusal runs no stop/return/purge side effects"
+    );
+    // Both rows survive.
+    assert!(ctx.get_instance(&x, &ctx.human).await?.is_object());
+    assert!(ctx.get_instance(&y, &ctx.human).await?.is_object());
+    Ok(())
+}
+
+/// r9 item 1: after the lineage delete has committed, a Store failure on a
+/// post-commit best-effort step (here the worktree-lease lookup) must NOT
+/// turn into a 500 that skips the remaining worktree returns and the
+/// per-chapter instance.purge RPCs — a retry would only get 404, leaving
+/// the Nodes' data directories orphaned forever (the Hub has no
+/// purge-on-reconnect). The response stays 200 and EVERY chapter's purge
+/// still reaches the Node.
+#[tokio::test]
+async fn a_post_commit_lease_lookup_failure_still_purges_every_chapter_and_returns_200()
+-> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    ctx.report_session(&node, &x, true).await?;
+
+    // Continue X → Y (X terminal); both chapters go in the whole-lineage
+    // delete.
+    let first: Value = ctx
+        .resume(&x, &ctx.human)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let y = first["instance"]["instanceId"].as_str().unwrap().to_owned();
+    let (method, _) = node.next_frame().await?;
+    assert_eq!(method, "instance.resume");
+    ctx.report_session(&node, &y, true).await?;
+
+    // Give both chapters a task so the post-delete worktree-lease lookup
+    // actually runs for them.
+    let db = rusqlite::Connection::open(&ctx.db_path)?;
+    db.execute(
+        "UPDATE instances SET task_id = 'r9-fault-task' WHERE id IN (?1, ?2)",
+        rusqlite::params![x, y],
+    )?;
+    drop(db);
+
+    // Arm the post-commit fault BEFORE the delete: the committed delete
+    // still succeeds, the lease lookup then errors, and the handler must log
+    // and continue into the purge loop.
+    let _fault = remuda_hub::store_test_support::arm_lease_lookup_failure(
+        ctx.hub.store().expect("hub store"),
+    );
+    // Prove the seam itself fires: without this, an empty success and an
+    // injected failure would look identical to the delete handler.
+    let fault_fired = ctx
+        .hub
+        .store()
+        .expect("hub store")
+        .active_worktree_leases_for_task(ctx.host.clone(), "r9-fault-task".to_owned())
+        .await;
+    assert!(
+        fault_fired.is_err(),
+        "the injected lease-lookup fault must fire, got {fault_fired:?}"
+    );
+    let response = ctx
+        .http
+        .delete(format!("{}/v1/instances/{}", ctx.base(), y))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await?;
+    assert_eq!(
+        response.status(),
+        200,
+        "a post-commit store failure never becomes 500: {:?}",
+        response.text().await
+    );
+    let body: Value = response.json().await?;
+    let purged = body["chapterPurges"]
+        .as_object()
+        .expect("chapterPurges map");
+    assert_eq!(
+        purged.len(),
+        2,
+        "both chapters purged despite the fault: {body}"
+    );
+    for id in [&x, &y] {
+        assert_eq!(
+            purged.get(id.as_str()).and_then(Value::as_str),
+            Some("purged"),
+            "chapter {id} missing its purge outcome"
+        );
+    }
+
+    // Both purge RPCs reached the Node in order.
+    let mut purged_ids = Vec::new();
+    for _ in 0..2 {
+        let (method, params) = node.next_frame().await?;
+        assert_eq!(method, "instance.purge");
+        purged_ids.push(params["instanceId"].as_str().unwrap().to_owned());
+    }
+    purged_ids.sort();
+    let mut want = vec![x.clone(), y.clone()];
+    want.sort();
+    assert_eq!(
+        purged_ids, want,
+        "the lease-lookup failure skipped no purges"
+    );
+
+    // The rows are gone; a retry is the idempotent 404.
+    for id in [&x, &y] {
+        let status = ctx
+            .http
+            .get(format!("{}/v1/instances/{id}", ctx.base()))
+            .bearer_auth(&ctx.human)
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, 404, "deleted chapter {id} is gone");
+    }
     Ok(())
 }

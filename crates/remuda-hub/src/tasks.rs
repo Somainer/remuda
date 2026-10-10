@@ -1575,8 +1575,10 @@ impl Store {
         F: FnOnce(&mut Task, &mut Connection) -> Result<(), StoreError> + Send + 'static,
     {
         let task_id = task_id.clone();
+        #[cfg(any(test, feature = "test-faults"))]
         let armed_fence = self.take_test_task_mutate_fence();
         self.run_named("mutate_task", move |conn| {
+            #[cfg(any(test, feature = "test-faults"))]
             if let Some(fenced_instance) = armed_fence {
                 crate::store::test_apply_fence(conn, &fenced_instance)?;
             }

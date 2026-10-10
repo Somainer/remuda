@@ -135,8 +135,10 @@ impl Store {
         let subject = subject.clone();
         let check_initiator = auth.initiator.clone();
         // Test-only seam: fence lands inside this writer job.
+        #[cfg(any(test, feature = "test-faults"))]
         let armed_fence = self.take_test_authority_fence();
         self.run_named("admit_node_op", move |conn| {
+            #[cfg(any(test, feature = "test-faults"))]
             if let Some(fenced_instance) = armed_fence {
                 crate::store::test_apply_fence(conn, &fenced_instance)?;
             }

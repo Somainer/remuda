@@ -1161,6 +1161,166 @@ async fn host_loss_sweep_keeps_cards_and_revives_a_live_inventory_row_on_reconne
     Ok(())
 }
 
+/// r10 item 1 (OA6): after the contact-loss sweep marks a still-running row
+/// exited/host-contact-lost (no `ended_at`, cards pending), a NEW Node epoch
+/// whose inventory LISTS the instance live — here a herdr-adopted chapter
+/// reported `starting`, which is NOT the ready/running pair the old
+/// live_inventory_entries accepted — revives the row and leaves the card
+/// pending. Before the fix revival ran only on the same-epoch branch and only
+/// for ready/running entries, so the new epoch left a live process's approval
+/// born dead.
+#[tokio::test]
+async fn new_epoch_inventory_revives_a_swept_live_instance_without_settling_its_card() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+
+    let (instance_id, card) = seed_live_card(
+        addr,
+        &cookie,
+        &node,
+        &host_id,
+        "cardsettle r10 new-epoch revive",
+    )
+    .await?;
+    assert_eq!(
+        poll_card_state(addr, &cookie, &instance_id).await?,
+        "pending"
+    );
+
+    // Contact loss past grace: the sweep marks the ROW host-lost, no settle.
+    let store = hub.store().expect("hub store exposed to tests");
+    store
+        .mark_host_offline(host_id.as_id().as_str().to_string())
+        .await?;
+    let (swept, settlement) = store.expire_lost_hosts(0).await?;
+    assert_eq!(swept, 1);
+    assert!(
+        settlement.interactions.is_empty(),
+        "the sweep never settles: {settlement:?}"
+    );
+
+    // A NEW Node process (new epoch) reports it holds the instance, adopted
+    // mid-startup and therefore listed `starting`. Service the socket just
+    // enough to ack its RPCs; the hello is processed on receipt.
+    let mut hello_req = format!("ws://{addr}/v1/node").into_client_request()?;
+    hello_req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", node.node_token()).parse()?,
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(hello_req).await?;
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0", "id": "hello-new-epoch", "method": "node.hello",
+                "params": {
+                    "hostId": host_id.as_id().as_str(),
+                    "nodeVersion": "0.1.0",
+                    "nodeEpoch": "cs-r10-epoch-2",
+                    "instanceStoreFound": true,
+                    "instances": [
+                        { "id": instance_id, "hostId": host_id.as_id().as_str(),
+                          "lifecycle": "starting", "activity": "idle" }
+                    ]
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let service = tokio::spawn(async move {
+        use futures::{SinkExt, StreamExt};
+        let (mut sink, mut stream) = socket.split();
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_secs(8), stream.next()).await
+        {
+            let Message::Text(text) = msg else { continue };
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(id) = frame.get("id").cloned() else {
+                continue;
+            };
+            let _ = sink
+                .send(Message::Text(
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+        }
+    });
+
+    // The swept row is revived to the reported live lifecycle; the marker is
+    // cleared and no ended_at is stamped.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) = http(
+            addr,
+            "GET",
+            &format!("/v1/instances/{instance_id}"),
+            &cookie,
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let row: Value = serde_json::from_str(&body)?;
+        if row["lifecycle"] == "starting" {
+            assert!(
+                row.get("lastError").is_none() || row["lastError"].is_null(),
+                "revival clears the host-lost marker: {row}"
+            );
+            assert!(
+                row.get("endedAt").is_none() || row["endedAt"].is_null(),
+                "a revived live chapter carries no end evidence: {row}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the new-epoch starting inventory never revived the row: {row}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The live process's approval survives: still pending and blocking.
+    assert_eq!(
+        poll_card_state(addr, &cookie, &instance_id).await?,
+        "pending"
+    );
+    let (status, page_body) = http(
+        addr,
+        "GET",
+        &format!("/v1/interactions?instanceId={instance_id}"),
+        &cookie,
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{page_body}");
+    let page: Value = serde_json::from_str(&page_body)?;
+    let item = page["items"]
+        .as_array()
+        .context("items")?
+        .iter()
+        .find(|item| {
+            item.pointer("/event/payload/interaction/id")
+                .and_then(Value::as_str)
+                == Some(card.as_str())
+                || item["interactionId"] == json!(card)
+        })
+        .with_context(|| format!("card missing: {page}"))?;
+    assert_eq!(item["state"], json!("pending"));
+    assert_eq!(item["blocking"], json!(true));
+
+    service.abort();
+    hub.shutdown().await;
+    Ok(())
+}
+
 /// r8 item 3: a follower that subscribes with a PRE-POPULATED settlement
 /// history (hundreds of invalidated rows for the life of the database) must
 /// not replay that history when its ring lags. Its lag cursor is seeded at

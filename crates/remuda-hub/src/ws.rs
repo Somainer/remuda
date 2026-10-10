@@ -1040,6 +1040,12 @@ async fn reconcile_lost_instances(
             true,
         ))
         .await?;
+    // c-cardsettle r10 item 1 (OA6): a NEW Node epoch that LISTS a swept,
+    // still-pending instance as live is liveness evidence from the new
+    // process itself (a herdr-adopted chapter is normally listed starting or
+    // ready). Revive such rows BEFORE the lost side effects run; cards the
+    // chapter still owns stay pending and answerable.
+    revive_live_inventory(state, host_id, params).await?;
     for instance_id in lost {
         tracing::warn!(
             %host_id,
@@ -1064,10 +1070,18 @@ async fn reconcile_lost_instances(
     Ok(())
 }
 
-/// Extract the instances a hello inventory reports as LIVE
-/// (`ready`/`running`) as `(id, activity)` pairs, the input to
+/// Extract the instances a hello inventory reports as LIVE as
+/// `(id, hub_lifecycle, activity)` triples, the input to
 /// [`Store::revive_host_lost_instances`].
-fn live_inventory_entries(params: &Value) -> Vec<(String, String)> {
+///
+/// c-cardsettle r10 item 1 (OA6): a same- or new-epoch inventory that still
+/// holds a chapter is liveness evidence even when its lifecycle is not the
+/// Node's narrow ready/running pair — a herdr-adopted instance is listed
+/// `starting`, a draining chapter `closing`, and an older Node omits the key
+/// entirely (`unknown`). Each maps onto the closest LIVE Hub lifecycle; only
+/// confessed terminal entries (`exited`/`failed`/`closed`/`requested`) are
+/// excluded.
+fn live_inventory_entries(params: &Value) -> Vec<(String, String, String)> {
     params
         .get("instances")
         .and_then(Value::as_array)
@@ -1081,10 +1095,16 @@ fn live_inventory_entries(params: &Value) -> Vec<(String, String)> {
                 .and_then(Value::as_str)?
                 .to_string();
             // Only rows the Node claims are live revive a host-lost row.
-            let lifecycle = item.get("lifecycle").and_then(Value::as_str).unwrap_or("");
-            if !matches!(lifecycle, "ready" | "running") {
-                return None;
-            }
+            let reported = item.get("lifecycle").and_then(Value::as_str).unwrap_or("");
+            let lifecycle = match reported {
+                "ready" | "running" | "reconciling" | "" | "unknown" => "running",
+                "starting" | "preparing" => "starting",
+                "closing" => "closing",
+                // "closed" is a real end; "requested" is an unacked Hub
+                // create the Node does not hold; anything unrecognised is
+                // not liveness evidence.
+                _ => return None,
+            };
             let activity = match item
                 .get("activity")
                 .and_then(Value::as_str)
@@ -1094,17 +1114,17 @@ fn live_inventory_entries(params: &Value) -> Vec<(String, String)> {
                 Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
                 _ => "idle",
             };
-            Some((id, activity.to_string()))
+            Some((id, lifecycle.to_string(), activity.to_string()))
         })
         .collect()
 }
 
-/// Same-epoch reconnect: revive host-lost rows the reconnecting Node still
-/// reports live (c-cardsettle r8 item 2). Runs on BOTH daemon and plain
-/// runtime hellos — the daemon inventory overlay
-/// (`reconcile_daemon_instances`) already rewrites the rows it names, and the
-/// host-lost predicate revival here is idempotent for those and the only
-/// revival path for a non-daemon runtime link.
+/// Reconnect: revive host-lost rows the reconnecting or restarted Node still
+/// reports live (c-cardsettle r8 item 2; r10 item 1 runs this on BOTH epoch
+/// branches). Runs on daemon and plain runtime hellos — the daemon inventory
+/// overlay (`reconcile_daemon_instances`) already rewrites the rows it names,
+/// and the host-lost predicate revival here is idempotent for those and the
+/// only revival path for a non-daemon runtime link.
 async fn revive_live_inventory(
     state: &AppState,
     host_id: &str,
@@ -1122,7 +1142,7 @@ async fn revive_live_inventory(
         tracing::info!(
             %host_id,
             %instance_id,
-            "same-epoch reconnect reports a host-lost instance live; revived without settling cards"
+            "a reconnect inventory reports a host-lost instance live; revived without settling cards"
         );
     }
     Ok(())

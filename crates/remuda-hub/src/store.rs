@@ -3823,37 +3823,41 @@ impl Store {
         .await
     }
 
-    /// Same-epoch reconnect revival (c-cardsettle r8 item 2, OA6): bring rows
-    /// the contact-loss sweep marked `exited`/host-lost back to `running` when
-    /// the same or a NEW Node epoch reports them live in its hello inventory.
+    /// Reconnect revival (c-cardsettle r8 item 2 + r10 item 1, OA6): bring
+    /// rows the contact-loss sweep marked `exited`/[`HOST_LOST_MARKER`] back
+    /// to the lifecycle the live Node reports, when the SAME or a NEW Node
+    /// epoch lists the instance in its hello inventory.
     ///
     /// Host loss is CONTACT loss, never process end: the child kept running
     /// while the Hub could not see the host, the sweep only marked the row
     /// host-lost (no `ended_at`, cards untouched), and on reconnect the live
     /// process's own inventory is the evidence that the chapter never ended.
-    /// Only rows with exactly that shape revive — a real exit
-    /// (`ended_at` set or any other marker) is never resurrected.
+    /// Only rows with exactly that shape revive — a real exit (`ended_at`
+    /// set, the legacy marker, or any other marker) is never resurrected.
+    ///
+    /// `live_inventory` carries `(id, lifecycle, activity)` with the lifecycle
+    /// already normalised to the Hub vocabulary by the caller.
     ///
     /// Returns the revived instance ids.
     pub async fn revive_host_lost_instances(
         &self,
         host_id: String,
-        live_inventory: &[(String, String)],
+        live_inventory: &[(String, String, String)],
     ) -> Result<Vec<String>, StoreError> {
-        let live: Vec<(String, String)> = live_inventory.to_vec();
+        let live: Vec<(String, String, String)> = live_inventory.to_vec();
         self.run_named("revive_host_lost_instances", move |conn| {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             let mut revived = Vec::new();
-            for (id, activity) in &live {
+            for (id, lifecycle, activity) in &live {
                 let changed = tx.execute(
-                    "UPDATE instances SET lifecycle = 'running', activity = ?3,
-                        connectivity = 'connected', last_error = NULL, updated_at = ?4
+                    "UPDATE instances SET lifecycle = ?3, activity = ?4,
+                        connectivity = 'connected', last_error = NULL, updated_at = ?5
                      WHERE id = ?1 AND host_id = ?2
                        AND lifecycle = 'exited'
-                       AND COALESCE(last_error, '') = ?5
+                       AND COALESCE(last_error, '') = ?6
                        AND ended_at IS NULL",
-                    params![id, &host_id, activity, &now, HOST_LOST_MARKER],
+                    params![id, &host_id, lifecycle, activity, &now, HOST_LOST_MARKER],
                 )?;
                 if changed > 0 {
                     revived.push(id.clone());
@@ -12200,7 +12204,11 @@ mod tests {
         let revived = store
             .revive_host_lost_instances(
                 host.clone(),
-                &[(instance.instance_id.clone(), "idle".to_string())],
+                &[(
+                    instance.instance_id.clone(),
+                    "running".to_string(),
+                    "idle".to_string(),
+                )],
             )
             .await
             .expect("revive");
@@ -12218,6 +12226,143 @@ mod tests {
         let (state, _reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "pending", "the card stays pending through revival");
         store.close().await;
+    }
+
+    /// c-cardsettle r10 item 1 (OA6 regression): the contact-loss sweep leaves
+    /// a row `exited`/host-contact-lost with NO `ended_at` while its process
+    /// still lives. A state-bearing event the live agent journals WITHOUT a
+    /// reviving hello — an `interaction.requested` deriving (running, blocked)
+    /// — keeps the stored RANK at `exited`, but the settlement guard must key
+    /// on the EVENT'S OWN verdict. The old code passed the rank-held lifecycle
+    /// and invalidated every pending card of a live process (the answer then
+    /// 404'd before the RPC). Both the old card and the new one stay pending.
+    #[tokio::test]
+    async fn state_event_on_a_host_lost_rank_keeps_the_live_processs_cards_pending() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("dir store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-rank-event").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let first_card = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        store
+            .mark_host_offline(host.clone())
+            .await
+            .expect("offline");
+        let (swept, sweep_settlement) = store.expire_lost_hosts(0).await.expect("sweep");
+        assert_eq!(swept, 1);
+        assert!(sweep_settlement.interactions.is_empty());
+
+        // The live process raises a NEW approval; no hello inventory has
+        // revived the row in between.
+        let second_card = format!("int_{}", uuid::Uuid::now_v7());
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": second_card,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "carrier": "harness-hook",
+                            "deadline": { "state": "unknown" },
+                            "resolution": { "state": "unknown" },
+                            "request": {
+                                "kind": "approval",
+                                "title": "Bash",
+                                "description": "echo live",
+                                "options": [],
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("a host-lost row without end evidence is not an ended owner");
+
+        // The rank stays at the sweep's shape (a non-terminal event never
+        // downgrades the stored lifecycle) …
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        assert_eq!(row.last_error.as_deref(), Some(HOST_LOST_MARKER));
+        // … but BOTH cards are still live and answerable.
+        for card in [&first_card, &second_card] {
+            let (state, reason) = interaction_state_and_reason(&store, card).await;
+            assert_eq!(state, "pending", "{card} must not be born dead");
+            assert!(reason.is_none(), "{card} carries no end reason");
+        }
+        let rows = store
+            .list_interactions(None, Some(instance.instance_id.clone()), None, false)
+            .await
+            .expect("list");
+        for record in &rows {
+            assert!(record.blocking, "{} stays blocking", record.interaction_id);
+        }
+        store.close().await;
+    }
+
+    /// c-cardsettle r10 item 1 (revive widening): a reconnect inventory that
+    /// holds a swept instance reports it with lifecycles OTHER than
+    /// ready/running — a herdr-adopted chapter is listed `starting`, a draining
+    /// one `closing`, and an older Node omits the lifecycle (`unknown`). Each
+    /// revives the host-lost row to the closest LIVE Hub lifecycle; the
+    /// pending card is untouched and a closed/requested entry never revives.
+    #[tokio::test]
+    async fn host_lost_row_revives_from_starting_closing_unknown_inventory() {
+        for (reported, expected_life) in [
+            ("starting", "starting"),
+            ("closing", "closing"),
+            ("reconciling", "running"),
+            ("", "running"),
+            ("unknown", "running"),
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let store = Store::open(dir.path()).expect("dir store");
+            let host = new_id("hst").expect("host");
+            enroll_labeled(&store, host.clone(), "r10-revive-lifecycles").await;
+            let instance = seed_acknowledged_instance(&store, &host).await;
+            let card = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+            store
+                .mark_host_offline(host.clone())
+                .await
+                .expect("offline");
+            let (swept, _) = store.expire_lost_hosts(0).await.expect("sweep");
+            assert_eq!(swept, 1);
+
+            let revived = store
+                .revive_host_lost_instances(
+                    host.clone(),
+                    &[(
+                        instance.instance_id.clone(),
+                        expected_life.to_string(),
+                        "idle".to_string(),
+                    )],
+                )
+                .await
+                .expect("revive");
+            assert_eq!(revived, vec![instance.instance_id.clone()], "{reported}");
+            let row = store
+                .get_instance(instance.instance_id.clone())
+                .await
+                .expect("get")
+                .expect("row");
+            assert_eq!(row.lifecycle, expected_life, "reported {reported:?}");
+            assert!(row.last_error.is_none(), "revival clears the marker");
+            let (state, _) = interaction_state_and_reason(&store, &card).await;
+            assert_eq!(state, "pending", "the card survives the {reported} revival");
+            store.close().await;
+        }
     }
 
     /// Read an instance row's `ended_at` directly (InstanceRecord does not
@@ -12268,7 +12413,12 @@ mod tests {
         // The Node comes back under a NEW epoch and holds nothing for this
         // instance (empty attested inventory).
         let (lost, settlement) = store
-            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".to_string(), true)
+            .reconcile_reported_instances(
+                host.clone(),
+                vec![],
+                "node-epoch-changed".to_string(),
+                true,
+            )
             .await
             .expect("new-epoch reconcile");
         assert_eq!(lost, vec![instance.instance_id.clone()]);
@@ -14560,6 +14710,14 @@ fn apply_instance_lifecycle(
     // classifier's ProcessEnd evidence); `current` is read after it, so a
     // terminal the projection already wrote/settled is a no-op, while a
     // terminal only THIS derivation recognises still settles its generation.
+    //
+    // c-cardsettle r10 item 1 (OA6): the guard's `next` is the EVENT'S OWN
+    // derived verdict (`next_life`), never the rank-held EFFECTIVE lifecycle.
+    // A state-bearing event on an `exited` host-lost row whose process still
+    // lives — an interaction.requested that derives (running, blocked) — keeps
+    // the stored rank at `exited`; passing that rank settled a live process's
+    // card. `next_life` is terminal ONLY when the shared classifier returned
+    // an end for this exact event.
     settle_on_terminal_transition(
         conn,
         instance_id,
@@ -14572,7 +14730,7 @@ fn apply_instance_lifecycle(
                     ended_at.as_deref(),
                 )
             }),
-        Some(lifecycle),
+        next_life,
         &now,
         settlement,
     )?;

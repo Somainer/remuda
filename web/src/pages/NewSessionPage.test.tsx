@@ -353,6 +353,47 @@ it("r2 item 1: a pre-2.1.203 binary locks the launch switch with the 2.1.203 rea
   expect(screen.getByTestId("new-session-effort-ultracode-reason").textContent).toContain("2.1.203");
 });
 
+it.each([
+  ["legacy", "2.1.150"],
+  ["unknown", ""],
+])("item 10: a stored ultracode pref fails CLOSED on a %s host (preview, display, payload)", async (_label, version) => {
+  // The remembered pref carries the old "ultracode" name (equally covered: a
+  // pinned {xhigh,on} draft — both initialize the effort state with flag on).
+  localStorage.setItem(
+    "runtime.new-session",
+    JSON.stringify({ effortIndex: 5, effortName: "ultracode" }),
+  );
+  const gatedHost = {
+    ...cliHost,
+    cli: [{ kind: "claude", version, path: "/usr/bin/claude" }],
+  };
+  vi.mocked(store.useHub).mockReturnValue({
+    ...store.hubStore.getSnapshot(), hosts: [gatedHost], workspaces: [workspace], instances: [],
+  });
+  const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+  renderAt(["/sessions/new"]);
+
+  // The switch is locked and the DISPLAY does not carry the flag.
+  const sw = screen.getByTestId("new-session-effort-ultracode-switch");
+  expect(sw).toBeDisabled();
+  expect(sw).toHaveAttribute("aria-checked", "false");
+  expect(screen.getByTestId("new-session-effort-slider")).toHaveAttribute("data-ultracode", "0");
+
+  // The preview never promises `--effort ultracode`.
+  fireEvent.click(screen.getByTestId("new-session-advanced"));
+  const previewText = screen.getByTestId("new-session-launch-preview").textContent ?? "";
+  expect(previewText).not.toContain("ultracode");
+  // (the pinned xhigh level itself may still be named)
+  expect(previewText).not.toMatch(/--effort ultracode/);
+
+  // The payload forces the boolean false — all three together, not just UI.
+  fireEvent.change(screen.getByTestId("new-session-cwd"), { target: { value: "src" } });
+  fireEvent.click(screen.getByTestId("new-session-start"));
+  await waitFor(() => expect(create).toHaveBeenCalled());
+  const payload = create.mock.calls[0][0] as Record<string, unknown>;
+  expect(payload.effortUltracode).toBe(false);
+});
+
 it("writes the slider's tier into the instance it creates", async () => {
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
   renderWithCli();

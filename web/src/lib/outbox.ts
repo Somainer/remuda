@@ -457,14 +457,46 @@ export class Outbox {
       box.cache.set(rec.commandId, rec);
     }
     const now = Date.now();
+    // c-reconnfu gate 10 item 6: a same-owner FRESH lease may belong to a
+    // LIVE sibling tab/duplicated window that cloned sessionStorage (it has
+    // the same owner id). Before reclaiming it immediately, ask the Web Locks
+    // manager whether the instance delivery lock is held in THIS browser
+    // context. Held → the other tab is delivering; wait for the lease TTL like
+    // a foreign lease. No Web Locks API (private mode/no SW fallback) → also
+    // treat as foreign (safe; the durable Web Lock is unavailable there
+    // anyway). A prior CONTEXT (reload/SW restore) holds nothing.
+    const locksHeld = new Set<string>();
+    if (typeof navigator !== "undefined" && typeof navigator.locks?.query === "function") {
+      try {
+        const snapshot = await navigator.locks.query();
+        for (const lock of snapshot.held ?? []) {
+          if (typeof lock.name === "string") locksHeld.add(lock.name);
+        }
+      } catch {
+        // If the query itself fails, do NOT reclaim same-owner fresh leases:
+        // leave them to the TTL (fail safe).
+        locksHeld.add("__locks_unavailable__");
+      }
+    } else {
+      locksHeld.add("__locks_unavailable__");
+    }
     const requeue: Id[] = [];
     for (const [id, rec] of box.cache) {
       if (rec.state !== "inflight") continue;
       if (rec.lease?.owner === box.owner) {
-        // This browser profile's PREVIOUS context left the claim: no POST can
-        // still be in flight here (a fresh context owns the fetch lifecycle),
-        // so requeue immediately instead of waiting out the lease TTL.
-        requeue.push(id);
+        const lockName = `__lock__:${rec.instanceId}`;
+        if (locksHeld.has(lockName)) {
+          // A live same-owner context (duplicated tab/opener window) holds
+          // the instance lock: it is delivering this command. Wait for TTL.
+          if (rec.lease.until > now) continue;
+          requeue.push(id);
+        } else {
+          // This browser profile's PREVIOUS context left the claim: no POST
+          // can still be in flight here (a fresh context owns the fetch
+          // lifecycle), so requeue immediately instead of waiting out the
+          // lease TTL.
+          requeue.push(id);
+        }
       } else if (!rec.lease || rec.lease.until <= now) {
         // A row left inflight by another (possibly crashed) process is
         // returned to a deliverable state once its lease expires; the durable
@@ -473,16 +505,41 @@ export class Outbox {
       }
     }
     // Persist the requeue (refreshDurable re-reads the durable store and
-    // would otherwise resurrect the inflight claim).
+    // would otherwise resurrect the inflight claim). c-reconnfu gate 10
+    // item 8: a ONE-SHOT transaction abort must not leave the row inflight
+    // with a fresh lease — retry the merge once; if that also fails, the row
+    // is still deliverable when its lease expires because load() now also
+    // schedules an expiry wakeup for inflight rows this context is not
+    // actively delivering (it has no POST in flight — the context just booted).
     await Promise.all(
-      requeue.map((id) =>
-        storage
-          .mergeUnlessDone(id, { state: "pending", lease: undefined })
-          .then((stored) => {
-            if (stored) box.cache.set(id, stored);
-          })
-          .catch(() => undefined),
-      ),
+      requeue.map(async (id) => {
+        let stored: OutboxRecord | null = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            stored = await storage.mergeUnlessDone(id, {
+              state: "pending",
+              lease: undefined,
+            });
+            break;
+          } catch {
+            // one retry on a one-shot abort; second failure falls through
+          }
+        }
+        if (stored) {
+          box.cache.set(id, stored);
+        } else {
+          // Persist failed: the row is still (durable) inflight with a lease.
+          // This context is not delivering anything yet; wake at the lease
+          // deadline so an unrelated trigger is not required.
+          const until = box.cache.get(id)?.lease?.until;
+          if (typeof until === "number" && until > Date.now()) {
+            const delay = until - Date.now();
+            setTimeout(() => {
+              void box.refreshDurable().catch(() => undefined);
+            }, delay);
+          }
+        }
+      }),
     );
     return box;
   }

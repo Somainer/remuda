@@ -187,6 +187,115 @@ describe("Outbox", () => {
     expect(storage.map.get("cmd_foreign")?.state).toBe("inflight");
   });
 
+  it("GATE10 item 8: a one-shot abort on the requeue is retried once and succeeds", async () => {
+    // No fake timers (the retry is a plain async chain). Stub navigator.locks
+    // to report no holder so the same-owner fresh lease is reclaimed.
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { locks: { query: async () => ({ held: [] }) } },
+    });
+    const calls: string[] = [];
+    try {
+      const store = new MemStorage();
+      const first = await Outbox.load(store, "owner_one_shot");
+      await first.enqueue(rec({ commandId: "cmd_oneshot", instanceId: "ins_1" }));
+      await first.patch("cmd_oneshot", {
+        state: "inflight",
+        lease: { owner: "owner_one_shot", until: Date.now() + LEASE_TTL_MS },
+      });
+      // Arm the one-shot abort ONLY for the second context's reclaim merge.
+      vi.spyOn(store, "mergeUnlessDone").mockImplementation(
+        (id: string, patch: Partial<OutboxRecord>) => {
+          calls.push(id);
+          if (calls.filter((c) => c === id).length === 1) {
+            return Promise.reject(new Error("one-shot tx abort"));
+          }
+          // Retry: emulate the real merge without recursing into the spy.
+          return Promise.resolve(null).then(async () => {
+            const existing = (await store.all()).find((r) => r.commandId === id);
+            if (!existing) return null;
+            if (existing.state === "done") return existing;
+            const merged: OutboxRecord = { ...existing, ...patch };
+            (store as unknown as { map: Map<string, OutboxRecord> }).map.set(id, merged);
+            return merged;
+          });
+        },
+      );
+
+      // A fresh context reclaims: first merge attempt aborts, retried, succeeds.
+      const fresh = await Outbox.load(store, "owner_one_shot");
+      expect(calls.filter((c) => c === "cmd_oneshot")).toHaveLength(2);
+      const row = fresh.pendingFor("ins_1").find((r) => r.commandId === "cmd_oneshot");
+      expect(row?.state).toBe("pending");
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE10 item 6: a same-owner fresh lease is NOT reclaimed when a live context holds the instance lock", async () => {
+    // Duplicated tab (cloned sessionStorage → same tabOwner): tab A is
+    // delivering and holds the durable Web Lock. Tab B loads with a stubbed
+    // navigator.locks.query reporting the holder → it must leave A's fresh
+    // inflight row untouched and not deliver it.
+    const originalQuery = (globalThis as { navigator?: Navigator }).navigator?.locks?.query;
+    const originalNavigator = globalThis.navigator;
+    const heldNames = new Set<string>(["__lock__:ins_same"]);
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        locks: {
+          query: async () => ({ held: [...heldNames].map((name) => ({ name, mode: "exclusive" as const })) }),
+        },
+      },
+    });
+    try {
+      const store = new MemStorage();
+      const a = await Outbox.load(store, "owner_dup");
+      await a.enqueue(rec({ commandId: "cmd_dup", instanceId: "ins_same" }));
+      await a.patch("cmd_dup", {
+        state: "inflight",
+        lease: { owner: "owner_dup", until: Date.now() + LEASE_TTL_MS },
+      });
+      // B has the same owner (cloned sessionStorage) and sees the lock held.
+      const b = await Outbox.load(store, "owner_dup");
+      expect(b.pendingFor("ins_same")).toEqual([]);
+      const row = store.map.get("cmd_dup")!;
+      expect(row.state).toBe("inflight");
+      expect(row.lease?.owner).toBe("owner_dup");
+      // A (the real holder) can still see/deliver it via its cache.
+      expect(a.pendingFor("ins_same")).toEqual([]);
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      void originalQuery;
+    }
+  });
+
+  it("GATE10 item 6: a same-owner fresh lease with NO holder is reclaimed (fresh context)", async () => {
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        locks: {
+          query: async () => ({ held: [] }),
+        },
+      },
+    });
+    try {
+      const store = new MemStorage();
+      const old = await Outbox.load(store, "owner_ctx");
+      await old.enqueue(rec({ commandId: "cmd_ctx", instanceId: "ins_1" }));
+      await old.patch("cmd_ctx", {
+        state: "inflight",
+        lease: { owner: "owner_ctx", until: Date.now() + LEASE_TTL_MS },
+      });
+      const fresh = await Outbox.load(store, "owner_ctx");
+      expect(fresh.pendingFor("ins_1").map((r) => r.commandId)).toEqual(["cmd_ctx"]);
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE9 item 6: tabOwner writes sessionStorage and leaves localStorage untouched", () => {
     const session = new Map<string, string>();
     const local = new Map<string, string>();

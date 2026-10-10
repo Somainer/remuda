@@ -466,6 +466,25 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   REST 已恢复的链路上线即离线、亚秒级重连风暴）。一次真实 frame 重新认证 live
   后该截止清零。
 
+### 5.2.1 定时器归属表（c-reconnfu gate 10 item 0）
+
+客户端状态机的每个命名定时器只有一个 owner；`setTimer(name, ms, fn)` 在写入
+新 handle 前总是先 `clearTimer(name)`，所以旧 job 绝不会在后来的状态 episode 里
+开火（孤儿 timer 会让上一 episode 的截止在新 episode 误触发，`dispose()` 也
+cancel 不到已被替换的 handle）。
+
+| 状态 | probe | offline | bind | watchdog | reconnect | staleDeadlineAt |
+| --- | --- | --- | --- | --- | --- | --- |
+| **live** | — | — | arm：`followBound` 首次绑定（非 rebind 且非 stale）；clear：`armFrameWatchdog`/`setTimer` 自身/`dispose` | arm：`startLive` 经 `armFrameWatchdog`；clear：frame 超时转 stale、close/offline | —（在线不排程） | 0 |
+| **stale** | arm：`armStaleProbeTimers`；fire：probe ok→`quietReopen`，fail→`goOfflineAndSchedule`；clear：`setTimer` 自身、任何离开 stale | arm：`armStaleProbeTimers`（值=staleDeadlineAt−now）；fire：`goOfflineAndSchedule`；clear：同 probe | （rebind 中若 resumeInFlight 则不 arm；无 attempt 时 rebind 重新 arm stale/probe/offline） | 仅 quiet reopen 在飞时（见下）；fire 后回到 stale | — | arm：首次进 stale（`setState` 离开 stale 即清零）；fire：offline 定时器 |
+| **quiet-reopen-in-stale** | 由 quiet 之前的 stale episode 持有（`armResumeAttemptQuiet` **不**清 offline：gate 10 item 4） | 同一 stale episode 的 offline 截止继续有效 | —（rebind 跳过 bind：resumeInFlight=true） | arm：`armResumeAttemptQuiet`；fire：未 frame→回 stale（re-arm probe/offline），frame-live→live；clear：完成/绑定变更/`setTimer` | — | 沿用当前 episode |
+| **recovering** | — | arm：`goOfflineAndSchedule`→`scheduleReconnect`（经 backoff）；clear：新 attempt 的 `clearTimers` | —（非 rebind 且 resumeInFlight 时 `followBound` 跳过） | arm：`armResumeAttempt`；fire：frame-live→live、REST 可达→stale、不可达→offline；clear：resumeAttempt 完成、`setTimer` | arm：`scheduleReconnect`（仅离线自主路径）；fire：frame-live 则认证 live，否则 `beginResume`；clear：attempt 的 `clearTimers`、frame 认证 | 0（setState 离开 stale 清零） |
+| **offline** | — | —（offline 自身不持有 offline 截止） | arm：`followBound` 非 rebind 且 state=offline 立即 `beginResume`（无延迟 bind） | arm：`beginResume`/`resume`/`online` 事件→`armResumeAttempt` | arm：`setStateOffline` 与每次 `goOfflineAndSchedule`；fire：认证或重开；clear：resume 启动、frame 认证 | 0 |
+
+`dispose()` clear 全部六个定时器；浏览器 `offline` 事件只 retire 当前 attempt
+（`retireInFlightForOffline`），不清 offline 截止，它让随后的 `online` 事件启动
+新 attempt。
+
 ### 5.3 最高优先级规则：绝不把旧数据当新数据
 
 * 任何「运行中/等待审批/最后更新于现在」的动态呈现都必须绑定**新鲜连接**；

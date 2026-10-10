@@ -533,6 +533,7 @@ it("a failed configure rolls back only the still-current request and never rejec
 
 it("a failed configure for a replaced request does not clobber the newer one", async () => {
   const ctx = await startFollowing("configure-fail-replaced");
+  const toast = vi.spyOn(hubStore, "toast");
   // A fails slowly; B succeeds.
   let resolveA: () => void = () => {};
   vi.spyOn(api, "instanceConfigure").mockImplementation((_id, _perm, extras) => {
@@ -549,10 +550,16 @@ it("a failed configure for a replaced request does not clobber the newer one", a
   const a = hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
   const b = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
   await b;
-  // A's late rejection must not roll B back to high/xhigh.
+  // B's configure returned; its indicator is still pending the read-back
+  // (no verdict in this test). A's late rejection must not delete it.
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
   resolveA();
   await a;
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+  // Item 8: B's 切换中 indicator survives A's HTTP failure.
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
+  // The failure is still surfaced, but distinguished from a live failure.
+  expect(toast).toHaveBeenCalledWith(expect.stringContaining("上一次"));
 });
 
 it("a replaced request's late HTTP SUCCESS does not overwrite the newer choice", async () => {

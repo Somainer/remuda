@@ -27,7 +27,7 @@ use super::{PROMOTE_POLL, PtyState};
 use crate::claude_print::TranscriptMapper;
 use crate::claude_pty::now_ts;
 use crate::claude_transcript::{
-    ResumeBoundary, ResumeMode, SessionStartReport, TailProvenance, TranscriptBinding,
+    ResumeBoundary, ResumeMode, SessionStartReport, TailAnchor, TailProvenance, TranscriptBinding,
     TranscriptCandidate, TranscriptTail, bind_by_pid_file, bind_by_session_id, bind_manual,
     cwd_matches, list_candidates, recorded_cwd, transcript_belongs_to_cwd,
 };
@@ -882,6 +882,10 @@ pub(super) fn spawn(
         // SessionStart report. The first session reported per pid is the
         // launched process's own; every later key is an in-TUI rebind.
         let mut session_modes = SessionModeTable::default();
+        // r7 item 4(c): the last read offset per (pid, session), so a
+        // demote/re-promotion continues the same transcript where it left
+        // off instead of re-emitting it from the sticky anchor.
+        let mut read_anchors = std::collections::HashMap::new();
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1380,6 +1384,7 @@ pub(super) fn spawn(
                         &mut session_modes,
                         &mut launch_mode,
                         pre_resume_mode,
+                        &mut read_anchors,
                     )
                     .await;
                 }
@@ -1810,6 +1815,7 @@ async fn maintain_binding(
     session_modes: &mut SessionModeTable,
     launch_mode: &mut LaunchModeBinding,
     pre_resume_mode: Option<ResumeMode>,
+    read_anchors: &mut std::collections::HashMap<(i32, String), TailAnchor>,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -1948,6 +1954,11 @@ async fn maintain_binding(
         let mut bound_found = found.clone();
         bound_found.session_id = Some(binding.session_id.clone());
         let mode = epoch_mode(launch_mode, pre_resume_mode, sticky, &bound_found);
+        // r7 item 4(c): continue a re-promoted same-session tail at its last
+        // read offset instead of replaying from the sticky anchor.
+        let continue_anchor = read_anchors
+            .get(&(found.pid, binding.session_id.clone()))
+            .copied();
         *hydrator = Hydrator::open(
             ctx,
             &binding,
@@ -1957,11 +1968,19 @@ async fn maintain_binding(
             permission_bridge,
             launch_permission,
             mode,
+            continue_anchor,
         );
     }
     if let Some(active) = hydrator.as_mut() {
         match pump(active, events, seq, ctx).await {
-            Ok(()) => {}
+            Ok(()) => {
+                // Remember where this (pid, session) was read to, so a
+                // demote/re-promotion continues here instead of re-emitting
+                // the whole conversation.
+                if let Some(anchor) = active.tail.anchor() {
+                    read_anchors.insert((found.pid, binding.session_id.clone()), anchor);
+                }
+            }
             Err(()) => {
                 // The bound file vanished: degrade, never silently rebind.
                 bindings.mark_degraded("bound transcript file vanished");
@@ -2177,6 +2196,7 @@ impl Hydrator {
         permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
         launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
         mode: ResumeMode,
+        continue_anchor: Option<TailAnchor>,
     ) -> Option<Self> {
         tracing::info!(
             instance_id = %ctx.instance_id.as_id(),
@@ -2213,10 +2233,13 @@ impl Hydrator {
         if let Some(bridge) = permission_bridge {
             mapper = mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
         }
-        // Open the tail once per epoch (item 7): the boundary/EOF anchor is
-        // computed here and never re-read on later polls. An unverifiable
-        // resume whose file is absent leaves the hydrator unbound this tick.
-        let tail = mode.open_tail(&binding.path)?;
+        // r7 item 4(c): a re-promotion of the same (pid, session) continues at
+        // the last offset the previous hydrator read instead of replaying the
+        // sticky anchor. A changed identity/shrink invalidates the captured
+        // anchor, so fall back to the mode's own boundary/EOF open.
+        let tail = continue_anchor
+            .and_then(|anchor| TranscriptTail::continued(binding.path.clone(), anchor))
+            .or_else(|| mode.open_tail(&binding.path))?;
         Some(Self {
             mapper,
             tail,
@@ -3325,8 +3348,18 @@ mod tests {
         mode: ResumeMode,
         bridge: Option<&Arc<crate::effort::EffortBridge>>,
     ) -> Hydrator {
-        Hydrator::open(&fx.ctx, &fx.binding, bridge, None, None, None, None, mode)
-            .expect("hydrator opens against the bound transcript")
+        Hydrator::open(
+            &fx.ctx,
+            &fx.binding,
+            bridge,
+            None,
+            None,
+            None,
+            None,
+            mode,
+            None,
+        )
+        .expect("hydrator opens against the bound transcript")
     }
 
     async fn pump_once(hydrator: &mut Hydrator, fx: &PumpFixture) {
@@ -4094,6 +4127,83 @@ mod tests {
             ResumeMode::Unverified
         );
         assert_eq!(first_session_mode(&resume, None), ResumeMode::Unverified);
+    }
+
+    /// r7 item 4(c): a demote/re-promotion of the SAME (pid, session) reopens
+    /// its tail at the last read offset, so the conversation already
+    /// published before the demote is not re-emitted (no duplicated effort
+    /// edge) and only bytes appended after the demote hydrate.
+    #[tokio::test]
+    async fn item4c_repromotion_continues_at_the_last_read_offset() {
+        // First epoch: a Fresh session already holds one turn, including a
+        // high read-back.
+        let first_turn = format!(
+            "{}{}",
+            user_line(1, "first question"),
+            assistant_line(Some("high"), 2),
+        );
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &first_turn);
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Fresh, None);
+        pump_once(&mut hydrator, &fx).await;
+        let first = drain(&mut fx);
+        assert_eq!(
+            effort_rows(&first),
+            vec![(Some(remuda_protocol::EffortName::High), None)],
+            "first epoch reads the turn as current"
+        );
+        assert!(conversation_hydrated(&first, "first question"));
+        // The poller captures this from the running hydrator on every pump.
+        let anchor = hydrator.tail.anchor().expect("a live anchor");
+
+        // The agent demotes, then comes back (re-promotion). Meanwhile a new
+        // record is appended.
+        append_line(&fx.binding.path, &user_line(3, "after re-promotion"));
+        // The reopen goes through Hydrator::open with the captured anchor,
+        // exactly as maintain_binding does it.
+        let mut reopened = Hydrator::open(
+            &fx.ctx,
+            &fx.binding,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ResumeMode::Fresh,
+            Some(anchor),
+        )
+        .expect("the anchored tail reopens");
+        pump_once(&mut reopened, &fx).await;
+        let second = drain(&mut fx);
+        assert!(
+            effort_rows(&second).is_empty(),
+            "the pre-demote high read-back must not be re-emitted: {second:?}"
+        );
+        assert!(
+            !conversation_hydrated(&second, "first question"),
+            "pre-demote conversation must not re-emit: {second:?}"
+        );
+        assert!(
+            conversation_hydrated(&second, "after re-promotion"),
+            "only the post-demote record hydrates: {second:?}"
+        );
+
+        // An anchor against a DIFFERENT identity (the file was replaced) does
+        // not continue; the caller falls back to the mode's own open.
+        std::fs::remove_file(&fx.binding.path).unwrap();
+        std::fs::write(
+            &fx.binding.path,
+            format!(
+                "{}{}",
+                user_line(4, "recreated"),
+                assistant_line(Some("max"), 5)
+            ),
+        )
+        .unwrap();
+        assert!(
+            TranscriptTail::continued(fx.binding.path.clone(), anchor).is_none(),
+            "a replaced file invalidates the captured anchor"
+        );
     }
 
     /// r6 item 5: an unverified anchor captured at the SessionStart instant is

@@ -416,6 +416,10 @@ it("r6 item 6: a poll with no Hub effort projection never erases a live-only edg
     hubStore.effortEffectiveOf(ctx.instance.id)?.name,
     "a null the Hub never projected must not render the chip ?"
   ).toBe("high");
+  expect(
+    hubStore.effortReadbackWithdrawnOf(ctx.instance.id),
+    "never projected: not a withdrawal"
+  ).toBe(false);
 });
 
 it("r6 item 6: a Hub projection becoming null on a later poll withdraws the live edge", async () => {
@@ -439,12 +443,32 @@ it("r6 item 6: a Hub projection becoming null on a later poll withdraws the live
   } as never);
   await hubStore.refresh();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  expect(
+    hubStore.effortReadbackWithdrawnOf(ctx.instance.id),
+    "a level→null Hub record marks the explicit withdrawal"
+  ).toBe(true);
   // Poll C: still null must not throw/restore.
   await hubStore.refresh();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  // A later projection clears the marker again.
+  list.mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: { name: "high", ultracode: false, source: "remuda", observedAt: "2026-10-08T14:00:00Z" },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("high");
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(false);
 });
 
-it("r6 item 6: same-second timestamps with different fractional spelling compare by instant", async () => {
+it("r6 item 6: a no-fraction updatedAt must not outrank a fractional observedAt", async () => {
+  // SQLite writes second precision ("…:00Z", no fraction); the live edge
+  // carries milliseconds ("…:00.100Z"). A STRING compare puts 'Z' > '.',
+  // so the older second-precision value looked NEWER and replaced the
+  // fresher projection. Only parsed instants must decide ordering.
   const ctx = await startFollowing("poll-same-second");
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
   const list = vi.spyOn(api, "instanceList");
@@ -457,13 +481,12 @@ it("r6 item 6: same-second timestamps with different fractional spelling compare
     ],
   } as never);
   await hubStore.refresh();
-  // Same second, millisecond-earlier spelling: must NOT move the projection
-  // backwards.
+  // Second precision, same wall second = strictly OLDER (.000 vs .100).
   list.mockResolvedValue({
     items: [
       {
         ...ctx.instance,
-        effortEffective: { name: "medium", ultracode: false, source: "remuda", observedAt: "2026-10-08T12:00:00.050Z" },
+        effortEffective: { name: "medium", ultracode: false, source: "remuda", observedAt: "2026-10-08T12:00:00Z" },
       },
     ],
   } as never);
@@ -502,6 +525,10 @@ it("r6 item 8a: an out-of-order withdrawal (older observedAt) never deletes the 
     hubStore.effortEffectiveOf(ctx.instance.id)?.name,
     "the newer max projection survives the older withdrawal"
   ).toBe("max");
+  expect(
+    hubStore.effortReadbackWithdrawnOf(ctx.instance.id),
+    "an out-of-order withdrawal must not set the marker"
+  ).toBe(false);
   // A newer withdrawal still wins.
   const freshWithdrawn = {
     ...staleWithdrawn,
@@ -521,4 +548,5 @@ it("r6 item 8a: an out-of-order withdrawal (older observedAt) never deletes the 
   } as unknown as Observation;
   ctx.receive(freshWithdrawn);
   expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(true);
 });

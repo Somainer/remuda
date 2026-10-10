@@ -669,7 +669,7 @@ type MaterializedLaunch = {
 
 **回读不可用边（D-056 (4)，c-effortread r5/r6）。** `effort` 观察的 `effective` 正常时是 `{name, ultracode, source, observedAt}`；当一个已 verified 的 resume 边界在会话中途变为不可证明时，driver 只发**一条**撤回边：`{source: "unknown", observedAt, readbackAvailable: false}`。规则：
 
-- 触发撤回的边界变化只有三类：**transcript shrink、same-path replacement（identity 或 head 指纹变化）、ENOENT 后内容不同的恢复**。exec 保留 shell pid、时钟回拨、缺进程启动证据这些情形从会话一开始就是 Unverified（不发撤回边，gate 本来就没开过）。
+- 触发撤回的边界变化（verified→不可证明）只有四类：**cursor 之下的 transcript shrink、文件 identity（dev/inode）变化、head 指纹变化（同路径重写）、任意一次 ENOENT**（哪怕只持续一个 poll；恢复时若 head 一致则从旧 offset 继续、内容不同则锚到新 EOF，但两种恢复都**不会**重新打开 gate）。exec 保留 shell pid、时钟回拨、缺进程启动证据这些情形从会话一开始就是 Unverified（不发撤回边，gate 本来就没开过）。
 - wire 上撤回边**省略** `name` 与 `ultracode`（`skip_serializing_if`：字段不存在，而不是显式 `null`）；Hub/web 解析器以「有效 name 缺失 + `readbackAvailable:false`」识别它。
 - `readbackAvailable` 缺省/`null`/`true` = 回读可用；只有字面 `false` 是撤回。
 - Hub 收到 `false` 时把实例的 `effortEffective` 投影**置空**（不存占位），web 的投影解析器对该边返回 null；UI 回退到 `?`，不再显示撤回前的档/开关。撤回是粘性的：乱序（observedAt 早于当前投影，如后加载的历史）到达的撤回边被忽略；轮询只在 Hub 自己的记录从有投影变为空时撤回，不由「updatedAt 更新但从未投影过」触发；待决 push-down 期间 chip 显示 `?` 而不是待决词。

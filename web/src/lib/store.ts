@@ -347,6 +347,11 @@ export type HubState = {
   effort: Record<string, EffortSelection>;
   /** §9.1 transcript-read-back effective effort per instance; absent = `?`. */
   effortEffective: Record<string, EffortEffectiveView>;
+  /** r7 item 4(a): instances whose read-back was withdrawn by an explicit
+   *  `readbackAvailable:false` edge (or a Hub projection going from a level
+   *  to null). Distinct from "never read back": a pending push-down renders
+   *  `?` only while this is true, never merely because no edge arrived. */
+  effortReadbackWithdrawn: Record<string, boolean>;
   /** context-usage-1 Hub-computed token/context rollup per instance.
    *  Hydrated separately from `instances` for the same reason effort is:
    *  mergeInstanceSnapshots keeps the local instance while its
@@ -398,6 +403,7 @@ const initial: HubState = {
   permissionMode: {},
   effort: {},
   effortEffective: {},
+  effortReadbackWithdrawn: {},
   usageRollup: {},
   effortPending: {},
   permissionEffective: {},
@@ -739,6 +745,7 @@ class HubStore {
    */
   private hydrateEffortEffective(instances: Instance[]) {
     const next = { ...this.state.effortEffective };
+    const withdrawnNext = { ...this.state.effortReadbackWithdrawn };
     const pendingNext = { ...this.state.effortPending };
     let effectiveUpdated = false;
     let pendingSettled = false;
@@ -748,16 +755,20 @@ class HubStore {
       const previousPoll = this.polledEffort.get(id);
       this.polledEffort.set(id, view);
       if (!view) {
-        // r6 item 6: withdraw on poll ONLY when the Hub record goes from a
-        // previously projected non-null effortEffective to null (the Hub
-        // applied the read-back-unavailable edge). A null from an instance the
-        // Hub has never projected effort for — however new its updatedAt from
-        // an unrelated lifecycle write — must not erase a live follow edge.
+        // r7 item 4(a): distinguish "the Hub projection went from a level to
+        // null" (an explicit withdrawal) from "never projected". The pending
+        // chip shows `?` only for the former.
         if (previousPoll) {
           delete next[id];
+          withdrawnNext[id] = true;
           effectiveUpdated = true;
         }
         continue;
+      }
+      // A real projection clears the withdrawal marker.
+      if (withdrawnNext[id]) {
+        delete withdrawnNext[id];
+        effectiveUpdated = true;
       }
       const current = next[id];
       // Compare PARSED instants: a same-second write with a different
@@ -781,7 +792,9 @@ class HubStore {
     }
     if (effectiveUpdated || pendingSettled) {
       this.emit({
-        ...(effectiveUpdated ? { effortEffective: next } : {}),
+        ...(effectiveUpdated
+          ? { effortEffective: next, effortReadbackWithdrawn: withdrawnNext }
+          : {}),
         ...(pendingSettled ? { effortPending: pendingNext } : {}),
       });
     }
@@ -966,18 +979,34 @@ class HubStore {
       }
       const effortEffective = { ...this.state.effortEffective };
       delete effortEffective[instanceId];
-      this.emit({ effortEffective });
+      this.emit({
+        effortEffective,
+        effortReadbackWithdrawn: {
+          ...this.state.effortReadbackWithdrawn,
+          [instanceId]: true,
+        },
+      });
       return true;
     }
     const view = parsed.effective;
     if (!view) return false;
     const current = this.state.effortEffective[instanceId];
     if (current && view.observedAt < current.observedAt) return false;
+    const withdrawnClear = this.state.effortReadbackWithdrawn[instanceId] === true;
     const patch: Partial<HubState> = {
       effortEffective: {
         ...this.state.effortEffective,
         [instanceId]: view,
       },
+      ...(withdrawnClear
+        ? {
+            effortReadbackWithdrawn: (() => {
+              const next = { ...this.state.effortReadbackWithdrawn };
+              delete next[instanceId];
+              return next;
+            })(),
+          }
+        : {}),
     };
     const pending = this.state.effortPending[instanceId];
     const hydratedAt = this.settledEffortPushdown.get(instanceId);
@@ -3625,6 +3654,14 @@ class HubStore {
   /** §9.1: transcript-read-back effective effort, or `null` when unobserved. */
   effortEffectiveOf(instanceId: Id): EffortEffectiveView | null {
     return this.state.effortEffective[instanceId] ?? null;
+  }
+
+  /** r7 item 4(a): true only after an explicit read-back-unavailable edge (or
+   *  a Hub projection going from a level to null). A session that simply never
+   *  read back a level returns false, so a pending chip there shows the
+   *  pending word rather than a false "?". */
+  effortReadbackWithdrawnOf(instanceId: Id): boolean {
+    return this.state.effortReadbackWithdrawn[instanceId] === true;
   }
 
   /** context-usage-1: Hub-computed per-session usage rollup; null until the

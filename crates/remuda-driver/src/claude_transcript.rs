@@ -689,6 +689,24 @@ pub struct TranscriptTail {
     resume: Option<ResumeState>,
 }
 
+/// r7 item 4(c): a re-openable continuation point captured from a running
+/// [`TranscriptTail`], keyed per (pid, session) by the promotion poller so a
+/// re-promotion resumes at the last read offset instead of replaying the
+/// sticky boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TailAnchor {
+    /// File identity the offset is valid on.
+    identity: FileIdentity,
+    /// First unread byte at capture time.
+    start: u64,
+    /// The tail was reading Current (gate open). False = Unverified.
+    current: bool,
+    /// The tracked resume had already been displaced.
+    displaced: bool,
+    /// Head fingerprint at capture (None for a live tail).
+    head: Option<HeadFingerprint>,
+}
+
 #[derive(Debug)]
 struct ResumeState {
     /// File identity that must hold for reads past `start` to be trusted.
@@ -840,6 +858,79 @@ impl TranscriptTail {
                 absent: false,
             }),
         }
+    }
+
+    /// r7 item 4(c): the last position a prior hydrator read this file to,
+    /// captured per (pid, session) so a re-promotion can continue there
+    /// instead of re-reading the sticky anchor and re-emitting the whole
+    /// conversation.
+    ///
+    /// Returns `None` when the file is currently absent or its on-disk
+    /// identity no longer matches the tracked one (a replacement/rotation):
+    /// the caller reopens through the [`ResumeMode`] path, whose own
+    /// shrink/replacement rules then apply.
+    #[must_use]
+    pub(crate) fn anchor(&self) -> Option<TailAnchor> {
+        let on_disk = FileIdentity::of(&self.path)?;
+        let tracked = match self.resume.as_ref() {
+            Some(state) => {
+                if state.identity != on_disk {
+                    return None;
+                }
+                state.identity
+            }
+            None => on_disk,
+        };
+        let len = std::fs::metadata(&self.path).ok()?.len();
+        if len < self.offset {
+            return None;
+        }
+        Some(TailAnchor {
+            identity: tracked,
+            start: self.offset,
+            // A live tail, or a verified, undisplaced resume tail, was reading
+            // Current; everything else was reading Unverified.
+            current: self
+                .resume
+                .as_ref()
+                .is_none_or(|state| state.verified && !state.displaced),
+            displaced: self.resume.as_ref().is_some_and(|state| state.displaced),
+            head: self.resume.as_ref().and_then(|state| state.head),
+        })
+    }
+
+    /// Reopen a tail continuing at a previously captured [`TailAnchor`].
+    ///
+    /// `None` when the file changed identity or shrank below the anchor; the
+    /// caller falls back to [`ResumeMode::open_tail`]. A current anchor keeps
+    /// the gate open past the offset; an unverified/displaced anchor keeps
+    /// following appends as Unverified.
+    #[must_use]
+    pub(crate) fn continued(path: PathBuf, anchor: TailAnchor) -> Option<Self> {
+        let on_disk = FileIdentity::of(&path)?;
+        if on_disk != anchor.identity {
+            return None;
+        }
+        let len = std::fs::metadata(&path).ok()?.len();
+        if len < anchor.start {
+            return None;
+        }
+        // The captured head (first HEAD_PROBE bytes at capture) keeps guarding
+        // replacements after the reopen; a live tail captured none, so hash
+        // the present head now.
+        let head = anchor.head.or_else(|| hash_head(&path, len));
+        Some(Self {
+            path,
+            offset: anchor.start,
+            partial: String::new(),
+            resume: Some(ResumeState {
+                identity: anchor.identity,
+                head,
+                verified: anchor.current,
+                displaced: anchor.displaced || !anchor.current,
+                absent: false,
+            }),
+        })
     }
 
     /// Whether the resume boundary was proven (false for an unverified resume).

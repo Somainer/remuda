@@ -946,6 +946,7 @@ it("shows ? while an effort switch is pending and read-back has been withdrawn",
       model="opus"
       effort={effortAt("claude", 4, false)}
       effortEffective={null}
+      effortReadbackWithdrawn
       effortPending={{ word: "max", queued: false }}
       onEffort={vi.fn()}
     />,
@@ -953,8 +954,33 @@ it("shows ? while an effort switch is pending and read-back has been withdrawn",
   const chip = screen.getByTestId("model-effort-chip");
   expect(chip).toHaveAttribute("data-effort-effective", "unknown");
   expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("?");
+  // The withdrawn title is specific (not the generic waiting title).
+  expect(chip).toHaveAttribute("title", expect.stringContaining("回读不可用"));
   // The pending tag is still rendered (the switch outcome is awaited).
   expect(screen.getByTestId("model-effort-pending")).toHaveTextContent("切换中");
+});
+
+it("shows the pending word when a pending switch has simply never read back", () => {
+  // r7 item 4(a): a null effective with NO readbackAvailable:false edge is
+  // "not read back yet", not "withdrawn": the chip keeps the pending word
+  // and must not show the withdrawn title.
+  render(
+    <Composer
+      instanceId="ins_never_read_pending"
+      mobile={false}
+      onSend={vi.fn()}
+      kind="claude"
+      model="opus"
+      effort={effortAt("claude", 4, false)}
+      effortEffective={null}
+      effortPending={{ word: "max", queued: false }}
+      onEffort={vi.fn()}
+    />,
+  );
+  const chip = screen.getByTestId("model-effort-chip");
+  expect(chip).toHaveAttribute("data-effort-effective", "pending");
+  expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("max");
+  expect(chip).not.toHaveAttribute("title", expect.stringContaining("回读不可用"));
 });
 
 it("shows the pending word when read-back is still available during a switch", () => {

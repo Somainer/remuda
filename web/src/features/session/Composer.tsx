@@ -108,6 +108,7 @@ export function Composer({
   effort,
   onEffort,
   effortEffective,
+  effortReadbackWithdrawn = false,
   effortPending,
   onModel,
   contextLabel,
@@ -174,6 +175,11 @@ export function Composer({
   onEffort?: (next: EffortSelection) => void;
   /** §9.1 transcript-read-back level; null/undefined = unobserved (`?`). */
   effortEffective?: EffortEffectiveView | null;
+  /** r7 item 4(a): true ONLY after an explicit readbackAvailable:false edge
+   *  (or a Hub projection going level→null). A never-read-back session stays
+   *  false even though effortEffective is null, so a pending push-down there
+   *  shows the pending word rather than a withdrawn "?". */
+  effortReadbackWithdrawn?: boolean;
   /** §9.1 a push-down in flight (chip shows 切换中 / 排队中 until read-back). */
   effortPending?: { word: string; queued: boolean } | null;
   onModel?: (model: string) => void;
@@ -845,10 +851,11 @@ export function Composer({
   // with a 切换中 / 排队中 tag instead of going ambiguous.
   const effectiveUnknown = isEffortUnknown(effortEffective);
   const pendingLabel = effortPending?.word ?? null;
-  // r6 item 8(b): while a push-down is pending AND read-back has been
-  // withdrawn (no effective level), the chip renders "?" — not the pending
-  // word, which would imply the old level still holds.
-  const withdrawnPending = effectiveUnknown && Boolean(effortPending);
+  // r7 item 4(a): "?" during a pending push-down ONLY after an explicit
+  // read-back withdrawal. A session that has simply never read back a level
+  // (effortEffective null but no readbackAvailable:false edge) keeps showing
+  // the pending word instead of a false "?" and a misleading withdrawn title.
+  const withdrawnPending = effortReadbackWithdrawn && Boolean(effortPending);
   const effectiveWord = pendingLabel ?? effectiveLabel(effortEffective);
   // The chip word: "?" while read-back is withdrawn during a push-down,
   // otherwise the pending word, "?" when unknown, or the effective level.

@@ -1207,11 +1207,13 @@ impl ShellPtyDriver {
                     .parent()
                     .map(std::path::Path::to_path_buf)
             });
-        // r6 item 2: the catalog/settings refresh must read the SAME env and
-        // config dir the child receives (the pin overrides extra_env), so
-        // build it through the single source of truth rather than a bespoke
-        // chain that could let an extra_env CLAUDE_CONFIG_DIR win again.
-        let catalog_env: Vec<(String, String)> = child_env_layers(&self.options, &recipe)?.entries;
+        // r6 item 2 / r7 item 4(b): the catalog/settings refresh must read the
+        // SAME env and config dir the child receives (the pin overrides
+        // extra_env). Reuse the env layers built BEFORE the child spawned
+        // (line above): recomputing them here was a second fallible call
+        // AFTER spawn whose `?` returned straight through spawn_at, skipping
+        // the launch-failure teardown and orphaning the child.
+        let catalog_env: Vec<(String, String)> = child_env.entries.clone();
         let model_catalog = crate::model_discovery::resolve_catalog(
             Some(std::path::Path::new(&recipe.native_home)),
             host_config_dir.as_deref(),

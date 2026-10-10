@@ -81,6 +81,12 @@ impl ClaudeSdkDriver {
     ) -> crate::claude_print::test_barrier::WriteCommitBarrier {
         self.inner.arm_write_commit_barrier()
     }
+
+    /// Test-only (`test-stub`): force the terminal exit build to fail.
+    #[cfg(feature = "test-stub")]
+    pub fn force_exit_build_to_fail(&self) {
+        self.inner.force_exit_build_to_fail();
+    }
 }
 
 #[async_trait]

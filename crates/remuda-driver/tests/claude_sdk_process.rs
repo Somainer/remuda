@@ -1438,3 +1438,39 @@ async fn a_missing_image_send_errors_and_the_next_turn_still_starts_and_results(
 
     driver.close().await.expect("close");
 }
+
+/// ma-sdk-state r6 item 4: when the terminal exit observation build errors,
+/// the reserved channel permit (taken BEFORE the build) must be released so the
+/// RunHandle still reaches clean EOF after close. Pre-fix the permit stayed
+/// parked in Inner.exit_permit and recv() blocked forever.
+#[tokio::test]
+async fn a_failing_exit_observation_build_still_closes_the_run_handle_to_eof() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Arm the fault seam: emit_exit's observation build fails after taking the
+    // terminal permit.
+    driver.force_exit_build_to_fail();
+
+    driver
+        .close()
+        .await
+        .expect("close still acks despite the exit-build fault");
+
+    // Drain every buffered observation; the stream must TERMINATE (None) rather
+    // than hang with the permit still parked. Pre-fix this loop never reaches
+    // EOF. The forced fault suppresses the terminal `exited` observation itself.
+    let drain = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut count = 0usize;
+        while let Some(_obs) = handle.recv().await {
+            count += 1;
+        }
+        count
+    })
+    .await;
+    assert!(
+        drain.is_ok(),
+        "RunHandle must reach EOF after close even when the exit build errors: {drain:?}"
+    );
+}

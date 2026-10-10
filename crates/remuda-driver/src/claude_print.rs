@@ -492,6 +492,11 @@ struct Inner {
     /// tests driving different children in one process never share a barrier.
     #[cfg(feature = "test-stub")]
     barrier: test_barrier::Slot,
+    /// ma-sdk-state r6 item 4: test fault seam — make the terminal exit
+    /// observation build in `emit_exit` fail AFTER the reserved permit has been
+    /// taken, so a test can prove the RunHandle still reaches EOF on close.
+    #[cfg(feature = "test-stub")]
+    exit_build_fails: std::sync::atomic::AtomicBool,
 }
 
 /// Native Claude print driver (`claude -p` stream-json).
@@ -533,6 +538,17 @@ impl ClaudePrintDriver {
     #[must_use]
     pub fn arm_write_commit_barrier(&self) -> test_barrier::WriteCommitBarrier {
         test_barrier::arm(&self.inner.barrier)
+    }
+
+    /// Test-only (`test-stub`): make the terminal exit observation build fail
+    /// inside `emit_exit` (after the reserved channel permit was taken), to
+    /// prove the RunHandle still reaches EOF after close (ma-sdk-state r6 item
+    /// 4).
+    #[cfg(feature = "test-stub")]
+    pub fn force_exit_build_to_fail(&self) {
+        self.inner
+            .exit_build_fails
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Build a driver from explicit options.
@@ -595,6 +611,8 @@ impl ClaudePrintDriver {
                 child_exit_status: Mutex::new(None),
                 #[cfg(feature = "test-stub")]
                 barrier: std::sync::Mutex::new(None),
+                #[cfg(feature = "test-stub")]
+                exit_build_fails: std::sync::atomic::AtomicBool::new(false),
             }),
             reader: Mutex::new(None),
             publisher: Mutex::new(None),
@@ -2030,6 +2048,18 @@ async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
     let permit = inner.exit_permit.lock().await.take();
     let observation = {
         let mut mapper = inner.mapper.lock().await;
+        // ma-sdk-state r6 item 4: test fault seam — fail the build AFTER the
+        // permit was taken. Dropping `permit` on this early return is exactly
+        // what must free the terminal slot so the RunHandle reaches EOF.
+        #[cfg(feature = "test-stub")]
+        if inner
+            .exit_build_fails
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DriverError::CarrierUnavailable(
+                "test fault: forced exit observation build failure".into(),
+            ));
+        }
         let session_id = mapper.session_id.clone();
         mapper.lifecycle(
             LifecycleTopic::Session,

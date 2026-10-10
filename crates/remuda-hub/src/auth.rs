@@ -178,7 +178,54 @@ fn read_persisted_token(path: &Path) -> Result<Option<String>, HubError> {
 ///            adopted at a no-source start) and rotation is allowed.
 const BOOTSTRAP_EXPLICIT_MARKER: &str = "bootstrap-token-source-explicit";
 
+/// Test-only: when armed ON THE TEST THREAD, `write_private` fails for a file
+/// whose name contains the needle. Thread-local so parallel auth tests each
+/// call resolve_bootstrap on their own thread and never see another test's
+/// fault (production write_private runs synchronously on the caller thread).
+/// c-bootstrap-dev r8 item 3.
+#[cfg(test)]
+thread_local! {
+    static WRITE_FAULT_NEEDLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_write_fault(needle: &str) {
+    WRITE_FAULT_NEEDLE.with(|n| *n.borrow_mut() = Some(needle.to_owned()));
+}
+
+#[cfg(test)]
+fn clear_write_fault() {
+    WRITE_FAULT_NEEDLE.with(|n| *n.borrow_mut() = None);
+}
+
+/// Test-only RAII guard clearing the thread-local fault at scope end.
+#[cfg(test)]
+struct WriteFaultGuard;
+
+#[cfg(test)]
+impl Drop for WriteFaultGuard {
+    fn drop(&mut self) {
+        clear_write_fault();
+    }
+}
+
 fn write_private(path: &Path, contents: &str) -> Result<(), HubError> {
+    #[cfg(test)]
+    {
+        let faulted = WRITE_FAULT_NEEDLE.with(|needle| {
+            let n = needle.borrow();
+            n.as_deref().is_some_and(|needle| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(needle))
+            })
+        });
+        if faulted {
+            return Err(HubError::Internal(
+                "bootstrap: injected write fault".to_owned(),
+            ));
+        }
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -1001,6 +1048,18 @@ mod tests {
         let stamped = std::fs::read(&stamp_path).unwrap();
         assert_ne!(stamped, expired_bytes, "a real touch re-stamps");
         assert!(bootstrap_within_ttl(dir.path(), 24));
+        // c-bootstrap-dev r8 item 2: the deferred touch is consumed ONCE —
+        // another restart with the same (now current) mtime does not reissue.
+        let mtime_after = std::fs::metadata(&code_file)
+            .and_then(|m| m.modified())
+            .expect("code file mtime");
+        resolve_bootstrap(&mut config).expect("resolve after consumed touch");
+        assert_eq!(
+            std::fs::read(&stamp_path).unwrap(),
+            stamped,
+            "the (stamp, now] touch reissues exactly once"
+        );
+        let _ = mtime_after;
         // Future-date it again after the fresh stamp: the fresh stamp must
         // survive the next restart byte-for-byte.
         set_mtime(&code_file, future + 10, 0);
@@ -1876,6 +1935,53 @@ mod tests {
             "replaced-code"
         );
         assert!(bootstrap_within_ttl(dir2.path(), 24));
+    }
+
+    /// c-bootstrap-dev r8 item 3: a REAL-FUNCTION fault (not a hand-staged
+    /// residue) pins the explicit-path durable order — marker BEFORE the
+    /// token/stamp. If resolve_bootstrap were reordered to persist first, the
+    /// marker-fault test below would instead find a written token, and the
+    /// stamp-fault test would find a written stamp before the marker.
+    #[test]
+    fn explicit_order_pinned_by_real_write_faults() {
+        // Fault 1: marker write fails → nothing else may be written.
+        let _fault = WriteFaultGuard;
+        let dir = tempfile::tempdir().expect("data dir");
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "real-fault-code-at-least-16-xx").expect("code file");
+        arm_write_fault(BOOTSTRAP_EXPLICIT_MARKER);
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "real-fault-code-at-least-16-xx".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file.clone());
+        assert!(
+            resolve_bootstrap(&mut config).is_err(),
+            "marker fault aborts"
+        );
+        assert!(
+            !dir.path().join("bootstrap-token").is_file(),
+            "marker-before-token: a marker fault writes no token"
+        );
+        assert!(
+            !dir.path().join("bootstrap-issued-at").is_file(),
+            "marker-before-stamp: a marker fault writes no stamp"
+        );
+        // Fault 2: stamp write fails → the marker IS durable, token is NOT.
+        let dir2 = tempfile::tempdir().expect("data dir 2");
+        let code_file2 = dir2.path().join("access-code");
+        write_private(&code_file2, "real-fault-code-two-at-least-16-x").expect("code file 2");
+        arm_write_fault("bootstrap-issued-at");
+        let mut cfg2 = HubConfig::for_test(dir2.path().to_path_buf());
+        cfg2.bootstrap_token = "real-fault-code-two-at-least-16-x".to_owned();
+        cfg2.bootstrap_source = BootstrapSource::ExplicitFile(code_file2);
+        assert!(resolve_bootstrap(&mut cfg2).is_err(), "stamp fault aborts");
+        assert!(
+            dir2.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file(),
+            "marker committed before the stamp fault"
+        );
+        assert!(
+            !dir2.path().join("bootstrap-token").is_file(),
+            "stamp-before-token: a stamp fault writes no token"
+        );
     }
 
     /// Round 7 item 1, negative contract: an explicit start that died in the

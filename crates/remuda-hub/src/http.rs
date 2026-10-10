@@ -2134,7 +2134,14 @@ async fn resume_lineage(
                 .and_then(|reference| reference.get("spec").cloned())
                 .unwrap_or_else(|| current.spec_for_resume());
             if let Some(object) = spec.as_object_mut() {
-                object.insert("driver".into(), json!(current.driver));
+                // ma-lineage r7 item 6(a): honour the requested resume mode's
+                // driver on the FRESH path too — a {mode:"terminal"}
+                // continuation of a sessionless/failed chapter relaunches
+                // claude-pty, not the current chapter's driver (claude-sdk).
+                // Without this the row was inserted with the wrong driver and
+                // only corrected if the Node's reply carried /instance/driver.
+                let driver = mode.driver(&current.driver);
+                object.insert("driver".into(), json!(driver));
                 object.insert("resumedFrom".into(), json!(current.instance_id));
                 object.insert("parentInstanceId".into(), json!(current.parent_instance_id));
                 object.insert("hostId".into(), json!(current.host_id));
@@ -2213,6 +2220,14 @@ async fn resume_lineage(
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| "human".into());
+    // The resolved driver from the prepared spec — same value the queued
+    // create/resume sends, stamped on the successor row (r7 item 6a).
+    let successor_driver = spec
+        .get("driver")
+        .and_then(Value::as_str)
+        .filter(|driver| !driver.is_empty())
+        .unwrap_or(&current.driver)
+        .to_string();
     let result = state
         .store
         .continuation_resume(crate::store::ContinuationResumeRequest {
@@ -2224,6 +2239,7 @@ async fn resume_lineage(
             prompt: body.prompt.clone(),
             origin,
             title,
+            driver: successor_driver,
         })
         .await
         .map_err(map_store)?;

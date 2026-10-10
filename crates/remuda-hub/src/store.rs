@@ -1306,6 +1306,11 @@ pub struct ContinuationResumeRequest {
     pub origin: String,
     /// UI title for the successor.
     pub title: Option<String>,
+    /// Driver the successor launches, resolved by the handler's resume mode
+    /// (`ResumeMode::driver`) — used for the successor ROW so it never starts
+    /// life stamped with the predecessor's driver waiting for the Node to
+    /// correct it (ma-lineage r7 item 6a).
+    pub driver: String,
 }
 
 /// Payload of the winning continuation transaction.
@@ -1520,7 +1525,7 @@ fn continuation_resume_tx(
             current.host_id,
             current.workspace_id,
             current.kind,
-            current.driver,
+            request.driver,
             connectivity,
             request.title,
             journal_id,

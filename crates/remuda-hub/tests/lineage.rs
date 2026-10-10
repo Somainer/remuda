@@ -1138,7 +1138,9 @@ async fn a_host_lost_live_seat_is_closed_before_resume_and_keeps_no_ended_at() -
 #[tokio::test]
 async fn a_resume_after_a_host_lost_current_chapter_runs_continuation_not_replay() -> Result<()> {
     let ctx = Ctx::boot().await?;
-    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let enroll = ctx.hub.mint_enroll_token(5).await?;
+    let (mut node, node_token) = FakeNode::connect_bearer(&ctx.hub, &ctx.host, &enroll).await?;
+    let node_token = node_token.context("node token")?;
     let (x, _token) = ctx.seat(&mut node, None).await?;
     ctx.report_session(&node, &x, true).await?;
 
@@ -1154,26 +1156,18 @@ async fn a_resume_after_a_host_lost_current_chapter_runs_continuation_not_replay
     assert_eq!(method, "instance.resume");
     // Y reaches a live lifecycle (the Node launches and initializes it).
     ctx.report_session(&node, &y, false).await?;
-    {
-        let db = rusqlite::Connection::open(&ctx.db_path)?;
-        db.execute(
-            "UPDATE hosts SET state = 'unreachable', offline_since = '2000-01-01T00:00:00Z'
-             WHERE id = ?1",
-            rusqlite::params![ctx.host],
-        )?;
-    }
+
+    // ma-lineage r7 item 6(b): drop the actual node link instead of flipping
+    // hosts.state in SQLite while the socket stays connected.
+    node.disconnect().await;
+    drop(node);
+    ctx.wait_host_offline().await?;
     let (changed, _) = ctx.hub.store().expect("store").expire_lost_hosts(0).await?;
     assert_eq!(changed, 1, "Y is host-lost");
 
-    // Bring the node back (same host link; resume endpoint tolerates this via
-    // the continuation's own checks when the link is live in the test).
-    {
-        let db = rusqlite::Connection::open(&ctx.db_path)?;
-        db.execute(
-            "UPDATE hosts SET state = 'online', offline_since = NULL WHERE id = ?1",
-            rusqlite::params![ctx.host],
-        )?;
-    }
+    // Reconnect with the persistent node token on the SAME epoch: Y stays the
+    // ambiguous (potentially live) host-lost chapter.
+    let mut node = FakeNode::connect_with_token(&ctx.hub, &ctx.host, &node_token).await?;
 
     // Resume addressed to the OLD chapter X while the CURRENT chapter Y is
     // host-lost: continuation, not a {replayed} dead Y.
@@ -1195,8 +1189,9 @@ async fn a_resume_after_a_host_lost_current_chapter_runs_continuation_not_replay
     let (method, _) = node.next_frame().await?;
     assert_eq!(method, "instance.resume");
 
-    // Repeating the resume addresses the new current Z (live): an idempotent
-    // replay is correct here, and it must not send more close frames.
+    // Repeating the resume addresses the new current Z (requested until the
+    // node acks): an idempotent replay is correct here, and it must not send
+    // more close frames.
     let replay = ctx.resume(&x, &ctx.human).await?.error_for_status()?;
     assert_eq!(replay.status(), 200);
     let body: Value = replay.json().await?;
@@ -2497,6 +2492,41 @@ async fn a_terminal_mode_continuation_launches_claude_pty_with_the_session() -> 
     Ok(())
 }
 
+/// ma-lineage r7 item 6(a): a `{mode:"terminal"}` continuation that takes the
+/// FRESH path (the chapter ended without ever reporting a native session)
+/// launches claude-pty — both in the queued create spec and on the successor
+/// ROW — not the predecessor's claude-sdk driver.
+#[tokio::test]
+async fn a_terminal_mode_fresh_recovery_launches_claude_pty() -> Result<()> {
+    let ctx = Ctx::boot().await?;
+    let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await?;
+    let (x, _token) = ctx.seat(&mut node, None).await?;
+    // Deliberately report NO session: just a real process-end entity event.
+    node.appends.send((x.clone(), exited()))?;
+    ctx.wait_until(&x, |view| view["lifecycle"] == json!("exited"))
+        .await?;
+
+    let response = ctx.resume_mode(&x, &ctx.human, "terminal").await?;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await?;
+    assert_eq!(
+        body["instance"]["driver"],
+        json!("claude-pty"),
+        "the successor row is stamped with the mode-mapped driver immediately"
+    );
+
+    let (method, params) = node.next_frame().await?;
+    assert_eq!(method, "instance.create", "no session means a fresh launch");
+    assert_eq!(params["spec"]["driver"], json!("claude-pty"));
+    assert!(
+        params["spec"]
+            .get("resumeSessionId")
+            .is_none_or(|v| v.is_null()),
+        "fresh recovery carries no resume session id"
+    );
+    Ok(())
+}
+
 /// r3 item 4: an immediate retry of a sessionless fresh recovery returns the
 /// SAME successor (replayed) before the successor reports a session — no new
 /// generation and no extra command.
@@ -2714,6 +2744,7 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             prompt: None,
             origin: "human".to_owned(),
             title: None,
+            driver: "claude-sdk".to_owned(),
         };
         store1.continuation_resume(req).await
     });
@@ -2742,6 +2773,7 @@ async fn two_concurrent_resumes_produce_one_successor() -> Result<()> {
             prompt: None,
             origin: "human".to_owned(),
             title: None,
+            driver: "claude-sdk".to_owned(),
         };
         store2.continuation_resume(req).await
     });

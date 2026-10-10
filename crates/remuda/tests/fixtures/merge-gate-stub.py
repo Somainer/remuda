@@ -14,6 +14,9 @@ with trace.open("a", encoding="utf-8") as output:
         "cwd": str(Path.cwd()),
         "target": os.environ.get("CARGO_TARGET_DIR"),
         "incremental": os.environ.get("CARGO_INCREMENTAL"),
+        "hubListen": os.environ.get("HUB_E2E_LISTEN"),
+        "webPort": os.environ.get("HUB_E2E_WEB_PORT"),
+        "upstreamListen": os.environ.get("HUB_E2E_UPSTREAM_LISTEN"),
     }) + "\n")
 
 if step == "cargo-test" and os.environ.get("REMUDA_TEST_GATE_CAS"):

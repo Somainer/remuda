@@ -4,7 +4,7 @@
 //! so the Hub crate can be run before that subcommand is wired.
 
 use anyhow::Context;
-use remuda_hub::{HubConfig, serve};
+use remuda_hub::{BootstrapSource, HubConfig, serve};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -24,8 +24,21 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(listen) = std::env::var("REMUDA_LISTEN") {
         config.listen = listen.parse::<SocketAddr>().context("REMUDA_LISTEN")?;
     }
-    if let Ok(token) = std::env::var("REMUDA_BOOTSTRAP_TOKEN") {
-        config.bootstrap_token = token;
+    match std::env::var("REMUDA_BOOTSTRAP_TOKEN") {
+        // Operator-supplied provenance: the Hub must never mint over this
+        // code. Trim the way SecretRef::resolve does so a trailing newline or
+        // spaces from `$'secret\n'` cannot re-stamp the code on every restart.
+        Ok(token) if !token.trim().is_empty() => {
+            config.bootstrap_token = token.trim().to_owned();
+            config.bootstrap_source = BootstrapSource::ExplicitEnv;
+        }
+        // An empty code would accept empty-string logins and overwrite a
+        // previously persisted real code; refuse startup instead.
+        Ok(_) => anyhow::bail!("REMUDA_BOOTSTRAP_TOKEN must not be empty"),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("REMUDA_BOOTSTRAP_TOKEN is not valid UTF-8")
+        }
     }
     if let Ok(value) = std::env::var("REMUDA_COOKIE_SECURE") {
         config.cookie_secure = value != "0" && value != "false";

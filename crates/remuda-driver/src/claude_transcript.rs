@@ -96,13 +96,21 @@ fn invalid_input(message: impl Into<String>) -> std::io::Error {
 /// the staging walk requires a real file/directory). Same kind the
 /// descriptor-relative walk itself returns, so callers cannot distinguish a
 /// walk-level refusal from an explicit one.
-/// Validate the COMPLETE sidecar trees (`<session>/` and `memory/`) under an
-/// inherited destination slug dir: every descendant, at every nesting level,
-/// must be a real directory or regular file reached through pinned fds. Round
-/// 6 item 3: checking only the two roots let a NESTED link through
-/// (`<S>/subagents -> /outside`, `memory/MEMORY.md -> /outside`); a child that
-/// later walks those sidecars relative to the pinned project dir would escape.
-fn validate_inherited_sidecar_trees(
+/// Validate the COMPLETE existing destination sidecar trees (`<session>/` and
+/// `memory/`) under the destination slug dir: every descendant, at every
+/// nesting level, must be a real directory or regular file reached through
+/// pinned fds. Round 6 item 3: checking only the two roots let a NESTED link
+/// through (`<S>/subagents -> /outside`, `memory/MEMORY.md -> /outside`); a
+/// child that later walks those sidecars relative to the pinned project dir
+/// would escape.
+///
+/// Round 7 item 3: this runs BEFORE accepting EITHER outcome — a cross-home
+/// stage into a fresh managed home AND an inherited-home no-op. Publication
+/// only examines destination paths the SOURCE manifest selects, so a link
+/// planted at a destination-only path (`NEW/projects/<slug>/<S>/subagents
+/// -> /outside`, absent from the source tree) was never examined on a
+/// cross-home stage and the resumed child followed it.
+fn validate_existing_destination_trees(
     dest_dir_fd: &DirFd,
     session_id: &str,
     max_depth: u32,
@@ -112,23 +120,25 @@ fn validate_inherited_sidecar_trees(
             match entry.kind {
                 LeafKind::Directory => {
                     let root_fd = dest_dir_fd.subdir(root.as_bytes())?;
-                    root_fd.reject_symlink_descendants(max_depth).map_err(|error| {
-                        symlink_refused(format!(
-                            "inherited resume sidecar tree {root}/{} contains a symlink or special \
-                             file; refusing the no-op: {error}",
-                            error.at
-                        ))
-                    })?;
+                    root_fd
+                        .reject_symlink_descendants(max_depth)
+                        .map_err(|error| {
+                            symlink_refused(format!(
+                                "resume destination sidecar tree {root}/{} contains a symlink or \
+                             special file; refusing the stage: {error}",
+                                error.at
+                            ))
+                        })?;
                 }
                 LeafKind::Regular => {
                     // A regular file wearing a sidecar-directory name is not an
                     // escape, but the child expects a directory there; leave
-                    // the no-op decision untouched.
+                    // it untouched rather than adopt or replace it.
                 }
                 LeafKind::Symlink | LeafKind::Other => {
                     return Err(symlink_refused(format!(
-                        "inherited resume sidecar root {root} is a symlink or non-directory; \
-                         refusing the no-op"
+                        "resume destination sidecar root {root} is a symlink or non-directory; \
+                         refusing the stage"
                     )));
                 }
             }
@@ -927,6 +937,16 @@ fn stage_for_resume_into_pinned_home(
     let transcript_name_bytes = transcript_name.as_bytes().to_vec();
     let dest_transcript = dest_dir.join(&transcript_name);
 
+    // Round 7 item 3: validate the WHOLE existing destination session/memory
+    // tree before accepting EITHER outcome. Publication below only classifies
+    // destination paths selected by the SOURCE manifest, so a cross-home stage
+    // into a fresh managed home never examined a destination-only link planted
+    // ahead of time (`<NEW>/projects/<slug>/<S>/subagents -> /outside`); the
+    // resumed child then followed it out of the managed home. The inherited
+    // no-op is covered by this same check, so its early return needs no
+    // separate validation.
+    validate_existing_destination_trees(&dest_dir_fd, session_id, limits.max_depth)?;
+
     // Round 3 item 1: classify the destination leaf BEFORE any same-file
     // identity check. A symlinked `<S>.jsonl` pointing at the predecessor is a
     // refusal, not an inherited-home no-op.
@@ -949,14 +969,11 @@ fn stage_for_resume_into_pinned_home(
             if dest_leaf.identity()? == src_identity
                 && Some(dest_dir_identity) == src_dir_fd.dir_identity().ok()
             {
-                // Same file in the SAME inherited project directory. Round 6
-                // item 3: even the inherited-home no-op must not return before
-                // walking the COMPLETE `<S>/` and `memory/` trees: a nested
-                // symlink descendant (`<S>/subagents -> /outside`,
-                // `memory/MEMORY.md -> /outside`) under a real root must refuse
-                // the no-op. The transcript itself is already proven a real
-                // regular leaf above.
-                validate_inherited_sidecar_trees(&dest_dir_fd, session_id, limits.max_depth)?;
+                // Same file in the SAME inherited project directory: the
+                // complete `<S>/` and `memory/` trees were already validated
+                // link-free above (round 7 item 3), before either outcome was
+                // accepted, so this no-op cannot carry a nested destination
+                // link.
                 return Ok(StagedResume {
                     transcript: dest_transcript,
                     sidecar_dirs: Vec::new(),
@@ -4313,6 +4330,93 @@ mod tests {
             std::fs::read_to_string(&sentinel).unwrap(),
             "OUTSIDE-HOME\n",
             "the outside tree stays byte-identical"
+        );
+    }
+
+    /// Round 7 item 3: a link planted in the destination tree at a path the
+    /// SOURCE manifest does not select (`NEW/projects/<slug>/<S>/subagents
+    /// -> /outside`) must be examined and refuse a cross-home stage. The
+    /// source conversation has no `<S>/` sidecar dir, so publication never
+    /// walked that destination path; the resumed child would have followed
+    /// the planted link out of the managed home.
+    #[cfg(unix)]
+    #[test]
+    fn r7_cross_home_stage_refuses_a_destination_only_sidecar_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("workspace");
+        let session = "01993ab0-0000-7000-8000-0000000000e5";
+        let old_home = tmp.path().join("old");
+        let source = transcript_layout(&old_home, &ws, session);
+        write_file(&source, "cross home, source has no sidecar dir\n");
+
+        // Pre-plant the destination: a real `<S>` dir with a linked
+        // `subagents` beyond the new home; the source manifest contains no
+        // `<S>/...` entry that would make publication inspect it.
+        let new_home = tmp.path().join("new");
+        let slug = encode_project_dir(&ws.canonicalize().unwrap_or(ws.clone()));
+        let dest_slug = new_home.join("projects").join(&slug);
+        let planted_side = dest_slug.join(session);
+        std::fs::create_dir_all(&planted_side).expect("planted session sidecar dir");
+        let outside = tmp.path().join("outside-subagents");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let sentinel = outside.join("sentinel.txt");
+        write_file(&sentinel, "OUTSIDE-SIDE\n");
+        symlink(&outside, planted_side.join("subagents")).expect("destination-only link");
+
+        let error = stage_for_resume(&source, &new_home, &ws, session)
+            .expect_err("a destination-only symlink rejects the cross-home stage");
+        assert!(
+            error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.to_string().contains("symlink"),
+            "{error}"
+        );
+        // Nothing is published: the destination keeps no transcript or marker.
+        assert!(
+            !dest_slug.join(format!("{session}.jsonl")).exists(),
+            "no transcript is published when the destination tree is unsafe"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "OUTSIDE-SIDE\n",
+            "the outside tree stays byte-identical"
+        );
+    }
+
+    /// Companion to the item-3 refusal: a destination-only sidecar entry that
+    /// is a REAL regular file (no link) is validated, left untouched, and does
+    /// not block the cross-home stage — validation refuses links, not foreign
+    /// files.
+    #[cfg(unix)]
+    #[test]
+    fn r7_cross_home_stage_keeps_a_real_destination_only_sidecar_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("workspace");
+        let session = "01993ab0-0000-7000-8000-0000000000e6";
+        let old_home = tmp.path().join("old");
+        let source = transcript_layout(&old_home, &ws, session);
+        write_file(&source, "real foreign file case\n");
+
+        let new_home = tmp.path().join("new");
+        let slug = encode_project_dir(&ws.canonicalize().unwrap_or(ws.clone()));
+        let dest_slug = new_home.join("projects").join(&slug);
+        let planted_side = dest_slug.join(session);
+        std::fs::create_dir_all(&planted_side).expect("planted session sidecar dir");
+        let foreign = planted_side.join("older-turn.jsonl");
+        write_file(&foreign, "pre-existing real sidecar\n");
+
+        let staged = stage_for_resume(&source, &new_home, &ws, session)
+            .expect("a link-free destination tree is accepted");
+        assert_eq!(
+            std::fs::read_to_string(&staged.transcript).unwrap(),
+            "real foreign file case\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&foreign).unwrap(),
+            "pre-existing real sidecar\n",
+            "the real destination-only file is validated and kept"
         );
     }
 }

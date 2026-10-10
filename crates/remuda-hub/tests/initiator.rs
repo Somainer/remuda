@@ -1624,6 +1624,13 @@ async fn a_cancel_between_a_result_preread_and_its_writer_keeps_the_row_cancelin
 
 /// Shared setup: a LAND job claimed to Running and then moved to Canceling
 /// exactly as the cancel writer leaves it (state, lane/host pin, stamp).
+///
+/// The cancel stamp is NOW, not a backdated 2020 value: the Hub's 1 s tick
+/// runs `finish_expired_cancels` concurrently, and an expired stamp would
+/// let that loop settle the row before the result's pre-read — the old
+/// pre-read early-return would then make these tests pass with the writer
+/// guard reverted. With an unexpired stamp ONLY the armed seam can finish
+/// the row inside the result writer.
 async fn canceling_land_job(ctx: &Ctx) -> String {
     let (status, body) = ctx
         .agent_post(
@@ -1640,8 +1647,8 @@ async fn canceling_land_job(ctx: &Ctx) -> String {
         .unwrap()
         .expect("the queued land job claims to running");
     assert_eq!(claimed["state"], json!("running"), "{claimed}");
-    // The cancel commit: Running -> Canceling with the pin and stamp the
-    // real cancel writer records (no gate.cancel frame is needed here).
+    // The cancel commit: Running -> Canceling with the pin and a FRESH stamp
+    // the real cancel writer records (no gate.cancel frame is needed here).
     let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
     db.execute(
         "UPDATE gate_jobs
@@ -1649,10 +1656,10 @@ async fn canceling_land_job(ctx: &Ctx) -> String {
                 doc_json = json_set(
                     json_set(
                         json_set(doc_json, '$.state', 'canceling'),
-                        '$.cancelRequestedAt', '2020-01-01T00:00:00.000Z'),
+                        '$.cancelRequestedAt', strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                     '$.laneId', 'lane1'),
                 revision = revision + 1,
-                updated_at = '2020-01-01T00:00:00.000Z'
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
           WHERE id = ?1",
         rusqlite::params![job_id],
     )
@@ -1694,6 +1701,14 @@ async fn a_duplicate_base_moved_verdict_after_the_row_is_canceled_never_requeues
         .await
         .unwrap();
 
+    // The seam MUST have fired inside the result writer (if the pre-read had
+    // early-returned — e.g. the 1 s grace finisher settled the row first —
+    // the seam would still be armed and this assertion fails).
+    assert!(
+        ctx.store().take_test_finish_before_gate_mutate().is_none(),
+        "the finish seam did not fire inside the result writer"
+    );
+
     // A genuinely later third delivery now pre-reads Canceled as well and
     // must be ignored without any seam.
     ctx.hub
@@ -1719,6 +1734,10 @@ async fn a_duplicate_base_moved_verdict_after_the_row_is_canceled_never_requeues
         "the terminal finish stamp must survive the duplicate: {doc}"
     );
 
+    // Configure the lane ONLY now (the row is terminal): with an eligible
+    // lane the follow-up tick really would dispatch a wrongly-Queued row,
+    // which makes the no-gate.run assertion below meaningful.
+    ctx.configure_gate_lane().await;
     // The next scheduler tick must not re-dispatch: the row stays Canceled
     // and no gate.run frame reaches the Node.
     ctx.hub.test_gate_tick().await;
@@ -1759,6 +1778,14 @@ async fn a_grace_expiry_finish_between_a_result_preread_and_its_writer_keeps_the
         .await
         .unwrap();
 
+    // The grace seam MUST have fired inside the result writer (a fresh
+    // cancelRequestedAt keeps the real 1 s grace loop from settling the row
+    // first, so only the seam can have produced the terminal write here).
+    assert!(
+        ctx.store().take_test_finish_before_gate_mutate().is_none(),
+        "the grace finish seam did not fire inside the result writer"
+    );
+
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(
         doc["state"],
@@ -1770,6 +1797,9 @@ async fn a_grace_expiry_finish_between_a_result_preread_and_its_writer_keeps_the
         json!("canceled; run did not stop in time"),
         "the grace finisher's terminal evidence must survive: {doc}"
     );
+    // Eligible lane only once the row is terminal, so a tick genuinely would
+    // dispatch if the row were wrongly requeued.
+    ctx.configure_gate_lane().await;
     ctx.hub.test_gate_tick().await;
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(

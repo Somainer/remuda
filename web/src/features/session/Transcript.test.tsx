@@ -1713,9 +1713,13 @@ describe("font reflow compensator", () => {
     await act(async () => {
       await geo.nextFrame();
     });
-    // The above row's +40 is compensated exactly ONCE regardless of order; the
-    // anchor's viewport spot is held. A generic-hold + per-row double count
-    // would land at before + 80 in the below-first order.
+    // The above row's +40 is compensated exactly ONCE regardless of order and
+    // the anchor's viewport spot is held. Note (r8): at the tip the below-row
+    // observer never scrolls (the reflow anchor corrects the strictly-above
+    // row only), so the below-first ordering is redundant by design — the
+    // pre-r6 "before + 80" double count can no longer occur in either order
+    // after the r7 item-3 DOM-relative fix. This gate is retained as the
+    // order-independent anchor-stability regression check.
     expect(geo.top(), `two-row swap scrolled twice (order ${order})`).toBe(before + 40);
     expect(Math.abs(anchorOffset()), `anchor drifted (order ${order})`).toBeLessThanOrEqual(2);
   }
@@ -1927,6 +1931,14 @@ describe("font reflow compensator", () => {
       await Promise.resolve();
     });
     expect(geo.top(), "the streamed commit holds the drifted anchor").toBe(before + 40);
+    // The reflow anchor must still be armed at this point: if an earlier
+    // gesture/navigation had retired it, neither the streamed hold nor the
+    // row's own correction would engage and this expectation would pass for
+    // the wrong reason (nothing compensated at all).
+    expect(
+      screen.getByTestId("transcript-scroller").getAttribute("data-reflow-hold"),
+      "the reflow anchor retired before the row's RO delivery",
+    ).toBe("1");
     // n_6's own observer delivers after that commit: the reflow anchor's DOM
     // drift is now 0 and the ledger height delta must not be added again.
     await act(async () => {

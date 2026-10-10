@@ -498,6 +498,26 @@ export interface paths {
         patch: operations["hostPatch"];
         trace?: never;
     };
+    "/v1/hosts/{id}/dirs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Browse host directories for one to register (read-only, human-only)
+         * @description Human operator origin only; Bot and Agent origins are 403. Proxied to the addressed online Node's host.dirs.list RPC. The Node lists directories only, never follows symlinks, confines every path to its configured workspace_roots allowlist, hides dot-directories unless showHidden=true, and caps the reply (truncated=true past the cap). Never cached. Invalid query paths (relative, outside the Node allowlist, missing, or not a directory) return 400 with the Node's reason.
+         */
+        get: operations["hostDirsList"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/hosts/{id}/doctor": {
         parameters: {
             query?: never;
@@ -634,8 +654,8 @@ export interface paths {
          */
         post: operations["hostWorkspaceRegister"];
         /**
-         * Unregister a directory without deleting files or stopping sessions
-         * @description Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection.
+         * Unregister a directory without deleting files (refused while in use)
+         * @description Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection. Unbind only — files are never deleted. Returns 409 while a live session or an active (non-archived, non-done/failed) task still uses the workspace; ended sessions keep their history and do not block removal. The Node enforces the same live-session guard at prepare.
          */
         delete: operations["hostWorkspaceUnregister"];
         options?: never;
@@ -4201,6 +4221,39 @@ export interface operations {
             };
             401: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    hostDirsList: {
+        parameters: {
+            query?: {
+                /** @description Absolute Node directory to list; absent names the default start (home inside the allowlist, else the first allowed root). */
+                path?: string;
+                /** @description Include dot-directories; default false. */
+                showHidden?: boolean;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Node answer */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     hostDoctor: {

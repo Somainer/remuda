@@ -31,6 +31,33 @@ async fn main() -> Result<()> {
         .init();
 
     let dir = tempfile::tempdir().context("e2e data dir")?;
+    // r8 item 5 / r9 item 3: a per-run, owned browse root (never the shared
+    // /tmp path). With no env override it lives inside this run's TempDir (it
+    // dies with the data dir); when HUB_E2E_DIR_PICKER_ROOT names a
+    // caller-owned base, the harness creates and serves its OWN per-run
+    // subdirectory under it — the caller's directory is never deleted on
+    // exit, even when the dir-picker trigger is off.
+    let dirpicker_root = match std::env::var_os("HUB_E2E_DIR_PICKER_ROOT") {
+        Some(base) => {
+            let base = std::path::PathBuf::from(base);
+            let owned = base.join(format!(
+                "remuda-dirpicker-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&owned).context("create owned dir-picker root")?;
+            owned
+        }
+        None => {
+            let owned = dir.path().join("dirpicker-browse");
+            std::fs::create_dir_all(&owned).context("create dir-picker root")?;
+            owned
+        }
+    };
+    set_dir_picker_root(dirpicker_root);
     let origins = std::env::var("HUB_E2E_ORIGINS").unwrap_or_else(|_| {
         "http://127.0.0.1:4179,http://localhost:4179,http://127.0.0.1:4177".into()
     });
@@ -148,8 +175,13 @@ async fn main() -> Result<()> {
     // (see wait_frame_ack), or a dropped socket used to surface later as
     // unrelated offline/status flakes; instead print the causal error and exit
     // non-zero so the gate reports the real failure. Normal shutdown is ctrl-c.
+    // r9 item 3: the Playwright webServer launcher stops this process with
+    // SIGTERM (it does not deliver ctrl-c), so wait for both — otherwise
+    // the graceful shutdown path below never runs and the per-run browse
+    // tree (and the TempDir data dir) leak on every suite exit.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
+        _ = wait_for_sigterm() => {}
         outcome = &mut node => {
             let detail = match outcome {
                 Ok(Ok(())) => "fake Node task completed unexpectedly while the harness was running".to_string(),
@@ -158,6 +190,9 @@ async fn main() -> Result<()> {
             };
             eprintln!("FATAL hub_e2e fake Node exited before shutdown: {detail}");
             let _ = io::stderr().flush();
+            // process::exit skips TempDir drops: remove the owned browse tree
+            // explicitly (r9 item 3).
+            cleanup_dir_picker_fixtures();
             std::process::exit(1);
         }
     }
@@ -171,6 +206,28 @@ async fn main() -> Result<()> {
         host_b.abort();
     }
     drop(hub);
+    // r8 item 5 / r9 item 3: remove the per-run browse tree. This is always
+    // the harness-OWNED path (a per-run subdir of an env-provided base, or a
+    // directory inside the TempDir), so a caller-provided base itself is
+    // never deleted; the TempDir drop that follows removes the data dir.
+    cleanup_dir_picker_fixtures();
+    Ok(())
+}
+
+/// Completes when the process receives SIGTERM — the stop signal the
+/// Playwright webServer launcher sends (r9 item 3). Pending forever on
+/// non-unix, where ctrl-c stays the only graceful path.
+#[cfg(unix)]
+async fn wait_for_sigterm() -> std::io::Result<()> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
+        .recv()
+        .await;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm() -> std::io::Result<()> {
+    std::future::pending::<()>().await;
     Ok(())
 }
 
@@ -814,7 +871,11 @@ async fn fake_node(
             "root": "/tmp/remuda-project-a"
         }));
     }
-    let workspaces = Value::Array(workspaces);
+    // c-dirpicker: the mutation RPCs update this vec and advance the revision
+    // in place. The hello takes the initial snapshot below.
+    let mut workspace_rows: Vec<Value> = workspaces;
+    let mut workspace_revision: u64 = 1;
+    let workspaces = Value::Array(workspace_rows.clone());
     // The enroll hello announces an empty inventory — this process holds no
     // sessions yet — and a later restart re-announces whatever is still live.
     // The Hub reads a missing key as "cannot enumerate" and an empty array as
@@ -845,6 +906,9 @@ async fn fake_node(
         .to_owned();
     let _ = ready.send(());
     seed_host_file_fixtures()?;
+    // The c-dirpicker browse tree; cheap to seed for every harness run while
+    // the RPC that exposes it stays gated on HUB_E2E_DIR_PICKER.
+    seed_dir_picker_fixtures()?;
     let mut append_n = 0u64;
     // Minimal PTY harness for the xterm e2e specs. A terminal session is
     // registered on create, tty.attach returns its stable per-instance stream
@@ -983,9 +1047,153 @@ async fn fake_node(
                     send_rpc_ok(
                         &mut ws,
                         id,
-                        json!({"workspaceRevision": 1, "workspaces": workspaces}),
+                        workspace_snapshot(workspace_revision, &workspace_rows),
                     )
                     .await?;
+                }
+                // c-dirpicker: two-phase membership mutations behind the
+                // trigger; an untriggered harness answers "unknown method",
+                // exactly the shape an older Node gives the Hub.
+                // c-dirpicker round 6 item 1: read-only identity resolution,
+                // using the same canonicalize+containment+membership logic as
+                // the mutation arm below.
+                "workspace.resolve" if dir_picker_enabled() => {
+                    let path = params.get("path").and_then(Value::as_str).unwrap_or("");
+                    let resolved = (|| {
+                        let canonical = std::fs::canonicalize(path).ok()?;
+                        if !canonical.starts_with(std::fs::canonicalize(dir_picker_root()).ok()?) {
+                            return None;
+                        }
+                        let root = canonical.display().to_string();
+                        let row = workspace_rows
+                            .iter()
+                            .find(|row| row["root"].as_str() == Some(root.as_str()))?;
+                        Some(json!({
+                            "workspaceId": row["workspaceId"],
+                            "canonicalRoot": root,
+                        }))
+                    })();
+                    match resolved {
+                        Some(result) => send_rpc_ok(&mut ws, id, result).await?,
+                        None => {
+                            send_rpc_error(
+                                &mut ws,
+                                id,
+                                &format!("workspace {path} is not registered"),
+                            )
+                            .await?
+                        }
+                    }
+                }
+                "workspace.register" | "workspace.unregister" if dir_picker_enabled() => {
+                    let path = params.get("path").and_then(Value::as_str).unwrap_or("");
+                    let phase = params.get("phase").and_then(Value::as_str).unwrap_or("");
+                    let command_id = params.get("commandId").cloned().unwrap_or(Value::Null);
+                    let canonical = std::fs::canonicalize(path);
+                    let contained = canonical
+                        .as_ref()
+                        .ok()
+                        .filter(|path| {
+                            path.starts_with(
+                                std::fs::canonicalize(dir_picker_root()).unwrap_or_default(),
+                            )
+                        })
+                        .is_some();
+                    if !contained {
+                        send_rpc_error(
+                            &mut ws,
+                            id,
+                            &format!("workspace {path} is outside allowed workspace_roots"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let canonical = canonical?;
+                    let root_display = canonical.display().to_string();
+                    let existing = workspace_rows
+                        .iter()
+                        .position(|row| row["root"].as_str() == Some(root_display.as_str()));
+                    // Round 6 item 1: an unregister carries the resolved
+                    // workspaceId; verify id+root at both phases before
+                    // removing anything, exactly like the production Node.
+                    let expected_id = params.get("workspaceId").and_then(Value::as_str);
+                    if method == "workspace.unregister" {
+                        let matches = existing.is_some_and(|index| {
+                            expected_id.is_none()
+                                || expected_id == workspace_rows[index]["workspaceId"].as_str()
+                        });
+                        if !matches {
+                            send_rpc_error(
+                                &mut ws,
+                                id,
+                                "workspace unregister identity does not match the resolved \
+                                 workspace",
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                    if phase == "prepare" {
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({
+                                "workspaceRevision": workspace_revision,
+                                "workspaces": workspace_rows,
+                                "workspaceId": existing
+                                    .map(|index| workspace_rows[index]["workspaceId"].clone())
+                                    .unwrap_or(Value::Null),
+                                "commandId": command_id,
+                                "phase": "prepared",
+                            }),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let workspace_id;
+                    if method == "workspace.register" {
+                        if let Some(index) = existing {
+                            workspace_id = workspace_rows[index]["workspaceId"].clone();
+                        } else {
+                            let new_id = format!("wsp_dp_{}", uuid::Uuid::new_v4().simple());
+                            workspace_id = json!(new_id);
+                            workspace_rows.push(json!({
+                                "workspaceId": new_id,
+                                "hostId": host,
+                                "root": root_display,
+                            }));
+                            workspace_revision += 1;
+                        }
+                    } else {
+                        let Some(index) = existing else {
+                            send_rpc_error(
+                                &mut ws,
+                                id,
+                                &format!("workspace {path} is not registered"),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        workspace_id = workspace_rows[index]["workspaceId"].clone();
+                        workspace_rows.remove(index);
+                        workspace_revision += 1;
+                    }
+                    let mut snapshot = workspace_snapshot(workspace_revision, &workspace_rows);
+                    snapshot["workspaceId"] = workspace_id;
+                    snapshot["commandId"] = command_id;
+                    snapshot["phase"] = json!("settled");
+                    send_rpc_ok(&mut ws, id, snapshot).await?;
+                }
+                // c-dirpicker: real directories-only browse behind the trigger.
+                "host.dirs.list" if dir_picker_enabled() => {
+                    let registered_roots: Vec<String> = workspace_rows
+                        .iter()
+                        .map(|row| row["root"].as_str().unwrap_or("").to_owned())
+                        .collect();
+                    match dirs_list_answer(&params, &registered_roots) {
+                        Ok(result) => send_rpc_ok(&mut ws, id, result).await?,
+                        Err(error) => send_rpc_error(&mut ws, id, &error.to_string()).await?,
+                    }
                 }
                 // t-bind: in-memory worktree catalog/lease, gated on its own
                 // trigger so other specs see no worktree behaviour.
@@ -3354,6 +3562,134 @@ type FrameQueue = std::collections::VecDeque<String>;
 
 fn task_bind_enabled() -> bool {
     std::env::var("HUB_E2E_TASK_BIND").as_deref() == Ok("1")
+}
+
+// ── c-dirpicker directory browser + workspace mutations (HUB_E2E_DIR_PICKER=1) ─
+//
+// The fake Node gains a real, bounded directories-only `host.dirs.list` rooted
+// at DIRPICKER_BROWSE_ROOT, plus the two-phase workspace.register/unregister
+// protocol (mutating the announced snapshot). Behind an explicit trigger so
+// every other spec keeps the unchanged hello and the "unknown method"
+// behaviour for the mutation RPCs.
+
+fn dir_picker_enabled() -> bool {
+    std::env::var("HUB_E2E_DIR_PICKER").as_deref() == Ok("1")
+}
+
+/// Per-run browse allowlist root for the c-dirpicker spec (r8 item 5, r9
+/// item 3). It is always harness-OWNED: a per-run subdirectory of an
+/// env-provided base (HUB_E2E_DIR_PICKER_ROOT) or, by default, a directory
+/// inside the harness TempDir. It must never be a shared, hard-coded host
+/// `/tmp` path, and the caller's env-provided base itself must never be
+/// deleted — [`cleanup_dir_picker_fixtures`] removes only the owned path.
+static DIRPICKER_BROWSE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn set_dir_picker_root(path: std::path::PathBuf) {
+    let _ = DIRPICKER_BROWSE_ROOT.set(path);
+}
+
+fn dir_picker_root() -> &'static std::path::Path {
+    DIRPICKER_BROWSE_ROOT
+        .get()
+        .expect("dir-picker root initialised in main before the fake Node serves")
+}
+
+fn seed_dir_picker_fixtures() -> Result<()> {
+    let root = dir_picker_root();
+    std::fs::create_dir_all(root.join("alpha/nested"))?;
+    std::fs::create_dir_all(root.join("beta/nested"))?;
+    std::fs::create_dir_all(root.join(".hidden"))?;
+    std::fs::write(root.join("note.txt"), b"files are not directories\n")?;
+    Ok(())
+}
+
+/// Best-effort removal of the OWNED browse tree on shutdown. The owned path
+/// is a per-run subdirectory the harness itself created (under the
+/// env-provided base or the harness TempDir), so removing it never touches
+/// caller data; an env-provided base is left intact (r9 item 3).
+fn cleanup_dir_picker_fixtures() {
+    if let Some(root) = DIRPICKER_BROWSE_ROOT.get() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// Build the workspace snapshot the Hub observes after each list/mutation.
+fn workspace_snapshot(revision: u64, rows: &[Value]) -> Value {
+    json!({"workspaceRevision": revision, "workspaces": rows})
+}
+
+/// Real directories-only answer for `host.dirs.list`, mirroring the Node
+/// bounds: containment under one allowlist root, no symlink following, hidden
+/// dot-directories off by default, and a hard result cap.
+fn dirs_list_answer(params: &Value, registered_roots: &[String]) -> Result<Value> {
+    let root = std::fs::canonicalize(dir_picker_root())?;
+    let requested = params.get("path").and_then(Value::as_str).unwrap_or("");
+    let target = if requested.trim().is_empty() {
+        root.clone()
+    } else {
+        let path = std::path::Path::new(requested);
+        if !path.is_absolute() {
+            return Err(anyhow!("browsed path must be absolute"));
+        }
+        let canonical = std::fs::canonicalize(path)?;
+        if !canonical.starts_with(&root) {
+            return Err(anyhow!("path is outside the directories this Node allows"));
+        }
+        if !canonical.is_dir() {
+            return Err(anyhow!("{requested} is not a directory"));
+        }
+        canonical
+    };
+    let show_hidden = params
+        .get("showHidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut names: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    let mut truncated = false;
+    for entry in std::fs::read_dir(&target)? {
+        let Ok(entry) = entry else { continue };
+        scanned += 1;
+        if scanned > 16_384 {
+            truncated = true;
+            break;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    if names.len() > 4096 {
+        names.truncate(4096);
+        truncated = true;
+    }
+    let parent = if target == root {
+        None
+    } else {
+        target
+            .parent()
+            .filter(|parent| parent.starts_with(&root))
+            .map(|parent| json!(parent.display().to_string()))
+    };
+    Ok(json!({
+        "path": target.display().to_string(),
+        "parent": parent,
+        "home": root.display().to_string(),
+        "roots": [root.display().to_string()],
+        "workspaces": registered_roots,
+        "dirs": names.iter().map(|name| json!({"name": name})).collect::<Vec<_>>(),
+        "truncated": truncated,
+    }))
 }
 
 // ── c-perfaudit high-rate flood triggers (HUB_E2E_PERF=1 only) ────────────

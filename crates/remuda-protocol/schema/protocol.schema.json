@@ -6220,6 +6220,96 @@
       ],
       "type": "object"
     },
+    "HostDirEntry": {
+      "description": "One subdirectory row in a [`HostDirsListResult`]. Symlinks are never\nlisted (lstat classification), so a row is always a real directory the\nbrowser can descend into without escaping the allowlist.",
+      "properties": {
+        "name": {
+          "description": "Bare directory name; never a path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "HostDirsListParams": {
+      "description": "`host.dirs.list` params (c-dirpicker). The human-only directory browser.\n\nEvery path is an absolute Node path: the browser is not anchored to a\nregistered workspace, but the Node confines it to the configured\n`workspace_roots` allowlist (the same policy registration validates\nagainst). Symlinks are never followed.",
+      "properties": {
+        "path": {
+          "description": "Absolute directory to list. Absent names the Node default start\n(the user's home when it lies inside an allowed root, else the first\nallowed root).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "showHidden": {
+          "default": false,
+          "description": "Include dot-directories; absent/`false` hides them.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "showHidden"
+      ],
+      "type": "object"
+    },
+    "HostDirsListResult": {
+      "description": "`host.dirs.list` result: the canonical directory, navigation boundaries\nand its subdirectories (bounded).",
+      "properties": {
+        "dirs": {
+          "description": "Subdirectories, sorted by name and capped at the Node bound.",
+          "items": {
+            "$ref": "#/$defs/HostDirEntry"
+          },
+          "type": "array"
+        },
+        "home": {
+          "description": "Canonical user home when it lies inside an allowed root, else `None`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent": {
+          "description": "Canonical parent when it still lies inside an allowed root; `None` at\nthe browse boundary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Canonical absolute directory that was actually listed.",
+          "type": "string"
+        },
+        "roots": {
+          "description": "Canonical configured allowlist roots (`workspace_roots`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "description": "True when entries were dropped at the result-size cap.",
+          "type": "boolean"
+        },
+        "workspaces": {
+          "description": "Canonical already-registered workspace roots, for quick jumps.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "roots",
+        "workspaces",
+        "dirs",
+        "truncated"
+      ],
+      "type": "object"
+    },
     "HostEnv": {
       "description": "HostEnv; `protocol.md` §4.1.",
       "properties": {

@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { act, createRef } from "react";
+import { act, createRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { buildLongObservations } from "../../fixtures/session/longEvents";
@@ -1868,6 +1868,61 @@ describe("font reflow compensator", () => {
     });
     expect(hold(), "the no-op second write disarmed the latch before the first write's own event").toBe("1");
     expect(geo.top()).toBe(3120);
+  });
+
+  it("r7 item 3: a streamed commit that already held the row is not double-counted by the row's RO delivery", async () => {
+    // A React commit changing nodes/sizes (a streamed event) lands between the
+    // font swap's LAYOUT (rows already resized in the DOM) and the per-row
+    // ResizeObserver deliveries: with the resized row ABOVE the sampled
+    // reading anchor, the commit's generic hold counter-scrolls the drift, and
+    // row A's observer must not add its ledger height delta a SECOND time. The
+    // explicit reflow correction is the anchor's DOM-relative drift, which is
+    // 0 after the generic hold.
+    const geo = installGeo(40);
+    const opts = { instanceId: "insStream" as Id, journalId: "obj_insStream" as Id, hostId: "hst_1" as Id };
+    localStorage.clear();
+    localStorage.setItem(
+      "runtime.reading.v1.insStream",
+      // n_12 at saved offset 300 -> restore top 756; n_6 sits strictly ABOVE
+      // the viewport then, so a later grow of n_6 drifts the on-screen anchor
+      // and the sizes-commit generic hold compensates it.
+      JSON.stringify({ anchorId: "obj_long_n_12", offset: 300, ratio: 0, avgRow: ROW, follow: false }),
+    );
+    // Stateful driver INSIDE the route (a rerendered MemoryRouter would not
+    // propagate new props): bumping the count simulates a streamed nodes
+    // commit exactly as SessionPage's event subscription would.
+    let bump!: () => void;
+    function Driver() {
+      const [count, setCount] = useState(40);
+      bump = () => setCount((n) => n + 1);
+      return <Transcript events={buildLongObservations({ ...opts, count })} compact={false} />;
+    }
+    render(
+      <MemoryRouter initialEntries={["/s/insStream"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Driver />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await settle(geo, "insStream");
+    const before = geo.top();
+    expect(before).toBe(756);
+    // The swap resizes n_6 (strictly above the anchor) in the DOM, then a
+    // streamed nodes commit lands BEFORE n_6's observer delivery: the
+    // commit's generic hold counter-scrolls the 40px drift.
+    geo.presetHeight("obj_long_n_6", ROW + 40);
+    await act(async () => {
+      bump();
+      await Promise.resolve();
+    });
+    expect(geo.top(), "the streamed commit holds the drifted anchor").toBe(before + 40);
+    // n_6's own observer delivers after that commit: the reflow anchor's DOM
+    // drift is now 0 and the ledger height delta must not be added again.
+    await act(async () => {
+      geo.fireMeasure("obj_long_n_6");
+      await geo.nextFrame();
+    });
+    expect(geo.top(), "the row's RO delivery double-counted the drift the streamed commit held").toBe(before + 40);
   });
 
 });

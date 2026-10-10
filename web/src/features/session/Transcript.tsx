@@ -281,9 +281,12 @@ function TranscriptInner({
   /**
    * The row a saved-position restore settled on, kept stable across a later
    * font reflow of rows above it (unlike readingAnchorRef, which scroll events
-   * re-sample to the topmost visible row). Cleared on route change / nav.
+   * re-sample to the topmost visible row). Holds the row id and the viewport
+   * offset it was restored to, so a correction is the row's DOM-relative drift
+   * from that offset — idempotent if a same-commit generic hold already moved
+   * scrollTop by the same amount. Cleared on route change / nav.
    */
-  const reflowAnchorRef = useRef<{ id: string } | null>(null);
+  const reflowAnchorRef = useRef<{ id: string; offset: number } | null>(null);
   /** Set for one sizes commit when the reflow self-correction held the anchor. */
   const reflowCorrectedThisCommitRef = useRef(false);
   /**
@@ -606,7 +609,18 @@ function TranscriptInner({
           // and after it finalizes (the generic anchor holds it).
           const resizedDoc = el.scrollTop + resized.getBoundingClientRect().top - el.getBoundingClientRect().top;
           const anchorDoc = el.scrollTop + anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top;
-          if (resizedDoc < anchorDoc) selfDelta = height - prevHeight;
+          if (resizedDoc < anchorDoc) {
+            // Hold the anchor at its SAVED viewport offset by measuring how
+            // far it has drifted RIGHT NOW, instead of adding the resized row's
+            // ledger height delta. A React commit changing nodes/sizes (a
+            // streamed event) that lands between the font layout and this
+            // ResizeObserver delivery can already have counter-scrolled the
+            // drift via the generic hold: the DOM-relative drift is 0 then, so
+            // the anchor is corrected exactly once whichever path runs first.
+            const drift =
+              anchorRow.getBoundingClientRect().top - el.getBoundingClientRect().top - reflow.offset;
+            if (Math.abs(drift) >= 1) selfDelta = drift;
+          }
         }
       }
     }
@@ -803,7 +817,7 @@ function TranscriptInner({
         // Pin the reflow anchor to the restored row for the WHOLE restore
         // (including a restoreProbe-held restore that is still pending when a
         // font swap lands), so height changes of rows above it hold this row.
-        reflowAnchorRef.current = { id: pending.anchorId };
+        reflowAnchorRef.current = { id: pending.anchorId, offset: pending.offset };
         const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - pending.offset;
         // Finalize only once the row actually sits at the saved offset. Seed
         // the generic reading anchor with the restored row + offset so that a

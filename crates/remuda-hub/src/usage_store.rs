@@ -1046,15 +1046,11 @@ fn is_one_million_tag(model: &str) -> bool {
     model.trim().to_ascii_lowercase().ends_with("[1m]")
 }
 
-fn static_window_from_model_id(model: &str) -> Option<i64> {
-    let model = model.trim();
-    if is_one_million_tag(model) {
-        return Some(1_000_000);
-    }
-    if let Some(row) = crate::model_catalog::lookup(model) {
-        return Some(row.context_window as i64);
-    }
-    None
+/// The static catalog's window for a model id. The explicit `[1m]` tag is
+/// resolved separately and earlier (it outranks the profile); this is only the
+/// catalog lookup (c-usagefu r2 item 4).
+fn catalog_window(model: &str) -> Option<i64> {
+    crate::model_catalog::lookup(model.trim()).map(|row| row.context_window as i64)
 }
 
 /// A context window declared on the provider profile's `models_json`.
@@ -1110,11 +1106,21 @@ mod window {
 /// Resolve a session's context window and whether the number is an estimate.
 ///
 /// Native harness report (payload `contextWindow`, e.g. stream-json
-/// `modelUsage`) wins; then each model candidate — transcript-observed
-/// effective id first, then the launch model — through its `[1m]` tag/static
-/// catalog row and its provider profile's declared `contextWindow`; finally the
-/// harness-kind fallback. Only the last step is approximate (a guess at an
-/// unknown gateway model's window).
+/// `modelUsage`) wins. Otherwise the model candidate and its sources resolve,
+/// in this order per candidate:
+///
+/// 1. the explicit `[1m]` long-context tag on the id (exact `1_000_000`);
+/// 2. the provider profile's declared `models_json` `contextWindow` — a
+///    gateway serving a model at its own window must not be overridden by the
+///    static catalog (c-usagefu r2 item 4);
+/// 3. the static catalog row.
+///
+/// The candidate itself is the transcript-observed effective id
+/// (`modelEffective`, i.e. after a `/model` switch) when one is known; the
+/// launch `spec.model` is consulted ONLY when no effective model exists. An
+/// effective model that resolves to nothing must not fall back to the launch
+/// model's window marked exact — it goes to the harness-kind fallback, which is
+/// the single approximate step (a guess at an unknown gateway model's window).
 fn resolve_context_window(
     conn: &Connection,
     req: &RollupRequest<'_>,
@@ -1123,23 +1129,29 @@ fn resolve_context_window(
     if let Some(window) = native_window {
         return (Some(window), false);
     }
-    for (model, profile_id) in [
-        (req.effective_model, req.profile_id),
-        (req.spec_model, req.profile_id),
-    ] {
-        let Some(model) = model else {
-            continue;
-        };
-        if let Some(window) = static_window_from_model_id(model) {
-            return (Some(window), false);
-        }
-        if let Some(profile_id) = profile_id
-            && let Ok(Some(window)) = profile_context_window(conn, profile_id, model)
-        {
-            return (Some(window), false);
-        }
+    let Some(model) = req.effective_model.or(req.spec_model) else {
+        return kind_fallback(req.kind);
+    };
+    // 1. explicit [1m] tag.
+    if is_one_million_tag(model) {
+        return (Some(1_000_000), false);
     }
-    match kind_context_window(req.kind) {
+    // 2. the provider profile's declared window.
+    if let Some(profile_id) = req.profile_id
+        && let Ok(Some(window)) = profile_context_window(conn, profile_id, model)
+    {
+        return (Some(window), false);
+    }
+    // 3. the static catalog (the [1m] tag inside it was handled first).
+    if let Some(window) = catalog_window(model) {
+        return (Some(window), false);
+    }
+    kind_fallback(req.kind)
+}
+
+/// The harness-kind fallback window, always approximate.
+fn kind_fallback(kind: &str) -> (Option<i64>, bool) {
+    match kind_context_window(kind) {
         Some(window) => (Some(window), true),
         None => (None, false),
     }
@@ -1889,6 +1901,78 @@ mod tests {
             resolve_context_window(&conn, &req, None),
             (Some(250_000), false),
             "profile-declared window is evidence, not an estimate"
+        );
+    }
+
+    #[test]
+    fn provider_profile_window_beats_the_static_catalog_and_is_exact() {
+        // c-usagefu r2 item 4: a gateway serving a catalog-known model at its
+        // OWN window (models_json contextWindow) must not be overridden by the
+        // catalog row. claude-sonnet-5 is 1,000,000 in the static catalog; the
+        // gateway serves it at 200,000. Old order reported 18% at 180k used;
+        // correct is 90%.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "CREATE TABLE provider_profiles (
+                id TEXT PRIMARY KEY,
+                models_json TEXT NOT NULL DEFAULT '[]'
+             );",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_profiles (id, models_json) VALUES \
+             ('pvp_sonnet', '[{\"id\":\"claude-sonnet-5\",\"enabled\":true,\"contextWindow\":200000}]')",
+            [],
+        )
+        .unwrap();
+        let req = RollupRequest {
+            instance_id: "ins_x",
+            kind: "claude",
+            spec_model: Some("claude-sonnet-5"),
+            effective_model: None,
+            profile_id: Some("pvp_sonnet"),
+        };
+        assert_eq!(
+            resolve_context_window(&conn, &req, None),
+            (Some(200_000), false),
+            "profile's 200k beats the catalog's 1m and is exact, not approximate"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_effective_model_falls_back_approximate_not_to_the_launch_window() {
+        // c-usagefu r2 item 4: after a /model switch to a model the store cannot
+        // resolve, the LAUNCH model's window must not be used as exact. The
+        // effective id is the only candidate; resolving to nothing goes to the
+        // harness-kind fallback marked approximate.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let req = RollupRequest {
+            instance_id: "ins_x",
+            kind: "claude",
+            // Launch model has a known 1m window.
+            spec_model: Some("claude-sonnet-5"),
+            // Switched to something unknown.
+            effective_model: Some("gateway/renamed-thing"),
+            profile_id: None,
+        };
+        assert_eq!(
+            resolve_context_window(&conn, &req, None),
+            (Some(200_000), true),
+            "unknown effective model -> kind fallback, approximate, never the 1m launch window"
+        );
+
+        // With NO effective model, the launch window IS consulted and is exact.
+        let launch_only = RollupRequest {
+            effective_model: None,
+            ..req
+        };
+        assert_eq!(
+            resolve_context_window(&conn, &launch_only, None),
+            (Some(1_000_000), false),
+            "spec model is consulted and exact only when no effective model exists"
         );
     }
 

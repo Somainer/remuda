@@ -149,7 +149,7 @@ impl CodexAdapter {
     pub fn bind_rollout(&mut self, session_id: &str, path: PathBuf) {
         if !session_id.trim().is_empty() {
             self.confirmed = Some(session_id.trim().to_owned());
-            self.bind(session_id.trim().to_owned(), path);
+            self.bind(session_id.trim().to_owned(), path, true);
         }
     }
 
@@ -158,18 +158,26 @@ impl CodexAdapter {
     /// Claims the file process-wide (no other adapter may bind it) and, for a
     /// driver launch, releases the same-cwd discovery window so a later
     /// launch is not tainted by this instance (c-usagefu r5 item 1).
-    fn bind(&mut self, session_id: String, path: PathBuf) -> bool {
+    fn bind(&mut self, session_id: String, path: PathBuf, strict_launch: bool) -> bool {
         // Two adapters polling in parallel can race for the same file; a lost
         // claim means the candidate is someone else's — don't bind.
         if !crate::adapters::codex_discovery::claim(&path) {
             return false;
         }
-        // Tail position is chosen by the driver-launch floor rules; promoted
-        // and hook-confirmed attaches hydrate from byte zero.
-        let tail = if self.home.launched_at.is_some() {
-            RolloutTail::new_at_end(path.clone()).unwrap_or_else(|_| RolloutTail::new(path.clone()))
-        } else {
+        // Tail position:
+        // - promoted / hook-confirmed attaches (no launch floor): byte zero
+        //   with durable dedupe;
+        // - a STRICTLY post-launch session (session_meta.timestamp >=
+        //   launched_at): byte zero too — codex 0.154 creates the rollout
+        //   lazily on the first turn, so every record (task_started,
+        //   turn_context, prompt, usage) belongs to THIS instance;
+        // - an in-slack match (crash-loop possible): current EOF, so a prior
+        //   session's records never replay (r4 item 3).
+        let from_start = self.home.launched_at.is_none() || strict_launch;
+        let tail = if from_start {
             RolloutTail::new(path.clone())
+        } else {
+            RolloutTail::new_at_end(path.clone()).unwrap_or_else(|_| RolloutTail::new(path.clone()))
         };
         self.tail = Some(tail);
         self.binding = Some(AdapterBinding {
@@ -222,7 +230,7 @@ impl CodexAdapter {
         }
         if let Some(id) = self.confirmed.clone() {
             if let Some(path) = locate_rollout_in(&self.home.home, &id) {
-                return Ok(self.bind(id, path));
+                return Ok(self.bind(id, path, true));
             }
             return Ok(false);
         }
@@ -230,7 +238,7 @@ impl CodexAdapter {
             if let Some(id) = newest_indexed(&self.home.home)
                 && let Some(path) = locate_rollout_in(&self.home.home, &id)
             {
-                return Ok(self.bind(id, path));
+                return Ok(self.bind(id, path, true));
             }
             return Ok(false);
         };
@@ -251,9 +259,9 @@ impl CodexAdapter {
             // open: files the other adapter bound are excluded above, so the
             // "A bound first" race resolves cleanly (a parallel claim race
             // returns false here and we keep discovering).
-            CwdRollout::Found { id, path } => {
+            CwdRollout::Found { id, path, strict } => {
                 self.confirmed = Some(id.clone());
-                Ok(self.bind(id, path))
+                Ok(self.bind(id, path, strict))
             }
             // Two UNCLAIMED same-cwd sessions exist at once. While a partner
             // window is still open one of them may be theirs — wait (never

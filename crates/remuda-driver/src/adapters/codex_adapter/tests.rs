@@ -720,44 +720,107 @@ fn an_idle_unbound_instance_does_not_block_a_later_second_instance() {
 }
 
 #[test]
-fn a_launch_bind_tails_from_the_end_and_never_replays_pre_bind_records() {
-    // r4 item 3 crash-loop shape: the matched file already carries a whole
-    // prior turn at bind time. A launch tail starts at the current end, so
-    // those records are never re-journaled; only post-bind appends flow.
+fn a_strictly_post_launch_match_hydrates_its_own_first_turn_from_byte_zero() {
+    // r5 item 2: codex 0.154 creates the rollout lazily ON the first turn, so
+    // session_meta and task_started share one timestamp; reading from EOF
+    // dropped the instance's own first turn (task_started, turn_context, the
+    // prompt and its usage). A session whose session_meta.timestamp is at/after
+    // the STRICT launch floor must be hydrated from byte zero.
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/race-tail";
+    let cwd = "/projects/r5-strict-tail";
     let now = OffsetDateTime::now_utc();
-    let floor = now - time::Duration::seconds(5);
+    // Floor well in the past: session start is strictly after it (and the
+    // content is genuinely new — no previous session at this timestamp).
+    let floor = now - time::Duration::seconds(30);
     let started = now.format(&Rfc3339).unwrap();
     let session_dir = home.path().join("sessions/2026/09/14");
     std::fs::create_dir_all(&session_dir).unwrap();
-    let path = session_dir.join("rollout-replay.jsonl");
-    // Header plus a PRE-BIND turn line.
+    let path = session_dir.join("rollout-strict.jsonl");
     std::fs::write(
         &path,
         format!(
-            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"replay\",\"session_id\":\"replay\",\"cwd\":\"{cwd}\",\"timestamp\":\"{started}\"}}}}\n\
-             {{\"timestamp\":\"{started}\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"old-turn\"}}}}\n"
+            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"strict\",\"session_id\":\"strict\",\"cwd\":\"{cwd}\",\"timestamp\":\"{started}\"}}}}
+             {{\"timestamp\":\"{started}\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"first-turn\"}}}}
+"
         ),
     )
     .unwrap();
 
     let mut adapter = launch_adapter(home.path(), cwd, floor);
-    assert!(adapter.discover().unwrap(), "the in-slack file matches");
-    let pre_bind = adapter.poll().unwrap();
     assert!(
-        pre_bind.is_empty(),
-        "pre-bind records must not replay, got {pre_bind:?}"
+        adapter.discover().unwrap(),
+        "the strict post-floor file matches"
+    );
+    let first_poll = adapter.poll().unwrap();
+    let turns: Vec<_> = first_poll
+        .iter()
+        .filter_map(|obs| obs.turn_id.clone())
+        .collect();
+    assert_eq!(
+        turns,
+        vec!["first-turn"],
+        "the instance's OWN first turn is hydrated from byte zero, got {first_poll:?}"
     );
 
-    // Content appended AFTER the bind is tailed normally.
+    // Subsequent appends still tail normally (the head is not replayed).
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .unwrap();
     writeln!(
         file,
-        "{{\"timestamp\":\"{started}\",\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"new-turn\"}}}}"
+        "{{\"timestamp\":\"{started}\",\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"second-turn\"}}}}"
+    )
+    .unwrap();
+    drop(file);
+    let next = adapter.poll().unwrap();
+    let turns: Vec<_> = next.iter().filter_map(|obs| obs.turn_id.clone()).collect();
+    assert_eq!(turns, vec!["second-turn"]);
+}
+
+#[test]
+fn an_in_slack_match_tails_from_end_and_skips_pre_bind_records() {
+    // A session started INSIDE the clock slack (session_meta.timestamp before
+    // the strict floor) could be a crash-looped previous instance: tail from
+    // EOF so its records never replay, even though it is an acceptable
+    // candidate.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r5-slack-tail";
+    let now = OffsetDateTime::now_utc();
+    let floor = now; // strict floor = now; session 2 s earlier is in-slack only
+    let started = (now - time::Duration::seconds(2)).format(&Rfc3339).unwrap();
+    let session_dir = home.path().join("sessions/2026/09/14");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let path = session_dir.join("rollout-slack.jsonl");
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"slack\",\"session_id\":\"slack\",\"cwd\":\"{cwd}\",\"timestamp\":\"{started}\"}}}}
+             {{\"timestamp\":\"{started}\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"old-turn\"}}}}
+"
+        ),
+    )
+    .unwrap();
+
+    let mut adapter = launch_adapter(home.path(), cwd, floor);
+    assert!(
+        adapter.discover().unwrap(),
+        "the in-slack file still matches"
+    );
+    let pre_bind = adapter.poll().unwrap();
+    assert!(
+        pre_bind.is_empty(),
+        "in-slack records must not replay, got {pre_bind:?}"
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    let now_rfc = now.format(&Rfc3339).unwrap();
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{now_rfc}\",\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"new-turn\"}}}}"
     )
     .unwrap();
     drop(file);

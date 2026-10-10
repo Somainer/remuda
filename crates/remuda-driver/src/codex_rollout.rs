@@ -440,12 +440,18 @@ pub enum CwdRollout {
     /// registered. The caller should keep polling until its discovery
     /// deadline.
     NotYet,
-    /// Exactly one rollout matches: its thread id and file.
+    /// Exactly one rollout matches: its thread id, file, and whether the
+    /// session began at/after the STRICT launch floor (vs inside the clock
+    /// slack — a possible crash-looped previous instance).
     Found {
         /// `session_meta.id` of the matching rollout.
         id: String,
         /// Rollout JSONL file.
         path: PathBuf,
+        /// True when `session_meta.timestamp >= launched_at`: the session
+        /// cannot predate this launch, so byte-0 hydration is safe and the
+        /// first turn (created lazily together with session_meta) is ours.
+        strict: bool,
     },
     /// More than one rollout matches cwd + launch window. Never guess which is
     /// ours: the caller must stop discovering rather than bind one.
@@ -474,7 +480,7 @@ pub fn locate_rollout_by_cwd(
     // Wall-clock form of the floor for mtime comparisons.
     let floor_system = std::time::SystemTime::UNIX_EPOCH
         + std::time::Duration::from_secs(floor.unix_timestamp().max(0) as u64);
-    let mut matches: Vec<(String, PathBuf)> = Vec::new();
+    let mut matches: Vec<(String, PathBuf, bool)> = Vec::new();
     let mut pending = vec![codex_home.join("sessions")];
     while let Some(dir) = pending.pop() {
         let Ok(dir_meta) = std::fs::symlink_metadata(&dir) else {
@@ -568,15 +574,19 @@ pub fn locate_rollout_by_cwd(
                 continue;
             };
             if started >= floor {
-                matches.push((id.to_owned(), entry.path()));
+                // Distinguish a strictly post-launch session (safe to
+                // hydrate from byte zero) from an in-slack candidate (a
+                // possible relaunch — tail from EOF).
+                let strict = started >= launched_at;
+                matches.push((id.to_owned(), entry.path(), strict));
             }
         }
     }
     match matches.len() {
         0 => CwdRollout::NotYet,
         1 => {
-            let (id, path) = matches.remove(0);
-            CwdRollout::Found { id, path }
+            let (id, path, strict) = matches.remove(0);
+            CwdRollout::Found { id, path, strict }
         }
         _ => CwdRollout::Ambiguous,
     }

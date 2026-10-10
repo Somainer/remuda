@@ -184,13 +184,19 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   const instanceId = await createReadySession(page);
   created.push(instanceId);
 
-  // Before any usage observation the chip is an empty ring with a dash and
-  // cannot open a popover.
+  // Before any usage observation the chip is an empty ring with a dash; per
+  // RC3 it still opens the usage card in the "harness never reported" state.
   const chip = page.getByTestId("context-chip");
   await expect(chip).toHaveText("—");
-  expect(chip).toHaveAttribute("data-has-popover", "0");
+  await expect(chip).toHaveAttribute("data-has-popover", "1");
   await chip.click();
-  expect(await page.getByTestId("context-usage-popover").count()).toBe(0);
+  const emptyCard = page.getByTestId("context-usage-popover");
+  await expect(emptyCard).toBeVisible();
+  await expect(page.getByTestId("context-usage-empty-note")).toBeVisible();
+  // The click pins the card; close it so it cannot cover the composer while
+  // the usage turns below are sent.
+  await page.getByTestId("context-usage-close").click();
+  await expect(emptyCard).toHaveCount(0);
 
   // Turn 1 — the recorded sequence's first row (4794 / 260 / 29496 read).
   // Next-request context = 4794 + 29496 = 34290 → 17% of the 200k window.

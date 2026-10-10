@@ -8,6 +8,7 @@ import type { PromptMode } from "../types/generated";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import { mapWorkspace } from "../features/workspaces/registry";
 import { followWorkspaces } from "../features/workspaces/follow";
+import type { HostDirsListing } from "../features/workspaces/dirs";
 import type {
   ProviderCreate,
   ProviderDiscoverBody,
@@ -662,6 +663,8 @@ export type HubApi = {
   workspaceList(hostId?: Id): Promise<Page<Workspace>>;
   workspaceRegister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceId?: string; workspaceRevision?: number }>;
   workspaceUnregister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceRevision?: number }>;
+  /** c-dirpicker: human-only directory browser on one host. */
+  hostDirsList(hostId: Id, query?: { path?: string; showHidden?: boolean }): Promise<import("../features/workspaces/dirs").HostDirsListing>;
   hostWorkspaceSubscribe(onSnapshot: (snapshot: WorkspaceSnapshot) => void, refresh: () => void): () => void;
   providerList(q?: { hostId?: string }): Promise<{ items: HubProviderRow[]; nextCursor?: string | null }>;
   providerGet(id: string): Promise<HubProviderRow>;
@@ -1242,6 +1245,29 @@ function createMockApi(): HubApi {
       mockDb.workspaces = mockDb.workspaces.filter((w) => w.hostId !== hostId || w.rootPath !== path);
       return this.workspaceList(hostId);
     },
+    async hostDirsList(hostId, query) {
+      const roots = Array.from(new Set(mockDb.workspaces.filter((w) => w.hostId === hostId).map((w) => {
+        const parts = w.rootPath.split("/").filter(Boolean);
+        return parts.length > 1 ? `/${parts.slice(0, -1).join("/")}` : "/";
+      }))).sort();
+      const path = query?.path
+        || mockDb.workspaces.find((w) => w.hostId === hostId)?.rootPath
+        || "/home/remuda";
+      const registered = mockDb.workspaces.filter((w) => w.hostId === hostId).map((w) => w.rootPath);
+      const dirs = registered
+        .filter((root) => root.startsWith(path.endsWith("/") ? path : `${path}/`) &&
+          root.slice(path.endsWith("/") ? path.length : path.length + 1).split("/").filter(Boolean).length === 1)
+        .map((root) => ({ name: root.split("/").filter(Boolean).at(-1) ?? root }));
+      return {
+        path,
+        parent: roots.includes(path) ? null : path.split("/").slice(0, -1).join("/") || null,
+        home: "/home/remuda",
+        roots: roots.length ? roots : ["/home/remuda"],
+        workspaces: registered,
+        dirs,
+        truncated: false,
+      };
+    },
     hostWorkspaceSubscribe() { return () => undefined; },
     eventsRead: async ({ journalId, afterSeq, beforeSeq, limit }) => mockReadJournal(journalId, afterSeq, beforeSeq, limit),
     async eventsSubscribe(journalId, _afterSeq, onBatch, _onGap, _hooks) {
@@ -1735,6 +1761,13 @@ function createLiveApi(): HubApi {
         method: "DELETE", body: JSON.stringify({ path }),
       });
       return { items: response.workspaces.map(mapWorkspace), workspaceRevision: response.workspaceRevision, nextCursor: null };
+    },
+    async hostDirsList(hostId, query) {
+      const qs = new URLSearchParams();
+      if (query?.path) qs.set("path", query.path);
+      if (query?.showHidden) qs.set("showHidden", "true");
+      const suffix = qs.size ? `?${qs}` : "";
+      return rest<HostDirsListing>(`/v1/hosts/${encodeURIComponent(hostId)}/dirs${suffix}`);
     },
     hostWorkspaceSubscribe(onSnapshot, refresh) {
       return followWorkspaces(wsUrl("/v1/follow"), onSnapshot, refresh);

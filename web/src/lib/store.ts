@@ -87,6 +87,7 @@ const HELD_RETRY_BASE_MS = 2_000;
 const HELD_RETRY_MAX_MS = 30_000;
 import { liveSummary } from "../features/session/liveSummary";
 import { HubHttpError, isUnauthorized } from "./httpError";
+import { e2eSeamsEnabled } from "./e2eSeams";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
 import { mockGappedTail, mockJournalIds } from "./mock";
@@ -342,6 +343,15 @@ export type HubState = {
   hosts: Host[];
   workspaces: Workspace[];
   interactions: Interaction[];
+  /**
+   * Whether the interaction list has been loaded from at least one
+   * SUCCESSFUL interaction-list response (bootstrap or poll). A failed first
+   * fetch leaves this false even though `ready` is emitted with an empty list
+   * (offline reload), so arrival watchers (question alerts) do not take a
+   * baseline from a failed fetch and toast every already-pending question on
+   * the next successful poll. Empty is a valid success and sets this true.
+   */
+  interactionsHydrated: boolean;
   events: Record<string, Observation[]>;
   journalStatus: Record<string, JournalClient["status"]>;
   bubbles: LocalBubble[];
@@ -393,6 +403,7 @@ const initial: HubState = {
   hosts: [],
   workspaces: [],
   interactions: [],
+  interactionsHydrated: false,
   events: {},
   journalStatus: {},
   bubbles: [],
@@ -1381,6 +1392,12 @@ class HubStore {
     this.connectionStateOverride = state;
   }
 
+  /** Test-only: replace slices and emit, so stores subscribing to hubStore
+   * (e.g. the question-alert watcher) can be driven without a live Hub. */
+  setSlicesForTest(slices: Partial<HubState>): void {
+    this.emit(slices);
+  }
+
   /** Test-only: drive the pagehide/pageshow lifecycle (BFCache, iOS). */
   async pageShowForTest(persisted: boolean): Promise<void> {
     this.onPageHide();
@@ -1897,6 +1914,10 @@ class HubStore {
         hosts: registeredHosts,
         workspaces: registeredHosts.flatMap((host) => (host.workspaces ?? []).map(mapWorkspace)),
         interactions,
+        // The Promise.all above only resolves after a SUCCESSFUL
+        // interaction-list read (an empty page is a valid success): arrival
+        // watchers may take their baseline from this page.
+        interactionsHydrated: true,
       });
       profileRegion("store.pollHydrate", () => {
         this.hydrateEffortEffective(instances.items);
@@ -2075,6 +2096,7 @@ class HubStore {
       hosts: [],
       workspaces: [],
       interactions: [],
+      interactionsHydrated: false,
       events: {},
       connection: "offline",
     });
@@ -2186,17 +2208,24 @@ class HubStore {
         );
         // An unchanged poll preserves every row identity (see the merge
         // functions), so skip the emission — and every consumer render wave —
-        // entirely when neither snapshot changed.
+        // entirely when neither snapshot changed. The hydration flag is
+        // main's offline-reload baseline: a failed bootstrap leaves it false,
+        // so the first SUCCESSFUL poll must still emit to flip it even when
+        // both lists are empty/identical.
         if (
+          !this.state.interactionsHydrated ||
           !sameArrayIdentity(nextInstances, this.state.instances) ||
           !sameArrayIdentity(nextInteractions, this.state.interactions)
         ) {
           this.emit({
             instances: nextInstances,
             interactions: nextInteractions,
+            // A successful poll/refresh read settles the baseline even when the
+            // bootstrap fetch failed (offline reload): an empty page here is a
+            // valid success.
+            interactionsHydrated: true,
           });
         }
-        return;
       });
       // A response newer than a pin proves the server has spoken after the
       // create/answer. Combined with the in-flight sweep below (every older
@@ -3679,6 +3708,15 @@ class HubStore {
       this.state.instances.find((row) => row.id === instanceId)?.usageRollup ??
       null
     );
+  }
+
+  /** c-composerpop e2e seam: inject a Hub-computed usage rollup exactly as a
+   *  poll hydration would have folded it in (fake-node sessions never report
+   *  usage, so the mobile stacked-sheet cases inject one). Inert unless the
+   *  e2e seam marker is set — no production call site can reach it. */
+  setUsageRollupForTest(instanceId: Id, rollup: UsageRollup) {
+    if (!e2eSeamsEnabled()) return;
+    this.emit({ usageRollup: { ...this.state.usageRollup, [instanceId]: rollup } });
   }
 
   /** The word the slider last requested for this instance (wire spelling). */

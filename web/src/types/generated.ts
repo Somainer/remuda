@@ -1335,6 +1335,31 @@ export type Host = ({
   [key: string]: unknown;
 });
 
+/** One subdirectory row in a [`HostDirsListResult`]. Symlinks are never listed (lstat classification), so a row is always a real directory the browser can descend into without escaping the allowlist. */
+export type HostDirEntry = ({
+  "name": (string);
+  [key: string]: unknown;
+});
+
+/** `host.dirs.list` params (c-dirpicker). The human-only directory browser.  Every path is an absolute Node path: the browser is not anchored to a registered workspace, but the Node confines it to the configured `workspace_roots` allowlist (the same policy registration validates against). Symlinks are never followed. */
+export type HostDirsListParams = ({
+  "path"?: (string | null);
+  "showHidden": (boolean);
+  [key: string]: unknown;
+});
+
+/** `host.dirs.list` result: the canonical directory, navigation boundaries and its subdirectories (bounded). */
+export type HostDirsListResult = ({
+  "dirs": ((HostDirEntry)[]);
+  "home"?: (string | null);
+  "parent"?: (string | null);
+  "path": (string);
+  "roots": (((string))[]);
+  "truncated": (boolean);
+  "workspaces": (((string))[]);
+  [key: string]: unknown;
+});
+
 /** HostEnv; `protocol.md` §4.1. */
 export type HostEnv = ({
   "name": (string);

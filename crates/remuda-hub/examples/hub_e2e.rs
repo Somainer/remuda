@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -31,6 +31,33 @@ async fn main() -> Result<()> {
         .init();
 
     let dir = tempfile::tempdir().context("e2e data dir")?;
+    // r8 item 5 / r9 item 3: a per-run, owned browse root (never the shared
+    // /tmp path). With no env override it lives inside this run's TempDir (it
+    // dies with the data dir); when HUB_E2E_DIR_PICKER_ROOT names a
+    // caller-owned base, the harness creates and serves its OWN per-run
+    // subdirectory under it — the caller's directory is never deleted on
+    // exit, even when the dir-picker trigger is off.
+    let dirpicker_root = match std::env::var_os("HUB_E2E_DIR_PICKER_ROOT") {
+        Some(base) => {
+            let base = std::path::PathBuf::from(base);
+            let owned = base.join(format!(
+                "remuda-dirpicker-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&owned).context("create owned dir-picker root")?;
+            owned
+        }
+        None => {
+            let owned = dir.path().join("dirpicker-browse");
+            std::fs::create_dir_all(&owned).context("create dir-picker root")?;
+            owned
+        }
+    };
+    set_dir_picker_root(dirpicker_root);
     let origins = std::env::var("HUB_E2E_ORIGINS").unwrap_or_else(|_| {
         "http://127.0.0.1:4179,http://localhost:4179,http://127.0.0.1:4177".into()
     });
@@ -40,6 +67,8 @@ async fn main() -> Result<()> {
         .parse::<SocketAddr>()
         .context("listen addr")?;
     config.web_root = std::env::var_os("REMUDA_WEB_ROOT").map(Into::into);
+    // Fixed e2e login code; for_test already tags it ExplicitEnv so the fixed
+    // code has provenance (round 4: a sourceless non-empty token is refused).
     config.bootstrap_token = BOOTSTRAP.into();
     config.cookie_secure = false;
     config.allowed_origins = origins
@@ -100,7 +129,7 @@ async fn main() -> Result<()> {
     let rpc_gate = std::env::temp_dir().join(format!("remuda-e2e-rpc-gate-{}", addr.port()));
     let _ = std::fs::remove_file(&rpc_gate);
     let (ready_tx, ready_rx) = oneshot::channel();
-    let node = tokio::spawn(fake_node(
+    let mut node = tokio::spawn(fake_node(
         addr,
         enroll,
         host_id.clone(),
@@ -141,7 +170,32 @@ async fn main() -> Result<()> {
     }
     println!("HUB_E2E_READY {line}");
     let _ = io::stdout().flush();
-    tokio::signal::ctrl_c().await.ok();
+    // Supervise the fake Node: the harness is only correct while that task is
+    // alive. A journal.append ack timeout, an `error` ack, a queue overflow
+    // (see wait_frame_ack), or a dropped socket used to surface later as
+    // unrelated offline/status flakes; instead print the causal error and exit
+    // non-zero so the gate reports the real failure. Normal shutdown is ctrl-c.
+    // r9 item 3: the Playwright webServer launcher stops this process with
+    // SIGTERM (it does not deliver ctrl-c), so wait for both — otherwise
+    // the graceful shutdown path below never runs and the per-run browse
+    // tree (and the TempDir data dir) leak on every suite exit.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = wait_for_sigterm() => {}
+        outcome = &mut node => {
+            let detail = match outcome {
+                Ok(Ok(())) => "fake Node task completed unexpectedly while the harness was running".to_string(),
+                Ok(Err(err)) => format!("fake Node task returned an error: {err:#}"),
+                Err(err) => format!("fake Node task panicked or was cancelled: {err}"),
+            };
+            eprintln!("FATAL hub_e2e fake Node exited before shutdown: {detail}");
+            let _ = io::stderr().flush();
+            // process::exit skips TempDir drops: remove the owned browse tree
+            // explicitly (r9 item 3).
+            cleanup_dir_picker_fixtures();
+            std::process::exit(1);
+        }
+    }
     let _ = std::fs::remove_file(&rpc_gate);
     if let Some(gate) = &route_down_gate {
         let _ = std::fs::remove_file(gate);
@@ -152,6 +206,28 @@ async fn main() -> Result<()> {
         host_b.abort();
     }
     drop(hub);
+    // r8 item 5 / r9 item 3: remove the per-run browse tree. This is always
+    // the harness-OWNED path (a per-run subdir of an env-provided base, or a
+    // directory inside the TempDir), so a caller-provided base itself is
+    // never deleted; the TempDir drop that follows removes the data dir.
+    cleanup_dir_picker_fixtures();
+    Ok(())
+}
+
+/// Completes when the process receives SIGTERM — the stop signal the
+/// Playwright webServer launcher sends (r9 item 3). Pending forever on
+/// non-unix, where ctrl-c stays the only graceful path.
+#[cfg(unix)]
+async fn wait_for_sigterm() -> std::io::Result<()> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
+        .recv()
+        .await;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm() -> std::io::Result<()> {
+    std::future::pending::<()>().await;
     Ok(())
 }
 
@@ -795,7 +871,11 @@ async fn fake_node(
             "root": "/tmp/remuda-project-a"
         }));
     }
-    let workspaces = Value::Array(workspaces);
+    // c-dirpicker: the mutation RPCs update this vec and advance the revision
+    // in place. The hello takes the initial snapshot below.
+    let mut workspace_rows: Vec<Value> = workspaces;
+    let mut workspace_revision: u64 = 1;
+    let workspaces = Value::Array(workspace_rows.clone());
     // The enroll hello announces an empty inventory — this process holds no
     // sessions yet — and a later restart re-announces whatever is still live.
     // The Hub reads a missing key as "cannot enumerate" and an empty array as
@@ -826,6 +906,9 @@ async fn fake_node(
         .to_owned();
     let _ = ready.send(());
     seed_host_file_fixtures()?;
+    // The c-dirpicker browse tree; cheap to seed for every harness run while
+    // the RPC that exposes it stays gated on HUB_E2E_DIR_PICKER.
+    seed_dir_picker_fixtures()?;
     let mut append_n = 0u64;
     // Minimal PTY harness for the xterm e2e specs. A terminal session is
     // registered on create, tty.attach returns its stable per-instance stream
@@ -858,6 +941,14 @@ async fn fake_node(
     // web poll's interaction.list). Never drop RPCs: reprocess them as soon
     // as the current handler returns.
     let mut frame_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // c-hubfakeack round 3: the JSON-RPC id of the interaction.list an
+    // __ackbarrier__:hold is currently parked behind its append ack. The
+    // interaction.list arm writes a reply marker only when it actually answers
+    // THIS id, so the e2e can prove the queued frame was drained and replied
+    // to — recording the frame alone cannot pass (a recorded-then-discarded
+    // frame leaves no reply marker).
+    let tracked_ack_reply: std::sync::Arc<tokio::sync::Mutex<Option<Value>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
     // Parked frames re-enter this loop verbatim once the gate file is removed;
     // they are then processed by their normal arm, so the reply is exactly the
     // ungated one. The park task never touches the socket itself.
@@ -956,9 +1047,153 @@ async fn fake_node(
                     send_rpc_ok(
                         &mut ws,
                         id,
-                        json!({"workspaceRevision": 1, "workspaces": workspaces}),
+                        workspace_snapshot(workspace_revision, &workspace_rows),
                     )
                     .await?;
+                }
+                // c-dirpicker: two-phase membership mutations behind the
+                // trigger; an untriggered harness answers "unknown method",
+                // exactly the shape an older Node gives the Hub.
+                // c-dirpicker round 6 item 1: read-only identity resolution,
+                // using the same canonicalize+containment+membership logic as
+                // the mutation arm below.
+                "workspace.resolve" if dir_picker_enabled() => {
+                    let path = params.get("path").and_then(Value::as_str).unwrap_or("");
+                    let resolved = (|| {
+                        let canonical = std::fs::canonicalize(path).ok()?;
+                        if !canonical.starts_with(std::fs::canonicalize(dir_picker_root()).ok()?) {
+                            return None;
+                        }
+                        let root = canonical.display().to_string();
+                        let row = workspace_rows
+                            .iter()
+                            .find(|row| row["root"].as_str() == Some(root.as_str()))?;
+                        Some(json!({
+                            "workspaceId": row["workspaceId"],
+                            "canonicalRoot": root,
+                        }))
+                    })();
+                    match resolved {
+                        Some(result) => send_rpc_ok(&mut ws, id, result).await?,
+                        None => {
+                            send_rpc_error(
+                                &mut ws,
+                                id,
+                                &format!("workspace {path} is not registered"),
+                            )
+                            .await?
+                        }
+                    }
+                }
+                "workspace.register" | "workspace.unregister" if dir_picker_enabled() => {
+                    let path = params.get("path").and_then(Value::as_str).unwrap_or("");
+                    let phase = params.get("phase").and_then(Value::as_str).unwrap_or("");
+                    let command_id = params.get("commandId").cloned().unwrap_or(Value::Null);
+                    let canonical = std::fs::canonicalize(path);
+                    let contained = canonical
+                        .as_ref()
+                        .ok()
+                        .filter(|path| {
+                            path.starts_with(
+                                std::fs::canonicalize(dir_picker_root()).unwrap_or_default(),
+                            )
+                        })
+                        .is_some();
+                    if !contained {
+                        send_rpc_error(
+                            &mut ws,
+                            id,
+                            &format!("workspace {path} is outside allowed workspace_roots"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let canonical = canonical?;
+                    let root_display = canonical.display().to_string();
+                    let existing = workspace_rows
+                        .iter()
+                        .position(|row| row["root"].as_str() == Some(root_display.as_str()));
+                    // Round 6 item 1: an unregister carries the resolved
+                    // workspaceId; verify id+root at both phases before
+                    // removing anything, exactly like the production Node.
+                    let expected_id = params.get("workspaceId").and_then(Value::as_str);
+                    if method == "workspace.unregister" {
+                        let matches = existing.is_some_and(|index| {
+                            expected_id.is_none()
+                                || expected_id == workspace_rows[index]["workspaceId"].as_str()
+                        });
+                        if !matches {
+                            send_rpc_error(
+                                &mut ws,
+                                id,
+                                "workspace unregister identity does not match the resolved \
+                                 workspace",
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                    if phase == "prepare" {
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({
+                                "workspaceRevision": workspace_revision,
+                                "workspaces": workspace_rows,
+                                "workspaceId": existing
+                                    .map(|index| workspace_rows[index]["workspaceId"].clone())
+                                    .unwrap_or(Value::Null),
+                                "commandId": command_id,
+                                "phase": "prepared",
+                            }),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let workspace_id;
+                    if method == "workspace.register" {
+                        if let Some(index) = existing {
+                            workspace_id = workspace_rows[index]["workspaceId"].clone();
+                        } else {
+                            let new_id = format!("wsp_dp_{}", uuid::Uuid::new_v4().simple());
+                            workspace_id = json!(new_id);
+                            workspace_rows.push(json!({
+                                "workspaceId": new_id,
+                                "hostId": host,
+                                "root": root_display,
+                            }));
+                            workspace_revision += 1;
+                        }
+                    } else {
+                        let Some(index) = existing else {
+                            send_rpc_error(
+                                &mut ws,
+                                id,
+                                &format!("workspace {path} is not registered"),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        workspace_id = workspace_rows[index]["workspaceId"].clone();
+                        workspace_rows.remove(index);
+                        workspace_revision += 1;
+                    }
+                    let mut snapshot = workspace_snapshot(workspace_revision, &workspace_rows);
+                    snapshot["workspaceId"] = workspace_id;
+                    snapshot["commandId"] = command_id;
+                    snapshot["phase"] = json!("settled");
+                    send_rpc_ok(&mut ws, id, snapshot).await?;
+                }
+                // c-dirpicker: real directories-only browse behind the trigger.
+                "host.dirs.list" if dir_picker_enabled() => {
+                    let registered_roots: Vec<String> = workspace_rows
+                        .iter()
+                        .map(|row| row["root"].as_str().unwrap_or("").to_owned())
+                        .collect();
+                    match dirs_list_answer(&params, &registered_roots) {
+                        Ok(result) => send_rpc_ok(&mut ws, id, result).await?,
+                        Err(error) => send_rpc_error(&mut ws, id, &error.to_string()).await?,
+                    }
                 }
                 // t-bind: in-memory worktree catalog/lease, gated on its own
                 // trigger so other specs see no worktree behaviour.
@@ -1002,6 +1237,7 @@ async fn fake_node(
                         ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
                         append_n = append_instance_state(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "ready",
@@ -1025,6 +1261,7 @@ async fn fake_node(
                         model_catalogs.insert(instance_id.clone(), catalog_ids);
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "model",
@@ -1055,6 +1292,7 @@ async fn fake_node(
                             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
                         append_n = append_instance_state(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "ready",
@@ -1107,6 +1345,7 @@ async fn fake_node(
                         let session_id = format!("mhome-exit-{}", uuid::Uuid::now_v7());
                         append_n = append_instance_state(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "ready",
@@ -1115,6 +1354,7 @@ async fn fake_node(
                         .await?;
                         append_n = append_instance_exit(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             &session_id,
@@ -1195,8 +1435,13 @@ async fn fake_node(
                             json!({ "ok": true, "instanceId": instance_id }),
                         )
                         .await?;
-                        append_n =
-                            append_mfix_chrome_combo(&mut ws, &instance_id, append_n).await?;
+                        append_n = append_mfix_chrome_combo(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                        )
+                        .await?;
                         continue;
                     }
                     // UO-6b round 2: a live turn the Hub must settle when the
@@ -1208,7 +1453,13 @@ async fn fake_node(
                             json!({ "ok": true, "instanceId": instance_id }),
                         )
                         .await?;
-                        append_n = append_uo6b_epoch_live(&mut ws, &instance_id, append_n).await?;
+                        append_n = append_uo6b_epoch_live(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                        )
+                        .await?;
                         continue;
                     }
                     // c-inboxfu: `inbox-focus:<n>` parks n pending approval
@@ -1234,6 +1485,7 @@ async fn fake_node(
                         let command_id = params.get("commandId").and_then(Value::as_str);
                         append_n = append_command_user(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt,
@@ -1260,7 +1512,22 @@ async fn fake_node(
                     // card instead: harness-hook carrier, the real tool input as
                     // its description, and an always-allow option built from the
                     // permission_suggestion the harness offered.
-                    let card = if prompt.contains("ask-question") {
+                    let card = if prompt.contains("ask-question-deadline") {
+                        // c-question-alert: a question with a short known
+                        // deadline (~60 s). The e2e installs page.clock at
+                        // roughly the same real instant and fast-forwards past
+                        // it (~30 store polls, no year-long timer flood).
+                        let deadline = (time::OffsetDateTime::now_utc()
+                            + time::Duration::seconds(60))
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default();
+                        fake_hook_question_with_deadline(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                            &deadline,
+                        )
+                    } else if prompt.contains("ask-question") {
                         fake_hook_question(
                             &instance_id,
                             host_id.as_id().as_str(),
@@ -1309,9 +1576,15 @@ async fn fake_node(
                     // C2: the create prompt is a command, so its user observation
                     // carries the commandId the Hub forwards in params.
                     let command_id = params.get("commandId").and_then(Value::as_str);
-                    append_n =
-                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
-                            .await?;
+                    append_n = append_command_user(
+                        &mut ws,
+                        &mut frame_queue,
+                        &instance_id,
+                        append_n,
+                        prompt,
+                        command_id,
+                    )
+                    .await?;
                     // r-ux-comment: a fenced block to exercise 评论.
                     if let Some(reply) = code_comment_reply(prompt) {
                         append_n =
@@ -1340,9 +1613,15 @@ async fn fake_node(
                     // a known 50% context ring (100k of the 200k Claude window).
                     if prompt.contains("mhome-blocked") {
                         if let Some(usage) = scripted_usage("usage:40000,500,60000,0") {
-                            append_n =
-                                append_event(&mut ws, &instance_id, append_n, "usage", usage)
-                                    .await?;
+                            append_n = append_event(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                "usage",
+                                usage,
+                            )
+                            .await?;
                         }
                         append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
                             .await?;
@@ -1356,9 +1635,14 @@ async fn fake_node(
                     if let Some(scenario) = row_scenario {
                         // Running workflow events follow the working status, so
                         // the row projects a live-run phrase from the journal.
-                        append_n =
-                            append_workflow_scenario(&mut ws, &instance_id, append_n, scenario)
-                                .await?;
+                        append_n = append_workflow_scenario(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            scenario,
+                        )
+                        .await?;
                     }
                     // §9.1 model-sync: the launch snapshot carries the
                     // gateway-discovered catalog and current model for any claude
@@ -1375,6 +1659,7 @@ async fn fake_node(
                         model_catalogs.insert(instance_id.clone(), catalog_ids);
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "model",
@@ -1426,6 +1711,60 @@ async fn fake_node(
                             &mut node_epoch,
                             survivors,
                             &mut frame_queue,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    // c-hubfakeack determinism regression (`__ackbarrier__:hold`
+                    // followed by `__ackbarrier__:next`): the hold command parks
+                    // its append-ack wait until a FURTHER Hub RPC is buffered,
+                    // forcing the swallowed-frame race structurally; both reply
+                    // `accepted:true` so the Hub marks the row accepted from the
+                    // RPC reply itself (not via later journal reconcile).
+                    if prompt.starts_with("__ackbarrier__:") {
+                        if prompt.contains(":hold") {
+                            append_n = append_command_user_barrier(
+                                &mut ws,
+                                &mut frame_queue,
+                                addr.port(),
+                                tracked_ack_reply.clone(),
+                                &instance_id,
+                                append_n,
+                                prompt,
+                                command_id,
+                            )
+                            .await?;
+                        } else {
+                            append_n = append_command_user(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                prompt,
+                                command_id,
+                            )
+                            .await?;
+                        }
+                        append_n = append_journal(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "assistant",
+                            &format!("echo: {prompt}"),
+                        )
+                        .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({
+                                "accepted": true,
+                                "command": {
+                                    "state": "accepted",
+                                    "commandId": command_id.unwrap_or(""),
+                                }
+                            }),
                         )
                         .await?;
                         continue;
@@ -1503,6 +1842,7 @@ async fn fake_node(
                         };
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "effort",
@@ -1527,14 +1867,22 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_command_user(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt,
                             command_id,
                         )
                         .await?;
-                        append_n =
-                            append_event(&mut ws, &instance_id, append_n, "usage", usage).await?;
+                        append_n = append_event(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            "usage",
+                            usage,
+                        )
+                        .await?;
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -1554,6 +1902,7 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "permission",
@@ -1576,6 +1925,7 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_event(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             "model",
@@ -1595,15 +1945,26 @@ async fn fake_node(
                     // (exited resumable instance + live hook/tool/status strip).
                     if prompt == "mfix-chrome-combo" {
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                        append_n =
-                            append_mfix_chrome_combo(&mut ws, &instance_id, append_n).await?;
+                        append_n = append_mfix_chrome_combo(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                        )
+                        .await?;
                         continue;
                     }
                     // UO-6b round 2: a live turn the Hub must settle when the
                     // Node restarts (the spec then types TTYNODE_RESTART).
                     if prompt == "uo6b-epoch-live" {
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                        append_n = append_uo6b_epoch_live(&mut ws, &instance_id, append_n).await?;
+                        append_n = append_uo6b_epoch_live(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                        )
+                        .await?;
                         continue;
                     }
                     // r-ux-comment: reply with a fenced code block so the browser
@@ -1613,6 +1974,7 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_command_user(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt,
@@ -1641,6 +2003,7 @@ async fn fake_node(
                         .await?;
                         append_n = append_toolfold_settle_scenario(
                             &mut ws,
+                            &mut frame_queue,
                             &instance_id,
                             append_n,
                             prompt.contains("mcp"),
@@ -1657,8 +2020,14 @@ async fn fake_node(
                             json!({ "ok": true, "instanceId": instance_id }),
                         )
                         .await?;
-                        append_n =
-                            append_workflow_scenario(&mut ws, &instance_id, append_n, kind).await?;
+                        append_n = append_workflow_scenario(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            kind,
+                        )
+                        .await?;
                         continue;
                     }
                     // c-cua-media: a computer-use MCP call whose result carries
@@ -1672,6 +2041,7 @@ async fn fake_node(
                         .await?;
                         append_n = append_cua_scenario(
                             &mut ws,
+                            &mut frame_queue,
                             addr,
                             host_id.as_id().as_str(),
                             &durable_token,
@@ -1686,9 +2056,15 @@ async fn fake_node(
                     // C2: the journal user node for a composer send carries the
                     // exact commandId the HTTP response returned, so the web folds
                     // optimistic bubble and transcript node into one.
-                    append_n =
-                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
-                            .await?;
+                    append_n = append_command_user(
+                        &mut ws,
+                        &mut frame_queue,
+                        &instance_id,
+                        append_n,
+                        prompt,
+                        command_id,
+                    )
+                    .await?;
                     // D-027: echo the attachment metadata the Hub resolved, so the
                     // e2e can prove staging reached the Node without a real agent.
                     // 2026-09-15: also echo the [Image #n] manifest (index +
@@ -1830,6 +2206,7 @@ async fn fake_node(
                         if let Some(mid) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("model-queued:{mid}"),
@@ -1838,6 +2215,7 @@ async fn fake_node(
                         } else if let Some(mid) = requested.strip_prefix("__notfound__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("model-degraded:{mid}:not-found"),
@@ -1858,6 +2236,7 @@ async fn fake_node(
                             // verdict lands.
                             append_n = append_native_user(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("/model {requested_id}"),
@@ -1873,6 +2252,7 @@ async fn fake_node(
                             let selection_path = if listed { "listed" } else { "typed" };
                             append_n = append_event(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 "model",
@@ -1912,6 +2292,7 @@ async fn fake_node(
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("effort-queued:{word}"),
@@ -1920,6 +2301,7 @@ async fn fake_node(
                         } else if let Some(word) = requested.strip_prefix("__degrade__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("effort-degraded:{word}:dialog-kept"),
@@ -1963,6 +2345,7 @@ async fn fake_node(
                             });
                             append_n = append_event(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 "effort",
@@ -1981,6 +2364,7 @@ async fn fake_node(
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("permission-queued:{word}"),
@@ -1989,6 +2373,7 @@ async fn fake_node(
                         } else if let Some(word) = requested.strip_prefix("__degrade__:") {
                             append_n = append_configure_status(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 &format!("permission-degraded:{word}:no-status-line"),
@@ -1997,6 +2382,7 @@ async fn fake_node(
                         } else {
                             append_n = append_event(
                                 &mut ws,
+                                &mut frame_queue,
                                 &instance_id,
                                 append_n,
                                 "permission",
@@ -2018,9 +2404,15 @@ async fn fake_node(
                 "instance.close" => {
                     if claude_ptys.contains(&instance_id) {
                         ttys.remove(&instance_id);
-                        append_n =
-                            append_instance_state(&mut ws, &instance_id, append_n, "exited", None)
-                                .await?;
+                        append_n = append_instance_state(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            "exited",
+                            None,
+                        )
+                        .await?;
                     }
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                 }
@@ -2054,7 +2446,29 @@ async fn fake_node(
                         })
                         .cloned()
                         .collect();
+                    // Capture whether THIS list answers the ack barrier BEFORE
+                    // send_rpc_ok moves `id`.
+                    let is_tracked = tracked_ack_reply.lock().await.as_ref() == Some(&id);
                     send_rpc_ok(&mut ws, id, json!({ "items": items })).await?;
+                    // c-hubfakeack round 3: write the REPLY marker now that the
+                    // dispatch loop has actually answered the parked
+                    // interaction.list. A recorded-but-discarded frame never
+                    // reaches this point, so the marker proves the queued RPC
+                    // was serviced (not merely observed).
+                    if is_tracked {
+                        let reply_marker = std::env::temp_dir()
+                            .join(format!("remuda-e2e-ackreply-{}", addr.port()));
+                        let _ = std::fs::write(
+                            &reply_marker,
+                            tracked_ack_reply
+                                .lock()
+                                .await
+                                .clone()
+                                .map(|v| format!("{v} interaction.list"))
+                                .unwrap_or_else(|| " interaction.list".into()),
+                        );
+                        *tracked_ack_reply.lock().await = None;
+                    }
                     // A scripted terminal answer starts its timer here: the
                     // card has now been listed to a client at least once, so
                     // the spec's "pending after the form is visible" assertion
@@ -2430,8 +2844,14 @@ async fn fake_node(
                         continue;
                     }
                     if let Some(line) = submitted {
-                        append_n =
-                            append_native_user(&mut ws, &instance_id, append_n, &line).await?;
+                        append_n = append_native_user(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            &line,
+                        )
+                        .await?;
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -2491,33 +2911,232 @@ async fn fake_node(
     Ok(())
 }
 
+/// Total time one journal append may take to be acknowledged. This is an
+/// ABSOLUTE budget: it must not reset per received frame, or a steady trickle
+/// of unrelated frames (interaction.list polls every ~2 s, pipelined RPCs)
+/// would let a missing ack park the Node in the append handler forever and
+/// grow the stash without bound.
+const FRAME_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on frames stashed behind one ack wait. Hitting it is a LOUD harness
+/// failure, never an unbounded queue.
+const PENDING_FRAME_QUEUE_CAP: usize = 4096;
+/// c-hubfakeack determinism barrier: how long the marked send waits for the
+/// NEXT interaction.list RPC to already be on the wire while its own append
+/// ack is outstanding. The spec issues that GET itself, so the frame is
+/// present within milliseconds. This is deliberately WELL BELOW the Hub's
+/// 5 s command-accept budget (DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS): a missed RPC
+/// fails loudly in the Node before the Hub gives up and returns reconciling.
+const ACK_BARRIER_TIMEOUT: Duration = Duration::from_millis(2_000);
+/// Test-only negative control: HUB_E2E_ACK_DISCARD=1 makes the barrier RECORD
+/// the intervening interaction.list (and its marker) but DROP the frame,
+/// reproducing the old swallowed-frame bug while keeping the new markers. The
+/// reply marker must then never appear, proving the test has real power.
+fn ack_discard_enabled() -> bool {
+    std::env::var("HUB_E2E_ACK_DISCARD").as_deref() == Ok("1")
+}
+
+/// Classify a frame against the wanted append-ack id.
+///
+/// - `Some(Ok(()))`  — a matching SUCCESS response (object `result`, no error)
+/// - `Some(Err(_))`  — a matching response carrying an `error`, or no result
+///   object (a rejected/failed append must never be hidden as success)
+/// - `None`          — not the wanted response (a Hub RPC or a stale ack)
+fn classify_ack_frame(value: &Value, want: &str) -> Option<Result<()>> {
+    if value.get("method").is_some() {
+        return None;
+    }
+    if value.get("id").and_then(Value::as_str) != Some(want) {
+        return None;
+    }
+    if let Some(error) = value.get("error") {
+        return Some(Err(anyhow!("append ack {want} was an RPC error: {error}")));
+    }
+    if !value.get("result").is_some_and(Value::is_object) {
+        return Some(Err(anyhow!(
+            "append ack {want} carried no result object: {value}"
+        )));
+    }
+    Some(Ok(()))
+}
+
 /// Read frames until the Hub acknowledges the journal append with id `want`.
 ///
-/// Any other frame read while waiting — a stale fire-and-forget append ack or
-/// an unrelated Hub RPC like the web poll's interaction.list — is stashed in
-/// `queue` for the main loop to process, so waiting on durability can never
-/// swallow an RPC.
-async fn wait_frame_ack(
-    ws: &mut NodeWs,
-    queue: &mut std::collections::VecDeque<String>,
-    want: &str,
-) -> Result<()> {
+/// Uses ONE absolute deadline (`FRAME_ACK_TIMEOUT` from the first call),
+/// blocking only for the time remaining each iteration. Before blocking it
+/// scans `queue` for an already-buffered matching ack (the determinism
+/// barrier and nested appends can stash the ack ahead of unrelated RPCs).
+///
+/// Every other frame — a stale fire-and-forget append ack or an unrelated Hub
+/// RPC like the web poll's interaction.list — is stashed in `queue` for the
+/// main loop to process, so waiting on durability can never swallow an RPC.
+/// A missing ack, an `error` ack, or an over-capacity queue is a loud error
+/// that the spawn supervisor turns into a non-zero harness exit.
+async fn wait_frame_ack(ws: &mut NodeWs, queue: &mut FrameQueue, want: &str) -> Result<()> {
+    let deadline = Instant::now() + FRAME_ACK_TIMEOUT;
     loop {
-        let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => text,
-            Ok(_) => anyhow::bail!("hub connection closed waiting for append ack {want}"),
-            Err(_) => anyhow::bail!("timed out waiting for append ack {want}"),
-        };
-        let value: Value = serde_json::from_str(&frame)?;
-        let matched =
-            value.get("method").is_none() && value.get("id").and_then(Value::as_str) == Some(want);
-        if matched {
+        // 1. Already-buffered match (the ack may be queued ahead of RPCs).
+        if let Some(pos) = queue.iter().position(|frame| {
+            serde_json::from_str::<Value>(frame)
+                .map(|v| classify_ack_frame(&v, want).is_some())
+                .unwrap_or(false)
+        }) {
+            let frame = queue.remove(pos).context("frame queue position vanished")?;
+            let value: Value = serde_json::from_str(&frame)?;
+            classify_ack_frame(&value, want).expect("frame just matched")?;
             return Ok(());
         }
-        queue.push_back(frame.to_string());
+        // 2. Block for the REMAINING time only — the deadline never extends.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "timed out after {} ms waiting for append ack {want} ({} frame(s) queued)",
+                FRAME_ACK_TIMEOUT.as_millis(),
+                queue.len()
+            );
+        }
+        let frame = match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => text,
+            Ok(_) => anyhow::bail!("hub connection closed waiting for append ack {want}"),
+            Err(_) => {
+                anyhow::bail!(
+                    "timed out after {} ms waiting for append ack {want} ({} frame(s) queued)",
+                    FRAME_ACK_TIMEOUT.as_millis(),
+                    queue.len()
+                )
+            }
+        };
+        let value: Value = serde_json::from_str(&frame)?;
+        match classify_ack_frame(&value, want) {
+            Some(Ok(())) => return Ok(()),
+            Some(Err(reason)) => return Err(reason),
+            None => {
+                if queue.len() >= PENDING_FRAME_QUEUE_CAP {
+                    anyhow::bail!(
+                        "pending frame queue overflow (>{PENDING_FRAME_QUEUE_CAP}) waiting for append ack {want}"
+                    );
+                }
+                queue.push_back(frame.to_string());
+            }
+        }
     }
 }
 
+/// c-hubfakeack determinism barrier (test-only): do not let an append ack
+/// complete until a FURTHER Hub→Node RPC has actually arrived on the socket
+/// and been stashed. This makes the "RPC buffered behind an outstanding ack"
+/// race structural instead of relying on scheduler timing: the marked send
+/// parks here, and the Hub (which pipelines instance.send over independent
+/// in-flight slots) forwards the next command into this wait. Every frame —
+/// including an ack that arrives early — is queued; the caller then runs the
+/// normal [`wait_frame_ack`], which resolves from the queue. Writes a marker
+/// file (counting intervening RPCs) so the Playwright spec can prove the
+/// intervening RPC really was queued, not merely that two sends succeeded.
+///
+/// If no further RPC arrives within the barrier window the Node is mis-wired
+/// or the Hub serialised — a loud error rather than a silent pass.
+/// The interaction.list frame the ack barrier is waiting for, if `frame` is
+/// one: returns its parsed JSON-RPC id.
+fn interaction_list_id(frame: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(frame).ok()?;
+    if value.get("method").and_then(Value::as_str) == Some("interaction.list") {
+        value.get("id").cloned()
+    } else {
+        None
+    }
+}
+
+/// Park behind the append ack `want` until an `interaction.list` RPC is
+/// buffered (the spec issues that GET itself). Records the RPC's id in
+/// `tracked` and writes the QUEUE marker (`<id> interaction.list`) the moment
+/// the frame arrives. Under HUB_E2E_ACK_DISCARD=1 the frame is recorded but
+/// then DROPPED (negative control): the interaction.list arm can never answer
+/// it, so the separate REPLY marker never appears even though the queue marker
+/// does — exactly the gap this regression must catch.
+async fn ensure_intervening_rpc(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    want: &str,
+    port: u16,
+    tracked: std::sync::Arc<tokio::sync::Mutex<Option<Value>>>,
+) -> Result<()> {
+    let queue_marker = std::env::temp_dir().join(format!("remuda-e2e-ackqueue-{port}"));
+    let record = |rpc_id: &Value| {
+        let body = format!("{rpc_id} interaction.list");
+        std::fs::write(&queue_marker, body)
+            .with_context(|| format!("write ack queue marker {}", queue_marker.display()))
+    };
+
+    // 1. Already buffered ahead of the wait; remember its QUEUE POSITION so the
+    // discard negative control can remove THAT entry (removing only a clone
+    // would leave the original queued, answered, and wrongly reply-marked).
+    let mut found: Option<(Value, String, Option<usize>)> = queue
+        .iter()
+        .position(|f| interaction_list_id(f).is_some())
+        .map(|pos| {
+            let frame = &queue[pos];
+            (
+                interaction_list_id(frame).expect("just matched"),
+                frame.clone(),
+                Some(pos),
+            )
+        });
+
+    let deadline = Instant::now() + ACK_BARRIER_TIMEOUT;
+    while found.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "ack barrier: no interaction.list arrived behind append ack {want} within {} ms",
+                ACK_BARRIER_TIMEOUT.as_millis()
+            );
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let text = text.to_string();
+                if interaction_list_id(&text).is_some() {
+                    // A frame just read: not in the queue yet (position None).
+                    let id = interaction_list_id(&text).expect("matched above");
+                    found = Some((id, text, None));
+                } else if queue.len() < PENDING_FRAME_QUEUE_CAP {
+                    // A journal ack or other RPC: stash for the dispatch loop.
+                    queue.push_back(text);
+                } else {
+                    anyhow::bail!("pending frame queue overflow in ack barrier for {want}");
+                }
+            }
+            Ok(_) => anyhow::bail!("hub connection closed during ack barrier for {want}"),
+            Err(_) => {
+                anyhow::bail!(
+                    "ack barrier: no interaction.list arrived behind append ack {want} within {} ms",
+                    ACK_BARRIER_TIMEOUT.as_millis()
+                )
+            }
+        }
+    }
+
+    let (rpc_id, frame, queued_pos) = found.expect("an interaction.list was observed");
+    record(&rpc_id)?;
+    *tracked.lock().await = Some(rpc_id);
+    if ack_discard_enabled() {
+        // NEGATIVE CONTROL: record + marker written, then REMOVE the frame for
+        // real. If it was already queued, drop the entry at its captured
+        // position; otherwise simply do not enqueue the freshly read frame.
+        if let Some(pos) = queued_pos {
+            if pos < queue.len() && queue[pos] == frame {
+                queue.remove(pos);
+            } else if let Some(eq) = queue.iter().position(|f| f == &frame) {
+                queue.remove(eq);
+            }
+        }
+        tracing::warn!("HUB_E2E_ACK_DISCARD=1: dropped queued interaction.list behind {want}");
+    } else if queued_pos.is_none() && queue.len() < PENDING_FRAME_QUEUE_CAP {
+        // Normal mode, freshly read frame: enqueue it, preserving order.
+        queue.push_back(frame);
+    }
+    // Normal mode with queued_pos = Some: the frame is already in the queue at
+    // its original position; leave it there (do not move it to the back).
+    Ok(())
+}
 /// Journal the entity lifecycle a terminal-answered question settles with:
 /// state `resolved`, actor human with no device, answer carried verbatim.
 async fn append_terminal_resolution(
@@ -2926,6 +3545,12 @@ async fn send_rpc_ok(
 type NodeWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// c-hubfakeack: frames stashed while an append waits for its own ack. Every
+/// journal.append waits on its JSON-RPC id; a Hub RPC (instance.send,
+/// interaction.list, tty.screen, …) that arrives meanwhile is pushed here so
+/// the main dispatch loop answers it — never swallowed by the ack wait.
+type FrameQueue = std::collections::VecDeque<String>;
+
 // ── t-bind fake worktree layer (HUB_E2E_TASK_BIND=1 only) ──────────────────
 //
 // The default fake Node holds no git repository, so the worktree lease RPCs
@@ -2937,6 +3562,134 @@ type NodeWs =
 
 fn task_bind_enabled() -> bool {
     std::env::var("HUB_E2E_TASK_BIND").as_deref() == Ok("1")
+}
+
+// ── c-dirpicker directory browser + workspace mutations (HUB_E2E_DIR_PICKER=1) ─
+//
+// The fake Node gains a real, bounded directories-only `host.dirs.list` rooted
+// at DIRPICKER_BROWSE_ROOT, plus the two-phase workspace.register/unregister
+// protocol (mutating the announced snapshot). Behind an explicit trigger so
+// every other spec keeps the unchanged hello and the "unknown method"
+// behaviour for the mutation RPCs.
+
+fn dir_picker_enabled() -> bool {
+    std::env::var("HUB_E2E_DIR_PICKER").as_deref() == Ok("1")
+}
+
+/// Per-run browse allowlist root for the c-dirpicker spec (r8 item 5, r9
+/// item 3). It is always harness-OWNED: a per-run subdirectory of an
+/// env-provided base (HUB_E2E_DIR_PICKER_ROOT) or, by default, a directory
+/// inside the harness TempDir. It must never be a shared, hard-coded host
+/// `/tmp` path, and the caller's env-provided base itself must never be
+/// deleted — [`cleanup_dir_picker_fixtures`] removes only the owned path.
+static DIRPICKER_BROWSE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn set_dir_picker_root(path: std::path::PathBuf) {
+    let _ = DIRPICKER_BROWSE_ROOT.set(path);
+}
+
+fn dir_picker_root() -> &'static std::path::Path {
+    DIRPICKER_BROWSE_ROOT
+        .get()
+        .expect("dir-picker root initialised in main before the fake Node serves")
+}
+
+fn seed_dir_picker_fixtures() -> Result<()> {
+    let root = dir_picker_root();
+    std::fs::create_dir_all(root.join("alpha/nested"))?;
+    std::fs::create_dir_all(root.join("beta/nested"))?;
+    std::fs::create_dir_all(root.join(".hidden"))?;
+    std::fs::write(root.join("note.txt"), b"files are not directories\n")?;
+    Ok(())
+}
+
+/// Best-effort removal of the OWNED browse tree on shutdown. The owned path
+/// is a per-run subdirectory the harness itself created (under the
+/// env-provided base or the harness TempDir), so removing it never touches
+/// caller data; an env-provided base is left intact (r9 item 3).
+fn cleanup_dir_picker_fixtures() {
+    if let Some(root) = DIRPICKER_BROWSE_ROOT.get() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// Build the workspace snapshot the Hub observes after each list/mutation.
+fn workspace_snapshot(revision: u64, rows: &[Value]) -> Value {
+    json!({"workspaceRevision": revision, "workspaces": rows})
+}
+
+/// Real directories-only answer for `host.dirs.list`, mirroring the Node
+/// bounds: containment under one allowlist root, no symlink following, hidden
+/// dot-directories off by default, and a hard result cap.
+fn dirs_list_answer(params: &Value, registered_roots: &[String]) -> Result<Value> {
+    let root = std::fs::canonicalize(dir_picker_root())?;
+    let requested = params.get("path").and_then(Value::as_str).unwrap_or("");
+    let target = if requested.trim().is_empty() {
+        root.clone()
+    } else {
+        let path = std::path::Path::new(requested);
+        if !path.is_absolute() {
+            return Err(anyhow!("browsed path must be absolute"));
+        }
+        let canonical = std::fs::canonicalize(path)?;
+        if !canonical.starts_with(&root) {
+            return Err(anyhow!("path is outside the directories this Node allows"));
+        }
+        if !canonical.is_dir() {
+            return Err(anyhow!("{requested} is not a directory"));
+        }
+        canonical
+    };
+    let show_hidden = params
+        .get("showHidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut names: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    let mut truncated = false;
+    for entry in std::fs::read_dir(&target)? {
+        let Ok(entry) = entry else { continue };
+        scanned += 1;
+        if scanned > 16_384 {
+            truncated = true;
+            break;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    if names.len() > 4096 {
+        names.truncate(4096);
+        truncated = true;
+    }
+    let parent = if target == root {
+        None
+    } else {
+        target
+            .parent()
+            .filter(|parent| parent.starts_with(&root))
+            .map(|parent| json!(parent.display().to_string()))
+    };
+    Ok(json!({
+        "path": target.display().to_string(),
+        "parent": parent,
+        "home": root.display().to_string(),
+        "roots": [root.display().to_string()],
+        "workspaces": registered_roots,
+        "dirs": names.iter().map(|name| json!({"name": name})).collect::<Vec<_>>(),
+        "truncated": truncated,
+    }))
 }
 
 // ── c-perfaudit high-rate flood triggers (HUB_E2E_PERF=1 only) ────────────
@@ -3154,6 +3907,7 @@ async fn send_rpc_error(ws: &mut NodeWs, id: Value, message: &str) -> Result<()>
 /// Confirm resource lifecycle and the native identity needed by Hub resume.
 async fn append_instance_state(
     ws: &mut NodeWs,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     state: &str,
@@ -3178,7 +3932,7 @@ async fn append_instance_state(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -3188,6 +3942,7 @@ async fn append_instance_state(
 /// the session id keeps D-026 resume available.
 async fn append_instance_exit(
     ws: &mut NodeWs,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     session_id: &str,
@@ -3215,7 +3970,7 @@ async fn append_instance_exit(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -3227,7 +3982,12 @@ async fn append_instance_exit(
 /// decision in `working` (so Esc 打断 renders), and an 858-output-token usage
 /// snapshot. The web spec asserts the compact keyboard band still shows the
 /// composer and a >=40% transcript.
-async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64) -> Result<u64> {
+async fn append_mfix_chrome_combo(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    mut n: u64,
+) -> Result<u64> {
     let session_id = format!("mfix-chrome-{}", uuid::Uuid::now_v7());
     let rfc3339 = |t: time::OffsetDateTime| {
         format!(
@@ -3260,9 +4020,10 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
             }
         })
     };
-    n = append_full_event(ws, instance_id, n, entity("ready", &now_at)).await?;
+    n = append_full_event(ws, queue, instance_id, n, entity("ready", &now_at)).await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3279,6 +4040,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     for i in 1..=12 {
         n = append_full_event(
             ws,
+        queue,
             instance_id,
             n,
             json!({
@@ -3298,6 +4060,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     // running AskUserQuestion card is the transcript's final (latest) row.
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3327,6 +4090,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3354,6 +4118,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3380,6 +4145,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     // hook tier is stalled (Esc 打断 must render).
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3400,7 +4166,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
         }),
     )
     .await?;
-    append_full_event(ws, instance_id, n, entity("exited", &now_at)).await
+    append_full_event(ws, queue, instance_id, n, entity("exited", &now_at)).await
 }
 
 /// UO-6b round 2: a turn that stays LIVE — a latched hook text-streaming
@@ -3413,7 +4179,12 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
 /// message and NO `status`), and the strip must settle on that instead of
 /// throwing / keeping the growing timer. The web spec triggers the restart
 /// with `TTYNODE_RESTART` after this fixture lands.
-async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) -> Result<u64> {
+async fn append_uo6b_epoch_live(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    mut n: u64,
+) -> Result<u64> {
     let now_at = {
         let t = time::OffsetDateTime::now_utc();
         format!(
@@ -3429,6 +4200,7 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
     };
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3446,6 +4218,7 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3458,6 +4231,7 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3482,6 +4256,7 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
     .await?;
     append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -3506,7 +4281,10 @@ async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) 
 
 /// One full-shape user message observation. A composer/command send carries
 /// `command_id` (C2 correlation); a natively typed prompt omits it.
-async fn append_user_message(
+/// Send one command/user journal message frame and return its `j{seq}` id;
+/// does NOT wait for the append ack (callers drive [`wait_frame_ack`],
+/// possibly behind the determinism barrier).
+async fn send_user_message_frame(
     ws: &mut NodeWs,
     instance_id: &str,
     n: u64,
@@ -3550,13 +4328,35 @@ async fn append_user_message(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
 }
 
-/// A command-delivered prompt: its user node carries the delivering commandId.
-async fn append_command_user(
+async fn append_user_message(
     ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+    command_id: Option<&str>,
+    node: &str,
+) -> Result<u64> {
+    let seq = send_user_message_frame(ws, instance_id, n, text, command_id, node).await?;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
+    Ok(seq)
+}
+
+/// c-hubfakeack barrier command: append the user frame, then force a FURTHER
+/// Hub RPC to be buffered behind this append's outstanding ack before
+/// matching it. Proves the queue-and-drain path under a guaranteed race and
+/// that the ack itself is an explicit success (wait_frame_ack rejects an
+/// `error` ack). The marker file reports how many intervening RPCs were
+/// stashed.
+#[allow(clippy::too_many_arguments)]
+async fn append_command_user_barrier(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    port: u16,
+    tracked: std::sync::Arc<tokio::sync::Mutex<Option<Value>>>,
     instance_id: &str,
     n: u64,
     text: &str,
@@ -3568,12 +4368,40 @@ async fn append_command_user(
                 .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
         })
         .unwrap_or_else(|| format!("obj_legacy_{n}"));
-    append_user_message(ws, instance_id, n, text, command_id, &node).await
+    let seq = send_user_message_frame(ws, instance_id, n, text, command_id, &node).await?;
+    let want = format!("j{seq}");
+    ensure_intervening_rpc(ws, queue, &want, port, tracked).await?;
+    wait_frame_ack(ws, queue, &want).await?;
+    Ok(seq)
+}
+
+/// A command-delivered prompt: its user node carries the delivering commandId.
+async fn append_command_user(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+    command_id: Option<&str>,
+) -> Result<u64> {
+    let node = command_id
+        .map(|id| {
+            id.strip_prefix("cmd_")
+                .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
+        })
+        .unwrap_or_else(|| format!("obj_legacy_{n}"));
+    append_user_message(ws, queue, instance_id, n, text, command_id, &node).await
 }
 
 /// A prompt typed natively into the PTY: human origin, no commandId, its own
 /// node (eventId-derived identity through the hub shorthand normaliser).
-async fn append_native_user(ws: &mut NodeWs, instance_id: &str, n: u64, text: &str) -> Result<u64> {
+async fn append_native_user(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+) -> Result<u64> {
     let seq = n + 1;
     ws.send(Message::Text(
         json!({
@@ -3593,7 +4421,7 @@ async fn append_native_user(ws: &mut NodeWs, instance_id: &str, n: u64, text: &s
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -4177,6 +5005,20 @@ fn fake_hook_question(instance_id: &str, host_id: &str, interaction_id: &str) ->
     })
 }
 
+/// c-question-alert: like [`fake_hook_question`] but with a KNOWN deadline
+/// (RFC3339, ~15 min out) so the web countdown can be asserted and advanced
+/// with `page.clock`. The card is otherwise the ask-question sentinel.
+fn fake_hook_question_with_deadline(
+    instance_id: &str,
+    host_id: &str,
+    interaction_id: &str,
+    deadline: &str,
+) -> Value {
+    let mut card = fake_hook_question(instance_id, host_id, interaction_id);
+    card["deadline"] = json!({ "state": "known", "value": deadline });
+    card
+}
+
 /// r-ux-w: select a synthetic workflow scenario by prompt prefix.
 /// r-ux-comment: prompts mentioning code get an assistant reply containing a
 /// fenced ts block, so the browser spec can quote it with the 评论 action.
@@ -4258,6 +5100,7 @@ async fn append_configure_status(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     status: &str,
@@ -4284,7 +5127,7 @@ async fn append_configure_status(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -4292,6 +5135,7 @@ async fn append_event(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     kind: &str,
@@ -4299,6 +5143,7 @@ async fn append_event(
 ) -> Result<u64> {
     append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({ "kind": kind, "payload": payload }),
@@ -4312,6 +5157,7 @@ async fn append_full_event(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     n: u64,
     event: Value,
@@ -4328,7 +5174,7 @@ async fn append_full_event(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    wait_frame_ack(ws, queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 
@@ -4483,6 +5329,7 @@ async fn append_toolfold_settle_scenario(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     mut n: u64,
     long_mcp: bool,
@@ -4491,6 +5338,7 @@ async fn append_toolfold_settle_scenario(
     if long_mcp {
         n = append_event(
             ws,
+        queue,
             instance_id,
             n,
             "tool_call",
@@ -4513,6 +5361,7 @@ async fn append_toolfold_settle_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "tool_result",
@@ -4536,6 +5385,7 @@ async fn append_toolfold_settle_scenario(
     }
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "tool_call",
@@ -4561,6 +5411,7 @@ async fn append_toolfold_settle_scenario(
     tokio::time::sleep(Duration::from_millis(3_000)).await;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "tool_result",
@@ -4590,6 +5441,7 @@ async fn append_workflow_scenario(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     mut n: u64,
     kind: &str,
@@ -4620,6 +5472,7 @@ async fn append_workflow_scenario(
     // The Workflow tool call the card hangs on.
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "tool_call",
@@ -4705,6 +5558,7 @@ async fn append_workflow_scenario(
         // Decision 6: old daemon — run with a note and no phase/member detail.
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -4722,8 +5576,17 @@ async fn append_workflow_scenario(
     }
 
     if kind == "drill" {
-        return append_drill_scenario(ws, instance_id, n, &workflow_id, &tool_id, &phase, &member)
-            .await;
+        return append_drill_scenario(
+            ws,
+            queue,
+            instance_id,
+            n,
+            &workflow_id,
+            &tool_id,
+            &phase,
+            &member,
+        )
+        .await;
     }
 
     if kind == "live" {
@@ -4732,6 +5595,7 @@ async fn append_workflow_scenario(
         // can be proven to fold the card into the compact summary row.
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -4747,6 +5611,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -4755,6 +5620,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -4763,6 +5629,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4786,6 +5653,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4809,6 +5677,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4832,6 +5701,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4858,6 +5728,7 @@ async fn append_workflow_scenario(
         let bash_id = format!("obj_bash_{tag}");
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "tool_call",
@@ -4880,6 +5751,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "tool_result",
@@ -4900,6 +5772,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "thought",
@@ -4925,6 +5798,7 @@ async fn append_workflow_scenario(
     if kind == "demo-done" {
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4948,6 +5822,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4971,6 +5846,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -4994,6 +5870,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5002,6 +5879,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5010,6 +5888,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5030,6 +5909,7 @@ async fn append_workflow_scenario(
         let running_only = kind == "demo-running";
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5045,6 +5925,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5053,6 +5934,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5061,6 +5943,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5084,6 +5967,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5107,6 +5991,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5130,6 +6015,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5157,6 +6043,7 @@ async fn append_workflow_scenario(
         tokio::time::sleep(Duration::from_millis(900)).await;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5180,6 +6067,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5203,6 +6091,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5226,6 +6115,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5234,6 +6124,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5242,6 +6133,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5262,6 +6154,7 @@ async fn append_workflow_scenario(
         // One 20-agent phase: the >12-row quiet tail must fold behind 还有 8 个.
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5277,6 +6170,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5287,6 +6181,7 @@ async fn append_workflow_scenario(
             let state = if i == 0 { "running" } else { "queued" };
             n = append_event(
                 ws,
+                queue,
                 instance_id,
                 n,
                 "workflow.member",
@@ -5321,6 +6216,7 @@ async fn append_workflow_scenario(
         for i in 0..20 {
             n = append_event(
                 ws,
+                queue,
                 instance_id,
                 n,
                 "workflow.member",
@@ -5345,6 +6241,7 @@ async fn append_workflow_scenario(
         }
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.phase",
@@ -5353,6 +6250,7 @@ async fn append_workflow_scenario(
         .await?;
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.run",
@@ -5372,6 +6270,7 @@ async fn append_workflow_scenario(
     // kind == "fail": 14 done, 1 failed. Failed rows never fold.
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.run",
@@ -5387,6 +6286,7 @@ async fn append_workflow_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.phase",
@@ -5396,6 +6296,7 @@ async fn append_workflow_scenario(
     for i in 0..14 {
         n = append_event(
             ws,
+            queue,
             instance_id,
             n,
             "workflow.member",
@@ -5420,6 +6321,7 @@ async fn append_workflow_scenario(
     }
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.member",
@@ -5561,6 +6463,7 @@ impl remuda_protocol::ToolMediaStager for CuaStager {
 #[allow(clippy::too_many_arguments)]
 async fn append_cua_scenario(
     ws: &mut NodeWs,
+    queue: &mut FrameQueue,
     addr: SocketAddr,
     host: &str,
     token: &str,
@@ -5581,7 +6484,7 @@ async fn append_cua_scenario(
                 .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
         })
         .unwrap_or_else(|| format!("obj_legacy_{n}"));
-    n = append_user_message(ws, instance_id, n, prompt, command_id, &node).await?;
+    n = append_user_message(ws, queue, instance_id, n, prompt, command_id, &node).await?;
 
     let http_base = format!("http://{addr}");
     let stager = std::sync::Arc::new(CuaStager {
@@ -5696,7 +6599,7 @@ async fn append_cua_scenario(
             .get("payload")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("mapped event missing payload"))?;
-        n = append_event(ws, instance_id, n, &kind, payload).await?;
+        n = append_event(ws, queue, instance_id, n, &kind, payload).await?;
     }
 
     n = append_journal(
@@ -5724,6 +6627,7 @@ async fn append_drill_scenario(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    queue: &mut FrameQueue,
     instance_id: &str,
     mut n: u64,
     workflow_id: &str,
@@ -5747,6 +6651,7 @@ async fn append_drill_scenario(
     }
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.run",
@@ -5775,6 +6680,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.phase",
@@ -5783,6 +6689,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.phase",
@@ -5791,6 +6698,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.member",
@@ -5812,6 +6720,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "workflow.member",
@@ -5838,6 +6747,7 @@ async fn append_drill_scenario(
     let sub_tool = "toolu_sec_bash1";
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -5866,6 +6776,7 @@ async fn append_drill_scenario(
     .await?;
     n = append_full_event(
         ws,
+        queue,
         instance_id,
         n,
         json!({
@@ -5891,6 +6802,7 @@ async fn append_drill_scenario(
     // A main-agent tool call stays at top level (no agent id on the source).
     n = append_event(
         ws,
+        queue,
         instance_id,
         n,
         "tool_call",

@@ -291,6 +291,24 @@
   --dur-3: 240ms;
   --ease-out: cubic-bezier(0.2, 0, 0, 1);
   --ease-in: cubic-bezier(0.3, 0, 1, 1);
+
+  /*
+   * Stacking order (c-composerpop). Final order, low → high:
+   *   notify stack 30 < popover/menu 40 < annotation dock 50 < sheet 60
+   *   < stacked sheet 61 < fullscreen terminal 80.
+   * Popovers/menus sit above the notification stack so a toast or standing
+   * error never covers or dismisses an open menu; the annotation dock rides
+   * above menus (the 批注 bar must not hide behind an open slider) but below
+   * a sheet/scrim. A sheet stacked ABOVE another sheet (the mobile usage
+   * card over the options sheet) takes --z-sheet-stacked: the card is a
+   * previous DOM sibling of the options sheet, so an equal value would let
+   * the later sheet cover it (r3 item 1).
+   */
+  --z-notify-stack: 30;
+  --z-popover: 40;
+  --z-annotation-dock: 50;
+  --z-sheet: 60;
+  --z-sheet-stacked: 61;
 }
 
 @media (max-width: 1199px) {

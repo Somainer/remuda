@@ -23,6 +23,7 @@ import { ADMIN_NAV, PRIMARY_NAV, isSessionRoute, isUnder } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
 import { formatDiagnostic, notify, notifyStore, toastAdapter, useLiveAnnouncement, useNotifications, type Notification, type NotifyInput } from "../lib/notify";
 import { useWorkbenchViewport } from "../lib/viewport";
+import { e2eSeamsEnabled } from "../lib/e2eSeams";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { SpaceTabs } from "../features/spaces/SpaceTabs";
 import { spaceStore } from "../features/spaces/store";
@@ -68,6 +69,9 @@ export function shellChrome(pathname: string, mobile: boolean) {
 /** Test seam for the notification surfaces; mirrors `window.__ttyLab`. */
 type NotifyLabHandle = {
   notify: (input: NotifyInput) => string;
+  /** Raise through the legacy `hubStore.toast` bridge so the info strip the
+   *  Shell derives from it is mounted alongside a blocker. */
+  toast: (text: string) => void;
   dismissAllBlocking: () => void;
 };
 
@@ -106,7 +110,14 @@ export function ShellNotify() {
    * backend facts.
    */
   useEffect(() => {
-    window.__notifyLab = { notify, dismissAllBlocking: notifyStore.dismissAllBlocking };
+    // c-composerpop r2 item 4: the notification test seam exists only in e2e,
+    // behind the explicit addInitScript marker — never in a production session.
+    if (!e2eSeamsEnabled()) return;
+    window.__notifyLab = {
+      notify,
+      toast: (text: string) => hubStore.toast(text),
+      dismissAllBlocking: notifyStore.dismissAllBlocking,
+    };
     return () => {
       delete window.__notifyLab;
     };
@@ -508,7 +519,7 @@ export function Shell() {
   return (
     <CommitProbe name="Shell">
     <AnnotationProvider>
-    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layout}data-collapsed={collapsed}>
+    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layout} data-phone-nav={chrome.phoneNav ? "1" : undefined} data-collapsed={collapsed}>
       <BoardScopeSync />
       <div className={css.install}>
         <InstallBar />

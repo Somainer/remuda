@@ -3033,24 +3033,51 @@ describe("load-earlier anchor lifecycle round 5", () => {
       // correction write, so no readerInputSeq bump happens. Pixel proximity
       // must then classify it: an event far from the echo target is the
       // reader, not the restore.
-      const { user, geo, g, older } = setup("insCoalesceFar");
-      await user.click(screen.getByTestId("load-earlier"));
-      geo.setTotal(150);
-      await act(async () => {
-        g.resolve(pageOf(older));
-        await Promise.resolve();
+      // Hold the rAF queue for this test so a queued echo cannot self-clear
+      // between the write and the far scroll (independent of test ordering).
+      const rafQueue: number[] = [];
+      let rafId = 0;
+      const realRaf = globalThis.requestAnimationFrame;
+      vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+        rafId += 1;
+        rafQueue.push(cb as unknown as number);
+        return rafId;
       });
-      await act(async () => {});
-      // A settle correction schedules an own-echo write (rAF not flushed).
-      // Immediately move FAR with a bare scroll event and NO wheel/gesture,
-      // so the input token is unchanged but the position is 12 rows away.
-      const dest = geo.top();
-      geo.scrollTo(dest - 12 * ROW);
-      await act(async () => {});
-      expect(
-        geo.scroller().getAttribute("data-prepend-hold"),
-        "a far scroll coalesced with the echo was swallowed and kept the restore",
-      ).toBe("0");
+      try {
+        const { user, geo, g, older } = setup("insCoalesceFar");
+        await user.click(screen.getByTestId("load-earlier"));
+        geo.setTotal(150);
+        await act(async () => {
+          g.resolve(pageOf(older));
+          await Promise.resolve();
+        });
+        // Drive settle corrections synchronously until an own-echo write is
+        // queued (the held rAF never delivers it).
+        let armed = false;
+        for (let i = 0; i < 14; i += 1) {
+          geo.growRow(4, ROW + 1);
+          if (geo.isQueued()) {
+            armed = true;
+            break;
+          }
+        }
+        expect(armed, "no restore echo was queued for the far scroll to coalesce with").toBe(true);
+        // Move FAR with a bare scroll event and NO wheel/gesture, in the same
+        // frame: the input token is unchanged but the position is 12 rows from
+        // the echo target.
+        const dest = geo.top();
+        geo.scrollTo(dest - 12 * ROW);
+        expect(
+          geo.scroller().getAttribute("data-prepend-hold"),
+          "a far scroll coalesced with the echo was swallowed and kept the restore",
+        ).toBe("0");
+      } finally {
+        rafQueue.length = 0;
+        vi.unstubAllGlobals();
+        // Restore the real rAF binding explicitly (unstubAllGlobals may leave
+        // the jsdom rAF in place until the next test's defineScroll).
+        globalThis.requestAnimationFrame = realRaf;
+      }
     });
 
     // UO-6a round 8 item 3: after a load-earlier cancel switches growth

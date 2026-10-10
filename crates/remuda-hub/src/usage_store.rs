@@ -183,31 +183,78 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
 fn existing_session_floors(
     conn: &Connection,
     row: &UsageEventRow,
-) -> rusqlite::Result<Vec<SnapshotCounters>> {
+) -> rusqlite::Result<Vec<SessionStockPoint>> {
     let mut stmt = conn.prepare(
-        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                cost_usd
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session'
            AND (scope_id = ?2 OR scope_id IS NULL)",
     )?;
     let floors = stmt
         .query_map(params![row.instance_id, row.scope_id], |r| {
-            Ok(SnapshotCounters {
-                total: r.get(0)?,
-                input: r.get(1)?,
-                output: r.get(2)?,
-                cache_read: r.get(3)?,
-                cache_write: r.get(4)?,
+            Ok(SessionStockPoint {
+                counters: SnapshotCounters {
+                    total: r.get(0)?,
+                    input: r.get(1)?,
+                    output: r.get(2)?,
+                    cache_read: r.get(3)?,
+                    cache_write: r.get(4)?,
+                },
+                cost: parse_cost(r.get::<_, Option<String>>(5)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(floors)
 }
 
+/// One cumulative session stock: token buckets plus the reported cumulative
+/// cost. Both are cumulative monotonic quantities, so both participate in the
+/// growth/freeze decision (c-usagefu r3 item 3: the result frame carries no
+/// tokens, so a token-only comparison froze every later result at the turn-1
+/// cumulative cost).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct SessionStockPoint {
+    counters: SnapshotCounters,
+    cost: Option<f64>,
+}
+
+impl SessionStockPoint {
+    fn of(row: &UsageEventRow) -> Self {
+        Self {
+            counters: SnapshotCounters::of(row),
+            cost: parse_cost(row.cost_usd.clone()),
+        }
+    }
+
+    /// Equality of every reported bucket INCLUDING cost.
+    fn eq_stock(&self, other: &Self) -> bool {
+        self.counters == other.counters && self.cost == other.cost
+    }
+
+    /// Per-bucket growth/decrease across token buckets and cost. `None`
+    /// incoming imposes no constraint, exactly as for token buckets.
+    fn growth_against(&self, stored: &Self) -> (bool, bool) {
+        let (mut grew, mut decreased) = self.counters.growth_against(&stored.counters);
+        match (self.cost, stored.cost) {
+            (Some(incoming), Some(stored)) if incoming < stored => decreased = true,
+            (Some(incoming), Some(stored)) if incoming > stored => grew = true,
+            (Some(_), None) => grew = true,
+            _ => {}
+        }
+        (grew, decreased)
+    }
+}
+
+/// Parse a stored decimal cost; a malformed value behaves as "not reported".
+fn parse_cost(cost: Option<String>) -> Option<f64> {
+    cost.and_then(|raw| raw.parse::<f64>().ok())
+}
+
 /// Content-ordered acceptance against a set of existing stocks.
-fn freezes_against(incoming: &SnapshotCounters, existing: &[SnapshotCounters]) -> bool {
+fn freezes_against(incoming: &SessionStockPoint, existing: &[SessionStockPoint]) -> bool {
     for stored in existing {
-        if incoming == stored {
+        if incoming.eq_stock(stored) {
             return true;
         }
         let (_grew, decreased) = incoming.growth_against(stored);
@@ -224,12 +271,13 @@ fn freezes_against(incoming: &SnapshotCounters, existing: &[SnapshotCounters]) -
 /// The cumulative stock is monotonic by contract, so acceptance is content-
 /// based and independent of the restart-unsafe producer revision and ingest
 /// seq:
-/// - identical counters already recorded for this session (or for a legacy
-///   NULL-scope row) -> frozen;
-/// - any reported bucket smaller than the current stock -> frozen;
+/// - identical counters AND cost already recorded for this session (or for a
+///   legacy NULL-scope row) -> frozen;
+/// - any reported bucket or the cumulative cost smaller than the current
+///   stock -> frozen;
 /// - otherwise the point is appended.
 fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let incoming = SnapshotCounters::of(row);
+    let incoming = SessionStockPoint::of(row);
     let floors = existing_session_floors(conn, row)?;
     if freezes_against(&incoming, &floors) {
         return Ok(false);
@@ -241,20 +289,24 @@ fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqli
 /// rows only. Scoped points are the newer world and are summed separately in
 /// the rollup; legacy totals are read at all only while no scoped rows exist.
 fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let incoming = SnapshotCounters::of(row);
+    let incoming = SessionStockPoint::of(row);
     let mut stmt = conn.prepare(
-        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                cost_usd
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NULL",
     )?;
-    let existing: Vec<SnapshotCounters> = stmt
+    let existing: Vec<SessionStockPoint> = stmt
         .query_map(params![row.instance_id], |r| {
-            Ok(SnapshotCounters {
-                total: r.get(0)?,
-                input: r.get(1)?,
-                output: r.get(2)?,
-                cache_read: r.get(3)?,
-                cache_write: r.get(4)?,
+            Ok(SessionStockPoint {
+                counters: SnapshotCounters {
+                    total: r.get(0)?,
+                    input: r.get(1)?,
+                    output: r.get(2)?,
+                    cache_read: r.get(3)?,
+                    cache_write: r.get(4)?,
+                },
+                cost: parse_cost(r.get::<_, Option<String>>(5)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -629,29 +681,48 @@ pub enum BudgetStatus {
     Stop,
 }
 
+/// Cumulative cost of one scope's events as the budget endpoints must report
+/// it (c-usagefu r3 item 3):
+///
+/// A `session` row is a CUMULATIVE STOCK (the result's reported
+/// `total_cost_usd`, or a Grok/Codex priced cumulative snapshot); `turn` and
+/// `message` rows are per-call FLOW carrying independently priced estimates.
+/// Summing both tiers counted the same dollars twice (Σ per-call estimates +
+/// the result's cumulative ≈ 2x). When any priced session stock exists the
+/// reported cumulative — the newest accepted growth point — is the bill; the
+/// flow estimates fall back in only for harnesses that emit no session cost
+/// at all. Same predicate parameter as the token aggregate.
+const SESSION_COST_STOCK_SQL: &str = "(SELECT CAST(cost_usd AS REAL) FROM usage_events
+      WHERE {predicate} AND scope = 'session' AND cost_usd IS NOT NULL
+      ORDER BY seq DESC LIMIT 1)";
+
+const FLOW_COST_SQL: &str = "(SELECT COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0) FROM usage_events
+      WHERE {predicate} AND scope != 'session')";
+
 /// Aggregate all persisted events for one instance.
 pub fn aggregate_instance(
     conn: &Connection,
     instance_id: &str,
 ) -> rusqlite::Result<UsageAggregate> {
-    conn.query_row(
+    let stock = SESSION_COST_STOCK_SQL.replace("{predicate}", "instance_id = ?1");
+    let flow = FLOW_COST_SQL.replace("{predicate}", "instance_id = ?1");
+    let sql = format!(
         "SELECT COUNT(*),
                 COALESCE(SUM(total_tokens), 0),
                 COALESCE(SUM(input_tokens), 0),
                 COALESCE(SUM(output_tokens), 0),
-                COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0)
-         FROM usage_events WHERE instance_id = ?1",
-        params![instance_id],
-        |row| {
-            Ok(UsageAggregate {
-                events: row.get(0)?,
-                total_tokens: row.get(1)?,
-                input_tokens: row.get(2)?,
-                output_tokens: row.get(3)?,
-                cost_usd: row.get(4)?,
-            })
-        },
-    )
+                COALESCE({stock}, {flow})
+         FROM usage_events WHERE instance_id = ?1"
+    );
+    conn.query_row(&sql, params![instance_id], |row| {
+        Ok(UsageAggregate {
+            events: row.get(0)?,
+            total_tokens: row.get(1)?,
+            input_tokens: row.get(2)?,
+            output_tokens: row.get(3)?,
+            cost_usd: row.get(4)?,
+        })
+    })
 }
 
 /// Aggregate persisted events for one `(profile, model)`.
@@ -660,24 +731,25 @@ pub fn aggregate_supply(
     profile_id: &str,
     model: &str,
 ) -> rusqlite::Result<UsageAggregate> {
-    conn.query_row(
+    let stock = SESSION_COST_STOCK_SQL.replace("{predicate}", "profile_id = ?1 AND model = ?2");
+    let flow = FLOW_COST_SQL.replace("{predicate}", "profile_id = ?1 AND model = ?2");
+    let sql = format!(
         "SELECT COUNT(*),
                 COALESCE(SUM(total_tokens), 0),
                 COALESCE(SUM(input_tokens), 0),
                 COALESCE(SUM(output_tokens), 0),
-                COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0)
-         FROM usage_events WHERE profile_id = ?1 AND model = ?2",
-        params![profile_id, model],
-        |row| {
-            Ok(UsageAggregate {
-                events: row.get(0)?,
-                total_tokens: row.get(1)?,
-                input_tokens: row.get(2)?,
-                output_tokens: row.get(3)?,
-                cost_usd: row.get(4)?,
-            })
-        },
-    )
+                COALESCE({stock}, {flow})
+         FROM usage_events WHERE profile_id = ?1 AND model = ?2"
+    );
+    conn.query_row(&sql, params![profile_id, model], |row| {
+        Ok(UsageAggregate {
+            events: row.get(0)?,
+            total_tokens: row.get(1)?,
+            input_tokens: row.get(2)?,
+            output_tokens: row.get(3)?,
+            cost_usd: row.get(4)?,
+        })
+    })
 }
 
 /// Per-session token/context rollup backing the composer's context chip
@@ -1530,6 +1602,113 @@ mod tests {
         let mut other = usage_record(4, 1, None);
         other.event["kind"] = json!("message");
         assert!(project_usage_event(&other, None, None).is_none());
+    }
+
+    #[test]
+    fn reported_session_cost_replaces_the_per_call_estimates_and_keeps_growing() {
+        // c-usagefu r3 item 3: a two-turn SDK session on a priced model.
+        //  - each per-call Turn row carries the driver's independently PRICED
+        //    estimate (0.01, 0.02);
+        //  - each result frame emits a token-LESS Session snapshot carrying
+        //    the reported CUMULATIVE cost (0.01, then 0.03).
+        // estimatedUsd must be the latest reported cumulative (0.03), not
+        // Sigma per-call + the frozen turn-1 session cost (0.04).
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // Turn 1: per-call estimate + the result's cumulative session point.
+        let t1 = usage_record(1, 1000, Some("0.01"));
+        insert(&conn, &t1);
+        let s1 = tokenless_session_record(2, "sdk-session-1", 1, Some("0.01"));
+        assert!(insert(&conn, &s1), "first result appends");
+
+        let after_one = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!(
+            (after_one.cost_usd - 0.01).abs() < 1e-9,
+            "the reported session stock, not the 0.01 turn estimate + 0.01 stock"
+        );
+
+        // Turn 2: another per-call estimate and the cumulative result.
+        let t2 = usage_record(3, 2000, Some("0.02"));
+        insert(&conn, &t2);
+        let s2 = tokenless_session_record(4, "sdk-session-1", 2, Some("0.03"));
+        assert!(
+            insert(&conn, &s2),
+            "a token-less snapshot whose cumulative COST grew must append"
+        );
+
+        let after_two = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!(
+            (after_two.cost_usd - 0.03).abs() < 1e-9,
+            "latest cumulative reported cost, not 0.01+0.02+0.01 (2x/frozen)"
+        );
+
+        // A re-delivered turn-2 result (identical counters AND cost) freezes.
+        let s2_again = tokenless_session_record(5, "sdk-session-1", 2, Some("0.03"));
+        assert!(!insert(&conn, &s2_again), "identical cost+counters frozen");
+    }
+
+    #[test]
+    fn without_session_cost_the_per_call_estimates_still_sum() {
+        // Harnesses that emit only per-call rows (no reported session cost)
+        // keep the priced flow sum as the estimate.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        insert(&conn, &usage_record(1, 1000, Some("0.01")));
+        insert(&conn, &usage_record(2, 500, Some("0.02")));
+        let agg = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!((agg.cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_session_point_whose_cost_shrinks_is_frozen() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(insert(
+            &conn,
+            &tokenless_session_record(1, "s", 1, Some("0.03"))
+        ));
+        assert!(
+            !insert(&conn, &tokenless_session_record(2, "s", 2, Some("0.01"))),
+            "cumulative cost is monotonic like the token stock"
+        );
+        let agg = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!((agg.cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    /// A result-frame session point: no token buckets (the SDK result omits
+    /// per-call counters), just the reported cumulative cost.
+    fn tokenless_session_record(
+        seq: i64,
+        scope_id: &str,
+        revision: i64,
+        cost: Option<&str>,
+    ) -> JournalRecord {
+        let mut payload = serde_json::Map::new();
+        payload.insert("scope".into(), json!("session"));
+        payload.insert("scopeId".into(), json!(scope_id));
+        payload.insert("mode".into(), json!("snapshot"));
+        payload.insert("metricRevision".into(), json!(revision.to_string()));
+        payload.insert(
+            "cost".into(),
+            cost.map_or(
+                json!({ "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] }),
+                |amount| {
+                    json!({
+                        "state": "known",
+                        "value": { "amount": amount, "currency": "USD" }
+                    })
+                },
+            ),
+        );
+        payload.insert("accounting".into(), json!("estimated"));
+        JournalRecord {
+            instance_id: "ins_test".into(),
+            seq,
+            event_id: format!("evt_{seq}"),
+            event: json!({ "kind": "usage", "payload": Value::Object(payload) }),
+            observed_at: "2026-09-15T00:00:00.000Z".into(),
+        }
     }
 
     #[test]

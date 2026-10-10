@@ -2764,18 +2764,34 @@ describe("load-earlier anchor lifecycle round 5", () => {
       expect(geo.top()).toBe(50 * ROW - VIEW);
     });
 
-    it("a search jump during the fetch cancels the restore and stays on its hit", async () => {
+    it("a search jump during the fetch retargets the hold and parks the hit after the prepend", async () => {
       const { user, geo, g, writes, older } = setup("insSearch");
+      // Earlier tests can leave coalesced scroll rAFs queued on the shared
+      // prototype setter; drain them so a stale event cannot cancel THIS
+      // test's fresh in-flight request (only observable in a full-file run).
+      for (let i = 0; i < 4; i += 1) await geo.nextFrame();
       await user.click(screen.getByTestId("load-earlier"));
       await user.click(screen.getByTestId("transcript-search-open"));
+      // The hit m1035 sits at tail index 34 — after the 100-row prepend it
+      // shifts to 134, beyond the mounted window; the retarget parks it.
       await user.type(screen.getByTestId("transcript-search-input"), "insSearch-m1035");
       await user.keyboard("[Enter]");
+      // Merged list (100 prepended + 50 tail) is the real scrollHeight.
+      geo.setTotal(150);
       await land(geo, g, older);
-      // The prepend would restore the click-time row (100*ROW); the cancelled
-      // restore never writes it and the scroller stays at the search target.
+      // The click-time anchor (100*ROW) is never written; the hit parks at the
+      // viewport top once the shifted window mounts it. Drain any coalesced
+      // scroll events queued ahead of this test before refining.
       expect(writes).not.toContain(100 * ROW);
-      expect(geo.top()).toBe(34 * ROW);
-      expect(geo.top()).not.toBe(100 * ROW);
+      for (let i = 0; i < 5; i += 1) {
+        await geo.nextFrame();
+        await act(async () => {});
+        if (nodeTop(geo, "n_1035_user_insSearch") === 0) break;
+      }
+      expect(
+        nodeTop(geo, "n_1035_user_insSearch"),
+        "the search hit did not park at the top after the retargeted prepend",
+      ).toBe(0);
       await expectGrowthHolds(geo);
     });
 

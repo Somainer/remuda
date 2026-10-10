@@ -688,7 +688,14 @@ pub async fn delete_instance(
             }),
         )
         .await
-        .map_err(map_store)?;
+        .map_err(|error| {
+            // r9 item 1: the lineage is already deleted. A 500 here would
+            // make a retry get 404 and skip the purges below, orphaning the
+            // Nodes' data directories forever; log and finish the
+            // best-effort work, returning 200.
+            tracing::error!(%error, instance_id = %instance_id, "delete audit failed after the lineage was removed")
+        })
+        .ok();
 
     // t-pool: a deleted session must not leave its worktree lease pinned.
     // Key on the instance's task (not the attach-lock holder, which is only
@@ -698,6 +705,11 @@ pub async fn delete_instance(
     // the delete transaction already cleared holder_instance_id. Every
     // chapter of the lineage copied the task, so walk each (host, task) pair
     // exactly once.
+    //
+    // r9 item 1: a Store failure in this loop must NOT skip the remaining
+    // worktree returns and the instance.purge loop below — the rows are
+    // already gone and a retry only gets 404. Log with the instance id and
+    // the failing step, then continue.
     for chapter in &chapters {
         let Some(task_id) = chapter.task_id.as_deref() else {
             continue;
@@ -705,11 +717,23 @@ pub async fn delete_instance(
         if !lease_keys_seen.insert((chapter.host_id.clone(), task_id.to_owned())) {
             continue;
         }
-        let held = state
+        let held = match state
             .store
             .active_worktree_leases_for_task(chapter.host_id.clone(), task_id.to_string())
             .await
-            .map_err(map_store)?;
+        {
+            Ok(held) => held,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    instance_id = %instance_id,
+                    host_id = %chapter.host_id,
+                    "active_worktree_leases_for_task failed after the lineage was removed; \
+                     continuing to the Node purges"
+                );
+                continue;
+            }
+        };
         for lease in held {
             let name = lease.worktree_name.clone().unwrap_or_else(|| ".".into());
             let dir_key = lease.dir_key.clone();
@@ -737,9 +761,7 @@ pub async fn delete_instance(
                         .get("branch")
                         .and_then(Value::as_str)
                         .map(str::to_string);
-                    // Keep the Hub lease row consistent: pool slots park warm;
-                    // reuse rows drop at zero.
-                    let released = state
+                    let released = match state
                         .store
                         .release_worktree_lease(
                             lease.host_id.clone(),
@@ -750,7 +772,20 @@ pub async fn delete_instance(
                             branch,
                         )
                         .await
-                        .map_err(map_store)?;
+                    {
+                        Ok(released) => released,
+                        Err(error) => {
+                            // r9 item 1: keep returning the remaining leases
+                            // and never skip the purge loop.
+                            tracing::error!(
+                                %error,
+                                instance_id = %instance_id,
+                                dir_key = %lease.dir_key,
+                                "release_worktree_lease failed after the lineage was removed"
+                            );
+                            None
+                        }
+                    };
                     if released.is_some() || mode_was_reuse {
                         lease_returns.push(dir_key);
                     }

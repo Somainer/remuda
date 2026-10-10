@@ -28,6 +28,39 @@ use tokio::sync::{Semaphore, oneshot};
 #[path = "store_auth_tests.rs"]
 mod auth_tests;
 
+/// Test-only fault injection for post-commit best-effort paths. Integration
+/// tests arm a flag via [`crate::store_test_support`] to make one Store
+/// method fail, proving an HTTP handler still completes the remaining
+/// best-effort work instead of returning 500 after the commit. Compiled into
+/// every build (one relaxed atomic load per faulted call site); never armed
+/// outside tests.
+pub(crate) mod test_faults {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static LEASE_LOOKUP_FAILURE: AtomicBool = AtomicBool::new(false);
+
+    /// Make every [`crate::store::Store::active_worktree_leases_for_task`]
+    /// call fail until [`clear`] runs.
+    pub fn arm_lease_lookup_failure() {
+        LEASE_LOOKUP_FAILURE.store(true, Ordering::Release);
+    }
+
+    /// Clear every injected fault.
+    pub fn clear() {
+        LEASE_LOOKUP_FAILURE.store(false, Ordering::Release);
+    }
+
+    pub(super) fn lease_lookup_injected_failure() -> Result<(), crate::store::StoreError> {
+        if LEASE_LOOKUP_FAILURE.load(Ordering::Acquire) {
+            Err(crate::store::StoreError::Internal(
+                "test injected failure: active_worktree_leases_for_task".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// SQLite or actor failures.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -52,6 +85,9 @@ pub enum StoreError {
     /// A passkey with the same credential id is already registered.
     #[error("duplicate credential")]
     DuplicateCredential,
+    /// An internal/injected failure not caused by SQLite itself.
+    #[error("store: {0}")]
+    Internal(String),
 }
 
 fn sqlite_is_busy(err: &rusqlite::Error) -> bool {
@@ -3529,6 +3565,7 @@ impl Store {
         host_id: String,
         task_id: String,
     ) -> Result<Vec<WorktreeLeaseRow>, StoreError> {
+        test_faults::lease_lookup_injected_failure()?;
         self.run_named("active_worktree_leases_for_task", move |conn| {
             // Match the task on the decoded array so `task_ids_json` stays an
             // internal detail rather than leaking a JSON1 expression to callers.

@@ -211,7 +211,11 @@ impl AppState {
                 instance_id: settled.instance_id.clone(),
                 interaction_id: settled.interaction_id.clone(),
                 state: "invalidated".to_string(),
-                reason: "generation-ended".to_string(),
+                // r10 item 4(a): carry the durable reason verbatim. The frame
+                // used to hard-code generation-ended, so a demotion
+                // invalidation (reason agent-demoted) reached followers with
+                // the wrong end reason.
+                reason: settled.reason.clone(),
                 seq: settled.seq,
             });
         }

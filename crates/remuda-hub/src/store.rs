@@ -2010,6 +2010,11 @@ pub struct SettledInteraction {
     pub seq: i64,
     /// Durable `updated_at` of the terminal row.
     pub updated_at: String,
+    /// Settlement reason written to `settlement_events.reason` and carried on
+    /// the live follower frame (r10 item 4(a)): `generation-ended` for a
+    /// process end, the real reason code (e.g. `agent-demoted`) for an
+    /// entity-driven invalidation.
+    pub reason: String,
 }
 
 impl Settlement {
@@ -11439,7 +11444,7 @@ mod tests {
         // The exact shell_pty retire_payload("invalidated", "agent-demoted")
         // entity lifecycle: the producer supplies reasonCode but the
         // Interaction entity's resolution is still UNKNOWN (r6 item 4).
-        store
+        let appended = store
             .append_journal(
                 host.clone(),
                 instance.instance_id.clone(),
@@ -11467,6 +11472,15 @@ mod tests {
             )
             .await
             .expect("demotion replay");
+
+        // r10 item 4(a): the LIVE settlement the ws broadcasts carries the
+        // real demotion reason, never the hard-coded generation-ended frame.
+        assert_eq!(appended.settlement.interactions.len(), 1);
+        assert_eq!(
+            appended.settlement.interactions[0].reason, "agent-demoted",
+            "the live settlement frame carries the demotion reason"
+        );
+        assert_eq!(appended.settlement.interactions[0].interaction_id, int_id);
 
         let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "invalidated");
@@ -13645,6 +13659,7 @@ fn apply_interaction_event(
                 interaction_id: id.to_owned(),
                 seq,
                 updated_at: now,
+                reason: reason.to_owned(),
             });
         }
         return Ok(settlement);
@@ -13725,6 +13740,7 @@ fn apply_interaction_event(
                         interaction_id: id.to_owned(),
                         seq,
                         updated_at: now.clone(),
+                        reason: "generation-ended".to_owned(),
                     });
                 }
             }
@@ -14101,6 +14117,7 @@ pub(crate) fn settle_instance_interactions(
                 interaction_id: id,
                 seq,
                 updated_at: now.to_owned(),
+                reason: "generation-ended".to_owned(),
             });
         }
     }

@@ -12,7 +12,8 @@ import {
 } from "../../lib/imageAnchors";
 import {
   isLiveReachable,
-  structuredPermissionTable,
+  launchPermissionTable,
+  runtimePermissionTable,
   normalizePermissionMode,
 } from "./permissions";
 import type { PermissionEffectiveView } from "./permissionEffective";
@@ -452,18 +453,28 @@ export function Composer({
   const ember = isEmberEffort(harness, currentEffort.index, ultraOn);
   const effortLocked = Boolean(effortDisabled) || !onEffort || table.length === 0;
   // Permission: the chip renders the read-back mode; pending overrides it
-  // with 切换中/排队中. The menu lists the harness's real launch table, with
-  // launch-only rows greyed for the live session.
-  // Structured composer: the unified four-row permission menu (New Session
-  // and the live wheel share it); the row's native word maps per CLI.
-  const permOptions = structuredPermissionTable(harness);
+  // with 切换中/排队中. The LIVE wheel is the runtime table — exactly the modes
+  // the CLI's shift+tab cycle reaches in a running session (manual →
+  // acceptEdits → plan → auto; bypass joins only when the launch carried the
+  // allowance; dontAsk never joins). New Session is the separate launch table
+  // with every launch-only mode (see NewSessionPage). Other harnesses have no
+  // runtime configure today, so their wheel is empty / read-only.
+  const permOptions = runtimePermissionTable(harness, {
+    bypassAllowed: launchPermissionMode === "bypassPermissions",
+  });
+  // The chip's CURRENT mode is also looked up in the launch table: a read-only
+  // non-Claude session (codex `never`, …) still has to render its native word
+  // and danger treatment even though it has no live wheel rows.
+  const launchPermOptions = launchPermissionTable(harness);
   const liveMode = normalizePermissionMode(
     harness,
     permissionPending?.mode ?? permissionEffective?.mode ?? permissionMode,
   );
   const permOption =
     permOptions.find((m) => m.id === liveMode) ??
-    permOptions.find((m) => m.id === permissionMode);
+    launchPermOptions.find((m) => m.id === liveMode) ??
+    permOptions.find((m) => m.id === permissionMode) ??
+    launchPermOptions.find((m) => m.id === permissionMode);
   // Read-only chips (generic-pty / other harnesses) render the native word;
   // interactive chips render the localized label from the harness table.
   const permLabel = onPermission ? permOption?.label ?? liveMode : permissionMode;
@@ -1057,10 +1068,11 @@ export function Composer({
 
   const permReadonlyNode = (
     <span
-      className={css.chip}
+      className={`${css.chip} ${permDanger ? css.chipDanger : ""}`}
       data-testid="permission-chip"
       data-readonly="1"
       data-permission={liveMode}
+      data-permission-danger={permDanger ? "1" : "0"}
       title={permOption?.description}
     >
       {permLabel}

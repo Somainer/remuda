@@ -185,6 +185,18 @@ it("mounts the inline slider (layout A, no card) with the five Claude stops and 
   expect(screen.queryByTestId("new-session-effort-tier-ultracode")).toBeNull();
 });
 
+
+it("offers each other harness its OWN native permission ids, never Claude ids (item 7)", () => {
+  renderWithCli();
+  fireEvent.click(screen.getByTestId("new-session-kind-grok"));
+  expect(screen.getByTestId("new-session-perm-native-prompt")).toBeVisible();
+  expect(screen.queryByTestId("new-session-perm-acceptEdits")).toBeNull();
+  // Codex keeps its native policy + sandbox axes, including the danger row.
+  fireEvent.click(screen.getByTestId("new-session-kind-codex"));
+  expect(screen.getByTestId("new-session-perm-never")).toHaveAttribute("data-danger", "1");
+  expect(screen.queryByTestId("new-session-perm-bypassPermissions")).toBeNull();
+});
+
 it("re-snaps the slider onto the new harness table when the runtime changes", () => {
   renderWithCli();
   const slider = () => screen.getByTestId("new-session-effort-slider");

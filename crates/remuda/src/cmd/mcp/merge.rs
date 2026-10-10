@@ -20,7 +20,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "land": { "type": "boolean", "description": "Advance main to the report verified for branch+onto without re-running the gate" },
                     "queue": { "type": "array", "items": { "type": "string" }, "description": "Branches to verify as an optimistic queue (sets branch aside)" },
                     "lanes": { "type": "integer", "minimum": 1, "default": 2 },
-                    "e2ePortBase": { "type": "integer", "description": "Base port for the lane Hub e2e triple (base, web=base+9, upstream=base+1; lane N shifts base by 10*(N-1)). Omit to inherit HUB_E2E_LISTEN/HUB_E2E_WEB_PORT/HUB_E2E_UPSTREAM_LISTEN from this server's environment; absent both, 58980/58989/58981 are used." },
+                    "e2ePortBase": { "type": "integer", "description": "Base port for the lane Hub e2e triple (base, web=base+9, upstream=base+1; lane N shifts base by 10*(N-1)). Single-branch merges omit it and inherit HUB_E2E_LISTEN/HUB_E2E_WEB_PORT/HUB_E2E_UPSTREAM_LISTEN from this server's environment (absent all three, 58980/58989/58981); queue lanes instead take only HUB_E2E_LISTEN's port as the base and derive web/upstream from it." },
                     "affected": { "type": "boolean", "default": true },
                     "full": { "type": "boolean", "description": "Test the full workspace" },
                     "web": { "type": "boolean" },

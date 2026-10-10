@@ -3175,7 +3175,7 @@ impl Store {
             for chapter_id in &chapter_ids {
                 settlement.merge(settle_instance_interactions(
                     &tx,
-                    &[chapter_id.clone()],
+                    std::slice::from_ref(chapter_id),
                     &now,
                 )?);
             }
@@ -5393,14 +5393,23 @@ impl Store {
         // replay the newest ones — the rows a page navigation just missed —
         // not the oldest page. Only the windowless lag-drain walk is
         // ascending.
-        self.run_named("recent_invalidated_interactions", |conn| {
+        //
+        // c-cardsettle r10 item 4(e): compare created_at against a
+        // Rust-formatted RFC3339 cutoff rather than julianday(created_at).
+        // Every created_at is a fixed-width now_rfc3339 string, so a
+        // lexicographic `>=` is chronological and the
+        // settlement_events_recent(created_at, seq) index is usable. The old
+        // julianday() wrapping forced a full table scan; this read-only page
+        // also runs on the READER pool, never the writer.
+        let cutoff = crate::config::rfc3339_minutes_ago(5);
+        self.read("recent_invalidated_interactions", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT instance_id, interaction_id, reason FROM settlement_events
-                 WHERE julianday(created_at) >= julianday('now', '-5 minutes')
+                 WHERE created_at >= ?1
                  ORDER BY seq DESC
-                 LIMIT ?1",
+                 LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![SETTLEMENT_LAG_PAGE], |row| {
+            let rows = stmt.query_map(params![cutoff, SETTLEMENT_LAG_PAGE], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -9101,6 +9110,61 @@ mod tests {
             .and_then(Value::as_str)
             .map(str::to_owned);
         (row.state, reason)
+    }
+
+    /// c-cardsettle r10 item 4(e): the replay window compares created_at
+    /// against a Rust-formatted RFC3339 cutoff on the READER pool. Lock the
+    /// boundary semantics of that cutoff (the old predicate used SQLite's own
+    /// julianday clock): just inside the window is replayed, just outside is
+    /// not.
+    #[tokio::test]
+    async fn recent_invalidated_replay_cutoff_is_a_rfc3339_window_boundary() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-replay-cutoff").await;
+
+        async fn settle_and_stamp(store: &Store, host: &str, minutes_ago: i64) -> String {
+            let instance = seed_acknowledged_instance(store, host).await;
+            let int_id = seed_pending_interaction(store, host, &instance.instance_id).await;
+            store
+                .settle_instance_exited(instance.instance_id.clone(), "x".into())
+                .await
+                .expect("settle");
+            let stamped = crate::config::rfc3339_minutes_ago(minutes_ago);
+            let int_for_update = int_id.clone();
+            store
+                .run_named("r10_stamp_cutoff_row", move |conn| {
+                    conn.execute(
+                        "UPDATE settlement_events SET created_at = ?1 WHERE interaction_id = ?2",
+                        params![stamped, int_for_update],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("stamp");
+            int_id
+        }
+
+        // 4 minutes ago: inside; 6 minutes ago: outside.
+        let inside = settle_and_stamp(&store, &host, 4).await;
+        let outside = settle_and_stamp(&store, &host, 6).await;
+
+        let recent = store
+            .recent_invalidated_interactions()
+            .await
+            .expect("recent");
+        let ids: std::collections::HashSet<String> =
+            recent.into_iter().map(|(_, id, _)| id).collect();
+        assert!(
+            ids.contains(&inside),
+            "a 4-minute-old settlement is inside the window"
+        );
+        assert!(
+            !ids.contains(&outside),
+            "a 6-minute-old settlement is outside the window"
+        );
+        store.close().await;
     }
 
     /// c-cardsettle r3 item 4: the replay-on-connect window returns recent

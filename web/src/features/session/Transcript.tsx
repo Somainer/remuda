@@ -1272,15 +1272,67 @@ function TranscriptInner({
     nodesRef.current = nodes;
   }, [nodes]);
 
-  const applyOffset = useCallback((index: number, offset: number) => {
+  const applyOffset = useCallback((index: number, offset: number, fromRestore = false) => {
     const el = scrollerRef.current;
     if (!el) return;
     const { offsets, total } = rowOffsets(nodesRef.current.length, sizesHold.current, estimateRef.current);
     const base = offsets[index] ?? 0;
     const max = Math.max(0, total - el.clientHeight);
     const top = Math.min(max, Math.max(0, base + offset));
-    programmaticScroll(el, top);
+    // A retargeted in-flight restore's first jump is that restore's OWN write
+    // (echo recognised), not an intentional navigation that cancels it.
+    programmaticScroll(el, top, fromRestore);
   }, [programmaticScroll]);
+
+  /**
+   * If a load-earlier request is still in flight (!done), re-aim its hold at
+   * a navigation destination instead of dropping the hold. The destination
+   * becomes a restore-kind hold on the SAME request: its current index/top
+   * node list gate the pending correction (it stays inert until the prepend
+   * shifts the row), and after the prepend the anchor is resolved by content
+   * and settled at its viewport offset. Returns true when the caller's normal
+   * index navigation must be skipped.
+   */
+  const retargetInFlightRestore = useCallback(
+    (destIndex: number): boolean => {
+      const req = loadReqRef.current;
+      const destNode = nodesRef.current[destIndex];
+      if (!req || req.done || req.cancelled || !destNode) return false;
+      const prevNodes = nodesRef.current.slice();
+      if (prependSettleTimerRef.current !== null) {
+        window.clearTimeout(prependSettleTimerRef.current);
+        prependSettleTimerRef.current = null;
+      }
+      prependAnchorRef.current = {
+        anchorId: destNode.id,
+        offset: 0,
+        tries: 0,
+        corrections: 0,
+        deadline: Date.now() + PREPEND_SETTLE_DEADLINE_MS,
+        armedIndex: destIndex,
+        reqId: req.reqId,
+        prevNodes,
+      };
+      pendingScroll.current = {
+        kind: "restore",
+        anchorId: destNode.id,
+        offset: 0,
+        tries: 0,
+        awaitIndex: destIndex,
+        reqId: req.reqId,
+        prevNodes,
+      };
+      restoringRef.current = true;
+      setRestoreActiveAttr();
+      // The hold is retargeted, not abandoned: growth anchoring stays active
+      // (cancelLoadRestore would have suppressed it), and the first jump is
+      // the restore's own write.
+      growthHoldSuppressedRef.current = false;
+      applyOffset(destIndex, 0, true);
+      return true;
+    },
+    [applyOffset],
+  );
 
   // Refine an estimated scroll (search hit, saved position) as the window
   // measures the rows around it. pendingScroll is declared with the other
@@ -1510,12 +1562,14 @@ function TranscriptInner({
   }, [flushPosition]);
 
   const scrollToIndex = useCallback((index: number) => {
-    const el = scrollerRef.current;
-    if (!el || index < 0) return;
+    if (!scrollerRef.current || index < 0) return;
     pinRef.current = index >= nodesRef.current.length - 1;
+    // j while an older page is loading: re-aim its hold at this turn instead
+    // of cancelling it, so the landing prepend settles onto the turn.
+    if (retargetInFlightRestore(index)) return;
     pendingScroll.current = { kind: "index", index, offset: 0, tries: 0 };
     applyOffset(index, 0);
-  }, [applyOffset]);
+  }, [applyOffset, retargetInFlightRestore]);
 
   const turnIds = useMemo(
     () => nodes.filter((n) => n.type === "message").map((n) => n.id),
@@ -1578,9 +1632,12 @@ function TranscriptInner({
     } else {
       setCompactHit(null);
     }
+    // A search jump while an older page is loading re-aims the hold at the hit;
+    // after the prepend the hit row settles at the top instead of being lost.
+    if (retargetInFlightRestore(located.index)) return;
     pendingScroll.current = { kind: "index", index: located.index, offset: 0, tries: 0 };
     applyOffset(located.index, 0);
-  }, [matches, applyOffset]);
+  }, [matches, applyOffset, retargetInFlightRestore]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {

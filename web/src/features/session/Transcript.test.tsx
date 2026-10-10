@@ -2697,17 +2697,28 @@ describe("load-earlier anchor lifecycle round 5", () => {
       expect(geo.top()).toBeGreaterThanOrEqual(before + 39);
     }
 
-    it("j navigation during the fetch cancels the restore and stays on its turn", async () => {
+    // r8 item 2: an in-flight navigation RETARGETS the load-earlier hold, so
+    // after the prepend the DESTINATION row settles at the viewport top
+    // (asserted on the row's rect, not scrollTop, which shifts with the
+    // inserted rows).
+    function nodeTop(geo: ReturnType<typeof setup>["geo"], nodeId: string): number | null {
+      const row = geo.scroller().querySelector<HTMLElement>(`[data-anchor="${nodeId}"]`);
+      if (!row) return null;
+      return Math.round(row.getBoundingClientRect().top - geo.scroller().getBoundingClientRect().top);
+    }
+
+    it("j navigation during the fetch retargets the hold and lands the turn at the top", async () => {
       const { user, geo, g, writes, older } = setup("insJ");
       await user.click(screen.getByTestId("load-earlier"));
       // First press selects turn 0 (already at top: no write/no event); the
-      // second jumps to turn 1 — its echo is an intentional navigation.
+      // second jumps to turn 1 — the in-flight hold is re-aimed at turn 1.
       await user.keyboard("jj");
       await land(geo, g, older);
-      // The prepend would restore the click-time row to 100*ROW; the cancelled
-      // restore never writes it and the j target survives the prepend.
+      // The click-time anchor would have restored to 100*ROW; the retargeted
+      // hold never writes it. After the 100-row prepend the DESTINATION turn
+      // (the second message, n_1002 assistant) sits at the viewport top.
       expect(writes).not.toContain(100 * ROW);
-      expect(geo.top()).toBe(ROW);
+      expect(nodeTop(geo, "n_1002_assistant_insJ"), "the j turn did not land at the top after the prepend").toBe(0);
       expect((screen.getByTestId("load-earlier") as HTMLButtonElement).disabled).toBe(false);
       await expectGrowthHolds(geo);
     });

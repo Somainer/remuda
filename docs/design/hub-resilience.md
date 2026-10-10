@@ -455,6 +455,12 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   判定在客户端常量里）。
 * 后台 tab：定时器被节流时以 socket close/error 与重新可见时的首帧时间为准；
   从后台回前台立即按最近帧年龄判一次态，不等下一拍。
+* **stale 的总时长有界（c-reconnfu gate 8）**：从首次进入 quiet stale 起算
+  **30 s**（`STALE_TO_OFFLINE_MS`）的硬截止在整个 stale 生命周期内携带，不被
+  周期性 probe / 安静重开 follow 的重定器重置；截止到点即使每轮 probe 都成功、
+  follow 升级始终被阻塞，也必须转 `disconnected`（ loud offline，横幅出现、
+  重连时钟接管）。REST 可达只决定「不谎报 live」，不允许让无 follow 的 stale
+  无限延续。一次真实 frame 重新认证 live 后该截止清零。
 
 ### 5.3 最高优先级规则：绝不把旧数据当新数据
 

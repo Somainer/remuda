@@ -861,7 +861,14 @@ test.describe("notification stack clears the tty bottom chrome (r5 item 2)", () 
     const createdBody = (await createdRes.json()) as {
       instance: { instanceId?: string; id?: string };
     };
-    return createdBody.instance.instanceId ?? createdBody.instance.id!;
+    // Register for the suite afterEach the instant the id is known: on a
+    // test timeout Playwright tears the request context down before the
+    // test's own finally runs, so its DELETE fails silently and the terminal
+    // instance leaks into the shared hub (tripping host maxInstances later).
+    // The finally delete stays as the fast path (its 404 here is swallowed).
+    const id = createdBody.instance.instanceId ?? createdBody.instance.id!;
+    if (!created.includes(id)) created.push(id);
+    return id;
   }
 
   async function gotoTty(page: Page, id: string) {

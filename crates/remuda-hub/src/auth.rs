@@ -1082,6 +1082,44 @@ mod tests {
         }
     }
 
+    /// Round 7 item 3: an EMPTY access-code FILE (or a whitespace-only one)
+    /// configured as an ExplicitFile is refused exactly like an empty env
+    /// value — before any marker/token/stamp write — and does not silently
+    /// mint. The CLI rejects the empty SecretRef before spawning; this pins
+    /// the library refusal the spawn path relies on.
+    #[test]
+    fn empty_explicit_file_is_rejected_before_writes() {
+        for contents in ["", "   ", "\n\t "] {
+            let dir = tempfile::tempdir().expect("data dir");
+            let code_file = dir.path().join("access-code");
+            write_private(&code_file, contents).expect("empty code file");
+            // Pre-existing hub-owned code the refusal must leave untouched.
+            persist_bootstrap(dir.path(), "real-code").expect("persist");
+            let token_bytes = std::fs::read(dir.path().join("bootstrap-token")).unwrap();
+            let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap();
+
+            let mut config = HubConfig::for_test(dir.path().to_path_buf());
+            config.bootstrap_token = String::new();
+            config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+            let err = resolve_bootstrap(&mut config).expect_err("empty file refused");
+            assert!(format!("{err}").contains("empty"), "got: {err}");
+
+            assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+            assert_eq!(
+                std::fs::read(dir.path().join("bootstrap-token")).unwrap(),
+                token_bytes
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+                stamp_bytes
+            );
+            assert!(
+                rotate_bootstrap(dir.path()).is_ok(),
+                "the dir stays hub-owned"
+            );
+        }
+    }
+
     /// Round 4 item 2: an empty explicit code on an EXISTING hub-owned dir
     /// must not overwrite the real token or stamp and must not write the
     /// marker (so rotation stays available).

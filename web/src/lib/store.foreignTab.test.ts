@@ -59,6 +59,65 @@ function row(over: Partial<OutboxRecord>): OutboxRecord {
   };
 }
 
+it("GATE10 item 7: a lease-less done row committed by another tab skips without aborting the flush; B still sends", async () => {
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore);
+
+  // Two rows: A is delivered FIRST; the claim transaction returns it as a
+  // lease-less done (another tab journal-confirmed it between cache read and
+  // the claim merge). The durable done must be a definitive SKIP, not a
+  // claim-abort — otherwise B never sends. B pending.
+  localStorage.setItem(
+    OUTBOX_LS_KEY,
+    JSON.stringify([
+      row({
+        commandId: "cmd_done_no_lease",
+        state: "inflight",
+        lease: undefined,
+      }),
+      row({ commandId: "cmd_after_done" }),
+    ]),
+  );
+  // Flip A to a lease-less done in the MERGE result the claim reads: mock
+  // the outbox patch to return the done row for A's claim.
+  const store = (hubStore as unknown as {
+    outbox?: { patch: (id: string, p: unknown) => Promise<OutboxRecord | null>; cache?: Map<string, OutboxRecord> };
+  }).outbox;
+  if (store) {
+    const origPatch = store.patch.bind(store);
+    vi.spyOn(store, "patch").mockImplementation(async (id: string, p: unknown) => {
+      if (id === "cmd_done_no_lease") {
+        // The durable claim transaction finds another tab's journal-confirmed
+        // done and returns it verbatim, discarding this tab's inflight claim.
+        return row({ commandId: "cmd_done_no_lease", state: "done", lease: undefined });
+      }
+      return origPatch(id, p);
+    });
+  }
+  const send = vi.spyOn(api, "instanceSend").mockResolvedValue({
+    relatedCommandIds: [],
+    command: {
+      commandId: "cmd_after_done",
+      id: "cmd_after_done",
+      state: "accepted",
+      revision: "1",
+      dispatch: "native-acknowledged",
+      resolution: "clear",
+    } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
+  });
+
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  // The done row is skipped but its claim outcome previously looked like a
+  // foreign-owner abort; flush [A, B] then inspects the durable cache (which
+  // patch would mutate), so call flush TWICE to rule out ordering flukes.
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  // A is never POSTed (done), B IS sent — the old lease-owner-first check
+  // returned claim-aborted on A and stopped BOTH passes.
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(send.mock.calls[0]?.[4]).toBe("cmd_after_done");
+  hubStore.logout();
+});
+
 it("discovers and delivers a row another tab persisted after this tab loaded", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);

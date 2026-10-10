@@ -2114,6 +2114,12 @@ class HubStore {
     // in-memory marker. The same transaction that writes preserves a
     // journal-confirmed done: a stored done also means NO POST (the command
     // demonstrably executed; the Hub replay path would only be dead traffic).
+    // A journal-confirmed terminal done checked FIRST (c-reconnfu gate 10
+    // item 7): the CLAIM TRANSACTION may return a lease-less done (another tab
+    // committed it between filtering and the merge). A lease-less done is a
+    // definitive skip — never "claim-aborted", which ended the whole flush so
+    // B never sent. Checked again after the claim below.
+    if (current0.state === "done") return false;
     const isFreshAttempt = current0.state !== "held";
     let claimed;
     try {
@@ -2134,9 +2140,11 @@ class HubStore {
     // Refuse a claim that did not come back with THIS tab's lease owner: a
     // foreign live lease is POSTing (or will POST) the row. Keep FIFO — do not
     // send a later row first this turn.
-    if (claimed.lease?.owner !== box.ownerId) return "claim-aborted";
-    // A journal-confirmed terminal done: the command already executed.
+    // A journal-confirmed terminal done (possibly lease-less — another tab's
+    // journal commit merged during the claim) wins over the lease check: skip
+    // and continue the flush with B (gate 10 item 7).
     if (claimed.state === "done") return false;
+    if (claimed.lease?.owner !== box.ownerId) return "claim-aborted";
     this.syncBubbleFromOutbox(commandId);
 
     const finish = async (patch: Partial<OutboxRecord>) => {

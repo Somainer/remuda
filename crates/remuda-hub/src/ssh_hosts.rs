@@ -888,12 +888,19 @@ mod tests {
 
         let abort_seen = Arc::new(tokio::sync::Notify::new());
         let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        // The durable unbinding mark the dead previous link prepared: set
+        // until the abort is PROCESSED. The abort answer is parked on the
+        // `release_abort` watch so the test can observe a create colliding
+        // with the mark BEFORE the abort path clears it.
+        let unbinding_mark = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (release_abort_tx, release_abort_rx) = tokio::sync::watch::channel(false);
 
         // The scripted persistent daemon: hello first, then answer the
         // post-hello abort and the follow-up create over the SAME bridge.
         let node = {
             let abort_seen = abort_seen.clone();
             let captured = captured.clone();
+            let unbinding_mark = unbinding_mark.clone();
             let hello = hello.clone();
             tokio::spawn(async move {
                 from_node_tx.send(hello).unwrap();
@@ -904,25 +911,57 @@ mod tests {
                     match method {
                         "workspace.unregister" if params["phase"] == "abort" => {
                             captured.lock().unwrap().push(params.clone());
+                            // The abort frame has arrived but, like the real
+                            // Node, the mark is only released when the abort
+                            // is processed and acked. Park the answer (the
+                            // recv loop keeps draining, so a create still
+                            // gets its conflict reply) until the test
+                            // releases it.
                             abort_seen.notify_waiters();
-                            from_node_tx
-                                .send(json!({
-                                    "jsonrpc": "2.0", "id": id,
-                                    "result": {
-                                        "commandId": params["commandId"].clone(),
-                                        "workspaceId": params["workspaceId"].clone(),
-                                        "phase": "aborted",
-                                    }
-                                }))
-                                .unwrap();
+                            let mut released = release_abort_rx.clone();
+                            let reply_tx = from_node_tx.clone();
+                            let unbinding_mark = unbinding_mark.clone();
+                            tokio::spawn(async move {
+                                let _ = released.wait_for(|stop| *stop).await;
+                                unbinding_mark.store(false, std::sync::atomic::Ordering::SeqCst);
+                                reply_tx
+                                    .send(json!({
+                                        "jsonrpc": "2.0", "id": id,
+                                        "result": {
+                                            "commandId": params["commandId"].clone(),
+                                            "workspaceId": params["workspaceId"].clone(),
+                                            "phase": "aborted",
+                                        }
+                                    }))
+                                    .unwrap();
+                            });
                         }
                         "instance.create" => {
-                            from_node_tx
-                                .send(json!({
-                                    "jsonrpc": "2.0", "id": id,
-                                    "result": {"ok": true, "instanceId": "it_dp_r9_create"}
-                                }))
-                                .unwrap();
+                            // The real Node's create reservation
+                            // (DevNode::reserve_locked): while the unbinding
+                            // mark is set this is a Conflict, code -32009,
+                            // the message the Hub surfaces as 409.
+                            if unbinding_mark.load(std::sync::atomic::Ordering::SeqCst) {
+                                from_node_tx
+                                    .send(json!({
+                                        "jsonrpc": "2.0", "id": id,
+                                        "error": {
+                                            "code": -32009,
+                                            "message": format!(
+                                                "workspace {ROOT} is being unregistered; \
+                                                 wait for it to settle before starting a session"
+                                            ),
+                                        }
+                                    }))
+                                    .unwrap();
+                            } else {
+                                from_node_tx
+                                    .send(json!({
+                                        "jsonrpc": "2.0", "id": id,
+                                        "result": {"ok": true, "instanceId": "it_dp_r10_create"}
+                                    }))
+                                    .unwrap();
+                            }
                         }
                         // The hello reply (and anything else) needs no answer.
                         _ => {}
@@ -958,6 +997,48 @@ mod tests {
         assert_eq!(seen[0]["workspaceId"], json!(WSP));
         assert_eq!(seen[0]["commandId"], json!(command.command_id));
 
+        // r10 item 3: the create-after-abort assertion used to be vacuous —
+        // the scripted Node answered every create OK, so it passed even if
+        // the abort never ran. With the abort ANSWER parked and the unbinding
+        // mark still held, the create must now hit the Node's conflict:
+        // JSON-RPC -32009 carrying the 409 "being unregistered" message.
+        let blocked = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.nodes.call(
+                &host,
+                "instance.create",
+                json!({"workspaceId": WSP}),
+                Duration::from_secs(10),
+            ),
+        )
+        .await
+        .expect("pre-abort create timed out")
+        .expect("the pre-abort create reached the node")
+        .expect("the pre-abort create carried an RPC frame");
+        assert_eq!(blocked["error"]["code"], json!(-32009), "{blocked}");
+        let conflict_message = blocked["error"]["message"]
+            .as_str()
+            .expect("the conflict carries a message");
+        assert!(
+            conflict_message.contains("being unregistered"),
+            "{conflict_message}"
+        );
+        assert!(conflict_message.contains(ROOT), "{conflict_message}");
+        // The stuck command is still unsettled: the abort has not been
+        // processed yet, so nothing could have settled it.
+        assert_ne!(
+            store
+                .get_command(command.command_id.clone())
+                .await
+                .expect("command row")
+                .expect("command row")
+                .state,
+            "settled"
+        );
+
+        // Let the Node process the abort: it clears the mark and acks.
+        release_abort_tx.send(true).unwrap();
+
         // The Hub only settles the stuck command after the Node acked.
         let row = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -976,7 +1057,8 @@ mod tests {
         .expect("the stuck unregister never settled");
         assert_eq!(row.settlement_outcome.as_deref(), Some("rejected"));
 
-        // The wedge is gone: a following create succeeds on the same bridge.
+        // The wedge is gone ONLY because the abort ran: the SAME create that
+        // just collided with the mark now succeeds on the same bridge.
         let answer = tokio::time::timeout(
             Duration::from_secs(10),
             crate::http::call_node(
@@ -989,7 +1071,7 @@ mod tests {
         .await
         .expect("create timed out")
         .expect("a following create must succeed after the abort");
-        assert_eq!(answer["instanceId"], json!("it_dp_r9_create"));
+        assert_eq!(answer["instanceId"], json!("it_dp_r10_create"));
 
         // Close the carrier (child exit) and join the bridge and the node.
         shutdown_tx.send(true).unwrap();

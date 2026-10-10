@@ -1026,15 +1026,16 @@ test("a saved position in a bounded long journal survives a monospace swap landi
   // strictly BELOW the growing wrap block, and the swap is released while the
   // ?restoreProbe restore is still ARMED, so this proves a below-block anchor
   // survives a real font swap landing mid-restore (the product path, real
-  // woff2, real ResizeObserver timing). It does NOT isolate the mid-restore
-  // reflow correction: the armed barrier above releases only after the
-  // restore converged within 2px, the wrap row is strictly above the anchor so
-  // the compensator counter-scrolls exactly the growth, and with the
-  // correction disabled the pending restore's own DOM correction lands at the
-  // same spot. The only proof that specifically FAILS on the pre-fix
-  // (finalize-on-reflowCorrected) code is the unit test "item 3 mid
-  // (below-anchor growth): a mid-restore reflow must not finalize while the
-  // anchor is still off its saved offset" in Transcript.test.tsx.
+  // woff2, real ResizeObserver timing). It is NOT a proof that specifically
+  // fails on the pre-e6dc324d finalize-on-reflowCorrected guard: the armed
+  // barrier releases only after the restore converged within 2px, the wrap row
+  // is strictly above the anchor, and with the r8 DOM-relative compensator
+  // the whole drift is written by the reflow correction itself, so BOTH the
+  // old finalize-on-reflowCorrected branch and the current code land the
+  // anchor on its saved offset. The "don't finalize while reflowCorrected but
+  // |delta| > 2" guard is defense-in-depth (a clamped/interleaved correction),
+  // not something this arm or the unit test can drive red against the pre-fix
+  // code in this harness.
   test.setTimeout(240_000);
   await savedPositionSurvivesSwap(page, LONG_BURST, "first");
 });

@@ -52,10 +52,10 @@ pub struct SettlementNotice {
     pub state: String,
     /// Resolution reason ("generation-ended").
     pub reason: String,
-    /// Durable `updated_at` of the terminal row; followers advance their
-    /// delivery cursor on every notice so a multi-page lag drain skips no row
-    /// (c-cardsettle r6 item 2).
-    pub updated_at: String,
+    /// Per-Hub monotonic settlement seq (c-cardsettle r9 item 3); followers
+    /// advance their delivery cursor on every notice so a multi-page lag
+    /// drain skips no row regardless of timestamps or id ordering.
+    pub seq: i64,
 }
 
 /// Live event for `/v1/follow`.
@@ -1396,14 +1396,14 @@ enum FollowMsg {
 /// the client pins all of them before reconciling. A query error or a dead
 /// writer returns Err and the caller closes the follower (never a bare gap).
 ///
-/// r7 item 3 PUBLICATION-ORDER INVARIANT: the live broadcast path publishes a
-/// sweep in ascending `(updated_at, id)` order (the store's settle select
-/// orders it so and every row of one sweep shares `updated_at`). That ordering
-/// is what lets the composite max-cursor and this strict-forward `>` recovery
-/// coexist: a dropped low-id row of the current batch always sits BEHIND the
-/// cursor's timestamp only with a lower id, and is still recovered because no
-/// higher-id row of the same batch was published ahead of it. Keep both paths
-/// ascending; out-of-order publication would permanently skip rows here.
+/// r9 item 3 PUBLICATION-ORDER INVARIANT: the live broadcast path publishes
+/// settlements in the order of the per-Hub monotonic `settlement_events.seq`
+/// assigned inside each settling transaction (within one sweep the settle
+/// SELECT orders rows by id so seqs ascend; across sweeps AUTOINCREMENT is a
+/// total order even in the same millisecond). That ordering is what lets the
+/// max-seq cursor and this strictly-forward `seq > cursor` recovery coexist:
+/// a dropped low-seq row of an earlier batch always sits behind the cursor
+/// and is recovered on the next drain. Keep both paths seq-ascending.
 async fn drain_settlement_lag(
     store: &crate::store::Store,
     instance_ids: &[String],
@@ -1418,7 +1418,7 @@ async fn drain_settlement_lag(
                 tracing::error!(%error, "settlement lag recovery query failed; closing follower");
             })?;
         let short = page.len() < crate::store::SETTLEMENT_LAG_PAGE as usize;
-        for (sid, iid, reason, updated_at) in page {
+        for (sid, iid, reason, seq_token) in page {
             if instance_ids.is_empty() || instance_ids.iter().any(|id| id == &sid) {
                 let frame = json!({
                     "type": "settlement",
@@ -1430,11 +1430,13 @@ async fn drain_settlement_lag(
                 .to_string();
                 out_tx.send(FollowMsg::Text(frame)).await.map_err(|_| ())?;
             }
-            // Cursor advances past EVERY paged row, sent or filtered.
+            // Cursor advances past EVERY paged row, sent or filtered. The
+            // token is the monotonic settlement_events.seq (r9 item 3); it
+            // was issued by the store, so it parses.
+            let seq = seq_token.parse::<i64>().map_err(|_| ())?;
             *cursor = Some(crate::store::Store::settlement_max_cursor(
                 cursor.as_deref(),
-                &updated_at,
-                &iid,
+                seq,
             ));
         }
         if short {
@@ -1638,18 +1640,16 @@ async fn follow_session(
                             // for this follower — so a later lag drain never
                             // re-scans or skips past it.
                             //
-                            // r7 item 3 INVARIANT: the rows of one settlement
-                            // sweep are published in ascending
-                            // `(updated_at, id)` cursor order (the store's
-                            // settle select orders them so), so advancing this
-                            // max-cursor past a published row can never exclude
-                            // a lower-id row of the SAME batch that backpressure
-                            // dropped. Lag recovery pages strictly forward from
-                            // this cursor; see drain_settlement_lag.
+                            // r9 item 3: the key is the monotonic
+                            // settlement_events.seq assigned in the settling
+                            // transaction, not a (updated_at, id) composite,
+                            // so same-millisecond cross-settle publication can
+                            // never skip a row a follower missed. Lag recovery
+                            // pages strictly forward from this cursor; see
+                            // drain_settlement_lag.
                             settlement_cursor = Some(crate::store::Store::settlement_max_cursor(
                                 settlement_cursor.as_deref(),
-                                &notice.updated_at,
-                                &notice.interaction_id,
+                                notice.seq,
                             ));
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -2114,8 +2114,9 @@ mod tests {
     use crate::store::{SETTLEMENT_LAG_PAGE, Store};
     use rusqlite::params;
 
-    /// Insert `count` invalidated interactions with ascending synthetic
-    /// timestamps, optionally one 2-hours-old lost row and one pending row.
+    /// Insert `count` rows into the settlement_events log, optionally one
+    /// 2-hours-old lost row and one still-pending interaction (which has NO
+    /// log entry and must never drain).
     async fn seed_backlog(
         store: &Store,
         count: u32,
@@ -2123,23 +2124,21 @@ mod tests {
         with_pending: bool,
     ) -> Vec<String> {
         store
-            .run_named("r6_seed_settlement_backlog", move |conn| {
+            .run_named("r9_seed_settlement_backlog", move |conn| {
                 let mut ids = Vec::new();
                 {
                     let mut stmt = conn.prepare(
-                        "INSERT INTO interactions
-                            (id, instance_id, host_id, kind, state, blocking,
-                             payload_json, created_at, updated_at)
-                         VALUES (?1, 'ins_lag', 'hst_lag', 'approval', 'invalidated', 0,
-                                 '{}', ?2, ?2)",
+                        "INSERT INTO settlement_events
+                            (interaction_id, instance_id, state, reason, created_at)
+                         VALUES (?1, 'ins_lag', 'invalidated', 'generation-ended', ?2)",
                     )?;
                     if with_aged_lost {
                         stmt.execute(params!["int_lag_AGED", "2026-09-01T00:00:00.000Z"])?;
                     }
                     for n in 0..count {
                         let id = format!("int_lag_{n:05}");
-                        // Proper RFC3339 stamps; the backlog stays under 10
-                        // minutes and sorts in seed order.
+                        // Proper RFC3339 stamps; the backlog stays in the
+                        // present window. Seq, not the stamp, orders the drain.
                         let stamp = format!("2026-10-07T12:{:02}:{:02}.000Z", n / 60, n % 60);
                         stmt.execute(params![id, stamp])?;
                         ids.push(format!("int_lag_{n:05}"));
@@ -2244,24 +2243,22 @@ mod tests {
         assert!(cursor.is_some(), "the cursor advanced past the tail");
     }
 
-    /// c-cardsettle r8 item 4: cross-`settle` publication ORDER. A follower
+    /// c-cardsettle r9 item 3: cross-`settle` publication ORDER. A follower
     /// that has already drained part of a FIRST settlement batch (its cursor
-    /// ends MID the settlement history) must not be able to permanently skip
-    /// rows of a SECOND settle whose notices overrun the broadcast ring.
+    /// ends MID the settlement log) must not be able to permanently skip rows
+    /// of a SECOND settle whose notices overrun the broadcast ring.
     /// Concretely:
-    ///   1. settle A (5 rows); drain A partially — receive 3, cursor mid-A.
+    ///   1. settle A (5 rows); the follower receives 3 live, cursor mid-A.
     ///   2. settle B (70 rows > the 64-notice ring) with NO live delivery
     ///      (its out channel is dropped, as a backpressured socket behaves).
     ///   3. resume draining from the mid-A cursor: all remaining A rows AND all
-    ///      B rows must be recovered, in ascending `(updated_at, id)` order,
-    ///      each once, before the gap.
+    ///      B rows must be recovered, in ascending settlement seq order, each
+    ///      once, before the gap.
     ///
-    /// The strictly-forward cursor alone can lose B rows here: B shares one
-    /// `updated_at`, so a row skipped because of a stale same-timestamp read
-    /// is not recovered by `(updated_at, id) > cursor`. The store's settled
-    /// set is therefore forced through the publication-order lock and the
-    /// ORDER BY below is what keeps the drain complete; this test locks the
-    /// observed delivery to that order at the cross-settle boundary.
+    /// The per-Hub AUTOINCREMENT seq assigned in the settling transaction is a
+    /// total order even when the two settles share a millisecond and their
+    /// interaction ids interleave, so a strictly-forward seq cursor can never
+    /// skip a row of the earlier batch.
     #[tokio::test]
     async fn settlement_cursor_mid_first_batch_recovers_a_later_overring_sweep() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -2349,43 +2346,24 @@ mod tests {
                 (instance_id, ids)
             }
         };
-        // Batch A settles FIRST (older timestamp) but its ids sort AFTER B's
-        // (instance number 2 vs 1), so id order and the composite
-        // (updated_at, id) order disagree: an id-ordered page from a mid-A
-        // cursor returns B first and would skip A's remaining rows.
+        // Batch A settles FIRST, then B. The seqs are what order publication
+        // (A's five before B's seventy) even though B is the bigger sweep and
+        // both settle at the wall clock's same millisecond.
         let (inst_a, mut cards_a) = seed(2, 5).await;
         let (inst_b, cards_b) = seed(1, 70).await;
 
-        // Settle A, then B (distinct instants so the cross-batch cursor order
-        // is total); B never publishes live to this follower.
+        // Settle A, then B; B never publishes live to this follower.
         store
-            .settle_instance_exited(inst_a.clone(), "r8-order-a".into())
+            .settle_instance_exited(inst_a.clone(), "r9-order-a".into())
             .await
             .expect("settle A");
-        // Force A's settlement timestamp strictly older than B's: otherwise
-        // both stamps can land in the same millisecond and id order coincides
-        // with the composite order, hiding an ORDER BY regression.
         store
-            .run_named("r8_backdate_a", {
-                let inst_a = inst_a.clone();
-                move |conn| {
-                    conn.execute(
-                        "UPDATE interactions SET updated_at = '2000-01-01T00:00:00.000Z'
-                         WHERE instance_id = ?1",
-                        rusqlite::params![inst_a],
-                    )?;
-                    Ok(())
-                }
-            })
-            .await
-            .expect("backdate A");
-        store
-            .settle_instance_exited(inst_b.clone(), "r8-order-b".into())
+            .settle_instance_exited(inst_b.clone(), "r9-order-b".into())
             .await
             .expect("settle B");
 
         // PART 1: the follower received the first three A rows live, so its
-        // durable cursor is the composite token on the third row.
+        // durable cursor is the seq token on the third row.
         let page = store
             .invalidated_interactions_after(None)
             .await
@@ -2395,13 +2373,12 @@ mod tests {
             .take(3)
             .map(|(_, id, _, _)| id.clone())
             .collect();
-        let mid_cursor = {
-            let (_, id, _, ts) = page
-                .iter()
-                .find(|(_, id, _, _)| id == &first_three[2])
-                .expect("third row present");
-            Store::settlement_cursor_of(ts, id)
-        };
+        let mid_cursor = page
+            .iter()
+            .find(|(_, id, _, _)| id == &first_three[2])
+            .expect("third row present")
+            .3
+            .clone();
 
         // PART 2: fresh drain from the MID cursor recovers the rest in order.
         // Concurrently receive: the batch exceeds the channel capacity, so the
@@ -2455,16 +2432,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let store = Store::open(dir.path()).expect("store");
         store
-            .run_named("r6_seed_two_instances", |conn| {
+            .run_named("r9_seed_two_instances", |conn| {
                 conn.execute(
-                    "INSERT INTO interactions
-                        (id, instance_id, host_id, kind, state, blocking,
-                         payload_json, created_at, updated_at)
+                    "INSERT INTO settlement_events
+                        (interaction_id, instance_id, state, reason, created_at)
                      VALUES
-                        ('int_OWNED', 'ins_owned', 'hst', 'approval', 'invalidated', 0,
-                         '{}', '2026-10-07T12:00:01.000Z', '2026-10-07T12:00:01.000Z'),
-                        ('int_OTHER', 'ins_other', 'hst', 'approval', 'invalidated', 0,
-                         '{}', '2026-10-07T12:00:02.000Z', '2026-10-07T12:00:02.000Z')",
+                        ('int_OWNED', 'ins_owned', 'invalidated',
+                         'generation-ended', '2026-10-07T12:00:01.000Z'),
+                        ('int_OTHER', 'ins_other', 'invalidated',
+                         'generation-ended', '2026-10-07T12:00:02.000Z')",
                     [],
                 )?;
                 Ok(())

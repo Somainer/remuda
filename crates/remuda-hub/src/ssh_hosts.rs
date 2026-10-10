@@ -378,20 +378,47 @@ impl Store {
                     Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
                     _ => "unknown",
                 };
-                let was_terminal = tx
+                // r9 item 2 (OA6): "was this row REALLY terminal?" must use
+                // process-end EVIDENCE, not the lifecycle string alone. The
+                // host-lost sweep marker (`exited` + 'host-lost' + no
+                // ended_at) is only potentially dead; a daemon that now
+                // reports the instance exited authoritatively attests the
+                // process end, so its pending cards must settle.
+                let previous: Option<(String, Option<String>, Option<String>)> = tx
                     .query_row(
-                        "SELECT lifecycle FROM instances WHERE id = ?1 AND host_id = ?2",
+                        "SELECT lifecycle, last_error, ended_at
+                         FROM instances WHERE id = ?1 AND host_id = ?2",
                         params![id, &host_id],
-                        |row| row.get::<_, String>(0),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
-                    .map(|previous| matches!(previous.as_str(), "exited" | "failed" | "closed"))
-                    .unwrap_or(true);
+                    .optional()?;
+                let was_terminal = match &previous {
+                    Some((lifecycle, last_error, ended_at)) => {
+                        crate::store::lifecycle_has_process_end_evidence(
+                            lifecycle,
+                            last_error.as_deref(),
+                            ended_at.as_deref(),
+                        )
+                    }
+                    None => true,
+                };
+                let now_terminal = matches!(lifecycle, "exited" | "failed" | "closed");
                 tx.execute(
                     "UPDATE instances SET lifecycle = ?3, activity = ?4, connectivity = 'connected',
-                     last_error = ?5, updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
-                    params![id, host_id, lifecycle, activity, instance["lastError"].as_str(), &now],
+                     last_error = ?5, updated_at = ?6,
+                     ended_at = CASE WHEN ?7 THEN COALESCE(ended_at, ?6) ELSE ended_at END
+                     WHERE id = ?1 AND host_id = ?2",
+                    params![
+                        id,
+                        host_id,
+                        lifecycle,
+                        activity,
+                        instance["lastError"].as_str(),
+                        &now,
+                        now_terminal
+                    ],
                 )?;
-                if !was_terminal && matches!(lifecycle, "exited" | "failed" | "closed") {
+                if !was_terminal && now_terminal {
                     ended.push(id.to_string());
                 }
             }

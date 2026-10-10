@@ -793,9 +793,14 @@ pub async fn delete_instance(
         .delete_instance(instance_id.clone())
         .await
         .map_err(map_store)?;
-    if !deleted {
+    let Some(deleted) = deleted else {
         return Err(HubError::NotFound);
-    }
+    };
+    // c-cardsettle r10 item 4(d): publish the cards the delete transaction
+    // itself invalidated (a force-deleted host-lost chapter still carried
+    // pending ones). The stop path's earlier settlement is empty here, so
+    // broadcasting it is a no-op in the normal case.
+    state.broadcast_settlement(&deleted.settlement);
     tracing::info!(
         %instance_id,
         device_id = %device.id,

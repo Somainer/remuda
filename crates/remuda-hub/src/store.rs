@@ -2012,6 +2012,15 @@ pub struct ReconcileOutcome {
     pub settlement: Settlement,
 }
 
+/// Result of a successful [`Store::delete_instance`] (c-cardsettle r10 item
+/// 4(d)). The settlement covers pending cards invalidated inside the delete
+/// transaction (empty when the stop already settled them).
+#[derive(Debug, Default)]
+pub struct DeletedInstance {
+    /// Cards settled because their chapter was deleted while still pending.
+    pub settlement: Settlement,
+}
+
 /// One interaction a terminal transaction settled. `seq` is the per-Hub
 /// monotonic settlement sequence assigned in the SAME transaction
 /// (c-cardsettle r9 item 3); it is the follower delivery cursor key.
@@ -3059,17 +3068,24 @@ impl Store {
     /// Permanently delete an Instance and everything the Hub keeps for it.
     ///
     /// Only a stopped Instance can be deleted; the caller is responsible for
-    /// stopping it first (`force`). Returns `false` when the row is already
-    /// gone, which is what makes `DELETE` idempotent, and an
-    /// [`StoreError::Id`] naming the lifecycle when it is still live.
+    /// stopping it first (`force`). Returns `None` when the row is already
+    /// gone (idempotent), and an
+    /// [`crate::store::DeletedInstance`] naming the settlement (c-cardsettle
+    /// r10 item 4(d): a host-lost row still carries pending cards when it is
+    /// force-deleted; those cards are invalidated and logged in the SAME
+    /// transaction that tombstones them, and the HTTP handler publishes the
+    /// settlement so open inboxes drop them).
     ///
     /// Journal rows, queued commands, interactions, and fleet membership go
     /// with it: leaving any of them behind would resurrect the session in a
     /// list view or keep a command queued against an id that no longer exists.
-    pub async fn delete_instance(&self, instance_id: String) -> Result<bool, StoreError> {
+    pub async fn delete_instance(
+        &self,
+        instance_id: String,
+    ) -> Result<Option<DeletedInstance>, StoreError> {
         self.run_named("delete_instance", move |conn| {
             let Some(instance) = load_instance(conn, &instance_id)? else {
-                return Ok(false);
+                return Ok(None);
             };
             if !matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed") {
                 return Err(StoreError::Id(format!(
@@ -3146,6 +3162,23 @@ impl Store {
                 }
             }
             let tx = conn.transaction()?;
+            // c-cardsettle r10 item 4(d): settle every chapter's still-pending
+            // cards BEFORE the rows are tombstoned and deleted. A force-delete
+            // of a host-lost chapter never received a settlement (host loss is
+            // contact loss, not a process end), so without this its cards were
+            // tombstoned pending with no settlement_events row and no notice —
+            // an open inbox kept an actionable card for a deleted instance.
+            // The tombstones written by delete_instance_rows then retain the
+            // invalidated state and reason.
+            let mut settlement = Settlement::default();
+            let now = now_rfc3339();
+            for chapter_id in &chapter_ids {
+                settlement.merge(settle_instance_interactions(
+                    &tx,
+                    &[chapter_id.clone()],
+                    &now,
+                )?);
+            }
             for chapter_id in &chapter_ids {
                 delete_instance_rows(&tx, chapter_id)?;
             }
@@ -3156,7 +3189,7 @@ impl Store {
                 )?;
             }
             tx.commit()?;
-            Ok(true)
+            Ok(Some(DeletedInstance { settlement }))
         })
         .await
     }
@@ -9111,6 +9144,7 @@ mod tests {
                 .delete_instance(deleted.instance_id)
                 .await
                 .expect("delete")
+                .is_some()
         );
 
         // Still-pending: never replayed as a settlement.
@@ -9450,6 +9484,7 @@ mod tests {
                 .delete_instance(deleted_instance.instance_id)
                 .await
                 .expect("delete")
+                .is_some()
         );
 
         // A still-pending interaction raises no settlement event.
@@ -11572,6 +11607,7 @@ mod tests {
                 .delete_instance(instance.instance_id.clone())
                 .await
                 .expect("delete")
+                .is_some()
         );
         let page = store
             .invalidated_interactions_after(None)
@@ -12734,6 +12770,81 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r10 item 4(d): force-deleting a HOST-LOST chapter whose
+    /// cards the sweep deliberately left pending must invalidate them INSIDE
+    /// the delete transaction (not tombstone them pending with no notice) and
+    /// return the settlement so the HTTP handler publishes it.
+    #[tokio::test]
+    async fn deleting_a_host_lost_instance_settles_its_pending_cards_first() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-delete-hostlost").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        // Contact loss past grace: the sweep marks the row host-lost WITHOUT
+        // settling the card.
+        store
+            .mark_host_offline(host.clone())
+            .await
+            .expect("offline");
+        let (_, sweep_settlement) = store.expire_lost_hosts(0).await.expect("sweep");
+        assert!(sweep_settlement.is_empty());
+
+        // Delete (the row is already exited, so no stop is needed).
+        let deleted = store
+            .delete_instance(instance.instance_id.clone())
+            .await
+            .expect("delete")
+            .expect("the row existed");
+        assert_eq!(
+            deleted
+                .settlement
+                .interactions
+                .iter()
+                .map(|s| s.interaction_id.clone())
+                .collect::<Vec<_>>(),
+            vec![int_id.clone()],
+            "the delete returns the pending card it invalidated"
+        );
+
+        // The settlement log carries the event, so a follower drains it.
+        let page = store
+            .invalidated_interactions_after(None)
+            .await
+            .expect("page");
+        assert!(
+            page.iter().any(|(_, id, _, _)| id == &int_id),
+            "the delete logged a settlement_events row for the card"
+        );
+
+        // The tombstone retains the invalidated state and the end reason, so
+        // a late answer is rejected without fanning out.
+        let tomb: (String, Option<String>) = store
+            .run_named("r10_read_tombstone", move |conn| {
+                conn.query_row(
+                    "SELECT state, reason FROM interaction_tombstones WHERE id = ?1",
+                    params![&int_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("tombstone");
+        assert_eq!(tomb.0, "invalidated", "the card is not tombstoned pending");
+        assert_eq!(tomb.1.as_deref(), Some("generation-ended"));
+        assert!(
+            store
+                .get_instance(instance.instance_id)
+                .await
+                .expect("get")
+                .is_none(),
+            "the instance row is gone"
+        );
+        store.close().await;
+    }
+
     /// c-cardsettle r2 item 2: deleting a terminal instance removes the live
     /// interaction rows but retains their terminal state as tombstones, so a
     /// late answer can be rejected without fanning out to Nodes.
@@ -12756,6 +12867,7 @@ mod tests {
                 .delete_instance(instance.instance_id.clone())
                 .await
                 .expect("delete")
+                .is_some()
         );
 
         // The live row is gone with the instance…

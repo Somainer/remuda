@@ -272,6 +272,27 @@ impl SessionStartReport {
         })
     }
 
+    /// Build the report the promoted-shell poll loop consumes when the NATIVE
+    /// HOOK BUS (not a pid-file bind) supplied the current `SessionBinding`.
+    ///
+    /// The bus folds the hook at delivery, so this carries the authenticated
+    /// [`SessionBinding::source`](remuda_signal::SessionBinding::source) — a
+    /// `/clear` reaches `record` as Fresh even when Z.jsonl already holds the
+    /// queued prompt at the first poll tick (c-effortread r9 item 1). The
+    /// binding has no cwd; the caller still runs its own cwd membership checks.
+    /// Returns `None` when the hook named no transcript path yet.
+    #[must_use]
+    pub fn from_bus_binding(binding: &remuda_signal::SessionBinding) -> Option<Self> {
+        let transcript_path = binding.transcript_path.clone()?;
+        Some(Self {
+            session_id: binding.session_id.clone(),
+            transcript_path: PathBuf::from(transcript_path),
+            cwd: None,
+            ppid: Some(i64::from(binding.pid)),
+            start_source: binding.source.clone(),
+        })
+    }
+
     /// Bind iff the hook's parent pid is exactly the foreground agent pid and
     /// the named transcript exists. A hook from another session (same cwd,
     /// different pid) is ignored.

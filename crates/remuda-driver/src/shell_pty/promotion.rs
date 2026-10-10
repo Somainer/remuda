@@ -1035,6 +1035,13 @@ pub(super) fn spawn(
                         }
                     }
                 }
+                // One report derived from the NATIVE hook binding. Its source
+                // was folded by the bus at hook delivery (r9 item 1): reading
+                // it here sizes the first tick correctly even when this
+                // report has not yet been ingested into `start_sources`, so a
+                // /clear whose Z.jsonl already holds the queued prompt is
+                // classified Fresh instead of an unverified EOF anchor.
+                let hook_report = SessionStartReport::from_bus_binding(&binding);
                 if session_modes
                     .mode_for(binding.pid, &binding.session_id)
                     .is_none()
@@ -1044,23 +1051,13 @@ pub(super) fn spawn(
                         &binding.session_id,
                         binding.transcript_path.as_deref().map(std::path::Path::new),
                         pre_resume_mode,
-                        bindings
-                            .start_source_for(binding.pid, &binding.session_id)
-                            .as_deref(),
+                        hook_report
+                            .as_ref()
+                            .and_then(|report| report.start_source.as_deref()),
                         found.as_ref().expect("matched foreground"),
                     );
                 }
-                if let Some(path) = binding.transcript_path {
-                    let report = SessionStartReport {
-                        session_id: binding.session_id,
-                        transcript_path: path.into(),
-                        cwd: None,
-                        ppid: Some(i64::from(binding.pid)),
-                        // This report is synthesized from a pid-file bind, not
-                        // the native hook payload — source unknown, fall back
-                        // to transcript sizing.
-                        start_source: None,
-                    };
+                if let Some(report) = hook_report {
                     // r7 item 1: the authenticated report names the session
                     // ACTUALLY live in this pid. It governs both when an
                     // existing binding flips (/resume, /clear after the launch
@@ -4383,6 +4380,131 @@ mod tests {
             matches!(unknown.mode, ResumeMode::Boundary(_)),
             "unknown source sizes the file (non-empty -> unverified): {:?}",
             unknown.mode
+        );
+    }
+
+    /// c-effortread r9 item 1: the source must ride the NATIVE hook bus
+    /// binding all the way to the first-tick classification. A `/clear` whose
+    /// Z.jsonl ALREADY holds the queued prompt when the pump ingests the
+    /// SessionStart is Fresh (gate opens, queued prompt is current session
+    /// content) — never an unverified EOF anchor that skips the prompt and
+    /// keeps the effort read-back gate shut. Unlike the r8 test this goes bus
+    /// -> binding -> [`SessionStartReport::from_bus_binding`] -> record -> the
+    /// production Hydrator pump, with no hand-passed `Some("clear")`.
+    #[tokio::test]
+    async fn r9_item1_native_bus_clear_source_sizes_z_fresh_at_the_first_tick() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let launch = slug_session(dir.path(), &cwd, CORRECT, "{}\n");
+        // Z.jsonl already holds the queued prompt BEFORE the first poll tick.
+        let z: std::path::PathBuf = slug_session(
+            dir.path(),
+            &cwd,
+            "clear-z",
+            &user_line(1, "queued before first tick"),
+        );
+
+        // Native hook bus: deliver the /clear SessionStart exactly as the
+        // relay socket would, with the folded source.
+        let (tx, _rx) = mpsc::channel(256);
+        let bus = remuda_signal::SignalBus::new(
+            remuda_signal::BusContext {
+                instance_id: InstanceId::new(),
+                host_id: HostId::new(),
+                journal_id: Id::new("obj").expect("journal id"),
+                run_id: RunId::new(),
+                driver_kind: remuda_protocol::DriverKind::ShellPty,
+                adapter_version: "test".into(),
+            },
+            tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+        bus.handle(remuda_signal::HookEnvelope {
+            credential: "cred".into(),
+            event: "SessionStart".into(),
+            ppid: 7,
+            payload: serde_json::json!({
+                "session_id": "clear-z",
+                "transcript_path": z.to_string_lossy(),
+                "cwd": cwd.to_string_lossy(),
+                "source": "clear",
+            }),
+        })
+        .await;
+        let binding = bus.binding().expect("the native bus folded a binding");
+        assert_eq!(binding.source.as_deref(), Some("clear"));
+
+        // The poll loop's own conversion (production seam) and first-tick
+        // classification. The start_sources registry is still empty here, so a
+        // record that read the registry instead of the binding would get None.
+        let report =
+            SessionStartReport::from_bus_binding(&binding).expect("a named path yields a report");
+        let mut table = SessionModeTable::default();
+        let launch_found = detected_claude(7, Some(CORRECT));
+        let launch_sticky = table.record(7, CORRECT, Some(&launch), None, None, &launch_found);
+        assert!(!launch_sticky.rebound);
+        let z_found = detected_claude(7, Some("clear-z"));
+        let z_sticky = table.record(
+            7,
+            "clear-z",
+            Some(report.transcript_path.as_path()),
+            None,
+            report.start_source.as_deref(),
+            &z_found,
+        );
+        assert!(z_sticky.rebound, "Z is an in-TUI rebound session");
+        assert_eq!(
+            z_sticky.mode,
+            ResumeMode::Fresh,
+            "the bus-carried /clear source makes Z Fresh despite the non-empty file"
+        );
+
+        // The production read gate: a Fresh tail hydrates the queued prompt as
+        // current session content. Under the old None-source path this opened
+        // as an unverified EOF anchor and emitted nothing.
+        let ctx = PromoteCtx {
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            cwd: cwd.clone(),
+            claude_home: dir.path().to_path_buf(),
+        };
+        let z_binding = TranscriptBinding {
+            session_id: "clear-z".to_owned(),
+            path: z,
+            cwd,
+            source: crate::claude_transcript::BindingSource::Hook,
+        };
+        let (etx, mut erx) = mpsc::channel(256);
+        let seq = Arc::new(AtomicU64::new(0));
+        let mut hydrator = Hydrator::open(
+            &ctx,
+            &z_binding,
+            None,
+            None,
+            None,
+            None,
+            None,
+            z_sticky.mode,
+            None,
+            None,
+        )
+        .expect("Fresh hydrator opens on Z");
+        pump(&mut hydrator, &etx, &seq, &ctx)
+            .await
+            .expect("production pump");
+        let observations: Vec<Observation> = {
+            let mut out = Vec::new();
+            while let Ok(observation) = erx.try_recv() {
+                out.push(observation);
+            }
+            out
+        };
+        assert!(
+            conversation_hydrated(&observations, "queued before first tick"),
+            "the Fresh gate hydrates Z's queued prompt (read-back gate open): {observations:?}"
         );
     }
 

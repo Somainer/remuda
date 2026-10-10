@@ -844,12 +844,17 @@ impl DevNode {
         };
         #[cfg(unix)]
         {
-            let child_pid = child.id().unwrap_or(0);
-            *live
-                .pgid
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) =
-                Some(i32::try_from(child_pid).unwrap_or(0));
+            // None id (or an unconvertible one) leaves the pgid unset: a
+            // Some(0) here would later become killpg(0) against the Node's
+            // own process group.
+            if let Some(pid) = child.id()
+                && let Ok(pgid) = i32::try_from(pid)
+            {
+                *live
+                    .pgid
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(pgid);
+            }
         }
 
         // Stream gate.jsonl step results as they are flushed (gate.sh flushes

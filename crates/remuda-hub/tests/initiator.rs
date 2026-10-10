@@ -1454,8 +1454,12 @@ async fn fenced_cancel_of_a_queued_or_running_gate_job_is_refused_before_the_nod
 async fn cancel_of_a_job_claimed_between_preread_and_writer_still_sends_gate_cancel() {
     let (ctx, mut node) = Ctx::boot().await.unwrap();
     let job_id = queued_job(&ctx).await;
-    ctx.configure_gate_lane().await;
 
+    // No lane is configured: the real 1 s scheduler tick therefore cannot
+    // dispatch this job (previously the test configured the lane and could
+    // race the tick). The seam itself pins laneId/hostId on the row, which is
+    // all the cancel handler needs to address gate.cancel.
+    //
     // Deterministic seam: inside the cancel writer job, before its read, the
     // scheduler claim commits (queued -> running, pinned to the lane) —
     // exactly what the 1 s tick can do between the handler's pre-read and

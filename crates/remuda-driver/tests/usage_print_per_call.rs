@@ -231,3 +231,70 @@ fn nested_subagent_assistant_frames_emit_no_usage() {
         "sub-agent usage stays out of the parent session's rollup"
     );
 }
+
+#[test]
+fn sdk_takes_per_call_usage_and_never_the_summed_session_stock() {
+    // c-usagefu r2 item 3: the SDK carrier uses the same stream-json argv as
+    // print apart from `-p`, so it has the same per-call assistant channel.
+    // The summed result.usage must NOT be stored as a cumulative Session stock.
+    let frames: Vec<Value> = std::fs::read_to_string(FIXTURE)
+        .expect("fixture")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("real stream-json frame"))
+        .collect();
+
+    let mut mapper = StdoutMapper::with_driver(remuda_driver::DriverKind::ClaudeSdk);
+    let payloads = usages(&mut mapper, &frames);
+
+    // Per-call Turn rows exist for the SDK exactly as for print.
+    let turn: Vec<_> = payloads
+        .iter()
+        .filter(|p| p.scope == UsageScope::Turn)
+        .collect();
+    let last: Vec<_> = turn
+        .iter()
+        .filter(|p| p.scope_id == "msg_replay_05")
+        .copied()
+        .collect();
+    assert!(!last.is_empty(), "SDK emits per-call Turn usage");
+    let final_last = last.last().unwrap();
+    let context = known(&final_last.input_tokens)
+        + known(&final_last.cache_read_tokens)
+        + known(&final_last.cache_write_tokens);
+    assert_eq!(
+        context, 33_718,
+        "SDK last-call context is the real per-call basket, not 134,448"
+    );
+    assert_eq!(known(&final_last.output_tokens), 30);
+
+    // The single result-frame Session snapshot carries cost + window but NO
+    // token buckets — never the summed 134,448 / 442 cumulative stock.
+    let session: Vec<_> = payloads
+        .iter()
+        .filter(|p| p.scope == UsageScope::Session)
+        .collect();
+    assert_eq!(session.len(), 1, "one result frame in the fixture");
+    let session = session[0];
+    for (name, counter) in [
+        ("input", &session.input_tokens),
+        ("output", &session.output_tokens),
+        ("cache_read", &session.cache_read_tokens),
+        ("cache_write", &session.cache_write_tokens),
+        ("total", &session.total_tokens),
+    ] {
+        assert!(
+            matches!(counter, Knowledge::Unknown { .. }),
+            "SDK session {name} tokens must not be the summed stock: {counter:?}"
+        );
+    }
+    assert!(
+        matches!(session.cost, Knowledge::Known { .. }),
+        "the result still contributes reported cost"
+    );
+    assert_eq!(
+        session.context_window.as_ref().map(U64::to_owned),
+        Some(U64(1_000_000)),
+        "the result still carries the native modelUsage window"
+    );
+}

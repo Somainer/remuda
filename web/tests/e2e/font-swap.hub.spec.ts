@@ -1014,11 +1014,19 @@ test("a saved position in a bounded long journal survives a late monospace swap"
 });
 
 test("a saved position in a bounded long journal survives a monospace swap landing mid-restore", async ({ page }) => {
-  // The gap-16 park (longBurst>0) saves a burst row strictly BELOW the growing
-  // wrap block, so unlike the short mid arm (whose saved anchor IS the wrap
-  // row) a broken mid-restore re-anchor makes THIS anchor drift by the block's
-  // growth. This is the arm that proves the mid-restore correction, not merely
-  // the anchor row's own top.
+  // End-to-end long-journal mid arm: the gap-16 park saves a burst row
+  // strictly BELOW the growing wrap block, and the swap is released while the
+  // ?restoreProbe restore is still ARMED, so this proves a below-block anchor
+  // survives a real font swap landing mid-restore (the product path, real
+  // woff2, real ResizeObserver timing). It does NOT isolate the mid-restore
+  // reflow correction: the armed barrier above releases only after the
+  // restore converged within 2px, the wrap row is strictly above the anchor so
+  // the compensator counter-scrolls exactly the growth, and with the
+  // correction disabled the pending restore's own DOM correction lands at the
+  // same spot. The only proof that specifically FAILS on the pre-fix
+  // (finalize-on-reflowCorrected) code is the unit test "item 3 mid
+  // (below-anchor growth): a mid-restore reflow must not finalize while the
+  // anchor is still off its saved offset" in Transcript.test.tsx.
   test.setTimeout(240_000);
   await savedPositionSurvivesSwap(page, LONG_BURST, "first");
 });

@@ -503,6 +503,16 @@ pub struct InstanceRecord {
     /// Current model id from create / `instance.configure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Requested harness permission mode from the create / configure spec
+    /// (D-057 §3.3). The transcript-observed effective mode is
+    /// `permissionEffective` inside the spec; this is the seated value that
+    /// survives a continuation resume.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "permissionMode"
+    )]
+    pub permission_mode: Option<String>,
     /// Requested launch renderer; actual mode comes from the tty snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui: Option<remuda_protocol::TuiMode>,
@@ -11450,6 +11460,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let permission_mode = spec
+                .get("permissionMode")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let effort = spec.get("effort");
             // D-028 §9.1: normalize by NAME, never by index, using the shared
             // per-harness normalizer (remuda-protocol). Codex `max` / `ultra`
@@ -11550,6 +11564,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 provider_source_hint,
                 api_route,
                 model,
+                permission_mode,
                 tui: spec
                     .get("tui")
                     .and_then(|value| serde_json::from_value(value.clone()).ok()),

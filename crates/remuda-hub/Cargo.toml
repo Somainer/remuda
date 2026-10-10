@@ -61,6 +61,10 @@ remuda-driver = { workspace = true, features = ["test-stub"] }
 ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
 # Software ES256 authenticator for the passkey ceremony tests (D-029).
 openssl = "0.10"
+# utimensat/TimeSpec: tests backdate an access-code file's mtime to exercise
+# the round-3 "file newer than stamp" re-stamp rule. Features unify with the
+# normal-dep entry; no new crate is pulled.
+nix = { version = "0.28", default-features = false, features = ["fs", "time"] }
 # The offline Anthropic-Messages gateway the api-routing relay e2e runs against.
 remuda-journal.workspace = true
 remuda-testing.workspace = true

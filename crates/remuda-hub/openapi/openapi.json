@@ -1609,6 +1609,13 @@
               "null"
             ]
           },
+          "permissionMode": {
+            "description": "Requested harness permission mode from the create/configure spec; the transcript-observed effective mode is permissionEffective (D-057 §3.3).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "promotedAt": {
             "description": "When the terminal was promoted. Absent unless mode is \"promoted\".",
             "type": [

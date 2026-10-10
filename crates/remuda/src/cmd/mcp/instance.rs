@@ -275,5 +275,16 @@ fn create_opts_from_json(args: &Value) -> Result<CreateOpts> {
         // too; the client-side preflight fails loudly for agent tokens (which
         // cannot list hosts), so a grant can never be silently dispatched.
         capabilities: string_list(args, "capabilities"),
+        // D-057 seating flags are CLI-only in ma-seat-cli; the MCP surface
+        // keeps omitting every one of them, so its request body is unchanged.
+        role: None,
+        grants: Vec::new(),
+        scope_projects: Vec::new(),
+        scope_hosts: Vec::new(),
+        scope_workspaces: Vec::new(),
+        project_id: None,
+        permission_mode: None,
+        model: None,
+        restart: None,
     })
 }

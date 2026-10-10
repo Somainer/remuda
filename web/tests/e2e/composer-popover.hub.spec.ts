@@ -1007,3 +1007,61 @@ test.describe("notification stack clears the tty bottom chrome (r5 item 2)", () 
     }
   });
 });
+
+test.describe("notification stack keeps the safe-area offset without measured chrome (r6 item 1)", () => {
+  // /s/:id/events mounts neither the structured dock nor the tty bottom
+  // chrome (and the snapshot-loading state mounts neither either), so the
+  // height-publishing hook REMOVES --session-dock-h. The pre-fix session
+  // rule fell back to 0px and parked a blocking item inside a notched
+  // phone's home-indicator zone; it must fall back to --safe-bottom like
+  // the base rule instead.
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+
+  test("390 /s/:id/events: the stack bottom is safe-bottom + 12", async ({ page }) => {
+    const id = await createSession(page, "composer popover events safe area");
+    await page.goto(`/s/${id}/events`);
+    await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "events");
+
+    // No measured chrome on the events route → the hook unpublished the var.
+    await expect(page.getByTestId("session-dock")).toHaveCount(0);
+    await expect(page.getByTestId("tty-bottom-chrome")).toHaveCount(0);
+    await page.waitForFunction(
+      () =>
+        getComputedStyle(document.documentElement).getPropertyValue("--session-dock-h").trim() ===
+        "",
+      null,
+      { timeout: 10_000 },
+    );
+
+    // env(safe-area-inset-bottom) cannot be emulated; stamp the derived
+    // token directly (a notched phone is ~34 px).
+    await page.evaluate(() => {
+      document.documentElement.style.setProperty("--safe-bottom", "34px");
+    });
+
+    await page.evaluate(() => {
+      const lab = (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab;
+      lab?.notify({ severity: "blocking", subject: "standing one", stage: "standing error" });
+    });
+    try {
+      await expect(page.getByText("standing error").first()).toBeVisible();
+      // 34 px inset + the 12 px (--space-3) anchor gap.
+      await page.waitForFunction(
+        (expected) => {
+          const stack = document.querySelector<HTMLElement>(
+            "[data-testid='blocking-errors']",
+          )?.parentElement;
+          if (!stack) return false;
+          const bottom = Math.round(window.innerHeight - stack.getBoundingClientRect().bottom);
+          return Math.abs(bottom - expected) <= 2;
+        },
+        46,
+        { timeout: 10_000 },
+      );
+    } finally {
+      await page.evaluate(() => {
+        (window as unknown as { __notifyLab?: NotifyLab }).__notifyLab?.dismissAllBlocking();
+      });
+    }
+  });
+});

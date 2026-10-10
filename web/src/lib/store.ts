@@ -1609,7 +1609,15 @@ class HubStore {
       }
       throw err;
     }
-    await Promise.all([this.refresh().catch(() => undefined), this.refreshHosts().catch(() => undefined)]);
+    // c-reconnfu gate 7: the trailing REST bootstrap must NOT decide the
+    // resume outcome. Under gate load the follow socket can be open and
+    // streaming while the /v1/instances list read is slow/fails; rejecting
+    // (or succeeding) here only certifies/denies the LINK via the machine —
+    // a failed list read is not a dead follow (the socket's frame watchdog
+    // and close own that), and a successful read does not certify live.
+    // Treating it as either flapped the machine offline↔recovering on every
+    // resume while the restored page's follow was otherwise healthy.
+    void Promise.all([this.refresh().catch(() => undefined), this.refreshHosts().catch(() => undefined)]);
   }
 
   /**

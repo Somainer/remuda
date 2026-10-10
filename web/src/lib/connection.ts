@@ -4,15 +4,16 @@
  *
  * States (hub-resilience §5.2, client names):
  *  - live: follow socket open and a frame received within LIVE_FRAME_MS.
- *  - stale: socket open but silent past LIVE_FRAME_MS, or one REST probe
- *    timeout. No banner; the top dot only.
+ *  - stale: socket open but silent past LIVE_FRAME_MS, one REST probe
+ *    timeout, OR a resume whose follow could not open while REST stayed
+ *    reachable. No banner; the top dot only; REST drives delivery.
  *  - offline: socket closed, navigator offline, or a reconnect attempt
- *    failed. Banner; writes go to the outbox.
+ *    failed with REST also unreachable. Banner; writes go to the outbox.
  *  - recovering: a reconnect is open and its seq catch-up / outbox flush is
  *    running. A watchdog guarantees it can never stay here.
  *
- * The machine never lies: a failed catch-up ends in offline, never a forced
- * "live" (the bug this replaces). Every state has an exit.
+ * The machine never lies: a failed catch-up ends in stale/offline, never a
+ * forced "live" (the bug this replaces). Every state has an exit.
  */
 
 export type ConnectionState = "live" | "stale" | "offline" | "recovering";
@@ -197,19 +198,7 @@ export class ConnectionMachine {
           // OPEN but silent: stale, then the same probe/offline dance the
           // frame watchdog runs (REST reachable triggers reopen+catch-up).
           this.setState("stale");
-          this.timers.set(
-            "probe",
-            this.schedule(() => {
-              if (this.state !== "stale") return;
-              void this.deps.probe().then((ok) => this.dispatch({ type: "probe", ok }));
-            }, REST_PROBE_MS),
-          );
-          this.timers.set(
-            "offline",
-            this.schedule(() => {
-              if (this.state === "stale") this.goOfflineAndSchedule();
-            }, STALE_TO_OFFLINE_MS),
-          );
+          this.armStaleProbeTimers();
         } else {
           this.beginResume();
         }
@@ -300,7 +289,15 @@ export class ConnectionMachine {
           this.setState("live");
           this.armFrameWatchdog();
         } else {
-          this.goOfflineAndSchedule();
+          // The follow could not open (refused/timeout — under load Chrome
+          // may block the loopback WS upgrade while HTTP to the same origin
+          // still works). Probe REST before deciding: when REST is reachable
+          // settle at quiet STALE instead of loud offline. REST delivery and
+          // the bounded catch-up keep the UI honest and current, no banner,
+          // no socket storm; the stale probe path retries the follow
+          // periodically and a foreground resume retries immediately. A
+          // genuinely unreachable Hub stays offline.
+          this.settleResumeFailureViaProbe();
         }
         // Bind match is defence in depth: noteBinding retires a superseded
         // attempt before its completion can arrive, so only a current-binding
@@ -334,22 +331,56 @@ export class ConnectionMachine {
         if (this.state !== "live") return;
         this.setState("stale");
         // One REST probe decides whether the socket is silently dead.
-        this.timers.set(
-          "probe",
-          this.schedule(() => {
-            if (this.state !== "stale") return;
-            void this.deps.probe().then((ok) => this.dispatch({ type: "probe", ok }));
-          }, REST_PROBE_MS),
-        );
-        // No frame for another window: offline regardless of the probe.
-        this.timers.set(
-          "offline",
-          this.schedule(() => {
-            if (this.state === "stale") this.goOfflineAndSchedule();
-          }, STALE_TO_OFFLINE_MS),
-        );
+        this.armStaleProbeTimers();
       }, LIVE_FRAME_MS),
     );
+  }
+
+  /**
+   * The quiet-state retry timers: probe REST, reopening the follow when it
+   * answers, and giving up to loud offline after a window without a probe.
+   */
+  private armStaleProbeTimers() {
+    this.timers.set(
+      "probe",
+      this.schedule(() => {
+        if (this.state !== "stale") return;
+        void this.deps.probe().then((ok) => this.dispatch({ type: "probe", ok }));
+      }, REST_PROBE_MS),
+    );
+    this.timers.set(
+      "offline",
+      this.schedule(() => {
+        if (this.state === "stale") this.goOfflineAndSchedule();
+      }, STALE_TO_OFFLINE_MS),
+    );
+  }
+
+  /**
+   * Decide the aftermath of a resume that could not open the follow socket.
+   * Restores stay in `recovering` (banner) only for the probe's own duration;
+   * REST reachable settles quiet at stale, otherwise loud offline.
+   */
+  private settleResumeFailureViaProbe() {
+    void this.deps
+      .probe()
+      .then((ok) => {
+        // A newer attempt / a frame / a user action may already own the state.
+        if (this.resumeInFlight) return;
+        if (this.state !== "recovering" && this.state !== "stale") return;
+        if (ok) {
+          this.attempt = 0;
+          this.setState("stale");
+          this.armStaleProbeTimers();
+        } else {
+          this.goOfflineAndSchedule();
+        }
+      })
+      .catch(() => {
+        if (!this.resumeInFlight && this.state === "recovering") {
+          this.goOfflineAndSchedule();
+        }
+      });
   }
 
   private goOffline() {
@@ -529,7 +560,9 @@ export class ConnectionMachine {
         }
         this.resumeInFlight = false;
         this.attempt += 1;
-        this.goOfflineAndSchedule();
+        // Same REST-reachable-but-follow-blocked decision as a rejected resume
+        // action: settle quiet at stale (no banner, no storm) when REST works.
+        this.settleResumeFailureViaProbe();
         this.deps.onAttemptFinish?.({ gen, attemptId, why: "watchdog" });
       }, RECOVERING_WATCHDOG_MS),
     );

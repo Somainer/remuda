@@ -5,6 +5,7 @@ import {
   MAX_BACKOFF_MS,
   RECOVERING_WATCHDOG_MS,
   STALE_TO_OFFLINE_MS,
+  REST_PROBE_MS,
 } from "./connection";
 
 function fakeTimers() {
@@ -126,18 +127,34 @@ describe("ConnectionMachine", () => {
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
-  it("a failed resume returns to offline, never stays recovering; next success heals", async () => {
+  it("GATE7: a failed resume with REST reachable settles quiet at stale; a later success heals", async () => {
     const { machine, isFollowLive } = setupTracked();
     isFollowLive.mockReturnValue(false);
     machine.startLive();
     machine.dispatch({ type: "close" });
     machine.dispatch({ type: "resume" });
     expect(machine.state).toBe("recovering");
+    // probe() resolves true by default: follow blocked but REST works → stale.
     machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
-    expect(machine.state).toBe("offline");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
     machine.dispatch({ type: "resume" });
     machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 2 });
     expect(machine.state).toBe("live");
+  });
+
+  it("a failed resume with REST unreachable returns to loud offline", async () => {
+    const { machine, isFollowLive, probe } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    probe.mockResolvedValue(false);
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("offline");
   });
 
   it("GATE7: a failed resume ACTION stays live when its follow socket is already frame-certified", async () => {
@@ -193,17 +210,29 @@ describe("ConnectionMachine", () => {
     expect(resume).not.toHaveBeenCalled();
   });
 
-  it("the recovering watchdog forces offline if resume hangs", () => {
-    const { clock, machine, isFollowLive } = setupTracked();
+  it("GATE7: the recovering watchdog with REST reachable settles quiet stale; a dead Hub stays offline", async () => {
+    const { clock, machine, isFollowLive, probe } = setupTracked();
     isFollowLive.mockReturnValue(false);
     machine.startLive();
     machine.dispatch({ type: "close" });
     machine.dispatch({ type: "resume" });
     expect(machine.state).toBe("recovering");
     clock.advance(RECOVERING_WATCHDOG_MS);
-    expect(machine.state).toBe("offline");
+    // probe() resolves true by default: REST reachable → quiet stale.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
     // A late response after the watchdog must not resurrect the attempt.
     machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 1 });
+    expect(machine.state).toBe("stale");
+
+    // REST gone too → loud offline.
+    probe.mockResolvedValue(false);
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    await Promise.resolve();
+    await Promise.resolve();
     expect(machine.state).toBe("offline");
   });
 
@@ -212,8 +241,9 @@ describe("ConnectionMachine", () => {
     // while B is still pending, then B fails. A's completion must be dropped
     // (it is not the current attempt) and B's failure must land offline —
     // never a false live certified by the dead attempt A.
-    const { clock, machine, resume, isFollowLive } = setupTracked();
+    const { clock, machine, resume, isFollowLive, probe } = setupTracked();
     isFollowLive.mockReturnValue(false);
+    probe.mockResolvedValue(false); // genuinely unreachable: failures land offline
     let resolveA: () => void = () => {};
     let rejectB: (err: Error) => void = () => {};
     resume
@@ -235,8 +265,10 @@ describe("ConnectionMachine", () => {
     clock.advance(250);
     expect(machine.state).toBe("recovering");
     expect(resume).toHaveBeenCalledTimes(1);
-    // A hangs past the watchdog: offline, reconnect scheduled.
+    // A hangs past the watchdog; REST is down too → offline (probe settles).
     clock.advance(RECOVERING_WATCHDOG_MS);
+    await Promise.resolve();
+    await Promise.resolve();
     expect(machine.state).toBe("offline");
     // Watchdog bumped the attempt to 2: backoff is 1000 ms (cap 2_000 * 0.5).
     clock.advance(1_000);
@@ -252,9 +284,7 @@ describe("ConnectionMachine", () => {
 
     // B then fails: the machine goes offline, never live.
     rejectB(new Error("follow reopen failed"));
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(machine.state).toBe("offline");
+    await vi.waitFor(() => expect(machine.state).toBe("offline"));
   });
 
   it("hiding the page cancels the offline reconnect clock", () => {
@@ -361,18 +391,23 @@ describe("ConnectionMachine", () => {
     expect(machine.state).toBe("stale");
   });
 
-  it("followAttempt: an initial journal seed is recovering immediately; failure goes offline and retries", () => {
+  it("GATE7: an initial journal seed failure with REST reachable settles stale and the probe retries the follow", async () => {
     const { clock, machine, resume, isFollowLive } = setupTracked();
     isFollowLive.mockReturnValue(false);
     machine.bootstrapLive();
     const id = machine.followAttemptBegin();
     expect(machine.state).toBe("recovering");
 
-    // The seed fails: offline + reconnect clock armed (no false live).
+    // The seed fails but REST answers: quiet stale (no loud offline banner),
+    // not a false live.
     machine.followAttemptEnd(false, id);
-    expect(machine.state).toBe("offline");
-    // armResumeAttempt bumped the attempt to 1: backoff is 500 ms.
-    clock.advance(500);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    // The stale probe (15 s) reopens the follow (probe resolves async).
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve();
+    await Promise.resolve();
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
@@ -389,16 +424,18 @@ describe("ConnectionMachine", () => {
     expect(machine.state).toBe("stale");
   });
 
-  it("followAttempt: a hung seed is forced offline by the watchdog", () => {
+  it("GATE7: a hung seed watchdog with REST reachable settles stale; a late completion stays stale", async () => {
     const { clock, machine, isFollowLive } = setupTracked();
     isFollowLive.mockReturnValue(false);
     machine.bootstrapLive();
     const id = machine.followAttemptBegin();
     clock.advance(RECOVERING_WATCHDOG_MS);
-    expect(machine.state).toBe("offline");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
     // A late seed completion must not certify live.
     machine.followAttemptEnd(true, id);
-    expect(machine.state).toBe("offline");
+    expect(machine.state).toBe("stale");
   });
 
   it("followAttempt: nested in a resume shares its slot and id, never double-watchdogs", () => {
@@ -548,13 +585,15 @@ describe("ConnectionMachine", () => {
     expect(onAttemptFinish).toHaveBeenCalledWith({ gen: 3, attemptId: id2, why: "failed" });
   });
 
-  it("gate6 item2: the watchdog reports why=watchdog for a hung current-binding attempt", () => {
+  it("gate6 item2: the watchdog reports why=watchdog for a hung current-binding attempt (settles stale when REST answers)", async () => {
     const { clock, machine, onAttemptFinish } = setupTracked();
     machine.bootstrapLive();
     machine.noteBinding(1);
     const id = machine.followAttemptBegin(1);
     clock.advance(RECOVERING_WATCHDOG_MS);
-    expect(machine.state).toBe("offline");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
     expect(onAttemptFinish).toHaveBeenCalledWith({ gen: 1, attemptId: id, why: "watchdog" });
   });
 

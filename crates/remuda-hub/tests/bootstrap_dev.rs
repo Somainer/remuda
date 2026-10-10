@@ -93,6 +93,23 @@ fn backdate_mtime(path: &Path) {
         .expect("utimensat backdates the access-code file");
 }
 
+/// Set a path's atime+mtime one day in the FUTURE (Unix only), modelling clock
+/// skew or a restored tree carrying a timestamp ahead of the hub clock.
+#[cfg(unix)]
+fn future_mtime(path: &Path) {
+    use nix::sys::stat::{UtimensatFlags, utimensat};
+    use nix::sys::time::TimeSpec;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+        + 86_400;
+    let ts = TimeSpec::new(secs, 0);
+    utimensat(None, path, &ts, &ts, UtimensatFlags::FollowSymlink)
+        .expect("utimensat postdates the access-code file");
+}
+
 fn explicit_file_config(hub_data: PathBuf, code_file: PathBuf, code: &str) -> HubConfig {
     HubConfig {
         bootstrap_token: code.to_owned(),
@@ -494,5 +511,71 @@ async fn rotate_bootstrap_honours_dev_hub_layout() -> Result<()> {
     assert_eq!(stored.trim(), new);
     // The OUTER dir must NOT have received a token.
     assert!(!outer.path().join("bootstrap-token").exists());
+    Ok(())
+}
+
+/// Round 7 item 4: an access file with a FUTURE mtime (clock skew / restored
+/// tree) must not re-stamp an expired bootstrap on restart — neither the first
+/// restart nor the second. The expired login stays refused and the stamp bytes
+/// never move; a genuine same-time touch is what re-issues.
+#[cfg(unix)]
+#[tokio::test]
+async fn future_dated_access_file_does_not_restamp_across_restarts() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    let code_file = outer.path().join("access-code");
+    const CODE: &str = "explicit-file-code-at-least-sixteen";
+    write_code_file(&code_file, CODE)?;
+
+    // First start: the explicit file persists the code and a fresh stamp.
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            CODE,
+        ))
+        .await?;
+        login(hub.addr, CODE).await?;
+        hub.shutdown().await;
+    }
+
+    // Expire the stamp and give the file a future mtime WITHOUT changing its
+    // content (no code change).
+    std::fs::write(hub_data.join("bootstrap-issued-at"), EXPIRED_STAMP)?;
+    future_mtime(&code_file);
+    let expired_bytes = std::fs::read(hub_data.join("bootstrap-issued-at"))?;
+
+    for restart in 1..=2 {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            CODE,
+        ))
+        .await?;
+        let status = login_status(hub.addr, CODE).await?;
+        assert_eq!(
+            status, 401,
+            "restart {restart}: the future mtime must not revive the code"
+        );
+        let stamp = std::fs::read(hub_data.join("bootstrap-issued-at"))?;
+        assert_eq!(
+            stamp, expired_bytes,
+            "restart {restart}: a future-dated file must never re-stamp"
+        );
+        hub.shutdown().await;
+    }
+
+    // A genuine redeploy touch (mtime = now) re-issues the stamp once.
+    write_code_file(&code_file, CODE)?;
+    let hub = spawn(explicit_file_config(
+        hub_data.clone(),
+        code_file.clone(),
+        CODE,
+    ))
+    .await?;
+    login(hub.addr, CODE).await?;
+    let stamp = std::fs::read(hub_data.join("bootstrap-issued-at"))?;
+    assert_ne!(stamp, expired_bytes, "a real touch re-stamps");
+    hub.shutdown().await;
     Ok(())
 }

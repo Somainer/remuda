@@ -397,7 +397,16 @@ fn file_mtime_newer_than_stamp(file: &Path, stamp: &Path) -> Result<bool, HubErr
     let Ok(modified) = meta.modified() else {
         return Ok(false);
     };
-    Ok(time::OffsetDateTime::from(modified) > parsed)
+    let modified = time::OffsetDateTime::from(modified);
+    // c-bootstrap-dev r7 item 4: a FUTURE mtime is clock skew / a restored
+    // tree, not evidence of a redeploy. Clamping it to "now" is not enough on
+    // its own (now is always newer than the stored stamp, so that would
+    // re-stamp on EVERY restart): a touch only counts when it lies in the
+    // observable interval (stamp, now]. A future-dated file therefore keeps the
+    // stored issued-at until real time actually passes its mtime; the code
+    // change check still re-stamps a changed content independently.
+    let now = time::OffsetDateTime::now_utc();
+    Ok(modified <= now && modified > parsed)
 }
 
 /// Commit the post-bind adoption of provenance. Called only when
@@ -941,6 +950,66 @@ mod tests {
         let after = std::fs::read(dir.path().join("bootstrap-issued-at")).expect("read stamp");
         assert_ne!(after, stamp_bytes, "a newer-than-stamp file must re-stamp");
         assert!(bootstrap_within_ttl(dir.path(), 24));
+    }
+
+    /// Round 7 item 4: a FUTURE-dated access-file mtime (clock skew, a
+    /// `cp -r`/restore carrying a timestamp ahead of the hub clock) must not
+    /// re-stamp the bootstrap on every restart. The touch rule only accepts an
+    /// mtime in the interval (stamp, now]; a future value is ignored, so the
+    /// expired stamp stays expired and a fresh stamp stays byte-identical
+    /// across restarts.
+    #[cfg(unix)]
+    #[test]
+    fn future_dated_access_file_mtime_never_restamps() {
+        let dir = tempfile::tempdir().expect("data dir");
+        // (1) An EXPIRED stamp plus a future file: the code stays expired
+        //     instead of being revived.
+        let expired_bytes = expired_token_setup(dir.path(), "same-code");
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "same-code").expect("code file");
+        let future = time::OffsetDateTime::now_utc().unix_timestamp() + 86_400;
+        set_mtime(&code_file, future, 0);
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file.clone());
+        resolve_bootstrap(&mut config).expect("resolve restart 1");
+        let stamp_path = dir.path().join("bootstrap-issued-at");
+        assert_eq!(
+            std::fs::read(&stamp_path).unwrap(),
+            expired_bytes,
+            "a future mtime must not revive an expired stamp"
+        );
+        assert!(!bootstrap_within_ttl(dir.path(), 24));
+
+        // Restart 2 leaves the exact same bytes — no perpetual re-stamp.
+        resolve_bootstrap(&mut config).expect("resolve restart 2");
+        assert_eq!(
+            std::fs::read(&stamp_path).unwrap(),
+            expired_bytes,
+            "the future-dated file must not re-stamp on any restart"
+        );
+
+        // (2) A genuine touch in the observable past (now, second resolution)
+        // still re-stamps once and then settles.
+        set_mtime(
+            &code_file,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+            0,
+        );
+        resolve_bootstrap(&mut config).expect("resolve after real touch");
+        let stamped = std::fs::read(&stamp_path).unwrap();
+        assert_ne!(stamped, expired_bytes, "a real touch re-stamps");
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+        // Future-date it again after the fresh stamp: the fresh stamp must
+        // survive the next restart byte-for-byte.
+        set_mtime(&code_file, future + 10, 0);
+        resolve_bootstrap(&mut config).expect("resolve restart 3");
+        assert_eq!(
+            std::fs::read(&stamp_path).unwrap(),
+            stamped,
+            "a future mtime never overwrites a freshly issued stamp"
+        );
     }
 
     /// Item 2: a no-source start that finds the explicit marker defers marker

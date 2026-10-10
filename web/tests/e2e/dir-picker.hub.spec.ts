@@ -26,13 +26,18 @@ test.skip(
   "set HUB_E2E_DIR_PICKER=1 for the c-dirpicker harness",
 );
 
-/// The fixture root AS THE NODE REPORTS IT, read once from a real
-/// `host.dirs.list` response (round 6 item 6). Never recompute it with a
-/// platform guess like `/private/tmp`: every path the spec sends — browsing,
-/// register fallback, cleanup DELETE — uses these exact bytes.
+/// The fixture root AS THE NODE REPORTS IT, read exactly ONCE per run from a
+/// real `host.dirs.list` response (round 6 item 6; r9 item 4) and reused by
+/// every call site. Never recompute it with a platform guess like
+/// `/private/tmp`, and never refetch: browsing, the register fallback and
+/// the cleanup DELETEs all use these same bytes.
+let cachedFixtureRoot: string | null = null;
+
 async function fixtureRoot(page: Page, host: string): Promise<string> {
+  if (cachedFixtureRoot !== null) return cachedFixtureRoot;
   const listing = await apiJson<{ path: string }>(page, "GET", `/v1/hosts/${host}/dirs`);
   if (!listing.path) throw new Error("fixture host.dirs.list returned no path");
+  cachedFixtureRoot = listing.path;
   return listing.path;
 }
 

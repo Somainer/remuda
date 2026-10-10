@@ -280,17 +280,20 @@ function effortLifecycleStatus(status: unknown):
 
 /**
  * Map a lifecycle word onto the two request axes. The driver (D-056) journals
- * the level word (`max`), an ultracode word (`ultracode`,
- * `ultracode:on` / `ultracode:off`), or a legacy coupled `xhigh+flag` form.
- * Only axes the word actually names are returned, so a stale lifecycle for a
- * replaced request can never match the new one.
+ * the level word (`max`), the coupled bare word (`ultracode`), or the
+ * decoupled toggle word (`ultracode on` / `ultracode off` — space form, the
+ * actual command; legacy `:`/`-` separators accepted too). Only axes the word
+ * actually names are returned, so a stale lifecycle for a replaced request
+ * can never match the new one.
  */
 function effortLifecycleRequest(word: string): EffortLifecycleRequest {
-  const normalized = word.trim().toLowerCase();
-  if (normalized === "ultracode" || normalized === "ultracode:on" || normalized === "ultracode-on") {
+  // Normalize the toggle spelling: "ultracode on/off" with any single
+  // separator (the command itself uses a space) → "ultracode:on|off".
+  const normalized = word.trim().toLowerCase().replace(/^ultracode[\s:_-]+(on|off)$/, "ultracode:$1");
+  if (normalized === "ultracode" || normalized === "ultracode:on") {
     return { ultracode: true };
   }
-  if (normalized === "ultracode:off" || normalized === "ultracode-off") {
+  if (normalized === "ultracode:off") {
     return { ultracode: false };
   }
   return { name: normalized };

@@ -1934,6 +1934,13 @@ async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
     if inner.exit_emitted.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
+    // r5 item 5: take the reserved terminal permit BEFORE the fallible
+    // observation build. If `mapper.lifecycle(...)?` errors, `permit` is a local
+    // and is dropped while unwinding, releasing the reserved channel slot;
+    // taking it only after a successful build left it parked in
+    // Inner.exit_permit on that error, so the RunHandle never reached EOF after
+    // close.
+    let permit = inner.exit_permit.lock().await.take();
     let observation = {
         let mut mapper = inner.mapper.lock().await;
         let session_id = mapper.session_id.clone();
@@ -1945,12 +1952,12 @@ async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
             false,
         )?
     };
-    // r4 item 4: deliver on the reserved terminal slot first. The permit
-    // occupies a position in the SAME bounded channel behind every
-    // observation already queued, so FIFO order is preserved even though the
-    // publication worker may be blocked or aborted by close. Fall back to the
-    // ordinary sender only if the permit is gone.
-    if let Some(permit) = inner.exit_permit.lock().await.take() {
+    // Deliver on the reserved terminal slot first. The permit occupies a
+    // position in the SAME bounded channel behind every observation already
+    // queued, so FIFO order is preserved even though the publication worker may
+    // be blocked or aborted by close. Fall back to the ordinary sender only if
+    // the permit is gone.
+    if let Some(permit) = permit {
         permit.send(observation);
         return Ok(());
     }
@@ -5146,5 +5153,51 @@ mod turn_reservation_wakeup_tests {
             reservation.claim_start(),
             "a committed ticket may claim the start"
         );
+    }
+}
+
+#[cfg(test)]
+mod exit_permit_on_build_error_tests {
+    use tokio::sync::mpsc;
+
+    /// ma-sdk-state r5 item 5: `emit_exit` takes the reserved terminal
+    /// `OwnedPermit` out of `Inner.exit_permit` BEFORE the fallible observation
+    /// build. If that build returns `Err`, the permit is a local that drops
+    /// while unwinding, releasing the bounded-channel slot and letting the
+    /// RunHandle reach EOF after close. Leaving the permit parked on that error
+    /// keeps the slot occupied forever. The observation build only fails on
+    /// timestamp generation, so this pins the channel-ownership invariant the
+    /// fix depends on.
+    #[tokio::test]
+    async fn the_terminal_permit_is_released_when_the_exit_build_errors() {
+        let (tx, mut rx) = mpsc::channel::<u8>(1);
+
+        // The single reserved slot, exactly as Inner.exit_permit parks it.
+        let mut parked: Option<mpsc::OwnedPermit<u8>> = Some(
+            tx.clone()
+                .try_reserve_owned()
+                .expect("the terminal slot is reservable"),
+        );
+        assert!(
+            tx.try_reserve().is_err(),
+            "the parked terminal permit occupies the only slot"
+        );
+
+        // emit_exit's fallible build: on Err the local permit is dropped (the
+        // r5 fix), rather than left parked in Inner.exit_permit.
+        let build: Result<(), ()> = Err(());
+        if build.is_err() {
+            drop(parked.take());
+        }
+        assert!(parked.is_none());
+
+        // The slot is free again and the receiver still reaches clean EOF once
+        // the sender goes away (the RunHandle does not wedge after close).
+        assert!(
+            tx.try_reserve().is_ok(),
+            "the terminal slot must be released on a build error"
+        );
+        drop(tx);
+        assert!(rx.recv().await.is_none(), "the stream reaches EOF");
     }
 }

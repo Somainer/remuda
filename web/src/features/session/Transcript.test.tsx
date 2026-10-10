@@ -2730,6 +2730,29 @@ describe("load-earlier anchor lifecycle round 5", () => {
       await expectGrowthHolds(geo);
     });
 
+    it("a slow page (>5s after the key press) still lands the retargeted turn at the top", async () => {
+      const { user, geo, g, writes, older } = setup("insJSlow");
+      await user.click(screen.getByTestId("load-earlier"));
+      await user.keyboard("jj");
+      geo.setTotal(150);
+      // The bounded read resolves more than PREPEND_SETTLE_DEADLINE_MS (5s)
+      // after the key press. The retarget's settle deadline is stamped only on
+      // the first post-landing commit (deadline: 0), so the hold must not
+      // expire before the page even lands.
+      const clockSpy = vi.spyOn(Date, "now");
+      const baseNow = Date.now();
+      clockSpy.mockImplementation(() => baseNow + 6_000);
+      await land(geo, g, older);
+      clockSpy.mockRestore();
+      expect(writes).not.toContain(100 * ROW);
+      await geo.nextFrame();
+      await act(async () => {});
+      expect(
+        nodeTop(geo, "n_1002_assistant_insJSlow"),
+        "a slow page made the retargeted hold expire before landing",
+      ).toBe(0);
+    });
+
     it("跳到最新 during the fetch cancels the restore and keeps the tail pinned", async () => {
       const { user, geo, g, writes, older } = setup("insLatest");
       await user.click(screen.getByTestId("load-earlier"));

@@ -1388,7 +1388,13 @@ function TranscriptInner({
         offset: 0,
         tries: 0,
         corrections: 0,
-        deadline: Date.now() + PREPEND_SETTLE_DEADLINE_MS,
+        // Stamped on the first POST-LANDING commit, like the click path: the
+        // deadline starts when the page actually lands, not at navigation time.
+        // A page that resolves >PREPEND_SETTLE_DEADLINE_MS after the key press
+        // would otherwise have the repin effect see Date.now() >= deadline,
+        // release the same-request restore pending, and skip the retarget —
+        // landing the reader a page older than the turn they chose.
+        deadline: 0,
         armedIndex: destIndex,
         reqId: req.reqId,
         prevNodes,

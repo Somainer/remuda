@@ -26,6 +26,13 @@ export async function useAccessCode(page: Page) {
 }
 
 export async function login(page: Page, name = "e2e-browser") {
+  // Enable the window.__*Lab test seams BEFORE any document script runs
+  // (c-composerpop r2 item 4): production never sets this marker, so the
+  // seams stay uninstalled there. Registered before the first goto so it is
+  // present on /login and every later navigation in this page.
+  await page.addInitScript((flag) => {
+    (window as unknown as Record<string, unknown>)[flag] = true;
+  }, "__remudaE2E");
   await page.goto("/login");
   // The first SPA render after goto can miss the 5 s expect default under gate
   // load; match the generous post-submit waits below.

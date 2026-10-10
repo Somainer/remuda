@@ -1,11 +1,13 @@
 //! Real local Git refs, worktrees and pushes; only gate executables are stubbed.
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -52,6 +54,7 @@ struct Repo {
     source: PathBuf,
     stub: PathBuf,
     trace: PathBuf,
+    tmp: PathBuf,
     base: String,
     branch_commit: String,
 }
@@ -66,6 +69,10 @@ impl Repo {
         let source = parent.join("source worktree");
         let stub = parent.join("gate stub.py");
         let trace = parent.join("trace.jsonl");
+        // Private TMPDIR for every merge child so its remuda-mq-* scratch roots
+        // can never share a temp directory with another test or a real gate.
+        let tmp = parent.join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
         fs::create_dir_all(root.join("scripts/ci")).unwrap();
         fs::create_dir_all(root.join("web/src/lib")).unwrap();
         fs::create_dir_all(&origin).unwrap();
@@ -147,6 +154,7 @@ impl Repo {
             source,
             stub,
             trace,
+            tmp,
             base,
             branch_commit,
         }
@@ -158,6 +166,10 @@ impl Repo {
             .current_dir(&self.root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("TMPDIR", &self.tmp)
+            .env_remove("HUB_E2E_LISTEN")
+            .env_remove("HUB_E2E_WEB_PORT")
+            .env_remove("HUB_E2E_UPSTREAM_LISTEN")
             .env("REMUDA_MERGE_GATE_COMMAND", &self.stub)
             .env("REMUDA_TEST_GATE_TRACE", &self.trace)
             // Merge must ignore the worker's inherited Cargo target.
@@ -216,7 +228,39 @@ impl Repo {
             "merge created scratch inside the repo: {:?}",
             self.root.join("data")
         );
+        assert_no_scratch_leftovers(&self.tmp);
     }
+}
+
+/// Assert a TMPDIR holds no leftover `remuda-mq-*` scratch root.
+fn assert_no_scratch_leftovers(tmp: &Path) {
+    let leftovers: Vec<_> = fs::read_dir(tmp)
+        .unwrap_or_else(|error| panic!("read {tmp:?}: {error}"))
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("remuda-mq-")
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "scratch roots leaked in {tmp:?}: {leftovers:?}"
+    );
+}
+
+/// Snapshot the `remuda-mq-*` names directly under the ambient temp dir.
+fn ambient_scratch_names() -> BTreeSet<String> {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("remuda-mq-"))
+        .collect()
 }
 
 fn step<'a>(report: &'a Value, name: &str) -> &'a Value {
@@ -306,6 +350,7 @@ fn docs_only_gate_skips_tests_but_keeps_the_other_rust_checks() {
     for name in [
         "secret-scan",
         "no-tunnel-scan",
+        "no-host-wide-kills",
         "cargo-fmt",
         "cargo-check",
         "cargo-clippy",
@@ -358,6 +403,7 @@ fn merge_pushes_verified_no_ff_commit_and_preserves_worker_edits() {
         [
             "secret-scan",
             "no-tunnel-scan",
+            "no-host-wide-kills",
             "cargo-fmt",
             "cargo-check",
             "cargo-clippy",
@@ -370,9 +416,10 @@ fn merge_pushes_verified_no_ff_commit_and_preserves_worker_edits() {
             .iter()
             .all(|event| event["target"] == repo.root.join("target-gate").to_str().unwrap())
     );
-    // The gate worktree lives under an OS-temp remuda-mq-* scratch root,
-    // never inside the repository checkout.
-    let scratch_prefix = std::env::temp_dir().canonicalize().unwrap();
+    // The gate worktree lives under the fixture's isolated TMPDIR in an
+    // OS-temp remuda-mq-* scratch root, never in the ambient temp dir or in
+    // the repository checkout.
+    let scratch_prefix = repo.tmp.canonicalize().unwrap();
     assert!(trace.iter().all(|event| {
         let cwd = Path::new(event["cwd"].as_str().unwrap());
         cwd.starts_with(&scratch_prefix)
@@ -416,6 +463,7 @@ fn test_retry_is_reported_once_and_forced_web_runs_in_web_directory_without_push
         [
             "secret-scan",
             "no-tunnel-scan",
+            "no-host-wide-kills",
             "cargo-fmt",
             "cargo-check",
             "cargo-clippy",
@@ -433,11 +481,11 @@ fn test_retry_is_reported_once_and_forced_web_runs_in_web_directory_without_push
             .all(|event| event["target"] == repo.root.join("chosen-target").to_str().unwrap())
     );
     assert!(
-        trace[7..10]
+        trace[8..11]
             .iter()
             .all(|event| Path::new(event["cwd"].as_str().unwrap()).ends_with("worktree/web"))
     );
-    assert!(Path::new(trace[10]["cwd"].as_str().unwrap()).ends_with("worktree"));
+    assert!(Path::new(trace[11]["cwd"].as_str().unwrap()).ends_with("worktree"));
     assert!(trace.iter().all(|event| event["incremental"] == "0"));
     let generated = step(&report, "gen-api-current");
     assert_eq!(
@@ -734,6 +782,86 @@ fn gate_cannot_publish_a_tree_it_mutated() {
 }
 
 #[test]
+fn gate_e2e_ports_prefer_the_flag_and_otherwise_keep_inherited_env() {
+    fn port_trace(
+        repo: &Repo,
+        flags: &[&str],
+        env: &[(&str, &str)],
+    ) -> Vec<(String, String, String)> {
+        let (output, report) = repo.merge(flags, env);
+        assert_exit(&output, &report, 0);
+        repo.trace()
+            .iter()
+            .map(|event| {
+                (
+                    event["hubListen"].as_str().unwrap().to_owned(),
+                    event["webPort"].as_str().unwrap().to_owned(),
+                    event["upstreamListen"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    // No flag, no env: the documented default block, including the upstream
+    // pair (previously the upstream default 58881 was never exported).
+    let repo = Repo::new();
+    commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let ports = port_trace(&repo, &["--gate", "--no-push"], &[]);
+    assert!(
+        ports
+            .iter()
+            .all(|(hub, web, upstream)| hub == "127.0.0.1:58980"
+                && web == "58989"
+                && upstream == "127.0.0.1:58981"),
+        "{ports:?}"
+    );
+
+    // No flag but inherited HUB_E2E_*: the merge keeps the inherited values
+    // instead of forcing its defaults.
+    let repo = Repo::new();
+    commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let ports = port_trace(
+        &repo,
+        &["--gate", "--no-push"],
+        &[
+            ("HUB_E2E_LISTEN", "127.0.0.1:59040"),
+            ("HUB_E2E_WEB_PORT", "59049"),
+            ("HUB_E2E_UPSTREAM_LISTEN", "127.0.0.1:59041"),
+        ],
+    );
+    assert!(
+        ports
+            .iter()
+            .all(|(hub, web, upstream)| hub == "127.0.0.1:59040"
+                && web == "59049"
+                && upstream == "127.0.0.1:59041"),
+        "{ports:?}"
+    );
+
+    // The explicit flag wins over every inherited value and derives the
+    // whole lane block from it.
+    let repo = Repo::new();
+    commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let ports = port_trace(
+        &repo,
+        &["--gate", "--no-push", "--e2e-port-base", "59100"],
+        &[
+            ("HUB_E2E_LISTEN", "127.0.0.1:59040"),
+            ("HUB_E2E_WEB_PORT", "59049"),
+            ("HUB_E2E_UPSTREAM_LISTEN", "127.0.0.1:59041"),
+        ],
+    );
+    assert!(
+        ports
+            .iter()
+            .all(|(hub, web, upstream)| hub == "127.0.0.1:59100"
+                && web == "59109"
+                && upstream == "127.0.0.1:59101"),
+        "{ports:?}"
+    );
+}
+
+#[test]
 fn cleanup_removes_scratch_even_when_temp_dir_is_a_symlink() {
     let repo = Repo::new();
     // Point the merge at a temp root reached through a symlink: create_root
@@ -765,6 +893,57 @@ fn cleanup_removes_scratch_even_when_temp_dir_is_a_symlink() {
         .count();
     assert_eq!(leftovers, 0);
     assert!(!repo.root.join("data").exists());
+}
+
+#[test]
+fn gate_run_creates_no_scratch_root_in_the_ambient_temp_dir() {
+    let repo = Repo::new();
+    commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let child = repo
+        .command()
+        .args(["merge", "topic", "--gate", "--no-push", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+    // Wait until the gate is actually running from its scratch worktree: the
+    // first stub invocation appends a trace event while that worktree exists.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = fs::read_to_string(&repo.trace)
+            && !text.trim().is_empty()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "gate never started");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Two snapshots while the gate runs plus one after it ends. Only
+    // pid-attributed names are checked: the ambient TMPDIR is shared with
+    // other merges, Node gates and queue lanes, so a name this test does not
+    // own is none of its business. The merge always names every scratch root
+    // after its own pid, which alone proves this run wrote nothing ambient.
+    let during_a = ambient_scratch_names();
+    std::thread::sleep(Duration::from_millis(150));
+    let during_b = ambient_scratch_names();
+    let output = child.wait_with_output().unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!("JSON {error}: {}", String::from_utf8_lossy(&output.stderr))
+    });
+    assert_exit(&output, &report, 0);
+    let after = ambient_scratch_names();
+    let owned_by_child = |name: &str| name.starts_with(&format!("remuda-mq-{child_pid}-"));
+    assert!(
+        during_a
+            .iter()
+            .chain(&during_b)
+            .chain(&after)
+            .all(|name| !owned_by_child(name)),
+        "merge child {child_pid} created an ambient scratch root:\na={during_a:?}\nb={during_b:?}\nafter={after:?}"
+    );
+    repo.assert_cleaned();
 }
 
 #[test]

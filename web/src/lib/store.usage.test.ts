@@ -96,3 +96,18 @@ it("hydrates the polled rollup even when the local instance wins the seq merge",
   await hubStore.refresh();
   expect(hubStore.usageRollupOf(instance.id)).toEqual(rollup2);
 });
+
+it("r2 item 4: setUsageRollupForTest is inert without the e2e seam marker", () => {
+  const instance: Instance = mockDb.instances[0];
+  // Production default: no marker on window.
+  (window as unknown as { __remudaE2E?: boolean }).__remudaE2E = undefined;
+  const before = hubStore.usageRollupOf(instance.id);
+  hubStore.setUsageRollupForTest(instance.id, rollup1);
+  expect(hubStore.usageRollupOf(instance.id)).toBe(before);
+
+  // With the explicit e2e marker the seam injects the rollup.
+  window.__remudaE2E = true;
+  hubStore.setUsageRollupForTest(instance.id, rollup1);
+  expect(hubStore.usageRollupOf(instance.id)).toEqual(rollup1);
+  delete window.__remudaE2E;
+});

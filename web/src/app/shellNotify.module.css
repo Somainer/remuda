@@ -17,7 +17,7 @@
 .stack {
   position: fixed;
   /* Unchanged anchor: clear of the phone home bar where one shows. */
-  bottom: calc(var(--phone-nav-h) + var(--safe-bottom) + var(--space-3));
+  bottom: calc(var(--safe-bottom) + var(--space-3));
   left: 50%;
   transform: translateX(-50%);
   display: flex;
@@ -25,7 +25,30 @@
   gap: var(--space-2);
   align-items: center;
   width: min(92vw, 520px);
-  z-index: 30;
+  /* Below popovers/menus/sheets so notifications never cover an open menu. */
+  z-index: var(--z-notify-stack);
+  /* The stack container never swallows pointer events; only standing
+     (blocking) items are interactive. Transient toasts pass clicks through. */
+  pointer-events: none;
+}
+
+/*
+ * c-composerpop r4 item 1: on a session route the dock (composer control bar
+ * with the options trigger, send button and the model/effort/permission
+ * chips) is the bottom-most surface — anchoring only by the home indicator
+ * parks a blocking error ON TOP of those controls, making them unreachable
+ * while the error stands. SessionPage measures its dock and publishes the
+ * height as --session-dock-h (ResizeObserver); lift the stack clear of it.
+ * r5 item 2: the tty view has no session dock — TerminalView measures its
+ * own bottom chrome (local input dock + the phone key bar, + the byte-route
+ * note on desktop) into the same property, so the stack clears the key bar
+ * there too. The shell has no bottom safe-area padding (the dock reaches the
+ * band edge and the phone bar carries the safe-area inset itself), so the
+ * measured height already spans to the bottom. /m uses PhoneShell, which
+ * never stamps data-layout="session", and keeps its anchor.
+ */
+:global([data-layout="session"]) .stack {
+  bottom: calc(var(--session-dock-h, 0px) + var(--space-3));
 }
 
 /* Transient confirmations, above the errors in the same stack. */
@@ -59,6 +82,8 @@
   flex-direction: column;
   gap: var(--space-2);
   width: 100%;
+  /* Standing errors are interactive; the rest of the stack passes through. */
+  pointer-events: auto;
 }
 
 .blockingItem {
@@ -137,6 +162,23 @@
   .dismiss {
     min-height: 44px;
     min-width: 44px;
+  }
+}
+
+/*
+ * The --phone-nav-h offset applies ONLY while the 56px PhoneNav bar is
+ * actually mounted (r3 item 2): Shell stamps data-phone-nav="1" on home-level
+ * compact routes (chrome.phoneNav = mobile && !session), and PhoneShell
+ * always stamps it. A media query alone cannot know the route — on /s/:id at
+ * 390 PhoneNav is not mounted and the extra 56px parked a blocking notice on
+ * top of the composer dock. CSS cannot express that condition either, so the
+ * shell element carries the fact. The base `.stack` rule
+ * (safe-bottom + space-3) therefore holds on /s/* and on desktop.
+ */
+@media (max-width: 767px),
+  (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
+  :global([data-phone-nav="1"]) .stack {
+    bottom: calc(var(--phone-nav-h) + var(--safe-bottom) + var(--space-3));
   }
 }
 

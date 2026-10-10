@@ -205,7 +205,7 @@ async fn worker_listener_auth_matrix() {
     .expect("provision");
     let url = provision.listener.base_url();
     assert_eq!(provision.kind, ApiRouteKind::HubRelay);
-    // lsof-free loopback assertion: the bound address itself is loopback.
+    // Host-tool-free loopback assertion: the bound address itself is loopback.
     assert!(provision.listener.local_addr().ip().is_loopback());
     let bearer = provision.listener.bearer_token();
     assert_eq!(BASE64.decode(bearer.as_bytes()).unwrap().len(), 32);

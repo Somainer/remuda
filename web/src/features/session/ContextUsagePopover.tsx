@@ -37,6 +37,7 @@ export function ContextUsagePopover({
   placement = "down",
   onMouseEnter,
   onMouseLeave,
+  emptyNote,
 }: {
   rollup: UsageRollup;
   mobile: boolean;
@@ -48,6 +49,8 @@ export function ContextUsagePopover({
   placement?: "up" | "down";
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
+  /** Shown when the harness has not reported any usage yet (RC3 empty state). */
+  emptyNote?: string | null;
 }) {
   // The last-turn relative label and the TPM windows age in place; the
   // parent's 2 s instance poll refreshes the numbers, this 1 Hz clock only
@@ -88,6 +91,11 @@ export function ContextUsagePopover({
       </div>
 
       <div data-popover-scroll="1">
+        {emptyNote ? (
+          <div className={css.usageEmptyNote} data-testid="context-usage-empty-note">
+            {emptyNote}
+          </div>
+        ) : null}
         <div className={css.usageSection}>
           <div
             className={css.usageContextLine}

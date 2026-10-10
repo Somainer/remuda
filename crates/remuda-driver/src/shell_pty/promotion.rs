@@ -4147,6 +4147,137 @@ mod tests {
         );
     }
 
+    /// c-effortread r8 item 3 (r5 item 7 regression guard): a real resume
+    /// launch pre-populates `<child config dir>/projects/<slug>/<id>.jsonl`
+    /// with HISTORY and anchors at its end. The spawn must derive the boundary
+    /// from the CHILD config dir (PromoteCtx, the directory the resume target
+    /// resolves through) — never a parent $CLAUDE_CONFIG_DIR. The pre-anchor
+    /// history never publishes; a verdict appended AFTER spawn (bytes past the
+    /// boundary) publishes via the production Hydrator pump. Both pin modes
+    /// share the boundary logic, so this exercises the path for any pin.
+    #[tokio::test]
+    async fn r8_item3_resume_boundary_uses_child_config_dir_and_publishes_only_post_anchor() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        // Two DISTINCT config dirs: the parent driver process's env value,
+        // which must NEVER be used, and the child's resolved directory.
+        let parent_dir = tmp.path().join("parent-driver-config");
+        let child_home = tmp.path().join("child-home");
+        std::fs::create_dir_all(&parent_dir).expect("mkdir");
+        std::fs::create_dir_all(&child_home).expect("mkdir");
+        let session_id = "abcd1234-2222-4333-8444-eeeeeeeeeeee";
+
+        // The resume transcript lives under the CHILD dir only, pre-populated
+        // with history the resumed process must not replay as current.
+        let child_path =
+            crate::claude_transcript::ResumeBoundary::session_path(&child_home, &cwd, session_id);
+        std::fs::create_dir_all(child_path.parent().unwrap()).expect("slug dir");
+        let history = assistant_line(Some("high"), 1);
+        std::fs::write(&child_path, &history).expect("pre-populate history");
+
+        // The parent dir has a same-id file too (simulating leakage): it must
+        // be ignored entirely.
+        let parent_path =
+            crate::claude_transcript::ResumeBoundary::session_path(&parent_dir, &cwd, session_id);
+        std::fs::create_dir_all(parent_path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&parent_path, "PARENT-LEAK\n").expect("parent decoy");
+
+        // 1. Boundary resolves ONLY through the child directory.
+        let child_boundary =
+            crate::claude_transcript::ResumeBoundary::for_resume(&child_home, &cwd, session_id)
+                .expect("child resume snapshot resolves");
+        assert_eq!(
+            child_boundary.start,
+            history.len() as u64,
+            "anchored at end of history"
+        );
+        // Pointing the constructor at the parent pins the regression class:
+        // it would snapshot the WRONG file.
+        let parent_boundary =
+            crate::claude_transcript::ResumeBoundary::for_resume(&parent_dir, &cwd, session_id)
+                .expect("parent decoy exists");
+        assert_ne!(
+            child_boundary.identity, parent_boundary.identity,
+            "child and parent transcript identities must differ"
+        );
+
+        // 1b. A parent-dir boundary's identity differs from the child file:
+        //     a tail on the CHILD path resumed with the parent boundary must
+        //     fail the identity guard. This is the exact regression guard — if
+        //     spawn_at resolved the resume boundary through the parent driver's
+        //     CLAUDE_CONFIG_DIR, the identity mismatches the bound transcript.
+        let parent_tail = TranscriptTail::resumed(parent_path.clone(), parent_boundary);
+        assert!(
+            TranscriptTail::continued(child_path.clone(), parent_tail.anchor().expect("anchor"))
+                .is_none(),
+            "a parent-dir resume boundary must not continue the child transcript (identity mismatch)"
+        );
+
+        // 2. Production hydrator on the child boundary: pre-anchor history
+        //    never publishes on the first pump.
+        let binding = TranscriptBinding {
+            session_id: session_id.to_owned(),
+            path: child_path.clone(),
+            cwd: cwd.clone(),
+            source: crate::claude_transcript::BindingSource::PidFile,
+        };
+        let ctx = PromoteCtx {
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            run_id: RunId::new(),
+            cwd: cwd.clone(),
+            claude_home: child_home.clone(),
+        };
+        let (tx, mut rx) = mpsc::channel(256);
+        let seq = Arc::new(AtomicU64::new(0));
+        let mut hydrator = Hydrator::open(
+            &ctx,
+            &binding,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ResumeMode::Boundary(child_boundary),
+            None,
+        )
+        .expect("hydrator opens on the resume boundary");
+        pump(&mut hydrator, &tx, &seq, &ctx)
+            .await
+            .expect("production pump");
+        let first: Vec<Observation> = {
+            let mut out = Vec::new();
+            while let Ok(observation) = rx.try_recv() {
+                out.push(observation);
+            }
+            out
+        };
+        assert!(
+            !conversation_hydrated(&first, "reply 1"),
+            "the pre-anchor history (reply 1) must never publish as current"
+        );
+
+        // 3. After spawn the agent's verdict appends bytes PAST the boundary;
+        //    those bytes publish (the verified tail drives the chip/gate).
+        append_line(&child_path, &stdout_verdict("Set effort level to max", 2));
+        pump(&mut hydrator, &tx, &seq, &ctx)
+            .await
+            .expect("second production pump");
+        let second: Vec<Observation> = {
+            let mut out = Vec::new();
+            while let Ok(observation) = rx.try_recv() {
+                out.push(observation);
+            }
+            out
+        };
+        assert!(
+            conversation_hydrated(&second, "Set effort level to max"),
+            "the post-spawn verdict publishes through the resume boundary"
+        );
+    }
+
     /// r6 item 3 (the lazy-create case): a fresh launch has no transcript and
     /// no binding yet; the user /resume's an older session before typing. The
     /// session recorded SECOND for the pid is an unverified rebound: the older

@@ -233,6 +233,14 @@ export class ConnectionMachine {
         return;
       case "close":
       case "error":
+        // A resume attempt in flight OWNS the decision for this failure:
+        // `openFollowSocket`'s socket fails to open and rejects the resume
+        // action, whose completion settles via the REST probe. Letting the
+        // socket's own close/error force offline here raced that decision
+        // (offline in tens of ms, before the probe could answer) and stormed
+        // offline↔recovering on every blocked follow upgrade under load
+        // (c-reconnfu gate 7). The resume watchdog (20 s) guarantees an exit.
+        if (this.resumeInFlight) return;
         this.goOfflineAndSchedule();
         return;
       case "online":
@@ -256,10 +264,13 @@ export class ConnectionMachine {
         if (this.state !== "stale") return;
         if (event.ok) {
           // REST reachable is NOT proof the follow stream works: a live
-          // transcript needs the socket. Reopen + catch up (which certifies
-          // live on success) instead of optimistically setting live.
+          // transcript needs the socket. Reopen + catch up — but QUIETLY while
+          // already in stale (REST proven): stay banner-less, success certifies
+          // live on the first frame, a blocked upgrade stays stale (c-reconnfu
+          // gate 7: a loud recovering blip on every periodic reopen kept the
+          // banner mounted under load).
           this.attempt = 0;
-          this.beginResume();
+          this.quietReopen();
         } else {
           this.goOfflineAndSchedule();
         }
@@ -288,15 +299,15 @@ export class ConnectionMachine {
           this.attempt = 0;
           this.setState("live");
           this.armFrameWatchdog();
+        } else if (this.state === "stale") {
+          // This was a QUIET reopen out of a REST-proven stale state (see
+          // quietReopen): REST already answered, so the failed follow re-open
+          // stays quiet stale and the stale probe/offline timers keep
+          // ticking — no loud recovering/offline banner blip.
+          this.attempt = 0;
+          this.armStaleProbeTimers();
         } else {
-          // The follow could not open (refused/timeout — under load Chrome
-          // may block the loopback WS upgrade while HTTP to the same origin
-          // still works). Probe REST before deciding: when REST is reachable
-          // settle at quiet STALE instead of loud offline. REST delivery and
-          // the bounded catch-up keep the UI honest and current, no banner,
-          // no socket storm; the stale probe path retries the follow
-          // periodically and a foreground resume retries immediately. A
-          // genuinely unreachable Hub stays offline.
+          // First failure out of loud recovering: probe REST before deciding.
           this.settleResumeFailureViaProbe();
         }
         // Bind match is defence in depth: noteBinding retires a superseded
@@ -419,6 +430,48 @@ export class ConnectionMachine {
         this.beginResume();
       }, delay),
     );
+  }
+
+  /**
+   * Reopen the follow WITHOUT leaving quiet `stale`: REST is already proven by
+   * the probe that triggered this, so the UI must not show recovering/offline.
+   * A frame certifies live (the resume action resolves ok); a blocked/dead
+   * upgrade rejects and the failure arm keeps stale. The 20 s watchdog still
+   * bounds the attempt.
+   */
+  private quietReopen() {
+    if (this.resumeInFlight) return;
+    const attemptId = this.armResumeAttemptQuiet(this.latestBindGen);
+    void this.deps
+      .resume()
+      .then(() => this.dispatch({ type: "resumeAttempt", ok: true, attemptId }))
+      .catch(() => this.dispatch({ type: "resumeAttempt", ok: false, attemptId }));
+  }
+
+  /** beginResume variant that keeps a REST-proven stale state banner-less. */
+  private armResumeAttemptQuiet(gen: number): number {
+    this.clearTimers("stale", "offline", "probe", "reconnect");
+    // NOTE: no setState("recovering") — stay in quiet stale.
+    this.resumeInFlight = true;
+    this.resumeBindGen = gen;
+    const attemptId = ++this.resumeAttemptId;
+    this.timers.set(
+      "watchdog",
+      this.schedule(() => {
+        if (
+          !this.resumeInFlight ||
+          this.resumeAttemptId !== attemptId ||
+          this.resumeBindGen !== this.latestBindGen
+        ) {
+          return;
+        }
+        this.resumeInFlight = false;
+        this.attempt = 0;
+        this.armStaleProbeTimers();
+        this.deps.onAttemptFinish?.({ gen, attemptId, why: "watchdog" });
+      }, RECOVERING_WATCHDOG_MS),
+    );
+    return attemptId;
   }
 
   private beginResume() {
@@ -560,9 +613,16 @@ export class ConnectionMachine {
         }
         this.resumeInFlight = false;
         this.attempt += 1;
-        // Same REST-reachable-but-follow-blocked decision as a rejected resume
-        // action: settle quiet at stale (no banner, no storm) when REST works.
-        this.settleResumeFailureViaProbe();
+        if (this.state === "stale") {
+          // Quiet reopen watchdog: REST was proven; stay quiet stale.
+          this.attempt = 0;
+          this.armStaleProbeTimers();
+        } else {
+          // Same REST-reachable-but-follow-blocked decision as a rejected
+          // resume action: settle quiet at stale (no banner, no storm) when
+          // REST works.
+          this.settleResumeFailureViaProbe();
+        }
         this.deps.onAttemptFinish?.({ gen, attemptId, why: "watchdog" });
       }, RECOVERING_WATCHDOG_MS),
     );

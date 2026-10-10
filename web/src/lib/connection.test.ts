@@ -127,6 +127,40 @@ describe("ConnectionMachine", () => {
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
+  it("GATE7: a follow close/error while a resume is in flight does not force offline (the resume settles)", async () => {
+    const { machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    // The follow fails to open: its socket error/close arrive, but the resume
+    // attempt owns the outcome — no immediate offline storm.
+    machine.dispatch({ type: "error" });
+    machine.dispatch({ type: "close" });
+    expect(machine.state).toBe("recovering");
+    // Resume action rejects; probe (default true) settles quiet stale.
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+  });
+
+  it("GATE7: a blocked follow upgrade during a quiet stale reopen keeps the machine quiet stale", async () => {
+    const { clock, machine, resume } = setupTracked();
+    resume.mockReturnValue(new Promise<void>(() => {})); // blocked upgrade: never resolves
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // stale
+    clock.advance(REST_PROBE_MS); // probe ok → quiet reopen (stays stale)
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    expect(resume).toHaveBeenCalledTimes(1);
+    // Follow upgrade blocked: failure keeps stale (never recovering/offline).
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    expect(machine.state).toBe("stale");
+  });
+
   it("GATE7: a failed resume with REST reachable settles quiet at stale; a later success heals", async () => {
     const { machine, isFollowLive } = setupTracked();
     isFollowLive.mockReturnValue(false);
@@ -297,7 +331,7 @@ describe("ConnectionMachine", () => {
     expect(machine.state).toBe("offline");
   });
 
-  it("a successful REST probe triggers reopen+catch-up, never a false live", async () => {
+  it("GATE7: a successful REST probe QUIETLY reopens the follow while staying stale, never a false live", async () => {
     const { clock, machine, probe, resume } = setupTracked();
     machine.startLive();
     clock.advance(LIVE_FRAME_MS);
@@ -305,10 +339,13 @@ describe("ConnectionMachine", () => {
     clock.advance(15_000);
     expect(probe).toHaveBeenCalledTimes(1);
     await Promise.resolve();
-    // REST reachable is not live: it forces a resume (socket reopen+catch-up),
-    // which certifies live only on success.
-    expect(machine.state).toBe("recovering");
+    // REST reachable is not live: a follow reopen runs (resume invoked) but the
+    // machine stays QUIET stale while it tries — no recovering banner. Success
+    // certifies live via the resume result/frame, failure returns to stale.
+    expect(machine.state).toBe("stale");
     expect(resume).toHaveBeenCalledTimes(1);
+    machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 1 });
+    expect(machine.state).toBe("live");
   });
 
   it("backoff is full-jitter within the doubling 30 s cap", () => {

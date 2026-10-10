@@ -108,6 +108,10 @@ pub(crate) struct RaceBarriers {
     /// Parks the unregister handler after the forward intent was stamped and
     /// the transport pinned, before the prepare is sent (r11 item 2).
     forward_marked: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks after the pin, before the INSERT (r12 item 1).
+    forward_pinned: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks after the command INSERT, before the mark (r12 item 1).
+    forward_queued: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
 }
 
 impl RaceBarriers {
@@ -117,6 +121,8 @@ impl RaceBarriers {
             RacePhase::Unregister => &self.unregister,
             RacePhase::TaskBind => &self.task_bind,
             RacePhase::ForwardMarked => &self.forward_marked,
+            RacePhase::ForwardPinned => &self.forward_pinned,
+            RacePhase::ForwardQueued => &self.forward_queued,
         };
         table.lock().unwrap().insert(key, slot);
     }
@@ -129,6 +135,8 @@ impl RaceBarriers {
                 RacePhase::Unregister => &self.unregister,
                 RacePhase::TaskBind => &self.task_bind,
                 RacePhase::ForwardMarked => &self.forward_marked,
+                RacePhase::ForwardPinned => &self.forward_pinned,
+                RacePhase::ForwardQueued => &self.forward_queued,
             };
             table
                 .lock()
@@ -154,6 +162,10 @@ pub(crate) enum RacePhase {
     /// the mark-then-resolve ordering this replaces had not, so a hello that
     /// lands during the park moves only the new code's pin nowhere.
     ForwardMarked,
+    /// Parks after the transport pin, before the command INSERT (r12 item 1).
+    ForwardPinned,
+    /// Parks between the command INSERT and mark_forward_intent (r12 item 1).
+    ForwardQueued,
 }
 
 /// Stable substrings the Node's unregister prepare emits for occupancy/race
@@ -577,18 +589,50 @@ async fn mutate(
         payload["workspaceId"] = json!(workspace_id);
     }
     crate::agent_scope::stamp(&mut payload, &device);
-    // c-dirpicker r11 item 2: pin the (transport, link generation) pair BEFORE
-    // queueing. The INSERT stamps this generation as a floor; the mark refreshes
-    // it; prepare, commit and every best-effort abort below ride THIS transport.
-    // A hello installing a new link between any of those steps can no longer
-    // move one frame onto a different link than the row is attributed to.
+    // c-dirpicker r11 item 2 / r12 item 1: pin the (transport, link generation)
+    // pair BEFORE queueing. The INSERT stamps the PINNED generation (not the
+    // hosts counter, which a hello in this span may already have bumped); the
+    // mark refreshes the same value; prepare, commit and every best-effort
+    // abort below ride THIS transport. A hello installing a new link between
+    // any of those steps can no longer move one frame onto a different link
+    // than the row is attributed to.
     let pinned = state.nodes.pin(&id).await.ok_or(HubError::HostOffline {
         host_id: id.clone(),
     })?;
+    // r12 item 1 test seam: park AFTER the pin, BEFORE the INSERT. A hello
+    // bumping the hosts counter here must not make the INSERT stamp the new
+    // value — the row carries the pinned generation. No-op in production.
+    state
+        .race_barriers
+        .wait_if_armed(
+            RacePhase::ForwardPinned,
+            &id,
+            node_workspace_id.as_deref().unwrap_or(""),
+        )
+        .await;
     let (command, _) = state
         .store
-        .queue_command(None, None, id.clone(), method.into(), payload, None)
+        .queue_command(
+            None,
+            None,
+            id.clone(),
+            method.into(),
+            payload,
+            None,
+            Some(pinned.link_generation()),
+        )
         .await?;
+    // r12 item 1 test seam: park AFTER the INSERT, before the mark, so the
+    // test can run the post-hello sweep while the row is queued. No-op in
+    // production.
+    state
+        .race_barriers
+        .wait_if_armed(
+            RacePhase::ForwardQueued,
+            &id,
+            node_workspace_id.as_deref().unwrap_or(""),
+        )
+        .await;
     state
         .store
         .mark_forward_intent(command.command_id.clone(), pinned.link_generation())
@@ -1391,6 +1435,7 @@ mod tests {
                 "workspace.unregister".into(),
                 json!({"path": "/srv/old", "workspaceId": "wsp_old"}),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1412,6 +1457,7 @@ mod tests {
                 host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": "/srv/legacy", "workspaceId": "wsp_legacy"}),
+                None,
                 None,
             )
             .await
@@ -1436,6 +1482,7 @@ mod tests {
                 host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": "/srv/new", "workspaceId": "wsp_new"}),
+                None,
                 None,
             )
             .await
@@ -1563,6 +1610,7 @@ mod tests {
                 "workspace.unregister".into(),
                 json!({"path": "/srv/fresh", "workspaceId": "wsp_fresh"}),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1599,6 +1647,7 @@ mod tests {
                 host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": "/srv/legacy2", "workspaceId": "wsp_legacy2"}),
+                None,
                 None,
             )
             .await
@@ -1669,6 +1718,7 @@ mod tests {
                 host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": "/srv/window", "workspaceId": "wsp_window"}),
+                None,
                 None,
             )
             .await

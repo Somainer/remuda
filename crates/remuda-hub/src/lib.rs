@@ -619,6 +619,61 @@ impl RunningHub {
         (reached, release_tx)
     }
 
+    /// Test helper (c-dirpicker r12 item 1): arm the park point between the
+    /// command INSERT and `mark_forward_intent` in the REAL unregister DELETE
+    /// handler — after the handler pinned the (L1, generation) pair. A test
+    /// parks the DELETE there, bumps the durable host generation (as the next
+    /// hello would), and asserts the post-hello sweep still selects the row
+    /// stamped with the pinned generation.
+    #[doc(hidden)]
+    pub fn test_arm_forward_queued_barrier(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardQueued,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test helper (c-dirpicker r12 item 1): arm the park point between the
+    /// transport pin and the command INSERT in the REAL unregister DELETE
+    /// handler.
+    #[doc(hidden)]
+    pub fn test_arm_forward_pinned_barrier(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardPinned,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into

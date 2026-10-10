@@ -4116,6 +4116,19 @@ impl Store {
     }
 
     /// Queue a command. Same `command_id` or idempotency key returns the original row.
+    ///
+    /// c-dirpicker r12 item 1: `pinned_link_generation` is the durable link
+    /// generation the forwarding attempt PINNED when it chose its transport
+    /// (unregister DELETE). It is stamped at INSERT because queue and
+    /// [`Self::mark_forward_intent`] are separate writer jobs: a hello that
+    /// bumps the hosts counter between them used to leave the row stamped with
+    /// the new generation while the frame rode the pinned older link, so the
+    /// post-hello sweep skipped the row until the link AFTER that. `None` (all
+    /// other callers) falls back to the host row's current generation via
+    /// COALESCE. The pinned value is always ≤ the hosts value (a hello only
+    /// ever increments), so a row can never be hidden by a smaller-than-hosts
+    /// stamp.
+    #[allow(clippy::too_many_arguments)]
     pub async fn queue_command(
         &self,
         command_id: Option<String>,
@@ -4124,6 +4137,7 @@ impl Store {
         operation: String,
         payload: Value,
         idempotency_key: Option<String>,
+        pinned_link_generation: Option<i64>,
     ) -> Result<(CommandRecord, bool), StoreError> {
         self.run_named("queue_command", move |conn| {
             if let Some(key) = idempotency_key.as_ref()
@@ -4175,22 +4189,16 @@ impl Store {
                 None => new_id("cmd").map_err(|e| StoreError::Id(e.to_string()))?,
             };
             let now = now_rfc3339();
-            // c-dirpicker r11 item 1: stamp the host's CURRENT link generation
-            // at INSERT, not only at mark_forward_intent. Queue and mark run as
-            // separate writer jobs: a reconnect hello that bumps the generation
-            // between them used to leave a fresh DELETE with a NULL stamp, so
-            // the post-hello sweep aborted an operator command the NEW link was
-            // about to forward (a regression to the old created_at window).
-            // mark_forward_intent still re-stamps with the generation the
-            // forwarding attempt pinned, which covers a bump between INSERT and
-            // mark. A missing host row stamps NULL, which the sweep treats as
-            // dead-link intent (the conservative choice).
+            // c-dirpicker r11 item 1 / r12 item 1: stamp at INSERT. A pinned
+            // forwarding attempt (unregister DELETE) supplies the generation it
+            // pinned; every other caller passes None and the stamp falls back
+            // to the host row's current generation.
             conn.execute(
                 "INSERT INTO commands
                     (id, instance_id, host_id, operation, state, resolution, forwarded,
                      payload_json, idempotency_key, created_at, updated_at, link_generation)
                  VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7,
-                         (SELECT link_generation FROM hosts WHERE id = ?3))",
+                         COALESCE(?8, (SELECT link_generation FROM hosts WHERE id = ?3)))",
                 params![
                     command_id,
                     instance_id,
@@ -4198,7 +4206,8 @@ impl Store {
                     operation,
                     payload.to_string(),
                     idempotency_key,
-                    now
+                    now,
+                    pinned_link_generation
                 ],
             )?;
             let row = load_command(conn, &command_id)?
@@ -6933,6 +6942,7 @@ mod tests {
                 "instance.create".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
             )
             .await
             .expect("command");
@@ -7069,6 +7079,7 @@ mod tests {
                 "instance.create".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
             )
             .await
             .expect("command");
@@ -7164,6 +7175,7 @@ mod tests {
                 host_id.clone(),
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
+                None,
                 None,
             )
             .await
@@ -7277,6 +7289,7 @@ mod tests {
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
             )
             .await
             .expect("command");
@@ -7334,6 +7347,7 @@ mod tests {
                 host_id.clone(),
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
+                None,
                 None,
             )
             .await
@@ -7402,6 +7416,7 @@ mod tests {
                         host_id.clone(),
                         "instance.send".into(),
                         json!({"instanceId": instance.instance_id}),
+                        None,
                         None,
                     )
                     .await
@@ -7720,6 +7735,7 @@ mod tests {
                 "instance.configure".into(),
                 payload.clone(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -7912,6 +7928,7 @@ mod tests {
                     host.clone(),
                     "instance.configure".into(),
                     payload.clone(),
+                    None,
                     None,
                 )
                 .await
@@ -8888,6 +8905,7 @@ mod tests {
                     loser.clone(),
                     "workspace.unregister".into(),
                     json!({"path": "/srv/dup", "workspaceId": "wsp_dup"}),
+                    None,
                     None,
                 )
                 .await

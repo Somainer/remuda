@@ -1482,6 +1482,7 @@ mod abort {
                 "workspace.unregister".into(),
                 json!({"path": root, "workspaceId": WORKSPACE}),
                 None,
+                None,
             )
             .await?;
         store
@@ -1557,6 +1558,7 @@ mod abort {
                 fixture.host.clone(),
                 "workspace.unregister".into(),
                 json!({"path": root, "workspaceId": WORKSPACE}),
+                None,
                 None,
             )
             .await?;
@@ -2223,6 +2225,97 @@ async fn forward_pin_keeps_prepare_commit_on_one_link_across_a_hello() -> Result
         l1.calls(),
         vec!["prepare", "abort"],
         "a gen-2 forwarding attempt never touches the stale L1"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// r12 item 1: the DELETE pins (L1, N) BEFORE queueing. A hello that bumps the
+/// hosts counter to N+1 between the pin and the INSERT used to make the INSERT
+/// stamp N+1; a sweep between the INSERT and mark_forward_intent then skipped
+/// the row, the mark rewrote it to N, and the command rode dead L1 unswept
+/// until L3. The INSERT now stamps the PINNED N, so a sweep at N+1 running in
+/// the INSERT→mark gap selects the row.
+#[tokio::test]
+async fn pinned_generation_at_insert_keeps_the_row_selectable_in_the_mark_window() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = HubConfig::for_test(dir.path().join("data"));
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let host = HostId::new().as_id().as_str().to_owned();
+    hub.test_insert_host(&host).await?;
+    let store = hub.store().expect("store");
+
+    // L1 adopts generation 1 and is the registered transport.
+    assert_eq!(store.bump_host_link_generation(host.clone()).await?, 1);
+    let l1 = Arc::new(InterleaveNode {
+        name: "L1",
+        calls: Mutex::new(Vec::new()),
+        dead: std::sync::atomic::AtomicBool::new(false),
+    });
+    hub.test_set_node_transport_with_generation(&host, l1.clone(), 1)
+        .await;
+
+    // Observe the snapshot so the DELETE resolves by exact root.
+    let (status, _) = json_request(
+        hub.addr,
+        "GET",
+        &format!("/v1/hosts/{}/workspaces", host),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200);
+
+    // Arm both park points: after the pin (before INSERT) and after the INSERT
+    // (before mark).
+    let (pinned_reached, release_pinned) = hub.test_arm_forward_pinned_barrier(&host, WORKSPACE);
+    let (queued_reached, release_queued) = hub.test_arm_forward_queued_barrier(&host, WORKSPACE);
+    let addr = hub.addr;
+    let host_for_delete = host.clone();
+    let cookie_for_delete = cookie.clone();
+    let delete = tokio::spawn(async move {
+        json_request(
+            addr,
+            "DELETE",
+            &format!("/v1/hosts/{}/workspaces", host_for_delete),
+            &[("Cookie", &cookie_for_delete)],
+            Some(&json!({"path": ROOT}).to_string()),
+        )
+        .await
+    });
+    pinned_reached.notified().await;
+
+    // The hello lands AFTER the pin but BEFORE the INSERT: hosts goes 1 → 2.
+    // The registry still carries the half-open L1 the pinned frame will ride.
+    assert_eq!(store.bump_host_link_generation(host.clone()).await?, 2);
+    release_pinned.send(()).expect("let the INSERT run");
+
+    // The handler INSERTs the row and parks again before the mark.
+    queued_reached.notified().await;
+
+    // The post-hello sweep at generation 2, running BEFORE the mark, must
+    // already select the row: its INSERT stamp is the PINNED 1, not the hosts
+    // counter's new 2.
+    let pending = store.list_unsettled_workspace_unregisters(&host, 2).await?;
+    assert_eq!(
+        pending.len(),
+        1,
+        "the sweep in the INSERT→mark window must select the row stamped with the pinned generation"
+    );
+    let queued_id = pending[0].command_id.clone();
+
+    // Release: the mark refreshes the same pinned 1 and the frame rides L1 and
+    // settles (no new transport was installed).
+    release_queued.send(()).expect("release the parked DELETE");
+    let (status, body) = delete.await.expect("delete task joined")?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(l1.calls(), vec!["prepare", "commit"]);
+    assert_eq!(
+        store.get_command(queued_id).await?.expect("row").state,
+        "settled"
     );
 
     hub.shutdown().await;

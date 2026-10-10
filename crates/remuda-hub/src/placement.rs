@@ -576,6 +576,7 @@ pub async fn spawn_on_host(
             request.operation.to_owned(),
             payload,
             request.idempotency_key,
+            None,
         )
         .await?;
     let command = crate::http::forward_if_online(state, command, true).await?;

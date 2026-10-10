@@ -718,6 +718,7 @@ async fn stop_before_delete(
             "instance.close".into(),
             json!({ "instanceId": instance.instance_id, "origin": "human" }),
             None,
+            None,
         )
         .await
         .map_err(map_store)?;
@@ -2131,6 +2132,7 @@ async fn resume_lineage(
                 "instance.close".into(),
                 json!({ "instanceId": fenced.instance_id, "origin": "human" }),
                 None,
+                None,
             )
             .await?;
         let _ = forward_if_online(state, close, true).await;
@@ -2433,6 +2435,7 @@ pub async fn post_command(
             body.operation,
             payload,
             body.idempotency_key,
+            None,
         )
         .await
         .map_err(map_store)?;

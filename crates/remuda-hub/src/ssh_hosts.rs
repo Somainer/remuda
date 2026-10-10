@@ -872,6 +872,7 @@ mod tests {
                 "workspace.unregister".into(),
                 json!({"path": ROOT, "workspaceId": WSP}),
                 None,
+                None,
             )
             .await
             .unwrap();

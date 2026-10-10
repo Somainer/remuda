@@ -1962,16 +1962,24 @@ function TranscriptInner({
           // OR while its restore is still settling owns the position: release
           // that click's held anchors immediately so neither the pending
           // prepend nor a later measurement commit can restore them back to
-          // the click-time row. Classification is by the programmaticScroll
-          // TOKEN (a live armOwnScrollEcho record, rAF-invalidated after the
-          // single coalesced event), NOT by pixel proximity: a genuine 1-2px
-          // wheel that happens to land within ±2px of the echo is reader
-          // input, not the restore's echo. An intentional programmatic
-          // navigation invalidated the token before its event, so it releases
-          // like a gesture and is never swallowed.
+          // the click-time row. Classification requires BOTH:
+          //  1. the programmaticScroll TOKEN (a live armOwnScrollEcho record,
+          //     rAF-invalidated after the single coalesced event, stamped with
+          //     the readerInputSeq at write time) — a genuine gesture bumps the
+          //     seq before the event, so a 1-2px wheel is reader input even at
+          //     the echo's pixel position; and
+          //  2. pixel proximity (±2px to the recorded target) — input the
+          //     gesture listener never sees (keyboard scrolling with body
+          //     focus, middle-click autoscroll, engines that do not deliver a
+          //     gutter pointerdown) can coalesce a scroll with a correction
+          //     write's echo; if it lands far from the echo target it is the
+          //     reader, not our math.
           const echo = restoreEchoRef.current;
           restoreEchoRef.current = null;
-          const ownEcho = echo !== null && echo.inputSeq === readerInputSeqRef.current;
+          const ownEcho =
+            echo !== null &&
+            echo.inputSeq === readerInputSeqRef.current &&
+            Math.abs(el.scrollTop - echo.top) <= 2;
           if (!ownEcho) {
             // Genuine reader scroll: re-arm growth anchoring immediately.
             rearmGrowthHold();

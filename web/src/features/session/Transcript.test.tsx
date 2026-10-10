@@ -2989,6 +2989,33 @@ describe("load-earlier anchor lifecycle round 5", () => {
       });
     });
 
+    it("a reader scroll that coalesces with a correction echo far from its target cancels the restore", async () => {
+      // Input the gesture listener never sees (keyboard scrolling with body
+      // focus, middle-click autoscroll, an engine that drops gutter
+      // pointerdown) can land a scroll event in the same frame as a restore
+      // correction write, so no readerInputSeq bump happens. Pixel proximity
+      // must then classify it: an event far from the echo target is the
+      // reader, not the restore.
+      const { user, geo, g, older } = setup("insCoalesceFar");
+      await user.click(screen.getByTestId("load-earlier"));
+      geo.setTotal(150);
+      await act(async () => {
+        g.resolve(pageOf(older));
+        await Promise.resolve();
+      });
+      await act(async () => {});
+      // A settle correction schedules an own-echo write (rAF not flushed).
+      // Immediately move FAR with a bare scroll event and NO wheel/gesture,
+      // so the input token is unchanged but the position is 12 rows away.
+      const dest = geo.top();
+      geo.scrollTo(dest - 12 * ROW);
+      await act(async () => {});
+      expect(
+        geo.scroller().getAttribute("data-prepend-hold"),
+        "a far scroll coalesced with the echo was swallowed and kept the restore",
+      ).toBe("0");
+    });
+
     // UO-6a round 8 item 3: after a load-earlier cancel switches growth
     // anchoring off, it must come back on the NEXT genuine gesture even when
     // the gesture dispatches no usable scroll event (tiny wheel, scrollbar

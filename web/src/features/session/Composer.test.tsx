@@ -391,6 +391,24 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("context-chip")).toBeVisible();
   });
 
+  it("r4 item 5(b): permissionDanger forces danger style on a read-only chip with no table row", () => {
+    render(
+      <Composer
+        instanceId="ins_yolo_forced"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="grok"
+        model="grok-4"
+        effort={effortAt("grok", 1)}
+        permissionMode="bypass"
+        permissionDanger
+      />,
+    );
+    const chip = screen.getByTestId("permission-chip");
+    expect(chip).toHaveAttribute("data-readonly", "1");
+    expect(chip).toHaveAttribute("data-permission-danger", "1");
+  });
+
   it("item 7: a read-only codex `never` chip keeps the danger treatment", () => {
     render(
       <Composer

@@ -104,6 +104,7 @@ export function Composer({
   onSteerHeld,
   onFlushHeld,
   permissionMode = "manual",
+  permissionDanger = false,
   onPermission,
   launchPermissionMode,
   permissionEffective = null,
@@ -166,6 +167,9 @@ export function Composer({
   /** Post every held row in order (the turn-end / answer transition). */
   onFlushHeld?: () => void | Promise<void>;
   permissionMode?: string;
+  /** Force danger styling on a read-only chip whose word is in no permission
+   *  table (generic-PTY Node yolo preset; c-effortui r4 item 5(b)). */
+  permissionDanger?: boolean;
   onPermission?: (mode: string) => void;
   /** Mode the session launched with; decides whether bypass is live-reachable. */
   launchPermissionMode?: string;
@@ -485,7 +489,7 @@ export function Composer({
   const permLabel = onPermission ? permOption?.label ?? liveMode : permissionMode;
   // D-042: yolo-class modes (绕过全部 / 不再询问 / 完全访问) must read as
   // danger on the collapsed phone trigger, not only inside the sheet.
-  const permDanger = permOption?.danger === true;
+  const permDanger = permissionDanger || permOption?.danger === true;
   const permTag = permissionPending
     ? permissionPending.queued
       ? "排队中"

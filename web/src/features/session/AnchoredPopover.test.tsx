@@ -121,6 +121,61 @@ describe("computeAnchored placement math", () => {
     expect(measured.maxHeight).toBe(540); // min(841 plain above-room, 60vh)
   });
 
+  it("item 5(a): a tiny plain (no-card) up strip grows to the usable minimum", () => {
+    // Dock near the bottom (dodging DOWN is not an option) in a short viewport
+    // with NO parked card: plain above-room is only ~40px → stay up, but the
+    // cap reaches the usable 120px floor so the menu rows are scrollable.
+    const measured = computeAnchored(
+      { top: 56, bottom: 86, left: 100, right: 200, width: 100 },
+      { preferredHeight: 300, width: 300 },
+      { width: 600, height: 100 },
+      OPTS,
+    );
+    expect(measured.placement).toBe("up");
+    expect(measured.maxHeight).toBe(60); // floor 120 bounded by 60vh of 100
+  });
+
+  it("item 5(a): the usable floor applies when the plain strip is 40–120px with room to grow", () => {
+    // Trigger low in a tall viewport with below unusable (12px): the plain
+    // above-room is 100px — under the 120 floor but plenty of room to grow.
+    const measured = computeAnchored(
+      { top: 116, bottom: 146, left: 100, right: 200, width: 100 },
+      { preferredHeight: 300, width: 300 },
+      { width: 1440, height: 166 },
+      OPTS,
+    );
+    expect(measured.placement).toBe("up");
+    expect(measured.maxHeight).toBe(99); // 60vh of 166 = 99, below the floor
+  });
+
+  it("item 5(a): the usable floor grows a sub-120 strip in a tall viewport", () => {
+    // Dock near the bottom of a 900px viewport (below ~5px, unusable): the
+    // plain above-room is 100px; the floor grows it to 120.
+    const measured = computeAnchored(
+      { top: 116, bottom: 892, left: 100, right: 200, width: 100 },
+      { preferredHeight: 300, width: 300 },
+      { width: 1440, height: 900 },
+      OPTS,
+    );
+    expect(measured.placement).toBe("up");
+    expect(measured.maxHeight).toBe(120);
+  });
+
+  it("item 5(a): with a parked card the usable floor never overrides the clearance", () => {
+    // Same docked geometry as the composer-effort overlap e2e: the cleared
+    // strip (71px) is under the usable minimum, but growing the panel would
+    // cover the card — so the cap stays exactly the strip.
+    const measured = computeAnchored(
+      { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
+      { preferredHeight: 131, width: 300 },
+      { width: 1440, height: 900 },
+      { ...OPTS, avoidBottom: 770 },
+    );
+    expect(measured.placement).toBe("up");
+    expect(measured.maxHeight).toBe(71);
+    expect(measured.top).toBe(857 - 8 - 71);
+  });
+
   it("shifts a panel that would overflow the right edge back inside", () => {
     const measured = computeAnchored(
       { top: 700, bottom: 730, left: 1300, right: 1430, width: 130 },

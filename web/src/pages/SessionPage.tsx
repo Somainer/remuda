@@ -877,6 +877,10 @@ export function SessionPage({
           permissionMode={
             genericPty ? ptyYoloChipLabel(instance.kind) : hubStore.permissionModeOf(instance.id)
           }
+          // generic-PTY read-only chip: the Node yolo preset (bypass /
+          // always-approve / skip-permissions) is a danger state and is in no
+          // live table, so mark it explicitly (c-effortui r4 item 5(b)).
+          permissionDanger={genericPty}
           launchPermissionMode={genericPty ? undefined : hubStore.launchPermissionModeOf(instance.id)}
           permissionEffective={genericPty ? null : hubStore.permissionEffectiveOf(instance.id)}
           permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}

@@ -516,7 +516,7 @@ mediaType, name}`，`protocol.md` §5.2），字节在对象库、不在 journal
   - **默认档不写死**：Claude 的默认档按模型（Opus 5.5 / Sonnet 5.5 = medium，Opus 4.7 = xhigh，其余 = high），任何文案都不得把某一档标成通用「默认」。未 pin 时触发器显示「跟随模型默认」，回读后显示解析出的档；没有记忆偏好的新会话即未 pin。未 pin 滑杆的缺省档优先级为**每模型 catalog 默认 → 本机设备默认（settings）→ high**。
   - 两条轴各自显示 effective：档位读不到显示 `?`，开关读不到显示 `?`；与请求不一致时逐轴提示「请求 max → 实际 high」「请求 ultracode → 实际关」（resume 后未重新生效就是后者；开关只认本进程的记录，resume 前重放出来的「Ultracode on」不算）。**列表行**的 effort 后缀三态显式区分：`true` 显示「· ultracode」，`false` 不显示，档位已知但 flag 为 `null`（如刚 resume）显示「· ?」——不得因档位已知就把未知 flag 画成关；非 Claude harness 无 flag 轴，只显示档位。
   - `›` 展开的列表里才有档位说明和模型选择（`‹` 返回 pill）；pill 视图本身不列模型。
-  - 变更走 `instance.configure`（journal + persist），`effort` 发 `{name, ultracode, index}`（`index` 只是旧字段，Hub 读时忽略），不再用旧名 `ultracode` 上 wire。滑杆与开关在同一次确认里一起变时只发一次 configure，driver 端至多两条命令、档位在前；耦合版本打开 ultracode 永远只发一条 `/effort ultracode`（D-056 (3)）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
+  - 变更走 `instance.configure`（journal + persist），`effort` 发 `{name, ultracode, index}`（`index` 只是旧字段，Hub 读时忽略），不再用旧名 `ultracode` 上 wire。driver 按**上报版本**从两轴选出唯一的打字词（c-effortui r4）：耦合（2.1.203–2.1.283）开 flag 是一条 `/effort ultracode`（同时把档位带到 xhigh），其余是档位词；解耦（≥2.1.284）同档切 flag 是一条 `/effort ultracode on|off`，换档（无论 flag 是否随行）是一条 `/effort <level>`，正交 flag 由 CLI 自行保持——**一次 configure 永远只有一条命令**。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
 - 本地草稿按 `instanceId` 存（herdrx `composerDrafts`）；未 accepted 的乐观气泡可撤回。
 
 **compact composer 边界（D-042，修订 §11.7 冲突「P0-3」；收起态单行 56px 不变）**

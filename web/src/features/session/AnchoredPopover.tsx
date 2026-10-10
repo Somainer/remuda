@@ -135,12 +135,12 @@ export function computeAnchored(
   // When the panel stays UP despite the parked card (below has no room for a
   // usable panel), it is HEIGHT-CAPPED to the card-cleared room so its bottom
   // edge never overlaps the card — even a 20–40px cleared strip keeps the
-  // panel clear of the card and the inner region scrolls (composer-effort
-  // overlap e2e pins this: a usable-minimum FLOOR would overlap, which the
-  // card case forbids). The one exception is a LITERAL 0: that used to mean
-  // "no maxHeight" and painted the full-vh panel over everything; cap it to
-  // the plain above-room instead (bounded; overlapping the dismissible card
-  // is then the only remaining lesser evil) — never uncapped.
+  // panel clear of the card and the inner region scrolls. A usable-minimum
+  // floor is applied ONLY to plain (unblocked) up placement (the r4 5(a)
+  // "20–40 px strip" case, with no card to keep clear of); against a card the
+  // strip is exactly the clearance and must not grow. A LITERAL 0 never means
+  // "uncapped" (that painted the full-vh panel); it falls back to the bounded
+  // plain above-room.
   const room =
     placement === "up"
       ? blockedUpByCard
@@ -148,6 +148,12 @@ export function computeAnchored(
         : roomAbove
       : roomBelow;
   let cap = Math.min(vhCap, room);
+  if (placement === "up" && !blockedUpByCard && 0 < cap && cap < DOWN_USABLE) {
+    // No card: grow a tiny strip to the usable minimum (the panel starts at
+    // the trigger minus 120 and its lower rows extend toward the trigger; the
+    // inner region scrolls). Bounded only by the 60vh cap, not by room.
+    cap = Math.min(vhCap, DOWN_USABLE);
+  }
   if (cap <= 0) {
     cap = Math.min(vhCap, placement === "up" ? roomAbove : vhCap);
   }

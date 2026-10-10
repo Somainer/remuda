@@ -5320,6 +5320,13 @@ fn scripted_usage(prompt: &str, turn: u64) -> Option<Value> {
         "totalTokens": knowledge(total),
         "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
         "accounting": "estimated",
+        // The fake session's model id is not in the Hub's static catalog and
+        // the e2e profile has no declared window, so the rollup would use the
+        // approximate kind-fallback. A real driver reports the per-model
+        // window on usage observations (c-usagefu (c)); mirror that (a bare
+        // protocol U64 scalar, like to_usage_payload encodes it) so the
+        // ux-usage chip shows an EXACT percentage (200k window → 17%).
+        "contextWindow": "200000",
         // c-ctxusage r5 item 7: the sentinel's usage is a live observation, so
         // it carries a current nativeAt and enters the rate window.
         "nativeAt": { "state": "known", "value": monotonic_effort_observed_at() },

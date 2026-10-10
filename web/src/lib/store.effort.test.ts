@@ -341,6 +341,23 @@ it("item 3: request A's read-back never settles B — queued threshold and the r
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
+it("a decoupled queued `ultracode on` edge names the flag request and keeps the tier", async () => {
+  // The driver's decoupled command word is "ultracode on" (a space); the
+  // queued/applied lifecycle must parse as the FLAG axis, not an unknown tier.
+  const ctx = await startFollowing("queued-flag-word", { state: "known", value: "working" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  await hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
+  await hubStore.setUltracode(ctx.instance.id, true);
+  ctx.receive(configureLifecycle(2, "effort-queued:ultracode on", "x", "2026-10-08T12:02:01.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({
+    name: "xhigh",
+    ultracode: true,
+    queued: true,
+  });
+  ctx.receive(configureLifecycle(3, "effort-applied:ultracode on", "x", "2026-10-08T12:02:05.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
 it("item 3: A's degraded LEVEL word never rolls back B's in-flight ultracode request", async () => {
   const ctx = await startFollowing("ab-degrade-flag", { state: "known", value: "working" });
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);

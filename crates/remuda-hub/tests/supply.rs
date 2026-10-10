@@ -875,3 +875,141 @@ async fn usage_events_flow_through_journal_into_aggregation() -> Result<()> {
     hub.shutdown().await;
     Ok(())
 }
+
+/// c-usagefu r2 item 5(c): the transcript-observed `modelEffective` (a `/model`
+/// switch) drives the context-window rollup served on the instance API, and the
+/// rollup is refreshed on the next read after the switch. No prior test
+/// exercised the store.rs rollup wiring against a live model observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_effective_switch_refreshes_the_instance_context_window() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let host = HostId::new().as_id().to_string();
+    let node = enroll_fake_node(&hub, &host, 8).await?;
+    let relay = create_relay(hub.addr, &cookie).await?;
+    let profile_id = relay["id"].as_str().unwrap();
+    // Launch model: claude-haiku-4-5 = 200k in the static catalog.
+    let instance_id =
+        seed_live_instance(&hub, &node, &host, profile_id, "claude-haiku-4-5").await?;
+
+    // 100,000 uncached input tokens: 50% of the launch model's 200k window.
+    let usage = json!({
+        "instanceId": instance_id,
+        "event": {
+            "schemaVersion": 1,
+            "eventId": "evt_r2c-usage-1",
+            "journalId": "obj_r2c-1",
+            "instanceId": instance_id,
+            "hostId": host,
+            "processGeneration": "1",
+            "seq": "1",
+            "observedAt": "2026-10-09T10:00:00.000Z",
+            "kind": "usage",
+            "completeness": "structured",
+            "payload": {
+                "usageId": "obj_r2c-turn-1",
+                "scope": "turn",
+                "scopeId": "msg_r2c_1",
+                "mode": "snapshot",
+                "metricRevision": "2",
+                "inputAccounting": "uncached",
+                "accounting": "estimated",
+                "inputTokens": { "state": "known", "value": "100000" },
+                "outputTokens": { "state": "known", "value": "1000" },
+                "reasoningTokens": { "state": "known", "value": "0" },
+                "cacheReadTokens": { "state": "known", "value": "0" },
+                "cacheWriteTokens": { "state": "not-applicable" },
+                "totalTokens": { "state": "known", "value": "101000" }
+            }
+        }
+    });
+    node.append.lock().await(usage).await?;
+
+    let rollup = get_instance_rollup(hub.addr, &cookie, &instance_id).await?;
+    assert_eq!(
+        rollup["contextWindowTokens"], 200_000,
+        "launch catalog window"
+    );
+    assert_eq!(rollup["contextUsedTokens"], 100_000);
+    assert_eq!(rollup["contextPct"], 50);
+    assert_eq!(
+        rollup["contextPctApproximate"], false,
+        "catalog evidence is exact"
+    );
+
+    // A `/model` switch to a [1m] id refreshes the window to 1m: the same
+    // 100k used is now 10%, still exact (explicit tag).
+    let switch_long = json!({
+        "instanceId": instance_id,
+        "event": {
+            "kind": "model",
+            "payload": {
+                "requested": "claude-haiku-4-5[1m]",
+                "effective": {
+                    "id": "claude-haiku-4-5[1m]",
+                    "source": "slash",
+                    "observedAt": "2026-10-09T10:01:00.000Z"
+                },
+                "raw": "claude-haiku-4-5[1m]"
+            }
+        }
+    });
+    node.append.lock().await(switch_long).await?;
+
+    let rollup = get_instance_rollup(hub.addr, &cookie, &instance_id).await?;
+    assert_eq!(
+        rollup["contextWindowTokens"], 1_000_000,
+        "the switched-to effective model's [1m] window is used"
+    );
+    assert_eq!(rollup["contextPct"], 10, "100k / 1m = 10%");
+    assert_eq!(rollup["contextPctApproximate"], false);
+
+    // A switch to an UNKNOWN id drops to the harness-kind fallback and is
+    // marked approximate (never an exact window).
+    let switch_unknown = json!({
+        "instanceId": instance_id,
+        "event": {
+            "kind": "model",
+            "payload": {
+                "requested": "gateway/renamed-model",
+                "effective": {
+                    "id": "gateway/renamed-model",
+                    "source": "slash",
+                    "observedAt": "2026-10-09T10:02:00.000Z"
+                },
+                "raw": "gateway/renamed-model"
+            }
+        }
+    });
+    node.append.lock().await(switch_unknown).await?;
+
+    let rollup = get_instance_rollup(hub.addr, &cookie, &instance_id).await?;
+    assert_eq!(
+        rollup["contextWindowTokens"], 200_000,
+        "unknown effective model -> claude kind fallback"
+    );
+    assert_eq!(
+        rollup["contextPctApproximate"], true,
+        "the fallback percentage is an estimate"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+async fn get_instance_rollup(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    instance_id: &str,
+) -> Result<Value> {
+    let (_, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &[("Cookie", cookie)],
+        None,
+    )
+    .await?;
+    let record: Value = serde_json::from_str(body.trim())?;
+    Ok(record["usageRollup"].clone())
+}

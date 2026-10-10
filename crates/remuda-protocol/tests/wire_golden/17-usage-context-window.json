@@ -55,7 +55,7 @@
   "kind": "usage",
   "payload": {
     "usageId": "obj_01993ab0-0000-7000-8000-000000000006",
-    "scope": "message",
+    "scope": "turn",
     "scopeId": "msg_019abc",
     "mode": "snapshot",
     "metricRevision": "1",

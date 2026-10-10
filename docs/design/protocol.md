@@ -2282,7 +2282,7 @@ PTY carrier 的完整 Herdr pin：
 ~~~
 
 <!-- golden: usage-context-window -->
-一个 `scope=message` 的 per-call usage 观察携带 harness 上报的原生模型窗口（stream-json `result.modelUsage[m].contextWindow`）。`contextWindow` 是 additive 可选字段；未上报时该键直接缺席（`skip_serializing_if`），Hub 回退到 effective-model → profile → 目录 → kind 默认解析窗口百分比。
+一个 `scope=turn` 的 per-call usage 观察（`scopeId` 是该次 assistant 消息 id；provisional 首帧 revision 1，`message_delta` 终值 revision 2 增长替换）携带 harness 上报的原生模型窗口（stream-json `result.modelUsage[m].contextWindow`）。`contextWindow` 是 additive 可选字段；未上报时该键直接缺席（`skip_serializing_if`），Hub 回退到 effective-model → profile → 目录 → kind 默认解析窗口百分比。
 
 ~~~json
 {
@@ -2320,7 +2320,7 @@ PTY carrier 的完整 Herdr pin：
   "kind": "usage",
   "payload": {
     "usageId": "obj_01993ab0-0000-7000-8000-000000000006",
-    "scope": "message",
+    "scope": "turn",
     "scopeId": "msg_019abc",
     "mode": "snapshot",
     "metricRevision": "1",

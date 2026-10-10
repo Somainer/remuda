@@ -397,22 +397,23 @@ pub(super) fn map_assistant(
         }
     }
     mapper.stream.blocks.insert(key, blocks);
-    // Per-call usage (c-usagefu (a), r2 item 3): one Turn usage payload per
-    // top-level model message, from `message.usage` — never the summed
+    // Per-call usage (c-usagefu (a), r2 items 3 & 5a): one Turn usage payload
+    // per top-level model message, from `message.usage` — never the summed
     // `result.usage`. Sub-agent frames carry a parent and are dropped the same
     // way transcript sidechain records are. Repeated block frames for one
     // message id dedupe.
     //
-    // The ShellPty carrier reaches this function TWICE per frame: its
-    // transcript mapper's `emit_conversation` rebuilds the record into a
-    // stream frame after the group machinery. For ShellPty the group-gated
-    // `flush_group` is the sole usage source (it waits for stop_reason /
-    // supersede / finish), so the stream emission is print/SDK carriers only
-    // — otherwise every transcript block would bypass that gate. SDK runs the
-    // identical stream-json argv apart from `-p` (r2 item 3), so it has the
-    // same per-call channel and is included.
+    // This stream emission is the SOLE per-call channel only for the stdout
+    // carriers (claude-print / claude-sdk), whose argv produces stream-json.
+    // The interactive pty carriers (shell-pty and claude-pty) hydrate from the
+    // native transcript through this same mapper: `emit_conversation` rebuilds
+    // each record into a stream frame that reaches here, while a later
+    // group-gated `flush`/`finish` is their authoritative usage source (it
+    // waits for stop_reason / supersede / finish). Emitting on the ungated
+    // first frame would double-count every pty transcript — shell-pty was
+    // already excluded; r2 item 5a closes the same hole for claude-pty.
     if msg.parent_tool_use_id.is_none()
-        && mapper.driver_kind != DriverKind::ShellPty
+        && stream_usage_carrier(mapper.driver_kind)
         && let Some(usage_obs) = super::usage_from_assistant_message(mapper, msg)?
     {
         out.push(usage_obs);
@@ -421,4 +422,12 @@ pub(super) fn map_assistant(
         mapper.stream.snapshots.insert(id.clone());
     }
     Ok(out)
+}
+
+/// Whether this carrier reads stream-json as its authoritative output channel
+/// (and therefore takes per-call usage straight off the assistant / delta
+/// frames). The interactive pty carriers instead hydrate a native transcript
+/// and emit usage through the group-gated flush (r2 item 5a).
+fn stream_usage_carrier(kind: DriverKind) -> bool {
+    matches!(kind, DriverKind::ClaudePrint | DriverKind::ClaudeSdk)
 }

@@ -680,3 +680,47 @@ fn nested_message_delta_emits_no_usage() {
     );
     assert!(delta.is_empty(), "a sub-agent delta is a sidechain");
 }
+
+#[test]
+fn pty_transcript_carriers_do_not_emit_ungated_stream_usage() {
+    // c-usagefu r2 item 5a: the claude-pty (and shell-pty) hydrator rebuilds
+    // transcript records through this same mapper, but its authoritative usage
+    // comes from the group-gated flush, not the first assistant frame. Emitting
+    // here would double-count every pty transcript.
+    for carrier in [DriverKind::ClaudePty, DriverKind::ShellPty] {
+        let mut mapper = mapper();
+        mapper.driver_kind = carrier;
+        let frame = json!({"type": "assistant", "uuid": "u", "message": {
+            "id": "msg_pty", "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        }});
+        let obs = map(&mut mapper, frame);
+        assert!(
+            obs.iter()
+                .all(|o| !matches!(o.body, ObservationPayload::Usage(_))),
+            "{carrier:?} must not emit usage on the ungated first frame"
+        );
+    }
+
+    // The stdout carriers keep the emission.
+    for carrier in [DriverKind::ClaudePrint, DriverKind::ClaudeSdk] {
+        let mut mapper = mapper();
+        mapper.driver_kind = carrier;
+        let frame = json!({"type": "assistant", "uuid": "u", "message": {
+            "id": "msg_stdout", "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        }});
+        let obs = map(&mut mapper, frame);
+        assert!(
+            obs.iter()
+                .any(|o| matches!(o.body, ObservationPayload::Usage(_))),
+            "{carrier:?} emits per-call usage on the stream channel"
+        );
+    }
+}

@@ -1,0 +1,754 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/lib.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/remuda_hub-4450c0e6aa692d6a)
+
+running 194 tests
+test agent_scope::tests::only_the_exact_hostcap_shape_is_an_agent_read_target ... ok
+test agent_scope::tests::only_the_node_stage_shape_skips_the_device_middleware ... ok
+test agent_scope::tests::only_the_two_attachment_read_shapes_bypass_the_instance_path_check ... ok
+test agent_scope::tests::authenticated_kind_and_instance_binding_determine_origin ... ok
+test agent_scope::tests::passkey_login_routes_are_auth_establishing_but_register_is_not ... ok
+test attachments::tests::an_operator_names_a_session_and_an_unknown_kind_gets_none ... ok
+test attachments::tests::an_instance_credential_is_pinned_to_its_own_session ... ok
+test attachments::tests::the_inline_ceiling_is_below_the_staging_ceiling ... ok
+test api_relay::tests::revoke_frame_round_trips_as_typed_params ... ok
+test auth::tests::secret_eq_is_length_sensitive ... ok
+test auth::tests::secure_cookie_rejects_http_origin ... ok
+test http::forward_slot_tests::dispatch_marker_owner_and_non_owner_drop ... ok
+test http::forward_slot_tests::insert_loser_that_owns_the_marker_never_clears_it ... ok
+test interactions::tests::appearing_on_both_lists_fails_closed ... ok
+test interactions::tests::chain_starting_at_a_missing_row_is_empty ... ok
+test http::forward_slot_tests::legacy_rejected_configure_replays_original_status ... ok
+test interactions::tests::chain_walk_is_cycle_safe ... ok
+test interactions::tests::chain_walks_parent_edges_up_to_the_null_parent_ancestor ... ok
+test interactions::tests::chain_with_dead_middle_parent_ends_at_last_reachable_hop_but_keeps_edge ... ok
+test http::forward_slot_tests::leader_slot_is_exclusive ... ok
+test http::forward_slot_tests::follower_is_bound_to_its_attempt_not_a_newer_one ... ok
+test agent_approvals::tests::agent_approvals_answer_refuses_agent_origin_from_non_grant_caller ... ok
+test agent_approvals::tests::approval_binds_caller_and_exact_action_and_is_consumed_once ... ok
+test interactions::tests::force_off_refuses_one_project_even_when_the_global_is_on ... ok
+test http::forward_slot_tests::follower_learns_when_leader_ends_without_publishing ... ok
+test interactions::tests::force_on_admits_one_project_while_the_global_stays_off ... ok
+test interactions::tests::chain_with_no_parent_root_is_the_single_root_hop ... ok
+test interactions::tests::level_last_when_the_root_operator_answers ... ok
+test interactions::tests::level_root_of_a_single_hop_chain_is_zero ... ok
+test interactions::tests::level_one_when_the_direct_parent_answers ... ok
+test interactions::tests::switch_defaults_to_the_global_when_no_project_or_list_matches ... ok
+test interactions::tests::level_zero_when_the_owner_instance_answers_itself ... ok
+test inventory::tests::computer_use_capability_names_are_validated ... ok
+test inventory::tests::computer_use_capability_reports_all_three_states ... ok
+test inventory::tests::gateway_native_auth_is_preserved ... ok
+test inventory::tests::computer_use_preflight_classifies_every_host_shape ... ok
+test inventory::tests::nested_hello_inventory_normalizes_cli_and_labels ... ok
+test model_catalog::tests::aliases_and_suffixes_resolve ... ok
+test model_catalog::tests::codex_capability_rows_offer_the_six_native_tiers ... ok
+test model_catalog::tests::declared_role_fills_unknown_gateway_models ... ok
+test model_catalog::tests::feature_gates_and_prices ... ok
+test objects::tests::arbitrary_file_types_are_accepted_as_essence ... ok
+test objects::tests::declared_type_must_agree_with_the_sniffed_image ... ok
+test objects::tests::malformed_or_hostile_file_types_are_rejected ... ok
+test model_catalog::tests::every_row_is_self_consistent ... ok
+test objects::tests::sniff_recognises_the_image_allowlist_and_nothing_else ... ok
+test objects::tests::filenames_are_sanitised_for_the_manifest ... ok
+test passkeys::tests::clean_name_trims_falls_back_and_caps_length ... ok
+test passkeys::tests::ceremony_rejects_non_loopback_http_and_unlisted_origins ... ok
+test placement::tests::at_capacity_host_is_unsatisfiable ... ok
+test passkeys::tests::ceremony_uses_allowlist_for_https_origin ... ok
+test passkeys::tests::challenge_store_is_single_use_and_ttl_bounded ... ok
+test passkeys::tests::user_id_is_stable_per_rp_and_distinct_between_rps ... ok
+test placement::tests::labels_and_herdr_and_load ... ok
+test maintenance::tests::migration_reports_corrupt_database ... ok
+test placement::tests::managed_ssh_requires_ready_link_and_real_herdr_executable ... ok
+test placement::tests::project_placement_parses ... ok
+test placement::tests::pinned_host_admits_over_limit_and_emits_warnings ... ok
+test placement::tests::project_quota_clamps_host_capacity ... ok
+test placement::tests::project_placement_restricts_to_member_hosts_and_requires ... ok
+test placement::tests::saturated_cpu_or_mem_resources_exclude_a_host ... ok
+test placement::tests::resource_sample_age_distinguishes_fresh_stale_and_unknown ... ok
+test provider_models::tests::an_unreadable_or_empty_body_yields_no_models ... ok
+test provider_models::tests::drops_blank_duplicate_and_unreadable_catalogs ... ok
+test provider_models::tests::carries_gateway_tags_and_context_metadata ... ok
+test provider_models::tests::keeps_disabled_rows_out_of_the_enabled_set ... ok
+test provider_models::tests::declared_supply_fields_round_trip_and_survive_reprobe ... ok
+test provider_models::tests::migrates_a_legacy_string_catalog_to_enabled_rows ... ok
+test provider_models::tests::normalizes_the_anthropic_shape_with_display_names ... ok
+test provider_models::tests::normalizes_the_openai_shape_and_a_bare_array ... ok
+test provider_models::tests::union_is_stable_when_one_listing_is_empty_or_both_agree ... ok
+test provider_models::tests::surfaces_survive_the_stored_round_trip ... ok
+test provider_resolve::tests::explicit_gateway_requires_configuration_but_direct_uses_native_fallback ... ok
+test provider_resolve::tests::explicit_none_is_native ... ok
+test provider_resolve::tests::hint_strings ... ok
+test provider_resolve::tests::explicit_profile_id_wins ... ok
+test provider_resolve::tests::host_binding_native_and_profile ... ok
+test provider_models::tests::unions_the_two_listings_a_gateway_serves_per_header ... ok
+test provider_resolve::tests::host_scoped_default_beats_universal ... ok
+test provider_resolve::tests::host_scoped_profile_is_refused_on_the_wrong_host ... ok
+test provider_resolve::tests::profile_via_is_used_when_no_explicit_layer_speaks ... ok
+test provider_resolve::tests::project_layer_wins_over_profile_delivery ... ok
+test provider_resolve::tests::project_none_forces_direct_over_profile ... ok
+test provider_resolve::tests::relay_bind_validation_rejects_wildcards_and_public_addresses ... ok
+test provider_resolve::tests::relay_capability_is_read_from_either_hello_shape ... ok
+test provider_resolve::tests::request_layer_wins_over_project_and_profile ... ok
+test provider_resolve::tests::request_none_forces_direct_even_when_profile_and_project_say_via ... ok
+test provider_resolve::tests::request_route_overrides_profile_route ... ok
+test provider_resolve::tests::via_self_targets_the_hub_host_and_never_collapses ... ok
+test provider_resolve::tests::via_the_worker_host_collapses_to_direct_in_every_layer ... ok
+test provider_resolve::tests::waterfall_defaults_to_direct ... ok
+test provider_resolve::tests::universal_default_then_inventory_then_native_fallback ... ok
+test proxy::tests::forwarding_requires_exact_peer_and_unambiguous_headers ... ok
+test proxy::tests::public_origin_pins_origin_and_cannot_disable_secure_cookies ... ok
+test rate_limit::tests::peers_and_endpoints_have_independent_budgets_that_refill ... ok
+test rate_limit::tests::global_budget_bounds_distributed_attempts ... ok
+test auth::tests::legacy_data_dir_without_stamp_is_accepted_and_stamped ... ok
+test store::derive_tests::create_default_is_not_idle ... ok
+test store::derive_tests::herdr_agent_status_idle_is_idle_proof ... ok
+test store::derive_tests::entity_ready_is_running_not_idle ... ok
+test store::derive_tests::start_failure_marks_failed ... ok
+test auth::tests::unparseable_bootstrap_stamp_is_expired ... ok
+test supervise::tests::null_signal_liveness_detects_self_and_misses_unknown_pid ... ok
+test supply::tests::account_level_window_parks_every_family ... ok
+test supply::tests::backoff_ladder_is_capped ... ok
+test supply::tests::classifies_429_and_529_oppositely ... ok
+test supply::tests::family_429_parks_family_but_siblings_stay_open_then_backoff_ladder ... ok
+test supply::tests::known_reset_time_parks_until_reset_not_backoff ... ok
+test supply::tests::textual_observer_does_nothing_on_529 ... ok
+test supply::tests::workhorse_warning_is_informational_only ... ok
+test supply::tests::known_pin_is_honored_without_refusal ... ok
+test supply::tests::min_class_defers_never_downgrades ... ok
+test supply::tests::unknown_supply_pin_is_refused ... ok
+test supply::tests::model_x_incident_shape_family_cool_sibling_wins ... ok
+test supply::tests::concurrency_max_rejects_even_when_hosts_are_empty ... ok
+test supply::tests::unknown_gateway_supply_is_last_resort_and_pin_wins ... ok
+test usage_store::tests::budget_band_uses_estimate_times_tolerance ... ok
+test supply::tests::rank_priority_then_share_then_load ... ok
+test supply::tests::coordinator_only_reserve_rejects_workers ... ok
+test web::tests::rejects_unsafe_relative_paths ... ok
+test usage_store::tests::context_window_resolution_order ... ok
+test worker_watch::tests::kept_model_verdict_is_a_rejection ... ok
+test supply::tests::unknown_model_pin_is_refused_not_substituted_with_suggestions ... ok
+test worker_watch::tests::not_found_verdict_is_a_rejection ... ok
+test worker_watch::tests::unrelated_lines_have_no_verdict ... ok
+test worker_watch::tests::verdict_without_dialog_still_records_the_switch ... ok
+test worker_watch::tests::verdict_accepts_a_resolved_alias ... ok
+test workers::driver_choice_tests::a_driver_the_harness_cannot_use_is_a_bad_request ... ok
+test workers::driver_choice_tests::a_launchable_shell_pty_is_preferred_over_herdr ... ok
+test workers::driver_choice_tests::an_explicit_driver_is_honoured_verbatim ... ok
+test workers::driver_choice_tests::an_explicit_driver_the_host_cannot_launch_is_refused_not_replaced ... ok
+test workers::driver_choice_tests::an_unknown_harness_is_refused_rather_than_answered_with_a_carrier ... ok
+test supply::tests::refusal_suggestions_are_capped_at_five ... ok
+test workers::driver_choice_tests::neither_carrier_is_refused_rather_than_downgraded_to_print ... ok
+test workers::driver_choice_tests::herdr_only_falls_back_to_the_pty_drivers_not_to_print ... ok
+test ws::tests::replacement_terminal_stream_retires_stale_mode_source ... ok
+test usage_store::tests::rollup_no_events_means_no_rollup ... ok
+test usage_store::tests::rollup_folds_recorded_usage_sequence ... ok
+test rate_limit::tests::bucket_storage_is_bounded_and_idle_entries_are_reclaimed ... ok
+test usage_store::tests::rollup_leaves_unreported_channels_unknown ... ok
+test usage_store::tests::projects_folds_and_dedupes_usage_events ... ok
+test tasks::tests::migrate_on_a_fresh_db_creates_the_archive_column ... ok
+test tasks::tests::migrate_adds_archived_at_to_a_legacy_tasks_table_and_is_idempotent ... ok
+test supervise::tests::rejects_unusable_parent_pids ... ok
+test ws::tests::follow_bus_reports_lag_when_capacity_exceeded ... ok
+test supervise::tests::marker_rejects_reused_pid ... ok
+test supervise::tests::reads_own_proc_starttime ... ok
+test transport::budget_tests::post_send_link_drop_is_lost_reply_error ... ok
+test supervise::tests::pid_file_lifecycle_records_this_process_and_cleans_up ... ok
+test auth::tests::bootstrap_ttl_expires_and_rotation_resets_it ... ok
+test transport::budget_tests::pre_send_failure_is_not_writable ... ok
+test transport::budget_tests::cancelled_call_frees_its_slot ... ok
+test transport::budget_tests::bulk_reads_cannot_starve_control ... ok
+test transport::budget_tests::control_keeps_half_the_slots ... ok
+test transport::budget_tests::bulk_timeout_is_node_busy ... ok
+test store::derive_tests::append_chunks_bound_count_and_bytes_and_cover_everything ... ok
+test agent_approvals::tests::completed_grants_release_capacity_and_pending_lists_are_caller_scoped ... ok
+test supervise::tests::uptime_advances ... ok
+test attachments::tests::listing_orders_by_send_manifest_anchor ... ok
+test store::tests::stale_requested_instances_free_their_placement_slot_and_expire ... ok
+test store::tests::permission_observation_projects_effective_mode ... ok
+test store::tests::model_observation_projects_effective_id ... ok
+test ssh_hosts::tests::bridge_loss_grace_begins_only_after_daemon_probe_fails ... ok
+test store::tests::expired_enroll_token_is_rejected ... ok
+test store::tests::a_rejected_send_settles_rejected_and_a_later_settle_frame_keeps_it ... ok
+test store::tests::enroll_token_is_single_use_and_cannot_claim_an_existing_host ... ok
+test ssh_hosts::tests::daemon_snapshot_is_host_scoped_and_cannot_advance_acked_seq ... ok
+test store::auth_tests::opening_legacy_schema_preserves_records_and_adds_indexes ... ok
+test store::tests::node_epoch_change_reconciles_only_unreported_instances ... ok
+test store::tests::host_lost_obeys_offline_grace_and_reconnect_and_preserves_history ... ok
+test store::auth_tests::sqlite_query_plans_use_auth_indexes ... ok
+test store::tests::instance_configure_is_queued_and_persisted_on_the_instance ... ok
+test store::tests::a_never_acked_send_rests_unknown_until_the_journal_settles_it ... ok
+test maintenance::tests::migration_is_repeatable_and_preserves_data_without_bootstrapping ... ok
+test store::tests::operator_max_instances_override_survives_hello_and_restart ... ok
+test store::tests::placement_slots_count_node_confirmed_lifecycles_only ... ok
+test store::tests::settling_an_unknown_instance_releases_its_slot_once ... ok
+test store::tests::a_lost_accept_reconciling_row_is_converged_by_the_journal_not_a_resend ... ok
+test store::tests::instance_projection_never_infers_api_route_from_the_spec ... ok
+test store::tests::effort_observation_projects_effective_without_touching_requested ... ok
+test store::tests::launched_by_is_derived_from_mode_for_legacy_rows ... ok
+test store::tests::promoted_hook_activity_is_mirrored_without_screen_or_subagent_override ... ok
+test store::tests::model_pin_mismatch_projects_onto_instance_record ... ok
+test store::tests::duplicate_label_hosts_merge_on_reopen ... ok
+test store::auth_tests::pair_codes_use_one_candidate_expire_lock_out_and_consume_once ... ok
+test store::tests::enrolled_host_reannounces_with_its_own_node_token ... ok
+test store::tests::codex_top_efforts_round_trip_through_configure_and_reload ... ok
+test store::tests::journal_settles_commands_while_connectivity_follows_the_host_link ... ok
+test store::tests::a_remuda_launched_agent_stays_remuda_after_it_promotes ... ok
+test store::tests::legacy_failed_rows_and_the_reason_column_are_migrated ... ok
+test store::tests::legacy_effort_tier_names_normalize_by_name_not_index ... ok
+test store::auth_tests::device_lookup_is_indexed_and_legacy_migration_verifies_only_the_named_row ... ok
+test store::auth_tests::host_lookup_and_legacy_host_id_migration_are_bounded_and_bound_to_the_secret ... ok
+test store::auth_tests::device_verification_yields_writer_and_rechecks_revocation_hash_and_scope ... ok
+
+test result: ok. 194 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+
+     Running tests/api_relay.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/api_relay-69b48415091295db)
+
+running 23 tests
+test the_relay_destination_streams_sse_and_lists_two_catalogs ... ok
+test an_unroutable_api_open_does_not_break_the_link ... ok
+test a_profile_can_point_at_the_fake_gateway_and_test_it ... ok
+test relays_a_messages_request_and_streams_the_response_back ... ok
+test an_oversized_api_body_frame_is_refused_not_truncated ... ok
+test a_non_allowlisted_destination_is_refused ... ok
+test the_response_header_allowlist_drops_set_cookie ... ok
+test a_302_redirect_never_leaks_the_credential_to_the_target ... ok
+test coalescing_separates_small_delayed_writes_into_sub_cap_frames ... ok
+test an_origin_429_is_projected_into_supply_evidence ... ok
+test relays_a_chunked_request_body_larger_than_one_frame ... ok
+test two_sequential_streams_on_one_via_instance_both_egress ... ok
+test tty_attach_still_flows_while_a_relay_stream_is_hot ... ok
+test an_exited_lifecycle_journal_revokes_egress_on_proxy ... ok
+test an_auto_route_against_a_relaybind_host_still_gets_egress ... ok
+test instance_projection_carries_the_node_reported_hub_relay_route ... ok
+test proxy_reconnect_gets_fresh_api_egress_before_next_open ... ok
+test the_hub_egress_coalesces_and_delivers_incrementally_before_end ... ok
+test a_producer_stalls_at_the_credit_cap ... ok
+test a_superseded_socket_drop_does_not_tear_down_the_new_link ... ok
+test a_rescoped_profile_is_not_redelivered_on_proxy_reconnect ... ok
+test a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes ... ok
+test open_time_rejections_all_emit_a_terminal_end ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.10s
+
+     Running tests/api_route_refusals.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/api_route_refusals-2e805e875855fc2c)
+
+running 8 tests
+test an_old_worker_naming_a_bogus_host_gets_400_unknown_host_not_409_unsupported ... ok
+test via_the_worker_host_collapses_to_direct ... ok
+test unknown_via_host_is_a_400_on_dispatch_and_create ... ok
+test profile_delivery_via_is_resolved_and_none_forces_direct ... ok
+test offline_via_host_is_a_409_before_allocation ... ok
+test direct_net_without_a_relay_bind_is_409_and_auto_falls_back_to_hub_relay ... ok
+test direct_net_is_allowed_once_a_loopback_private_relay_bind_is_set ... ok
+test old_worker_and_old_proxy_nodes_are_409_unsupported ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.77s
+
+     Running tests/attachments.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/attachments-afaf4706b3a47e66)
+
+running 6 tests
+test a_traversal_shaped_filename_is_rejected ... ok
+test an_instance_credential_reads_its_own_attachment_as_base64 ... ok
+test arbitrary_files_stage_and_read_back_with_attachment_disposition ... ok
+test an_attachment_over_the_inline_cap_is_refused_with_its_size_and_type ... ok
+test another_sessions_attachment_is_refused ... ok
+test listing_covers_this_session_and_operators_must_name_one ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.88s
+
+     Running tests/changes.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/changes-5a3dbaf7e3a69e11)
+
+running 2 tests
+test changes_proxy_returns_node_error_without_caching_it ... ok
+test changes_proxy_enforces_operator_and_maps_offline_states ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.85s
+
+     Running tests/cross_host_messaging.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/cross_host_messaging-a26de973a6115aab)
+
+running 1 test
+test agent_messages_remote_instance_within_scope_and_journals_both_sides ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.99s
+
+     Running tests/delegated_decisions.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/delegated_decisions-07de6807c550a9e5)
+
+running 14 tests
+test a_parents_plan_review_answer_wins_the_real_node_cas_once ... ok
+test agent_answer_to_approval_kind_is_forbidden_even_when_owned ... ok
+test agent_interactions_are_operator_only_when_switch_is_off ... ok
+test an_answer_the_real_node_rejects_does_not_commit ... ok
+test agent_answer_to_unowned_interaction_is_forbidden ... ok
+test agent_answer_to_owned_and_self_interaction_reaches_node_cas ... ok
+test agent_lists_own_and_direct_child_pending_but_not_sibling_or_excluded ... ok
+test bypass_posture_child_interaction_is_refused_and_hidden ... ok
+test middleware_admits_only_the_literal_interaction_predicates ... ok
+test the_child_cannot_answer_or_even_see_its_own_plan_review ... ok
+test bypass_posture_parent_cannot_answer_or_see_child_pending ... ok
+test in_memory_approval_grant_is_filtered_from_agent_page_after_merge ... ok
+test operators_still_see_and_pin_every_pending_with_switch_on ... ok
+test when_human_and_parent_answer_concurrently_one_wins_and_one_is_superseded ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.07s
+
+     Running tests/delegated_decisions_2.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/delegated_decisions_2-2f0864d71a15096d)
+
+running 9 tests
+test audit_answered_by_level_last_when_root_operator ... ok
+test bot_relayed_answer_keeps_bot_answer_row_in_addition_to_answered_row ... ok
+test audit_rows_for_one_subject_reconstruct_every_hop_in_id_order ... ok
+test chain_walk_tolerates_a_deleted_middle_ancestor ... ok
+test in_memory_one_shot_approval_answer_leaves_an_answered_audit_row ... ok
+test audit_answered_by_level_one_when_direct_parent ... ok
+test audit_answered_by_level_zero_when_self ... ok
+test node_rpc_frame_carries_truthful_origin_and_bound_instance ... ok
+test plain_human_answer_writes_one_answered_row_and_no_bot_relay_row ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.11s
+
+     Running tests/dispatch_driver.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/dispatch_driver-82f6522df822b7b5)
+
+running 7 tests
+test a_host_with_neither_carrier_is_refused_rather_than_run_on_print ... ok
+test an_explicit_driver_the_host_cannot_launch_is_refused_not_replaced ... ok
+test the_roster_records_the_driver_the_node_reports_not_the_one_requested ... ok
+test a_herdr_only_host_dispatches_on_claude_pty_never_print ... ok
+test a_native_carrier_host_dispatches_on_shell_pty_end_to_end ... ok
+test a_failure_after_provisioning_gives_back_the_worktree ... ok
+test a_native_profile_pin_launches_with_no_delegation_and_no_token ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.51s
+
+     Running tests/durability.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/durability-3681524ead4a647f)
+
+running 2 tests
+test follow_backpressure_does_not_duplicate_journal ... ok
+test hub_restart_keeps_host_journal_interactions_and_device ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.12s
+
+     Running tests/fleet.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/fleet-e72b3e9c63cffd75)
+
+running 2 tests
+test broadcast_fans_out_with_filters_and_idempotency ... ok
+test two_nodes_placement_fleet_and_unsatisfiable ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.92s
+
+     Running tests/gate_queue.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/gate_queue-4bd1839b5fb60709)
+
+running 18 tests
+test gate_run_carries_the_merged_step_timeouts ... ok
+test land_losing_the_cas_is_reverified_onto_new_main_then_lands ... ok
+test passing_verify_records_the_merge_ref_on_the_job ... ok
+test verify_job_runs_on_a_lane_and_passes ... ok
+test unknown_lane_and_bad_inputs_are_rejected ... ok
+test push_from_home_lands_via_the_home_host_then_unpins ... ok
+test cancel_a_running_job_sends_gate_cancel_and_finishes_canceled ... ok
+test cancel_a_queued_job_marks_it_canceled_without_a_node_call ... ok
+test home_land_base_moved_requeues_a_verify_instead_of_pushing ... ok
+test cancel_while_running_a_home_land_never_lands ... ok
+test restart_during_a_home_push_does_not_wedge_the_cancel_grace ... ok
+test cancel_during_a_home_push_that_lands_reports_landed ... ok
+test land_jobs_are_serialized_and_the_second_lands_after ... ok
+test failed_job_persists_evidence_fields_and_a_fetchable_log_object ... ok
+test ref_retention_drops_pins_for_an_unlanded_verify ... ok
+test two_verify_jobs_run_in_parallel_on_two_lanes ... ok
+test fifo_order_is_preserved_on_one_lane ... ok
+test a_late_run_reply_after_the_cancel_grace_changes_nothing ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.91s
+
+     Running tests/host_files.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/host_files-bab15259164c1492)
+
+running 8 tests
+test staging_rejects_oversize_and_unsanitized_names ... ok
+test human_operator_gets_search_results ... ok
+test human_operator_gets_list_and_read_results ... ok
+test agent_origin_is_always_403 ... ok
+test search_rejects_bad_query_and_unknown_workspace ... ok
+test staged_screenshot_is_typed_and_served_as_an_image ... ok
+test missing_and_offline_hosts_are_rejected ... ok
+test node_stages_with_its_own_token_and_another_host_cannot ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.81s
+
+     Running tests/hub.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/hub-adbb5f9abcca7fe2)
+
+running 57 tests
+test auth_reject_http_and_origin ... ok
+test node_ws_rejects_missing_token ... ok
+test enroll_token_requires_an_authenticated_device ... ok
+test login_and_pair_attempts_are_limited_by_peer_not_forwarded_headers ... ok
+test healthz_ok ... ok
+test node_auth_must_match_upgrade_bearer ... ok
+test journal_duplicate_seq_is_acked ... ok
+test revoking_current_device_expires_httponly_cookie ... ok
+test second_hello_on_socket_is_rejected ... ok
+test restart_marks_hosts_offline_and_rejects_create ... ok
+test access_code_pairs_devices_but_never_enrolls_a_node ... ok
+test follow_tty_relays_snapshot_input_and_resize ... ok
+test repeat_pairing_under_a_shared_device_name_succeeds ... ok
+test fake_node_hello_heartbeat_append_then_http_and_follow ... ok
+test bootstrap_cannot_impersonate_existing_host_but_host_token_can_reconnect ... ok
+test node_cannot_append_to_another_hosts_journal ... ok
+test create_instance_persists_delegation_and_provider_profile ... ok
+test concurrent_same_id_reposts_forward_once ... ok
+test a_send_the_node_rejects_settles_rejected_and_is_listed_by_the_new_route ... ok
+test follow_uses_cookie_or_header_and_never_query_token ... ok
+test create_instance_fails_when_node_rejects_cwd ... ok
+test stale_socket_does_not_offline_live_host ... ok
+test get_command_during_in_flight_send_reports_the_attempt_outcome ... ok
+test same_command_id_with_different_payload_conflicts ... ok
+test agent_scoped_create_cannot_set_args_or_binary_path ... ok
+test same_command_id_replay_with_out_of_range_anchor_index_matches ... ok
+test configure_replay_while_accepted_is_409_in_flight ... ok
+test same_id_repost_after_attachment_expiry_replays ... ok
+test tty_binary_frames_are_scoped_to_the_registering_socket ... ok
+test configure_replay_before_forward_registration_is_409_in_flight ... ok
+test instance_configure_is_journaled_and_persisted ... ok
+test same_command_id_with_different_mode_conflicts ... ok
+test configure_concurrent_inserts_loser_and_replay_are_409_in_flight ... ok
+test configure_replay_in_flight_is_409_then_returns_stored_original ... ok
+test malformed_command_id_is_rejected_with_400 ... ok
+test same_command_id_changed_top_level_anchor_index_conflicts ... ok
+test same_id_replay_with_whitespace_attachment_id_matches ... ok
+test same_command_id_posted_three_times_forwards_and_journals_once ... ok
+test offline_host_exits_in_background_and_is_only_listed_in_history ... ok
+test concurrent_retries_against_dead_forward_all_report_unforwarded ... ok
+test queued_offline_configure_replay_is_rejected_and_never_forwards ... ok
+test queued_unforwarded_send_with_expired_attachment_is_rejected ... ok
+test offline_queued_command_forwards_only_when_same_id_is_reposted ... ok
+test configure_replay_is_read_only_and_keeps_newer_configuration ... ok
+test concurrent_same_id_configure_merges_and_forwards_once ... ok
+test forward_intent_is_released_when_the_frame_was_never_queued ... ok
+test host_launch_defaults_round_trip_and_a_session_replaces_them ... ok
+test concurrent_same_id_first_posts_with_different_keys_one_conflicts ... ok
+test human_command_id_replayed_by_agent_conflicts ... ok
+test get_configure_during_rolled_back_forward_never_walks_back ... ok
+test command_status_endpoint_returns_row_and_enforces_principals ... ok
+test same_command_id_with_different_nested_prompt_conflicts ... ok
+test same_command_id_changed_nested_attachment_metadata_conflicts ... ok
+test a_send_the_node_never_acks_rests_reconciling_and_is_never_self_failed ... ok
+test model_pin_mismatch_is_served_on_public_instance_json ... ok
+test command_id_replay_enforces_idempotency_key_precedence ... ok
+test command_stays_queued_when_node_offline_and_is_not_resent ... ok
+
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.25s
+
+     Running tests/hub_store.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/hub_store-5542279a758cd902)
+
+running 6 tests
+test bounded_ingest_yields_to_a_concurrent_point_read ... ok
+test window_flags_and_before_seq_descend_to_full_history ... ok
+test long_reader_does_not_block_writer_or_unrelated_read ... ok
+test journal_http_response_exposes_window_metadata ... ok
+test journal_window_and_durable_seq_share_one_snapshot ... ok
+test journal_endpoint_windows_a_200k_event_journal ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.32s
+
+     Running tests/hub_store_evidence.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/hub_store_evidence-dd502ba1e400c1bb)
+
+running 1 test
+test hub_store_evidence ... ignored, run on demand; seeds a 200k-event journal (~30s)
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lifecycle.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/lifecycle-fe974e797beee32c)
+
+running 4 tests
+test a_late_create_ack_converges_from_the_journal_without_a_resend ... ok
+test journal_replay_promotes_and_demotes_a_terminal_instance ... ok
+test journal_replay_derives_lifecycle_and_herdr_idle ... ok
+test pty_create_stays_accepted_with_a_queued_prompt_and_native_dialog ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.66s
+
+     Running tests/node_busy.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/node_busy-fe735c4805248627)
+
+running 2 tests
+test saturated_control_budget_refuses_create_with_503_and_fails_row ... ok
+test saturated_configure_refuses_503_and_replay_reproduces_it ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.70s
+
+     Running tests/object_pull.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/object_pull-4621e5501b8a6ae6)
+
+running 4 tests
+test authorized_pull_returns_the_object_inline ... ok
+test large_object_is_streamed_as_chunks_and_reassembled ... ok
+test pull_enforces_the_hub_attachment_cap ... ok
+test pull_is_refused_for_another_host_or_instance ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+
+     Running tests/objects.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/objects-50dff96f5e8a7261)
+
+running 12 tests
+test an_oversize_content_length_is_rejected_before_the_body ... ok
+test upload_sniffs_the_type_and_returns_a_derived_name ... ok
+test upload_requires_authentication_and_a_known_instance ... ok
+test upload_rejects_an_attachment_over_the_size_cap ... ok
+test exiting_an_instance_drops_its_staged_attachments ... ok
+test upload_rejects_a_content_type_that_contradicts_the_bytes ... ok
+test re_uploading_identical_bytes_reuses_the_object ... ok
+test non_image_types_stage_as_files_but_fake_images_are_downgraded ... ok
+test agent_origin_cannot_upload_and_human_can ... ok
+test the_owning_node_can_read_bytes_and_another_host_cannot ... ok
+test send_refuses_more_attachments_than_the_per_message_cap ... ok
+test send_accepts_only_attachments_bound_to_that_instance ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.72s
+
+     Running tests/openapi.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/openapi-e43379d62ba04157)
+
+running 4 tests
+test command_record_schema_matches_the_serialized_struct ... ok
+test overlapping_web_client_operations_exist ... ok
+test openapi_is_31_and_covers_source_routes_and_methods ... ok
+test journal_page_schema_matches_the_serialized_response ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+
+     Running tests/passkeys.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/passkeys-28cb46018a43d92b)
+
+running 7 tests
+test register_requires_a_paired_device ... ok
+test conditional_mediation_is_reflected_in_options ... ok
+test wrong_origin_and_bad_csrf_are_rejected ... ok
+test challenges_are_single_use ... ok
+test deleted_passkey_and_counter_rollback_fail_login ... ok
+test duplicate_credential_id_conflicts ... ok
+test register_list_login_and_rename_full_ceremony ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+
+     Running tests/placement_freshness.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/placement_freshness-773597f74c3102eb)
+
+running 4 tests
+test hosts_carry_sampled_at_stamped_by_the_hub ... ok
+test fresh_saturation_refuses_auto_but_pins_warn_and_admit ... ok
+test stale_saturated_sample_refreshes_and_auto_placement_admits ... ok
+test stale_sample_that_cannot_be_refreshed_does_not_refuse ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.72s
+
+     Running tests/projects.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/projects-58a3d7d599a9a25a)
+
+running 12 tests
+test saturated_resources_exclude_a_host_in_project_placement ... ok
+test address_owner_uniqueness_is_409 ... ok
+test placement_project_resolves_member_hosts_and_folds_defaults ... ok
+test delegation_tree_chain_presets_scope_and_views ... ok
+test fan_out_limit_returns_409 ... ok
+test dispatch_holder_per_project_is_unique_by_default_but_relaxable ... ok
+test project_scoped_coordinator_sees_only_its_project ... ok
+test project_crud_and_members_across_two_fake_hosts ... ok
+test delegation_cycle_is_rejected_even_if_columns_are_tampered ... ok
+test leaf_worker_gets_403_on_projects_providers_and_other_projects ... ok
+test dispatching_without_grant_or_widened_scope_is_403 ... ok
+test depth_limit_returns_409_and_policy_raises_it ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.25s
+
+     Running tests/providers.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/providers-22cc6d9da44b7812)
+
+running 12 tests
+test provider_create_rejects_missing_token ... ok
+test discover_unions_the_two_catalogs_a_gateway_serves_per_header ... ok
+test discover_normalizes_both_upstream_shapes_without_echoing_the_token ... ok
+test a_legacy_string_catalog_migrates_to_structured_rows ... ok
+test discover_reuses_a_saved_profile_token_and_test_returns_the_same_shape ... ok
+test structured_models_round_trip_and_default_model_must_be_enabled ... ok
+test discover_requires_auth_a_base_url_and_reports_unreachable ... ok
+test provider_round_trip_encrypts_secret_and_test_is_unreachable ... ok
+test delivery_fields_are_stored_and_applied ... ok
+test explicit_gateway_placement_skips_hosts_without_a_default_provider ... ok
+test provider_scope_default_and_host_filter ... ok
+test missing_provider_defaults_reject_gateway_and_preserve_native_fallback_hint ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.33s
+
+     Running tests/public_proxy.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/public_proxy-9ccec97c4d01f2b0)
+
+running 2 tests
+test trusted_proxy_login_budgets_are_per_forwarded_client ... ok
+test only_trusted_https_or_configured_https_upgrades_cookies ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+
+     Running tests/push.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/push-20c63726e4e523c4)
+
+running 1 test
+test pairing_list_revoke_and_push_with_follow_suppress ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.46s
+
+     Running tests/resume.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/resume-cd5a5543c38893d8)
+
+running 2 tests
+test resume_creates_a_linked_child_on_both_targets_and_refuses_agents ... ok
+test resume_redelivers_current_gateway_profile_and_host_scoped_secret ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.48s
+
+     Running tests/ssh_hosts.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/ssh_hosts-6e8833071ed31bf7)
+
+running 6 tests
+test invalid_and_missing_binary_report_actionable_errors ... ok
+test drop_and_failed_bind_cancel_ssh_supervision ... ok
+test ssh_proxy_teardown_runs_api_relay_link_loss ... ok
+test ssh_worker_drop_forwards_api_cancel_to_proxy ... ok
+test bridge_loss_preserves_instance_then_replays_from_hub_watermark ... ok
+test api_supervises_reconnect_restart_and_removal ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.94s
+
+     Running tests/supply.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/supply-4e068789667dcc54)
+
+running 7 tests
+test catalog_endpoint_lists_revisioned_capabilities ... ok
+test textual_429_via_fake_node_cools_family_and_529_does_not ... ok
+test usage_events_flow_through_journal_into_aggregation ... ok
+test unknown_pin_refused_on_resolve_and_known_pin_honored ... ok
+test account_concurrency_max_enforced_across_two_fake_hosts ... ok
+test dispatch_task_spec_defers_below_min_class_and_writes_ledger ... ok
+test family_window_admits_sibling_account_window_parks_all ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.38s
+
+     Running tests/tasks.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/tasks-587bc66b7daf6c01)
+
+running 8 tests
+test split_inherits_the_mandate_chain_and_respects_depth_policy ... ok
+test own_claim_conflicts_are_rejected_and_check_judges_a_synthetic_diff ... ok
+test terminal_tasks_release_claims ... ok
+test scoped_agents_are_enforced_on_task_routes ... ok
+test dependency_edges_unlock_only_from_a_landed_sha ... ok
+test placement_ledger_round_trip_and_state_transitions ... ok
+test state_machine_accepts_legal_lifecycle_and_rejects_illegal_jumps ... ok
+test board_projects_states_placement_failures_and_the_archive_flag ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.22s
+
+     Running tests/tty_relay.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/tty_relay-ef5c212d493c7b74)
+
+running 19 tests
+test a_legacy_gone_watch_row_still_deserializes ... ok
+test an_unvouched_empty_inventory_leaves_rows_alone ... ok
+test deleting_with_the_node_offline_still_removes_the_hub_record ... ok
+test stop_for_an_instance_the_node_forgot_settles_as_exited ... ok
+test a_vouched_empty_inventory_still_settles_lost_rows ... ok
+test a_requested_row_survives_the_epoch_reconcile ... ok
+test a_done_worker_keeps_its_sha_when_its_instance_is_lost ... ok
+test agents_cannot_delete_instances ... ok
+test node_restart_reconciles_lost_instances_and_frees_the_cap ... ok
+test max_instances_override_and_reconciliation_survive_a_hub_restart ... ok
+test deleting_a_live_instance_requires_force_and_settles_it_first ... ok
+test deleting_a_stopped_instance_removes_it_and_is_idempotent ... ok
+test a_lost_instance_fails_its_worker_and_frees_the_slot ... ok
+test a_node_restart_leaves_another_hosts_rows_alone ... ok
+test unacknowledged_creates_expire_and_release_the_placement_cap ... ok
+test failed_tty_input_and_resize_surface_a_diagnostic ... ok
+test tty_output_resumes_on_an_open_follow_socket_after_a_node_reconnect ... ok
+test cached_snapshot_is_sent_when_the_node_cannot_be_attached ... ok
+test an_attach_without_snapshot_bytes_stays_live ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.80s
+
+     Running tests/watch.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/watch-8ec718b4c6bf2b25)
+
+running 22 tests
+test first_run_dialog_classifies_from_a_raw_ring_tail ... ok
+test stop_closes_without_reclaiming ... ok
+test gone_when_carrier_reports_closed ... ok
+test new_done_then_echo_transitions_roster ... ok
+test idle_after_api_error_is_classified ... ok
+test answer_sends_tty_write_keys ... ok
+test replace_retires_and_redispatches_same_brief ... ok
+test failed_carrier_lifecycle_classifies_without_journal ... ok
+test stalled_requires_an_aged_quiet_turn ... ok
+test a_gateway_resolving_the_pin_to_an_upstream_name_is_not_blocked ... ok
+test screenless_idle_after_api_error_does_not_overstate_failure ... ok
+test nudge_is_file_transport_and_throttled ... ok
+test recovered_error_then_done_before_exit_is_done_not_failed ... ok
+test gone_carries_the_settled_rows_own_reason ... ok
+test resume_relaunches_in_same_worktree_and_resends_brief ... ok
+test blocked_dialog_is_classified_and_echo_suppressed ... ok
+test an_unknown_source_readback_clears_a_stale_launch_divergence ... ok
+test a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids ... ok
+test failed_first_turn_on_screenless_worker_is_classified_and_persisted ... ok
+test first_run_dialog_screens_classify_blocked_with_their_titles ... ok
+test a_mid_session_model_switch_after_an_honoured_launch_never_blocks ... ok
+test switch_model_confirms_only_when_dialog_shown ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.22s
+
+     Running tests/web.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/web-d61bb5424e93b967)
+
+running 4 tests
+test cache_headers_match_asset_class_and_missing_assets_404 ... ok
+test raw_static_traversals_return_404_without_leaking_files ... ok
+test static_symlinks_cannot_escape_even_via_spa_fallback ... ok
+test security_headers_cover_assets_api_errors_and_upgrade_rejections ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/workers.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/workers-de6a057a219b19f0)
+
+running 16 tests
+test dispatch_rejects_brief_and_unknown_project ... ok
+test dispatch_rejects_unknown_capability_value ... ok
+test agent_origin_create_with_computer_use_is_refused_before_approval_and_placement ... ok
+test duplicate_worker_name_conflicts ... ok
+test hostcap_reports_capacity_and_blocks ... ok
+test dispatch_pin_admits_over_cpu_ceiling_but_auto_dispatch_refuses ... ok
+test dispatch_warns_when_honored_pin_differs_from_project_workhorse ... ok
+test force_retire_working_worker ... ok
+test port_blocks_allocate_uniquely_and_exhaust ... ok
+test dispatch_honors_known_model_pin_and_provisions ... ok
+test instance_create_refuses_codex_unattended_spellings_with_computer_use ... ok
+test dispatch_refuses_unknown_model_pin_without_provisioning ... ok
+test dispatch_provisions_records_and_launches ... ok
+test state_done_requires_sha_and_blocked_requires_reason ... ok
+test retire_refuses_working_then_force_reclaims ... ok
+test dispatch_refuses_computer_use_for_every_harness_without_downgrading ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.59s
+
+     Running tests/workspaces.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/workspaces-7d901d038f4cf907)
+
+running 1 test
+test workspace_routes_require_settlement_persist_and_forbid_agents ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.28s
+
+     Running tests/worktree.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/worktree-e54a39346a514ab5)
+
+running 1 test
+test worktree_list_and_create_forward_to_node ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+
+     Running tests/worktree_pool.rs (/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/deps/worktree_pool-bf88cda6a84d47f2)
+
+running 10 tests
+test full_pool_defers_with_429_and_records_no_lease ... ok
+test retire_of_a_sole_holder_returns_and_parks_instead_of_removing ... ok
+test retire_without_a_lease_uses_the_legacy_remove_path ... ok
+test delete_clears_a_preexisting_attach_holder_on_the_lease_row ... ok
+test retire_of_a_shared_slot_is_refused_and_never_reaches_remove ... ok
+test reuse_to_root_lands_a_null_name_dot_key_row ... ok
+test second_task_shares_refcount_and_queues ... ok
+test lease_forwards_only_the_safe_params_and_records_a_pool_row ... ok
+test retire_resolves_a_pool_suffixed_slot_back_to_the_worker_name ... ok
+test deleting_an_instance_returns_its_task_lease_without_a_holder_row ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+
+   Doc-tests remuda_hub
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+EXIT=0

@@ -1,0 +1,15 @@
+   Compiling agent-client-protocol v2.1.0
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 32.38s
+     Running tests/usage_native_rollup.rs (target-cu2/debug/deps/usage_native_rollup-4b9714b83b209a0a)
+
+running 1 test
+test a_native_shell_pty_claude_session_reports_a_usage_rollup has been running for over 60 seconds
+test a_native_shell_pty_claude_session_reports_a_usage_rollup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 72.87s
+

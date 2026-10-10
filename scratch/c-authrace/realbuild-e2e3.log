@@ -1,0 +1,20 @@
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.30s
+
+[WebServer]      Running `target-authrace/debug/examples/hub_e2e`
+
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a10e22-4330-761e-9ba9-b21c0dd2bc42","upstream":"http://127.0.0.1:58881","viaHost":null}
+
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 235 ms
+[WebServer] 
+
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+
+Running 1 test using 1 worker
+
+[1/1] [chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:130:1 › an offline first visit through the router loads a never-opened real route from the precache
+[chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:130:1 › an offline first visit through the router loads a never-opened real route from the precache
+[pwa-realbuild] vite build finished in 1499 ms
+
+  1 passed (6.5s)

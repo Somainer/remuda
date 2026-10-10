@@ -1,0 +1,91 @@
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s
+
+[WebServer]      Running `target-authrace/debug/examples/hub_e2e`
+
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a10e44-4f26-72e0-a215-1c73b28d862d","upstream":"http://127.0.0.1:58881","viaHost":null}
+
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 197 ms
+[WebServer] 
+
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+
+Running 3 tests using 1 worker
+
+[1/3] [chromium] › tests/e2e/offline-outbox.hub.spec.ts:275:1 › offline sends are queued and delivered exactly once after reconnect
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+
+[WebServer] 2026-10-05T22:52:04.451878Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e44-5f75-7760-bd60-069a61e62061 response={"jsonrpc":"2.0","id":"016705ab-6e57-4b6d-b4f4-4f2fe6c50fec","result":{"ok":true,"instanceId":"ins_01a10e44-5f73-76b0-8420-a0c5ada01b9a"}}
+
+[WebServer] 2026-10-05T22:52:09.370344Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e44-705d-72c6-bbf3-cc335d5f0d94 response={"jsonrpc":"2.0","id":"6d643b38-ef0a-4746-be4f-f7c3c04a9303","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:52:09.745687Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e44-70cf-7aa1-9c4a-97f2ad10519b response={"jsonrpc":"2.0","id":"20866cb1-5838-4997-9d28-1b6d704e122e","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:52:13.167722Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e44-81ec-7600-a896-38a35fe88178 response={"jsonrpc":"2.0","id":"f1babb8a-69ba-48c5-aff4-817fccab3624","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:52:13.174104Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a10e44-5f73-76b0-8420-a0c5ada01b9a device_id=dev_01a10e44-7e5e-73ea-b7ef-5118a66f39ed forced=true
+
+[2/3] [chromium] › tests/e2e/offline-outbox.hub.spec.ts:323:1 › an offline-queued message survives a reload while the Hub is still off and sends once after
+[WebServer] 2026-10-05T22:52:16.131046Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e44-8d15-7086-8a87-964302829df3 response={"jsonrpc":"2.0","id":"ef171a7f-ce5f-4c12-a7a6-bd9d41090d22","result":{"ok":true,"instanceId":"ins_01a10e44-8d14-767e-902d-5d8b095d07a3"}}
+
+[WebServer] 6:52:18 AM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:794:10
+[WebServer]     792 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     793 |      }
+[WebServer]     794 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     795 |    }
+[WebServer]     796 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1748:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2360:17
+[WebServer] 
+
+[WebServer] 6:52:18 AM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:794:10
+[WebServer]     792 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     793 |      }
+[WebServer]     794 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     795 |    }
+[WebServer]     796 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1748:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2360:17
+[WebServer] 
+
+[WebServer] 2026-10-05T22:52:48.726886Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e44-9352-77cb-8cbb-585808b3c63c response={"jsonrpc":"2.0","id":"5053fca2-5a15-4f98-82d1-da54869f6793","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:52:49.624161Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e45-1055-7229-8940-328bbcf42724 response={"jsonrpc":"2.0","id":"99b8cb4b-bed2-4576-b488-978b598870ea","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:52:49.630123Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a10e44-8d14-767e-902d-5d8b095d07a3 device_id=dev_01a10e45-0cc1-7314-b1d0-6aad65e306ef forced=true
+
+  1) [chromium] › tests/e2e/offline-outbox.hub.spec.ts:323:1 › an offline-queued message survives a reload while the Hub is still off and sends once after 
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 0
+
+    Call Log:
+    - Timeout 30000ms exceeded while waiting on the predicate
+
+      363 |   await expect
+      364 |     .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    > 365 |     .toBe(1);
+          |      ^
+      366 |   await expect
+      367 |     .poll(
+      368 |       async () =>
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/offline-outbox.hub.spec.ts:365:6
+
+    Error Context: test-results/offline-outbox.hub-an-offl-35ef9-ll-off-and-sends-once-after-chromium/error-context.md
+
+    Error Context: test-results/offline-outbox.hub-an-offl-35ef9-ll-off-and-sends-once-after-chromium/error-context.md
+
+
+[3/3] [chromium] › tests/e2e/offline-outbox.hub.spec.ts:378:1 › a committed POST whose browser response is lost retries with replayed:true and runs once
+  1 failed
+    [chromium] › tests/e2e/offline-outbox.hub.spec.ts:323:1 › an offline-queued message survives a reload while the Hub is still off and sends once after 
+  1 did not run
+  1 passed (50.4s)

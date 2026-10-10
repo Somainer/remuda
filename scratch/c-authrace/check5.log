@@ -1,0 +1,45 @@
+    Checking remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+warning: unused variable: `spec`
+    --> crates/remuda-driver/src/shell_pty.rs:1065:19
+     |
+1065 |             (Some(spec), Target::Agent { resume: Some(session_id), .. }) => {
+     |                   ^^^^ help: if this is intentional, prefix it with an underscore: `_spec`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `catalog_refresh_task` is never read
+    --> crates/remuda-driver/src/shell_pty.rs:1179:64
+     |
+1179 |         let mut catalog_refresh_task: Option<JoinHandle<()>> = None;
+     |                                                                ^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `is_current_process` is never used
+    --> crates/remuda-driver/src/claude_print.rs:2680:19
+     |
+2583 | impl TranscriptMapper {
+     | --------------------- method in this implementation
+...
+2680 |     pub(crate) fn is_current_process(&self) -> bool {
+     |                   ^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+error: missing documentation for a struct field
+   --> crates/remuda-driver/src/claude_transcript.rs:668:5
+    |
+668 |     pub lines: Vec<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: requested on the command line with `-D missing-docs`
+
+error: missing documentation for a struct field
+   --> crates/remuda-driver/src/claude_transcript.rs:669:5
+    |
+669 |     pub provenance: TailProvenance,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `remuda-driver` (lib) generated 3 warnings
+error: could not compile `remuda-driver` (lib) due to 2 previous errors; 3 warnings emitted

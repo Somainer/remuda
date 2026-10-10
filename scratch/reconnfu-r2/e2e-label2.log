@@ -1,0 +1,23 @@
+[2026-09-29T03:00:47+08:00] waiting for gate-e2e.lock
+[2026-09-29T03:00:47+08:00] acquired gate-e2e.lock
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s
+[WebServer]      Running `/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/examples/hub_e2e`
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a0e964-246c-744c-9beb-275d9eb529c2","upstream":"http://127.0.0.1:58881","viaHost":null}
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 211 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+Running 1 test using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+[WebServer] 2026-09-28T19:00:54.393007Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e964-3789-773d-b3b7-3ef2f763f91e response={"jsonrpc":"2.0","id":"ea7b2c6c-ceb8-4d1f-91d9-b8ce58d591ec","result":{"ok":true,"instanceId":"ins_01a0e964-3788-7183-a889-21926b129e88"}}
+[WebServer] 2026-09-28T19:00:56.799342Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e964-4034-7615-8db7-c38bddccbcdd response={"jsonrpc":"2.0","id":"11d7041e-bcc6-4962-a1c8-a9eb40fba4fc","result":{"ok":true}}
+[WebServer] 2026-09-28T19:01:07.620867Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e964-6ba1-7264-98b5-b1c899e7694a response={"jsonrpc":"2.0","id":"95c1cbdc-63aa-4564-b339-3bbfcf1557f8","result":{"ok":true}}
+[WebServer] 2026-09-28T19:01:07.627484Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e964-3788-7183-a889-21926b129e88 device_id=dev_01a0e964-67fe-7524-af6b-c16704885685 forced=true
+  ✓  1 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:517:1 › a Hub-accepted send shows its delivered label on the still-visible bubble until the journal join (16.8s)
+
+  1 passed (19.2s)
+[2026-09-29T03:01:08+08:00] playwright exit 0
+[2026-09-29T03:01:08+08:00] EXIT 0

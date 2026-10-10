@@ -1,0 +1,13 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.10s
+     Running tests/adapters_parity.rs (target-cu2/debug/deps/adapters_parity-a702ce29734daa1d)
+
+running 4 tests
+test fake_grok_question_frames_reach_the_adapter ... ok
+test fake_grok_shell_and_write_frames_reach_the_adapter ... ok
+test fake_grok_non_shell_call_after_shell_has_no_terminal_log ... ok
+test codex_and_grok_adapter_dumps_are_journal_diff_parity ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.94s
+

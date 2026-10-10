@@ -1,0 +1,13 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.68s
+     Running tests/usage_transcript.rs (target-fs2/debug/deps/usage_transcript-cb085e58e2324823)
+
+running 2 tests
+usage observations=24 distinct=24 dups=[]
+usage observations=24 distinct=24 dups=[]
+test one_usage_observation_per_finished_assistant_message_with_known_cache_buckets ... ok
+usage observations=24 distinct=24 dups=[]
+test a_fresh_mapper_replaying_the_transcript_re_emits_but_hub_dedupes ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+

@@ -1,0 +1,124 @@
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s
+[WebServer]      Running `/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/examples/hub_e2e`
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:59280","token":"e2e-bootstrap-token","hostId":"hst_01a0e533-3581-7084-8d82-4cadd3409ac9","upstream":"http://127.0.0.1:59281","viaHost":null}
+[WebServer] 7:28:54 AM [vite] (client) Re-optimizing dependencies because lockfile has changed
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 224 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:59289/
+
+Running 11 tests using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+[WebServer] 2026-09-27T23:29:00.312394Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-4f28-76b9-b506-f00e7e0e2187 response={"jsonrpc":"2.0","id":"5e76d940-f18e-4fb7-a54b-29d13fef804c","result":{"ok":true,"instanceId":"ins_01a0e533-4f26-72f3-bb61-d7fe4a898da5"}}
+[WebServer] 2026-09-27T23:29:03.869249Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-5c18-7ad1-8afe-1ff9ab25b7e4 response={"jsonrpc":"2.0","id":"7e2cc220-02f5-444c-a00b-4c4ad1df65d0","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:04.276387Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-5f11-75e0-8b87-e0db165d832f response={"jsonrpc":"2.0","id":"b306fabf-40c1-4e6d-95c8-8eb3bdd0fd2a","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:04.716073Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-60c8-704e-91e0-239b96301525 response={"jsonrpc":"2.0","id":"ab4ebb68-fc99-44a5-8c5a-acb27dafab07","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:04.722907Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e533-4f26-72f3-bb61-d7fe4a898da5 device_id=dev_01a0e533-498b-7622-ab37-c53f5ad1fb56 forced=true
+  ✓   1 [chromium] › tests/e2e/hub-live.spec.ts:140:1 › device login, hosts, create/send/close, follow, approvals (6.8s)
+[WebServer] 2026-09-27T23:29:06.775575Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-685a-71fc-821f-87fe72d4b73f response={"jsonrpc":"2.0","id":"8122d3b3-4d6f-47ad-ab5c-ab4613f8f040","result":{"ok":true,"instanceId":"ins_01a0e533-6858-77de-872a-33502aa902bc"}}
+[WebServer] 2026-09-27T23:29:07.943752Z  INFO remuda_hub::objects: attachment.uploaded object_id=obj_01a0e533-6d66-7519-a523-ea16f1c3c636 digest=adc5413403ee067dd71eee67f9be6a78be834b05372737f7307fad4caea0cb01 bytes=88 kind=image media_type=image/png original_name=Some("red.png") instance_id=ins_01a0e533-6858-77de-872a-33502aa902bc device_id=dev_01a0e533-63f9-72eb-bcfb-295cc917f62e
+[WebServer] 2026-09-27T23:29:08.551626Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-6e95-74cc-97c6-1a22c5ccd63d response={"jsonrpc":"2.0","id":"659441ff-95b7-46c7-ad8f-be7a9f5b7abd","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:09.304457Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-72b5-7205-8f13-213463af1c27 response={"jsonrpc":"2.0","id":"ec64f0bd-e5b8-4ab7-8ac5-adf8dc54e7bc","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:09.311751Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e533-6858-77de-872a-33502aa902bc device_id=dev_01a0e533-63f9-72eb-bcfb-295cc917f62e forced=true
+  ✓   2 [chromium] › tests/e2e/hub-live.spec.ts:228:1 › paste an image: it stages on the Hub and its metadata reaches the Node (4.6s)
+  -   3 [chromium] › tests/e2e/hub-live.spec.ts:323:1 › real Node: register a project, create a shell in it, close and unregister
+[WebServer] 2026-09-27T23:29:11.411766Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-7a86-717b-9a87-9444a635948b response={"jsonrpc":"2.0","id":"b00a1fad-31ba-44cb-8e02-78c685e7f35d","result":{"ok":true,"instanceId":"ins_01a0e533-7a84-7292-8597-12281ae3493c"}}
+[WebServer] 2026-09-27T23:29:12.037369Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-7d5b-77dd-a5df-48598e6777a0 response={"jsonrpc":"2.0","id":"604cbfa2-e706-4f3b-8e85-8f2e008be97e","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:12.405206Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-7ecb-76ec-8d8b-f5f6bfb49e35 response={"jsonrpc":"2.0","id":"ab36993c-8eb3-402e-8582-e6309d1e37c3","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:13.231980Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-820d-7567-bd64-47d1e2dac212 response={"jsonrpc":"2.0","id":"af686c7f-6e17-470a-829d-2e5f0f8bf4fe","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:13.237920Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e533-7a84-7292-8597-12281ae3493c device_id=dev_01a0e533-762f-76e9-9d32-a60cea061245 forced=true
+  ✓   4 [chromium] › tests/e2e/hub-live.spec.ts:398:1 › effort slider drag and keyboard send instance.configure (3.9s)
+[WebServer] 2026-09-27T23:29:16.406208Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-8e00-749a-aa18-5d7c29d65e4f response={"jsonrpc":"2.0","id":"5b6877b6-5b57-4812-a038-1d05f8ed393c","result":{"ok":true,"instanceId":"ins_01a0e533-8dff-770c-853d-f4f60fafcf1a"}}
+[WebServer] 2026-09-27T23:29:17.176491Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-9175-73a0-b75d-0f797fe783b3 response={"jsonrpc":"2.0","id":"6e1f0a54-be2e-4554-a5f3-18167d286f44","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:17.183193Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e533-8dff-770c-853d-f4f60fafcf1a device_id=dev_01a0e533-855f-74ee-99cc-fbff8d35ae7a forced=true
+  ✓   5 [chromium] › tests/e2e/hub-live.spec.ts:477:1 › native PTY default from the host matrix, with both projections (3.9s)
+[WebServer] 2026-09-27T23:29:19.825640Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-9b63-71a3-9092-abd5dc8b524f response={"jsonrpc":"2.0","id":"c5c7ae83-0f6b-4ba6-89c3-201bb38bc822","result":{"ok":true,"instanceId":"ins_01a0e533-9b61-7029-9b40-27db705bfebb"}}
+[WebServer] 2026-09-27T23:29:22.127914Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-a394-7af2-bef8-8382a9bf76d0 response={"jsonrpc":"2.0","id":"330d7c93-2c90-4ab0-9f68-c5f73ab0ce7b","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:24.485819Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-acf2-7522-86dd-7c6136dc9140 response={"jsonrpc":"2.0","id":"f05563f8-72f7-4716-b62a-4adabb0ca07f","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:26.008801Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-b2ce-7251-9242-04c60775ba98 response={"jsonrpc":"2.0","id":"7f5a5f5b-70a3-45b1-92c0-360d0629c833","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:26.829946Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-b4e3-7601-8c86-822b079dbea0 response={"jsonrpc":"2.0","id":"c864036c-e43c-443c-b79a-1ea7121af356","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:28.405337Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-bd50-7120-ad61-15c1324974e4 response={"jsonrpc":"2.0","id":"19a553ea-526e-46a5-bff7-6b71a45a6754","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:29.625997Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-c216-70e1-a7f2-15fc1806cabc response={"jsonrpc":"2.0","id":"57832720-db81-418d-b629-cdd918deca6d","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:29.633118Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e533-9b61-7029-9b40-27db705bfebb device_id=dev_01a0e533-94aa-71a4-adf5-9b8c47df8c06 forced=true
+  ✓   6 [chromium] › tests/e2e/hub-live.spec.ts:514:1 › composer queue / steer / interrupt states on a working native session (12.4s)
+[WebServer] 2026-09-27T23:29:31.716039Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-c9d5-7280-8302-3c1e5342c3fe response={"jsonrpc":"2.0","id":"db015701-74b4-4a4b-9f75-509270da46bb","result":{"ok":true,"instanceId":"ins_01a0e533-c9d3-70dc-b505-d397aae0b720"}}
+[WebServer] 2026-09-27T23:29:33.707662Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-d208-77b7-991f-2d4cab113e0b response={"jsonrpc":"2.0","id":"5f2ed6fe-9fd9-4269-9b75-46c30d792e06","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:33.714106Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e533-c9d3-70dc-b505-d397aae0b720 device_id=dev_01a0e533-c56e-7263-b059-1b5a83d84371 forced=true
+[WebServer] 7:29:33 AM [vite] (client) [Unhandled rejection] HubHttpError: not found
+[WebServer]  > rest src/lib/api.ts:832:10
+[WebServer]     830 |        /* raw */
+[WebServer]     831 |      }
+[WebServer]     832 |      throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
+[WebServer]         |            ^
+[WebServer]     833 |    }
+[WebServer]     834 |    if (res.status === 204) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer] 
+  ✓   7 [chromium] › tests/e2e/hub-live.spec.ts:623:1 › a hook-carried approval shows the real tool input and an always-allow option (4.7s)
+[WebServer] 2026-09-27T23:29:36.974669Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-de5f-7357-9f83-16d00f261871 response={"jsonrpc":"2.0","id":"bdcb7057-c9b4-4d8a-8cbd-2cfbabd37d8b","result":{"ok":true,"instanceId":"ins_01a0e533-de5d-7353-a198-515b284bde8e"}}
+[WebServer] 2026-09-27T23:29:39.243278Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-e680-76f0-9192-15487c215f08 response={"jsonrpc":"2.0","id":"8e3a90e0-3a7b-435c-8a10-121c303585b4","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:40.166556Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-eb43-774c-a79b-d449be39bb44 response={"jsonrpc":"2.0","id":"9f897426-ac60-488a-a27a-8862a798df67","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:40.172505Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e533-de5d-7353-a198-515b284bde8e device_id=dev_01a0e533-d7a8-750d-ae12-15c67bded5c8 forced=true
+  ✓   8 [chromium] › tests/e2e/hub-live.spec.ts:699:1 › structured view streams assistant text and separates injected records (6.6s)
+[WebServer] 2026-09-27T23:29:44.127139Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e533-fa51-73f1-9ac5-c62e200c1481 response={"jsonrpc":"2.0","id":"4c516e26-2829-4b96-9344-dba3394dbbd6","result":{"ok":true,"instanceId":"ins_01a0e533-fa50-722f-aedf-991665f99a30"}}
+[WebServer] 2026-09-27T23:29:46.894577Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e534-02d2-732a-a0f0-e9301d07204c response={"jsonrpc":"2.0","id":"44324731-75ea-4ffc-9f60-d849fff99cda","result":{"ok":true}}
+[WebServer] 2026-09-27T23:29:47.220437Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e534-0370-779b-8d38-0370d35bf392 response={"jsonrpc":"2.0","id":"6453c52f-36b7-4ae8-b85e-c0013cecf3ba","result":{"ok":true}}
+  ✓   9 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:216:1 › offline sends are queued and delivered exactly once after reconnect (8.1s)
+[WebServer] 2026-09-27T23:29:51.747593Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e534-1816-713a-b162-7ad7cb01986b response={"jsonrpc":"2.0","id":"df22026f-6534-4cb7-af07-ac3835d028e4","result":{"ok":true,"instanceId":"ins_01a0e534-1814-74a4-ab2f-9ab2e52d2f46"}}
+[WebServer] 7:29:54 AM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:793:10
+[WebServer]     791 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     792 |      }
+[WebServer]     793 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     794 |    }
+[WebServer]     795 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer] 
+[WebServer] 7:29:54 AM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:793:10
+[WebServer]     791 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     792 |      }
+[WebServer]     793 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     794 |    }
+[WebServer]     795 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer] 
+[WebServer] 7:29:54 AM [vite] (client) [Unhandled rejection] HubHttpError: not found
+[WebServer]  > rest src/lib/api.ts:832:10
+[WebServer]     830 |        /* raw */
+[WebServer]     831 |      }
+[WebServer]     832 |      throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
+[WebServer]         |            ^
+[WebServer]     833 |    }
+[WebServer]     834 |    if (res.status === 204) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer]  > src/lib/store.ts:1389:8
+[WebServer] 
+[WebServer] 2026-09-27T23:29:55.013352Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e534-2060-7470-81a0-c415e006ed0d response={"jsonrpc":"2.0","id":"e9bc464b-74a9-4067-9032-8a54e4dbc7e7","result":{"ok":true}}
+[WebServer] 7:29:55 AM [vite] (client) [Unhandled rejection] HubHttpError: not found
+[WebServer]  > rest src/lib/api.ts:832:10
+[WebServer]     830 |        /* raw */
+[WebServer]     831 |      }
+[WebServer]     832 |      throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
+[WebServer]         |            ^
+[WebServer]     833 |    }
+[WebServer]     834 |    if (res.status === 204) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer]  > src/lib/store.ts:1389:8
+[WebServer] 
+  ✓  10 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:264:1 › an offline-queued message survives a reload while the Hub is still off and sends once after (10.4s)
+[WebServer] 2026-09-27T23:30:02.177323Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e534-40d3-7565-970c-d7557a8e9171 response={"jsonrpc":"2.0","id":"4e92d111-c415-4a6d-8646-b1704e3f0104","result":{"ok":true,"instanceId":"ins_01a0e534-40d2-7398-a0d4-e8e1fda0ef2d"}}
+[WebServer] 2026-09-27T23:30:04.484296Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e534-4900-7d8d-9a60-eca5f2d1d182 response={"jsonrpc":"2.0","id":"07eb17f0-4c59-41d3-978f-100519c8eaed","result":{"ok":true}}
+  ✓  11 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:319:1 › a committed POST whose browser response is lost retries with replayed:true and runs once (6.0s)
+
+  1 skipped
+  10 passed (1.2m)

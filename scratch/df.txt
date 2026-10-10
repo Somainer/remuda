@@ -1,0 +1,2 @@
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb       1007G  942G   20G  98% /home/wangruming.nana

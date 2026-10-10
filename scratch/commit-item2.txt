@@ -1,0 +1,22 @@
+fix(web): preserve terminal done inside the outbox patch transaction
+
+The never-downgrade-done guard only checked the in-memory cache, and
+Outbox.patch updated that cache after its own IDB put using a full record
+built from the stale read: a journal patch(done) whose readwrite
+transaction was still open, or a done committed by another tab, was
+invisible to the check and got overwritten with sent/held/rejected/
+unknown. The held branch then re-armed scheduleHeldRetry and POSTed the
+terminal command a second time.
+
+The stored row is now read inside the SAME readwrite transaction that
+writes (mergeUnlessDone; IndexedDB serializes readwrite transactions on a
+store in creation order, so a committed or committing done is always
+visible); a stored done is returned without any put and the cache adopts
+the authoritative stored row after commit. reconcilePatch treats a
+transaction-read-back done as preserved and skips the held retry.
+
+Regressions: serial-IDB fake proving an uncommitted done tx blocks the
+downgrade's read, a second tab's stale cache cannot downgrade, and a store
+held-verdict-vs-durable-done test asserting no held timer and one POST.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>

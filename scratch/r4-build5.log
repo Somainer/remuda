@@ -1,0 +1,11 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+warning: unused import: `ResumeBoundary`
+  --> crates/remuda-driver/src/shell_pty/promotion.rs:30:5
+   |
+30 |     ResumeBoundary, ResumeMode, SessionStartReport, TailProvenance, TranscriptBinding,
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `remuda-driver` (lib) generated 1 warning (run `cargo fix --lib -p remuda-driver` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.17s

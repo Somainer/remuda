@@ -1,0 +1,1 @@
+import{t as e}from"./jsx-runtime-RRncGqZB.js";import{t}from"./InboxShell-U8hIjCir.js";var n=e();function r(){return(0,n.jsx)(t,{mode:`compact`})}export{r as Inbox};

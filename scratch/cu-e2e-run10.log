@@ -1,0 +1,10 @@
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+error: no rules expected keyword `as`
+   --> crates/remuda-node/tests/usage_native_rollup.rs:218:21
+    |
+218 |         "cwd": null as Option<&str>,
+    |                     ^^ no rules expected this token in macro call
+    |
+    = note: while trying to match end of macro
+
+error: could not compile `remuda-node` (test "usage_native_rollup") due to 1 previous error

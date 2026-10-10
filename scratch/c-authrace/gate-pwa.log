@@ -1,0 +1,99 @@
+[WebServer]    Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.44s
+
+[WebServer]      Running `target-authrace/debug/examples/hub_e2e`
+
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a10e36-22bf-722d-be97-c6fdb5a41634","upstream":"http://127.0.0.1:58881","viaHost":null}
+
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 240 ms
+[WebServer] 
+
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+
+Running 6 tests using 1 worker
+
+[1/6] [chromium] › tests/e2e/offline-outbox.hub.spec.ts:275:1 › offline sends are queued and delivered exactly once after reconnect
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+
+[WebServer] 2026-10-05T22:36:35.942911Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e36-3477-7331-9771-9b25a626c5fd response={"jsonrpc":"2.0","id":"7f7a5b6c-159b-43df-b0e8-9058abfab7e1","result":{"ok":true,"instanceId":"ins_01a10e36-3475-76d8-9605-bc3afe7f979b"}}
+
+[WebServer] 2026-10-05T22:36:40.524504Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e36-440f-77fb-b4d4-05f2b37a7fe6 response={"jsonrpc":"2.0","id":"0ee8554e-240c-45ef-b273-411a1f9bf802","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:36:40.940200Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e36-44a0-7651-a613-c2cd2de00e5d response={"jsonrpc":"2.0","id":"78de4968-3a15-47c5-9477-563b52f9134b","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:36:44.294175Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e36-5583-70c3-8a22-19a40bd583ea response={"jsonrpc":"2.0","id":"9c7a95d2-be3e-4895-888c-3367621d00a6","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:36:44.301490Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a10e36-3475-76d8-9605-bc3afe7f979b device_id=dev_01a10e36-51ef-74b7-8c16-0ac947e5c74e forced=true
+
+[2/6] [chromium] › tests/e2e/offline-outbox.hub.spec.ts:323:1 › an offline-queued message survives a reload while the Hub is still off and sends once after
+[WebServer] 2026-10-05T22:36:47.284222Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e36-60c7-726a-9439-0df4d9c6e674 response={"jsonrpc":"2.0","id":"cba0805b-dadc-49f9-b2ba-e7af2fbb2d6f","result":{"ok":true,"instanceId":"ins_01a10e36-60c6-7511-aed7-1adcbf2d779e"}}
+
+[WebServer] 6:36:49 AM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:794:10
+[WebServer]     792 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     793 |      }
+[WebServer]     794 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     795 |    }
+[WebServer]     796 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1748:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2360:17
+[WebServer] 
+
+[WebServer] 6:36:49 AM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:794:10
+[WebServer]     792 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     793 |      }
+[WebServer]     794 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     795 |    }
+[WebServer]     796 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1748:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2360:17
+[WebServer] 
+
+[WebServer] 2026-10-05T22:37:19.880645Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e36-6736-70eb-8cc6-5d6180378678 response={"jsonrpc":"2.0","id":"e8220da7-ee31-43ff-a1a1-20bc11bd5c6b","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:37:20.802775Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a10e36-e41f-7288-afce-50e5442aab7d response={"jsonrpc":"2.0","id":"2e2fd1f4-0930-4f68-ba1d-571869ad067b","result":{"ok":true}}
+
+[WebServer] 2026-10-05T22:37:20.809377Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a10e36-60c6-7511-aed7-1adcbf2d779e device_id=dev_01a10e36-e08d-7500-a870-819ee14b9d08 forced=true
+
+  1) [chromium] › tests/e2e/offline-outbox.hub.spec.ts:323:1 › an offline-queued message survives a reload while the Hub is still off and sends once after 
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 0
+
+    Call Log:
+    - Timeout 30000ms exceeded while waiting on the predicate
+
+      363 |   await expect
+      364 |     .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    > 365 |     .toBe(1);
+          |      ^
+      366 |   await expect
+      367 |     .poll(
+      368 |       async () =>
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/offline-outbox.hub.spec.ts:365:6
+
+    Error Context: test-results/offline-outbox.hub-an-offl-35ef9-ll-off-and-sends-once-after-chromium/error-context.md
+
+    Error Context: test-results/offline-outbox.hub-an-offl-35ef9-ll-off-and-sends-once-after-chromium/error-context.md
+
+
+[3/6] [chromium] › tests/e2e/offline-outbox.hub.spec.ts:378:1 › a committed POST whose browser response is lost retries with replayed:true and runs once
+[4/6] [chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:130:1 › an offline first visit through the router loads a never-opened real route from the precache
+[chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:130:1 › an offline first visit through the router loads a never-opened real route from the precache
+[pwa-realbuild] vite build finished in 1488 ms
+
+[5/6] [chromium] › tests/e2e/pwa-shell.hub.spec.ts:148:1 › a redeployed shell renders on reload with no 404 and no HTML for the module script
+[6/6] [chromium] › tests/e2e/pwa-shell.hub.spec.ts:282:1 › an offline first visit to a never-visited route loads the precached chunk
+  1 failed
+    [chromium] › tests/e2e/offline-outbox.hub.spec.ts:323:1 › an offline-queued message survives a reload while the Hub is still off and sends once after 
+  1 did not run
+  4 passed (1.3m)

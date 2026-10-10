@@ -1,0 +1,11 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+error[E0308]: `if` and `else` have incompatible types
+   --> crates/remuda-driver/tests/usage_transcript.rs:132:62
+    |
+132 |                 "stop_reason": if stop { "end_turn" } else { serde_json::Value::Null },
+    |                                          ----------          ^^^^^^^^^^^^^^^^^^^^^^^ expected `&str`, found `Value`
+    |                                          |
+    |                                          expected because of this
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `remuda-driver` (test "usage_transcript") due to 1 previous error

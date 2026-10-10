@@ -1,0 +1,181 @@
+    Checking remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+error[E0599]: no method named `is_empty` found for struct `TailRead` in the current scope
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1905:15
+     |
+1905 |     if !lines.is_empty() && !hydrator.mapper.is_current_process() {
+     |               ^^^^^^^^ method not found in `TailRead`
+     |
+    ::: crates/remuda-driver/src/claude_transcript.rs:674:1
+     |
+ 674 | pub struct TailRead {
+     | ------------------- method `is_empty` not found for this struct
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following traits define an item `is_empty`, perhaps you need to implement one of them:
+             candidate #1: `Buffer`
+             candidate #2: `ExactSizeIterator`
+             candidate #3: `NixPath`
+             candidate #4: `RangeBounds`
+             candidate #5: `bitflags::traits::Flags`
+             candidate #6: `toml_edit::table::TableLike`
+help: one of the expressions' fields has a method of the same name
+     |
+1905 |     if !lines.lines.is_empty() && !hydrator.mapper.is_current_process() {
+     |               ++++++
+
+error[E0599]: no method named `iter` found for struct `TailRead` in the current scope
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1913:10
+     |
+1912 |       let mut batches: Vec<_> = lines
+     |  _______________________________-
+1913 | |         .iter()
+     | |         -^^^^ method not found in `TailRead`
+     | |_________|
+     |
+     |
+    ::: crates/remuda-driver/src/claude_transcript.rs:674:1
+     |
+ 674 |   pub struct TailRead {
+     |   ------------------- method `iter` not found for this struct
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following traits define an item `iter`, perhaps you need to implement one of them:
+             candidate #1: `bitflags::traits::Flags`
+             candidate #2: `strum::IntoEnumIterator`
+             candidate #3: `strum::VariantIterator`
+             candidate #4: `toml_edit::table::TableLike`
+help: one of the expressions' fields has a method of the same name
+     |
+1913 |         .lines.iter()
+     |          ++++++
+
+error[E0599]: no function or associated item named `new_at_end` found for struct `TranscriptTail` in the current scope
+    --> crates/remuda-driver/src/claude_pty.rs:1453:71
+     |
+1453 | ...                   crate::claude_transcript::TranscriptTail::new_at_end(path),
+     |                                                                 ^^^^^^^^^^ function or associated item not found in `TranscriptTail`
+     |
+    ::: crates/remuda-driver/src/claude_transcript.rs:647:1
+     |
+ 647 | pub struct TranscriptTail {
+     | ------------------------- function or associated item `new_at_end` not found for this struct
+     |
+note: if you're trying to build a new `TranscriptTail` consider using one of the following associated functions:
+      TranscriptTail::new
+      TranscriptTail::resumed
+    --> crates/remuda-driver/src/claude_transcript.rs:682:5
+     |
+ 682 |     pub fn new(path: PathBuf) -> Self {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 694 |     pub fn resumed(path: PathBuf, boundary: ResumeBoundary) -> Self {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `TailRead: std::default::Default` is not satisfied
+    --> crates/remuda-driver/src/claude_pty.rs:1474:49
+     |
+1474 |                         let lines = tail.poll().unwrap_or_default();
+     |                                                 ^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+     |
+help: the trait `std::default::Default` is not implemented for `TailRead`
+    --> crates/remuda-driver/src/claude_transcript.rs:674:1
+     |
+ 674 | pub struct TailRead {
+     | ^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `std::result::Result::<T, E>::unwrap_or_default`
+    --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/result.rs:1265:4
+
+error[E0599]: no method named `is_empty` found for struct `TailRead` in the current scope
+    --> crates/remuda-driver/src/claude_pty.rs:1478:35
+     |
+1478 |                         if !lines.is_empty() && !mapper.is_current_process() {
+     |                                   ^^^^^^^^ method not found in `TailRead`
+     |
+    ::: crates/remuda-driver/src/claude_transcript.rs:674:1
+     |
+ 674 | pub struct TailRead {
+     | ------------------- method `is_empty` not found for this struct
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following traits define an item `is_empty`, perhaps you need to implement one of them:
+             candidate #1: `Buffer`
+             candidate #2: `ExactSizeIterator`
+             candidate #3: `NixPath`
+             candidate #4: `RangeBounds`
+             candidate #5: `bitflags::traits::Flags`
+             candidate #6: `toml_edit::table::TableLike`
+help: one of the expressions' fields has a method of the same name
+     |
+1478 |                         if !lines.lines.is_empty() && !mapper.is_current_process() {
+     |                                   ++++++
+
+error[E0599]: no method named `iter` found for struct `TailRead` in the current scope
+    --> crates/remuda-driver/src/claude_pty.rs:1486:35
+     |
+1486 | ...                   lines.iter().map(|line| mapper.map_line(line)).collect();
+     |                             ^^^^ method not found in `TailRead`
+     |
+    ::: crates/remuda-driver/src/claude_transcript.rs:674:1
+     |
+ 674 | pub struct TailRead {
+     | ------------------- method `iter` not found for this struct
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following traits define an item `iter`, perhaps you need to implement one of them:
+             candidate #1: `bitflags::traits::Flags`
+             candidate #2: `strum::IntoEnumIterator`
+             candidate #3: `strum::VariantIterator`
+             candidate #4: `toml_edit::table::TableLike`
+help: one of the expressions' fields has a method of the same name
+     |
+1486 |                             lines.lines.iter().map(|line| mapper.map_line(line)).collect();
+     |                                   ++++++
+
+error[E0599]: no function or associated item named `new_at_end` found for struct `TranscriptTail` in the current scope
+   --> crates/remuda-driver/src/claude_transcript.rs:118:25
+    |
+118 |         TranscriptTail::new_at_end(self.path.clone())
+    |                         ^^^^^^^^^^ function or associated item not found in `TranscriptTail`
+...
+647 | pub struct TranscriptTail {
+    | ------------------------- function or associated item `new_at_end` not found for this struct
+    |
+note: if you're trying to build a new `TranscriptTail` consider using one of the following associated functions:
+      TranscriptTail::new
+      TranscriptTail::resumed
+   --> crates/remuda-driver/src/claude_transcript.rs:682:5
+    |
+682 |     pub fn new(path: PathBuf) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+694 |     pub fn resumed(path: PathBuf, boundary: ResumeBoundary) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0631]: type mismatch in function arguments
+   --> crates/remuda-driver/src/claude_transcript.rs:514:42
+    |
+514 |         std::fs::metadata(path).ok().map(Self::from_metadata)
+    |                                      --- ^^^^^^^^^^^^^^^^^^^ expected due to this
+    |                                      |
+    |                                      required by a bound introduced by this call
+...
+520 |     pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    |     ---------------------------------------------------------- found signature defined here
+    |
+    = note: expected function signature `fn(std::fs::Metadata) -> _`
+               found function signature `fn(&std::fs::Metadata) -> _`
+note: required by a bound in `std::option::Option::<T>::map`
+   --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/option.rs:1160:4
+help: consider wrapping the function in a closure
+    |
+514 |         std::fs::metadata(path).ok().map(|metadata: std::fs::Metadata| Self::from_metadata(&metadata))
+    |                                          +++++++++++++++++++++++++++++                    +++++++++++
+help: consider adjusting the signature so it does not borrow its argument
+    |
+520 -     pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+520 +     pub fn from_metadata(metadata: std::fs::Metadata) -> Self {
+    |
+
+Some errors have detailed explanations: E0277, E0599, E0631.
+For more information about an error, try `rustc --explain E0277`.
+error: could not compile `remuda-driver` (lib) due to 8 previous errors

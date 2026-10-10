@@ -1,0 +1,112 @@
+vite v8.3.0 building client environment for production...
+transforming...
+
+A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+✓ 2446 modules transformed.
+rendering chunks...
+computing gzip size...
+../scratch/c-authrace/realbuild/index.html                                              1.90 kB │ gzip:   0.64 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Size4-Regular-Dl5lxZxV.woff2               4.92 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Size2-Regular-Dy4dx90m.woff2               5.20 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Size1-Regular-mCD8mA8B.woff2               5.46 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Caligraphic-Regular-Di6jR-x-.woff2         6.90 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Caligraphic-Bold-Dq_IR9rO.woff2            6.91 kB
+../scratch/c-authrace/realbuild/sw.js                                                   9.36 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Script-Regular-D3wIWfF6.woff2              9.64 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_SansSerif-Regular-DDBCnlJ7.woff2          10.34 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Fraktur-Regular-CTYiF6lA.woff2            11.31 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Fraktur-Bold-CL6g_b3V.woff2               11.34 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_SansSerif-Italic-C3H0VqGB.woff2           12.02 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_SansSerif-Bold-D1sUS0GD.woff2             12.21 kB
+../scratch/c-authrace/realbuild/assets/ibm-plex-mono-latin-400-normal-CvHOgSBP.woff    13.14 kB
+../scratch/c-authrace/realbuild/assets/ibm-plex-mono-latin-500-normal-CB9ihrfo.woff    13.15 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Typewriter-Regular-CO6r4hn1.woff2         13.56 kB
+../scratch/c-authrace/realbuild/assets/ibm-plex-mono-latin-400-normal-DMJ8VG8y.woff2   14.70 kB
+../scratch/c-authrace/realbuild/assets/ibm-plex-mono-latin-500-normal-DSY6xOcd.woff2   14.88 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Math-BoldItalic-CZnvNsCZ.woff2            16.40 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Math-Italic-t53AETM-.woff2                16.44 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Main-BoldItalic-DxDJ3AOS.woff2            16.78 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Main-Italic-NWA7e6Wa.woff2                16.98 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Main-Bold-Cx986IdX.woff2                  25.32 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_Main-Regular-B22Nviop.woff2               26.27 kB
+../scratch/c-authrace/realbuild/assets/KaTeX_AMS-Regular-BQhdFMY1.woff2                28.07 kB
+../scratch/c-authrace/realbuild/assets/ProjectsPage-DYT7cgX3.css                        0.25 kB │ gzip:   0.19 kB
+../scratch/c-authrace/realbuild/assets/workspaces-DyX_ahjC.css                          1.41 kB │ gzip:   0.53 kB
+../scratch/c-authrace/realbuild/assets/FleetPage-CcgC89eq.css                           2.29 kB │ gzip:   0.72 kB
+../scratch/c-authrace/realbuild/assets/overlay-DtsqXxcV.css                             2.38 kB │ gzip:   0.84 kB
+../scratch/c-authrace/realbuild/assets/BotsPage-BgXbIJT4.css                            2.65 kB │ gzip:   0.87 kB
+../scratch/c-authrace/realbuild/assets/HomeList-BCNxIqCG.css                            4.45 kB │ gzip:   1.25 kB
+../scratch/c-authrace/realbuild/assets/TaskList-BYZAR5p8.css                            5.35 kB │ gzip:   1.45 kB
+../scratch/c-authrace/realbuild/assets/SettingsPage-D5A98pA_.css                        6.49 kB │ gzip:   1.59 kB
+../scratch/c-authrace/realbuild/assets/InboxShell-BFqhgYVx.css                          6.51 kB │ gzip:   1.51 kB
+../scratch/c-authrace/realbuild/assets/hosts-BWmqCGfv.css                               7.24 kB │ gzip:   1.72 kB
+../scratch/c-authrace/realbuild/assets/Board-C5_OI3UH.css                               8.47 kB │ gzip:   2.14 kB
+../scratch/c-authrace/realbuild/assets/providers-yfboBDIV.css                           9.81 kB │ gzip:   2.11 kB
+../scratch/c-authrace/realbuild/assets/NewSessionPage-BwZs9mI_.css                     11.36 kB │ gzip:   2.24 kB
+../scratch/c-authrace/realbuild/assets/SessionsPage-DxWmViIi.css                       13.15 kB │ gzip:   2.85 kB
+../scratch/c-authrace/realbuild/assets/EffortSlider-CfDaoh9y.css                       14.18 kB │ gzip:   3.50 kB
+../scratch/c-authrace/realbuild/assets/ui-RsYJQwb-.css                                 14.23 kB │ gzip:   3.10 kB
+../scratch/c-authrace/realbuild/assets/mathKatex-B2XouDXw.css                          27.24 kB │ gzip:   7.49 kB
+../scratch/c-authrace/realbuild/assets/ApprovalCard-DdwQGKIQ.css                       45.40 kB │ gzip:   9.30 kB
+../scratch/c-authrace/realbuild/assets/index-BSJcWH2n.css                              45.90 kB │ gzip:   9.03 kB
+../scratch/c-authrace/realbuild/assets/ToolCard-B-fnuPpo.css                           58.89 kB │ gzip:  11.69 kB
+../scratch/c-authrace/realbuild/assets/SessionPage-BPLLPf8C.css                        68.63 kB │ gzip:  13.09 kB
+../scratch/c-authrace/realbuild/assets/command-BLygjlZi.js                              0.06 kB │ gzip:   0.08 kB
+../scratch/c-authrace/realbuild/assets/Inbox-B9J6X-B5.js                                0.16 kB │ gzip:   0.15 kB
+../scratch/c-authrace/realbuild/assets/ApprovalsPage-CQy3tbes.js                        0.17 kB │ gzip:   0.16 kB
+../scratch/c-authrace/realbuild/assets/workspaces.module-CwBJeH1J.js                    0.24 kB │ gzip:   0.16 kB
+../scratch/c-authrace/realbuild/assets/useNowTick-Gyk__l_V.js                           0.30 kB │ gzip:   0.22 kB
+../scratch/c-authrace/realbuild/assets/CommitProbe-Bbl9bvHY.js                          0.34 kB │ gzip:   0.26 kB
+../scratch/c-authrace/realbuild/assets/Button-DWfmWTHu.js                               0.42 kB │ gzip:   0.29 kB
+../scratch/c-authrace/realbuild/assets/json-PmyKWHmm.js                                 0.58 kB │ gzip:   0.41 kB
+../scratch/c-authrace/realbuild/assets/rolldown-runtime-hePW80VL.js                     0.71 kB │ gzip:   0.42 kB
+../scratch/c-authrace/realbuild/assets/clipboard-CMJanXyi.js                            0.90 kB │ gzip:   0.50 kB
+../scratch/c-authrace/realbuild/assets/Modal-BrFRpY_d.js                                1.25 kB │ gzip:   0.54 kB
+../scratch/c-authrace/realbuild/assets/nextStep-DIKv3CFP.js                             1.31 kB │ gzip:   0.74 kB
+../scratch/c-authrace/realbuild/assets/accessCode-lGGhgB8H.js                           1.58 kB │ gzip:   0.69 kB
+../scratch/c-authrace/realbuild/assets/status-DjBFJzNw.js                               1.71 kB │ gzip:   0.76 kB
+../scratch/c-authrace/realbuild/assets/overlay.module-DY3FYAZ7.js                       2.21 kB │ gzip:   1.01 kB
+../scratch/c-authrace/realbuild/assets/sessionOptions-6-pXTb3k.js                       2.30 kB │ gzip:   1.20 kB
+../scratch/c-authrace/realbuild/assets/endReason-CeRYjaHo.js                            2.51 kB │ gzip:   1.05 kB
+../scratch/c-authrace/realbuild/assets/rust-BIKPVoi6.js                                 2.72 kB │ gzip:   1.44 kB
+../scratch/c-authrace/realbuild/assets/commandStatus-C2x5F0mD.js                        2.81 kB │ gzip:   1.26 kB
+../scratch/c-authrace/realbuild/assets/bash-LmRjUKlR.js                                 2.83 kB │ gzip:   1.56 kB
+../scratch/c-authrace/realbuild/assets/registry-CG29PxS0.js                             3.29 kB │ gzip:   1.45 kB
+../scratch/c-authrace/realbuild/assets/python-gHmu6VPG.js                               3.31 kB │ gzip:   1.48 kB
+../scratch/c-authrace/realbuild/assets/ProjectsPage-Dx93UhJX.js                         4.55 kB │ gzip:   1.79 kB
+../scratch/c-authrace/realbuild/assets/SubagentView-CcKAjCWl.js                         4.58 kB │ gzip:   1.97 kB
+../scratch/c-authrace/realbuild/assets/BotsPage-D9qbSCmx.js                             5.83 kB │ gzip:   1.96 kB
+../scratch/c-authrace/realbuild/assets/javascript-8AmHuH5O.js                           6.35 kB │ gzip:   2.61 kB
+../scratch/c-authrace/realbuild/assets/typescript-CxkPLmSc.js                           7.60 kB │ gzip:   3.08 kB
+../scratch/c-authrace/realbuild/assets/hosts-cI22l-ju.js                                9.78 kB │ gzip:   3.91 kB
+../scratch/c-authrace/realbuild/assets/ProvidersPage-Dj_dXL4N.js                       10.00 kB │ gzip:   3.09 kB
+../scratch/c-authrace/realbuild/assets/HomeList-BBGhEF6x.js                            12.00 kB │ gzip:   4.63 kB
+../scratch/c-authrace/realbuild/assets/TaskList-CgMge4JH.js                            12.19 kB │ gzip:   4.34 kB
+../scratch/c-authrace/realbuild/assets/FleetPage-wm5w7zJe.js                           12.87 kB │ gzip:   4.61 kB
+../scratch/c-authrace/realbuild/assets/HostsPage-D4yKgYVi.js                           12.95 kB │ gzip:   4.10 kB
+../scratch/c-authrace/realbuild/assets/ui.module-ByQNywmk.js                           13.05 kB │ gzip:   5.07 kB
+../scratch/c-authrace/realbuild/assets/InboxShell-U8hIjCir.js                          13.68 kB │ gzip:   4.58 kB
+../scratch/c-authrace/realbuild/assets/EffortSlider-CWOiD9nt.js                        15.28 kB │ gzip:   5.13 kB
+../scratch/c-authrace/realbuild/assets/providers-BOSDV_ci.js                           16.47 kB │ gzip:   5.33 kB
+../scratch/c-authrace/realbuild/assets/ApprovalCard-C2zShf-I.js                        19.03 kB │ gzip:   6.27 kB
+../scratch/c-authrace/realbuild/assets/SettingsPage-FSS8xyEK.js                        19.66 kB │ gzip:   6.86 kB
+../scratch/c-authrace/realbuild/assets/core-VbNX68N4.js                                20.40 kB │ gzip:   8.05 kB
+../scratch/c-authrace/realbuild/assets/Board-Bk_Bcdzy.js                               20.51 kB │ gzip:   7.30 kB
+../scratch/c-authrace/realbuild/assets/SessionsPage-0KFPHKl1.js                        28.16 kB │ gzip:   8.99 kB
+../scratch/c-authrace/realbuild/assets/NewSessionPage-By057sCK.js                      32.01 kB │ gzip:  10.73 kB
+../scratch/c-authrace/realbuild/assets/jsx-runtime-RRncGqZB.js                         47.58 kB │ gzip:  16.95 kB
+../scratch/c-authrace/realbuild/assets/api-gRM4zWuA.js                                 51.90 kB │ gzip:  17.02 kB
+../scratch/c-authrace/realbuild/assets/store-CERgR8pi.js                               82.82 kB │ gzip:  24.20 kB
+../scratch/c-authrace/realbuild/assets/addon-canvas-CY8shz_h.js                        93.64 kB │ gzip:  23.41 kB
+../scratch/c-authrace/realbuild/assets/addon-webgl-BQImtbV0.js                        113.38 kB │ gzip:  30.97 kB
+../scratch/c-authrace/realbuild/assets/katex-BHxplFoT.js                              259.16 kB │ gzip:  77.74 kB
+../scratch/c-authrace/realbuild/assets/ToolCard-Bd9k77TD.js                           263.87 kB │ gzip:  82.02 kB
+../scratch/c-authrace/realbuild/assets/index-DgHgGWjk.js                              317.56 kB │ gzip:  99.82 kB
+../scratch/c-authrace/realbuild/assets/SessionPage-D8q_GKr2.js                        553.69 kB │ gzip: 156.09 kB
+
+✓ built in 1.56s
+[plugin builtin:vite-reporter] 
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.

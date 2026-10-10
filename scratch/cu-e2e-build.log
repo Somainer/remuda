@@ -1,0 +1,132 @@
+   Compiling subtle v2.6.1
+   Compiling crossbeam-utils v0.8.23
+   Compiling aho-corasick v1.1.5
+   Compiling regex-syntax v0.8.11
+   Compiling crossbeam-epoch v0.9.21
+   Compiling crossbeam-deque v0.8.8
+   Compiling bstr v1.13.1
+   Compiling quick-xml v0.42.0
+   Compiling digest v0.10.7
+   Compiling ff v0.13.1
+   Compiling rustls v0.23.44
+   Compiling group v0.13.0
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling hkdf v0.12.4
+   Compiling sha1 v0.10.7
+   Compiling signature v2.2.0
+   Compiling concurrent-queue v2.5.0
+   Compiling crypto-bigint v0.5.5
+   Compiling sec1 v0.7.3
+   Compiling remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+   Compiling async-channel v2.5.0
+   Compiling async-io v2.6.0
+   Compiling rfc6979 v0.4.0
+   Compiling blocking v1.7.0
+   Compiling tungstenite v0.29.0
+   Compiling universal-hash v0.5.1
+   Compiling async-signal v0.2.14
+   Compiling async-process v2.5.0
+   Compiling poly1305 v0.8.0
+   Compiling regex-automata v0.4.18
+   Compiling elliptic-curve v0.13.8
+   Compiling agent-client-protocol v2.1.0
+   Compiling tokio-tungstenite v0.29.0
+   Compiling chacha20poly1305 v0.10.1
+   Compiling rsa v0.9.10
+   Compiling ecdsa v0.16.9
+   Compiling primeorder v0.13.6
+   Compiling axum v0.8.9
+   Compiling hmac-sha256 v1.1.14
+   Compiling hmac-sha512 v1.1.12
+   Compiling k256 v0.13.4
+   Compiling superboring v0.1.14
+   Compiling p384 v0.13.1
+   Compiling tokio-rustls v0.26.5
+   Compiling tungstenite v0.28.0
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling tokio-tungstenite v0.28.0
+   Compiling p256 v0.13.2
+   Compiling regex v1.13.1
+   Compiling pem v0.8.3
+   Compiling matchers v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling sec1_decode v0.1.0
+   Compiling jwt-simple v0.12.17
+   Compiling globset v0.4.20
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling ece v2.3.1
+   Compiling base64 v0.23.1
+   Compiling web-push v0.11.0
+   Compiling plist v1.10.1
+   Compiling ignore v0.4.33
+   Compiling blake2 v0.10.6
+   Compiling password-hash v0.5.0
+   Compiling glob v0.3.4
+   Compiling argon2 v0.5.3
+   Compiling remuda-push v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-push)
+   Compiling remuda-ssh v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-ssh)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+error[E0425]: cannot find function `workspace_bin` in crate `remuda_testing`
+   --> crates/remuda-node/tests/usage_native_rollup.rs:104:34
+    |
+104 |     let source = remuda_testing::workspace_bin("fake-harness");
+    |                                  ^^^^^^^^^^^^^
+    |
+   ::: crates/remuda-testing/src/bin_locator.rs:22:1
+    |
+ 22 | pub fn workspace_root() -> PathBuf {
+    | ---------------------------------- similarly named function `workspace_root` defined here
+    |
+help: a function with a similar name exists
+    |
+104 -     let source = remuda_testing::workspace_bin("fake-harness");
+104 +     let source = remuda_testing::workspace_root("fake-harness");
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `Arc`
+   --> crates/remuda-node/tests/usage_native_rollup.rs:137:40
+    |
+137 |         DevNode::with_parts(&http_cfg, Arc::new(remuda_node::MemoryStore::new(256)), registry)
+    |                                        ^^^ use of undeclared type `Arc`
+    |
+help: consider importing this struct
+    |
+  6 + use std::sync::Arc;
+    |
+
+error[E0308]: mismatched types
+   --> crates/remuda-node/tests/usage_native_rollup.rs:119:32
+    |
+119 |     native.relay_binary = Some(remuda_relay_bin(&root));
+    |                           ---- ^^^^^^^^^^^^^^^^^^^^^^^ expected `Box<PathBuf>`, found `PathBuf`
+    |                           |
+    |                           arguments to this enum variant are incorrect
+    |
+    = note: expected struct `Box<PathBuf>`
+               found struct `PathBuf`
+    = note: for more on the distinction between the stack and the heap, read https://doc.rust-lang.org/book/ch15-01-box.html, https://doc.rust-lang.org/rust-by-example/std/box.html, and https://doc.rust-lang.org/std/boxed/index.html
+help: the type constructed contains `PathBuf` due to the type of the argument passed
+   --> crates/remuda-node/tests/usage_native_rollup.rs:119:27
+    |
+119 |     native.relay_binary = Some(remuda_relay_bin(&root));
+    |                           ^^^^^-----------------------^
+    |                                |
+    |                                this argument influences the type of `Some`
+note: tuple variant defined here
+   --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/option.rs:608:4
+help: store this in the heap by calling `Box::new`
+    |
+119 |     native.relay_binary = Some(Box::new(remuda_relay_bin(&root)));
+    |                                +++++++++                       +
+
+Some errors have detailed explanations: E0308, E0425, E0433.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `remuda-node` (test "usage_native_rollup") due to 3 previous errors

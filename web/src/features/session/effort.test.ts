@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { UsagePayload } from "../../types/generated";
-import { effectiveFromObservation, effortFlagMismatch, effortLevelMismatch } from "./effortEffective";
+import { effectiveFromObservation, effectiveFromRecord, effortFlagMismatch, effortLevelMismatch } from "./effortEffective";
 import {
   CLAUDE_XHIGH_INDEX,
   contextPercent,
@@ -393,5 +393,49 @@ describe("caps and names", () => {
   it("isEmberName is true only for a native ember tier (Codex ultra)", () => {
     expect(isEmberName("codex", "ultra")).toBe(true);
     expect(isEmberName("claude", "max")).toBe(false);
+  });
+});
+
+describe("read-back-unavailable edge (D-056 (4))", () => {
+  const withdrawn = {
+    kind: "effort" as const,
+    payload: {
+      requested: { name: "max", ultracode: false },
+      effective: {
+        name: null,
+        ultracode: null,
+        source: "unknown",
+        observedAt: "2026-10-08T12:05:00Z",
+        readbackAvailable: false,
+      },
+    },
+  };
+
+  it("withdraws the projected record: effectiveFromRecord returns null", () => {
+    expect(effectiveFromRecord(withdrawn.payload.effective)).toBeNull();
+  });
+
+  it("marks the observation withdrawn with a null effective view", () => {
+    const parsed = effectiveFromObservation(withdrawn)!;
+    expect(parsed.withdrawn).toBe(true);
+    expect(parsed.effective).toBeNull();
+    expect(parsed.requested?.name).toBe("max");
+  });
+
+  it("a normal edge is never marked withdrawn", () => {
+    const parsed = effectiveFromObservation({
+      kind: "effort",
+      payload: {
+        effective: { name: "high", source: "slash", observedAt: "2026-10-08T12:00:00Z" },
+      },
+    })!;
+    expect(parsed.withdrawn).toBe(false);
+    expect(parsed.effective?.name).toBe("high");
+  });
+
+  it("a non-effort event returns nothing", () => {
+    expect(
+      effectiveFromObservation({ kind: "lifecycle", payload: { type: "native" } }),
+    ).toBeNull();
   });
 });

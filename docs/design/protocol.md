@@ -667,6 +667,15 @@ type MaterializedLaunch = {
 
 `--resume` 不恢复 ultracode，resume launch 按上面同一规则再带一次。`effort` 缺省表示「交给 harness 决定」，materializer **不发** `--effort`——这与请求某一档不是一回事。实测见 [effort-sync-4](evidence/effort-sync-4.md)。
 
+**回读不可用边（D-056 (4)，c-effortread r5/r6）。** `effort` 观察的 `effective` 正常时是 `{name, ultracode, source, observedAt}`；当一个已 verified 的 resume 边界在会话中途变为不可证明时，driver 只发**一条**撤回边：`{source: "unknown", observedAt, readbackAvailable: false}`。规则：
+
+- 触发撤回的边界变化（verified→不可证明）只有四类：**cursor 之下的 transcript shrink、文件 identity（dev/inode）变化、head 指纹变化（同路径重写）、任意一次 ENOENT**（哪怕只持续一个 poll；恢复时若 head 一致则从旧 offset 继续、内容不同则锚到新 EOF，但两种恢复都**不会**重新打开 gate）。exec 保留 shell pid、时钟回拨、缺进程启动证据这些情形从会话一开始就是 Unverified（不发撤回边，gate 本来就没开过）。
+- wire 上撤回边**省略** `name` 与 `ultracode`（`skip_serializing_if`：字段不存在，而不是显式 `null`）；Hub/web 解析器以「有效 name 缺失 + `readbackAvailable:false`」识别它。
+- `readbackAvailable` 缺省/`null`/`true` = 回读可用；只有字面 `false` 是撤回。
+- Hub 收到 `false` 时把实例的 `effortEffective` 投影**置空**（不存占位），web 的投影解析器对该边返回 null；UI 回退到 `?`，不再显示撤回前的档/开关。撤回是粘性的：乱序（observedAt 早于当前投影，如后加载的历史）到达的撤回边被忽略；轮询只在 Hub 自己的记录从有投影变为空时撤回，不由「updatedAt 更新但从未投影过」触发；web 单独记录 withdrawn 标记，待决 push-down **仅在收到过显式撤回边**时 chip 显示 `?` 而不是待决词，从未回读过的会话仍显示待决词。
+- 撤回**不结算**任何待决 configure：既不标 Applied 也不拒绝；待决开关由后续 configure 的结果或有界超时收场。driver 同时丢掉自己一侧的 armed generation，防止 displaced transcript 里的迟到 verdict 把它结算成 Applied。
+- 同一进程不会 respawn，撤回是粘性的、整条边只发一次。
+
 历史档名按**名字**归一，绝不按 index：`default→low`、`think→high`、`think-hard→xhigh`，无法识别的名字落到 `high`（一个过期的 UI 字符串不该让启动失败；这是归一兜底，不是默认档）。旧名 `ultracode` 是**只用于输入**的别名：读入时归一为 `{name: "xhigh", ultracode: true}`，不写回，客户端也不再写出它——要表达 `{max, true}` 这类组合只能用 `ultracode` 字段。按 index 归一会出错，因为旧表是 per-harness 且长度不同——claude 的 index 3 是 `ultracode`，codex 的 index 3 是 `ultra`。旧客户端发来的 `{index, name}` 仍然接受，`index` 在读取时被忽略、也不写回。
 
 **Codex effort（codex-cli 0.154.0）。** 六档按原生 picker 顺序展示，默认 `medium`。`max` 和 `ultra` 原样持久化并传入 `-c model_reasoning_effort="<v>"`；历史输入 `minimal` 归一为 `low`，未知名字回落到默认档。`ultra` 是 Codex 的真实档位，Claude/agy/Grok 拒绝它；`ultracode` 仍是 Claude 专属的会话开关。跨 harness 历史名字只按名字读取，不按旧 index 推测。

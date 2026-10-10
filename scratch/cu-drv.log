@@ -1,0 +1,105 @@
+   Compiling generic-array v0.14.7
+   Compiling typenum v1.20.1
+   Compiling syn v2.0.119
+   Compiling getrandom v0.2.17
+   Compiling getrandom v0.4.3
+   Compiling rustix v1.1.4
+   Compiling fastrand v2.5.0
+   Compiling zerocopy v0.8.57
+   Compiling rand_core v0.6.4
+   Compiling time v0.3.55
+   Compiling futures-lite v2.6.1
+   Compiling uuid v1.26.1
+   Compiling piper v0.2.5
+   Compiling subtle v2.6.1
+   Compiling sync_wrapper v1.0.2
+   Compiling hyper v1.11.1
+   Compiling regex-automata v0.4.18
+   Compiling blocking v1.7.0
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling digest v0.10.7
+   Compiling cipher v0.4.4
+   Compiling sha2 v0.10.9
+   Compiling sha1 v0.10.7
+   Compiling universal-hash v0.5.1
+   Compiling poly1305 v0.8.0
+   Compiling chacha20 v0.9.1
+   Compiling aead v0.5.2
+   Compiling signal-hook v0.3.18
+   Compiling lazy_static v1.5.0
+   Compiling hyper-util v0.1.20
+   Compiling sharded-slab v0.1.7
+   Compiling chacha20poly1305 v0.10.1
+   Compiling unsafe-libyaml v0.2.11
+   Compiling remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+   Compiling matchers v0.2.0
+   Compiling fs2 v0.4.3
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling ppv-lite86 v0.2.21
+   Compiling tracing-attributes v0.1.31
+   Compiling strum_macros v0.28.0
+   Compiling derive_more-impl v2.1.1
+   Compiling pin-project-internal v1.1.13
+   Compiling rand_chacha v0.9.0
+   Compiling polling v3.11.0
+   Compiling async-io v2.6.0
+   Compiling thiserror-impl v1.0.69
+   Compiling pin-project v1.1.13
+   Compiling tracing v0.1.44
+   Compiling futures-concurrency v7.7.1
+   Compiling async-signal v0.2.14
+   Compiling async-process v2.5.0
+   Compiling rand v0.9.5
+   Compiling remuda-claude-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-claude-wire)
+   Compiling derive_more v2.1.1
+   Compiling remuda-herdr v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-herdr)
+   Compiling strum v0.28.0
+   Compiling agent-client-protocol-schema v1.7.0
+   Compiling thiserror v1.0.69
+   Compiling filedescriptor v0.8.3
+   Compiling tungstenite v0.29.0
+   Compiling portable-pty v0.9.0
+   Compiling axum-core v0.5.6
+   Compiling tokio-tungstenite v0.29.0
+   Compiling tower v0.5.3
+   Compiling tracing-subscriber v0.3.23
+   Compiling terminal_size v0.4.4
+   Compiling axum v0.8.9
+   Compiling tempfile v3.27.0
+   Compiling agent-client-protocol v2.1.0
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.10s
+     Running tests/usage_transcript.rs (target-fs2/debug/deps/usage_transcript-cb085e58e2324823)
+
+running 2 tests
+test one_usage_observation_per_finished_assistant_message_with_known_cache_buckets ... FAILED
+test a_fresh_mapper_replaying_the_transcript_re_emits_but_hub_dedupes ... FAILED
+
+failures:
+
+---- one_usage_observation_per_finished_assistant_message_with_known_cache_buckets stdout ----
+
+thread 'one_usage_observation_per_finished_assistant_message_with_known_cache_buckets' (2417210) panicked at crates/remuda-driver/tests/usage_transcript.rs:43:10:
+fixture dir: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_fresh_mapper_replaying_the_transcript_re_emits_but_hub_dedupes stdout ----
+
+thread 'a_fresh_mapper_replaying_the_transcript_re_emits_but_hub_dedupes' (2417209) panicked at crates/remuda-driver/tests/usage_transcript.rs:43:10:
+fixture dir: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+
+
+failures:
+    a_fresh_mapper_replaying_the_transcript_re_emits_but_hub_dedupes
+    one_usage_observation_per_finished_assistant_message_with_known_cache_buckets
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p remuda-driver --test usage_transcript`

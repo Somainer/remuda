@@ -1,0 +1,55 @@
+[WebServer]    Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.06s
+
+[WebServer]      Running `target-fs2/debug/examples/hub_e2e`
+
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a11294-f069-7040-8421-046105f6c6bf","upstream":"http://127.0.0.1:58881","viaHost":null}
+
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 240 ms
+[WebServer] 
+
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+
+Running 2 tests using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+
+[1/2] [chromium] › tests/e2e/ux-usage.hub.spec.ts:180:1 › context chip: ring percentage and popover rollup over three turns
+[WebServer] 2026-10-06T18:58:38.919577Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11295-0636-7346-a0bd-03c7aab87f4d response={"jsonrpc":"2.0","id":"715ab04c-02ee-4f0d-ab3f-bec805eae613","result":{"ok":true,"instanceId":"ins_01a11295-0634-738b-87a5-af70721693be"}}
+
+[WebServer] 2026-10-06T18:58:41.285875Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11295-0ecf-74fa-a987-c5446a02f1cf response={"jsonrpc":"2.0","id":"a651e8a7-fad6-4f37-a83f-32d299888f58","result":{"ok":true}}
+
+[WebServer] 2026-10-06T18:58:42.975803Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11295-169d-70b1-acf0-b3d9243da1ca response={"jsonrpc":"2.0","id":"7408e75e-0d10-43d2-b337-96a819fdd3d4","result":{"ok":true}}
+
+[WebServer] 2026-10-06T18:58:42.982484Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a11295-0634-738b-87a5-af70721693be device_id=dev_01a11294-fd6b-72e1-a14a-315eb6dfa6f1 forced=true
+
+  1) [chromium] › tests/e2e/ux-usage.hub.spec.ts:180:1 › context chip: ring percentage and popover rollup over three turns 
+
+    TypeError: expect(received).toMatch(expected)
+
+    Matcher error: received value must be a string
+
+    Received has value: null
+
+      214 |     { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 },
+      215 |   );
+    > 216 |   expect(hit, `panel centre hit-test: ${hit}`).toMatch(/context-usage/);
+          |                                                ^
+      217 |   await expect(page.getByTestId("context-usage-headline")).toHaveText(
+      218 |     "上下文 34.3k/200.0k (17%)",
+      219 |   );
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/ux-usage.hub.spec.ts:216:48
+
+    Error Context: test-results/ux-usage.hub-context-chip--32aa3-ver-rollup-over-three-turns-chromium/error-context.md
+
+    Error Context: test-results/ux-usage.hub-context-chip--32aa3-ver-rollup-over-three-turns-chromium/error-context.md
+
+
+[2/2] [chromium] › tests/e2e/ux-usage.hub.spec.ts:270:1 › context chip popover becomes a sheet at 390 px touch width
+  1 failed
+    [chromium] › tests/e2e/ux-usage.hub.spec.ts:180:1 › context chip: ring percentage and popover rollup over three turns 
+  1 did not run

@@ -1,0 +1,82 @@
+   Compiling subtle v2.6.1
+   Compiling crossbeam-utils v0.8.23
+   Compiling aho-corasick v1.1.5
+   Compiling serde_core v1.0.229
+   Compiling futures-concurrency v7.7.1
+   Compiling crossbeam-epoch v0.9.21
+   Compiling crossbeam-deque v0.8.8
+   Compiling bstr v1.13.1
+   Compiling digest v0.10.7
+   Compiling ff v0.13.1
+   Compiling rustls v0.23.44
+   Compiling crypto-bigint v0.5.5
+   Compiling group v0.13.0
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling hkdf v0.12.4
+   Compiling sha1 v0.10.7
+   Compiling concurrent-queue v2.5.0
+   Compiling signature v2.2.0
+   Compiling sec1 v0.7.3
+   Compiling rfc6979 v0.4.0
+   Compiling async-io v2.6.0
+   Compiling async-channel v2.5.0
+   Compiling remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+   Compiling blocking v1.7.0
+   Compiling rsa v0.9.10
+   Compiling regex-automata v0.4.18
+   Compiling elliptic-curve v0.13.8
+   Compiling async-signal v0.2.14
+   Compiling tungstenite v0.29.0
+   Compiling async-process v2.5.0
+   Compiling ecdsa v0.16.9
+   Compiling primeorder v0.13.6
+   Compiling hmac-sha512 v1.1.12
+   Compiling hmac-sha256 v1.1.14
+   Compiling universal-hash v0.5.1
+   Compiling poly1305 v0.8.0
+   Compiling superboring v0.1.14
+   Compiling p256 v0.13.2
+   Compiling p384 v0.13.1
+   Compiling tokio-tungstenite v0.29.0
+   Compiling k256 v0.13.4
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper-rustls v0.27.9
+   Compiling tungstenite v0.28.0
+   Compiling regex v1.13.1
+   Compiling reqwest v0.12.28
+   Compiling tokio-tungstenite v0.28.0
+   Compiling pem v0.8.3
+   Compiling sec1_decode v0.1.0
+   Compiling jwt-simple v0.12.17
+   Compiling agent-client-protocol v2.1.0
+   Compiling deranged v0.5.8
+   Compiling matchers v0.2.0
+   Compiling axum v0.8.9
+   Compiling chacha20poly1305 v0.10.1
+   Compiling ece v2.3.1
+   Compiling tracing-subscriber v0.3.23
+   Compiling time v0.3.55
+   Compiling globset v0.4.20
+   Compiling web-push v0.11.0
+   Compiling blake2 v0.10.6
+   Compiling password-hash v0.5.0
+   Compiling quick-xml v0.42.0
+   Compiling base64 v0.23.1
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+   Compiling remuda-ssh v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-ssh)
+   Compiling argon2 v0.5.3
+   Compiling plist v1.10.1
+   Compiling ignore v0.4.33
+   Compiling remuda-hub-client v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub-client)
+   Compiling remuda v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda)
+   Compiling glob v0.3.4
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-push v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-push)
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+   Compiling remuda-feishu v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-feishu)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 54.71s

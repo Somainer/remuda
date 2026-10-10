@@ -1,0 +1,14 @@
+4.0K	target-authrace/debug/incremental
+2.6G	target-authrace/debug/deps
+4.0K	target-authrace/.rustc_info.json
+--- scratch contents ---
+28K	scratch/r5-regate
+28K	scratch/tasks-before.txt
+40K	scratch/r5-gate
+52K	scratch/hub-final.log
+60K	scratch/pna-exp
+64K	scratch/r5-leakfix
+220K	scratch/ws-test-final.log
+300K	scratch/ws-test-c-resumehome.log
+48M	scratch/reconnfu-r2
+202M	scratch/reconnfu-e2e

@@ -1,0 +1,51 @@
+[2026-09-28T16:17:49+08:00] waiting
+[2026-09-28T16:17:49+08:00] go
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s
+[WebServer]      Running `/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/examples/hub_e2e`
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a0e717-7ca3-75ac-ac6d-e57d79f0aa82","upstream":"http://127.0.0.1:58881","viaHost":null}
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 202 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+Running 2 tests using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+[WebServer] 2026-09-28T08:17:56.160277Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e717-8f51-75dc-95ee-5142642184aa response={"jsonrpc":"2.0","id":"3471f372-0cb2-46e1-bece-2da70b641889","result":{"ok":true,"instanceId":"ins_01a0e717-8f50-7363-b536-534c1c62c6e6"}}
+[WebServer] 2026-09-28T08:17:58.522251Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e717-97a1-73a9-9cb7-3dcc3d838c47 response={"jsonrpc":"2.0","id":"965c58d3-f8d3-4ade-a762-5c72efb65845","result":{"ok":true}}
+[WebServer] 2026-09-28T08:18:00.448475Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e717-a07d-751f-a65e-83bf6616044d response={"jsonrpc":"2.0","id":"0e603e38-3678-407d-96d5-def9a3957f26","result":{"ok":true}}
+[WebServer] 2026-09-28T08:18:00.455033Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e717-8f50-7363-b536-534c1c62c6e6 device_id=dev_01a0e717-9ce6-737a-9406-7bc8fda16616 forced=true
+  ✓  1 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:451:1 › an online send labels the row 等待发送 then 已发送，等待确认/已受理 as it delivers (7.9s)
+[WebServer] 2026-09-28T08:18:03.340910Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e717-ab62-7259-b0f3-03f4d8617372 response={"jsonrpc":"2.0","id":"f1635f2e-cd31-49c6-bb1e-74b493dbba9d","result":{"ok":true,"instanceId":"ins_01a0e717-ab60-74e5-8944-6e112d81efe4"}}
+[WebServer] 4:18:07 PM [vite] ws proxy error:
+[WebServer] Error: write ECONNRESET
+[WebServer]     at afterWriteDispatched (node:internal/stream_base_commons:159:15)
+[WebServer]     at writeGeneric (node:internal/stream_base_commons:150:3)
+[WebServer]     at Socket._writeGeneric (node:net:966:11)
+[WebServer]     at Socket._write (node:net:978:8)
+[WebServer]     at writeOrBuffer (node:internal/streams/writable:572:12)
+[WebServer]     at _write (node:internal/streams/writable:501:10)
+[WebServer]     at Writable.write (node:internal/streams/writable:510:10)
+[WebServer]     at Socket.ondata (node:internal/streams/readable:1009:22)
+[WebServer]     at Socket.emit (node:events:519:28)
+[WebServer]     at addChunk (node:internal/streams/readable:561:12)
+[WebServer] 4:18:07 PM [vite] ws proxy socket error:
+[WebServer] Error: write ECONNRESET
+[WebServer]     at afterWriteDispatched (node:internal/stream_base_commons:159:15)
+[WebServer]     at writeGeneric (node:internal/stream_base_commons:150:3)
+[WebServer]     at Socket._writeGeneric (node:net:966:11)
+[WebServer]     at Socket._write (node:net:978:8)
+[WebServer]     at writeOrBuffer (node:internal/streams/writable:572:12)
+[WebServer]     at _write (node:internal/streams/writable:501:10)
+[WebServer]     at Writable.write (node:internal/streams/writable:510:10)
+[WebServer]     at Socket.ondata (node:internal/streams/readable:1009:22)
+[WebServer]     at Socket.emit (node:events:519:28)
+[WebServer]     at addChunk (node:internal/streams/readable:561:12)
+[WebServer] 2026-09-28T08:18:08.589790Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e717-b929-7eb3-a4a1-b3bb495a0146 response={"jsonrpc":"2.0","id":"bdf3bc55-e945-4b1c-a7c0-7dff0b8d58a3","result":{"ok":true}}
+[WebServer] 2026-09-28T08:18:15.340193Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e717-daa9-746a-9f18-195c91546159 response={"jsonrpc":"2.0","id":"39bffd74-0de3-4953-b18f-4822ad7e2751","result":{"ok":true}}
+[WebServer] 2026-09-28T08:18:15.346177Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e717-ab60-74e5-8944-6e112d81efe4 device_id=dev_01a0e717-d718-7168-8c38-52534c163563 forced=true
+  ✓  2 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:552:1 › an offline-queued message survives a reload with the browser context STILL offline and sends once after (14.9s)
+
+  2 passed (25.0s)
+[2026-09-28T16:18:15+08:00] exit 0

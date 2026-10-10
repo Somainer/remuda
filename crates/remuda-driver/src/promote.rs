@@ -131,6 +131,10 @@ pub struct Detected {
     pub session_id: Option<String>,
     /// This kind hydrates structured messages from a transcript.
     pub hydrates_transcript: bool,
+    /// The argv resumed an existing session (`--resume <id>` / `-r <id>`), as
+    /// opposed to starting a new one with `--session-id`. A hand-typed resume
+    /// inside a login shell is gated the same way as a Remuda-launched one.
+    pub resume: bool,
 }
 
 /// Reads the foreground process group of a live PTY.
@@ -222,11 +226,13 @@ pub fn detect(rows: &[ProcessRow], alias: Option<&LaunchAlias>) -> Option<Detect
         // Exact identity first: this is the path we exec'd, so no name table
         // has to have heard of it.
         if let Some(alias) = alias.filter(|alias| alias.path == *program) {
+            let (session_id, resume) = session_id_from_argv(&argv);
             return Some(Detected {
                 kind: alias.kind,
                 pid: row.pid,
-                session_id: session_id_from_argv(&argv),
+                session_id,
                 hydrates_transcript: hydrates_transcript(alias.kind),
+                resume,
             });
         }
         let base = basename(program);
@@ -235,11 +241,13 @@ pub fn detect(rows: &[ProcessRow], alias: Option<&LaunchAlias>) -> Option<Detect
         }
         for entry in AGENT_TABLE {
             if entry.names.contains(&base.as_str()) {
+                let (session_id, resume) = session_id_from_argv(&argv);
                 return Some(Detected {
                     kind: entry.kind,
                     pid: row.pid,
-                    session_id: session_id_from_argv(&argv),
+                    session_id,
                     hydrates_transcript: entry.hydrates_transcript,
+                    resume,
                 });
             }
         }
@@ -271,24 +279,81 @@ pub fn screen_status(screen: &str) -> Option<ScreenStatus> {
     remuda_screen::screen_status(&ScreenGrid::from_raw(&remuda_screen::screen_tail(screen)))
 }
 
-/// `--session-id <uuid>` / `--resume <uuid>` from an agent's argv.
-fn session_id_from_argv(argv: &[String]) -> Option<String> {
+/// `--session-id <uuid>` / `--resume [<uuid>]` / `--continue` (`-c`) from an
+/// agent's argv, and whether a resume flag was present.
+///
+/// r4: the resume bit is returned even when the value is not a uuid (so
+/// `--resume latest`, `--resume` with no id, or an unparsable id still gate
+/// the transcript as an UNVERIFIABLE resume rather than a fresh session). The
+/// session id is `Some` only for a uuid-shaped value usable to locate the
+/// deterministic transcript.
+///
+/// r5 item 3: `--continue` / `-c` resume the most recent session and take NO
+/// value: they set the resume bit WITHOUT consuming the next argv token (a
+/// leading prompt like `claude -c "fix this"` must keep its prompt).
+fn session_id_from_argv(argv: &[String]) -> (Option<String>, bool) {
+    let mut is_resume = false;
+    let mut session_id: Option<String> = None;
     let mut iter = argv.iter().skip(1);
     while let Some(arg) = iter.next() {
+        // Boolean resume flags (`--continue`, `-c`): no value ever — including
+        // an inline `=…`, which is ignored — and the next argv token is left
+        // untouched so it stays a prompt.
+        if let Some((flag, _inline)) = arg.split_once('=') {
+            if is_boolean_resume_flag(flag) {
+                is_resume = true;
+                continue;
+            }
+        } else if is_boolean_resume_flag(arg) {
+            is_resume = true;
+            continue;
+        }
         let value = match arg.split_once('=') {
-            Some((flag, inline)) if is_session_flag(flag) => Some(inline.to_owned()),
-            _ if is_session_flag(arg) => iter.next().cloned(),
+            Some((flag, inline)) if is_session_flag(flag) => {
+                if is_resume_flag(flag) {
+                    is_resume = true;
+                }
+                Some(inline.to_owned())
+            }
+            None if is_session_flag(arg) => {
+                if is_resume_flag(arg) {
+                    is_resume = true;
+                }
+                iter.next().cloned()
+            }
             _ => None,
         };
-        if let Some(value) = value.filter(|value| looks_like_uuid(value)) {
-            return Some(value);
+        if session_id.is_none()
+            && let Some(value) = value.filter(|value| looks_like_uuid(value))
+        {
+            session_id = Some(value);
         }
     }
-    None
+    (session_id, is_resume)
 }
 
 fn is_session_flag(flag: &str) -> bool {
-    matches!(flag, "--session-id" | "--resume" | "-r")
+    matches!(
+        flag,
+        "--session-id" | "--resume" | "-r" | "--continue" | "-c"
+    )
+}
+
+fn is_resume_flag(flag: &str) -> bool {
+    matches!(flag, "--resume" | "-r" | "--continue" | "-c")
+}
+
+/// A resume flag that is purely boolean and never followed by a value token.
+fn is_boolean_resume_flag(flag: &str) -> bool {
+    matches!(flag, "--continue" | "-c")
+}
+
+/// Resume provenance parsed from one process's raw `ps args=` line. Returns
+/// `(session_id, is_resume)`; used by the hook-binding path where the
+/// SessionStart payload names the session but not whether the agent resumed.
+#[must_use]
+pub(crate) fn resume_provenance(args: &str) -> (Option<String>, bool) {
+    session_id_from_argv(&split_argv(args))
 }
 
 fn looks_like_uuid(value: &str) -> bool {
@@ -538,6 +603,43 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
         assert!(parse_grouped_rows(output, 300).is_empty());
     }
 
+    /// c-r3 item 3: a hand-typed `claude --resume <id>` in a login shell must
+    /// carry resume provenance, so the promotion hydrator bounds it at the
+    /// process start instead of replaying history from byte 0. `--session-id`
+    /// (a brand-new session) is NOT a resume.
+    #[test]
+    fn detection_marks_a_hand_typed_resume_but_not_a_new_session_id() {
+        let id = "01234567-89ab-cdef-0123-456789abcdef";
+        let resumed = detect(
+            &parse_grouped_rows(&format!("  7 7 /usr/local/bin/claude --resume {id}\n"), 7),
+            None,
+        )
+        .expect("resume detected");
+        assert!(resumed.resume, "--resume sets the resume gate");
+        assert_eq!(resumed.session_id.as_deref(), Some(id));
+
+        let short = detect(
+            &parse_grouped_rows(&format!("  8 8 /usr/local/bin/claude -r {id}\n"), 8),
+            None,
+        )
+        .expect("short flag detected");
+        assert!(short.resume, "-r is also a resume");
+
+        let fresh = detect(
+            &parse_grouped_rows(
+                &format!("  9 9 /usr/local/bin/claude --session-id {id}\n"),
+                9,
+            ),
+            None,
+        )
+        .expect("new session detected");
+        assert!(
+            !fresh.resume,
+            "--session-id starts a new session, not a resume"
+        );
+        assert_eq!(fresh.session_id.as_deref(), Some(id));
+    }
+
     #[cfg(unix)]
     #[test]
     fn system_process_table_finds_a_job_in_its_own_process_group() {
@@ -600,6 +702,34 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
                 "{args}"
             );
         }
+    }
+
+    #[test]
+    fn continue_flags_are_resume_without_consuming_the_prompt_token() {
+        // r5 item 3: `--continue` / `-c` resume the most recent session and
+        // take no value, so a leading prompt token is preserved.
+        for args in ["claude --continue", "claude -c"] {
+            let found = detect(&rows(&[(7, args)]), None).expect("detected");
+            assert!(found.resume, "{args} is a resume");
+            assert_eq!(found.session_id, None, "{args} carries no session id");
+        }
+        // The token after the boolean flag is a PROMPT, not a session id, and
+        // is never consumed: a uuid-shaped prompt must not bind a transcript.
+        for args in [
+            "claude -c 04b95a78-e876-4212-aa9c-a6482f30f583",
+            "claude --continue fix the build",
+        ] {
+            let found = detect(&rows(&[(7, args)]), None).expect("detected");
+            assert!(found.resume, "{args}");
+            assert_eq!(
+                found.session_id, None,
+                "the prompt token is not an id: {args}"
+            );
+        }
+        // `--continue=` is treated as the boolean flag (inline value ignored).
+        let found = detect(&rows(&[(7, "claude --continue=true")]), None).expect("detected");
+        assert!(found.resume);
+        assert_eq!(found.session_id, None);
     }
 
     #[test]

@@ -1,0 +1,1 @@
+function e(e){return e.state===`known`?e.value:void 0}export{e as t};

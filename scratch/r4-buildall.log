@@ -1,0 +1,156 @@
+   Compiling subtle v2.6.1
+   Compiling allocator-api2 v0.2.21
+   Compiling foldhash v0.2.0
+   Compiling serde_json v1.0.151
+   Compiling fastrand v2.5.0
+   Compiling rustix v1.1.4
+   Compiling regex-syntax v0.8.11
+   Compiling aho-corasick v1.1.5
+   Compiling crossbeam-utils v0.8.23
+   Compiling digest v0.10.7
+   Compiling universal-hash v0.5.1
+   Compiling futures-lite v2.6.1
+   Compiling piper v0.2.5
+   Compiling hashbrown v0.17.1
+   Compiling sha2 v0.10.9
+   Compiling sha1 v0.10.7
+   Compiling tungstenite v0.29.0
+   Compiling concurrent-queue v2.5.0
+   Compiling poly1305 v0.8.0
+   Compiling async-channel v2.5.0
+   Compiling indexmap v2.14.2
+   Compiling futures-concurrency v7.7.1
+   Compiling blocking v1.7.0
+   Compiling chacha20poly1305 v0.10.1
+   Compiling tokio-tungstenite v0.29.0
+   Compiling signal-hook v0.3.18
+   Compiling unsafe-libyaml v0.2.11
+   Compiling fs2 v0.4.3
+   Compiling toml_edit v0.22.27
+   Compiling num-iter v0.1.46
+   Compiling hmac v0.12.1
+   Compiling hkdf v0.12.4
+   Compiling regex-automata v0.4.18
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling ff v0.13.1
+   Compiling sec1 v0.7.3
+   Compiling group v0.13.0
+   Compiling rustls v0.23.44
+   Compiling schemars v1.2.2
+   Compiling remuda-claude-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-claude-wire)
+   Compiling toml v0.8.23
+   Compiling remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+   Compiling serde_with v3.23.0
+   Compiling tempfile v3.27.0
+   Compiling polling v3.11.0
+   Compiling remuda-herdr v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-herdr)
+   Compiling async-io v2.6.0
+   Compiling axum v0.8.9
+   Compiling async-signal v0.2.14
+   Compiling async-process v2.5.0
+   Compiling matchers v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling agent-client-protocol-schema v1.7.0
+   Compiling terminal_size v0.4.4
+   Compiling regex v1.13.1
+   Compiling signature v2.2.0
+   Compiling crypto-bigint v0.5.5
+   Compiling tokio-rustls v0.26.5
+   Compiling rfc6979 v0.4.0
+   Compiling num-bigint-dig v0.8.6
+   Compiling tungstenite v0.28.0
+   Compiling elliptic-curve v0.13.8
+   Compiling ecdsa v0.16.9
+   Compiling primeorder v0.13.6
+   Compiling rsa v0.9.10
+   Compiling hyper-rustls v0.27.9
+   Compiling hmac-sha256 v1.1.14
+   Compiling hmac-sha512 v1.1.12
+   Compiling pem v0.8.3
+   Compiling p256 v0.13.2
+   Compiling p384 v0.13.1
+   Compiling k256 v0.13.4
+   Compiling superboring v0.1.14
+   Compiling reqwest v0.12.28
+   Compiling tokio-tungstenite v0.28.0
+   Compiling sec1_decode v0.1.0
+   Compiling ece v2.3.1
+   Compiling webauthn-rs-proto v0.5.5
+   Compiling password-hash v0.5.0
+   Compiling blake2 v0.10.6
+   Compiling remuda-ssh v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-ssh)
+   Compiling argon2 v0.5.3
+   Compiling webauthn-rs-core v0.5.5
+   Compiling crossbeam-epoch v0.9.21
+   Compiling crossbeam-deque v0.8.8
+   Compiling bstr v1.13.1
+   Compiling jwt-simple v0.12.17
+   Compiling globset v0.4.20
+   Compiling quick-xml v0.42.0
+   Compiling web-push v0.11.0
+   Compiling base64 v0.23.1
+   Compiling ignore v0.4.33
+   Compiling glob v0.3.4
+   Compiling remuda-push v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-push)
+   Compiling plist v1.10.1
+   Compiling ahash v0.8.12
+   Compiling num-rational v0.4.2
+   Compiling num-complex v0.4.6
+   Compiling num v0.4.3
+   Compiling bit-vec v0.8.0
+   Compiling borrow-or-share v0.2.4
+   Compiling unicode-general-category v1.1.0
+   Compiling bit-set v0.8.0
+   Compiling fluent-uri v0.4.1
+   Compiling fraction v0.17.0
+   Compiling bytecount v0.6.9
+   Compiling micromap v0.3.0
+   Compiling num-cmp v0.1.0
+   Compiling vsimd v0.8.0
+   Compiling outref v0.5.2
+   Compiling fancy-regex v0.19.1
+   Compiling referencing v0.56.0
+   Compiling jsonschema-value v0.56.0
+   Compiling jsonschema-regex v0.56.0
+   Compiling uuid-simd v0.8.0
+   Compiling email_address v0.2.9
+   Compiling agent-client-protocol v2.1.0
+   Compiling jsonschema v0.56.0
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+warning: unused import: `ResumeBoundary`
+  --> crates/remuda-driver/src/shell_pty/promotion.rs:30:5
+   |
+30 |     ResumeBoundary, ResumeMode, SessionStartReport, TailProvenance, TranscriptBinding,
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+warning: `remuda-driver` (lib) generated 1 warning (run `cargo fix --lib -p remuda-driver` to apply 1 suggestion)
+error[E0308]: mismatched types
+    --> crates/remuda-driver/src/claude_pty.rs:2668:91
+     |
+2668 |             spawn_transcript_pump(slot, tx, ctx, seq, None, None, None, None, None, None, None);
+     |             --------------------- arguments to this function are incorrect                ^^^^ expected `ResumeMode`, found `Option<_>`
+     |
+     = note: expected enum `claude_transcript::ResumeMode`
+                found enum `std::option::Option<_>`
+note: function defined here
+    --> crates/remuda-driver/src/claude_pty.rs:1386:4
+     |
+1386 | fn spawn_transcript_pump(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+...
+1398 |     resume_mode: crate::claude_transcript::ResumeMode,
+     |     -------------------------------------------------
+
+For more information about this error, try `rustc --explain E0308`.
+warning: `remuda-driver` (lib test) generated 1 warning (1 duplicate)
+error: could not compile `remuda-driver` (lib test) due to 1 previous error; 1 warning emitted
+warning: build failed, waiting for other jobs to finish...

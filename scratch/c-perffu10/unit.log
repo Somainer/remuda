@@ -1,0 +1,19 @@
+
+ RUN  v5.0.0 /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web
+
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+
+ Test Files  191 passed (191)
+      Tests  2170 passed (2170)
+   Start at  08:15:16
+   Duration  10.55s (environment 44%, transform 27%, tests 15%, setup 10%, import 4%)
+
+Environment  jsdom was created 191 times · 248.80s total, 44% of tracked time
+             create it once per worker with pool: 'vmThreads' (keeps per-file isolation) or isolate: false (shares it across files)
+             learn more: https://vitest.dev/guide/improving-performance#test-environments
+

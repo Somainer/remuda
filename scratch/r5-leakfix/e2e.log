@@ -1,0 +1,269 @@
+[WebServer]    Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.81s
+[WebServer]      Running `/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/examples/hub_e2e`
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:59380","token":"e2e-bootstrap-token","hostId":"hst_01a0e5bc-aa17-774c-8733-98643ed96162","upstream":"http://127.0.0.1:59381","viaHost":null}
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 198 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:59389/
+
+Running 18 tests using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+[WebServer] 2026-09-28T01:59:07.365933Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bc-bef5-7189-a9e6-c62add421434 response={"jsonrpc":"2.0","id":"5ef8c6a2-93e7-4eb4-b996-174ab41e1797","result":{"ok":true,"instanceId":"ins_01a0e5bc-bef3-746e-bf2a-b0fdab92d677"}}
+[WebServer] 2026-09-28T01:59:10.640934Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bc-c991-7c78-a63b-319cb8993999 response={"jsonrpc":"2.0","id":"91d19407-44ff-4e25-babe-ded9c0c8e77f","result":{"ok":true}}
+[WebServer] 2026-09-28T01:59:11.059357Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bc-ca03-7c50-a0b8-ea612bf2b87c response={"jsonrpc":"2.0","id":"186d6adb-6293-4c2f-8257-b9353eb53418","result":{"ok":true}}
+[WebServer] 2026-09-28T01:59:14.618316Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bc-dbb7-7727-88e7-8eb407e8f377 response={"jsonrpc":"2.0","id":"5671b7a2-7448-425c-a73b-bc8ff89828a7","result":{"ok":true}}
+[WebServer] 2026-09-28T01:59:14.624862Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bc-bef3-746e-bf2a-b0fdab92d677 device_id=dev_01a0e5bc-d829-74bd-a344-85ccfd01756b forced=true
+  ✓   1 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:275:1 › offline sends are queued and delivered exactly once after reconnect (10.5s)
+[WebServer] 2026-09-28T01:59:17.556030Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bc-e6c3-753a-9060-b8a0ae626cde response={"jsonrpc":"2.0","id":"2bd12ee2-5547-43ae-8b27-c99e747d2e50","result":{"ok":true,"instanceId":"ins_01a0e5bc-e6c1-71c7-b91e-c5ab1ccc5e4b"}}
+[WebServer] 9:59:20 AM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:793:10
+[WebServer]     791 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     792 |      }
+[WebServer]     793 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     794 |    }
+[WebServer]     795 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer] 
+[WebServer] 9:59:20 AM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:793:10
+[WebServer]     791 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     792 |      }
+[WebServer]     793 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     794 |    }
+[WebServer]     795 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer] 
+[WebServer] 9:59:20 AM [vite] (client) [Unhandled rejection] HubHttpError: not found
+[WebServer]  > rest src/lib/api.ts:832:10
+[WebServer]     830 |        /* raw */
+[WebServer]     831 |      }
+[WebServer]     832 |      throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
+[WebServer]         |            ^
+[WebServer]     833 |    }
+[WebServer]     834 |    if (res.status === 204) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer]  > src/lib/store.ts:1389:8
+[WebServer] 
+[WebServer] 9:59:21 AM [vite] (client) [Unhandled rejection] HubHttpError: not found
+[WebServer]  > rest src/lib/api.ts:832:10
+[WebServer]     830 |        /* raw */
+[WebServer]     831 |      }
+[WebServer]     832 |      throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
+[WebServer]         |            ^
+[WebServer]     833 |    }
+[WebServer]     834 |    if (res.status === 204) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer]  > src/lib/store.ts:1389:8
+[WebServer] 
+[WebServer] 9:59:22 AM [vite] (client) [Unhandled rejection] HubHttpError: not found
+[WebServer]  > rest src/lib/api.ts:832:10
+[WebServer]     830 |        /* raw */
+[WebServer]     831 |      }
+[WebServer]     832 |      throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
+[WebServer]         |            ^
+[WebServer]     833 |    }
+[WebServer]     834 |    if (res.status === 204) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2244:17
+[WebServer]  > src/lib/store.ts:1389:8
+[WebServer] 
+[WebServer] 2026-09-28T01:59:57.261191Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bc-ef34-714c-9dee-cd147c1965b7 response={"jsonrpc":"2.0","id":"a856827e-464e-401b-a1ec-927c79a6e73f","result":{"ok":true}}
+[WebServer] 2026-09-28T01:59:59.900622Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bd-8c99-741e-8442-36531e9ba43d response={"jsonrpc":"2.0","id":"c032e6b0-9dd2-4345-9e54-bf60d429c531","result":{"ok":true}}
+[WebServer] 2026-09-28T01:59:59.906786Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bc-e6c1-71c7-b91e-c5ab1ccc5e4b device_id=dev_01a0e5bd-88f8-711c-94db-83b8c7bc3cb3 forced=true
+  ✓   2 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:323:1 › an offline-queued message survives a reload while the Hub is still off and sends once after (45.3s)
+[WebServer] 2026-09-28T02:00:02.937353Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bd-9802-7579-ab68-413580c0b7e0 response={"jsonrpc":"2.0","id":"a9342870-a88d-4b8c-95a0-e558db75a6ea","result":{"ok":true,"instanceId":"ins_01a0e5bd-9801-725a-a42a-29f5348f0ddc"}}
+[WebServer] 2026-09-28T02:00:05.277170Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bd-a056-7bf7-885a-f06e26dd9bbd response={"jsonrpc":"2.0","id":"fec0a2ae-0c91-4fa9-a6f5-13b953c50137","result":{"ok":true}}
+[WebServer] 2026-09-28T02:00:08.038555Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bd-ac63-7410-a902-15f73522641c response={"jsonrpc":"2.0","id":"513dd116-dad7-4c38-b4fd-be58b699924d","result":{"ok":true}}
+[WebServer] 2026-09-28T02:00:08.044578Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bd-9801-725a-a42a-29f5348f0ddc device_id=dev_01a0e5bd-a8ca-7374-b010-4a4f57ee67bf forced=true
+  ✓   3 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:378:1 › a committed POST whose browser response is lost retries with replayed:true and runs once (8.1s)
+[WebServer] 2026-09-28T02:00:13.565141Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bd-c18d-737f-a410-e30d0c55a05e response={"jsonrpc":"2.0","id":"c9b0247c-eddc-415a-838e-f0ddb19a91c2","result":{"ok":true,"instanceId":"ins_01a0e5bd-c18b-74e7-b14e-a31dafb01518"}}
+  ✓   4 [chromium] › tests/e2e/task-model-list.hub.spec.ts:236:3 › task list at 1440 desktop › groups, nesting, attention, SE keys, detail and archive fold (7.1s)
+[WebServer] 2026-09-28T02:00:20.772855Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bd-ddb2-73ac-a7ef-ab4fb87db4f6 response={"jsonrpc":"2.0","id":"4a50ceb6-bfb6-40f9-b102-f06e6f09c9dd","result":{"ok":true,"instanceId":"ins_01a0e5bd-ddb1-7580-9bba-3254de06e005"}}
+[WebServer] 2026-09-28T02:00:25.747515Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bd-f190-71b9-bcd4-c2d2f7cdaaf2 response={"jsonrpc":"2.0","id":"9eaa821c-1f47-4cc0-ae5c-a41032ee6504","result":{"ok":true}}
+[WebServer] 2026-09-28T02:00:25.753589Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bd-c18b-74e7-b14e-a31dafb01518 device_id=dev_01a0e5bd-ee00-74b3-b379-dd20cfb6f654 forced=true
+[WebServer] 2026-09-28T02:00:25.962696Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bd-f268-704f-89ed-e8164fc5dc10 response={"jsonrpc":"2.0","id":"20bc7314-c461-46de-b8c6-e29b5ff21ff3","result":{"ok":true}}
+[WebServer] 2026-09-28T02:00:25.968770Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bd-ddb1-7580-9bba-3254de06e005 device_id=dev_01a0e5bd-ee00-74b3-b379-dd20cfb6f654 forced=true
+  ✓   5 [chromium] › tests/e2e/task-model-list.hub.spec.ts:335:3 › task layer at 390 phone (/m) › stacks the task groups on the home and opens the shared session (8.6s)
+[WebServer] 2026-09-28T02:00:29.701543Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-0091-779d-90c2-877ba1e9bb83 response={"jsonrpc":"2.0","id":"6f7e6fd2-6639-48bd-befb-baecbaf6a9ff","result":{"ok":true,"instanceId":"ins_01a0e5be-0090-77dc-a2be-f69885fabb74"}}
+[WebServer] 2026-09-28T02:00:31.677116Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-08ba-73b6-8ccf-f9023e5c360d response={"jsonrpc":"2.0","id":"d590e903-fed4-4d5c-ad93-885341e5acf1","result":{"ok":true}}
+[WebServer] 2026-09-28T02:00:31.684295Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-0090-77dc-a2be-f69885fabb74 device_id=dev_01a0e5be-0787-774b-b9fd-2e3a53df903f forced=true
+  ✓   6 [chromium] › tests/e2e/uo3-evidence.hub.spec.ts:122:1 › 390 iPhone: /m chrome is 52+52 with no chips row and no tab strip, and PhoneNav is 56 (5.7s)
+  ✓   7 [chromium] › tests/e2e/uo3-evidence.hub.spec.ts:246:1 › 390 with a fine pointer keeps desktop density: controls stay 32px (2.3s)
+  ✓   8 [chromium] › tests/e2e/uo3-evidence.hub.spec.ts:268:1 › soft keyboard keeps the home head and search inside the visible band (2.3s)
+  ✓   9 [chromium] › tests/e2e/uo3-evidence.hub.spec.ts:324:1 › 1440 desktop: /m redirects to /sessions and no phone chrome renders (2.7s)
+[WebServer] 2026-09-28T02:00:42.111966Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-310f-73b1-aa0b-b9c0f015e30e response={"jsonrpc":"2.0","id":"2470a4d7-78bc-442e-bdf3-9b0aaf2c3451","result":{"ok":true,"instanceId":"ins_01a0e5be-310e-76d5-850d-d0a17e30a661"}}
+[WebServer] 2026-09-28T02:00:46.580214Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-42f1-7058-963c-c60dab82acfd response={"jsonrpc":"2.0","id":"548ebcd4-eb7c-458c-b031-ff9390a8564f","result":{"ok":true}}
+[WebServer] 2026-09-28T02:00:46.586293Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-310e-76d5-850d-d0a17e30a661 device_id=dev_01a0e5be-3f5f-74c7-90ab-66580c0c134a forced=true
+  ✓  10 [chromium] › tests/e2e/uo3-evidence.hub.spec.ts:342:1 › both appearances resolve role tokens at 390 and 1440 (7.5s)
+[WebServer] 2026-09-28T02:00:49.514566Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-4df9-7459-9d55-f747ab889bcf response={"jsonrpc":"2.0","id":"db98d469-1f16-496e-9bac-15892014c743","result":{"ok":true,"instanceId":"ins_01a0e5be-4df8-7718-beb1-5dfba0a61bf8"}}
+[WebServer] 2026-09-28T02:01:00.612563Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-79c1-77c9-80f0-d0ef7bbeb9bf response={"jsonrpc":"2.0","id":"9ced7705-46ef-4533-9014-6772794ddebe","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:00.619191Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-4df8-7718-beb1-5dfba0a61bf8 device_id=dev_01a0e5be-7630-7402-a1da-e2dbd0085173 forced=true
+  ✓  11 [chromium] › tests/e2e/uo3-evidence.hub.spec.ts:402:1 › perf: gaining pending bottom-bar interactions never commits HomeList (14.0s)
+[WebServer] 2026-09-28T02:01:04.068681Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-86d6-75a4-bc83-dcdb003c73df response={"jsonrpc":"2.0","id":"6cf4ef2b-62ea-4df2-af0e-3809c8fbf7a1","result":{"ok":true,"instanceId":"ins_01a0e5be-86d5-7694-b762-1e508e2ece3b"}}
+[WebServer] 2026-09-28T02:01:05.924857Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-8d37-7406-b48b-56108bfc0e16 response={"jsonrpc":"2.0","id":"52357d7d-823d-405a-b901-30c3440edd43","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:06.665986Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-9166-7704-ab4f-c51d211befc5 response={"jsonrpc":"2.0","id":"f1a23bcf-a1de-4081-8343-b2f0bc38404e","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:06.672297Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-86d5-7694-b762-1e508e2ece3b device_id=dev_01a0e5be-7d07-769d-9af6-09b66a6a4885 forced=true
+  ✓  12 [chromium] › tests/e2e/ux-command-id.hub.spec.ts:149:1 › a composer submit renders one user bubble after hook + transcript round-trip (6.1s)
+[WebServer] 2026-09-28T02:01:09.697705Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-9cd5-70c4-938f-8084304af1f6 response={"jsonrpc":"2.0","id":"0ebab3ff-b347-46cf-9f6c-97a74bbbbc52","result":{"ok":true,"instanceId":"ins_01a0e5be-9cd4-76a8-bad9-d3d366dac41c"}}
+[WebServer] 2026-09-28T02:01:11.386544Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-a3d7-73b5-82a8-90ef939830cc response={"jsonrpc":"2.0","id":"92185d90-daf1-4a4c-b4cd-bef4347bdf71","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:11.392547Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-9cd4-76a8-bad9-d3d366dac41c device_id=dev_01a0e5be-9497-7768-9c89-a14f96ae6480 forced=true
+  ✓  13 [chromium] › tests/e2e/ux-command-id.hub.spec.ts:170:1 › a prompt typed into the attached terminal is one commandId-less user bubble (4.7s)
+[WebServer] 2026-09-28T02:01:13.956474Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-ad7a-75fa-9dcd-db10f4f5839d response={"jsonrpc":"2.0","id":"35ae31fd-760f-438d-a546-3436e8de8d88","result":{"ok":true,"instanceId":"ins_01a0e5be-ad78-774a-9e0c-81b380e4805e"}}
+[WebServer] 2026-09-28T02:01:17.396997Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-b54e-7ad6-8477-8c570ec6e8f0 response={"jsonrpc":"2.0","id":"63077578-3b50-4893-a720-163d45e031ba","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:18.063489Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-bdec-7568-90ea-05558e8db96f response={"jsonrpc":"2.0","id":"7467f42e-b111-4978-875c-ff8f3e752c56","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:18.069666Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-ad78-774a-9e0c-81b380e4805e device_id=dev_01a0e5be-a705-724b-a129-6598e4c89233 forced=true
+  ✓  14 [chromium] › tests/e2e/ux-command-id.hub.spec.ts:192:1 › a delayed POST shows 等待发送, never a duplicate, then upgrades in place (6.6s)
+[WebServer] 2026-09-28T02:01:20.670739Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-c7af-7266-98b7-01261303e0cf response={"jsonrpc":"2.0","id":"e98c8802-869f-413c-abb1-e893a279d7ef","result":{"ok":true,"instanceId":"ins_01a0e5be-c7ad-729a-86e7-e86fa93db526"}}
+[WebServer] 2026-09-28T02:01:23.552104Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-cf5e-7abe-b875-3f29b1a60837 response={"jsonrpc":"2.0","id":"40778c04-16d2-4139-9b4c-1294ee692e1d","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:24.735514Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-d7fc-76ff-ae7c-e5bb0538a31b response={"jsonrpc":"2.0","id":"04a79b85-8e7d-434b-a7d7-a8ec1556a497","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:24.741399Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-c7ad-729a-86e7-e86fa93db526 device_id=dev_01a0e5be-c10e-743c-ae44-fe81e1eb1c70 forced=true
+  ✓  15 [chromium] › tests/e2e/ux-command-id.hub.spec.ts:223:1 › a transient 5xx POST keeps the row waiting and retries with the same commandId exactly once (6.7s)
+[WebServer] 2026-09-28T02:01:28.730243Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-e731-7177-8976-ec67cf979187 response={"jsonrpc":"2.0","id":"2901916b-9155-4323-bd25-8d5f610fcf37","result":{"ok":true,"instanceId":"ins_01a0e5be-e72f-7547-a153-3e02eaa87f0e"}}
+[WebServer] 2026-09-28T02:01:28.939618Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-e866-726d-9d5a-d8092fcde96d response={"jsonrpc":"2.0","id":"dfbaaa1b-4a91-4827-80a5-2ce50736330a","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:29.450899Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-ea00-756f-bec9-ef9ab27dc53a response={"jsonrpc":"2.0","id":"3796d339-d858-40e9-be3d-484d56bd82e1","result":{"ok":true,"instanceId":"ins_01a0e5be-e9ff-7615-b8ab-7d286d0bf473"}}
+[WebServer] 2026-09-28T02:01:29.656415Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-eb32-72ab-aa2e-e21b5753592d response={"jsonrpc":"2.0","id":"435cd10d-c89d-4fc0-8fa1-dcf80daea12d","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:30.175746Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-ecd6-7069-9178-228b15786719 response={"jsonrpc":"2.0","id":"f0610ede-5875-40fa-a6dd-4adb10f04bb4","result":{"ok":true,"instanceId":"ins_01a0e5be-ecd4-725c-8b09-410aebb103cd"}}
+[WebServer] 2026-09-28T02:01:30.388654Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-ee0f-7546-b050-99aa790b9725 response={"jsonrpc":"2.0","id":"b50a4cdb-9d40-4c95-8391-d131702b5b98","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:30.897909Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-efa9-722a-aa6c-eade2ad4b051 response={"jsonrpc":"2.0","id":"3233f5c9-c724-425a-b77f-a6f294b87e3a","result":{"ok":true,"instanceId":"ins_01a0e5be-efa8-7497-8025-5cba23115446"}}
+[WebServer] 2026-09-28T02:01:31.108292Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-f0de-715f-8d76-7d85f37c6cac response={"jsonrpc":"2.0","id":"4a3e47d0-e8dc-4404-a557-c911193fb900","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:31.630191Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-f286-752a-97c6-70b5e135cff7 response={"jsonrpc":"2.0","id":"bc9b25d5-3af7-43a7-bb9b-75cbe856c6ea","result":{"ok":true,"instanceId":"ins_01a0e5be-f284-70ba-9ddf-00af2a35fbe4"}}
+[WebServer] 2026-09-28T02:01:31.840926Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-f3bb-7756-b70c-d4d441830a64 response={"jsonrpc":"2.0","id":"c2b9e92e-f5d1-4cee-9434-ad3b4202777b","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:32.352042Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-f558-719c-8837-64d25bdfe867 response={"jsonrpc":"2.0","id":"1e634724-a99d-469b-b13f-6b170c52aec4","result":{"ok":true,"instanceId":"ins_01a0e5be-f557-73cb-b9fb-e4428df42d06"}}
+[WebServer] 2026-09-28T02:01:32.554310Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-f685-7786-9149-8125fdf3e648 response={"jsonrpc":"2.0","id":"e2c89887-f0fc-4ac7-b746-a6a8ee81e004","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:33.072138Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-f827-72af-a07d-d0cd1f945ed5 response={"jsonrpc":"2.0","id":"19e44e93-cfd7-42c4-94a9-25e0f4212b15","result":{"ok":true,"instanceId":"ins_01a0e5be-f825-779b-b79f-784c03b55934"}}
+[WebServer] 2026-09-28T02:01:33.279562Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-f95a-75f9-aedf-44f6a213d9f4 response={"jsonrpc":"2.0","id":"ae86bfb9-4ae1-4c44-b396-70fa586aca4e","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:33.787557Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-faf3-7248-a025-3beff2a40f8d response={"jsonrpc":"2.0","id":"cde687d4-f2a6-4f3a-8bdb-5ed792949d64","result":{"ok":true,"instanceId":"ins_01a0e5be-faf2-761a-a3c2-8cce1a801a11"}}
+[WebServer] 2026-09-28T02:01:33.993026Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-fc23-7541-ae19-b62fcf9fe48c response={"jsonrpc":"2.0","id":"fb3d9ccb-cdaf-4e82-9d2e-87d77256daf7","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:34.506942Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-fdc1-7357-b7e0-373b2c0ed0ad response={"jsonrpc":"2.0","id":"2d590d44-3845-4c80-9a80-51d91afcc6ce","result":{"ok":true,"instanceId":"ins_01a0e5be-fdc0-72f8-9022-2ae734aa83d5"}}
+[WebServer] 2026-09-28T02:01:34.712544Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5be-fef3-75fb-857c-1ef48aa26957 response={"jsonrpc":"2.0","id":"244e9259-d5ce-4d76-ab0c-bf12fa265555","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:35.227194Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-0091-74a3-862f-2630145f4457 response={"jsonrpc":"2.0","id":"bfb89b14-9a6d-4c1f-a5eb-8b602ca74c29","result":{"ok":true,"instanceId":"ins_01a0e5bf-008f-71f4-8665-44e9d14f86dd"}}
+[WebServer] 2026-09-28T02:01:35.433653Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-01c4-7452-873a-9e7ef6a51fad response={"jsonrpc":"2.0","id":"b071bd0c-f7b1-46fc-845a-9865a242ff78","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:36.049339Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-0394-7239-a492-871456036681 response={"jsonrpc":"2.0","id":"ea757045-9bb8-4b44-87b5-edf4a8f7f020","result":{"ok":true,"instanceId":"ins_01a0e5bf-0393-7224-b63d-4794aaa4c53c"}}
+[WebServer] 2026-09-28T02:01:36.257808Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-04fc-7738-bf73-c6dbdf6cebb4 response={"jsonrpc":"2.0","id":"006d32f0-7966-4733-9beb-bf3d7d2161da","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:36.767190Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-0698-74de-8bfe-52b0dacea398 response={"jsonrpc":"2.0","id":"79a75989-f786-4bd0-a3a5-8ed33eedaf05","result":{"ok":true,"instanceId":"ins_01a0e5bf-0696-7312-9a63-06fa4a3e4926"}}
+[WebServer] 2026-09-28T02:01:36.976469Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-07cb-75a4-a63f-04230b8b85db response={"jsonrpc":"2.0","id":"e740aa47-235d-4e98-9898-5f79276e9d5b","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:37.486310Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-0966-7316-b918-22294d8feb33 response={"jsonrpc":"2.0","id":"e74546c6-894c-40ff-9954-50048533a34f","result":{"ok":true,"instanceId":"ins_01a0e5bf-0965-7156-b15b-d893994c0341"}}
+[WebServer] 2026-09-28T02:01:37.692979Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-0a97-77b5-a8cb-acac4f621c24 response={"jsonrpc":"2.0","id":"4c59005e-f36d-4d55-8c8f-48d8ed8e979e","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:38.211667Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-0c3a-72f0-99ef-15660bd09a0f response={"jsonrpc":"2.0","id":"f4ca5cf6-d690-4cef-ad76-93edb922e5db","result":{"ok":true,"instanceId":"ins_01a0e5bf-0c38-71e7-9afc-a3baa60ee6a5"}}
+[WebServer] 2026-09-28T02:01:38.420402Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-0d6e-77c5-b697-fbee22435a08 response={"jsonrpc":"2.0","id":"aa1b1397-bff0-4539-92aa-6501b7dbde35","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:49.996057Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-3a3e-7369-9aba-121a62481212 response={"jsonrpc":"2.0","id":"d883755d-8fd8-4c3f-9ecb-c927664475d7","result":{"ok":true,"instanceId":"ins_01a0e5bf-3a3d-7020-827c-3163bcd02c50"}}
+[WebServer] 2026-09-28T02:01:51.023970Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-3e42-77c4-9b9f-bd2c92694870 response={"jsonrpc":"2.0","id":"1b381f04-c9aa-48c0-ad87-11aa15a11b1a","result":{"ok":true,"instanceId":"ins_01a0e5bf-3e41-7717-89a5-d77190035fea"}}
+[WebServer] 2026-09-28T02:01:51.373924Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-e72f-7547-a153-3e02eaa87f0e device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:51.591073Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-e9ff-7615-b8ab-7d286d0bf473 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:51.796922Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-ecd4-725c-8b09-410aebb103cd device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:52.010786Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-efa8-7497-8025-5cba23115446 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:52.214736Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-f284-70ba-9ddf-00af2a35fbe4 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:52.423972Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-f557-73cb-b9fb-e4428df42d06 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:52.628155Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-f825-779b-b79f-784c03b55934 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:52.835272Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-faf2-761a-a3c2-8cce1a801a11 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:53.041734Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5be-fdc0-72f8-9022-2ae734aa83d5 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:53.247366Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-008f-71f4-8665-44e9d14f86dd device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:53.450284Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-0393-7224-b63d-4794aaa4c53c device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:53.656728Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-0696-7312-9a63-06fa4a3e4926 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:53.865695Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-0965-7156-b15b-d893994c0341 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:54.072754Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-0c38-71e7-9afc-a3baa60ee6a5 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:54.281746Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-4b66-717f-83c2-ed1ebb9cae74 response={"jsonrpc":"2.0","id":"678c5601-9d9a-4b47-b09d-741cc37e1068","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:54.288370Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-3a3d-7020-827c-3163bcd02c50 device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+[WebServer] 2026-09-28T02:01:54.494559Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-4c3b-74e0-ba2d-316e858d718d response={"jsonrpc":"2.0","id":"301dec22-cfe3-40c7-87ab-670cbb3a4a1c","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:54.500932Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-3e41-7717-89a5-d77190035fea device_id=dev_01a0e5be-e1fd-75fa-b97e-246a5d670127 forced=true
+  ✓  16 [chromium] › tests/e2e/ux-mobile-new.hub.spec.ts:294:3 › mobile new session (390px) › exited rows cost no /screen 500 and two creates open their sessions (28.0s)
+[WebServer] 2026-09-28T02:01:56.779167Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-54c1-752f-ab2c-7e0ed370b79a response={"jsonrpc":"2.0","id":"6e74fe33-a686-4f03-b3ba-c676bf93f433","result":{"ok":true,"instanceId":"ins_01a0e5bf-54c0-77e1-bffb-7e11dfe8dc9c"}}
+[WebServer] 2026-09-28T02:01:56.988672Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-55f7-767c-a8ee-d65f03a44bc9 response={"jsonrpc":"2.0","id":"ed91d60f-65e7-4fbd-a527-a09c7641756f","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:57.497177Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-5791-73c7-9d04-9701e7bcefdf response={"jsonrpc":"2.0","id":"33443c77-340f-4ee0-b76c-fbb67006ae9b","result":{"ok":true,"instanceId":"ins_01a0e5bf-578f-7393-971c-c0f3b03a4022"}}
+[WebServer] 2026-09-28T02:01:57.703592Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-58c2-7385-8871-e6259afc7550 response={"jsonrpc":"2.0","id":"3de2b64d-b355-44b0-807d-0bca60139096","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:58.280985Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-5a9f-74c7-ac35-f6f796212d53 response={"jsonrpc":"2.0","id":"fabe28a0-6de1-4cdb-909e-d436bca7e91e","result":{"ok":true,"instanceId":"ins_01a0e5bf-5a9d-749c-a6e5-fc0d550ef190"}}
+[WebServer] 2026-09-28T02:01:58.487538Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-5bd2-74c2-bcc4-67a0a874d474 response={"jsonrpc":"2.0","id":"43484791-4149-4297-aa2b-5aa141698999","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:59.010856Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-5d79-7393-a0ba-f7fa99522f6d response={"jsonrpc":"2.0","id":"f074f247-99f4-46ef-aa13-5a227cbe55a5","result":{"ok":true,"instanceId":"ins_01a0e5bf-5d77-76cd-85fd-fc7b8d0cdd42"}}
+[WebServer] 2026-09-28T02:01:59.220481Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-5eaf-7294-903e-24ecc40f5ac6 response={"jsonrpc":"2.0","id":"489cfba7-ab7a-4675-8917-9e88de93b8f2","result":{"ok":true}}
+[WebServer] 2026-09-28T02:01:59.736116Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-604e-7637-a1fa-e378a0cf5aa4 response={"jsonrpc":"2.0","id":"b9126c08-4e45-4daf-96c7-8776f1ebbd47","result":{"ok":true,"instanceId":"ins_01a0e5bf-604d-77e9-89c7-f7733053bd1d"}}
+[WebServer] 2026-09-28T02:01:59.945854Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-6184-7042-9081-15c3f2f5bdd1 response={"jsonrpc":"2.0","id":"1e8d74ee-f816-45ff-a0b0-feb15da41d59","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:00.457280Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-631c-74ac-b248-8da85be05c3b response={"jsonrpc":"2.0","id":"95492190-ffd3-4808-9270-f83e017437cc","result":{"ok":true,"instanceId":"ins_01a0e5bf-631b-76b9-8f28-8be01b78aa93"}}
+[WebServer] 2026-09-28T02:02:00.670008Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-6458-7500-a21d-830b60135c69 response={"jsonrpc":"2.0","id":"1cb09611-5e53-45b9-9bca-819a3bda6857","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:01.191379Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-6601-7418-96dd-f1a82d0b25fe response={"jsonrpc":"2.0","id":"18b48dd4-196f-4e99-b9ec-30925bdfb4cd","result":{"ok":true,"instanceId":"ins_01a0e5bf-65ff-7085-b503-cd304e2eb927"}}
+[WebServer] 2026-09-28T02:02:01.401712Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-6734-7313-b4bc-b2d1be2ae6a3 response={"jsonrpc":"2.0","id":"af3d4d7d-50df-4a82-abd0-90a106ec1758","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:01.941444Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-68db-7133-a756-548980dc2e9e response={"jsonrpc":"2.0","id":"34065915-b986-486c-a84a-f047cbed4b0a","result":{"ok":true,"instanceId":"ins_01a0e5bf-68d9-7031-b571-679b9065fd37"}}
+[WebServer] 2026-09-28T02:02:02.162739Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-6a2c-71f6-94b6-9eac9a9e1250 response={"jsonrpc":"2.0","id":"8da713fe-d4e3-4e04-872c-a400923fdcb3","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:02.677148Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-6bcd-7572-a8e1-deff1ec63e0d response={"jsonrpc":"2.0","id":"86fc7cc0-1f31-41a0-ac02-f28542fce78d","result":{"ok":true,"instanceId":"ins_01a0e5bf-6bcc-743f-8427-284ff8915bc1"}}
+[WebServer] 2026-09-28T02:02:02.883460Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-6cfe-750f-b26c-89cf2e5aceba response={"jsonrpc":"2.0","id":"b9a1f9a7-2f1b-40a4-8177-f80ce0ea1f69","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:03.405785Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-6ea2-70a3-97f1-5fb8a06c5396 response={"jsonrpc":"2.0","id":"338f799a-41cf-4539-a608-396073c0cc99","result":{"ok":true,"instanceId":"ins_01a0e5bf-6ea1-71c9-9fdf-3423220fc48b"}}
+[WebServer] 2026-09-28T02:02:03.614443Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-6fd8-7533-b4c4-ca02cf4a3712 response={"jsonrpc":"2.0","id":"07c708cf-0897-4b45-b571-4083c5e97155","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:04.131326Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-717b-721a-ab47-62f010590ce0 response={"jsonrpc":"2.0","id":"1ad47be0-9b94-4d99-920f-d083ffef3b84","result":{"ok":true,"instanceId":"ins_01a0e5bf-7179-7350-afb9-56c6444abfbe"}}
+[WebServer] 2026-09-28T02:02:04.367475Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-72c9-7479-bd7c-c0bd91e18576 response={"jsonrpc":"2.0","id":"3e6372ce-59c9-4bfb-88c7-17ed4b36fdbc","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:04.879498Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-7467-76f7-9a76-c27f13aaa6db response={"jsonrpc":"2.0","id":"f3524bee-2e07-4cb1-b683-30694b9b2c0d","result":{"ok":true,"instanceId":"ins_01a0e5bf-7465-71be-bc88-43589735cbf1"}}
+[WebServer] 2026-09-28T02:02:05.093826Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-75a0-76b1-9cf6-83cb113a3ae2 response={"jsonrpc":"2.0","id":"f8da4042-d833-4818-ab0d-02c42bf2040a","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:05.611456Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-7741-70d9-927b-5f3036a7c128 response={"jsonrpc":"2.0","id":"8eda92eb-ec54-424b-9dee-d74271281456","result":{"ok":true,"instanceId":"ins_01a0e5bf-773f-7440-a135-02c56f4ea4c8"}}
+[WebServer] 2026-09-28T02:02:05.821135Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-7877-75c0-822f-0c1077e519e9 response={"jsonrpc":"2.0","id":"21a647ba-d543-4175-b97b-078b79a9f74c","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:06.332273Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-7a11-74f1-b5cc-c2d680b754c1 response={"jsonrpc":"2.0","id":"6f56293a-1836-4a48-9a38-db6ce35a5367","result":{"ok":true,"instanceId":"ins_01a0e5bf-7a10-7703-ab03-6577e931e3a6"}}
+[WebServer] 2026-09-28T02:02:06.536782Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-7b43-7159-8164-b346752086f2 response={"jsonrpc":"2.0","id":"37b93f2a-9945-4bd6-afa0-e170d1ee049d","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:10.479624Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-54c0-77e1-bffb-7e11dfe8dc9c device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:10.684422Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-578f-7393-971c-c0f3b03a4022 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:10.889897Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-5a9d-749c-a6e5-fc0d550ef190 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:11.094729Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-5d77-76cd-85fd-fc7b8d0cdd42 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:11.298655Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-604d-77e9-89c7-f7733053bd1d device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:11.501929Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-631b-76b9-8f28-8be01b78aa93 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:11.705103Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-65ff-7085-b503-cd304e2eb927 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:11.910520Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-68d9-7031-b571-679b9065fd37 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:12.112328Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-6bcc-743f-8427-284ff8915bc1 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:12.323680Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-6ea1-71c9-9fdf-3423220fc48b device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:12.524425Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-7179-7350-afb9-56c6444abfbe device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:12.732361Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-7465-71be-bc88-43589735cbf1 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:12.936946Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-773f-7440-a135-02c56f4ea4c8 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+[WebServer] 2026-09-28T02:02:13.141014Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-7a10-7703-ab03-6577e931e3a6 device_id=dev_01a0e5bf-4f93-7093-94db-883d1dea6d27 forced=true
+  ✓  17 [chromium] › tests/e2e/ux-mobile-new.hub.spec.ts:392:3 › mobile new session (390px) › NODE_BUSY on a saturated link rejects the real create with 503 inline (18.6s)
+[WebServer] 2026-09-28T02:02:15.452406Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-9dae-727d-bd97-eca9be3050e1 response={"jsonrpc":"2.0","id":"9e00f190-06aa-44bc-8c03-a2d52ba72de0","result":{"ok":true,"instanceId":"ins_01a0e5bf-9dac-76ed-8653-6d269706795d"}}
+[WebServer] 2026-09-28T02:02:15.659794Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-9ee6-713e-b48b-7c8e13b1f11a response={"jsonrpc":"2.0","id":"bf43f404-da0f-4157-8733-7942b973af68","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:16.184138Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-a086-7299-bcaa-10c78c5ff07a response={"jsonrpc":"2.0","id":"5f219bfc-2f46-4af0-be2d-6e8d1ab08e1d","result":{"ok":true,"instanceId":"ins_01a0e5bf-a084-75f9-a6ed-94a68b18be73"}}
+[WebServer] 2026-09-28T02:02:16.398045Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-a1c8-7285-b588-7d98d6ee043e response={"jsonrpc":"2.0","id":"cf0e5fa6-854d-4306-8116-a0c6901a6852","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:16.915134Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-a369-74bc-aea7-5be7ec9f115e response={"jsonrpc":"2.0","id":"39ff7c0a-f0e9-4fdf-bfe8-a3a31ad8d76f","result":{"ok":true,"instanceId":"ins_01a0e5bf-a367-733c-a1a9-89eab9481ef2"}}
+[WebServer] 2026-09-28T02:02:17.125143Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-a49f-747b-b685-4e2a8488e804 response={"jsonrpc":"2.0","id":"4b27e7ba-c1d4-485e-a82c-de85820cf2e0","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:17.638438Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-a63e-74fe-8846-e55a90a5c8de response={"jsonrpc":"2.0","id":"e1b0a3f4-e425-41d4-b663-e6671e62b4b2","result":{"ok":true,"instanceId":"ins_01a0e5bf-a63c-70ba-bce7-4ac6b175bfe8"}}
+[WebServer] 2026-09-28T02:02:17.851645Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-a776-71ad-8664-f822c954c61d response={"jsonrpc":"2.0","id":"18095f02-4526-4767-97f6-ea10e7bfc27e","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:18.378052Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-a919-76c4-b606-5d334e6a1edd response={"jsonrpc":"2.0","id":"da95c772-a216-41da-a282-39b0f44f3a47","result":{"ok":true,"instanceId":"ins_01a0e5bf-a917-7468-b8d6-91faf6a0c6eb"}}
+[WebServer] 2026-09-28T02:02:18.598305Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-aa60-7110-9186-3d874c4095eb response={"jsonrpc":"2.0","id":"a129af9e-53e0-4995-a847-4fa03040fb0e","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:19.118955Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-ac00-75a4-8154-d8dcd796de16 response={"jsonrpc":"2.0","id":"da1d3bec-c6a3-4dba-be66-5768e6758640","result":{"ok":true,"instanceId":"ins_01a0e5bf-abfe-7547-bfcc-3bf3bc09855b"}}
+[WebServer] 2026-09-28T02:02:19.328059Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-ad3a-7765-804c-220a7f02f64c response={"jsonrpc":"2.0","id":"8ad4e93e-4e2b-41bf-ac3d-dd99987dc494","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:19.838247Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-aed5-7556-aa9f-18acd41627f4 response={"jsonrpc":"2.0","id":"cbe775a6-d611-4d3c-b25c-b7ad4e122192","result":{"ok":true,"instanceId":"ins_01a0e5bf-aed3-72dd-9d69-76bb68f11857"}}
+[WebServer] 2026-09-28T02:02:20.048667Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-b00b-72f2-9465-7349e8b0ce29 response={"jsonrpc":"2.0","id":"a48f2990-ea70-4eef-8f81-65c050806f76","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:20.571435Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-b1aa-742e-a324-3cf499907ed3 response={"jsonrpc":"2.0","id":"468c72e1-c736-43f5-b24d-d0de65096800","result":{"ok":true,"instanceId":"ins_01a0e5bf-b1a9-7447-ac42-93ac2ba541aa"}}
+[WebServer] 2026-09-28T02:02:20.782040Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-b2e8-7749-b967-6963befa478a response={"jsonrpc":"2.0","id":"3a4fc22c-d998-484b-b0b2-f9791832303b","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:21.302663Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-b48e-72fe-8043-ae1dac755038 response={"jsonrpc":"2.0","id":"514033ad-446c-48fb-bcb0-615b52ecc5ad","result":{"ok":true,"instanceId":"ins_01a0e5bf-b48d-7262-b25a-d0c4b5b2187f"}}
+[WebServer] 2026-09-28T02:02:21.507244Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-b5bd-7604-bfd4-a3f7a23ddf30 response={"jsonrpc":"2.0","id":"d87c7b18-ab98-43a9-8f9d-972aa0af45a7","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:22.022407Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-b75e-7109-b66a-33236ec01ba5 response={"jsonrpc":"2.0","id":"7fa0581d-604e-41a8-8283-ce6f55f9bab0","result":{"ok":true,"instanceId":"ins_01a0e5bf-b75d-705c-92aa-24045c1514cc"}}
+[WebServer] 2026-09-28T02:02:22.243312Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-b89e-740b-ad9f-5cd37efa0ab4 response={"jsonrpc":"2.0","id":"bc157fc4-7e18-44b8-97ba-c3f68d007463","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:22.768975Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-ba46-70de-a81d-b1fa521a78b6 response={"jsonrpc":"2.0","id":"52aef80d-90bf-4d7b-a185-3300ef30bdca","result":{"ok":true,"instanceId":"ins_01a0e5bf-ba45-709b-a5c5-ae5261be52f4"}}
+[WebServer] 2026-09-28T02:02:22.981896Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-bb80-73c2-b2f0-c773b6aa7ae6 response={"jsonrpc":"2.0","id":"e0589c9b-8008-4a0e-875c-a9b2ec9cce17","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:23.498598Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-bd20-73fd-95f7-4d91977944aa response={"jsonrpc":"2.0","id":"1a92ae65-8b10-42a4-b418-e2107d0241d4","result":{"ok":true,"instanceId":"ins_01a0e5bf-bd1e-73d5-8648-1e25bda46be6"}}
+[WebServer] 2026-09-28T02:02:23.707187Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-be55-7576-8d2f-33b7fc57ffb8 response={"jsonrpc":"2.0","id":"75e617bd-c59f-4ce3-9c1d-b0529608e9a4","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:24.218888Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-bff4-7366-9621-c9b0b7702b13 response={"jsonrpc":"2.0","id":"79104530-523a-4cc0-88e6-b8ebabfe662a","result":{"ok":true,"instanceId":"ins_01a0e5bf-bff3-75a0-adf4-9433622e3049"}}
+[WebServer] 2026-09-28T02:02:24.433354Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-c12b-7579-b803-2131a995d8a1 response={"jsonrpc":"2.0","id":"cae78ad3-59ee-4e61-9666-5a76ad616a9f","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:24.941009Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-c2c5-7323-aeab-641b2379a779 response={"jsonrpc":"2.0","id":"b0517915-d3bf-420f-a674-3fe32da29bf7","result":{"ok":true,"instanceId":"ins_01a0e5bf-c2c3-774e-b227-80aa7a2446a1"}}
+[WebServer] 2026-09-28T02:02:25.167113Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-c409-75f1-b2e4-030df327f9f0 response={"jsonrpc":"2.0","id":"c4afc0b2-36f1-4e1e-abc0-f446a47c82db","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:27.392190Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-cc51-745c-ad36-ae2a94a848f7 response={"jsonrpc":"2.0","id":"19cd26f0-04c3-4589-be29-eecd404597f3","result":{"ok":true,"instanceId":"ins_01a0e5bf-cc50-701c-8ea4-f716d91699f7"}}
+[WebServer] 2026-09-28T02:02:27.905342Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-9dac-76ed-8653-6d269706795d device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:28.112111Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-a084-75f9-a6ed-94a68b18be73 device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:28.314576Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-a367-733c-a1a9-89eab9481ef2 device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:28.519621Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-a63c-70ba-bce7-4ac6b175bfe8 device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:28.724145Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-a917-7468-b8d6-91faf6a0c6eb device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:28.937504Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-abfe-7547-bfcc-3bf3bc09855b device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:29.139223Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-aed3-72dd-9d69-76bb68f11857 device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:29.348237Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-b1a9-7447-ac42-93ac2ba541aa device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:29.557792Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-b48d-7262-b25a-d0c4b5b2187f device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:29.775917Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-b75d-705c-92aa-24045c1514cc device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:29.986397Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-ba45-709b-a5c5-ae5261be52f4 device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:30.188739Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-bd1e-73d5-8648-1e25bda46be6 device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:30.401393Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-bff3-75a0-adf4-9433622e3049 device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:30.617086Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-c2c3-774e-b227-80aa7a2446a1 device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+[WebServer] 2026-09-28T02:02:30.821372Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e5bf-da22-7613-8a69-79bd69f88cc7 response={"jsonrpc":"2.0","id":"424b4ab6-5b75-4680-862e-4d36290d7014","result":{"ok":true}}
+[WebServer] 2026-09-28T02:02:30.826985Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e5bf-cc50-701c-8ea4-f716d91699f7 device_id=dev_01a0e5bf-984a-7286-8347-20e4434cb759 forced=true
+  ✓  18 [chromium] › tests/e2e/ux-mobile-new.hub.spec.ts:441:3 › mobile new session (390px) › saturated screen reads still let instance.create through (17.7s)
+
+  18 passed (3.9m)

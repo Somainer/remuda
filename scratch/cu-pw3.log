@@ -1,0 +1,63 @@
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s
+
+[WebServer]      Running `target-fs2/debug/examples/hub_e2e`
+
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a112a2-805c-7036-bb09-228b25fd411b","upstream":"http://127.0.0.1:58881","viaHost":null}
+
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 194 ms
+[WebServer] 
+
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+
+Running 2 tests using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+
+[1/2] [chromium] › tests/e2e/ux-usage.hub.spec.ts:180:1 › context chip: ring percentage and popover rollup over three turns
+[WebServer] 2026-10-06T19:13:27.233606Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a112a2-942c-7266-8238-5c5750c0dc6f response={"jsonrpc":"2.0","id":"5130832f-2484-40af-8776-6284867739dc","result":{"ok":true,"instanceId":"ins_01a112a2-942a-71fc-90d5-9585dba46705"}}
+
+[WebServer] 2026-10-06T19:13:29.585684Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a112a2-9cce-7963-bd44-a6d0108ba6aa response={"jsonrpc":"2.0","id":"c6b8ecf5-1b1d-4a2b-9bf9-50f82f81cd2f","result":{"ok":true}}
+
+[WebServer] 2026-10-06T19:13:32.009260Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a112a2-a62e-73b4-9695-1ab9b7ea8cf6 response={"jsonrpc":"2.0","id":"28f7e78f-51cb-442d-ad25-6a0589ca3848","result":{"ok":true}}
+
+[WebServer] 2026-10-06T19:13:47.805875Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a112a2-e51a-7669-bb9d-888d2ec1d52a response={"jsonrpc":"2.0","id":"ecc0ae04-23f1-4c05-942e-5d889bfeda18","result":{"ok":true}}
+
+[WebServer] 2026-10-06T19:13:47.812411Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a112a2-942a-71fc-90d5-9585dba46705 device_id=dev_01a112a2-8b9a-73f3-bd92-28c12ac3c867 forced=true
+
+  1) [chromium] › tests/e2e/ux-usage.hub.spec.ts:180:1 › context chip: ring percentage and popover rollup over three turns 
+
+    Error: expect(locator).toHaveText(expected) failed
+
+    Locator:  getByTestId('context-chip')
+    Expected: "18%"
+    Received: "17%"
+    Timeout:  15000ms
+
+    Call log:
+      - Expect "toHaveText" getByTestId('context-chip') with timeout 15000ms
+      - waiting for getByTestId('context-chip')
+        34 × locator resolved to <button type="button" data-has-popover="1" aria-expanded="true" aria-haspopup="dialog" class="_chip_1eckq_185" data-testid="context-chip" aria-label="上下文用量 17%，查看明细">…</button>
+           - unexpected value "17%"
+
+
+      238 |   // Turn 2 — 1839 / 185 / 33592: last-turn context = 35431 → 18%, totals add.
+      239 |   await sendUsageTurn(page, "1839,185,33592,0", true);
+    > 240 |   await expect(chip).toHaveText("18%", { timeout: 15_000 });
+          |                      ^
+      241 |   // Moving the pointer to the composer dismisses the hover-anchored panel;
+      242 |   // reopen to read the refreshed numbers.
+      243 |   await chip.click();
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/ux-usage.hub.spec.ts:240:22
+
+    Error Context: test-results/ux-usage.hub-context-chip--32aa3-ver-rollup-over-three-turns-chromium/error-context.md
+
+    Error Context: test-results/ux-usage.hub-context-chip--32aa3-ver-rollup-over-three-turns-chromium/error-context.md
+
+
+[2/2] [chromium] › tests/e2e/ux-usage.hub.spec.ts:274:1 › context chip popover becomes a sheet at 390 px touch width
+  1 failed
+    [chromium] › tests/e2e/ux-usage.hub.spec.ts:180:1 › context chip: ring percentage and popover rollup over three turns 
+  1 did not run

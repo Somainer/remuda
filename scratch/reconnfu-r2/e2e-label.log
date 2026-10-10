@@ -1,0 +1,55 @@
+[2026-09-29T02:55:04+08:00] waiting for gate-e2e.lock
+[2026-09-29T02:55:04+08:00] acquired gate-e2e.lock
+[WebServer]    Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.63s
+[WebServer]      Running `/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/examples/hub_e2e`
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a0e95e-fdc8-71b2-9143-c353b40b3103","upstream":"http://127.0.0.1:58881","viaHost":null}
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 298 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+Running 1 test using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+[WebServer] 2026-09-28T18:55:16.780139Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e95f-10b9-74c2-82a7-f4ef2480cc56 response={"jsonrpc":"2.0","id":"90580b9b-9ea4-41fe-9aad-930401f7ebd2","result":{"ok":true,"instanceId":"ins_01a0e95f-10b7-77ec-b2e8-0105c4eb3f4f"}}
+[WebServer] 2026-09-28T18:55:19.208490Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e95f-193f-71d0-bf40-82e2be0001b7 response={"jsonrpc":"2.0","id":"7c9e2ffd-afed-46c8-ae23-875adb5f8327","result":{"ok":true}}
+[WebServer] 2026-09-28T18:55:28.028110Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e95f-3d19-74e4-a9d6-3251c07c7957 response={"jsonrpc":"2.0","id":"03c04bee-9979-4c78-b507-a57fc7fcbf27","result":{"ok":true}}
+[WebServer] 2026-09-28T18:55:28.034849Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e95f-10b7-77ec-b2e8-0105c4eb3f4f device_id=dev_01a0e95f-317a-7057-807f-d8a847957677 forced=true
+  ✘  1 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:517:1 › a Hub-accepted send shows its delivered label on the still-visible bubble until the journal join (15.1s)
+
+
+  1) [chromium] › tests/e2e/offline-outbox.hub.spec.ts:517:1 › a Hub-accepted send shows its delivered label on the still-visible bubble until the journal join 
+
+    Error: expect(locator).toHaveCount(expected) failed
+
+    Locator:  locator('[data-testid="transcript-row"][data-role="user"][data-command-id="cmd_01a0e95f-193f-71d0-bf40-82e2be0001b7"]')
+    Expected: 0
+    Received: 1
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveCount" locator('[data-testid="transcript-row"][data-role="user"][data-command-id="cmd_01a0e95f-193f-71d0-bf40-82e2be0001b7"]') with timeout 5000ms
+      - waiting for locator('[data-testid="transcript-row"][data-role="user"][data-command-id="cmd_01a0e95f-193f-71d0-bf40-82e2be0001b7"]')
+        14 × locator resolved to 1 element
+           - unexpected value "1"
+
+
+      547 |   await expect(
+      548 |     page.locator(`[data-testid="transcript-row"][data-role="user"][data-command-id="${commandId}"]`),
+    > 549 |   ).toHaveCount(0);
+          |     ^
+      550 |
+      551 |   // Hold released: the journal user observation joins exactly once and the
+      552 |   // bubble is replaced by the transcript row.
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/offline-outbox.hub.spec.ts:549:5
+
+    Error Context: test-results/offline-outbox.hub-a-Hub-a-ed0e0-bble-until-the-journal-join-chromium/error-context.md
+
+    Error Context: test-results/offline-outbox.hub-a-Hub-a-ed0e0-bble-until-the-journal-join-chromium/error-context.md
+
+  1 failed
+    [chromium] › tests/e2e/offline-outbox.hub.spec.ts:517:1 › a Hub-accepted send shows its delivered label on the still-visible bubble until the journal join 
+[2026-09-29T02:55:28+08:00] playwright exit 1
+[2026-09-29T02:55:28+08:00] EXIT 0

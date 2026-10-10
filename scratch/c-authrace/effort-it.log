@@ -1,0 +1,31 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.01s
+     Running tests/effort_transcript.rs (target-authrace/debug/deps/effort_transcript-bafd8975a3669aca)
+
+running 23 tests
+test per_turn_effort_is_the_fallback_field ... ok
+test an_unrelated_slash_command_does_not_attribute_effort ... ok
+test a_typed_effort_slash_marks_the_next_new_level_as_source_slash ... ok
+test env_override_verdict_rejects_with_the_env_reason ... ok
+test real_21272_dismissed_dialog_rejects_the_bridge_with_a_reason ... ok
+test real_21272_reject_records_emit_no_effort_edges ... ok
+test invalid_argument_in_either_order_rejects_an_armed_switch_immediately ... ok
+test real_21272_ultracode_switch_resolves_its_bridge_from_stdout_not_the_turn ... ok
+test model_verdict_with_the_effort_suffix_emits_an_effort_observation ... ok
+test the_first_assistant_record_emits_once_then_identical_records_are_deduped ... ok
+test ultracode_slash_reads_back_as_xhigh_with_the_flag ... ok
+test real_21273_walk_emits_the_exact_coupled_observation_sequence ... ok
+test real_21273_four_consecutive_switches_each_resolve_their_own_generation ... ok
+test real_21289_workflows_disabled_refuses_immediately_with_the_reason ... ok
+test real_21272_walk_emits_the_exact_coupled_observation_sequence ... ok
+test real_21272_walk_settles_every_level_from_the_stdout_verdict ... ok
+test real_21289_model_unavailable_refuses_immediately_with_the_reason ... ok
+test real_21289_walk_flag_and_level_verdict_settle_every_armed_switch ... ok
+test real_21289_recordings_are_jsonl_with_an_effort_slash_and_a_verdict ... ok
+test real_21289_walk_emits_the_full_decoupled_observation_sequence ... ok
+test real_21289_launch_fixtures_each_emit_their_exact_sequence ... ok
+test real_21289_fixtures_are_live_journal_parity_with_deterministic_event_ids ... ok
+test resumed_history_ultracode_on_starts_off_and_only_the_new_verdict_settles ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+

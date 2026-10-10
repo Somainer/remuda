@@ -1,0 +1,40 @@
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s
+
+[WebServer]      Running `target-authrace/debug/examples/hub_e2e`
+
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a10e20-ab35-7102-b2c9-3139cc6916ee","upstream":"http://127.0.0.1:58881","viaHost":null}
+
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 247 ms
+[WebServer] 
+
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+
+Running 1 test using 1 worker
+
+[1/1] [chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:130:1 › an offline first visit through the router loads a never-opened real route from the precache
+[chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:130:1 › an offline first visit through the router loads a never-opened real route from the precache
+[pwa-realbuild] vite build finished in 1425 ms
+
+  1) [chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:130:1 › an offline first visit through the router loads a never-opened real route from the precache 
+
+    ReferenceError: caches is not defined
+
+      208 |     await expect
+      209 |       .poll(
+    > 210 |         async () => Boolean(await caches.match(boardChunk)),
+          |                                   ^
+      211 |         { timeout: 20_000 },
+      212 |       )
+      213 |       .toBe(true);
+        at expect.poll.timeout (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/pwa-realbuild.hub.spec.ts:210:35)
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/pwa-realbuild.hub.spec.ts:208:5
+
+    Error Context: test-results/pwa-realbuild.hub-an-offli-d0f2d-eal-route-from-the-precache-chromium/error-context.md
+
+    Error Context: test-results/pwa-realbuild.hub-an-offli-d0f2d-eal-route-from-the-precache-chromium/error-context.md
+
+
+  1 failed
+    [chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:130:1 › an offline first visit through the router loads a never-opened real route from the precache 

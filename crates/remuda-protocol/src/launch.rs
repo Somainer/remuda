@@ -335,26 +335,42 @@ impl<'de> Deserialize<'de> for EffortSelection {
 }
 
 /// Effective effort, read back from a Claude assistant transcript record
-/// (`effort` / `perTurnEffort`); D-028 §9.1.
+/// (`effort` / `perTurnEffort`); D-028 §9.1 / D-056.
 ///
-/// This is the *observed* tier, never the requested one. Claude reports
-/// `ultracode` sessions as level `xhigh` and does not repeat the workflow flag
-/// on assistant records, so `ultracode` is `None` unless the observation path
-/// has positive evidence (e.g. an immediately preceding `/effort ultracode`
-/// switch the driver itself made).
+/// This is the *observed* tier, never the requested one. Claude never repeats
+/// the ultracode workflow flag on assistant records: it is read from the
+/// `/effort` verdicts and the `ultra_effort_enter` / `ultra_effort_exit`
+/// attachments instead. On coupled builds (2.1.203–2.1.283) the flag implies
+/// xhigh; on decoupled builds (≥ 2.1.284) it is an orthogonal toggle that
+/// latches at every level. `ultracode` is `None` until this process has
+/// positive evidence either way.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EffortEffective {
-    /// Observed level name.
-    pub name: EffortName,
+    /// Observed level name. `None` ONLY on the read-back-unavailable edge
+    /// (`readback_available == Some(false)`): a verified resume boundary
+    /// became unverifiable mid-run, so the previously projected level is
+    /// withdrawn and consumers must render `?` rather than keep the stale
+    /// tier. Normal observations always carry `Some(name)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<EffortName>,
     /// Observed dynamic-workflow flag; `None` when the transcript does not
-    /// expose it (the common case).
+    /// expose it (the common case), and also withdrawn on the
+    /// read-back-unavailable edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ultracode: Option<bool>,
     /// What established this level.
     pub source: EffortSource,
     /// When the observation was made.
     pub observed_at: Timestamp,
+    /// D-056 (4): whether effort read-back is available for this process.
+    /// `Some(false)` means a resume boundary that was verified became
+    /// unverifiable mid-run (shrink/replacement/EOF, an exec keeping the shell
+    /// pid, a backward clock step): consumers must clear any projected
+    /// effective level/flag (the UI renders `?`) and must not treat a pending
+    /// switch as applied. Normal observations omit it (`None` = available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback_available: Option<bool>,
 }
 
 /// Effective permission mode, read back from the native TUI status line and

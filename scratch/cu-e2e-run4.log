@@ -1,0 +1,22 @@
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.64s
+     Running tests/usage_native_rollup.rs (target-fs2/debug/deps/usage_native_rollup-4b9714b83b209a0a)
+
+running 1 test
+test a_native_shell_pty_claude_session_reports_a_usage_rollup ... FAILED
+
+failures:
+
+---- a_native_shell_pty_claude_session_reports_a_usage_rollup stdout ----
+
+thread 'a_native_shell_pty_claude_session_reports_a_usage_rollup' (2850312) panicked at crates/remuda-node/tests/usage_native_rollup.rs:196:6:
+usageRollup never appeared; the native transcript did not emit usage: Elapsed(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_native_shell_pty_claude_session_reports_a_usage_rollup
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.01s
+
+error: test failed, to rerun pass `-p remuda-node --test usage_native_rollup`

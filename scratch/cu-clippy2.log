@@ -1,0 +1,16 @@
+    Checking remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+    Checking remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+error[E0425]: cannot find type `PathBuf` in this scope
+   --> crates/remuda-node/tests/usage_native_rollup.rs:129:23
+    |
+129 |         let retained: PathBuf = dir.keep();
+    |                       ^^^^^^^ not found in this scope
+    |
+help: consider importing this struct
+    |
+  6 + use std::path::PathBuf;
+    |
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `remuda-node` (test "usage_native_rollup") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

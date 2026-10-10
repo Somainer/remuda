@@ -715,3 +715,199 @@ it("r2 item 1: the version gate prefers the snapshot version, then the host's pi
   });
   expect(hubStore.effortVersionGate(legacyInstance.id)).toBe("legacy");
 });
+
+it("a read-back-unavailable edge clears the projection but keeps the pending switch (D-056 (4))", async () => {
+  const ctx = await startFollowing("withdrawn");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // A verified resume projected high+ultracode.
+  ctx.receive(effortEvent(2, "high", true, "launch"));
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("high");
+
+  // Remuda arms a switch to max: pending indicator on.
+  await hubStore.setEffort(ctx.instance.id, {
+    index: 4,
+    name: "max",
+    kind: "claude",
+    ultracode: false,
+  });
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
+
+  // The transcript is replaced: the driver withdraws read-back (name/flag
+  // null, readbackAvailable false).
+  const withdrawn = {
+    eventId: "evt_eff_withdrawn",
+    instanceId: "x",
+    journalId: "x",
+    seq: "3",
+    kind: "effort",
+    observedAt: "2026-10-08T12:05:00Z",
+    source: { channel: "transcript" },
+    payload: {
+      effective: {
+        name: null,
+        ultracode: null,
+        source: "unknown",
+        observedAt: "2026-10-08T12:05:00Z",
+        readbackAvailable: false,
+      },
+      raw: null,
+    },
+  } as unknown as Observation;
+  ctx.receive(withdrawn);
+
+  // Projected state is withdrawn -> the chip renders ? ...
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  // ... but the pending switch is neither settled nor rejected.
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
+});
+
+it("r6 item 6: a poll with no Hub effort projection never erases a live-only edge", async () => {
+  const ctx = await startFollowing("poll-null-never-projected");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  // The live follow socket projects a level BEFORE the Hub record exists.
+  ctx.receive(effortEvent(2, "high", false, "slash"));
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("high");
+  // An unrelated lifecycle write advances updatedAt while the Hub still has
+  // no effortEffective on this instance.
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: undefined, updatedAt: "2026-10-08T13:00:00Z" }],
+  } as never);
+  await hubStore.refresh();
+  expect(
+    hubStore.effortEffectiveOf(ctx.instance.id)?.name,
+    "a null the Hub never projected must not render the chip ?"
+  ).toBe("high");
+  expect(
+    hubStore.effortReadbackWithdrawnOf(ctx.instance.id),
+    "never projected: not a withdrawal"
+  ).toBe(false);
+});
+
+it("r6 item 6: a Hub projection becoming null on a later poll withdraws the live edge", async () => {
+  const ctx = await startFollowing("poll-hub-null-withdraws");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const list = vi.spyOn(api, "instanceList");
+  // Poll A: the Hub has projected max.
+  list.mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: "2026-10-08T12:00:00Z" },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  // Poll B: the Hub applied the withdrawal edge (record null).
+  list.mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: undefined, updatedAt: "2026-10-08T13:00:00Z" }],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  expect(
+    hubStore.effortReadbackWithdrawnOf(ctx.instance.id),
+    "a level→null Hub record marks the explicit withdrawal"
+  ).toBe(true);
+  // Poll C: still null must not throw/restore.
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  // A later projection clears the marker again.
+  list.mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: { name: "high", ultracode: false, source: "remuda", observedAt: "2026-10-08T14:00:00Z" },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("high");
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(false);
+});
+
+it("r6 item 6: a no-fraction updatedAt must not outrank a fractional observedAt", async () => {
+  // SQLite writes second precision ("…:00Z", no fraction); the live edge
+  // carries milliseconds ("…:00.100Z"). A STRING compare puts 'Z' > '.',
+  // so the older second-precision value looked NEWER and replaced the
+  // fresher projection. Only parsed instants must decide ordering.
+  const ctx = await startFollowing("poll-same-second");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const list = vi.spyOn(api, "instanceList");
+  list.mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: { name: "high", ultracode: false, source: "remuda", observedAt: "2026-10-08T12:00:00.100Z" },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  // Second precision, same wall second = strictly OLDER (.000 vs .100).
+  list.mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: { name: "medium", ultracode: false, source: "remuda", observedAt: "2026-10-08T12:00:00Z" },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("high");
+});
+
+it("r6 item 8a: an out-of-order withdrawal (older observedAt) never deletes the newer edge", async () => {
+  const ctx = await startFollowing("withdrawn-out-of-order");
+  // Newer valid edge M (contiguous after the follow cursor).
+  ctx.receive(effortEvent(2, "high", false, "slash"));
+  ctx.receive(effortEvent(3, "max", false, "slash"));
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  // An older withdrawal frame arriving late (Load earlier).
+  const staleWithdrawn = {
+    eventId: "evt_eff_withdrawn_old",
+    instanceId: "x",
+    journalId: "x",
+    seq: "4",
+    kind: "effort",
+    observedAt: "2026-09-16T00:01:30Z",
+    source: { channel: "transcript" },
+    payload: {
+      effective: {
+        name: null,
+        ultracode: null,
+        source: "unknown",
+        observedAt: "2026-09-16T00:01:30Z",
+        readbackAvailable: false,
+      },
+      raw: null,
+    },
+  } as unknown as Observation;
+  ctx.receive(staleWithdrawn);
+  expect(
+    hubStore.effortEffectiveOf(ctx.instance.id)?.name,
+    "the newer max projection survives the older withdrawal"
+  ).toBe("max");
+  expect(
+    hubStore.effortReadbackWithdrawnOf(ctx.instance.id),
+    "an out-of-order withdrawal must not set the marker"
+  ).toBe(false);
+  // A newer withdrawal still wins.
+  const freshWithdrawn = {
+    ...staleWithdrawn,
+    eventId: "evt_eff_withdrawn_new",
+    seq: "5",
+    observedAt: "2026-10-08T13:00:00Z",
+    payload: {
+      effective: {
+        name: null,
+        ultracode: null,
+        source: "unknown",
+        observedAt: "2026-10-08T13:00:00Z",
+        readbackAvailable: false,
+      },
+      raw: null,
+    },
+  } as unknown as Observation;
+  ctx.receive(freshWithdrawn);
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(true);
+});

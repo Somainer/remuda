@@ -1,0 +1,31 @@
+[2026-09-29T03:46:34+08:00] acquired gate-e2e.lock
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s
+[WebServer]      Running `/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/examples/hub_e2e`
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a0e98e-0d7e-7522-8d4f-3387aa1c47f2","upstream":"http://127.0.0.1:58881","viaHost":null}
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 199 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+Running 3 tests using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+[WebServer] 2026-09-28T19:46:41.059473Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e98e-20b4-711b-9587-44ecf9ed6e8a response={"jsonrpc":"2.0","id":"41bb3358-2bcf-4a44-a75d-79c2d8213f77","result":{"ok":true,"instanceId":"ins_01a0e98e-20b3-7640-a396-9bc1aa74e602"}}
+[WebServer] 2026-09-28T19:46:46.168178Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e98e-2df5-7f33-a988-2b19b897d4b3 response={"jsonrpc":"2.0","id":"2da8ac5b-49bd-4d3e-97d1-50d119ae101b","result":{"ok":true}}
+[WebServer] 2026-09-28T19:46:52.169919Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e98e-4c87-73eb-9e62-27cd36f50ad5 response={"jsonrpc":"2.0","id":"a1c6a062-41b9-4a43-8ecd-5d1c7b80c3bd","result":{"ok":true}}
+[WebServer] 2026-09-28T19:46:52.176192Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e98e-20b3-7640-a396-9bc1aa74e602 device_id=dev_01a0e98e-48f0-7766-bc17-ca121c0b8fc3 forced=true
+  ✓  1 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:618:3 › full offline SW restore (PNA/LNA loopback exemption for this harness case) › an offline-queued message survives a reload with the browser context STILL offline and sends once after (14.9s)
+[WebServer] 2026-09-28T19:46:56.079538Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e98e-5b5f-7458-953b-15cd5066eb0a response={"jsonrpc":"2.0","id":"69126ee6-263a-4a63-806b-cd55a64b754a","result":{"ok":true,"instanceId":"ins_01a0e98e-5b5e-74fb-a91b-fa4fad9d548f"}}
+[WebServer] 2026-09-28T19:47:01.383047Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e98e-6975-71ce-a725-6d6047686c8b response={"jsonrpc":"2.0","id":"aa674bfe-52e5-4b9d-8805-a44cf53377ba","result":{"ok":true}}
+[WebServer] 2026-09-28T19:47:06.873567Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e98e-85f6-7385-bb65-5730af1ceae8 response={"jsonrpc":"2.0","id":"2c5ea02c-c1bb-4276-871f-1d5de4575b66","result":{"ok":true}}
+[WebServer] 2026-09-28T19:47:06.878831Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e98e-5b5e-74fb-a91b-fa4fad9d548f device_id=dev_01a0e98e-826c-70d1-aa72-d01d1a4d627f forced=true
+  ✓  2 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:618:3 › full offline SW restore (PNA/LNA loopback exemption for this harness case) › an offline-queued message survives a reload with the browser context STILL offline and sends once after (13.9s)
+[WebServer] 2026-09-28T19:47:10.725366Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e98e-9498-7514-b1ba-52e0c4abd92f response={"jsonrpc":"2.0","id":"499fa5c2-2818-4ad1-a309-6ed8d5d592ae","result":{"ok":true,"instanceId":"ins_01a0e98e-9496-779f-ab89-96d46398b604"}}
+[WebServer] 2026-09-28T19:47:15.726436Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e98e-a1c5-77e9-8d20-60e1b400d555 response={"jsonrpc":"2.0","id":"d4ef15da-295e-4683-9471-42af86f790f2","result":{"ok":true}}
+[WebServer] 2026-09-28T19:47:21.254211Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e98e-be23-71fd-8a51-bb8ef6cc86fc response={"jsonrpc":"2.0","id":"378be96e-c20c-46db-8c2c-5d343bc2c6ae","result":{"ok":true}}
+[WebServer] 2026-09-28T19:47:21.260088Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e98e-9496-779f-ab89-96d46398b604 device_id=dev_01a0e98e-ba82-76f3-96d0-b68dbe939910 forced=true
+  ✓  3 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:618:3 › full offline SW restore (PNA/LNA loopback exemption for this harness case) › an offline-queued message survives a reload with the browser context STILL offline and sends once after (13.6s)
+
+  3 passed (46.1s)
+[2026-09-29T03:47:21+08:00] EXIT 0

@@ -1,0 +1,28 @@
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+error[E0382]: borrow of moved value: `host`
+   --> crates/remuda-node/tests/usage_native_rollup.rs:153:16
+    |
+144 |       let host = node.host().meta.id.as_id().to_string();
+    |           ---- move occurs because `host` has type `std::string::String`, which does not implement the `Copy` trait
+145 |       let _link = WssLink::connect_runtime(
+146 |           WssConfig::loopback(hub.addr, hub.mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES).await.expect("token"), host),
+    |                                                                                                                                    ---- value moved here
+...
+153 |       let body = json!({
+    |  ________________^
+154 | |         "hostId": host,
+155 | |         "kind": "claude",
+156 | |         "driver": "shell-pty",
+...   |
+162 | |         "claudeConfigDir": home.to_string_lossy()
+163 | |     })
+    | |______^ value borrowed here after move
+    |
+    = note: this error originates in the macro `$crate::json_internal` which comes from the expansion of the macro `json` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider cloning the value if the performance cost is acceptable
+    |
+146 |         WssConfig::loopback(hub.addr, hub.mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES).await.expect("token"), host.clone()),
+    |                                                                                                                                      ++++++++
+
+For more information about this error, try `rustc --explain E0382`.
+error: could not compile `remuda-node` (test "usage_native_rollup") due to 1 previous error

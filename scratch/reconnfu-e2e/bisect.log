@@ -1,0 +1,50 @@
+[2026-09-28T13:59:32+08:00] waiting
+[2026-09-28T13:59:32+08:00] go
+[WebServer]    Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.17s
+[WebServer]      Running `/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/examples/hub_e2e`
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a0e699-3b81-706b-bd41-a34afbcbcca7","upstream":"http://127.0.0.1:58881","viaHost":null}
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 197 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+Running 1 test using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+[WebServer] DBG_FOLLOW_END pump device=dev_01a0e699-4846-7336-ba7b-0565a21b60d3 ids=[]
+[WebServer] 2026-09-28T06:00:02.322630Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e699-4fa3-708a-991d-5a348f60bcfe response={"jsonrpc":"2.0","id":"71f0e8fa-b460-4441-939e-c14444af9e43","result":{"ok":true,"instanceId":"ins_01a0e699-4fa2-7555-9a7b-ed25bba7b413"}}
+[WebServer] 2:00:02 PM [vite] (client) [console.error] DBG_BEGIN_RESUME
+[WebServer] 2:00:02 PM [vite] (client) [console.error] DBG_SCHEDULE 1
+[WebServer] 2:00:02 PM [vite] (client) [console.error] DBG_TIMER_ARMED 339 attempt 2
+[WebServer] DBG_FOLLOW_END pump device=dev_01a0e699-4846-7336-ba7b-0565a21b60d3 ids=[]
+[WebServer] 2026-09-28T06:00:08.567133Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e699-6874-711f-819a-48f8b7a55532 response={"jsonrpc":"2.0","id":"ea477bd6-cfea-47fe-bc11-e615836839f5","result":{"ok":true}}
+[WebServer] 2026-09-28T06:00:08.573324Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e699-4fa2-7555-9a7b-ed25bba7b413 device_id=dev_01a0e699-64da-7543-8e22-01fdb6a1ee1b forced=true
+[WebServer] DBG_FOLLOW_END pump device=dev_01a0e699-64da-7543-8e22-01fdb6a1ee1b ids=[]
+  ✘  1 [chromium] › tests/e2e/zz-bisect-offline.hub.spec.ts:61:1 › bisect B: SW + offline reload — follow recovers (8.0s)
+
+
+  1) [chromium] › tests/e2e/zz-bisect-offline.hub.spec.ts:61:1 › bisect B: SW + offline reload — follow recovers 
+
+    Error: page.reload: net::ERR_FAILED
+    Call log:
+      - waiting for navigation until "domcontentloaded"
+
+
+      93 |   await expect(page.getByTestId("journal-banner")).toHaveAttribute("data-state", "offline", { timeout: 20_000 });
+      94 |   await page.waitForTimeout(2_000);
+    > 95 |   await page.reload({ waitUntil: "domcontentloaded" });
+         |              ^
+      96 |   await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
+      97 |   await expect(page.getByTestId("journal-banner")).toBeVisible({ timeout: 20_000 });
+      98 |   await page.context().setOffline(false);
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/zz-bisect-offline.hub.spec.ts:95:14
+
+    Error Context: test-results/zz-bisect-offline.hub-bise-35df2-ne-reload-—-follow-recovers-chromium/error-context.md
+
+    Error Context: test-results/zz-bisect-offline.hub-bise-35df2-ne-reload-—-follow-recovers-chromium/error-context.md
+
+  1 failed
+    [chromium] › tests/e2e/zz-bisect-offline.hub.spec.ts:61:1 › bisect B: SW + offline reload — follow recovers 
+[2026-09-28T14:00:08+08:00] exit 0

@@ -1,0 +1,18 @@
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.08s
+     Running unittests src/lib.rs (target-cu2/debug/deps/remuda_hub-4450c0e6aa692d6a)
+
+running 10 tests
+test usage_store::tests::budget_band_uses_estimate_times_tolerance ... ok
+test usage_store::tests::context_window_resolution_order ... ok
+test usage_store::tests::rollup_no_events_means_no_rollup ... ok
+test usage_store::tests::rollup_leaves_unreported_channels_unknown ... ok
+test usage_store::tests::re_hydration_dedupes_on_instance_scope_scope_id ... ok
+test usage_store::tests::rollup_folds_recorded_usage_sequence ... ok
+test usage_store::tests::turn_and_session_rows_do_not_double_count ... ok
+test usage_store::tests::session_snapshots_are_revision_replaced_not_frozen_or_summmed ... ok
+test usage_store::tests::projects_folds_and_dedupes_usage_events ... ok
+test usage_store::tests::migration_upgrades_a_pre_delivery_database_preserving_rows ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out; finished in 0.01s
+

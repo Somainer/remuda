@@ -1,0 +1,3 @@
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.65s
+  Executable tests/usage_native_rollup.rs (target-fs2/debug/deps/usage_native_rollup-4b9714b83b209a0a)

@@ -31,21 +31,32 @@ export type EffortObservationPayload = {
   payload: {
     requested?: { name?: string; ultracode?: boolean } | null;
     effective: {
-      name: string;
+      name?: string | null;
       ultracode?: boolean | null;
       source?: string;
       observedAt?: string;
-    };
+      /** D-056 (4): false withdraws the projected level/flag. */
+      readbackAvailable?: boolean | null;
+    } | null;
     raw?: string | null;
   };
 };
 
-const SOURCES = new Set(["launch", "slash", "remuda", "unknown"]);
+/** Whether an effective record withdraws read-back (D-056 (4)). */
+function readbackWithdrawn(record: Record<string, unknown>): boolean {
+  return record.readbackAvailable === false;
+}
 
-/** Normalize an `effortEffective` object off a Hub-record/frame into a view. */
+const SOURCES: ReadonlySet<string> = new Set(["launch", "slash", "remuda", "unknown"]);
+
+/** Normalize an `effortEffective` object off a Hub-record/frame into a view.
+ *  Returns null both before the first observation AND when the driver
+ *  withdraws read-back (`readbackAvailable:false`, name/flag null) — the UI
+ *  renders `?` and a pending switch is never treated as applied. */
 export function effectiveFromRecord(value: unknown): EffortEffectiveView | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
+  if (readbackWithdrawn(record)) return null;
   if (typeof record.name !== "string" || !record.name) return null;
   const source =
     typeof record.source === "string" && SOURCES.has(record.source)
@@ -59,31 +70,64 @@ export function effectiveFromRecord(value: unknown): EffortEffectiveView | null 
   };
 }
 
+/** Result of folding one `effort` observation. */
+export type EffortObservationResult = {
+  /** The projected effective state; null while unknown or withdrawn. */
+  effective: EffortEffectiveView | null;
+  /** True on the read-back-unavailable edge: the driver withdrew the previous
+   *  projection; consumers must clear it WITHOUT settling or deleting a
+   *  pending switch. */
+  withdrawn: boolean;
+  /** Timestamp carried by a withdrawn edge, for stale/ordering checks. */
+  observedAt?: string;
+  requested?: { name?: string; ultracode?: boolean };
+};
+
 /** Extract effective effort from an observation. Accepts the wire envelope
- *  ({payload:{kind,payload:{effective}}}), a bare body
- *  ({kind:"effort",payload:{effective}}), and a straight body
- *  ({effective}). */
-export function effectiveFromObservation(
-  observation: unknown,
-): { effective: EffortEffectiveView; requested?: { name?: string; ultracode?: boolean } } | null {
+ *  ({body:{payload:{kind:"effort",payload:{effective}}}}), a bare body
+ *  ({kind:"effort",payload:{effective}}), and a straight body ({effective}).
+ *  Returns null for non-effort events. An effort event whose effective is the
+ *  read-back-unavailable edge returns `{effective:null, withdrawn:true}`. */
+export function effectiveFromObservation(observation: unknown): EffortObservationResult | null {
   if (!observation || typeof observation !== "object") return null;
   const record = observation as Record<string, unknown>;
-  const payload =
-    (record.payload as { payload?: { effective?: unknown }; effective?: unknown; kind?: string } | undefined) ?? null;
-  const candidates: unknown[] = [];
+  const body =
+    record.body && typeof record.body === "object"
+      ? (record.body as Record<string, unknown>)
+      : null;
+  const envelope =
+    record.payload && typeof record.payload === "object"
+      ? (record.payload as Record<string, unknown>)
+      : null;
+  const candidates: Record<string, unknown>[] = [];
   if (record.kind === "effort") candidates.push(record);
-  if (payload && (payload.kind === "effort" || "effective" in payload)) candidates.push(payload);
-  if (payload && typeof payload.payload === "object") candidates.push(payload.payload);
+  if (body) candidates.push(body);
+  if (envelope && (envelope.kind === "effort" || "effective" in envelope)) {
+    candidates.push(envelope);
+  }
+  const nested = envelope?.payload;
+  if (nested && typeof nested === "object") candidates.push(nested as Record<string, unknown>);
   for (const candidate of candidates) {
-    if (!candidate || typeof candidate !== "object") continue;
-    const body = candidate as { effective?: unknown; requested?: unknown };
-    const effective = effectiveFromRecord(body.effective);
-    if (effective) {
-      const requested =
-        body.requested && typeof body.requested === "object"
-          ? (body.requested as { name?: string; ultracode?: boolean })
-          : undefined;
-      return { effective, requested };
+    if (!("effective" in candidate)) continue;
+    const effectiveRecord = candidate.effective;
+    if (!effectiveRecord || typeof effectiveRecord !== "object") continue;
+    const eff = effectiveRecord as Record<string, unknown>;
+    const requested =
+      candidate.requested && typeof candidate.requested === "object"
+        ? (candidate.requested as { name?: string; ultracode?: boolean })
+        : undefined;
+    if (readbackWithdrawn(eff)) {
+      const observedAt = typeof eff.observedAt === "string" ? eff.observedAt : undefined;
+      return {
+        effective: null,
+        withdrawn: true,
+        ...(observedAt ? { observedAt } : {}),
+        ...(requested ? { requested } : {}),
+      };
+    }
+    const view = effectiveFromRecord(eff);
+    if (view) {
+      return { effective: view, withdrawn: false, ...(requested ? { requested } : {}) };
     }
   }
   return null;

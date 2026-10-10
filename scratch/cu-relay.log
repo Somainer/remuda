@@ -1,0 +1,16 @@
+   Compiling async-io v2.6.0
+   Compiling serde_core v1.0.229
+   Compiling blocking v1.7.0
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+   Compiling remuda-hub-client v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub-client)
+   Compiling async-signal v0.2.14
+   Compiling async-process v2.5.0
+   Compiling remuda-feishu v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-feishu)
+   Compiling agent-client-protocol v2.1.0
+   Compiling deranged v0.5.8
+   Compiling time v0.3.55
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda)
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 44.72s

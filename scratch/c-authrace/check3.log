@@ -1,0 +1,29 @@
+    Checking remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+error[E0308]: mismatched types
+    --> crates/remuda-driver/src/shell_pty.rs:1226:36
+     |
+1179 |           let mut catalog_refresh_task: Option<JoinHandle<()>> = None;
+     |                                         ---------------------- expected due to this type
+...
+1226 |               catalog_refresh_task = tokio::spawn(async move {
+     |  ____________________________________^
+1227 | |                 let payload = crate::model_discovery::scoped_refresh_payload(
+1228 | |                     std::path::PathBuf::from(native_home),
+1229 | |                     host_dir,
+...    |
+1250 | |             });
+     | |______________^ expected `Option<JoinHandle<()>>`, found `JoinHandle<()>`
+     |
+     = note: expected enum `std::option::Option<tokio::task::JoinHandle<_>>`
+              found struct `tokio::task::JoinHandle<_>`
+help: try wrapping the expression in `Some`
+     |
+1226 ~             catalog_refresh_task = Some(tokio::spawn(async move {
+1227 |                 let payload = crate::model_discovery::scoped_refresh_payload(
+ ...
+1249 |                 }
+1250 ~             }));
+     |
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `remuda-driver` (lib) due to 1 previous error

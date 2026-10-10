@@ -1,0 +1,9 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.05s
+     Running unittests src/lib.rs (target-authrace/debug/deps/remuda_driver-b57c99b9a1bcf656)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 479 filtered out; finished in 0.00s
+

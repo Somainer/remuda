@@ -1,0 +1,153 @@
+diff --git a/web/src/lib/store.ts b/web/src/lib/store.ts
+index 53688770..c6c06924 100644
+--- a/web/src/lib/store.ts
++++ b/web/src/lib/store.ts
+@@ -1234,6 +1234,7 @@ class HubStore {
+     // unload flag, but the page is alive again — clear it so flushes resume.
+     // The flag must never outlive the unload that set it.
+     this.pageIsUnloading = false;
++    this.unloadProceeded = false;
+     if (event.persisted) {
+       this.connection?.dispatch({ type: "resume" });
+       // Resume any rows queued while the page was suspended.
+@@ -1309,13 +1310,26 @@ class HubStore {
+    * Rebind to a journal ANOTHER mount already finished loading (navigation
+    * back, or a racing same-journal mount whose seed won): its OPEN fresh
+    * socket certifies live immediately and closes an attempt a superseded
+-   * mount still owned; a dead socket starts a fresh recovery for THIS binding
+-   * instead of inheriting the previous mount's watchdog.
++   * mount still owned. A silent/dead socket keeps the OLD bind-deadline
++   * dance (followBound): an immediate resume would reopen the socket while a
++   * REST gap-backfill is still running and could strand gap-backfill — the
++   * deadline reuses the live frame/probe evidence instead.
+    */
+   private rebindMountedConnection() {
+     if (!this.connection) return;
+     if (this.followSocketLive()) this.connection.followRebindLive();
+-    else this.connection.dispatch({ type: "resume" });
++    else this.connection.followBound();
++  }
++
++  /**
++   * Hand-off from a mount whose seed LOST to another mount of the same
++   * journal that is already loading: only an OPEN fresh socket may certify
++   * (retiring the attempt this mount shares with the winner). A silent socket
++   * is left to the WINNING mount's own attempt/watchdog — kicking a resume
++   * here would open a second socket under the winner.
++   */
++  private handOffMountedConnection() {
++    if (this.connection && this.followSocketLive()) this.connection.followRebindLive();
+   }
+ 
+   /**
+@@ -1369,41 +1383,76 @@ class HubStore {
+   private connectionStateOverride: ConnectionState | null = null;
+   /** True during pagehide/beforeunload: no new outbox POSTs. */
+   private pageIsUnloading = false;
++  /**
++   * Set by a genuine pagehide. The beforeunload self-reset task is queued at
++   * setTimeout(0) and the browser's pagehide task can land AFTER it, so the
++   * task cannot infer the prompt was cancelled from timer ordering alone: it
++   * flushes only when pagehide never marked the navigation as real.
++   */
++  private unloadProceeded = false;
+   /** Auto-clear for a beforeunload prompt the user CANCELS (page stays). */
+   private unloadClearTimer: ReturnType<typeof setTimeout> | null = null;
+   private onPageHide = (event?: Event) => {
++    const proceeding = event?.type === "pagehide";
+     this.pageIsUnloading = true;
+-    // Stop any pending live-retry timer so it cannot POST during teardown.
+-    for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
+-    this.outboxRetryTimer.clear();
+-    for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
+-    this.leaseWakeupTimer.clear();
+-    this.leaseWakeupUntil.clear();
+-    // pagehide means navigation really proceeded: nothing may self-reset, and
+-    // a BFCache restore re-arms from onConnPageshow. (The browser stops the
+-    // page; the point is to not leave a timer that POSTs while it tears down.)
+-    if (event?.type === "pagehide") {
++    if (proceeding) {
++      // Navigation really proceeded: stop every timer so a tearing-down page
++      // cannot POST, and cancel the beforeunload self-reset. BFCache restore
++      // re-arms from onConnPageshow; a hard reload starts a fresh document.
++      this.unloadProceeded = true;
++      for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
++      this.outboxRetryTimer.clear();
++      for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
++      this.leaseWakeupTimer.clear();
++      this.leaseWakeupUntil.clear();
+       if (this.unloadClearTimer) {
+         clearTimeout(this.unloadClearTimer);
+         this.unloadClearTimer = null;
+       }
+       return;
+     }
+-    // beforeunload can be CANCELLED (the user stays on the page); pagehide
+-    // only fires when navigation actually proceeds. A beforeunload that does
+-    // not lead to a real unload must not latch delivery off forever: reset
+-    // the flag on the next task, unless a genuine pagehide lands first. The
+-    // lease-expiry wakeups above were cleared too, so a page that stays
+-    // RE-ARMS from durable rows (another tab's in-flight lease still needs a
+-    // wakeup here when it becomes stealable).
++    // beforeunload: disarm the retry/lease timers (they no-op anyway while
++    // the flag is up through the imminent pagehide of a real reload, and
++    // they must not POST during teardown). A CANCELLED prompt fires no
++    // pagehide and the document stays alive: the self-reset below re-latches
++    // delivery and re-arms the lease wakeups.
++    for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
++    this.outboxRetryTimer.clear();
++    for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
++    this.leaseWakeupTimer.clear();
++    this.leaseWakeupUntil.clear();
++    // The reset runs at setTimeout(0): in Chromium it measurably fires ~0.1
++    // ms BEFORE pagehide during a real reload, so pagehide marks
++    // unloadProceeded but cannot cancel this task in time. The task
++    // therefore must have NO side effect unsafe in a tearing-down page: it
++    // only clears the flag (a later user send triggers its own flush) and
++    // RE-ARMS WAKEUPS READ-ONLY — those timers just setTimeout at lease
++    // expiry (seconds out); a real pagehide task clears them, and no POST
++    // runs from here.
++    this.unloadProceeded = false;
+     if (this.unloadClearTimer) clearTimeout(this.unloadClearTimer);
+     this.unloadClearTimer = setTimeout(() => {
+-      this.pageIsUnloading = false;
+       this.unloadClearTimer = null;
+-      void this.flushAllOutbox();
++      if (this.unloadProceeded) return;
++      this.pageIsUnloading = false;
++      void this.rearmLeaseWakeups();
+     }, 0);
+   };
+ 
++  /**
++   * Re-arm lease-expiry wakeups from durable rows WITHOUT flushing: read-only
++   * refresh + schedule. Used by the cancelled-beforeunload self-reset, which
++   * must not itself POST (the task can run inside a real reload teardown).
++   */
++  private async rearmLeaseWakeups() {
++    const box = this.outbox;
++    if (!box || this.pageIsUnloading) return;
++    const now = Date.now();
++    const durable = await box.refreshDurable().catch(() => null);
++    if (!durable || this.pageIsUnloading) return;
++    this.scheduleLeaseExpiryWakeup(durable, now, box.ownerId);
++  }
++
+   get outboxUnavailable(): boolean {
+     return this.outboxDegraded;
+   }
+@@ -2369,10 +2418,11 @@ class HubStore {
+       // demand via JournalClient.loadEarlier.
+       const seed = await api.eventsRead({ journalId: instance.journalId, limit: 2000 });
+       // Another mount may finish loading this journal while this read is
+-      // pending. It now owns the bound attempt for THIS journal — hand its
+-      // mounted socket the machine slot instead of dropping the attempt.
++      // pending. It now owns the attempt (same binding generation, shared
++      // slot): hand off a live socket or leave its own attempt/watchdog to
++      // close, but never end this mount's attempt against it.
+       if (this.journals.has(instance.journalId)) {
+-        this.rebindMountedConnection();
++        this.handOffMountedConnection();
+         return;
+       }
+       const history = seed.events;

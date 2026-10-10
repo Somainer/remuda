@@ -1,0 +1,32 @@
+[WebServer]    Compiling remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+
+[WebServer]    Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+[WebServer]    Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+[WebServer]    Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+
+[WebServer]    Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+
+[WebServer]    Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+
+[WebServer]    Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 52.38s
+
+[WebServer]      Running `target-authrace/debug/examples/hub_e2e`
+
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:60180","token":"e2e-bootstrap-token","hostId":"hst_01a10e91-1f18-76ea-9a12-e9a9fba47156","upstream":"http://127.0.0.1:58881","viaHost":null}
+
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 195 ms
+[WebServer] 
+
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+
+Running 1 test using 1 worker
+
+[1/1] [chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:154:1 › an offline first visit through the router loads a never-opened real route from the precache
+[chromium] › tests/e2e/pwa-realbuild.hub.spec.ts:154:1 › an offline first visit through the router loads a never-opened real route from the precache
+[pwa-realbuild] vite build finished in 1584 ms
+
+  1 passed (58.5s)

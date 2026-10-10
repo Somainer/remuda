@@ -1,0 +1,79 @@
+   Compiling serde_core v1.0.229
+   Compiling typenum v1.20.1
+   Compiling generic-array v0.14.7
+   Compiling syn v2.0.119
+   Compiling getrandom v0.2.17
+   Compiling getrandom v0.4.3
+   Compiling smallvec v1.16.1
+   Compiling fastrand v2.5.0
+   Compiling rand_core v0.6.4
+   Compiling tracing-core v0.1.36
+   Compiling rustix v1.1.4
+   Compiling strsim v0.11.1
+   Compiling parking_lot_core v0.9.12
+   Compiling futures-lite v2.6.1
+   Compiling darling_core v0.24.1
+   Compiling parking_lot v0.12.5
+   Compiling futures-channel v0.3.34
+   Compiling piper v0.2.5
+   Compiling futures-util v0.3.34
+   Compiling subtle v2.6.1
+   Compiling blocking v1.7.0
+   Compiling log v0.4.34
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling universal-hash v0.5.1
+   Compiling digest v0.10.7
+   Compiling cipher v0.4.4
+   Compiling poly1305 v0.8.0
+   Compiling sha2 v0.10.9
+   Compiling chacha20 v0.9.1
+   Compiling aead v0.5.2
+   Compiling chacha20poly1305 v0.10.1
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling uuid v1.26.1
+   Compiling deranged v0.5.8
+   Compiling darling_macro v0.24.1
+   Compiling bytes v1.12.1
+   Compiling toml_datetime v0.6.11
+   Compiling darling v0.24.1
+   Compiling serde_with_macros v3.23.0
+   Compiling serde_spanned v0.6.9
+   Compiling toml_edit v0.22.27
+   Compiling schemars v1.2.2
+   Compiling tokio v1.53.1
+   Compiling futures-executor v0.3.34
+   Compiling time v0.3.55
+   Compiling polling v3.11.0
+   Compiling futures v0.3.34
+   Compiling async-io v2.6.0
+   Compiling tracing-attributes v0.1.31
+   Compiling derive_more-impl v2.1.1
+   Compiling strum_macros v0.28.0
+   Compiling pin-project-internal v1.1.13
+   Compiling async-signal v0.2.14
+   Compiling thiserror-impl v1.0.69
+   Compiling tracing v0.1.44
+   Compiling serde_with v3.23.0
+   Compiling pin-project v1.1.13
+   Compiling futures-concurrency v7.7.1
+   Compiling derive_more v2.1.1
+   Compiling async-process v2.5.0
+   Compiling thiserror v1.0.69
+   Compiling filedescriptor v0.8.3
+   Compiling remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+   Compiling strum v0.28.0
+   Compiling portable-pty v0.9.0
+   Compiling toml v0.8.23
+   Compiling agent-client-protocol-schema v1.7.0
+   Compiling tokio-util v0.7.19
+   Compiling remuda-herdr v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-herdr)
+   Compiling remuda-claude-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-claude-wire)
+   Compiling agent-client-protocol v2.1.0
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 32.21s

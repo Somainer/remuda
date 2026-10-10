@@ -1,0 +1,1 @@
+import{r as e}from"./rolldown-runtime-hePW80VL.js";import{h as t,t as n}from"./jsx-runtime-RRncGqZB.js";import{N as r,P as i}from"./ui.module-ByQNywmk.js";var a=e(t(),1),o=n(),s=(e,t,n)=>{i(`commit:${e}`,{phase:t,actualDuration:n})};function c({name:e,children:t}){return r?(0,o.jsx)(a.Profiler,{id:e,onRender:s,children:t}):t}export{c as t};

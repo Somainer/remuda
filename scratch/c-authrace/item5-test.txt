@@ -1,0 +1,56 @@
+    #[test]
+    fn every_verbatim_effort_sync_4_string_parses_to_its_measured_verdict() {
+        // c-effortread r2 item 5: EVERY distinct verdict/status/refusal string
+        // measured on 2.1.289 in effort-sync-4, copied byte-for-byte from the
+        // recorded transcripts (walk 1–11 + launch a,b,c1,c2,d,e,f1,f2,g).
+        // Each is asserted against its full parsed value, not just a prefix —
+        // in particular the full max and xhigh accept descriptions, which a
+        // prefix match could silently truncate.
+        let d = EffortSemantics::Decoupled;
+        let accepted = |name, flag| EffortStdout::Accepted(ObservedEffort { name, ultracode: flag });
+        let status = |name, flag| EffortStdout::Status(ObservedEffort { name, ultracode: flag });
+
+        let cases: [(&str, EffortStdout); 20] = [
+            // Walk 1 / 5, launch f1: flag on, carrying the level it stayed at.
+            ("Ultracode on (this session only): dynamic workflows on every task. Effort stays high.", accepted(EffortName::High, Some(true))),
+            ("Ultracode on (this session only): dynamic workflows on every task. Effort stays max.", accepted(EffortName::Max, Some(true))),
+            // Walk 4: flag off at max.
+            ("Ultracode off. Effort stays max.", accepted(EffortName::Max, Some(false))),
+            // Walk 2 / 11 level half: full plain high accept.
+            ("Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive testing and documentation", accepted(EffortName::High, None)),
+            // Walk 3: the FULL max accept string, "(this session only)" plus
+            // the whole multi-sentence description.
+            ("Set effort level to max (this session only): Maximum capability with deepest reasoning. May use excessive tokens resulting in long response times or overthinking. Use sparingly for the hardest tasks.", accepted(EffortName::Max, None)),
+            // Walk 6 / launch g: the FULL xhigh accept string.
+            ("Set effort level to xhigh (saved as your default for new sessions): Deeper reasoning than high, just below maximum (on supported models)", accepted(EffortName::Xhigh, None)),
+            // Walk 11: slider applied level and the toggle together.
+            ("Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive testing and documentation · Ultracode off", accepted(EffortName::High, Some(false))),
+            // Launch e: cap clamp accepted at the clamped level, flag unstated.
+            ("Effort 'max' exceeds the cap for claude-opus-5-5 set by your settings or organization; set to 'high' instead (this session only): Comprehensive implementation with extensive testing and documentation", accepted(EffortName::High, None)),
+            // Launch a: high status with the flag suffix.
+            ("Current effort level: high (Comprehensive implementation with extensive testing and documentation) · Ultracode on", status(EffortName::High, Some(true))),
+            // Launch b: xhigh status with the flag suffix.
+            ("Current effort level: xhigh (Deeper reasoning than high, just below maximum (on supported models)) · Ultracode on", status(EffortName::Xhigh, Some(true))),
+            // Launch c1 / walk 8 / launch d-after: auto resolved to medium.
+            ("Effort level: auto (currently medium) · Ultracode on", status(EffortName::Medium, Some(true))),
+            ("Effort level: auto (currently medium)", status(EffortName::Medium, Some(false))),
+            // Launch c2: medium status, suffix absent positively means off.
+            ("Current effort level: medium (Balanced approach with standard implementation and testing)", status(EffortName::Medium, Some(false))),
+            // Launch e / g status lines after the flag is off.
+            ("Current effort level: high (Comprehensive implementation with extensive testing and documentation)", status(EffortName::High, Some(false))),
+            ("Current effort level: xhigh (Deeper reasoning than high, just below maximum (on supported models))", status(EffortName::Xhigh, Some(false))),
+            // Launch d: workflows disabled refusal.
+            ("Ultracode needs dynamic workflows enabled (see /config). Valid options are: low, medium, high, xhigh, max, auto", EffortStdout::WorkflowsDisabled),
+            // Launch g: model-unavailable refusal.
+            ("Ultracode isn't available on claude-sonnet-4-6. Valid options are: low, medium, high, xhigh, max, auto", EffortStdout::UnavailableForModel),
+            // Walk 9 / 10: invalid argument in both measured list orders.
+            ("Invalid argument: bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]", EffortStdout::Invalid),
+            ("Invalid argument: ultracode bogus. Valid options are: low, medium, high, xhigh, max, auto, ultracode [on|off]", EffortStdout::Invalid),
+            // Walk 7: the separate auto acknowledgement is not an effort accept.
+            ("Effort level set to auto", EffortStdout::Other),
+        ];
+        for (stdout, expected) in cases {
+            assert_eq!(parse_effort_stdout(stdout, d), expected, "stdout: {stdout:?}");
+        }
+    }
+

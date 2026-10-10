@@ -1,0 +1,14 @@
+    Checking remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+error: mismatched closing delimiter: `}`
+    --> crates/remuda-driver/src/shell_pty.rs:1226:40
+     |
+1215 |         {
+     |         - closing delimiter possibly meant for this
+...
+1226 |             catalog_refresh_task = Some(tokio::spawn(async move {
+     |                                        ^ unclosed delimiter
+...
+1251 |         }
+     |         ^ mismatched closing delimiter
+
+error: could not compile `remuda-driver` (lib) due to 1 previous error

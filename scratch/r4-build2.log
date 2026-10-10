@@ -1,0 +1,205 @@
+   Compiling serde_core v1.0.229
+   Compiling generic-array v0.14.7
+   Compiling typenum v1.20.1
+   Compiling syn v2.0.119
+   Compiling getrandom v0.2.17
+   Compiling getrandom v0.4.3
+   Compiling smallvec v1.16.1
+   Compiling tracing-core v0.1.36
+   Compiling rand_core v0.6.4
+   Compiling strsim v0.11.1
+   Compiling parking_lot_core v0.9.12
+   Compiling futures-channel v0.3.34
+   Compiling subtle v2.6.1
+   Compiling darling_core v0.24.1
+   Compiling parking_lot v0.12.5
+   Compiling futures-util v0.3.34
+   Compiling log v0.4.34
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling universal-hash v0.5.1
+   Compiling digest v0.10.7
+   Compiling cipher v0.4.4
+   Compiling aead v0.5.2
+   Compiling poly1305 v0.8.0
+   Compiling sha2 v0.10.9
+   Compiling chacha20 v0.9.1
+   Compiling chacha20poly1305 v0.10.1
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling uuid v1.26.1
+   Compiling deranged v0.5.8
+   Compiling darling_macro v0.24.1
+   Compiling darling v0.24.1
+   Compiling serde_with_macros v3.23.0
+   Compiling bytes v1.12.1
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling futures-executor v0.3.34
+   Compiling toml_edit v0.22.27
+   Compiling futures v0.3.34
+   Compiling schemars v1.2.2
+   Compiling tokio v1.53.1
+   Compiling time v0.3.55
+   Compiling tracing-attributes v0.1.31
+   Compiling pin-project-internal v1.1.13
+   Compiling strum_macros v0.28.0
+   Compiling derive_more-impl v2.1.1
+   Compiling pin-project v1.1.13
+   Compiling serde_with v3.23.0
+   Compiling tracing v0.1.44
+   Compiling thiserror-impl v1.0.69
+   Compiling futures-concurrency v7.7.1
+   Compiling derive_more v2.1.1
+   Compiling toml v0.8.23
+   Compiling strum v0.28.0
+   Compiling remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+   Compiling thiserror v1.0.69
+   Compiling filedescriptor v0.8.3
+   Compiling portable-pty v0.9.0
+   Compiling agent-client-protocol-schema v1.7.0
+   Compiling tokio-util v0.7.19
+   Compiling remuda-claude-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-claude-wire)
+   Compiling remuda-herdr v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-herdr)
+   Compiling agent-client-protocol v2.1.0
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+error[E0425]: cannot find type `ResumeMode` in this scope
+   --> crates/remuda-driver/src/shell_pty/promotion.rs:797:29
+    |
+797 |     pre_resume_mode: Option<ResumeMode>,
+    |                             ^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this enum
+    |
+ 26 + use crate::claude_transcript::ResumeMode;
+    |
+
+error[E0425]: cannot find type `ResumeMode` in this scope
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1528:43
+     |
+1528 | fn shell_resume_mode(found: &Detected) -> ResumeMode {
+     |                                           ^^^^^^^^^^ not found in this scope
+     |
+help: consider importing this enum
+     |
+  26 + use crate::claude_transcript::ResumeMode;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ResumeMode`
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1530:9
+     |
+1530 |         ResumeMode::Unverified
+     |         ^^^^^^^^^^ use of undeclared type `ResumeMode`
+     |
+help: consider importing this enum
+     |
+  26 + use crate::claude_transcript::ResumeMode;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ResumeMode`
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1532:9
+     |
+1532 |         ResumeMode::Fresh
+     |         ^^^^^^^^^^ use of undeclared type `ResumeMode`
+     |
+help: consider importing this enum
+     |
+  26 + use crate::claude_transcript::ResumeMode;
+     |
+
+error[E0425]: cannot find type `ResumeMode` in this scope
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1550:11
+     |
+1550 |     mode: ResumeMode,
+     |           ^^^^^^^^^^ not found in this scope
+     |
+help: consider importing this enum
+     |
+  26 + use crate::claude_transcript::ResumeMode;
+     |
+
+error[E0425]: cannot find type `ResumeMode` in this scope
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1886:15
+     |
+1886 |         mode: ResumeMode,
+     |               ^^^^^^^^^^ not found in this scope
+     |
+help: consider importing this enum
+     |
+  26 + use crate::claude_transcript::ResumeMode;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ResumeMode`
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1892:38
+     |
+1892 |             resumed = matches!(mode, ResumeMode::Boundary(_) | ResumeMode::Unverified),
+     |                                      ^^^^^^^^^^ use of undeclared type `ResumeMode`
+     |
+help: consider importing this enum
+     |
+  26 + use crate::claude_transcript::ResumeMode;
+     |
+
+error[E0433]: failed to resolve: use of undeclared type `ResumeMode`
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1892:64
+     |
+1892 |             resumed = matches!(mode, ResumeMode::Boundary(_) | ResumeMode::Unverified),
+     |                                                                ^^^^^^^^^^ use of undeclared type `ResumeMode`
+     |
+help: consider importing this enum
+     |
+  26 + use crate::claude_transcript::ResumeMode;
+     |
+
+warning: unused import: `ResumeBoundary`
+  --> crates/remuda-driver/src/shell_pty/promotion.rs:30:5
+   |
+30 |     ResumeBoundary, SessionStartReport, TailProvenance, TranscriptBinding, TranscriptCandidate,
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0271]: expected `{closure@promotion.rs:1987:38}` to return `Result<Observation, _>`, but it returns `Result<Vec<Observation>, DriverError>`
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1987:45
+     |
+1987 |         .chain(read.lines.iter().map(|line| hydrator.mapper.map_line(line)))
+     |          -----                       ------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Result<Observation, _>`, found `Result<Vec<Observation>, DriverError>`
+     |          |                           |
+     |          |                           this closure
+     |          required by a bound introduced by this call
+     |
+     = note: expected enum `std::result::Result<remuda_protocol::Observation, _>`
+                found enum `std::result::Result<Vec<remuda_protocol::Observation>, DriverError>`
+     = note: required for `Map<Iter<'_, String>, {closure@promotion.rs:1987:38}>` to implement `Iterator`
+note: required by a bound in `std::iter::Iterator::chain`
+    --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/iter/traits/iterator.rs:499:4
+     = note: the full name for the type has been written to '/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/target-r4/debug/deps/remuda_driver-4d66f0a1e717b916.long-type-5233580353927898758.txt'
+     = note: consider using `--verbose` to print the full type name to the console
+
+error[E0599]: the method `collect` exists for struct `Chain<Map<IntoIter<Observation>, ...>, ...>`, but its trait bounds were not satisfied
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1988:10
+     |
+1984 |       let mut batches: Vec<_> = gate_edges
+     |  _______________________________-
+1985 | |         .into_iter()
+1986 | |         .map(Ok)
+1987 | |         .chain(read.lines.iter().map(|line| hydrator.mapper.map_line(line)))
+1988 | |         .collect();
+     | |         -^^^^^^^ method cannot be called on `Chain<Map<IntoIter<Observation>, ...>, ...>` due to unsatisfied trait bounds
+     | |_________|
+     |
+     |
+     = note: the following trait bounds were not satisfied:
+             `std::iter::Chain<std::iter::Map<std::vec::IntoIter<remuda_protocol::Observation>, fn(remuda_protocol::Observation) -> std::result::Result<remuda_protocol::Observation, _> {std::result::Result::<remuda_protocol::Observation, _>::Ok}>, std::iter::Map<std::slice::Iter<'_, std::string::String>, {closure@crates/remuda-driver/src/shell_pty/promotion.rs:1987:38: 1987:44}>>: Iterator`
+             which is required by `&mut std::iter::Chain<std::iter::Map<std::vec::IntoIter<remuda_protocol::Observation>, fn(remuda_protocol::Observation) -> std::result::Result<remuda_protocol::Observation, _> {std::result::Result::<remuda_protocol::Observation, _>::Ok}>, std::iter::Map<std::slice::Iter<'_, std::string::String>, {closure@crates/remuda-driver/src/shell_pty/promotion.rs:1987:38: 1987:44}>>: Iterator`
+     = note: the full name for the type has been written to '/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/target-r4/debug/deps/remuda_driver-4d66f0a1e717b916.long-type-5462207803514499601.txt'
+     = note: consider using `--verbose` to print the full type name to the console
+
+Some errors have detailed explanations: E0271, E0425, E0433, E0599.
+For more information about an error, try `rustc --explain E0271`.
+warning: `remuda-driver` (lib) generated 1 warning
+error: could not compile `remuda-driver` (lib) due to 10 previous errors; 1 warning emitted

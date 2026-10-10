@@ -562,7 +562,7 @@ mod d028 {
                 "source": "remuda",
                 "observedAt": "2026-09-15T00:00:00.000Z",
             }));
-            assert_eq!(effective.name, name);
+            assert_eq!(effective.name, Some(name));
             assert_eq!(effective.ultracode, None);
         }
     }

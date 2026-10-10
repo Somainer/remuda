@@ -1,0 +1,147 @@
+[2026-09-28T12:57:46+08:00] waiting for gate-e2e.lock
+[2026-09-28T12:57:46+08:00] acquired gate-e2e.lock
+[2026-09-28T12:57:55+08:00] hub healthy
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 231 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+Running 24 tests using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+  -   1 [chromium] › tests/e2e/hub-live.spec.ts:140:1 › device login, hosts, create/send/close, follow, approvals
+  -   2 [chromium] › tests/e2e/hub-live.spec.ts:228:1 › paste an image: it stages on the Hub and its metadata reaches the Node
+  ✘   3 [chromium] › tests/e2e/hub-live.spec.ts:323:1 › real Node: register a project, create a shell in it, close and unregister (69ms)
+  -   4 [chromium] › tests/e2e/hub-live.spec.ts:398:1 › effort slider drag and keyboard send instance.configure
+  -   5 [chromium] › tests/e2e/hub-live.spec.ts:477:1 › native PTY default from the host matrix, with both projections
+  -   6 [chromium] › tests/e2e/hub-live.spec.ts:514:1 › composer queue / steer / interrupt states on a working native session
+  -   7 [chromium] › tests/e2e/hub-live.spec.ts:623:1 › a hook-carried approval shows the real tool input and an always-allow option
+  -   8 [chromium] › tests/e2e/hub-live.spec.ts:699:1 › structured view streams assistant text and separates injected records
+  -   9 [chromium] › tests/e2e/journal-window.hub.spec.ts:282:1 › a bounded tail window pages older rows and descends a resync gap to live
+  ✓  10 [chromium] › tests/e2e/m-inbox.hub.spec.ts:171:3 › 390px phone inbox › 允许一次 removes the row and a second submit is impossible (4.6s)
+  ✓  11 [chromium] › tests/e2e/m-inbox.hub.spec.ts:200:3 › 390px phone inbox › an offline host disables the buttons and shows 主机离线，交互暂停 (4.5s)
+  ✓  12 [chromium] › tests/e2e/m-inbox.hub.spec.ts:235:3 › 390px phone inbox › ?focus= highlights the row and scrolls it inside the viewport (10.7s)
+  ✓  13 [chromium] › tests/e2e/m-inbox.hub.spec.ts:277:3 › 390px phone inbox › ?kind= filters like /approvals and question rows go 去回答 to /s/:id (7.2s)
+  ✓  14 [chromium] › tests/e2e/m-inbox.hub.spec.ts:306:3 › 390px phone inbox › kind radiogroup is fully 44px tappable at the coarse band edges (2.3s)
+[WebServer] 12:58:36 PM [vite] (client) [Unhandled rejection] HubHttpError: not found
+[WebServer]  > rest src/lib/api.ts:832:10
+[WebServer]     830 |        /* raw */
+[WebServer]     831 |      }
+[WebServer]     832 |      throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
+[WebServer]         |            ^
+[WebServer]     833 |    }
+[WebServer]     834 |    if (res.status === 204) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2304:19
+[WebServer] 
+  ✓  15 [chromium] › tests/e2e/m-inbox.hub.spec.ts:350:3 › 390px phone inbox › a Node-restarted session is filtered out of both compact inbox tiers; its session banner is neutral (8.7s)
+  -  16 [chromium] › tests/e2e/m-inbox.hub.spec.ts:455:3 › 390px phone inbox › evidence: inbox banner and both tiers at 390px
+  ✓  17 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:275:1 › offline sends are queued and delivered exactly once after reconnect (10.5s)
+[WebServer] 12:58:54 PM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:793:10
+[WebServer]     791 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     792 |      }
+[WebServer]     793 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     794 |    }
+[WebServer]     795 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2304:19
+[WebServer] 
+[WebServer] 12:58:54 PM [vite] (client) [Unhandled rejection] RestNetworkError: Failed to fetch
+[WebServer]  > rest src/lib/api.ts:793:10
+[WebServer]     791 |        throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+[WebServer]     792 |      }
+[WebServer]     793 |      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+[WebServer]         |            ^
+[WebServer]     794 |    }
+[WebServer]     795 |    if (!res.ok) {
+[WebServer]  > Object.eventsRead src/lib/api.ts:1745:19
+[WebServer]  > HubStore.follow src/lib/store.ts:2304:19
+[WebServer] 
+  ✓  18 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:323:1 › an offline-queued message survives a reload while the Hub is still off and sends once after (14.4s)
+  ✓  19 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:378:1 › a committed POST whose browser response is lost retries with replayed:true and runs once (9.5s)
+  ✓  20 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:451:1 › an online send labels the row 等待发送 then 已发送，等待确认/已受理 as it delivers (7.5s)
+  ✘  21 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:552:1 › an offline-queued message survives a reload with the browser context STILL offline and sends once after (29.8s)
+  ✓  22 [chromium] › tests/e2e/passkey-hub-live.spec.ts:63:3 › passkey login (CDP virtual authenticator) › register in settings, log out, log back in with the passkey (4.8s)
+  ✓  23 [chromium] › tests/e2e/passkey-hub-live.spec.ts:104:3 › passkey login (CDP virtual authenticator) › login fails once the authenticator is gone and access code still works (4.6s)
+  ✘  24 [chromium] › tests/e2e/spaces-hub-live.spec.ts:172:1 › registered spaces isolate tabs, remember selection and collapse, and fit a phone drawer (1.5s)
+
+
+  1) [chromium] › tests/e2e/hub-live.spec.ts:323:1 › real Node: register a project, create a shell in it, close and unregister 
+
+    Error: Set HUB_E2E_WORKSPACE to an existing allowed directory on the Node
+
+    expect(received).toBeTruthy()
+
+    Received: undefined
+
+      324 |   test.skip(process.env.HUB_E2E_EXTERNAL !== "1", "Requires the operator's remuda dev");
+      325 |   const path = process.env.HUB_E2E_WORKSPACE;
+    > 326 |   expect(path, "Set HUB_E2E_WORKSPACE to an existing allowed directory on the Node").toBeTruthy();
+          |                                                                                      ^
+      327 |   const followUrls: string[] = [];
+      328 |   page.on("websocket", (socket) => {
+      329 |     if (new URL(socket.url()).pathname === "/v1/follow") followUrls.push(socket.url());
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/hub-live.spec.ts:326:86
+
+    Error Context: test-results/hub-live-real-Node-registe-c80bb--in-it-close-and-unregister-chromium/error-context.md
+
+  2) [chromium] › tests/e2e/offline-outbox.hub.spec.ts:552:1 › an offline-queued message survives a reload with the browser context STILL offline and sends once after 
+
+    Error: expect(locator).toHaveCount(expected) failed
+
+    Locator:  getByTestId('journal-banner')
+    Expected: 0
+    Received: 1
+    Timeout:  20000ms
+
+    Call log:
+      - Expect "toHaveCount" getByTestId('journal-banner') with timeout 20000ms
+      - waiting for getByTestId('journal-banner')
+        44 × locator resolved to 1 element
+           - unexpected value "1"
+
+
+      603 |   // Lift emulation: the machine reconnects and the restored row sends once.
+      604 |   await page.context().setOffline(false);
+    > 605 |   await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
+          |                                                    ^
+      606 |   await expect
+      607 |     .poll(
+      608 |       async () =>
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/offline-outbox.hub.spec.ts:605:52
+
+    Error Context: test-results/offline-outbox.hub-an-offl-8214e-ffline-and-sends-once-after-chromium/error-context.md
+
+    Error Context: test-results/offline-outbox.hub-an-offl-8214e-ffline-and-sends-once-after-chromium/error-context.md
+
+  3) [chromium] › tests/e2e/spaces-hub-live.spec.ts:172:1 › registered spaces isolate tabs, remember selection and collapse, and fit a phone drawer 
+
+    Error: HUB_E2E_HOST_ID must identify the owned remuda dev Node
+
+    expect(received).toBeTruthy()
+
+    Received: undefined
+
+      22 |   ];
+      23 |   const hostId = process.env.HUB_E2E_HOST_ID;
+    > 24 |   expect(hostId, "HUB_E2E_HOST_ID must identify the owned remuda dev Node").toBeTruthy();
+         |                                                                             ^
+      25 |   const roots = [process.env.HUB_E2E_SPACE_PRIMARY, process.env.HUB_E2E_SPACE_SECONDARY];
+      26 |   expect(roots.every(Boolean), "Set HUB_E2E_SPACE_PRIMARY and HUB_E2E_SPACE_SECONDARY to registered project roots").toBe(true);
+      27 |   expect(roots[0]).not.toBe(roots[1]);
+        at registeredSpaces (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/spaces-hub-live.spec.ts:24:77)
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/spaces-hub-live.spec.ts:178:38
+
+    Error Context: test-results/spaces-hub-live-registered-9b289-apse-and-fit-a-phone-drawer-chromium/error-context.md
+
+  3 failed
+    [chromium] › tests/e2e/hub-live.spec.ts:323:1 › real Node: register a project, create a shell in it, close and unregister 
+    [chromium] › tests/e2e/offline-outbox.hub.spec.ts:552:1 › an offline-queued message survives a reload with the browser context STILL offline and sends once after 
+    [chromium] › tests/e2e/spaces-hub-live.spec.ts:172:1 › registered spaces isolate tabs, remember selection and collapse, and fit a phone drawer 
+  4 skipped
+  5 did not run
+  12 passed (2.1m)
+[2026-09-28T13:00:01+08:00] playwright exit 1

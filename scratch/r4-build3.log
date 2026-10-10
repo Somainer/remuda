@@ -1,0 +1,69 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+warning: unused import: `ResumeBoundary`
+  --> crates/remuda-driver/src/shell_pty/promotion.rs:30:5
+   |
+30 |     ResumeBoundary, ResumeMode, SessionStartReport, TailProvenance, TranscriptBinding,
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0271]: expected `{closure@promotion.rs:1987:38}` to return `Result<Observation, _>`, but it returns `Result<Vec<Observation>, DriverError>`
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1987:45
+     |
+1987 |         .chain(read.lines.iter().map(|line| hydrator.mapper.map_line(line)))
+     |          -----                       ------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Result<Observation, _>`, found `Result<Vec<Observation>, DriverError>`
+     |          |                           |
+     |          |                           this closure
+     |          required by a bound introduced by this call
+     |
+     = note: expected enum `std::result::Result<remuda_protocol::Observation, _>`
+                found enum `std::result::Result<Vec<remuda_protocol::Observation>, DriverError>`
+     = note: required for `Map<Iter<'_, String>, {closure@promotion.rs:1987:38}>` to implement `Iterator`
+note: required by a bound in `std::iter::Iterator::chain`
+    --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/iter/traits/iterator.rs:499:4
+     = note: the full name for the type has been written to '/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/target-r4/debug/deps/remuda_driver-4d66f0a1e717b916.long-type-15922185355807110979.txt'
+     = note: consider using `--verbose` to print the full type name to the console
+
+error[E0599]: the method `collect` exists for struct `Chain<Map<IntoIter<Observation>, ...>, ...>`, but its trait bounds were not satisfied
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:1988:10
+     |
+1984 |       let mut batches: Vec<_> = gate_edges
+     |  _______________________________-
+1985 | |         .into_iter()
+1986 | |         .map(Ok)
+1987 | |         .chain(read.lines.iter().map(|line| hydrator.mapper.map_line(line)))
+1988 | |         .collect();
+     | |         -^^^^^^^ method cannot be called on `Chain<Map<IntoIter<Observation>, ...>, ...>` due to unsatisfied trait bounds
+     | |_________|
+     |
+     |
+     = note: the following trait bounds were not satisfied:
+             `std::iter::Chain<std::iter::Map<std::vec::IntoIter<remuda_protocol::Observation>, fn(remuda_protocol::Observation) -> std::result::Result<remuda_protocol::Observation, _> {std::result::Result::<remuda_protocol::Observation, _>::Ok}>, std::iter::Map<std::slice::Iter<'_, std::string::String>, {closure@crates/remuda-driver/src/shell_pty/promotion.rs:1987:38: 1987:44}>>: Iterator`
+             which is required by `&mut std::iter::Chain<std::iter::Map<std::vec::IntoIter<remuda_protocol::Observation>, fn(remuda_protocol::Observation) -> std::result::Result<remuda_protocol::Observation, _> {std::result::Result::<remuda_protocol::Observation, _>::Ok}>, std::iter::Map<std::slice::Iter<'_, std::string::String>, {closure@crates/remuda-driver/src/shell_pty/promotion.rs:1987:38: 1987:44}>>: Iterator`
+     = note: the full name for the type has been written to '/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/target-r4/debug/deps/remuda_driver-4d66f0a1e717b916.long-type-2282489075568327942.txt'
+     = note: consider using `--verbose` to print the full type name to the console
+
+error[E0308]: mismatched types
+    --> crates/remuda-driver/src/shell_pty.rs:1417:17
+     |
+1394 |             *self.poller.lock().await = Some(promotion::spawn(
+     |                                              ---------------- arguments to this function are incorrect
+...
+1417 |                 pre_resume_boundary,
+     |                 ^^^^^^^^^^^^^^^^^^^ expected `Option<ResumeMode>`, found `Option<ResumeBoundary>`
+     |
+     = note: expected enum `std::option::Option<ResumeMode>`
+                found enum `std::option::Option<ResumeBoundary>`
+note: function defined here
+    --> crates/remuda-driver/src/shell_pty/promotion.rs:771:15
+     |
+ 771 | pub(super) fn spawn(
+     |               ^^^^^
+...
+ 797 |     pre_resume_mode: Option<ResumeMode>,
+     |     -----------------------------------
+
+Some errors have detailed explanations: E0271, E0308, E0599.
+For more information about an error, try `rustc --explain E0271`.
+warning: `remuda-driver` (lib) generated 1 warning
+error: could not compile `remuda-driver` (lib) due to 3 previous errors; 1 warning emitted

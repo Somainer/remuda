@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+     Running tests/usage_native_rollup.rs (target-fs2/debug/deps/usage_native_rollup-4b9714b83b209a0a)
+
+running 1 test
+test a_native_shell_pty_claude_session_reports_a_usage_rollup has been running for over 60 seconds
+test a_native_shell_pty_claude_session_reports_a_usage_rollup ... FAILED
+
+failures:
+
+---- a_native_shell_pty_claude_session_reports_a_usage_rollup stdout ----
+
+thread 'a_native_shell_pty_claude_session_reports_a_usage_rollup' (2748708) panicked at crates/remuda-node/tests/usage_native_rollup.rs:90:49:
+set-cookie
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_native_shell_pty_claude_session_reports_a_usage_rollup
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 108.51s
+
+error: test failed, to rerun pass `-p remuda-node --test usage_native_rollup`

@@ -1,0 +1,21 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+error[E0061]: this method takes 1 argument but 2 arguments were supplied
+    --> crates/remuda-driver/src/shell_pty.rs:4797:14
+     |
+4797 |             .write_all(
+     |              ^^^^^^^^^
+...
+4813 |                 b"\n",
+     |                 ----- unexpected argument #2 of type `&'static [u8; 1]`
+     |
+note: method defined here
+    --> /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/io/mod.rs:1875:7
+help: remove the extra argument
+     |
+4812 -                 .unwrap(),
+4813 -                 b"\n",
+4812 +                 .unwrap(),
+     |
+
+For more information about this error, try `rustc --explain E0061`.
+error: could not compile `remuda-driver` (lib test) due to 1 previous error

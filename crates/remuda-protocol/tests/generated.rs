@@ -131,6 +131,10 @@ fn public_wire_types_are_registered_for_generation() {
         // §9.1: parsed verdict of an /effort stdout line — mapper output, not
         // a wire type.
         "EffortStdout",
+        // D-056: version-gated effort semantics and the slash-argument
+        // classifier — pure transcript-mapper state/inputs, never on the wire.
+        "EffortSemantics",
+        "EffortSlash",
         // M1 5b `remuda watch`: borrowed classifier input / classified output
         // / key-encoding result — pure rule logic shared by Hub and tests,
         // never serialized on the wire (the roster carries `WorkerWatch`).

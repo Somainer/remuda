@@ -1,0 +1,27 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+error[E0599]: no variant or associated item named `OpenAiCompat` found for enum `profile::ProviderKind` in the current scope
+    --> crates/remuda-driver/src/shell_pty.rs:4695:41
+     |
+4695 |                     kind: ProviderKind::OpenAiCompat,
+     |                                         ^^^^^^^^^^^^ variant or associated item not found in `profile::ProviderKind`
+     |
+    ::: crates/remuda-driver/src/profile.rs:18:1
+     |
+  18 | pub enum ProviderKind {
+     | --------------------- variant or associated item `OpenAiCompat` not found for this enum
+
+error[E0594]: cannot assign to `driver.options.fail_after_spawn`, as `driver` is not declared as mutable
+    --> crates/remuda-driver/src/shell_pty.rs:4657:9
+     |
+4657 |         driver.options.fail_after_spawn = false;
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot assign
+     |
+help: consider changing this to be mutable
+     |
+4625 |         let mut driver = ShellPtyDriver::new(options);
+     |             +++
+
+Some errors have detailed explanations: E0594, E0599.
+For more information about an error, try `rustc --explain E0594`.
+error: could not compile `remuda-driver` (lib test) due to 2 previous errors

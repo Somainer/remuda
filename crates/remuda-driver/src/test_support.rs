@@ -41,9 +41,17 @@ impl Bridge {
     }
 
     /// Arm an arbitrary `/effort <word>` switch; returns its generation.
+    /// Accepts level words, the bare `ultracode`, and `ultracode on|off`.
     pub fn arm_word(&self, word: &str) -> u64 {
         self.inner
             .arm(EffortRequest::from_level(word).expect("level"))
+    }
+
+    /// Arm a switch from raw slash args; `None` for words Remuda cannot send
+    /// (`auto`, `status`, `bogus`, `ultracode bogus`).
+    #[must_use]
+    pub fn arm_args(&self, args: &str) -> Option<u64> {
+        EffortRequest::from_level(args).map(|request| self.inner.arm(request))
     }
 
     /// Whether a switch is still awaiting its verdict.
@@ -117,6 +125,29 @@ pub fn mapper_with_bridge(
         version.to_owned(),
     )
     .with_effort_bridge(Arc::clone(&bridge.inner), None)
+}
+
+/// Put a mapper in pre-launch (unverified/history) mode, as a resume
+/// transcript pump does for a batch whose current-process provenance cannot be
+/// established (D-056 (4)).
+#[must_use]
+pub fn resume_mapper(mapper: TranscriptMapper) -> TranscriptMapper {
+    let mut mapper = mapper;
+    mapper.set_effort_current_process(false);
+    mapper
+}
+
+/// Set the mapper's current-process provenance, as the transcript pump does
+/// per tail batch (`true` for current-process records, `false` for an
+/// unverified/displaced resume batch).
+pub fn mark_current_process(mapper: &mut TranscriptMapper, current: bool) {
+    mapper.set_effort_current_process(current);
+}
+
+/// Whether the mapper is accepting current-process effort records.
+#[must_use]
+pub fn is_current_process(mapper: &TranscriptMapper) -> bool {
+    mapper.is_current_process()
 }
 
 /// Build a mapper attached to a test model bridge.

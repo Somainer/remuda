@@ -1,0 +1,43 @@
+   Compiling tokio v1.53.1
+   Compiling remuda-rules v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-rules)
+   Compiling remuda v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda)
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling tokio-util v0.7.19
+   Compiling hyper v1.11.1
+   Compiling tower v0.5.3
+   Compiling tokio-tungstenite v0.29.0
+   Compiling remuda-claude-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-claude-wire)
+   Compiling remuda-herdr v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-herdr)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling tokio-rustls v0.26.5
+   Compiling tower-http v0.6.11
+   Compiling hyper-util v0.1.20
+   Compiling tokio-tungstenite v0.28.0
+   Compiling remuda-ssh v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-ssh)
+   Compiling remuda-codex-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-codex-wire)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling axum v0.8.9
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling remuda-hub-client v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub-client)
+   Compiling remuda-feishu v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-feishu)
+   Compiling remuda-push v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-push)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+error[E0599]: no method named `len` found for struct `TailRead` in the current scope
+  --> crates/remuda-testing/tests/fake_harness.rs:93:22
+   |
+93 |     assert_eq!(lines.len(), records.len());
+   |                      ^^^ method not found in `TailRead`
+   |
+help: one of the expressions' fields has a method of the same name
+   |
+93 |     assert_eq!(lines.lines.len(), records.len());
+   |                      ++++++
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `remuda-testing` (test "fake_harness") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

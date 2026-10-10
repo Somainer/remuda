@@ -1,0 +1,26 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.21s
+     Running unittests src/lib.rs (target-authrace/debug/deps/remuda_driver-b57c99b9a1bcf656)
+
+running 1 test
+  lifecycle: Native(NativeLifecycle { topic: Diagnostic, native_name: "agent_detected", native_id: NotApplicable, status: Known { value: "agent detected: claude" }, related_ids: {"kind": "claude", "pid": "3157874"}, data_ref: None, severity: Info, affects_completion: false })
+  lifecycle: Native(NativeLifecycle { topic: Session, native_name: "agent_promoted", native_id: NotApplicable, status: Known { value: "claude" }, related_ids: {"kind": "claude", "mode": "promoted", "pid": "3157874", "promotedAt": "2026-10-06T04:31:24.403Z"}, data_ref: None, severity: Info, affects_completion: false })
+  lifecycle: Native(NativeLifecycle { topic: Session, native_name: "transcript_bound", native_id: Known { value: "01234567-89ab-cdef-0123-456789abcdef" }, status: Known { value: "pid" }, related_ids: {"sessionId": "01234567-89ab-cdef-0123-456789abcdef", "source": "pid", "transcriptPath": "/home/wangruming.nana/t/.tmpiNDhgm/claude-home/projects/-home-wangruming-nana-t--tmpiNDhgm/01234567-89ab-cdef-0123-456789abcdef.jsonl"}, data_ref: None, severity: Info, affects_completion: false })
+PROMOTION PUMP OBSERVED KINDS: ["lifecycle", "lifecycle", "other", "lifecycle", "effort"]
+
+thread 'shell_pty::tests::the_promotion_pump_publishes_effort_through_the_live_channel' (3157869) panicked at crates/remuda-driver/src/shell_pty.rs:4848:9:
+assertion `left == right` failed: the promotion pump published the journal-derived effort id on its real channel
+  left: Some(EventId(Id("evt_60ea30e3-c634-7970-85c1-d20635fc34fd")))
+ right: Some(EventId(Id("evt_7834118c-c996-7105-a8a8-d338da9aaea5")))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test shell_pty::tests::the_promotion_pump_publishes_effort_through_the_live_channel ... FAILED
+
+failures:
+
+failures:
+    shell_pty::tests::the_promotion_pump_publishes_effort_through_the_live_channel
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 477 filtered out; finished in 0.86s
+
+error: test failed, to rerun pass `-p remuda-driver --lib`

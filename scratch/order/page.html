@@ -1,0 +1,11 @@
+<!doctype html><html><head><script>
+const t0 = performance.now();
+const mark = (m) => { console.log("UNLOADORDER " + m + "@" + (performance.now()-t0).toFixed(1)); };
+window.addEventListener("beforeunload", () => {
+  mark("beforeunload");
+  setTimeout(() => mark("timer0"), 0);
+  setTimeout(() => mark("timer100"), 100);
+});
+window.addEventListener("pagehide", () => mark("pagehide"));
+window.addEventListener("unload", () => mark("unload"));
+</script></head><body>page</body></html>

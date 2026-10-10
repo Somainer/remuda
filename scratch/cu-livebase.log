@@ -1,0 +1,38 @@
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.29s
+     Running tests/live_pipeline.rs (target-fs2/debug/deps/live_pipeline-79e54d9deac9b533)
+
+running 1 test
+
+thread 'budgets_and_rule_six_over_a_real_pty' (3482060) panicked at crates/remuda-node/tests/live_pipeline.rs:518:13:
+hooks child failed
+--- stdout ---
+
+running 1 test
+test budgets_and_rule_six_over_a_real_pty ... FAILED
+
+failures:
+
+failures:
+    budgets_and_rule_six_over_a_real_pty
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.14s
+
+
+--- stderr ---
+
+thread 'budgets_and_rule_six_over_a_real_pty' (3482066) panicked at crates/remuda-node/tests/live_pipeline.rs:545:10:
+UserPromptSubmit committed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test budgets_and_rule_six_over_a_real_pty ... FAILED
+
+failures:
+
+failures:
+    budgets_and_rule_six_over_a_real_pty
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.15s
+
+error: test failed, to rerun pass `-p remuda-node --test live_pipeline`

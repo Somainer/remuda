@@ -1,0 +1,10 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.51s
+     Running unittests src/lib.rs (target-authrace/debug/deps/remuda_driver-b57c99b9a1bcf656)
+
+running 1 test
+test shell_pty::tests::the_promotion_pump_publishes_effort_through_the_live_channel ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 477 filtered out; finished in 0.82s
+

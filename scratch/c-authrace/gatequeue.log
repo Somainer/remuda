@@ -1,0 +1,25 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running tests/gate_queue.rs (target-authrace/debug/deps/gate_queue-4bd1839b5fb60709)
+
+running 18 tests
+test verify_job_runs_on_a_lane_and_passes ... ok
+test gate_run_carries_the_merged_step_timeouts ... ok
+test land_losing_the_cas_is_reverified_onto_new_main_then_lands ... ok
+test passing_verify_records_the_merge_ref_on_the_job ... ok
+test unknown_lane_and_bad_inputs_are_rejected ... ok
+test cancel_a_queued_job_marks_it_canceled_without_a_node_call ... ok
+test cancel_a_running_job_sends_gate_cancel_and_finishes_canceled ... ok
+test home_land_base_moved_requeues_a_verify_instead_of_pushing ... ok
+test push_from_home_lands_via_the_home_host_then_unpins ... ok
+test cancel_while_running_a_home_land_never_lands ... ok
+test failed_job_persists_evidence_fields_and_a_fetchable_log_object ... ok
+test cancel_during_a_home_push_that_lands_reports_landed ... ok
+test restart_during_a_home_push_does_not_wedge_the_cancel_grace ... ok
+test land_jobs_are_serialized_and_the_second_lands_after ... ok
+test ref_retention_drops_pins_for_an_unlanded_verify ... ok
+test two_verify_jobs_run_in_parallel_on_two_lanes ... ok
+test fifo_order_is_preserved_on_one_lane ... ok
+test a_late_run_reply_after_the_cancel_grace_changes_nothing ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.73s
+

@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+     Running tests/usage_native_rollup.rs (target-fs2/debug/deps/usage_native_rollup-4b9714b83b209a0a)
+
+running 1 test
+
+thread 'a_native_shell_pty_claude_session_reports_a_usage_rollup' (2841778) panicked at crates/remuda-node/tests/usage_native_rollup.rs:166:5:
+assertion `left == right` failed: create instance: {"instance":{"instanceId":"ins_01a111ef-1530-7441-8f02-a17fb407661c","parentInstanceId":null,"hostId":"hst_01a111ef-1249-743c-9026-e647d82e4237","workspaceId":null,"kind":"claude","driver":"shell-pty","lifecycle":"requested","activity":"unknown","connectivity":"connected","title":null,"cwd":"/home/wangruming.nana/t/.tmptg882y/workspace","delegation":"none","providerProfileId":"none","providerSource":"request","providerSourceHint":"使用主机原生登录","model":"fake","tui":"fullscreen","journalId":"obj_01a111ef-1530-7441-8f02-a180887fa5b3","durableSeq":"0","configureSeq":0,"createdAt":"2026-10-06T15:57:23.632Z","updatedAt":"2026-10-06T15:57:23.632Z","launchedBy":"remuda","role":"worker","scope":{}},"command":{"commandId":"cmd_01a111ef-1531-72e9-b197-11ca9e623c72","instanceId":"ins_01a111ef-1530-7441-8f02-a17fb407661c","hostId":"hst_01a111ef-1249-743c-9026-e647d82e4237","operation":"instance.create","state":"accepted","resolution":"clear","forwarded":true,"payload":{"origin":"human","instanceId":"ins_01a111ef-1530-7441-8f02-a17fb407661c","spec":{"kind":"claude","driver":"shell-pty","model":"fake","args":[],"providerProfileId":"none","permissionMode":null,"sandbox":null,"workspaceId":null,"prompt":"ok","title":null,"name":null,"cwd":"/home/wangruming.nana/t/.tmptg882y/workspace","worktree":null,"requiredCapabilities":null,"capabilities":[],"delegation":"none","claudeConfigDir":"/home/wangruming.nana/t/.tmptg882y/claude-home","binaryPath":"/home/wangruming.nana/t/.tmptg882y/bin/claude","hostId":"hst_01a111ef-1249-743c-9026-e647d82e4237","tui":"fullscreen","providerSource":"request","providerSourceHint":"使用主机原生登录","origin":"human","parentInstanceId":null},"initialInput":{"type":"prompt","text":"ok"}},"idempotencyKey":null,"createdAt":"2026-10-06T15:57:23.633Z","updatedAt":"2026-10-06T15:57:23.759Z"},"hostId":"hst_01a111ef-1249-743c-9026-e647d82e4237","warnings":[]}
+  left: 200
+ right: 201
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_native_shell_pty_claude_session_reports_a_usage_rollup ... FAILED
+
+failures:
+
+failures:
+    a_native_shell_pty_claude_session_reports_a_usage_rollup
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s
+
+error: test failed, to rerun pass `-p remuda-node --test usage_native_rollup`

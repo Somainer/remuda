@@ -1,0 +1,42 @@
+   Compiling fastrand v2.5.0
+   Compiling rustix v1.1.4
+   Compiling num-iter v0.1.46
+   Compiling remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+   Compiling serde_core v1.0.229
+   Compiling reqwest v0.12.28
+   Compiling agent-client-protocol-schema v1.7.0
+   Compiling axum v0.8.9
+   Compiling num-bigint-dig v0.8.6
+   Compiling futures-lite v2.6.1
+   Compiling piper v0.2.5
+   Compiling blocking v1.7.0
+   Compiling rsa v0.9.10
+   Compiling futures-concurrency v7.7.1
+   Compiling superboring v0.1.14
+   Compiling deranged v0.5.8
+   Compiling remuda-herdr v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-herdr)
+   Compiling polling v3.11.0
+   Compiling async-io v2.6.0
+   Compiling async-signal v0.2.14
+   Compiling jwt-simple v0.12.17
+   Compiling async-process v2.5.0
+   Compiling remuda-claude-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-claude-wire)
+   Compiling time v0.3.55
+   Compiling webauthn-rs-proto v0.5.5
+   Compiling web-push v0.11.0
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+   Compiling plist v1.10.1
+   Compiling webauthn-rs-core v0.5.5
+   Compiling remuda-push v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-push)
+   Compiling remuda-ssh v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-ssh)
+   Compiling remuda-hub-client v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub-client)
+   Compiling remuda v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda)
+   Compiling agent-client-protocol v2.1.0
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+   Compiling remuda-feishu v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-feishu)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 54.67s

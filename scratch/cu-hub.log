@@ -1,0 +1,22 @@
+   Compiling futures-concurrency v7.7.1
+   Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+   Compiling tempfile v3.27.0
+   Compiling agent-client-protocol v2.1.0
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 39.47s
+     Running unittests src/lib.rs (target-fs2/debug/deps/remuda_hub-4450c0e6aa692d6a)
+
+running 7 tests
+test usage_store::tests::budget_band_uses_estimate_times_tolerance ... ok
+test usage_store::tests::context_window_resolution_order ... ok
+test usage_store::tests::rollup_no_events_means_no_rollup ... ok
+test usage_store::tests::rollup_leaves_unreported_channels_unknown ... ok
+test usage_store::tests::rollup_folds_recorded_usage_sequence ... ok
+test usage_store::tests::re_hydration_dedupes_on_instance_scope_scope_id ... ok
+test usage_store::tests::projects_folds_and_dedupes_usage_events ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out; finished in 0.00s
+

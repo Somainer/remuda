@@ -1,0 +1,22 @@
+[2026-09-28T17:41:50+08:00] waiting
+[2026-09-28T17:41:50+08:00] go
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s
+[WebServer]      Running `/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/examples/hub_e2e`
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a0e764-6770-730c-8e9c-a439896e7353","upstream":"http://127.0.0.1:58881","viaHost":null}
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 194 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+Running 1 test using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+[WebServer] 2026-09-28T09:41:56.991418Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e764-7a10-7054-9da0-2ef63ac2ac90 response={"jsonrpc":"2.0","id":"f11f2484-26d3-46a9-bc12-9c2ba2076ce1","result":{"ok":true,"instanceId":"ins_01a0e764-7a0e-71b6-b5ae-f8c827092415"}}
+[WebServer] 2026-09-28T09:42:02.093790Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e764-8700-7f5a-bb56-4bc401ec6f1b response={"jsonrpc":"2.0","id":"36b18fd4-b769-4a8a-a82e-098b92bce658","result":{"ok":true}}
+[WebServer] 2026-09-28T09:42:07.693678Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e764-a44b-763d-b5db-8267e8b4cd86 response={"jsonrpc":"2.0","id":"8e135b58-4b3c-42bf-a2fa-ed15afeac515","result":{"ok":true}}
+[WebServer] 2026-09-28T09:42:07.700625Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e764-7a0e-71b6-b5ae-f8c827092415 device_id=dev_01a0e764-a0b6-713a-9cad-0f1557b13137 forced=true
+  ✓  1 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:566:3 › full offline SW restore (PNA/LNA loopback exemption for this harness case) › an offline-queued message survives a reload with the browser context STILL offline and sends once after (14.1s)
+
+  1 passed (16.5s)
+[2026-09-28T17:42:08+08:00] exit 0

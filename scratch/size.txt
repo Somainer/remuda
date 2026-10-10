@@ -1,0 +1,8 @@
+2.8G	target-authrace
+--- top subdirs ---
+4.0K	target-authrace/CACHEDIR.TAG
+4.0K	target-authrace/tmp
+2.8G	target-authrace/debug
+--- my worktree other ---
+250M	scratch
+4.0K	locks

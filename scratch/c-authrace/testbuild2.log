@@ -1,0 +1,100 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+   --> crates/remuda-driver/tests/effort_transcript.rs:781:5
+    |
+781 |     remuda_driver::test_support::mark_current_process(&mut mapper);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^------------- argument #2 of type `bool` is missing
+    |
+note: function defined here
+   --> crates/remuda-driver/src/test_support.rs:143:8
+    |
+143 | pub fn mark_current_process(mapper: &mut TranscriptMapper, current: bool) {
+    |        ^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+    |
+781 |     remuda_driver::test_support::mark_current_process(&mut mapper, /* bool */);
+    |                                                                  ++++++++++++
+
+For more information about this error, try `rustc --explain E0061`.
+error: could not compile `remuda-driver` (test "effort_transcript") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error[E0308]: mismatched types
+    --> crates/remuda-driver/src/claude_transcript.rs:1036:48
+     |
+1036 |         assert_eq!(tail.poll().expect("poll"), vec!["{\"a\":1}", "{\"b\":2}"]);
+     |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `TailRead`, found `Vec<&str>`
+     |
+     = note: expected struct `claude_transcript::TailRead`
+                found struct `Vec<&str>`
+     = note: this error originates in the macro `vec` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+    --> crates/remuda-driver/src/claude_transcript.rs:1038:48
+     |
+1038 |         assert_eq!(tail.poll().expect("poll"), Vec::<String>::new());
+     |                                                ^^^^^^^^^^^^^^^^^^^^ expected `TailRead`, found `Vec<String>`
+     |
+     = note: expected struct `claude_transcript::TailRead`
+                found struct `Vec<std::string::String>`
+
+error[E0308]: mismatched types
+    --> crates/remuda-driver/src/claude_transcript.rs:1044:48
+     |
+1044 |         assert_eq!(tail.poll().expect("poll"), vec!["{\"partial\":3}"]);
+     |                                                ^^^^^^^^^^^^^^^^^^^^^^^ expected `TailRead`, found `Vec<&str>`
+     |
+     = note: expected struct `claude_transcript::TailRead`
+                found struct `Vec<&str>`
+     = note: this error originates in the macro `vec` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `len` found for struct `claude_transcript::TailRead` in the current scope
+    --> crates/remuda-driver/src/claude_transcript.rs:1053:47
+     |
+ 667 | pub struct TailRead {
+     | ------------------- method `len` not found for this struct
+...
+1053 |         assert_eq!(tail.poll().expect("poll").len(), 2);
+     |                                               ^^^ method not found in `claude_transcript::TailRead`
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following traits define an item `len`, perhaps you need to implement one of them:
+             candidate #1: `Buffer`
+             candidate #2: `ExactSizeIterator`
+             candidate #3: `Len`
+             candidate #4: `NixPath`
+             candidate #5: `SockaddrLike`
+             candidate #6: `rand::seq::slice::IndexedRandom`
+             candidate #7: `toml_edit::table::TableLike`
+             candidate #8: `winnow::stream::AsChar`
+help: one of the expressions' fields has a method of the same name
+     |
+1053 |         assert_eq!(tail.poll().expect("poll").lines.len(), 2);
+     |                                               ++++++
+
+error[E0308]: mismatched types
+    --> crates/remuda-driver/src/claude_transcript.rs:1055:48
+     |
+1055 |         assert_eq!(tail.poll().expect("poll"), vec!["{\"c\":3}"]);
+     |                                                ^^^^^^^^^^^^^^^^^ expected `TailRead`, found `Vec<&str>`
+     |
+     = note: expected struct `claude_transcript::TailRead`
+                found struct `Vec<&str>`
+     = note: this error originates in the macro `vec` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0369]: binary operation `>` cannot be applied to type `fn() -> Vec<std::string::String> {Vec::<std::string::String>::new}`
+    --> crates/remuda-driver/src/claude_transcript.rs:1155:50
+     |
+1155 |         assert_eq!(read.lines, Vec::<String>::new>());
+     |                                ------------------^-- ()
+     |                                |
+     |                                fn() -> Vec<std::string::String> {Vec::<std::string::String>::new}
+
+error[E0063]: missing field `resume` in initializer of `promote::Detected`
+    --> crates/remuda-driver/src/shell_pty.rs:4491:49
+     |
+4491 |         *driver.promoted.lock().unwrap() = Some(crate::promote::Detected {
+     |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^ missing `resume`
+
+Some errors have detailed explanations: E0063, E0308, E0369, E0599.
+For more information about an error, try `rustc --explain E0063`.
+error: could not compile `remuda-driver` (lib test) due to 7 previous errors

@@ -1,0 +1,23 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+error[E0597]: `buf` does not live long enough
+    --> crates/remuda-driver/src/shell_pty.rs:4814:17
+     |
+4797 |             .write_all({
+     |              --------- borrow later used by call
+4798 |                 let mut buf = serde_json::to_vec(&json!({
+     |                     ------- binding `buf` declared here
+...
+4814 |                 &buf
+     |                 ^^^^ borrowed value does not live long enough
+4815 |             })
+     |             - `buf` dropped here while still borrowed
+...
+4825 |         let mut kinds: Vec<&'static str> = Vec::new();
+     |             --------- variable `kinds` declared here
+     |
+     = note: `kinds` is a collection that stores borrowed references, but `buf` does not live long enough to be stored in it
+     = help: buffer reuse with borrowed references requires unsafe code or restructuring
+
+For more information about this error, try `rustc --explain E0597`.
+error: could not compile `remuda-driver` (lib test) due to 1 previous error

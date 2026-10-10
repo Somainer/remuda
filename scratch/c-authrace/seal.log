@@ -1,0 +1,1607 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s
+     Running unittests src/lib.rs (target-authrace/debug/deps/remuda_driver-e8533606e953a485)
+
+running 470 tests
+test adapters::grok_adapter::tests::a_hook_denied_tool_result_is_denied_not_failed ... ok
+test adapters::codex_adapter::tests::discovery_refuses_to_invent_a_session_when_the_index_is_empty ... ok
+test adapters::grok_adapter::tests::category_resolves_by_name_then_kind_then_other ... ok
+test adapters::codex_adapter::tests::a_hook_rejected_command_is_denied_without_an_exit_code ... ok
+test adapters::codex_adapter::tests::a_foreign_abort_reason_does_not_end_the_turn ... ok
+test adapters::codex_adapter::tests::interrupted_turn_comes_back_idle_not_failed ... ok
+test adapters::grok_adapter::tests::diff_terminal_and_unknown_content_blocks_are_surfaced_synthesized ... ok
+test adapters::codex_adapter::tests::usage_events_produce_turn_and_session_snapshots_at_turn_end ... ok
+test adapters::grok_adapter::tests::discovery_falls_back_from_pid_to_cwd ... ok
+test adapters::grok_adapter::tests::permission_events_are_journaled_but_never_answered_from_files ... ok
+test adapters::codex_adapter::tests::completed_items_map_messages_and_a_late_tool_result_keeps_the_old_turn ... ok
+test adapters::grok_adapter::tests::a_completed_diff_frame_emits_non_empty_changes_end_to_end ... ok
+test adapters::codex_adapter::tests::duplicate_representations_do_not_double_journal ... ok
+test adapters::codex_adapter::tests::a_newline_terminated_partial_line_is_held_until_complete ... ok
+test adapters::grok_adapter::tests::chunks_stream_append_then_close_with_the_full_text ... ok
+test adapters::grok_adapter::tests::a_cancelled_turn_closes_its_message_as_interrupted ... ok
+test adapters::grok_adapter::tests::terminal_only_content_keeps_the_real_output_for_prompt_synthesized ... ok
+test adapters::grok_live::tests::a_promptless_tool_call_is_the_first_frame_without_panicking ... ok
+test adapters::grok_adapter::tests::finished_tracks_release_their_tool_inputs_synthesized ... ok
+test adapters::grok_live::tests::a_multi_select_question_builds_a_multi_field ... ok
+test adapters::grok_live::tests::a_pending_question_is_resolved_native_cleared_at_turn_end ... ok
+test adapters::grok_live::tests::an_answer_that_matches_no_offered_label_resolves_native_cleared ... ok
+test adapters::grok_adapter::tests::thought_closes_with_the_full_text_and_mirror_status ... ok
+test adapters::grok_live::tests::a_structured_answers_object_commits_the_matching_label ... ok
+test adapters::grok_live::tests::live_ordering_tags_the_boundary_and_does_not_double_anchor ... ok
+test adapters::grok_adapter::tests::tool_identity_comes_from_meta_not_title_synthesized ... ok
+test adapters::grok_live::tests::turn_live_lifecycle_is_not_an_activity_edge ... ok
+test adapters::grok_live::tests::one_phase_lifecycle_per_episode_not_per_chunk ... ok
+test adapters::grok_live::tests::thinking_reopens_after_a_tool_in_the_same_turn ... ok
+test adapters::grok_live::tests::two_turns_replayed_in_one_batch_each_get_their_stream_phases_and_prompt_ids ... ok
+test adapters::grok_adapter::tests::statusless_update_merges_fields_and_only_updates_known_calls ... ok
+test adapters::grok_live::tests::finished_slots_are_pruned_and_a_pruned_turn_reopens_nothing ... ok
+test adapters::grok_adapter::tests::in_progress_runs_and_unknown_statuses_stay_open_synthesized ... ok
+test adapters::grok_terminal::tests::safe_log_name_accepts_only_one_normal_component ... ok
+test agent_mcp::tests::scoped_credential_is_redacted_and_has_no_operator_credential_names ... ok
+test attachment::tests::a_file_alone_still_produces_a_prompt ... ok
+test attachment::tests::a_file_block_resolves_with_kind_name_and_size ... ok
+test attachment::tests::a_resource_block_for_another_object_does_not_match ... ok
+test attachment::tests::a_text_only_prompt_has_no_attachments_and_keeps_its_text ... ok
+test attachment::tests::an_image_block_resolves_through_its_resource_block ... ok
+test attachment::tests::human_sizes_are_compact ... ok
+test attachment::tests::an_empty_prompt_is_still_rejected ... ok
+test attachment::tests::file_lines_lead_the_prompt_and_image_mentions_follow ... ok
+test attachment::tests::a_remote_resource_uri_is_not_treated_as_a_local_path ... ok
+test attachment::tests::image_path_mentions_instruct_the_agent_to_read_the_file ... ok
+test attachment::tests::numbered_image_mentions_pair_the_token_number_with_object_and_path ... ok
+test attachment::tests::an_image_without_a_resource_block_is_skipped ... ok
+test capabilities::tests::explicit_entries_win_over_the_tier_and_may_lower_a_capability ... ok
+test adapters::grok_terminal::tests::non_shell_tool_starting_a_log_is_never_tailed ... ok
+test capabilities::tests::queue_and_interrupt_are_unknown_for_every_driver ... ok
+test adapters::grok_terminal::tests::log_that_appears_late_is_silent_until_it_exists ... ok
+test capabilities::tests::no_runtime_report_leaves_the_static_matrix_alone ... ok
+test capabilities::tests::signal_tier_none_grants_the_sdk_carrier_nothing ... ok
+test capabilities::tests::a_signal_tier_lifts_shell_pty_above_its_static_row ... ok
+test child_env::tests::secrets_in_the_node_environment_are_not_inherited ... ok
+test child_env::tests::denied_names_are_dropped_even_when_otherwise_inheritable ... ok
+test child_env::tests::the_users_zsh_config_location_is_inherited_so_the_shim_can_source_it ... ok
+test child_env::tests::unlisted_names_are_not_inherited_by_default ... ok
+test child_env::tests::effort_level_and_child_session_markers_are_never_passed_to_a_child ... ok
+test child_env::tests::locale_and_terminal_are_inherited ... ok
+test child_env::tests::loader_tls_and_proxy_names_are_denied ... ok
+test capabilities::tests::the_sdk_row_reports_no_tty_and_an_unmeasured_steer ... ok
+test attachment::tests::unanchored_file_line_has_no_token ... ok
+test claude_onboarding::tests::an_ordinary_screen_is_never_a_startup_dialog ... ok
+test claude_onboarding::tests::outside_reads_allow_refuses_a_relative_config_dir ... ok
+test claude_onboarding::tests::seeding_refuses_a_relative_config_dir ... ok
+test claude_print::attachment_tests::a_prompt_without_attachments_is_still_sent_as_text ... ok
+test claude_print::attachment_tests::a_missing_attachment_file_fails_the_send ... ok
+test claude_print::native_home_tests::inherited_default_does_not_override_environment ... ok
+test claude_print::native_home_tests::isolated_home_is_exported ... ok
+test adapters::grok_terminal::tests::log_that_never_appears_leaves_final_unchanged ... ok
+test claude_onboarding::tests::startup_screens_are_recognised_with_the_right_default ... ok
+test claude_print::plan_review_mint_tests::a_plan_review_answer_does_not_match_an_approval_request ... ok
+test adapters::grok_terminal::tests::growing_log_emits_only_new_bytes_then_authoritative_final ... ok
+test claude_print::plan_review_mint_tests::approve_carries_no_permission_escalation ... ok
+test claude_print::plan_review_mint_tests::deny_feedback_is_forwarded_verbatim_including_whitespace ... ok
+test claude_print::plan_review_mint_tests::validate_rejects_bad_plan_answers ... ok
+test adapters::grok_terminal::tests::partial_utf8_sequence_held_until_its_final_byte ... ok
+test claude_print::records::tests::a_declared_typed_prompt_outranks_the_text_sniffer ... ok
+test adapters::grok_terminal::tests::output_file_hint_is_never_opened_on_this_host ... ok
+test adapters::grok_terminal::tests::rotation_signal_survives_an_empty_poll_between_truncate_and_new_head ... ok
+test adapters::grok_terminal::tests::shrunken_log_is_republished_as_a_replace_snapshot ... ok
+test claude_onboarding::tests::pre_trust_requires_absolute_paths ... ok
+test claude_print::records::tests::a_slash_command_invocation_is_an_injection_not_a_prompt ... ok
+test claude_print::records::tests::a_typed_prompt_is_the_humans_own_words ... ok
+test claude_print::plan_review_mint_tests::deny_uses_the_reviewer_feedback_or_a_default_message ... ok
+test claude_print::plan_review_mint_tests::a_nested_sub_agent_exit_plan_mode_falls_back_to_approval ... ok
+test claude_print::records::tests::a_compact_summary_is_not_a_turn ... ok
+test adapters::grok_terminal::tests::partial_node_is_the_d043_tool_call_node ... ok
+test claude_print::records::tests::a_new_message_id_does_not_continue_the_run ... ok
+test claude_print::records::tests::a_differing_request_id_splits_a_reused_message_id ... ok
+test adapters::grok_terminal::tests::final_frame_arriving_mid_tail_flushes_before_it ... ok
+test claude_print::records::tests::an_expanded_skill_body_is_recognised_by_its_meta_flag ... ok
+test claude_print::records::tests::an_unrecognised_record_stays_visible_as_human ... ok
+test claude_print::records::tests::a_tool_result_is_classified_from_its_block_or_its_source_id ... ok
+test claude_print::records::tests::api_block_index_reorders_records_that_arrived_out_of_order ... ok
+test adapters::grok_terminal::tests::two_progress_frames_keep_every_mutation_monotonic_with_partials ... ok
+test claude_print::records::tests::injected_context_and_command_output_are_separated ... ok
+test claude_print::records::tests::a_task_notification_outranks_its_prompt_source ... ok
+test claude_print::records::tests::structural_tool_result_evidence_outranks_a_declaration ... ok
+test claude_print::attachment_tests::an_attachment_becomes_a_base64_image_block_before_the_text ... ok
+test claude_print::records::tests::records_sharing_a_message_id_reassemble_into_one_message ... ok
+test claude_pty::tests::a_pty_prompt_mentions_attachment_paths_after_the_text ... ok
+test claude_transcript::tests::hook_stdin_tolerates_camel_case_and_a_missing_optional_ppid ... ok
+test claude_transcript::tests::project_dir_encoding_matches_claudes_own_naming ... ok
+test claude_pty::tests::a_text_only_pty_prompt_is_unchanged ... ok
+test claude_print::stream::tests::successive_singleton_text_snapshots_preserve_both_native_block_indices ... ok
+test claude_onboarding::tests::outside_reads_allow_upgrades_an_explicit_false_like_pre_trust ... ok
+test claude_onboarding::tests::seeding_without_a_readable_host_config_still_skips_onboarding ... ok
+test adapters::grok_terminal::tests::unsafe_native_call_ids_cannot_escape_the_session_directory ... ok
+test claude_onboarding::tests::a_seeded_config_dir_is_not_mistaken_for_a_logged_in_one ... ok
+test claude_pty::tests::refuse_bare_rejects_prohibited_tokens ... ok
+test claude_print::stream::tests::thinking_deltas_and_signature_keep_one_visible_thought ... ok
+test claude_onboarding::tests::pre_trust_does_not_touch_other_projects ... ok
+test effort::argv_tests::absent_effort_emits_nothing_for_every_kind ... ok
+test claude_print::stream::tests::tool_json_deltas_reconcile_snapshot_and_result_without_reopening_call ... ok
+test effort::argv_tests::codex_maps_one_to_one_onto_the_config_overlay ... ok
+test effort::argv_tests::extras_cannot_smuggle_effort_flags ... ok
+test claude_print::stream::tests::subsequent_turns_do_not_append_to_a_previous_message ... ok
+test claude_pty::tests::mapped_effort_observation_keeps_its_deterministic_event_id ... ok
+test claude_print::stream::tests::duplicate_snapshot_uuid_does_not_create_or_modify_another_node ... ok
+test effort::argv_tests::launch_provenance_never_panics_on_non_claude_words ... ok
+test claude_pty::tests::resume_argv_replaces_session_id_and_never_continue ... ok
+test claude_print::stream::tests::nested_parent_streams_do_not_steal_each_others_active_message ... ok
+test effort::argv_tests::ultra_is_rejected_by_other_harnesses_without_changing_the_error_shape ... ok
+test effort::argv_tests::claude_and_agy_use_the_effort_flag ... ok
+test effort::argv_tests::grok_uses_the_reasoning_effort_flag_with_the_menu_vocabulary ... ok
+test claude_transcript::tests::truncation_restarts_the_tail_at_zero ... ok
+test claude_onboarding::tests::seeded_files_are_private ... ok
+test claude_transcript::tests::a_hook_binds_only_when_its_ppid_is_the_foreground_pid ... ok
+test claude_print::stream::tests::malformed_partial_tool_json_does_not_become_an_empty_final_input ... ok
+test claude_transcript::tests::the_tail_yields_only_whole_lines_and_resumes_where_it_stopped ... ok
+test claude_print::stream::tests::unassociated_delta_is_opaque_instead_of_inventing_a_message_identity ... ok
+test claude_onboarding::tests::outside_reads_allow_writes_the_global_flag_once_and_preserves_other_keys ... ok
+test effort::sync_tests::flag_toggles_await_no_level_when_decoupled ... ok
+test effort::argv_tests::launch_ultracode_version_gate_refuses_below_the_floor_or_unknown ... ok
+test flags::tests::banned_flags_are_token_matches_not_substrings ... ok
+test claude_print::stream::tests::recorded_stream_reuses_one_text_node_through_snapshot_before_stop ... ok
+test effort::sync_tests::vocabulary_round_trips_through_the_command_word ... ok
+test claude_transcript::tests::an_explicit_argv_session_id_binds_exactly_and_never_falls_back ... ok
+test claude_print::stream::tests::repeated_tool_snapshot_uses_native_tool_id_across_different_frame_uuids ... ok
+test flags::tests::ide_is_a_zero_arg_toggle ... ok
+test flags::tests::effort_values_follow_each_clis_vocabulary ... ok
+test generic_pty::tests::done_line_matcher ... ok
+test flags::tests::the_allowlist_diverges_per_driver ... ok
+test generic_pty::tests::shell_prompt_detects_zsh_percent_not_fake_herdr_idle ... ok
+test flags::tests::a_repeated_flag_is_refused ... ok
+test hook_answer::tests::only_a_confirmed_hook_delivery_ends_the_story ... ok
+test effort::sync_tests::bridge_rejects_carry_the_reason ... ok
+test hook_answer::tests::each_interaction_has_its_own_budget ... ok
+test flags::tests::positional_argv_is_still_refused ... ok
+test hook_answer::tests::the_fallback_is_available_exactly_once_per_interaction ... ok
+test flags::tests::reserved_and_banned_names_are_rejected_in_every_spelling ... ok
+test hook_answer::tests::a_keypress_alone_is_never_confirmation ... ok
+test claude_print::stream::tests::late_complete_snapshot_replaces_the_closed_node_without_duplicating_text ... ok
+test launch::overlay::tests::a_legacy_entry_without_a_timeout_is_upgraded_in_place ... ok
+test launch::overlay::tests::overlay_argv_leaves_normal_sources_implicit_and_preserves_an_explicit_choice ... ok
+test launch::overlay::tests::overlay_argv_replaces_an_existing_settings_flag_rather_than_adding_a_second ... ok
+test interaction::tests::policy_auto_allow_forwards_without_waiting ... ok
+test launch::overlay::tests::the_timeout_relation_derives_from_blocking_wait_in_one_place ... ok
+test launch::overlay::tests::shadow_homes_are_named_but_not_created_this_phase ... ok
+test launch::runtime_dir::tests::broker_names_are_stable_and_distinct ... ok
+test interaction::tests::agent_caller_actor_names_agent_and_the_callers_bound_instance ... ok
+test claude_print::plan_review_mint_tests::a_top_level_exit_plan_mode_with_inline_plan_mints_a_plan_review ... ok
+test launch::runtime_dir::tests::redirect_predicate_matches_the_real_layout ... ok
+test adapters::grok_terminal::tests::real_fixture_emits_no_partials_and_keeps_d043_final ... ok
+test fake::tests::fake_claude_applies_model_switch_with_effort ... ok
+test claude_print::plan_review_mint_tests::an_unknown_tool_never_mints_a_plan_review ... ok
+test launch::overlay::tests::a_user_who_disabled_the_osc_signals_has_them_re_enabled_for_the_session ... ok
+test launch::overlay::tests::the_overlay_and_its_directory_are_private ... ok
+test binary::tests::pin_is_idempotent_for_a_stub_binary ... ok
+test claude_print::plan_review_mint_tests::an_empty_string_plan_still_mints_a_plan_review ... ok
+test claude_print::plan_review_mint_tests::a_plan_over_32kib_falls_back_to_approval ... ok
+test launch::runtime_dir::tests::a_short_instance_dir_keeps_hook_sock_in_place ... ok
+test effort::sync_tests::bridge_resolves_when_the_mapper_reports_the_level ... ok
+test launch::shadow::tests::grok_shadow_neutralises_the_cross_read_claude_hooks ... ok
+test claude_onboarding::tests::seeding_completes_onboarding_and_copies_only_allowlisted_host_keys ... ok
+test adapters::grok_adapter::tests::the_real_fixtures_statusless_update_is_a_running_replace ... ok
+test launch::overlay::tests::the_credential_is_never_written_into_the_hook_command ... ok
+test claude_transcript::tests::content_cwd_mismatch_is_detected_but_an_empty_head_is_indeterminate ... ok
+test fake::tests::fake_driver_replays_builtin_observations ... ok
+test launch::shadow::tests::the_canonical_hash_includes_the_handler_type_tag ... ok
+test interaction::tests::human_and_bot_callers_keep_the_actor_anchored_at_ticket_instance ... ok
+test adapters::codex_adapter::tests::the_real_fixture_produces_the_measured_turn_boundaries ... ok
+test claude_transcript::tests::a_pid_file_for_a_different_cwd_is_refused ... ok
+test launch::overlay::tests::the_users_own_hooks_survive_the_merge ... ok
+test launch::shadow::tests::the_hash_tracks_the_command_and_is_order_independent ... ok
+test launch::shadow::tests::codex_shadow_appends_an_mcp_server_without_disturbing_features_or_trust ... ok
+test launch::shadow::tests::codex_shadow_writes_config_with_inline_trust_and_hooks ... ok
+test adapters::grok_live::tests::file_tier_phase_tags_have_file_fidelity_and_streaming_completeness ... ok
+test launch::shadow::tests::the_canonical_hash_matches_a_live_codex_currenthash ... ok
+test adapters::grok_live::tests::tool_started_lifecycle_is_immediately_before_its_tool_call ... ok
+test launch::shim::tests::an_explicit_off_disables_the_shim_and_a_typo_does_not ... ok
+test launch::overlay::tests::releasing_tui_does_not_follow_a_settings_symlink ... ok
+test launch::shadow::tests::shadow_files_are_owner_only ... ok
+test adapters::grok_terminal::tests::byte_budgets_bound_each_poll_and_the_whole_call ... ok
+test claude_onboarding::tests::pre_trust_writes_exactly_the_one_project_key_and_is_idempotent ... ok
+test launch::shim::tests::every_startup_file_except_the_last_keeps_zdotdir_pointed_at_us ... ok
+test launch::overlay::tests::re_materializing_does_not_stack_duplicate_registrations ... ok
+test launch::shadow::tests::non_shadow_kinds_are_rejected_and_no_credential_is_written ... ok
+test launch::shadow::tests::the_written_trust_hash_is_byte_for_byte_the_one_codex_would_report ... ok
+test launch::user::tests::a_lowercase_or_mixed_case_host_variable_is_still_stripped ... ok
+test launch::shim::tests::shim_off_leaves_the_path_exactly_as_it_was ... ok
+test launch::user::tests::hooks_from_both_layers_run_and_exact_duplicates_do_not_stack ... ok
+test launch::user::tests::host_settings_alone_carry_over_untouched_for_native_delegation ... ok
+test launch::shim::tests::every_shim_is_generated_and_executable_by_its_owner_only ... ok
+test launch::shim::tests::a_path_with_a_quote_cannot_break_out_of_the_shim_body ... ok
+test launch::session::tests::dropping_the_session_takes_the_socket_with_it ... ok
+test launch::shim::tests::the_claude_shim_execs_rather_than_spawning_a_child ... ok
+test launch::shim::tests::a_re_entered_shim_gives_up_and_passes_through_instead_of_looping ... ok
+test launch::shim::tests::re_sourcing_an_rc_does_not_grow_path_without_bound ... ok
+test launch::shim::tests::the_shadow_zdotdir_is_private ... ok
+test launch::shim::tests::the_last_startup_file_hands_zdotdir_back_to_the_user ... ok
+test launch::shim::tests::the_shadow_zdotdir_restores_the_users_own_zdotdir_first ... ok
+test binary::tests::pin_is_idempotent_when_a_transient_writer_closes ... ok
+test launch::shim::tests::the_credential_reaches_the_child_through_the_environment ... ok
+test launch::shim::tests::the_shadow_zdotdir_sources_the_users_rc_before_re_asserting_the_shim ... ok
+test launch::shim::tests::the_shim_directory_goes_in_front_of_the_inherited_path ... ok
+test launch::user::tests::a_single_or_missing_settings_file_is_handled ... ok
+test launch::session::tests::starting_a_session_binds_the_socket_and_writes_both_artifacts ... ok
+test launch::user::tests::an_overlay_less_gateway_launch_still_strips_the_host_provider_config ... ok
+test launch::shim::tests::the_shim_removes_itself_from_path_before_resolving ... ok
+test launch::shim::tests::the_shim_finds_its_own_directory_without_calling_dirname ... ok
+test launch::session::tests::the_child_environment_puts_the_shim_first_and_carries_the_credential ... ok
+test launch::session::tests::a_hook_delivered_on_the_generated_socket_is_journaled_and_bound ... ok
+test launch::user::tests::non_hook_arrays_are_replaced_not_concatenated ... ok
+test launch::user::tests::redaction_masks_every_credential_value_and_keeps_the_rest ... ok
+test model::tests::arm_marks_listed_ids_and_typed_fallback ... ok
+test launch::user::tests::malformed_or_nonobject_settings_degrade_to_no_layer_not_an_error ... ok
+test agent_mcp::tests::trusted_context_reaches_the_print_child_and_overrides_overlay_identity ... ok
+test model::tests::bridge_resolve_and_reject ... ok
+test model::tests::request_validation ... ok
+test model::tests::resolve_records_the_effective_model ... ok
+test model_discovery::tests::nothing_known_falls_back_to_builtin ... ok
+test model::tests::host_fallback_answer_makes_every_switch_typed ... ok
+test launch::session::tests::each_instance_gets_its_own_credential ... ok
+test launch::user::tests::the_hosts_model_and_endpoint_variables_are_stripped_when_the_overlay_applies ... ok
+test launch::user::tests::the_hub_overlay_wins_the_endpoint_token_and_model_over_the_host ... ok
+test launch::user::tests::the_users_hooks_permissions_and_custom_settings_survive_the_overlay ... ok
+test launch::user::tests::settings_json_then_settings_local_json_merge_in_claudes_order ... ok
+test permission::switch_tests::bypass_without_allowance_is_refused ... ok
+test permission::switch_tests::dontask_is_refused_without_a_keystroke ... ok
+test model_discovery::tests::settings_and_env_resolve_without_discovery ... ok
+test model_discovery::tests::own_ids_follow_the_scoped_cache ... ok
+test permission::vocabulary_tests::bypass_dialog_active_detection_ignores_scrollback ... ok
+test model_discovery::tests::empty_scoped_cache_falls_back_to_host_cache ... ok
+test permission::vocabulary_tests::last_indicator_wins_over_stacked_toasts ... ok
+test permission::vocabulary_tests::native_words_round_trip_and_default_is_manual ... ok
+test permission::vocabulary_tests::reachability_matches_the_measured_wheel ... ok
+test model_discovery::tests::gateway_cache_wins_and_keeps_current ... ok
+test permission::vocabulary_tests::wheel_walks_match_measured_cycles ... ok
+test presets::tests::presets_cover_dogfood_kinds ... ok
+test permission::vocabulary_tests::indicators_parse_settled_and_hint_forms ... ok
+test presets::tests::yolo_requires_explicit_bypass_and_non_agent_origin_for_every_preset ... ok
+test profile::tests::direct_overlay_writes_api_key ... ok
+test profile::tests::gateway_overlay_writes_env_and_redacts_debug ... ok
+test profile::tests::secret_redacts_in_debug_and_exposes_exact_bytes ... ok
+test promote::tests::a_dotted_program_name_is_not_truncated_into_an_agent ... ok
+test promote::tests::a_booting_or_plain_shell_screen_has_no_status_yet ... ok
+test promote::tests::a_grouped_row_still_detects_the_agent_it_names ... ok
+test profile::tests::file_policy_rejects_a_symlink_escaping_the_secrets_dir ... ok
+test promote::tests::a_native_dialog_reads_as_blocked_even_with_a_composer_on_screen ... ok
+test profile::tests::file_policy_rejects_traversal_and_paths_outside_the_secrets_dir ... ok
+test promote::tests::a_non_uuid_session_argument_is_not_adopted ... ok
+test promote::tests::a_repainted_composer_without_a_leading_newline_still_reads_idle ... ok
+test profile::tests::helper_policy_rejects_commands_with_arguments_or_metacharacters ... ok
+test promote::tests::a_running_turn_reads_as_working_not_idle ... ok
+test profile::tests::file_policy_requires_mode_0600 ... ok
+test promote::tests::an_idle_composer_accepts_a_prompt ... ok
+test promote::tests::an_ordinary_foreground_command_is_not_an_agent ... ok
+test promote::tests::ansi_escapes_do_not_hide_the_composer ... ok
+test launch::session::tests::a_long_instance_dir_binds_a_runtime_socket_and_round_trips ... ok
+test promote::tests::claude_in_the_foreground_group_promotes_with_its_session_id ... ok
+test profile::tests::file_refs_need_a_policy ... ok
+test profile::tests::helper_policy_requires_an_executable_inside_an_allowed_dir ... ok
+test profile::tests::file_broker_reads_and_does_not_debug_the_value ... ok
+test promote::tests::login_shell_alone_does_not_promote ... ok
+test promote::tests::foreground_group_is_selected_separately_from_the_shell_session ... ok
+test promote::tests::ps_output_parses_into_pid_and_args ... ok
+test promote::tests::grouped_rows_keep_only_the_requested_process_group ... ok
+test promote::tests::resume_and_inline_flag_forms_both_yield_the_session ... ok
+test promote::tests::screen_fallback_only_fires_on_the_claude_banner ... ok
+test promote::tests::secondary_clis_switch_kind_without_transcript_hydration ... ok
+test launch::session::tests::two_long_instances_bind_distinct_runtime_sockets ... ok
+test promote::tests::strip_ansi_keeps_text_and_drops_control_sequences ... ok
+test promote::tests::the_same_agent_promotes_under_every_spelling_of_its_executable ... ok
+test pty_interaction::tests::exact_trust_dialog_requires_unambiguous_selected_menu ... ok
+test pty_interaction::tests::exact_candidates_and_control_input_validation ... ok
+test pty_launch::tests::incomplete_or_foreground_command_metadata_is_not_ready ... ok
+test pty_launch::tests::screen_diagnostic_keeps_only_last_lines ... ok
+test pty_launch::tests::other_start_errors_never_replay ... ok
+test screenlive::tests::active_payload_carries_every_field_at_screen_tier ... ok
+test screenlive::tests::inactive_payload_clears_the_strip_and_keeps_the_tier ... ok
+test screenlive::tests::interruptible_reading_tags_the_esc_hint ... ok
+test secrets::tests::broker_request_debug_redacts_the_bearer ... ok
+test secrets::tests::broker_request_still_serializes_the_token ... ok
+test shell_pty::answer::tests::a_dialog_that_is_not_an_approval_cannot_be_answered_as_one ... ok
+test shell_pty::answer::tests::a_question_answer_has_no_screen_intent ... ok
+test shell_pty::answer::tests::a_yes_no_dialog_maps_allow_to_y_and_deny_to_n ... ok
+test shell_pty::answer::tests::allow_always_selects_the_session_grant_not_the_plain_yes ... ok
+test shell_pty::answer::tests::allow_once_selects_the_plain_yes ... ok
+test shell_pty::answer::tests::an_allow_once_never_presses_the_session_wide_option ... ok
+test shell_pty::answer::tests::an_always_allow_the_screen_cannot_express_degrades_to_yes ... ok
+test shell_pty::answer::tests::intent_maps_every_card_option_and_nothing_else ... ok
+test shell_pty::keys::tests::an_unmeasured_harness_refuses_rather_than_guessing ... ok
+test shell_pty::keys::tests::claude_and_codex_interrupt_with_escape ... ok
+test shell_pty::keys::tests::every_harness_with_an_emulated_queue_has_a_turn_end_signal_to_deliver_on ... ok
+test shell_pty::answer::tests::clearing_is_detected_only_when_the_approval_is_gone ... ok
+test shell_pty::keys::tests::grok_needs_two_control_c_and_never_escape ... ok
+test shell_pty::answer::tests::deny_selects_no ... ok
+test shell_pty::keys::tests::only_codex_reports_a_native_queue ... ok
+test shell_pty::keys::tests::provisions_map_onto_the_wire_values_the_ui_branches_on ... ok
+test shell_pty::keys::tests::only_grok_charges_a_turn_for_sending_now ... ok
+test shell_pty::launch::tests::a_codex_launch_without_a_resume_is_left_alone ... ok
+test pty_interaction::tests::bounded_excerpt_is_utf8_safe_and_disables_truncated_reply ... ok
+test shell_pty::launch::tests::a_dangling_resume_flag_is_not_turned_into_a_subcommand_with_no_id ... ok
+test shell_pty::launch::tests::a_shell_target_names_no_agent_kind ... ok
+test shell_pty::answer::tests::a_truncated_screen_is_refused ... ok
+test shell_pty::launch::tests::the_carrier_flag_only_accepts_the_documented_value ... ok
+test shell_pty::launch::tests::codex_resume_becomes_a_subcommand_and_the_others_keep_the_flag ... ok
+test shell_pty::lifecycle::tests::a_clean_code_is_exited_and_everything_else_is_failed ... ok
+test shell_pty::lifecycle::tests::a_status_above_128_decodes_as_the_signal_that_produced_it ... ok
+test shell_pty::lifecycle::tests::a_synthetic_ps_table_classifies_an_exiting_macos_leader_as_dead ... ok
+test launch::overlay::tests::binding_releases_only_tui_in_base_and_private_explicit_settings ... ok
+test shell_pty::lifecycle::tests::a_synthetic_ps_table_keeps_a_live_member_visible ... ok
+test shell_pty::lifecycle::tests::an_ordinary_exit_code_is_not_mistaken_for_a_signal ... ok
+test shell_pty::lifecycle::tests::dead_state_letters_are_dead_in_every_os_spelling ... ok
+test shell_pty::lifecycle::tests::macos_flag_letters_do_not_change_the_run_state_reading ... ok
+test shell_pty::lifecycle::tests::proc_stat_dead_letters_are_classified_from_the_post_comm_tail ... ok
+test shell_pty::lifecycle::tests::rung_labels_are_the_signal_that_worked ... ok
+test shell_pty::lifecycle::tests::the_reason_names_the_evidence_that_produced_it ... ok
+test shell_pty::promotion::tests::a_clean_stop_emits_no_hook_silence_record_and_a_quiet_end_naming_only_real_failures ... ok
+test shell_pty::promotion::tests::a_historical_marker_with_a_changing_native_spinner_cannot_settle_cancel ... ok
+test shell_pty::promotion::tests::a_quiet_hook_tier_loses_its_screen_idle_veto_after_the_bound ... ok
+test shell_pty::promotion::tests::a_terminal_with_no_agent_journals_nothing ... ok
+test shell_pty::promotion::tests::exiting_the_agent_demotes_once_and_then_stays_quiet ... ok
+test shell_pty::promotion::tests::a_new_epoch_clears_the_locked_claim_and_resets_the_picker ... ok
+test shell_pty::promotion::tests::a_hook_binds_only_its_own_foreground_pid_and_beats_the_pid_file ... ok
+test shell_pty::promotion::tests::bypass_needs_a_real_foreground_pid_missing_its_exec_marker ... ok
+test shell_pty::promotion::tests::first_detection_journals_a_diagnostic_then_the_promotion ... ok
+test shell_pty::promotion::tests::interruption_output_recognizes_split_ansi_and_excludes_osc_titles ... ok
+test shell_pty::promotion::tests::promotion_is_idempotent_while_the_same_agent_holds_the_terminal ... ok
+test shell_pty::promotion::tests::a_late_appearing_transcript_binds_on_a_later_poll ... ok
+test shell_pty::promotion::tests::swapping_agents_demotes_the_old_kind_before_promoting_the_new_one ... ok
+test shell_pty::promotion::tests::a_vanished_file_degrades_and_is_never_rebound_within_the_epoch ... ok
+test shell_pty::promotion::tests::a_manual_answer_binds_exactly_and_an_unknown_option_is_rejected ... ok
+test shell_pty::send::tests::a_plain_shell_is_always_ready ... ok
+test pty_launch::tests::busy_then_available_waits_before_start ... ok
+test shell_pty::promotion::tests::fresh_replacement_marker_confirms_but_unchanged_redraw_and_idle_do_not ... ok
+test shell_pty::send::tests::a_shell_prompt_is_one_write_ending_in_a_carriage_return ... ok
+test shell_pty::promotion::tests::a_missing_argv_file_falls_through_to_the_pid_channel ... ok
+test shell_pty::send::tests::a_promoted_prompt_always_sends_its_enter_separately ... ok
+test shell_pty::promotion::tests::an_explicit_resume_id_wins_over_every_other_channel ... ok
+test shell_pty::send::tests::a_shell_prompt_that_already_ends_in_a_newline_is_not_doubled ... ok
+test shell_pty::send::tests::a_single_line_prompt_is_never_bracketed_even_when_paste_is_available ... ok
+test shell_pty::send::tests::a_trailing_newline_becomes_the_submit_rather_than_part_of_the_body ... ok
+test shell_pty::promotion::tests::authenticated_renderer_relaunch_can_replace_session_at_the_same_pid ... ok
+test shell_pty::send::tests::an_unknown_screen_with_no_stronger_evidence_yields_no_rung ... ok
+test shell_pty::send::tests::bracketed_paste_requires_the_emulator_to_have_seen_2004 ... ok
+test shell_pty::send::tests::rung_labels_are_stable_for_the_journal ... ok
+test shell_pty::send::tests::the_ladder_falls_to_quiescence_then_glyph ... ok
+test shell_pty::send::tests::the_ladder_prefers_a_hook_receipt_to_the_screen ... ok
+test promote::tests::only_the_tail_of_a_long_screen_decides_status ... ok
+test shell_pty::send::tests::without_an_emulator_nothing_is_bracketed ... ok
+test shell_pty::tests::a_plain_shell_prompt_is_one_write_of_text_plus_a_carriage_return ... ok
+test pty_launch::tests::definite_busy_after_ready_rechecks_and_retries ... ok
+test launch::runtime_dir::tests::two_instances_never_share_a_runtime_socket ... ok
+test shell_pty::promotion::tests::with_no_channel_the_epoch_stays_unbound_and_offers_a_manual_picker ... ok
+test launch::runtime_dir::tests::a_long_instance_dir_is_redirected_with_a_uuid_socket_name ... ok
+test shell_pty::tests::a_plain_shell_still_has_no_session_kind ... ok
+test adapters::grok_adapter::tests::the_real_session_has_seven_turn_boundaries_with_cancel_outcomes ... ok
+test interaction::tests::expiry_sweeper_emits_expired_and_denies ... ok
+test shell_pty::tests::a_promoted_prompt_sends_its_enter_as_a_separate_write ... ok
+test launch::runtime_dir::tests::non_canonical_instance_dirs_get_a_full_path_digest_name ... ok
+test claude_transcript::tests::a_resume_tail_reads_only_appended_history_not_the_prior_session ... ok
+test interaction::tests::stale_generation_is_rejected ... ok
+test shell_pty::tests::a_promoted_multiline_prompt_is_bracketed_when_the_tui_requested_paste ... ok
+test interaction::tests::first_answer_wins_across_two_devices ... ok
+test interaction::tests::legacy_answer_entry_stamps_human_at_the_ticket_instance ... ok
+test shell_pty::tests::paths_are_quoted_for_a_posix_shell ... ok
+test launch::overlay::tests::the_three_terminal_keys_are_pinned_in_both_directions ... ok
+test launch::overlay::tests::a_path_with_a_quote_in_it_cannot_break_out_of_the_hook_command ... ok
+test launch::overlay::tests::every_blocking_events_hook_timeout_outlasts_the_relay_wait ... ok
+test adapters::grok_live::tests::the_question_request_and_resolution_share_one_id_and_bump_revision ... ok
+test shell_pty::tests::promote_ctx_is_scoped_to_the_instance_the_node_named ... ok
+test claude_transcript::tests::candidates_are_listed_for_manual_pick_and_never_auto_selected ... ok
+test launch::overlay::tests::every_event_the_signal_bus_understands_is_registered ... ok
+test binary::tests::concurrent_pins_of_one_binary_agree ... ok
+test claude_transcript::tests::the_pid_file_binds_the_exact_foreground_pid_even_when_another_session_is_newer ... ok
+test adapters::grok_live::tests::turn_zero_runs_think_tool_think_text_with_reentry ... ok
+test usage::claude::tests::missing_ttl_split_falls_back_to_the_5m_bucket ... ok
+test usage::claude::tests::non_assistant_sidechain_and_usageless_records_yield_nothing ... ok
+test usage::claude::tests::result_frame_keeps_the_reported_cost_for_parity ... ok
+test usage::claude::tests::unknown_model_still_emits_tokens_without_cost ... ok
+test usage::claude::tests::reads_full_assistant_usage_with_ttl_split ... ok
+test tty::tests::maps_enter_esc_and_ctrl_c ... ok
+test binary::tests::the_digest_cache_serves_a_second_pin_without_rehashing ... ok
+test adapters::grok_live::tests::replay_anchors_every_prompt_on_the_user_chunk_before_the_boundaries ... ok
+test usage::grok::tests::unknown_models_keep_tokens_without_cost ... ok
+test launch::session::tests::codex_hook_session_splices_granted_mcp_server_into_shadow_config ... ok
+test usage::codex::tests::records_without_usage_and_other_events_yield_nothing ... ok
+test usage::grok::tests::update_frame_without_usage_yields_nothing ... ok
+test usage::codex::tests::per_response_usage_correlates_the_turn_context_model ... ok
+test launch::overlay::tests::explicit_file_and_inline_settings_keep_user_config_and_all_hooks ... ok
+test usage::grok::tests::update_frame_with_usage_subtracts_cache_from_total_input ... ok
+test usage::grok::tests::usage_json_map_form_emits_one_event_per_model ... ok
+test usage::tests::codex_cumulative_token_count_snapshots_are_never_added ... ok
+test usage::tests::empty_totals_serialize_cost_as_unknown_not_zero ... ok
+test usage::prices::tests::cost_is_the_weighted_sum_over_mtok ... ok
+test usage::prices::tests::counters_aggregate_buckets ... ok
+test usage::prices::tests::longest_prefix_wins ... ok
+test usage::prices::tests::matching_is_case_and_whitespace_insensitive ... ok
+test usage::prices::tests::point_and_dotted_versions_match_their_family ... ok
+test usage::grok::tests::usage_json_single_object_form_uses_its_model_id ... ok
+test usage::prices::tests::table_metadata_is_present_and_every_row_resolves_itself ... ok
+test usage::prices::tests::unknown_and_unmapped_models_have_no_price ... ok
+test usage::prices::tests::dated_snapshot_suffixes_still_resolve ... ok
+test usage::tests::claude_message_usage_is_deduped_per_message_id ... ok
+test usage::grok::tests::headless_end_frame_is_uncached_and_expands_model_usage ... ok
+test usage::codex::tests::token_count_events_are_tagged_cumulative_and_carry_total_counters ... ok
+test effort::sync_tests::bridge_times_out_when_nothing_is_observed ... ok
+test usage::tests::per_turn_and_session_totals_sum_independently ... ok
+test usage::tests::one_unpriced_model_makes_the_total_cost_unknown ... ok
+test usage::tests::payload_carries_estimated_accounting_and_normalized_buckets ... ok
+test adapters::grok_live::tests::the_two_cancelled_turns_end_interrupted ... ok
+test permission::vocabulary_tests::bridge_resolves_rejects_and_times_out ... ok
+test shell_pty::tests::an_inherited_native_home_does_not_seed_or_copy_settings ... ok
+test promote::tests::system_process_table_finds_a_job_in_its_own_process_group ... ok
+test shell_pty::lifecycle::tests::stopping_a_group_that_has_already_left_is_not_an_error ... ok
+test shell_pty::promotion::tests::the_pid_file_binds_the_foreground_session_and_a_second_poll_does_not_switch ... ok
+test shell_pty::tests::a_direct_claude_recipe_preserves_settings_and_audits_the_hook_overlay ... ok
+test adapters::grok_live::tests::every_turn_gets_its_own_thinking_and_text_streaming_with_its_prompt_id ... ok
+test shell_pty::tests::a_gateway_delegation_overrides_the_hosts_provider_and_journals_the_source ... ok
+test claude_print::attachment_tests::oversized_attachments_fall_back_to_a_path_mention ... ok
+test shell_pty::tests::a_bypass_native_launch_pins_its_home_and_suppresses_the_disclaimer ... ok
+test shell_pty::tests::a_scoped_native_home_merges_the_users_effective_settings ... ok
+test binary::tests::pin_binary_copies_to_a_fresh_path_when_source_is_busy ... ok
+test shell_pty::tests::a_driver_without_hooks_configured_starts_nothing ... ok
+test shell_pty::tests::failed_launch_after_spawn_reaps_the_child ... ok
+test shell_pty::lifecycle::tests::an_unreaped_zombie_leader_is_reaped_by_the_ladder_not_named_a_survivor ... ok
+test shell_pty::lifecycle::tests::a_cooperative_group_stops_at_the_first_rung ... ok
+test shell_pty::tests::an_agent_mid_turn_holds_the_prompt ... ok
+test shell_pty::tests::an_agent_whose_screen_says_idle_is_ready ... ok
+test shell_pty::tests::a_booting_agent_is_not_ready_for_a_prompt ... ok
+test shell_pty::tests::a_configured_hook_path_binds_a_socket_the_child_can_reach ... ok
+test shell_pty::tests::a_launched_agent_is_an_agent_before_the_first_promotion_poll ... ok
+test shell_pty::tests::cancel_uses_escape_only_for_a_promoted_claude_turn ... ok
+test shell_pty::tests::a_live_pty_reads_its_screen_and_an_unstarted_one_says_it_has_none ... ok
+test shell_pty::tests::a_plain_shell_is_always_ready ... ok
+test shell_pty::tests::cancelling_an_idle_composer_sends_nothing ... ok
+test permission::switch_tests::already_in_mode_is_a_noop ... ok
+test shell_pty::tests::interruption_snapshot_waits_for_the_complete_screen_update ... ok
+test effort::switch_tests::no_confirmation_dialog_means_one_cr ... ok
+test effort::switch_tests::an_invalid_argument_gets_no_confirm_cr_and_degrades_with_the_reason ... ok
+test effort::switch_tests::an_idle_switch_types_body_then_two_crs_and_reports_applied ... ok
+test model::tests::dialog_on_21221_gets_a_confirm_cr ... ok
+test pty_interaction::tests::closing_blocked_prompt_does_not_wait_for_optional_observer ... ok
+test permission::switch_tests::closed_loop_walk_presses_until_target_paints ... ok
+test effort::switch_tests::a_stale_dialog_naming_the_old_tier_never_gets_the_confirm_cr ... ok
+test effort::switch_tests::a_switch_while_working_is_queued_until_idle_then_applied ... ok
+test permission::switch_tests::never_reaching_target_degrades_with_reason ... ok
+test pty_launch::tests::always_busy_fails_with_last_screen_without_starting ... ok
+test model::tests::no_dialog_on_21272_means_body_plus_one_cr ... ok
+test model::tests::rejected_switch_degrades_with_the_reason ... ok
+test pty_launch::tests::hanging_readiness_and_screen_rpcs_are_bounded ... ok
+test effort::switch_tests::a_dialog_painting_after_phase1_is_confirmed_by_the_rescue_pass ... ok
+test shell_pty::lifecycle::tests::every_descendant_of_the_group_leader_is_reaped_not_just_the_leader ... ok
+test shell_pty::lifecycle::tests::a_group_that_ignores_sigint_is_escalated_until_it_is_gone ... ok
+test permission::switch_tests::bypass_modal_gets_gated_down_enter_then_applies ... ok
+test effort::switch_tests::missing_read_back_degrades_and_never_claims_applied ... ok
+
+test result: ok. 470 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.71s
+
+     Running tests/adapters_parity.rs (target-authrace/debug/deps/adapters_parity-9b1f64accfc83394)
+
+running 4 tests
+test fake_grok_question_frames_reach_the_adapter ... ok
+test fake_grok_shell_and_write_frames_reach_the_adapter ... ok
+test fake_grok_non_shell_call_after_shell_has_no_terminal_log ... ok
+test codex_and_grok_adapter_dumps_are_journal_diff_parity ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.97s
+
+     Running tests/child_env_isolation.rs (target-authrace/debug/deps/child_env_isolation-9c3a6f77af14fb71)
+
+running 5 tests
+test agent_child_is_isolated ... ignored, re-executed by node_environment_is_not_inherited with a hostile env
+test denylist_covers_every_name_this_test_plants ... ok
+test loader_names_are_denied_by_the_filter ... ok
+test extra_env_cannot_reintroduce_a_denied_name ... ok
+test node_environment_is_not_inherited ... ok
+
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/claude_bg.rs (target-authrace/debug/deps/claude_bg-dc50a59df42ea15d)
+
+running 3 tests
+test live_claude_bg_haiku_once ... ignored, live: claude --bg --model haiku once, then claude stop (never rm)
+test parse_backgrounded_line ... ok
+test stub_bg_start_send_stop_does_not_rm ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/claude_plan_review.rs (target-authrace/debug/deps/claude_plan_review-99a2d35389af12fe)
+
+running 5 tests
+test answering_deny_to_the_allow_fixture_makes_the_replay_exit_nonzero ... ok
+test the_recorded_allow_and_deny_verdicts_match_the_replay ... ok
+test denying_the_plan_review_feeds_feedback_to_the_model_and_blocks_execution ... ok
+test approving_the_plan_review_runs_the_planned_command ... ok
+test the_replay_rejects_a_corrupted_allow_permission_envelope ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/claude_print_process.rs (target-authrace/debug/deps/claude_print_process-d5fff20499b7ed94)
+
+running 7 tests
+test live_haiku_ok ... ignored, requires local `claude` and spends haiku budget
+test bot_bypass_is_rejected ... ok
+test kill_emits_session_exit_lifecycle ... ok
+test workflow_emits_two_results ... ok
+test ok_script_emits_init_message_and_turn_done ... ok
+test askuser_answers_question ... ok
+test approval_allow_and_deny ... ok
+
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/claude_print_review.rs (target-authrace/debug/deps/claude_print_review-dbabd9205735ba1c)
+
+running 9 tests
+test refuse_bare_and_no_session_persistence ... ok
+test permission_allow_is_camel_case_and_echoes_request_id ... ok
+test unknown_stdout_type_is_opaque_not_fatal ... ok
+test bot_origin_rejects_bypass_and_dont_ask ... ok
+test first_workflow_result_does_not_complete_the_run ... ok
+test bot_dont_ask_is_rejected_at_start ... ok
+test start_completes_initialize_before_user_and_keeps_stdin_open ... ok
+test workflow_keeps_reading_after_first_result ... ok
+test resume_reapplies_settings_and_model ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/claude_pty.rs (target-authrace/debug/deps/claude_pty-4095ea8da71efb2a)
+
+running 3 tests
+test live_claude_pty_haiku_once ... ignored, live: isolated remuda-test herdr session, claude --model haiku once
+test fake_herdr_start_prompt_idle_close ... ok
+test claude_pty_alt_screen_flips_when_the_harness_enters_fullscreen ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.54s
+
+     Running tests/claude_pty_review.rs (target-authrace/debug/deps/claude_pty_review-fff9b25e26bc755a)
+
+running 13 tests
+test ensure_sources_rejects_empty_and_leaves_normal_sources_implicit ... ok
+test refuse_bare_rejects_equals_form ... ok
+test stop_invocation_is_stop_not_rm ... ok
+test resume_argv_keeps_settings_and_model ... ok
+test bot_origin_rejects_bypass_and_dont_ask ... ok
+test parse_backgrounded_short_id_and_uuid ... ok
+test session_start_merge_appends_and_keeps_other_events ... ok
+test blocked_interaction_is_screen_derived_and_not_answerable ... ok
+test tty_bypass_strips_print_flag ... ok
+test inject_hook_writes_launch_dir_not_native_home_and_keeps_sources ... ok
+test bg_attach_before_dispatch_would_wake ... ok
+test bg_resume_keeps_settings_attach_after_stop_does_not_wake ... ok
+test pty_resume_keeps_settings_model_and_never_bare ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.83s
+
+     Running tests/claude_sdk_process.rs (target-authrace/debug/deps/claude_sdk_process-9ef81a6327296938)
+
+running 11 tests
+test start_resumed_without_a_session_id_is_refused ... ok
+test tty_surface_is_unsupported ... ok
+test start_resumed_passes_resume_on_a_new_child ... ok
+test a_second_send_reaches_the_same_process_and_session ... ok
+test relaunch_after_close_emits_one_exited_per_launch ... ok
+test the_child_is_launched_without_dash_p ... ok
+test one_turn_emits_the_observation_sequence_in_order ... ok
+test a_cooperative_child_exits_on_stdin_eof_with_one_exit_lifecycle ... ok
+test close_returns_within_the_bound_when_the_child_ignores_stdin_eof ... ok
+test close_returns_when_stdin_is_not_drained_and_the_writer_is_saturated ... ok
+test close_kills_a_child_that_ignores_both_eof_and_sigterm ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s
+
+     Running tests/claude_sdk_stream.rs (target-authrace/debug/deps/claude_sdk_stream-98677f64e8fa3e47)
+
+running 7 tests
+test thought_tool_call_and_tool_result_arrive_in_order ... ok
+test the_recorded_print_stream_still_assembles_on_sdk ... ok
+test deltas_are_partial_and_the_final_block_is_structured ... ok
+test session_identity_comes_from_system_init ... ok
+test print_keeps_structured_completeness_on_the_same_frames ... ok
+test stream_deltas_share_one_message_node_id ... ok
+test usage_comes_from_the_terminal_result ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/codex_rollout.rs (target-authrace/debug/deps/codex_rollout-15048d58acd73682)
+
+running 12 tests
+test compaction_unknown_types_sparse_records_and_invalid_json ... ok
+test metadata_and_context_preserve_identity_and_effective_settings ... ok
+test lifecycle_records_do_not_hide_completion_errors_or_item_fields ... ok
+test messages_and_reasoning_read_only_text_content ... ok
+test discovery_requires_thread_id_even_when_parser_accepts_a_root_only_header ... ok
+test discovery_does_not_follow_file_or_directory_symlinks ... ok
+test usage_retains_cumulative_and_response_accounting_as_distinct_sources ... ok
+test tool_calls_pair_by_call_id_without_coercing_input_or_output ... ok
+test tail_appends_complete_records_and_preserves_utf8_across_polls ... ok
+test discovery_checks_metadata_and_prefers_active_before_archived ... ok
+test discovery_rejects_ambiguous_reverted_threads_without_archived_fallback ... ok
+test real_interactive_rollout_keeps_tool_turn_usage_and_interruption_evidence ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/cua_capability.rs (target-authrace/debug/deps/cua_capability-1e26b7fb620d7968)
+
+running 16 tests
+test embedded_skill_matches_the_shipped_directory_byte_for_byte ... ok
+test codex_never_policy_is_refused_even_when_granted ... ok
+test bypass_permissions_plus_computer_use_is_refused ... ok
+test agent_origin_is_refused ... ok
+test unknown_capability_value_is_refused_and_named ... ok
+test ungranted_launch_writes_nothing_and_sets_no_handshake ... ok
+test granted_codex_on_a_non_shell_carrier_is_refused_and_writes_nothing ... ok
+test granted_claude_with_an_inherited_home_writes_nothing_into_it ... ok
+test a_capability_sourced_env_entry_with_another_name_is_still_denied ... ok
+test granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home ... ok
+test caller_supplied_mcp_config_collides_with_the_granted_one ... ok
+test recipe_json_records_the_grant_without_secret_shaped_values ... ok
+test granted_claude_writes_skill_tree_mcp_config_argv_and_env ... ok
+test granted_skill_tree_in_a_shared_home_is_native_store_lifetime ... ok
+test grok_and_other_kinds_are_refused_this_batch ... ok
+test launch_cleanup_removes_the_capability_files ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/effort_transcript.rs (target-authrace/debug/deps/effort_transcript-d01b59fd377425ed)
+
+running 23 tests
+test per_turn_effort_is_the_fallback_field ... ok
+test an_unrelated_slash_command_does_not_attribute_effort ... ok
+test real_21272_dismissed_dialog_rejects_the_bridge_with_a_reason ... ok
+test a_typed_effort_slash_marks_the_next_new_level_as_source_slash ... ok
+test real_21272_reject_records_emit_no_effort_edges ... ok
+test env_override_verdict_rejects_with_the_env_reason ... ok
+test real_21272_ultracode_switch_resolves_its_bridge_from_stdout_not_the_turn ... ok
+test model_verdict_with_the_effort_suffix_emits_an_effort_observation ... ok
+test invalid_argument_in_either_order_rejects_an_armed_switch_immediately ... ok
+test ultracode_slash_reads_back_as_xhigh_with_the_flag ... ok
+test the_first_assistant_record_emits_once_then_identical_records_are_deduped ... ok
+test real_21273_walk_emits_the_exact_coupled_observation_sequence ... ok
+test real_21289_workflows_disabled_refuses_immediately_with_the_reason ... ok
+test real_21273_four_consecutive_switches_each_resolve_their_own_generation ... ok
+test real_21272_walk_emits_the_exact_coupled_observation_sequence ... ok
+test real_21272_walk_settles_every_level_from_the_stdout_verdict ... ok
+test real_21289_model_unavailable_refuses_immediately_with_the_reason ... ok
+test real_21289_walk_emits_the_full_decoupled_observation_sequence ... ok
+test real_21289_recordings_are_jsonl_with_an_effort_slash_and_a_verdict ... ok
+test real_21289_walk_flag_and_level_verdict_settle_every_armed_switch ... ok
+test real_21289_launch_fixtures_each_emit_their_exact_sequence ... ok
+test real_21289_fixtures_are_live_journal_parity_with_deterministic_event_ids ... ok
+test resumed_history_ultracode_on_starts_off_and_only_the_new_verdict_settles ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/generic_pty.rs (target-authrace/debug/deps/generic_pty-0c3f7ab4d7b754c5)
+
+running 10 tests
+test live_agy_pty_once ... ignored, live: isolated remuda-test herdr + agy once
+test live_codex_pty_once ... ignored, live: isolated remuda-test herdr + codex once
+test live_grok_pty_once ... ignored, live: isolated remuda-test herdr + grok once
+test yolo_presets_match_dogfood ... ok
+test agent_origin_bypass_create_uses_non_yolo_preset ... ok
+test fake_herdr_start_failure_emits_error_lifecycle ... ok
+test fake_herdr_codex_start_send_wait_read_stop ... ok
+test fake_herdr_send_before_start_defers_without_blocking_control ... ok
+test fake_herdr_journals_bounded_screen_snapshot ... ok
+test fake_herdr_slow_start_emits_ready_lifecycle ... ok
+
+test result: ok. 7 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 2.87s
+
+     Running tests/grok_session.rs (target-authrace/debug/deps/grok_session-0961b1a2dda29318)
+
+running 14 tests
+test cwd_encoding_matches_native_percent_encoded_path_and_utf8 ... ok
+test malformed_records_do_not_become_semantic_events ... ok
+test real_active_registry_snapshot_decodes_required_identity ... ok
+test native_events_preserve_types_optional_fields_and_unrecognized_completion ... ok
+test all_message_chunk_types_keep_content_and_native_metadata ... ok
+test hook_and_unknown_updates_keep_their_native_frames ... ok
+test malformed_registry_fails_closed_instead_of_discarding_ambiguous_entries ... ok
+test discovery_resolves_cwd_aliases_but_rejects_session_directory_symlinks ... ok
+test tail_tracks_bytes_and_waits_for_partial_utf8_and_newline ... ok
+test tool_records_keep_native_ids_inputs_status_and_outputs ... ok
+test real_events_keep_lifecycle_and_terminal_outcome_without_synthesizing_completion ... ok
+test real_updates_cover_all_requested_types_and_keep_tool_correlation ... ok
+test tail_resets_after_truncation_and_can_continue_after_bad_json ... ok
+test discovery_requires_unique_registry_identity_and_existing_directory ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running tests/hook_fallback_pty.rs (target-authrace/debug/deps/hook_fallback_pty-db968ed962aef5cb)
+
+running 3 tests
+test a_screen_with_no_approval_on_it_is_left_alone ... ok
+test an_ignored_decision_is_answered_on_screen_once_and_confirmed ... ok
+test a_dialog_that_never_clears_is_not_reported_as_applied ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.08s
+
+     Running tests/launch_parity.rs (target-authrace/debug/deps/launch_parity-12a4d967638e139d)
+
+running 3 tests
+test a_remuda_launched_agent_and_a_hand_typed_one_journal_the_same_events ... ok
+test both_paths_report_the_same_evidence_channel_for_every_event ... ok
+test neither_path_claims_a_native_session_it_was_never_told ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/launch_shim.rs (target-authrace/debug/deps/launch_shim-9d9f99307ba85a26)
+
+running 16 tests
+test the_disable_switch_is_read_the_same_way_everywhere ... ok
+test an_absolute_path_bypasses_the_shim_entirely ... ok
+test a_missing_pinned_binary_exits_127_without_falling_back_to_path ... ok
+test a_missing_overlay_does_not_stop_the_agent_from_starting ... ok
+test remuda_shim_off_makes_the_shim_a_plain_passthrough ... ok
+test explicit_settings_reach_the_merger_with_the_original_argv ... ok
+test the_users_own_flags_survive_and_come_after_ours ... ok
+test the_credential_reaches_the_agent_but_is_not_on_its_command_line ... ok
+test typing_claude_by_hand_reaches_the_real_binary_with_the_overlay_attached ... ok
+test a_pinned_path_with_a_quote_is_quoted_into_the_script ... ok
+test which_claude_reports_the_shim_and_the_shim_still_resolves_the_real_one ... ok
+test shim_execs_the_pinned_binary_not_the_first_on_path ... ok
+test explicit_settings_plus_shim_overlay_pin_all_three_terminal_keys ... ok
+test overlay_beats_user_project_local_and_both_hook_sources_execute ... ok
+test a_shim_alone_on_path_exits_rather_than_resolving_to_itself ... ok
+test the_pass_through_shims_reach_their_real_binaries_unchanged ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/live_claude.rs (target-authrace/debug/deps/live_claude-1e7b7b34a4bfc346)
+
+running 2 tests
+test live_claude_bg_start_prompt_idle_read_close ... ignored, live: claude --bg --model haiku once, then claude stop
+test live_claude_pty_start_prompt_idle_read_close ... ignored, live: isolated remuda-test herdr + claude --model haiku once
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_tasktrack.rs (target-authrace/debug/deps/live_tasktrack-bc7b741debeb836a)
+
+running 1 test
+test live_tasktrack_fg_and_bg_agent ... ignored, live: real claude pty spawning foreground + background Agent
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/materializer.rs (target-authrace/debug/deps/materializer-bd238d11361a4213)
+
+running 48 tests
+test pin_host_claude ... ignored, requires a local claude binary on PATH
+test unknown_and_mcp_launch_origins_fail_closed ... ok
+test binary_pin_resolves_stub_and_hashes ... ok
+test bot_origin_rejects_bypass ... ok
+test binary_override::a_refused_override_writes_no_launch_files ... ok
+test profile_helper_command_is_refused_without_a_policy ... ok
+test direct_delegation_is_v2 ... ok
+test bot_origin_rejects_dont_ask ... ok
+test print_bypass_emits_yolo_flags ... ok
+test host_env_binding_cannot_launder_a_denied_source_name ... ok
+test missing_overlay_fails_closed_without_logging_contents ... ok
+test none_delegation_does_not_inject_anthropic_overlay ... ok
+test sdk_refuses_dont_ask_instead_of_inheriting_the_m0_debt ... ok
+test pty_and_bg_recipes_accept_user_overlay ... ok
+test pty_bypass_emits_dangerously_skip_permissions ... ok
+test gateway_overlay_config_dir_and_budget_are_emitted ... ok
+test resume_keeps_the_same_launch_surface_as_a_new_session ... ok
+test binary_override::bot_origin_cannot_set_args_or_binary_path ... ok
+test prohibited_flags_are_rejected ... ok
+test sdk_argv_is_print_without_dash_p ... ok
+test shell_pty_agent::flag_validation_applies_and_rejects_a_legacy_effort_tier ... ok
+test resume_emits_exact_session_id_and_never_continue ... ok
+test shell_pty_agent::terminal_kind_keeps_the_login_shell_arm ... ok
+test sdk_bypass_matches_print ... ok
+test cleanup_leaves_native_store_files_alone ... ok
+test dont_ask_is_tagged_td_m0_perm_01 ... ok
+test recipe_round_trip_json_has_no_env_values ... ok
+test profile_helper_command_must_be_an_executable_under_an_allowed_dir ... ok
+test recipe_serialization_omits_secret_values_and_prompts ... ok
+test spec_env_cannot_inject_loader_proxy_or_tls_names ... ok
+test materializer_is_idempotent_for_the_same_spec ... ok
+test launch_cleanup_is_idempotent ... ok
+test binary_override::recipe_audit_records_binary_override ... ok
+test permission_axes::codex_approval_and_sandbox_become_native_argv ... ok
+test binary_override::binary_override_sha_mismatch_is_refused ... ok
+test shell_pty_agent::a_pin_does_not_become_a_model_flag_for_non_claude_kinds ... ok
+test shell_pty_agent::no_pin_emits_no_model_token_on_any_carrier ... ok
+test binary_override::binary_override_must_be_absolute_executable_outside_the_instance_dir ... ok
+test shell_pty_agent::yolo_argv_still_requires_bypass_and_a_non_agent_origin ... ok
+test shell_pty_agent::an_explicit_spec_model_id_is_the_recipe_model_pin ... ok
+test shell_pty_agent::an_explicit_pin_reaches_every_claude_carrier_verbatim ... ok
+test launch_overlays_are_deleted_and_the_helper_token_does_not_survive ... ok
+test shell_pty_agent::settings_flag_and_config_home_follow_the_per_kind_recipe ... ok
+test permission_axes::grok_and_agy_yolo_modes_only_add_flags_when_requested ... ok
+test shell_pty_agent::every_agent_kind_materializes_on_shell_pty ... ok
+test token_broker_helper_script_in_settings_omits_auth_token_and_secret ... ok
+test shell_pty_agent::effort_becomes_one_flag_or_none ... ok
+test shell_pty_agent::codex_and_grok_effort_use_their_native_vocabulary ... ok
+
+test result: ok. 47 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/model_pin_overlay.rs (target-authrace/debug/deps/model_pin_overlay-0660862aa95165f4)
+
+running 5 tests
+test a_blank_pin_is_not_a_pin ... ok
+test a_pin_applies_to_an_absent_host_layer ... ok
+test model_env_matching_ignores_case_and_spares_endpoint_variables ... ok
+test a_pin_evicts_every_host_model_key_under_delegation_none ... ok
+test without_a_pin_the_host_model_is_left_alone ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/model_transcript.rs (target-authrace/debug/deps/model_transcript-7985f8752ffca12b)
+
+running 9 tests
+test real_reject_records_emit_no_model_edges ... ok
+test first_assistant_model_emits_then_identical_dedupes ... ok
+test env_hint_second_line_does_not_poison_the_resolved_id ... ok
+test real_bogus_rejects_the_bridge_with_a_reason ... ok
+test bogus_and_kept_system_records_emit_no_model_edge ... ok
+test alias_resolution_reports_the_resolved_id_not_the_typed_word ... ok
+test real_walk_switch_resolves_its_bridge_from_the_stdout_verdict ... ok
+test accepted_switch_settles_from_the_stdout_verdict_without_an_assistant_record ... ok
+test real_walk_observes_the_resolved_gateway_ids ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/permission_transcript.rs (target-authrace/debug/deps/permission_transcript-968d02246d464d25)
+
+running 7 tests
+test launch_mode_marks_the_first_matching_edge_as_launch ... ok
+test verbatim_21273_records_cover_all_six_modes ... ok
+test dontask_launch_fixture_records_the_launch_mode ... ok
+test a_remuda_cycle_edge_is_attributed_remuda_and_settles_the_switch ... ok
+test plan_slash_attributes_the_next_edge_to_the_terminal ... ok
+test mode_records_emit_edges_and_consecutive_duplicates_dedupe ... ok
+test verbatim_21273_walk_fixture_replays_every_mode ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/provider_overlay.rs (target-authrace/debug/deps/provider_overlay-b361b9dbd0c4af57)
+
+running 5 tests
+test via_overlay_evicts_host_anthropic_keys_and_the_pin_wins ... ok
+test writes_direct_overlay_with_api_key ... ok
+test writes_gateway_overlay_0600_without_leaking_debug ... ok
+test via_mode_writes_listener_url_and_relay_bearer_without_gateway_credential ... ok
+test no_launch_artefact_or_log_carries_the_gateway_token ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/pty_interactions.rs (target-authrace/debug/deps/pty_interactions-234e84f7db34404a)
+
+running 5 tests
+test a_human_only_startup_screen_is_reported_and_left_alone ... ok
+test claude_onboarding_is_detected_answered_and_blocks_prompt_dispatch ... ok
+test claude_trust_is_auto_answered_only_when_node_enabled_it ... ok
+test same_kind_instances_keep_prompt_and_key_ownership ... ok
+test all_pty_kinds_block_answer_once_and_settle_on_idle ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.33s
+
+     Running tests/pty_toolcalls.rs (target-authrace/debug/deps/pty_toolcalls-93afb2bb6a80d81a)
+
+running 4 tests
+test a_user_text_block_is_not_dropped_for_lacking_a_tool_result ... ok
+test each_tool_result_links_to_its_own_call ... ok
+test an_interleaved_tool_turn_hydrates_every_block_in_order ... ok
+test a_closed_tool_call_carries_its_input ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/screen_golden.rs (target-authrace/debug/deps/screen_golden-369d95c79ab63259)
+
+running 7 tests
+test banner_detection_is_unchanged_through_the_adapter ... ok
+test stripping_ansi_before_the_trust_dialog_parser_changes_nothing_on_its_real_input ... ok
+test the_re_exported_strip_ansi_is_the_same_function ... ok
+test the_driver_adapter_and_the_screen_crate_agree_on_every_recorded_shape ... ok
+test the_emulator_forgets_a_dialog_the_tui_painted_over_but_the_byte_tail_does_not ... ok
+test the_emulator_reaches_the_same_verdict_as_the_stripped_tail ... ok
+test a_stale_dialog_scrolled_out_of_view_does_not_keep_the_session_blocked ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/secrets.rs (target-authrace/debug/deps/secrets-9f54fa5e69280835)
+
+running 7 tests
+test file_store_rejects_non_store_refs ... ok
+test file_store_toml_round_trip ... ok
+test tampered_ciphertext_fails_closed ... ok
+test token_broker_allowlist_and_audit_omit_secret ... ok
+test file_store_round_trip_json_and_hides_debug ... ok
+test token_broker_redirects_a_long_socket_path_and_serves_the_real_one ... ok
+test token_broker_uds_helper_round_trip ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/shell_pty_fake_send.rs (target-authrace/debug/deps/shell_pty_fake_send-0c839eca7b252e51)
+
+running 1 test
+test a_send_lands_when_idle_and_is_held_until_a_running_turn_ends ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.55s
+
+     Running tests/shell_pty_native_live.rs (target-authrace/debug/deps/shell_pty_native_live-041163748a78f1fc)
+
+running 2 tests
+test real_claude_through_native_shell_pty ... ignored, live: real claude binary through the native shell-pty carrier
+test scoped_home_lists_gateway_models_in_model_picker ... ignored, live: scoped native home must list the user's gateway models in /model
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tasktrack_fold.rs (target-authrace/debug/deps/tasktrack_fold-14f6d37b554152b6)
+
+running 3 tests
+test a_background_launch_is_partial_then_final_on_its_notification ... ok
+test a_killed_background_agent_closes_failed ... ok
+test a_synchronous_foreground_agent_closes_final_with_one_result ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/terminal_promote.rs (target-authrace/debug/deps/terminal_promote-664cee25861ea59d)
+
+running 10 tests
+test the_session_start_hook_fixture_has_the_documented_shape ... ok
+test bookkeeping_and_sidechain_records_are_not_journaled ... ok
+test a_promoted_session_is_bound_by_exact_identity_never_by_newest_mtime ... ok
+test hydrated_observations_are_structured_transcript_records_on_the_promoted_driver ... ok
+test each_hydrated_block_opens_and_closes ... ok
+test the_first_message_is_the_users_prompt_and_the_last_is_the_reply ... ok
+test the_tool_call_and_its_result_share_one_native_tool_id ... ok
+test a_permission_mode_record_emits_an_effective_edge_and_a_lifecycle ... ok
+test a_transcript_hydrates_the_conversation_in_order ... ok
+test tailing_a_growing_transcript_hydrates_only_the_new_lines ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tool_media.rs (target-authrace/debug/deps/tool_media-26739baaac1cbe47)
+
+running 4 tests
+test text_array_result_is_the_joined_text_not_json ... ok
+test mixed_result_is_text_plus_staged_reference ... ok
+test image_bytes_are_never_inlined_without_a_stager ... ok
+test whole_result_payload_carries_no_base64_with_mirrored_sidecar ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/transcript_origin.rs (target-authrace/debug/deps/transcript_origin-519f5367d23739af)
+
+running 7 tests
+test a_replayed_line_is_not_emitted_twice ... ok
+test one_prompt_recorded_twice_renders_once ... ok
+test the_queue_ledger_and_mode_drift_reach_the_journal ... ok
+test a_skill_invocation_and_its_body_are_marked_as_injected ... ok
+test records_sharing_a_message_id_become_one_assistant_message ... ok
+test a_background_task_notification_is_not_the_users_words ... ok
+test tool_results_are_never_classified_as_human ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/transcript_parity.rs (target-authrace/debug/deps/transcript_parity-be260c23c5e63321)
+
+running 3 tests
+test the_shared_conversation_is_the_scenario_as_written ... ok
+test both_carriers_yield_the_same_conversation ... ok
+test the_tool_result_links_to_its_call_on_both_sides ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/usage.rs (target-authrace/debug/deps/usage-8d187a4585f783c6)
+
+running 9 tests
+test claude_print_cost_parity_within_10_percent ... ok
+test grok_headless_fixture_extracts_usage_and_end_frames ... ok
+test grok_usage_file_yields_priced_event_with_subtracted_cache ... ok
+test claude_extracts_one_event_per_content_block_and_dedupes_per_message ... ok
+test claude_session_payload_is_estimated_turn_scoped_snapshots_per_model_call ... ok
+test grok_updates_fixture_has_two_priced_turn_completed_frames_and_a_chunk ... ok
+test claude_transcript_and_result_paths_price_identically_for_the_same_counters ... ok
+test codex_aggregates_per_response_records_without_the_cumulative_snapshots ... ok
+test codex_cumulative_snapshots_do_not_inflate_session_totals ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target-authrace/debug/deps/remuda_journal-a4f9a042e8412944)
+
+running 13 tests
+test subagent::tests::agent_ids_are_path_safe ... ok
+test workflow::script::tests::a_static_template_literal_is_a_literal ... ok
+test workflow::script::tests::braces_inside_strings_do_not_end_the_meta_object ... ok
+test workflow::script::tests::concatenated_prompts_and_labels_are_not_static ... ok
+test subagent::tests::unknown_agent_is_none_not_error ... ok
+test workflow::script::tests::duplicate_literal_claims_each_call_site_once ... ok
+test workflow::script::tests::an_unmatched_prompt_returns_nothing ... ok
+test workflow::script::tests::escapes_are_decoded_like_the_harness_writes_them ... ok
+test workflow::script::tests::dynamic_prompts_degrade_without_a_phase ... ok
+test workflow::script::tests::garbage_parses_to_default ... ok
+test workflow::script::tests::loops_force_an_unknown_total_even_with_literal_prompts ... ok
+test workflow::script::tests::matches_an_agent_prompt_to_its_call_site ... ok
+test workflow::script::tests::parses_the_recorded_spike_script ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/journal.rs (target-authrace/debug/deps/journal-63a749700e04e25c)
+
+running 18 tests
+test claude_permission_mode_records_map_to_permission_observations ... ok
+test claude_jsonl_tailer_offset_resume_and_rotation ... ok
+test real_21272_reject_records_map_to_no_effort_envelopes ... ok
+test source_trait_object_and_opaque_unknown_types ... ok
+test real_21273_permission_walk_replays_every_wheel_mode ... ok
+test claude_transcript_effort_records_map_to_effort_observations ... ok
+test real_21272_walk_settles_effort_from_the_stdout_verdict ... ok
+test real_21289_walk_emits_the_full_decoupled_observation_sequence ... ok
+test workflow_journal_tailer_maps_launched_started_result ... ok
+test follow_subscribes_before_backfill ... ok
+test interaction_first_writer_wins ... ok
+test fold_consistency_replay_append_prepend ... ok
+test read_page_touches_only_its_limit ... ok
+test real_21289_launch_fixtures_each_emit_their_exact_sequence ... ok
+test a_corrupt_complete_record_fails_recovery ... ok
+test append_read_snapshot_and_recover ... ok
+test reopen_truncates_a_torn_tail_and_keeps_complete_records ... ok
+test a_live_writer_makes_a_second_open_fail_locked_then_succeeds_on_close ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/subagent.rs (target-authrace/debug/deps/subagent-34c6850b327f4710)
+
+running 3 tests
+test missing_agent_is_starting_not_an_error ... ok
+test locates_workflow_agent_and_plain_agent_files ... ok
+test reads_the_recorded_agent_through_the_transcript_pipeline ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tasktrack_fold.rs (target-authrace/debug/deps/tasktrack_fold-ef7ce241c7f6bdf3)
+
+running 1 test
+test file_mapper_folds_foreground_background_and_killed_subagents ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/tool_media.rs (target-authrace/debug/deps/tool_media-26b491e41c1a1954)
+
+running 6 tests
+test text_only_result_is_byte_identical_without_a_stager ... ok
+test malformed_image_degrades_to_named_text_block ... ok
+test mixed_text_and_image_result_becomes_text_plus_object_reference ... ok
+test unstageable_image_degrades_without_dropping_the_result ... ok
+test whole_result_payload_carries_no_base64_with_mirrored_sidecar ... ok
+test image_only_result_is_one_reference_and_never_inlines_bytes ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workflow.rs (target-authrace/debug/deps/workflow-8b497127179ae2fb)
+
+running 6 tests
+test launch_emits_a_running_run_snapshot_synchronously ... ok
+test dynamic_prompt_agents_degrade_to_short_code_with_no_note ... ok
+test a_270_shaped_run_uses_native_label_phase_model_and_failed_state ... ok
+test the_recorded_221_run_folds_real_members_with_model_tokens_and_phases ... ok
+test idle_polls_emit_nothing ... ok
+test task_notification_marks_the_run_completed_with_a_summary ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target-authrace/debug/deps/remuda_node-4225b0fcd1b3c0d0)
+
+running 367 tests
+test adapter_registry::tests::codex_and_grok_have_file_adapters_and_hook_tier ... ok
+test api_relay::policy::tests::bearer_header_parsing ... ok
+test api_relay::policy::tests::base_path_suffix_is_segment_wise ... ok
+test api_relay::policy::tests::error_status_mapping ... ok
+test api_relay::policy::tests::bind_policy_refuses_any_and_public_and_accepts_private_explicit ... ok
+test api_relay::policy::tests::peer_rules_match_cidr_and_exact ... ok
+test api_relay::policy::tests::bearer_roundtrip_and_wrong_value_fail ... ok
+test api_relay::policy::tests::traversal_and_backslash_are_refused ... ok
+test api_relay::policy::tests::response_header_allowlist_drops_set_cookie ... ok
+test api_relay::policy::tests::request_header_allowlist_drops_credentials_and_cookies ... ok
+test api_relay::policy::tests::anthropic_error_body_is_valid_json_under_hostile_inputs ... ok
+test api_relay::relay_tests::broker_enforces_stream_caps_and_demuxes ... ok
+test api_relay::relay_tests::direct_net_refusals ... ok
+test api_relay::relay_tests::api_open_before_egress_is_refused_after_install_succeeds_and_revoke_ends ... ok
+test api_relay::relay_tests::direct_request_provisions_nothing ... ok
+test api_relay::relay_tests::hello_limits_lower_chunk_size_and_stream_cap ... ok
+test api_relay::relay_tests::direct_net_unreachable_gateway_is_a_504_upstream_timeout ... ok
+test api_relay::relay_tests::egress_refuses_path_escape_and_missing_context ... ok
+test api_relay::tests::provision_lock_entry_is_pruned_when_unheld ... ok
+test api_relay::tests::split_respects_chunk_size_and_order ... ok
+test attachments::tests::extension_split_keeps_leading_dots_in_the_stem ... ok
+test attachments::tests::landing_names_prefer_the_original_and_fall_back_safely ... ok
+test attachments::tests::collision_suffixes_keep_every_landing_distinct ... ok
+test api_relay::relay_tests::via_without_host_is_refused_not_projected_direct ... ok
+test attachments::tests::object_ids_that_are_not_bare_identifiers_are_refused ... ok
+test attachments::tests::ws_urls_map_onto_their_http_origin ... ok
+test carrier::tests::outbound_wss_and_stdio_share_hello_with_distinct_framing ... ok
+test carrier_recovery::tests::carrier_loss_is_distinguished_from_an_ordinary_driver_error ... ok
+test carrier_objects::tests::hub_error_is_surfaced_and_unrelated_frames_pass_through ... ok
+test carrier::tests::node_hello_has_complete_fail_closed_inventory ... ok
+test carrier_objects::tests::sha_mismatch_is_rejected ... ok
+test carrier_objects::tests::small_object_returns_inline ... ok
+test daemon::tests::only_matching_durable_response_advances_ack ... ok
+test diagnostics::tests::disk_units_and_conflicting_port_are_explicit ... ok
+test api_relay::relay_tests::direct_net_probe_and_request_end_to_end ... ok
+test api_relay::relay_tests::gateway_failure_body_never_carries_the_pinned_origin_to_w ... ok
+test gate::tests::gate_child_env_from_real_process_env ... ignored, re-exec'd by ambient_pty_flag_never_reaches_the_gate_child with the sentinel set
+test gate::tests::cargo_test_failure_summary_extracts_names_panics_and_section ... ok
+test gate::tests::gate_child_path_falls_back_to_whitelisted_base ... ok
+test gate::tests::gate_then_child_env_is_lane_env_plus_base_path ... ok
+test gate::tests::host_env_snapshot_selects_only_the_whitelist ... ok
+test gate::tests::gate_step_timeouts_reach_the_child_env_as_the_serialized_map ... ok
+test gate::tests::gate_child_env_drops_ambient_pty_flags_and_composes_path ... ok
+test gate::tests::line_ring_bounds_lines_and_bytes_and_reports_drops ... ok
+test gate::tests::port_pair_and_path_helpers ... ok
+test gate::tests::playwright_summary_extracts_titles_and_first_block ... ok
+test gate::tests::lane_env_is_the_only_channel_for_a_pty_flag ... ok
+test gate::tests::step_markers_match_only_attempt_banners ... ok
+test gate::tests::trace_keeps_per_step_rings_following_markers ... ok
+test gate::tests::verify_streams_steps_with_redirected_tmpdir ... ignored, re-exec'd by step_streaming_honours_a_redirected_tmpdir with TMPDIR redirected
+test carrier_objects::tests::chunked_object_is_reassembled_in_order ... ok
+test daemon::tests::fragmented_frame_survives_select_cancellation ... ok
+test hook_shim::tests::deleted_suffix_is_stripped_only_when_the_real_file_exists ... ok
+test identity::tests::invalid_persisted_identity_fails_closed ... ok
+test identity::tests::identity_survives_restart ... ok
+test hook_shim::tests::a_failed_pin_falls_back_to_the_source_and_is_retried ... ok
+test hook_shim::tests::a_pinned_relay_survives_the_source_being_replaced ... ok
+test files::tests::search_scratch_area_only_walks_remuda_dirs ... ok
+test gate::tests::ambient_pty_flag_never_reaches_the_gate_child ... ok
+test enroll::tests::enrollment_survives_restart_and_hello_result ... ok
+test inventory::tests::computer_use_bundle_path_is_the_clients_own_app_bundle ... ok
+test diagnostics::tests::missing_workspace_short_circuits_inventory ... ok
+Initialized empty Git repository in /home/wangruming.nana/t/.tmp5pk3R8/origin.git/
+Initialized empty Git repository in /home/wangruming.nana/t/.tmpvpDTvA/origin.git/
+Initialized empty Git repository in /home/wangruming.nana/t/.tmpYn3X23/origin.git/
+Initialized empty Git repository in /home/wangruming.nana/t/.tmpmkK2AA/origin.git/
+Initialized empty Git repository in /home/wangruming.nana/t/.tmp2vTkra/origin.git/
+Initialized empty Git repository in /home/wangruming.nana/t/.tmpsuMV2Q/origin.git/
+test hook_shim::tests::garbage_collect_keeps_referenced_and_running_versions ... ok
+Initialized empty Git repository in /home/wangruming.nana/t/.tmpJFi8Vf/origin.git/
+Initialized empty Git repository in /home/wangruming.nana/t/.tmpE3tHRU/origin.git/
+Initialized empty Git repository in /home/wangruming.nana/t/.tmpuviwfB/origin.git/
+Initialized empty Git repository in /home/wangruming.nana/t/.tmpmy8S9q/origin.git/
+test files::tests::scratch_area_accepts_remuda_prefixed_tmp_and_rejects_other_tmp ... ok
+test attachments::tests::materialize_writes_named_files_and_rejects_digest_mismatch ... ok
+test api_relay::relay_tests::hub_relay_streams_sse_with_credential_swap_in_order ... ok
+Initialized empty Git repository in /home/wangruming.nana/t/.tmp08ouWr/origin.git/
+test files::tests::tool_media_stager_works_from_inside_a_tokio_worker ... ok
+test inventory::tests::computer_use_absent_bundle_reports_installed_false_without_a_path ... ok
+test api_relay::relay_tests::scripted_429_and_529_pass_through_with_retry_after ... ok
+test diagnostics::tests::claude_native_gateway_is_reported_without_settings_values ... ok
+test diagnostics::tests::workspace_diagnostics_report_failed_access_as_a_blocker ... ok
+test inventory::tests::claude_settings_without_gateway_keys_is_not_native ... ok
+test inventory::tests::computer_use_bundle_without_a_version_reports_installed_without_version ... ok
+test inventory::tests::computer_use_codex_home_pointing_at_a_file_is_not_installed ... ok
+test inventory::tests::sampler_reports_one_minute_load_as_cpu_percent_and_real_counts ... ok
+test api_relay::relay_tests::worker_listener_auth_matrix ... ok
+test journal_flush::tests::backoff_grows_to_the_ceiling_then_resets ... ok
+test journal_flush::tests::cursor_is_keyed_per_instance ... ok
+test journal_flush::tests::cursor_never_moves_backwards_and_forgets_on_clear ... ok
+test inventory::tests::claude_settings_api_key_helper_is_gateway_native ... ok
+test model::tests::codex_configure_retains_both_top_effort_names ... ok
+test journal_flush::tests::terminal_lifecycles_are_exited_and_failed ... ok
+test model::tests::codex_spec_efforts_preserve_max_and_ultra_and_migrate_minimal ... ok
+test inventory::tests::computer_use_non_executable_file_is_not_a_client_on_posix ... ok
+Initialized empty Git repository in /home/wangruming.nana/t/.tmplEokmp/origin.git/
+test inventory::tests::computer_use_is_presence_only_and_never_spawns_the_client ... ok
+test interactions::plan_review_node_cas_tests::an_answer_is_delivered_to_the_driver_on_its_native_id_exactly_once ... ok
+test interactions::plan_review_node_cas_tests::approve_with_feedback_is_rejected_for_a_plan_review ... ok
+test native::tests::a_shell_pty_native_delegation_launch_gets_no_overlay ... ok
+test native::tests::a_shell_pty_gateway_launch_materialises_the_hub_overlay_not_the_hosts ... ok
+test native::tests::attachments_become_image_and_resource_blocks_before_the_text ... ok
+Initialized empty Git repository in /home/wangruming.nana/t/.tmpZinRkk/origin.git/
+test inventory::tests::computer_use_reads_a_binary_plist ... ok
+test diagnostics::tests::missing_tools_low_disk_and_invalid_identity_are_explicit_blockers ... ok
+test interactions::plan_review_node_cas_tests::a_concurrent_human_and_parent_race_delivers_exactly_one_complete_answer ... ok
+test native::tests::file_attachments_become_file_blocks ... ok
+test inventory::tests::claude_settings_env_gateway_is_gateway_native_without_leaking_values ... ok
+test native::tests::automatic_trust_requires_canonical_registered_containment ... ok
+test inventory::tests::claude_without_oauth_key_is_logged_out ... ok
+test native::tests::every_bypass_spelling_reaches_bypass_permissions ... ok
+test native::tests::granted_codex_is_refused_on_generic_pty ... ok
+test native::tests::herdr_defaults_isolate_data_roots_and_preserve_explicit_session ... ok
+test interactions::plan_review_node_cas_tests::every_malformed_plan_review_answer_is_rejected_before_the_cas_and_the_ticket_stays_pending ... ok
+test native::tests::inherited_and_explicit_claude_homes_conflict ... ok
+test native::tests::native_prompt_preserves_each_submitting_origin ... ok
+test native::tests::granted_codex_is_refused_on_shell_pty_with_hooks_off ... ok
+test native::tests::gateway_without_overlay_fails_closed ... ok
+test native::tests::parse_delegation_prefers_explicit_field_then_profile_id ... ok
+test native::tests::registered_claude_home_must_be_absolute ... ok
+test native::tests::overlay_tilde_expands_and_missing_file_fails_closed ... ok
+test native::tests::spec_binary_path_beats_the_node_wide_claude_bin ... ok
+test native::tests::host_scoped_overlay_is_refused_on_the_wrong_host ... ok
+test files::tests::irregular_files_are_rejected ... ok
+test native::tests::gateway_resume_materializes_delivered_overlay_like_create ... ok
+test inventory::tests::computer_use_skips_an_oversized_plist_without_losing_the_row ... ok
+test diagnostics::tests::empty_registry_and_multiple_roots_collect_one_inventory ... ok
+test native::tests::the_pinned_relay_command_is_stable_when_the_source_is_replaced ... ok
+test inventory::tests::computer_use_row_is_appended_last ... ok
+test native::tests::the_hook_relay_command_names_the_pinned_copy_not_the_source ... ok
+test inventory::tests::herdr_uses_config_socket_and_fake_binary ... ok
+test native::tests::via_route_is_refused_for_generic_pty_never_rerouted_to_direct ... ok
+test native::tests::via_route_materializes_loopback_overlay_with_relay_bearer ... ok
+test native::tests::via_launch_artefacts_never_carry_the_gateway_token ... ok
+test api_relay::relay_tests::producer_waits_for_credits_then_moves ... ok
+test files::tests::parent_traversal_is_rejected ... ok
+test prompt_correlation::tests::a_prompt_with_no_pending_command_is_native ... ok
+test prompt_correlation::tests::different_text_never_matches ... ok
+test origin::tests::only_hub_envelope_sets_origin ... ok
+test origin::tests::child_environment_replaces_operator_credentials_and_caller_identity ... ok
+test diagnostics::tests::computer_use_check_reports_presence_and_version ... ok
+test prompt_correlation::tests::exact_text_wins_over_an_older_normalised_candidate ... ok
+test prompt_correlation::tests::two_identical_commands_attribute_fifo ... ok
+test prompt_correlation::tests::hook_and_transcript_for_one_submit_share_the_command_then_drop ... ok
+test files::tests::unknown_workspace_and_method_are_rejected ... ok
+test inventory::tests::auth_heuristics_do_not_emit_secrets ... ok
+test diagnostics::tests::computer_use_check_reports_absence_with_the_path_it_looked_for ... ok
+test inventory::tests::fake_path_resolves_absolute_version_and_sha256 ... ok
+test files::tests::search_rejects_traversal_and_symlink_escape ... ok
+test native_config_access::tests::denied_probe_preserves_error_and_names_configuration_remediation ... ok
+test files::tests::search_caps_truncate_with_reasons ... ok
+test api_relay::relay_tests::request_body_larger_than_one_chunk_streams_to_gateway ... ok
+test files::tests::search_name_content_regex_and_glob_modes ... ok
+test native_config_access::tests::denied_ancestor_is_not_mistaken_for_a_missing_optional_configuration ... ok
+test native::tests::gateway_falls_back_to_user_overlay_when_generated_overlay_is_unavailable ... ok
+test files::tests::symlink_pointing_outside_is_rejected ... ok
+test files::tests::lists_and_reads_inside_a_registered_workspace ... ok
+test native::tests::a_failed_pin_still_builds_with_the_fallback_and_retries ... ok
+test diagnostics::tests::fake_binaries_and_login_markers_are_reported_without_secrets ... ok
+test files::tests::oversized_files_are_rejected ... ok
+test native_config_access::tests::settings_access_probe_discards_contents_and_preserves_files ... ok
+test carrier_recovery::tests::recovery_is_a_no_op_while_the_carrier_is_healthy ... ok
+test native_config_access::tests::unrelated_skill_fixture_trees_are_not_traversed_or_read ... ok
+test reclaim::tests::stale_workspace_id_never_closes_a_replacement ... ok
+test native_config_access::tests::stalled_probe_is_bounded_and_returns_configuration_error ... ok
+test native_config_access::tests::stalled_settings_open_is_bounded_before_extension_loading ... ok
+test native_config_access::tests::safe_skill_symlinks_missing_optional_sources_and_broken_links_are_preserved ... ok
+test carrier_recovery::tests::mid_session_carrier_loss_recovers_and_marks_the_instance ... ok
+test runtime::api_relay_launch_test::nameless_via_is_refused_before_launch ... ok
+test runtime::tests::model_pin_gate::a_catalog_makes_an_unnamespaced_substitution_decidable ... ok
+test runtime::tests::model_pin_gate::a_gateway_resolution_on_the_launch_readback_is_not_reported ... ok
+test runtime::tests::model_pin_gate::a_later_human_or_remuda_switch_is_never_reported ... ok
+test runtime::tests::model_pin_gate::a_substituted_model_on_the_launch_readback_reports_a_divergence_naming_both_ids ... ok
+test runtime::tests::model_pin_gate::an_unpinned_or_blank_pin_arms_no_gate ... ok
+test runtime::tests::model_pin_gate::an_unrelated_observation_is_ignored ... ok
+test runtime::tests::model_pin_gate::no_pin_never_reports ... ok
+test runtime::tests::model_pin_gate::the_pin_answering_is_silent ... ok
+test runtime::tests::model_pin_gate::the_synthetic_snapshot_is_never_judged ... ok
+test runtime::tests::model_pin_gate::with_no_read_back_there_is_no_report ... ok
+test runtime::tests::only_session_bearing_lifecycles_are_read_as_the_native_session ... ok
+test runtime::tests::legacy_claude_pty_session_start_keeps_screen_activity_enabled ... ok
+test runtime::tests::tty_key_allowlist_accepts_cli_keys_and_rejects_parser_sequences ... ok
+test runtime::api_relay_launch_test::direct_net_probe_failure_refuses_without_creating_an_instance ... ok
+test runtime::api_relay_launch_test::via_create_echoes_resolved_route_and_serves_loopback ... ok
+test server::tests::a_live_frame_straddling_the_snapshot_is_trimmed_to_its_unseen_tail ... ok
+test server::tests::access_code_comparison_and_cookie_token_are_deterministic ... ok
+test server::tests::cookie_parser_does_not_accept_prefix_matches ... ok
+test journal_flush::tests::a_caught_up_instance_plans_no_read_and_an_unknown_cursor_reads ... ok
+test journal_flush::tests::a_terminal_lifecycle_does_not_skip_a_read_by_itself ... ok
+test signal::tests::a_screen_guess_cannot_masquerade_as_hook_activity ... ok
+test signal::tests::a_session_start_without_a_pid_is_not_bindable ... ok
+test signal::tests::a_session_start_yields_the_pid_session_and_transcript ... ok
+test signal::tests::an_unreadable_foreground_refuses_to_bind_rather_than_guessing ... ok
+test signal::tests::binding_requires_the_pid_to_be_the_ptys_foreground_leader ... ok
+test signal::tests::current_foreground_rebinds_only_on_a_new_session_start ... ok
+test signal::tests::early_turn_boundary_is_applied_once_when_its_session_binds ... ok
+test signal::tests::only_session_start_rebinds_the_session ... ok
+test signal::tests::only_the_hook_channel_counts_as_hook_evidence ... ok
+test signal::tests::replacement_session_start_survives_the_previous_foregrounds_demote ... ok
+test signal::tests::the_flag_is_off_unless_it_is_explicitly_on ... ok
+test signal::tests::the_turn_boundaries_move_the_instance_and_nothing_else_does ... ok
+test native::tests::registry_constructs_every_native_claude_driver ... ok
+test signal_messages::tests::a_chunk_after_the_final_one_is_ignored ... ok
+test signal::tests::unmatched_session_starts_are_bounded_and_deduplicated_by_pid ... ok
+test signal_messages::tests::a_repeated_chunk_is_folded_once ... ok
+test signal_messages::tests::a_single_final_chunk_is_a_complete_message ... ok
+test signal_messages::tests::every_chunk_of_one_message_shares_one_node ... ok
+test signal_messages::tests::only_a_hook_channel_message_display_is_a_delta ... ok
+test signal_messages::tests::recorded_deltas_stream_as_open_then_append_then_complete ... ok
+test signal_messages::tests::separate_messages_keep_separate_nodes ... ok
+test signal_messages::tests::the_derived_observation_is_a_message_on_the_hook_channel ... ok
+test signal_messages::tests::the_mutation_chain_is_contiguous ... ok
+test runtime::api_relay_launch_test::create_naming_a_terminated_instance_id_fails_and_revokes_bind ... ok
+test journal_flush::tests::a_cursor_past_the_tail_has_nothing_to_read ... ok
+test store::tests::journal_pages_exclude_the_cursor ... ok
+test runtime::api_relay_launch_test::retried_create_keeps_one_listener_and_exit_revokes_it ... ok
+test journal_flush::tests::a_terminal_lifecycle_that_is_journaled_after_the_fact_still_flushes ... ok
+test store::tests::replay_sweep_cost_is_linear_in_new_events ... ignored, measurement, not a gate
+test inventory::tests::ttl_cache_skips_version_until_expiry ... ok
+test runtime::tests::promoted_signal_bus_drives_activity_only_for_the_bound_session ... ok
+test diagnostics::tests::runtime_doctor_uses_current_registry_and_checks_all_roots ... ok
+test native::tests::outside_reads_answer_is_seeded_for_bypass_only ... ok
+test store::tests::journaled_store_commits_before_publishing ... ok
+test runtime::tests::instance_configure_is_forwarded_and_applied_on_fake_claude ... ok
+test runtime::tests::create_is_accepted_before_a_slow_launch_finishes ... ok
+test transport::hubnode_codec::tests::a_host_with_no_inventory_reports_no_capabilities_rather_than_an_empty_claim ... ok
+test native::tests::an_unregistered_cwd_gets_no_trust_flag ... ok
+test transport::hubnode_codec::tests::a_node_that_cannot_enumerate_omits_the_inventory ... ok
+test transport::hubnode_codec::tests::hello_carries_the_driver_inventory_under_capabilities ... ok
+test transport::hubnode_codec::tests::hello_carries_the_instance_inventory ... ok
+test transport::hubnode_codec::tests::request_carries_version ... ok
+test transport::tests::backoff_doubles_then_caps ... ok
+test transport::tests::jittered_delay_stays_within_band_and_is_deterministic ... ok
+test transport::hubnode_codec::tests::hello_includes_protocol_resume_and_inventory ... ok
+test runtime::tests::driver_panic_is_contained_and_marks_dispatch_unknown ... ok
+test runtime::pty_queue::tests::successful_pty_close_rejects_commands_accepted_while_close_was_in_flight ... ok
+test api_relay::relay_tests::slow_first_byte_is_mapped_to_504_anthropic_body ... ok
+test carrier_recovery::tests::startup_reconcile_survives_a_shutting_down_predecessor ... ok
+test gate::tests::a_failing_long_method_returns_its_error ... ok
+test gate::tests::the_long_method_cap_bounds_concurrency ... ok
+test transport::wss::tests::already_durable_matches_exact_got_seq ... ok
+test transport::wss::tests::append_params_use_hubnode_batch_and_watermark ... ok
+test gate::tests::a_panicking_long_method_releases_its_permit ... ok
+test transport::wss::tests::hello_params_include_resume_cursors ... ok
+test runtime::tests::tty_write_dispatches_send_keys_on_fake_driver ... ok
+test transport::wss::tests::heartbeat_resource_refresh_replaces_only_the_resources_block ... ok
+test transport::wss::tests::wss_heartbeat_refreshes_the_driver_inventory ... ok
+test service::tests::serve_binds_ephemeral_port_and_stops_cleanly ... ok
+test transport::wss::tests::wss_hello_carries_the_driver_inventory_under_capabilities ... ok
+test tty::tests::frame_has_protocol_v1_header ... ok
+test transport::wss::tests::wss_hello_without_inventory_sends_no_capabilities_rather_than_an_empty_claim ... ok
+test tty::tests::input_frame_uses_channel_three ... ok
+test worker::tests::bad_start_points_are_rejected ... ok
+test runtime::tests::tty_write_rpc_rejects_entire_invalid_batch_before_dispatch ... ok
+test worker::tests::target_dir_cannot_escape_scratch_root ... ok
+test workflow_producer::tests::launch_without_run_id_emits_nothing ... ok
+test workflow_producer::tests::non_workflow_hooks_are_ignored ... ok
+test workflow_producer::tests::workflow_transcript_paths_are_recognized ... ok
+test workspace::tests::denied_probe_precedes_canonicalization_and_preserves_remediation ... ok
+test workspace::tests::expansion_uses_only_node_home_prefixes ... ok
+test transport::hubnode_codec::driver_fidelity_tests::an_unknown_driver_name_is_refused_rather_than_defaulted ... ok
+test transport::hubnode_codec::driver_fidelity_tests::a_driver_with_no_adapter_is_refused_not_downgraded ... ok
+test transport::hubnode_codec::driver_fidelity_tests::an_unknown_kind_is_refused_rather_than_becoming_claude ... ok
+test transport::wss::runtime_wss::tests::create_params_round_trip_binary_path_and_reject_a_non_string ... ok
+test runtime::pty_queue::tests::pty_cancel_and_close_interrupt_queued_input_without_sending ... ok
+test api_relay::relay_tests::delayed_credits_keep_a_long_response_clean_to_its_last_chunk ... ok
+test transport::wss::tests::journal_queue_applies_backpressure ... ok
+test transport::hubnode_codec::driver_fidelity_tests::a_blocks_only_send_reaches_the_driver_with_joined_text_and_nested_mode ... ok
+test transport::wss::runtime_wss::tests::create_params_preserve_gateway_overlay_config_dir_and_budget ... ok
+test transport::hubnode_codec::driver_fidelity_tests::a_spec_that_names_no_driver_still_launches ... ok
+test transport::wss::runtime_wss::tests::create_params_preserve_native_model_permission_and_allowlisted_args ... ok
+test transport::wss::runtime_wss::tests::create_params_reject_non_string_native_args ... ok
+test transport::hubnode_codec::driver_fidelity_tests::a_hub_spec_full_of_nulls_still_launches_the_driver_it_names ... ok
+test transport::wss::runtime_wss::tests::an_unknown_method_fails_a_request_and_is_tolerated_as_a_notification ... ok
+test stdio::tests::composed_stdio_dispatches_create_and_streams_journal ... ok
+test service::tests::compose_reuses_the_persisted_host_identity ... ok
+test native::tests::an_inherited_config_dir_is_never_touched ... ok
+test workspace_access::tests::protected_paths_use_components_and_normalize_parent_segments ... ok
+test workspace::tests::registered_root_cannot_be_replaced_with_an_escaping_symlink ... ok
+test runtime::pty_queue::tests::pty_pending_bound_preserves_control_access ... ok
+test runtime::pty_queue::tests::control_unavailable_after_readiness_does_not_reject_or_duplicate_input ... ok
+test native::tests::a_provisioned_worktree_cwd_gets_the_trust_flag_and_bypass_answer ... ok
+test workspace::tests::prepared_unregister_cannot_delete_a_replacement_registration ... ok
+test workspace::tests::prepared_register_does_not_resurrect_a_removed_membership_identity ... ok
+test runtime::pty_queue::tests::rejected_pty_close_keeps_worker_available_for_send_and_close_retry ... ok
+test workspace::tests::registry_rejects_unprepared_or_changed_mutations ... ok
+test workspace::tests::registration_checks_worktree_aliases_without_touching_stale_project_roots ... ok
+test workspace_access::tests::probe_rejects_files_and_missing_paths_and_accepts_unusual_directory_names ... ok
+test workspace_scm::tests::whitelist_accepts_exact_templates_and_rejects_everything_else ... ok
+test runtime::pty_queue::tests::stopping_a_pty_instance_reclaims_its_durable_carrier_ownership ... ok
+test workspace_access::tests::exited_parent_with_inherited_pipes_is_still_bounded ... ok
+test transport::hubnode_codec::driver_fidelity_tests::every_named_driver_is_echoed_back_verbatim ... ok
+test carrier_objects::tests::missing_reply_times_out ... ok
+test workspace::tests::startup_flags_obey_allowlist_and_merge_without_duplicate_ids ... ok
+test workspace_access::tests::stalled_probe_is_killed_and_returns_within_deadline ... ok
+test worktree::tests::instance_cwd_accepts_a_relative_workspace_root ... ok
+test workspace_access::tests::inaccessible_workspace_is_rejected_before_registration_or_instance_acceptance ... ok
+test workspace_scm::tests::non_git_directory_is_structured_unsupported ... ok
+test worktree::tests::rejects_invalid_name ... ok
+test stdio::tests::an_unknown_instance_request_does_not_kill_the_streaming_carrier ... ok
+test workspace::tests::registry_rejects_invalid_paths_and_allows_canonical_aliases ... ok
+test workspace_scm::tests::contained_file_path_rejects_traversal_and_absolute_input ... ok
+test store::tests::a_page_read_is_bounded_by_its_limit ... ok
+test worktree::tests::instance_cwd_is_canonical_through_a_symlinked_root ... ok
+test workspace_scm::tests::clean_repo_reports_no_entries_without_attribution_wording ... ok
+test workspace::tests::restarted_registry_can_remove_symlink_drift_without_allowing_launch ... ok
+test transport::wss::runtime_wss::tests::the_wss_runtime_answers_drill_in_and_scm_reads_itself ... ok
+test workspace::tests::wire_create_preserves_registry_id_with_omitted_or_relative_cwd ... ok
+test workspace_scm::tests::content_change_is_detectable_via_head_and_digest ... ok
+test workspace_scm::tests::rename_keeps_the_original_path ... ok
+test workspace::tests::worktree_catalog_uses_selected_registered_project ... ok
+test workspace::tests::restarted_registry_applies_tightened_allowlist_at_admission ... ok
+test worktree_pool::tests::slot_number_helper_is_pool_bookkeeping_only ... ok
+test runtime::pty_queue::tests::pty_uncertain_send_is_not_replayed_and_does_not_fail_created_runtime ... ok
+test workspace_scm::tests::binary_changed_file_is_entry_level_unsupported_and_not_inlined ... ok
+test transport::wss::runtime_wss::tests::failed_final_event_replays_from_confirmed_watermark_without_new_broadcast ... ok
+test worktree::tests::instance_cwd_defaults_to_the_workspace_root ... ok
+test workspace::tests::registry_persists_membership_identity_and_two_phase_receipts ... ok
+test worktree::tests::instance_cwd_rejects_a_symlink_escaping_the_workspace ... ok
+test workspace_scm::tests::status_diff_and_file_round_trip_on_a_temp_repo ... ok
+test worktree::tests::rejects_path_escaping_the_worktree_root ... ok
+test workspace::tests::restart_keeps_deleted_projects_listable_and_removable ... ok
+test worker::tests::provision_and_remove_round_trip ... ok
+test gate::tests::stale_tip_is_refused_when_a_worktree_holds_a_diverged_branch ... ok
+test runtime::pty_queue::tests::queued_prompt_keeps_native_interaction_pending_until_user_response ... ok
+test worktree::tests::default_path_lands_in_the_worktree_root ... ok
+test gate::tests::land_mode_invokes_the_merge_cli_with_land ... ok
+test worktree_pool::tests::lease_refuses_path_and_repo_overrides ... ok
+test gate::tests::push_from_home_keeps_the_lane_a_verify ... ok
+test workspace::tests::runtime_resolves_registered_roots_and_explains_expanded_home_escape ... ok
+test worktree::tests::create_and_list_round_trip ... ok
+test gate::tests::unpin_removes_both_refs_and_is_idempotent ... ok
+test gate::tests::cancel_kills_the_running_process_group ... ok
+test native::tests::a_pooled_worktree_keeps_the_trust_flag_across_lease_and_park ... ok
+test worktree::tests::rejects_repo_override ... ok
+test worktree_pool::tests::reuse_to_root_lease_keys_the_registered_root ... ok
+test worktree::tests::instance_cwd_accepts_the_workspace_and_its_worktrees ... ok
+test worktree::tests::instance_cwd_rejects_paths_outside_the_workspace ... ok
+test gate::tests::passing_verify_pins_the_merge_at_a_ref_whose_first_parent_is_main ... ok
+test worktree_pool::tests::standalone_worktree_named_like_a_slot_returns_byte_identical ... ok
+test worktree_pool::tests::dirty_tracked_changes_refuse_pool_return_and_reset ... ok
+test worktree_pool::tests::reuse_return_leaves_the_tree_byte_identical ... ok
+test worker::tests::node_worker_provision_and_remove_rpc ... ok
+test worktree::tests::provisioned_worktree_named_matches_only_the_exact_recorded_path ... ok
+test gate::tests::home_host_land_pushes_once_and_refuses_a_moved_base ... ok
+test worktree_pool::tests::untracked_leftovers_are_cleaned_but_ignored_dirs_stay_warm ... ok
+test worktree_pool::tests::reconcile_drops_missing_rows_and_heals_stale_leases ... ok
+test runtime::pty_queue::tests::two_consecutive_steers_each_interrupt_and_keep_order ... ok
+test worktree_pool::tests::lease_and_return_round_trip_warms_a_slot ... ok
+test worktree_pool::tests::refcount_sharing_blocks_force_remove_until_returned ... ok
+test worktree_pool::tests::full_pool_without_a_clean_slot_defers_instead_of_rerouting ... ok
+test worktree_pool::tests::lease_return_dispatch_real_payloads_and_unknown_method_errors ... ok
+test worktree_pool::tests::detached_parking_survives_branch_name_reuse ... ok
+test worktree_pool::tests::warm_hit_does_not_fetch_while_offline ... ok
+test workspace_scm::tests::file_and_diff_cap_with_explicit_truncation_markers ... ok
+test gate::tests::failed_cargo_test_carries_the_extracted_summary ... ok
+test gate::tests::keep_logs_retains_a_green_run_log ... ok
+test gate::tests::passing_run_keeps_no_log_without_keep_logs ... ok
+test worktree_pool::tests::eviction_reclaims_only_a_clean_idle_slot_on_another_base ... ok
+test runtime::pty_queue::tests::steer_interrupts_the_running_turn_then_jumps_the_queue ... ok
+test runtime::pty_queue::tests::steer_waits_behind_a_pending_interaction_without_firing_esc ... ok
+test api_relay::relay_tests::client_disconnect_sends_api_cancel ... ok
+test worktree_pool::tests::worker_remove_does_not_delete_a_shared_slot ... ok
+test api_relay::relay_tests::credit_starved_egress_ends_at_the_hard_cap_after_four_chunks ... ok
+test transport::wss::tests::shutdown_aborts_an_unresponsive_session_task ... ok
+test workspace_scm::tests::reads_never_take_the_index_lock_or_mutate_the_workspace ... ok
+test gate::tests::verify_passes_and_streams_steps ... ok
+test gate::tests::step_streaming_honours_a_redirected_tmpdir ... ok
+test gate::tests::run_deadline_kills_and_fails ... ok
+test runtime::pty_queue::tests::pty_create_accepts_queued_input_then_delivers_fifo_after_control_keys ... ok
+test api_relay::relay_tests::actively_credited_stream_still_ends_at_the_hard_cap ... ok
+test reclaim::tests::stopping_a_pty_instance_closes_its_agent_pane_and_forgets_ownership ... ok
+test runtime::pty_queue::tests::steer_delivers_after_the_interrupt_budget_without_idle_evidence ... ok
+test runtime::pty_queue::tests::queued_inputs_preserve_each_origin_independently_of_the_instance_creator ... ok
+test runtime::api_relay_launch_test::concurrent_creates_with_one_command_id_both_return_the_accepted_one ... ok
+test native::tests::orphan_sweep_leaves_another_nodes_workspace_untouched ... ok
+test gate::tests::second_concurrent_run_on_same_lane_is_rejected ... ok
+test store::tests::one_flush_tick_costs_new_bytes_not_the_whole_journal ... ok
+test reclaim::tests::opt_out_preserves_unknown_panes_but_shutdown_reclaims_owned_partial_launch ... ok
+test reclaim::tests::restart_adopts_live_pane_sweeps_orphan_and_shutdown_cleans_durable_ownership ... ok
+
+test result: ok. 364 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 5.64s
+
+     Running unittests src/bin/node_stdio.rs (target-authrace/debug/deps/remuda_node_stdio-f34f64c5c1daae08)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/attachments.rs (target-authrace/debug/deps/attachments-9a451a87228057d8)
+
+running 9 tests
+test the_sweeper_removes_directories_for_instances_that_are_gone ... ok
+test materialized_paths_are_absolute_and_inside_the_instance_directory ... ok
+test a_send_pulls_its_attachments_to_the_instance_directory ... ok
+test more_attachments_than_the_cap_are_refused ... ok
+test a_traversal_shaped_object_id_never_becomes_a_path ... ok
+test a_node_with_no_object_source_refuses_attachments_but_still_sends_text ... ok
+test a_failed_pull_rejects_the_whole_send ... ok
+test closing_an_instance_removes_its_attachments ... ok
+test arbitrary_files_land_with_their_name_and_collision_suffix ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/claude_sdk_matrix.rs (target-authrace/debug/deps/claude_sdk_matrix-4aa37796ac32082b)
+
+running 2 tests
+test an_omitted_driver_never_resolves_to_sdk ... ok
+test claude_sdk_is_accepted_and_shell_pty_is_unchanged ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.01s
+
+     Running tests/computer_use_interop.rs (target-authrace/debug/deps/computer_use_interop-6fbfe614842224b0)
+
+running 3 tests
+test no_row_is_not_reported_rather_than_unsupported ... ok
+test the_probed_row_satisfies_the_launch_gate ... ok
+test the_probed_absence_states_are_refused_by_the_gate ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/computer_use_preflight.rs (target-authrace/debug/deps/computer_use_preflight-e7dfb763cb619ad9)
+
+running 7 tests
+test default_client_path_points_at_the_cua_app_under_codex_home ... ok
+test installed_row_on_macos_passes_for_claude_and_codex ... ok
+test missing_row_refuses_with_the_not_reported_message ... ok
+test non_macos_refuses_and_names_the_os_before_looking_at_the_row ... ok
+test not_installed_row_refuses_and_names_the_probed_path ... ok
+test not_installed_row_without_path_names_the_default_probe_location ... ok
+test unsupported_kinds_refuse_even_with_an_installed_macos_row ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/daemon.rs (target-authrace/debug/deps/daemon-9c19855ebe7ecfcd)
+
+running 10 tests
+test outbound_reconnect_replays_offline_completion_inner ... ignored, re-exec'd with proxy env cleared by the outer _without_a_new_command test
+test daemon_status_under_a_long_data_dir_before_first_start_is_not_running ... ok
+test daemon_socket_path_honors_the_installed_link_over_local_derivation ... ok
+test fake_hub_accept_drains_a_plain_http_probe_before_the_upgrade ... ok
+test daemon_socket_redirects_under_a_long_data_dir ... ok
+test stalled_reply_pipe_does_not_block_replacement_controller ... ok
+test controller_takeover_fences_old_bridge_and_outbound_waits_until_detach ... ok
+test killed_bridge_keeps_fake_claude_alive_and_replays_completion_after_watermark ... ok
+test outbound_reconnect_replays_offline_completion_without_a_new_command ... ok
+test a_long_method_does_not_blind_the_daemon_controller ... ok
+
+test result: ok. 9 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.01s
+
+     Running tests/dispatch_onboarding.rs (target-authrace/debug/deps/dispatch_onboarding-607aa0bcfd048fd9)
+
+running 1 test
+test dispatched_worker_reaches_first_tool_call_with_no_keys ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.59s
+
+     Running tests/effort_sync.rs (target-authrace/debug/deps/effort_sync-ac7596a3905c2bb9)
+
+running 3 tests
+test structured_to_terminal_rejects_carry_the_reason_for_ui_revert ... ok
+test structured_to_terminal_settles_from_stdout_inside_the_fold_budget ... ok
+test terminal_to_structured_emits_a_slash_attributed_effort_observation_without_any_bridge ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/hook_latency.rs (target-authrace/debug/deps/hook_latency-1e1a8217d58cc6d5)
+
+running 1 test
+test a_hook_delta_becomes_readable_text_well_inside_the_budget ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hook_signal.rs (target-authrace/debug/deps/hook_signal-fce60e6e1e0dbb3b)
+
+running 11 tests
+test the_hook_path_is_off_until_the_operator_turns_it_on ... ok
+test the_first_text_is_journaled_before_the_turn_stops ... ok
+test the_hook_evidence_survives_beside_the_derived_message ... ok
+test streamed_deltas_reach_the_journal_as_incremental_message_mutations ... ok
+test a_permission_request_opens_a_card_a_device_can_answer ... ok
+test message_deltas_are_persisted_for_p3_to_map ... ok
+test the_session_start_makes_a_promoted_terminal_resumable ... ok
+test a_recorded_session_lands_in_the_journal_on_the_hook_channel ... ok
+test two_terminals_running_their_own_agent_do_not_cross_bind ... ok
+test the_turn_opens_on_the_prompt_and_closes_on_the_stop ... ok
+test a_permission_request_holds_the_instance_waiting_on_a_human ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/interactions.rs (target-authrace/debug/deps/interactions-0d9f37c8fe8f8148)
+
+running 2 tests
+test fake_can_use_tool_answered_via_hub_http ... ok
+test pty_approval_hub_cas_settlement_and_restart_do_not_replay ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.46s
+
+     Running tests/live_latency.rs (target-authrace/debug/deps/live_latency-0361779bd1b9fe94)
+
+running 7 tests
+test pre_tool_use_becomes_a_running_tool_call_inside_the_budget ... ok
+test message_display_stays_readable_inside_the_inner_budget ... ok
+test prompt_and_stop_phases_land_inside_the_budget_with_outcomes ... ok
+test post_tool_use_closes_the_same_node_inside_the_budget ... ok
+test one_phase_transition_emits_at_most_one_live_observation ... ok
+test hook_and_transcript_converge_on_one_tool_node_on_recorded_fixture ... ok
+test a_twenty_second_tool_is_exactly_two_journal_events_and_one_phase_pair ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_pipeline.rs (target-authrace/debug/deps/live_pipeline-bd8d51b159427999)
+
+running 1 test
+test budgets_and_rule_six_over_a_real_pty has been running for over 60 seconds
+test budgets_and_rule_six_over_a_real_pty ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 186.82s
+

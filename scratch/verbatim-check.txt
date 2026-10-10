@@ -1,0 +1,4 @@
+table literals: 22
+fixture stdout records: 24
+table strings NOT in a fixture (would be fabricated): ['(this session only)', 'stdout: {stdout:?}']
+fixture stdout NOT asserted by table: ['Bye!', 'Catch you later!', 'See ya!', 'Set model to `Opus 5.5` and saved as your default for new sessions']

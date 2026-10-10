@@ -1,0 +1,22 @@
+c-reconnfu r2 item 6 bisect (Playwright chromium-1243 / Chrome 151 engine)
+
+A. origin Node HTTP server serves page + real /sw.js + WS; offline restore:
+   node-server-sw           wsResult=OPEN        (controller=real SW)
+B. same origin, /sw.js delivered via Playwright route.fulfill:
+   route                    wsResult=ERROR  ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS
+   routePassthrough         wsResult=ERROR  (route.fetch + fulfill real response)
+   routeHeaders             wsResult=ERROR  (identical server headers + body)
+   routeNoOffline           wsResult=ERROR  (NO offline/restore cycle at all)
+   routeUnroute             wsResult=ERROR  (unroute after install; tainted SW stays)
+C. Vite proxy topology (page :8097 -> WS upgrade proxied to :8099) with a
+   Vite-served real /sw.js, offline restore:
+   vite-server-sw           wsResult=OPEN        (only ERR_INTERNET_DISCONNECTED while offline)
+D. all cases: same-origin HTTP fetch from the controlled page = 200 (goes via
+   SW fetch handler); after SW unregister + fresh navigation WS = OPEN.
+
+Conclusion: the block is caused solely by a service worker whose SCRIPT
+response was synthesized by DevTools/Playwright interception (no real peer
+address space -> worker client space unknown -> LNA blocks the controlled
+page's SW-bypassing WebSocket to loopback). Not the Vite proxy hop, not
+offline restore, not headers/body. Production Hub serves sw.js over a real
+same-origin socket -> cannot hit this path.

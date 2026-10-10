@@ -1,0 +1,17 @@
+warning: use of deprecated method `tempfile::TempDir::into_path`: use TempDir::keep()
+   --> crates/remuda-node/tests/usage_native_rollup.rs:122:28
+    |
+122 |         let retained = dir.into_path();
+    |                            ^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: `remuda-node` (test "usage_native_rollup") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running tests/usage_native_rollup.rs (target-fs2/debug/deps/usage_native_rollup-4b9714b83b209a0a)
+
+running 1 test
+test a_native_shell_pty_claude_session_reports_a_usage_rollup ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.94s
+

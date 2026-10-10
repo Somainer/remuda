@@ -1,0 +1,179 @@
+[2026-09-28T14:07:08+08:00] waiting
+[2026-09-28T14:07:08+08:00] acquired
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s
+[WebServer]      Running `/home/wangruming.nana/Projects/remuda-agents/target-c-authrace/debug/examples/hub_e2e`
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a0e69f-d68f-7364-9053-3d9d5c301eaa","upstream":"http://127.0.0.1:58881","viaHost":null}
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 196 ms
+[WebServer] 
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+Running 1 test using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+[WebServer] DBG_FOLLOW_END pump device=dev_01a0e69f-e252-727d-999d-d2df96aec7d7 ids=[]
+[WebServer] 2026-09-28T06:07:14.914394Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e69f-e973-7547-90bf-38d428dbf52a response={"jsonrpc":"2.0","id":"50884771-8071-4271-bc75-a853c7e49e0f","result":{"ok":true,"instanceId":"ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621"}}
+[WebServer] 2:07:15 PM [vite] (client) [console.error] DBG_BEGIN_RESUME
+[WebServer] 2:07:15 PM [vite] (client) [console.error] DBG_WS new ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[WebServer] 2:07:15 PM [vite] (client) [console.error] DBG_WS open ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[WebServer] 2:07:15 PM [vite] (client) [console.error] DBG_WS SNAPSHOT ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621 {"type":"snapshot","instanceId":"ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621","asOf
+[WebServer] DBG_FOLLOW_END pump device=dev_01a0e69f-e252-727d-999d-d2df96aec7d7 ids=[]
+[WebServer] DBG_FOLLOW_END pump device=dev_01a0e69f-e252-727d-999d-d2df96aec7d7 ids=["ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621"]
+[WebServer] 2026-09-28T06:07:20.057112Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e69f-f65c-70c9-a24d-cb3f77f89e70 response={"jsonrpc":"2.0","id":"16261d9e-d743-464e-967d-85b6c68c3c12","result":{"ok":true}}
+DBG_STATES 0s:offline:nav=true | 1s:offline:nav=true | 2s:offline:nav=true | 3s:offline:nav=true | 4s:offline:nav=true | 5s:offline:nav=true | 6s:offline:nav=true | 7s:offline:nav=true | 8s:offline:nav=true | 9s:offline:nav=true | 10s:offline:nav=true | 11s:offline:nav=true | 12s:offline:nav=true | 13s:offline:nav=true
+DBG_CONSOLE_START
+[error] DBG_BEGIN_RESUME
+[error] DBG_WS new ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_WS open ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_WS SNAPSHOT ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621 {"type":"snapshot","instanceId":"ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621","asOf
+[error] WebSocket connection to 'ws://127.0.0.1:58889/?token=GX1W9oaefQTh' failed: Error in connection establishment: net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS
+[error] WebSocket connection to 'ws://127.0.0.1:58889/?token=GX1W9oaefQTh' failed: Error in connection establishment: net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS
+[error] WebSocket connection to 'ws://127.0.0.1:58889/v1/follow' failed: Error in connection establishment: net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS
+[error] DBG_BEGIN_RESUME
+[error] DBG_RESUME start ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_WS new ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] WebSocket connection to 'ws://127.0.0.1:58889/v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621' failed: Error in connection establishment: net::ERR_INTERNET_DISCONNECTED
+[warning] WebSocket connection to 'ws://127.0.0.1:58889/v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621' failed: WebSocket is closed before the connection is established.
+[error] DBG_WS new ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_WS error ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621 readyState 3 type error
+[pageerror] ReferenceError: settled is not defined
+    at WebSocket.<anonymous> (http://127.0.0.1:58889/src/lib/api.ts:1463:109)
+[pageerror] Error: FOLLOW_CONNECT_FAILED
+    at WebSocket.<anonymous> (http://127.0.0.1:58889/src/lib/api.ts:1529:13)
+[error] WebSocket connection to 'ws://127.0.0.1:58889/v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621' failed: Error in connection establishment: net::ERR_INTERNET_DISCONNECTED
+[error] DBG_WS error ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621 readyState 3 type error
+[error] DBG_RESUME fail Error: FOLLOW_CONNECT_FAILED
+[error] DBG_SCHEDULE 1
+[error] DBG_TIMER_ARMED 424 attempt 2
+[pageerror] ReferenceError: settled is not defined
+    at WebSocket.<anonymous> (http://127.0.0.1:58889/src/lib/api.ts:1463:109)
+[error] DBG_SCHEDULE 1
+[error] DBG_TIMER_ARMED 63 attempt 2
+[error] DBG_BEGIN_RESUME
+[error] DBG_RESUME start ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_WS new ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] WebSocket connection to 'ws://127.0.0.1:58889/v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621' failed: Error in connection establishment: net::ERR_INTERNET_DISCONNECTED
+[error] DBG_WS error ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621 readyState 3 type error
+[error] DBG_RESUME fail Error: FOLLOW_CONNECT_FAILED
+[error] DBG_SCHEDULE 2
+[error] DBG_TIMER_ARMED 98 attempt 3
+[pageerror] ReferenceError: settled is not defined
+    at WebSocket.<anonymous> (http://127.0.0.1:58889/src/lib/api.ts:1463:109)
+[error] DBG_SCHEDULE 2
+[error] DBG_TIMER_ARMED 337 attempt 3
+[error] WebSocket connection to 'ws://127.0.0.1:58889/?token=GX1W9oaefQTh' failed: Error in connection establishment: net::ERR_INTERNET_DISCONNECTED
+[error] WebSocket connection to 'ws://127.0.0.1:58889/?token=GX1W9oaefQTh' failed: Error in connection establishment: net::ERR_INTERNET_DISCONNECTED
+[error] DBG_SCHEDULE 0
+[error] DBG_TIMER_ARMED 103 attempt 1
+[error] DBG_BEGIN_RESUME
+[error] DBG_SCHEDULE 1
+[error] DBG_TIMER_ARMED 289 attempt 2
+[pageerror] RestNetworkError: Failed to fetch
+    at rest (http://127.0.0.1:58889/src/lib/api.ts:363:9)
+    at async Object.eventsRead (http://127.0.0.1:58889/src/lib/api.ts:1438:17)
+    at async HubStore.follow (http://127.0.0.1:58889/src/lib/store.ts:2002:17)
+[pageerror] RestNetworkError: Failed to fetch
+    at rest (http://127.0.0.1:58889/src/lib/api.ts:363:9)
+    at async Object.eventsRead (http://127.0.0.1:58889/src/lib/api.ts:1438:17)
+    at async HubStore.follow (http://127.0.0.1:58889/src/lib/store.ts:2002:17)
+[error] DBG_BEGIN_RESUME
+[error] DBG_RESUME start ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[pageerror] Failed to update a ServiceWorker for scope ('http://127.0.0.1:58889/') with script ('http://127.0.0.1:58889/e2e-offline-sw.js'): The script has an unsupported MIME type ('text/html').
+[error] DBG_SCHEDULE 0
+[error] DBG_TIMER_ARMED 380 attempt 1
+[error] DBG_RESUME fail HubHttpError: not found
+[error] DBG_BEGIN_RESUME
+[error] DBG_RESUME start ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_SCHEDULE 1
+[error] DBG_TIMER_ARMED 334 attempt 2
+[error] DBG_RESUME fail HubHttpError: not found
+[error] DBG_BEGIN_RESUME
+[error] DBG_RESUME start ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_SCHEDULE 2
+[error] DBG_TIMER_ARMED 931 attempt 3
+[error] DBG_RESUME fail HubHttpError: not found
+[error] DBG_BEGIN_RESUME
+[error] DBG_RESUME start ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_WS new ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] WebSocket connection to 'ws://127.0.0.1:58889/v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621' failed: Error in connection establishment: net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS
+[error] DBG_WS error ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621 readyState 3 type error
+[error] DBG_SCHEDULE 3
+[error] DBG_TIMER_ARMED 3215 attempt 4
+[error] DBG_RESUME fail Error: FOLLOW_CONNECT_FAILED
+[pageerror] ReferenceError: settled is not defined
+    at WebSocket.<anonymous> (http://127.0.0.1:58889/src/lib/api.ts:1463:109)
+[error] DBG_SCHEDULE 3
+[error] DBG_TIMER_ARMED 3108 attempt 4
+[error] DBG_BEGIN_RESUME
+[error] DBG_RESUME start ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_WS new ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] WebSocket connection to 'ws://127.0.0.1:58889/v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621' failed: Error in connection establishment: net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS
+[error] DBG_WS error ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621 readyState 3 type error
+[error] DBG_RESUME fail Error: FOLLOW_CONNECT_FAILED
+[error] DBG_SCHEDULE 4
+[error] DBG_TIMER_ARMED 4286 attempt 5
+[pageerror] ReferenceError: settled is not defined
+    at WebSocket.<anonymous> (http://127.0.0.1:58889/src/lib/api.ts:1463:109)
+[error] DBG_SCHEDULE 4
+[error] DBG_TIMER_ARMED 6037 attempt 5
+[error] DBG_BEGIN_RESUME
+[error] DBG_RESUME start ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] DBG_WS new ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
+[error] WebSocket connection to 'ws://127.0.0.1:58889/v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621' failed: Error in connection establishment: net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS
+[error] DBG_WS error ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621 readyState 3 type error
+[error] DBG_RESUME fail Error: FOLLOW_CONNECT_FAILED
+[error] DBG_SCHEDULE 5
+[error] DBG_TIMER_ARMED 3127 attempt 6
+[pageerror] ReferenceError: settled is not defined
+    at WebSocket.<anonymous> (http://127.0.0.1:58889/src/lib/api.ts:1463:109)
+[error] DBG_SCHEDULE 5
+[error] DBG_TIMER_ARMED 4357 attempt 6
+DBG_CONSOLE_END
+DBG_NET_START
+REQ_OK /v1/instances/obj_01a0e69f-e971-70cf-aaf7-5af51a8903e9/journal
+REQ_OK /v1/instances/obj_01a0e69f-e971-70cf-aaf7-5af51a8903e9/journal
+REQ_OK /v1/instances/ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621/journal
++1.9s WS_OPEN /v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
++1.9s WS_CLOSE
++5.0s WS_OPEN /v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
++5.1s WS_CLOSE
++11.1s WS_OPEN /v1/follow?instanceId=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621
++11.1s WS_CLOSE
+DBG_NET_END
+[WebServer] 2026-09-28T06:08:35.652999Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a0e6a1-2542-7348-9d13-6c68109a79cd response={"jsonrpc":"2.0","id":"0ba815b1-1cf6-4f71-9d49-989af623faa5","result":{"ok":true}}
+[WebServer] 2026-09-28T06:08:35.658764Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a0e69f-e971-70cf-aaf7-5af49ab1e621 device_id=dev_01a0e6a1-21a2-702c-955b-497815ae9c1c forced=true
+[WebServer] DBG_FOLLOW_END pump device=dev_01a0e6a1-21a2-702c-955b-497815ae9c1c ids=[]
+  ✘  1 [chromium] › tests/e2e/offline-outbox.hub.spec.ts:552:1 › an offline-queued message survives a reload with the browser context STILL offline and sends once after (1.4m)
+
+
+  1) [chromium] › tests/e2e/offline-outbox.hub.spec.ts:552:1 › an offline-queued message survives a reload with the browser context STILL offline and sends once after 
+
+    Error: journal banner stayed visible after offline recovery
+
+    journal banner stayed visible after offline recovery
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: "gone"
+    Received: "offline"
+
+    Call Log:
+    - Timeout 60000ms exceeded while waiting on the predicate
+
+      666 |       { timeout: 60_000, message: "journal banner stayed visible after offline recovery" },
+      667 |     )
+    > 668 |     .toBe("gone");
+          |      ^
+      669 |   await expectDelivered(page, commandId);
+      670 | });
+      671 |
+        at /home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/web/tests/e2e/offline-outbox.hub.spec.ts:668:6
+
+    Error Context: test-results/offline-outbox.hub-an-offl-8214e-ffline-and-sends-once-after-chromium/error-context.md
+
+    Error Context: test-results/offline-outbox.hub-an-offl-8214e-ffline-and-sends-once-after-chromium/error-context.md
+
+  1 failed
+    [chromium] › tests/e2e/offline-outbox.hub.spec.ts:552:1 › an offline-queued message survives a reload with the browser context STILL offline and sends once after 
+[2026-09-28T14:08:36+08:00] exit 1

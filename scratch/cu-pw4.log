@@ -1,0 +1,43 @@
+[WebServer]    Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+
+[WebServer]     Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.87s
+
+[WebServer]      Running `target-fs2/debug/examples/hub_e2e`
+
+[WebServer] HUB_E2E_READY {"hub":"http://127.0.0.1:58880","token":"e2e-bootstrap-token","hostId":"hst_01a11515-4a8f-76ae-8fa3-7de367855960","upstream":"http://127.0.0.1:58881","viaHost":null}
+
+[WebServer] 
+[WebServer]   VITE v8.3.0  ready in 190 ms
+[WebServer] 
+
+[WebServer]   ➜  Local:   http://127.0.0.1:58889/
+
+
+Running 2 tests using 1 worker
+
+[WebServer] 
+[WebServer] A PostCSS plugin did not pass the `from` option to `postcss.parse`. This may cause imported assets to be incorrectly transformed. If you've recently added a PostCSS plugin that raised this warning, please contact the package author to fix the issue.
+
+[1/2] [chromium] › tests/e2e/ux-usage.hub.spec.ts:180:1 › context chip: ring percentage and popover rollup over three turns
+[WebServer] 2026-10-07T06:38:05.157466Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11515-60ce-71b9-8e99-fc9bceb4dac8 response={"jsonrpc":"2.0","id":"a7d89861-90ac-4b20-a22a-a6f4dc357ab9","result":{"ok":true,"instanceId":"ins_01a11515-60cd-75ea-b6fc-c5f81374a5d3"}}
+
+[WebServer] 2026-10-07T06:38:07.515285Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11515-696e-7007-9bae-bcd56eb68f76 response={"jsonrpc":"2.0","id":"97a2eda4-f308-44e7-ad8f-a18d674bedef","result":{"ok":true}}
+
+[WebServer] 2026-10-07T06:38:09.901089Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11515-72b6-76ab-b051-762428e2c29d response={"jsonrpc":"2.0","id":"7c24abae-f2a4-4eb2-a285-7b5f4f5f10e0","result":{"ok":true}}
+
+[WebServer] 2026-10-07T06:38:11.731368Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11515-79d8-7989-aaec-64ec6cc35ffe response={"jsonrpc":"2.0","id":"41396bf3-5e7b-46ec-9ef3-c5ba1e58d8c8","result":{"ok":true}}
+
+[WebServer] 2026-10-07T06:38:13.405141Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11515-819a-72f3-a61a-dd881e209726 response={"jsonrpc":"2.0","id":"7e3c7af9-52f4-47f3-a615-171d0c961500","result":{"ok":true}}
+
+[WebServer] 2026-10-07T06:38:13.412180Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a11515-60cd-75ea-b6fc-c5f81374a5d3 device_id=dev_01a11515-581d-7053-8d31-c39acc234a74 forced=true
+
+[2/2] [chromium] › tests/e2e/ux-usage.hub.spec.ts:274:1 › context chip popover becomes a sheet at 390 px touch width
+[WebServer] 2026-10-07T06:38:17.889498Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11515-928a-74e2-8330-9e5bfd0fe269 response={"jsonrpc":"2.0","id":"f6912939-2e33-4744-af23-5e9051724e5e","result":{"ok":true,"instanceId":"ins_01a11515-9289-75c3-9da7-55c7e0adbeae"}}
+
+[WebServer] 2026-10-07T06:38:20.190004Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11515-9b07-74e3-bec1-064266f26a47 response={"jsonrpc":"2.0","id":"d997a08e-0068-435f-8f22-cf87f596e860","result":{"ok":true}}
+
+[WebServer] 2026-10-07T06:38:22.023444Z  WARN remuda_hub::http: node did not durably accept command; will not resend command_id=cmd_01a11515-a344-7187-9042-120963dd55c9 response={"jsonrpc":"2.0","id":"48e67788-c083-493e-a917-e393053e6e35","result":{"ok":true}}
+
+[WebServer] 2026-10-07T06:38:22.029613Z  INFO remuda_hub::http: instance deleted instance_id=ins_01a11515-9289-75c3-9da7-55c7e0adbeae device_id=dev_01a11515-84fb-75ec-846d-51f9ca8b07fb forced=true
+
+  2 passed (30.8s)

@@ -1,0 +1,49 @@
+   Compiling tracing v0.1.44
+   Compiling uuid v1.26.1
+   Compiling zerocopy v0.8.57
+   Compiling time v0.3.55
+   Compiling futures-concurrency v7.7.1
+   Compiling sha1 v0.10.7
+   Compiling sync_wrapper v1.0.2
+   Compiling hyper v1.11.1
+   Compiling regex-automata v0.4.18
+   Compiling agent-client-protocol-schema v1.7.0
+   Compiling lazy_static v1.5.0
+   Compiling sharded-slab v0.1.7
+   Compiling remuda-claude-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-claude-wire)
+   Compiling hyper-util v0.1.20
+   Compiling remuda-herdr v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-herdr)
+   Compiling portable-pty v0.9.0
+   Compiling axum-core v0.5.6
+   Compiling remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+   Compiling matchers v0.2.0
+   Compiling tower v0.5.3
+   Compiling tracing-subscriber v0.3.23
+   Compiling tempfile v3.27.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.5
+   Compiling tungstenite v0.29.0
+   Compiling tokio-tungstenite v0.29.0
+   Compiling axum v0.8.9
+   Compiling agent-client-protocol v2.1.0
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+error[E0608]: cannot index into a value of type `FlushedGroup`
+   --> crates/remuda-driver/src/claude_transcript_records.rs:476:30
+    |
+476 |         let content = flushed["message"]["content"].as_array().expect("content");
+    |                              ^^^^^^^^^^^
+
+error[E0608]: cannot index into a value of type `FlushedGroup`
+   --> crates/remuda-driver/src/claude_transcript_records.rs:503:30
+    |
+503 |         let content = flushed["message"]["content"].as_array().expect("content");
+    |                              ^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0608`.
+error: could not compile `remuda-driver` (lib test) due to 2 previous errors

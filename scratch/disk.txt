@@ -1,0 +1,19 @@
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb       1007G  961G  8.9M 100% /home/wangruming.nana
+---mount---
+---sizes---
+316K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-math
+320K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-modelpin
+320K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-tspec
+340K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-flakes2
+404K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-nodeflakes
+452K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-mkeybar
+660K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-deleg3
+704K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-mvoice
+952K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-uo2b
+960K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-uo13
+972K	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-askq
+1.3M	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-uo4
+1.4M	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-mfix
+1.4M	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-uo0
+4.4M	/home/wangruming.nana/t/claude-1001/-home-wangruming-nana-Projects-remuda-agents-wt-c-authrace

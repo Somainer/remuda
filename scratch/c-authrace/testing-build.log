@@ -1,0 +1,45 @@
+   Compiling displaydoc v0.2.7
+   Compiling agent-client-protocol v2.1.0
+   Compiling remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+   Compiling remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+   Compiling remuda-herdr v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-herdr)
+   Compiling remuda-claude-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-claude-wire)
+   Compiling axum v0.8.9
+   Compiling tracing-subscriber v0.3.23
+   Compiling tinystr v0.8.4
+   Compiling zerotrie v0.2.5
+   Compiling icu_locale_core v2.3.0
+   Compiling icu_collections v2.3.0
+   Compiling remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+   Compiling icu_provider v2.3.1
+   Compiling ring v0.17.14
+   Compiling icu_properties v2.3.0
+   Compiling icu_normalizer v2.3.0
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling rustls-webpki v0.103.15
+   Compiling url v2.5.8
+   Compiling rustls v0.23.44
+   Compiling tower-http v0.6.11
+   Compiling remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+   Compiling tokio-rustls v0.26.5
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.38s
+  Executable unittests src/lib.rs (target-authrace/debug/deps/remuda_testing-390f99e7b9d3d1e3)
+  Executable unittests src/bin/fake-claude.rs (target-authrace/debug/deps/fake_claude-54157076039175c9)
+  Executable unittests src/bin/fake-claude-replay.rs (target-authrace/debug/deps/fake_claude_replay-4e7c190864a901e3)
+  Executable unittests src/bin/fake-gateway.rs (target-authrace/debug/deps/fake_gateway-01f166937ed656dd)
+  Executable unittests src/bin/fake-harness.rs (target-authrace/debug/deps/fake_harness-6258768b2ec71030)
+  Executable unittests src/bin/fake-herdr.rs (target-authrace/debug/deps/fake_herdr-e61d593adb5a2448)
+  Executable unittests src/bin/m0-print-stub.rs (target-authrace/debug/deps/m0_print_stub-957ae69da3e806f6)
+  Executable tests/cua_capability.rs (target-authrace/debug/deps/cua_capability-3e817a9915aac1ad)
+  Executable tests/fake_gateway.rs (target-authrace/debug/deps/fake_gateway-b711ee097fec053d)
+  Executable tests/fake_harness.rs (target-authrace/debug/deps/fake_harness-84f23f86b5d4e5bd)
+  Executable tests/fake_herdr.rs (target-authrace/debug/deps/fake_herdr-9884bb6c10542b85)
+  Executable tests/fake_herdr_lifecycle.rs (target-authrace/debug/deps/fake_herdr_lifecycle-e522df3c74ca8e8b)
+  Executable tests/golden_screens.rs (target-authrace/debug/deps/golden_screens-5fe16a055b0cd309)
+  Executable tests/m0_slice.rs (target-authrace/debug/deps/m0_slice-dfeaa6587f936393)
+  Executable tests/scripts.rs (target-authrace/debug/deps/scripts-04ba9ca2471be480)

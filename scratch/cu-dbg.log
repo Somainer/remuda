@@ -1,0 +1,14 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+error[E0382]: borrow of moved value: `*payload`
+  --> crates/remuda-driver/tests/usage_transcript.rs:63:65
+   |
+62 |                     if by_id.insert(payload.scope_id.clone(), *payload).is_some() {
+   |                                                               -------- value moved here
+63 |                         eprintln!("DUP scope_id={} all_len={}", payload.scope_id, all.len());
+   |                                                                 ^^^^^^^^^^^^^^^^ value borrowed here after move
+   |
+   = note: move occurs because `*payload` has type `UsagePayload`, which does not implement the `Copy` trait
+   = note: this error originates in the macro `$crate::format_args_nl` which comes from the expansion of the macro `eprintln` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+For more information about this error, try `rustc --explain E0382`.
+error: could not compile `remuda-driver` (test "usage_transcript") due to 1 previous error

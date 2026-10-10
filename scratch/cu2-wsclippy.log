@@ -1,0 +1,94 @@
+    Checking subtle v2.6.1
+    Checking tokio v1.53.1
+    Checking aho-corasick v1.1.5
+    Checking crossbeam-utils v0.8.23
+   Compiling remuda-hub v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub)
+    Checking bstr v1.13.1
+    Checking quick-xml v0.42.0
+    Checking base64 v0.23.1
+    Checking digest v0.10.7
+    Checking universal-hash v0.5.1
+    Checking poly1305 v0.8.0
+    Checking sha2 v0.10.9
+    Checking sha1 v0.10.7
+    Checking concurrent-queue v2.5.0
+    Checking tungstenite v0.29.0
+    Checking rustls v0.23.44
+    Checking chacha20poly1305 v0.10.1
+    Checking async-io v2.6.0
+    Checking remuda-protocol v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-protocol)
+    Checking async-channel v2.5.0
+    Checking hmac v0.12.1
+    Checking blocking v1.7.0
+    Checking hkdf v0.12.4
+    Checking ff v0.13.1
+    Checking async-signal v0.2.14
+    Checking signature v2.2.0
+    Checking regex-automata v0.4.18
+    Checking group v0.13.0
+    Checking crypto-bigint v0.5.5
+    Checking sec1 v0.7.3
+    Checking async-process v2.5.0
+    Checking rfc6979 v0.4.0
+    Checking rsa v0.9.10
+    Checking hmac-sha256 v1.1.14
+    Checking agent-client-protocol v2.1.0
+    Checking hmac-sha512 v1.1.12
+    Checking ece v2.3.1
+    Checking superboring v0.1.14
+    Checking blake2 v0.10.6
+    Checking password-hash v0.5.0
+    Checking argon2 v0.5.3
+    Checking elliptic-curve v0.13.8
+    Checking crossbeam-epoch v0.9.21
+    Checking ecdsa v0.16.9
+    Checking primeorder v0.13.6
+    Checking crossbeam-deque v0.8.8
+    Checking plist v1.10.1
+    Checking glob v0.3.4
+    Checking k256 v0.13.4
+    Checking p384 v0.13.1
+    Checking p256 v0.13.2
+   Compiling deranged v0.5.8
+   Compiling powerfmt v0.2.0
+    Checking jwt-simple v0.12.17
+    Checking tungstenite v0.28.0
+    Checking matchers v0.2.0
+    Checking regex v1.13.1
+    Checking tracing-subscriber v0.3.23
+    Checking pem v0.8.3
+    Checking sec1_decode v0.1.0
+    Checking globset v0.4.20
+    Checking fancy-regex v0.19.1
+    Checking web-push v0.11.0
+    Checking ignore v0.4.33
+   Compiling time v0.3.55
+    Checking remuda-rules v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-rules)
+    Checking tokio-util v0.7.19
+    Checking hyper v1.11.1
+    Checking tower v0.5.3
+    Checking tokio-tungstenite v0.29.0
+    Checking remuda-claude-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-claude-wire)
+    Checking remuda-herdr v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-herdr)
+    Checking remuda-acp-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-acp-wire)
+    Checking tokio-rustls v0.26.5
+    Checking tower-http v0.6.11
+    Checking tokio-tungstenite v0.28.0
+    Checking jsonschema v0.56.0
+    Checking hyper-util v0.1.20
+    Checking remuda-ssh v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-ssh)
+    Checking remuda-codex-wire v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-codex-wire)
+    Checking axum v0.8.9
+    Checking hyper-rustls v0.27.9
+    Checking reqwest v0.12.28
+   Compiling remuda v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda)
+    Checking remuda-hub-client v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-hub-client)
+    Checking remuda-push v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-push)
+    Checking remuda-screen v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-screen)
+    Checking remuda-signal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-signal)
+    Checking remuda-journal v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-journal)
+    Checking remuda-feishu v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-feishu)
+    Checking remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+    Checking remuda-testing v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-testing)
+    Checking remuda-node v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-node)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 55.56s

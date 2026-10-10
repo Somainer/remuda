@@ -1,0 +1,194 @@
+diff --git a/web/src/lib/store.ts b/web/src/lib/store.ts
+index 93ca3a8b..0fcfc6d4 100644
+--- a/web/src/lib/store.ts
++++ b/web/src/lib/store.ts
+@@ -654,6 +654,14 @@ class HubStore {
+   private outboxDegraded = false;
+   private connectionBoundTo: Id | null = null;
+   private connectionBoundJournal: Id | null = null;
++  /**
++   * Monotonic generation of {@link connectionBoundJournal}: bumped only when
++   * the machine is (re)bound to a DIFFERENT journal. A follow mount captures
++   * its generation and may settle the machine's attempt only while it is still
++   * current — navigating A → B mid-seed supersedes A, whose late success must
++   * not certify B and whose late failure must not take B offline.
++   */
++  private connectionBindGen = 0;
+   private outboxInit: Promise<boolean> | null = null;
+ 
+   /**
+@@ -1282,6 +1290,34 @@ class HubStore {
+   private followReadyState = new Map<Id, () => number>();
+   private followFrameAt = new Map<Id, number>();
+ 
++  /**
++   * Bind the connection machine to a session. The generation bumps only when
++   * the journal changes: the reconnect resume's nested follow() of the SAME
++   * journal shares the in-flight attempt, while a user navigation A → B
++   * supersedes any attempt A still owns. Returns the generation the mount
++   * must report back with.
++   */
++  private bindConnection(instanceId: Id, journalId: Id): number {
++    if (this.connectionBoundJournal !== journalId) this.connectionBindGen += 1;
++    this.connectionBoundTo = instanceId;
++    this.connectionBoundJournal = journalId;
++    this.connection?.noteBinding(this.connectionBindGen);
++    return this.connectionBindGen;
++  }
++
++  /**
++   * Rebind to a journal ANOTHER mount already finished loading (navigation
++   * back, or a racing same-journal mount whose seed won): its OPEN fresh
++   * socket certifies live immediately and closes an attempt a superseded
++   * mount still owned; a dead socket starts a fresh recovery for THIS binding
++   * instead of inheriting the previous mount's watchdog.
++   */
++  private rebindMountedConnection() {
++    if (!this.connection) return;
++    if (this.followSocketLive()) this.connection.followRebindLive();
++    else this.connection.dispatch({ type: "resume" });
++  }
++
+   /**
+    * The follow link is genuinely live only when the socket is OPEN AND a frame
+    * arrived within LIVE_FRAME_MS. This is the ONLY thing that lets a
+@@ -1409,9 +1445,14 @@ class HubStore {
+   /** Foreground trigger used by Shell/PhoneShell (replaces raw catchup). */
+   resumeActive(instanceId: Id | null) {
+     if (instanceId) {
+-      this.connectionBoundTo = instanceId;
+       const j = this.state.instances.find((i) => i.id === instanceId)?.journalId;
+-      this.connectionBoundJournal = j ?? null;
++      if (j) this.bindConnection(instanceId, j);
++      else {
++        // Not in the local projection yet: reopenFollow re-fetches the
++        // instance and discovers its journal; no generation to bump.
++        this.connectionBoundTo = instanceId;
++        this.connectionBoundJournal = null;
++      }
+     }
+     this.connection?.dispatch({ type: "resume" });
+     if (!this.connection && instanceId) void this.catchup(instanceId);
+@@ -2009,6 +2059,7 @@ class HubStore {
+     this.connection = null;
+     this.connectionBoundTo = null;
+     this.connectionBoundJournal = null;
++    this.connectionBindGen = 0;
+     this.followReadyState.clear();
+     this.followFrameAt.clear();
+     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
+@@ -2267,9 +2318,9 @@ class HubStore {
+     // opened: if the subscribe fails while the Hub is unreachable (offline
+     // reload), the machine's reconnect resume must still know which instance
+     // to reopen — binding only after a successful open left reloaded sessions
+-    // with a delivered row but no follow and no journal join.
+-    this.connectionBoundTo = instance.id;
+-    this.connectionBoundJournal = instance.journalId;
++    // with a delivered row but no follow and no journal join. The binding
++    // generation supersedes any mount still in flight for another journal.
++    const bindGen = this.bindConnection(instance.id, instance.journalId);
+     if (!this.state.instances.some((i) => i.id === instanceId)) {
+       this.emit({ instances: [instance, ...this.state.instances] });
+     }
+@@ -2280,13 +2331,10 @@ class HubStore {
+     // whose socket stayed open): rebind the connection machine to THIS
+     // follow. The global state was previously driven by the socket the user
+     // just left; revalidate the re-bound one immediately — certify live when
+-    // its socket is OPEN+fresh, otherwise arm the bind deadline so a dead
+-    // socket is reopened rather than inherited as a false live.
++    // its socket is OPEN+fresh, otherwise arm recovery for this binding
++    // rather than inherit the previous mount's watchdog.
+     if (this.journals.has(instance.journalId)) {
+-      this.connectionBoundTo = instanceId;
+-      this.connectionBoundJournal = instance.journalId;
+-      if (this.followSocketLive()) this.connection?.dispatch({ type: "frame" });
+-      else this.connection?.followBound();
++      this.rebindMountedConnection();
+       return;
+     }
+     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
+@@ -2295,15 +2343,20 @@ class HubStore {
+     // strand the session "live" with no reconnect timer. The machine arms the
+     // recovering watchdog now; success is reported once the subscribe
+     // snapshot certifies the socket, failure goes offline and schedules.
+-    const attemptId = this.connection?.followAttemptBegin();
++    const attemptId = this.connection?.followAttemptBegin(bindGen);
+     try {
+       // Seed from ONE bounded tail window (newest rows win). The old ascending
+       // 512-loop sliced the front of the tail, silently dropping everything
+       // below the middle of the window on a long journal. Older rows load on
+       // demand via JournalClient.loadEarlier.
+       const seed = await api.eventsRead({ journalId: instance.journalId, limit: 2000 });
+-      // Another mount may finish loading this journal while this read is pending.
+-      if (this.journals.has(instance.journalId)) return;
++      // Another mount may finish loading this journal while this read is
++      // pending. It now owns the bound attempt for THIS journal — hand its
++      // mounted socket the machine slot instead of dropping the attempt.
++      if (this.journals.has(instance.journalId)) {
++        this.rebindMountedConnection();
++        return;
++      }
+       const history = seed.events;
+       const historyPhrase = liveSummary(history);
+       this.emit({
+@@ -2445,15 +2498,33 @@ class HubStore {
+         complete: seed.reachedAfterSeq,
+       });
+       // The subscribe snapshot certified the socket over this exact mount:
+-      // report success so the recovering watchdog is cleared for this attempt.
+-      if (this.connection && attemptId !== undefined) this.connection.followAttemptEnd(true, attemptId);
++      // report success so the recovering watchdog is cleared for this attempt
++      // — but only while THIS mount is still the bound one: a mount the user
++      // navigated away from mid-seed must not certify the new session.
++      if (
++        this.connection &&
++        attemptId !== undefined &&
++        bindGen === this.connectionBindGen &&
++        this.connectionBoundJournal === instance.journalId
++      ) {
++        this.connection.followAttemptEnd(true, attemptId, bindGen);
++      }
+       // (connectionBoundTo/Journal were bound at the top of follow(), so the
+       // machine owns this session even when this first open failed offline.)
+     } catch (err) {
+       // Seed/subscribe failure: never leave a false live. Go offline (the
+       // bounded reconnect loop retries this exact mount via resumeConnection
+-      // → reopenFollow → follow) and surface the failure to the caller.
+-      if (this.connection && attemptId !== undefined) this.connection.followAttemptEnd(false, attemptId);
++      // → reopenFollow → follow) and surface the failure to the caller. A
++      // failure belongs to a superseded mount, though: it must not take the
++      // newly bound session offline, so it is reported only while still bound.
++      if (
++        this.connection &&
++        attemptId !== undefined &&
++        bindGen === this.connectionBindGen &&
++        this.connectionBoundJournal === instance.journalId
++      ) {
++        this.connection.followAttemptEnd(false, attemptId, bindGen);
++      }
+       throw err;
+     }
+   }
+@@ -2473,8 +2544,10 @@ class HubStore {
+     // The active session's link claim starts here: the machine requires a
+     // frame within LIVE_FRAME_MS of the socket opening (a silent open must not
+     // keep 已连接 over a frozen transcript). The subscribe snapshot/any event
+-    // dispatches {frame} and satisfies it.
+-    this.connection?.followBound();
++    // dispatches {frame} and satisfies it. Only the CURRENTLY BOUND mount may
++    // arm the claim: a superseded mount's socket opening late must not
++    // start/reset the bind deadline for the new binding.
++    if (this.connectionBoundJournal === instance.journalId) this.connection?.followBound();
+     const sub = await api.eventsSubscribe(
+       instance.journalId,
+       afterSeq,
+@@ -2576,8 +2649,7 @@ class HubStore {
+   async catchup(instanceId: Id) {
+     const instance = this.state.instances.find((i) => i.id === instanceId);
+     if (!instance) return;
+-    this.connectionBoundTo = instanceId;
+-    this.connectionBoundJournal = instance.journalId;
++    this.bindConnection(instanceId, instance.journalId);
+     if (this.connection) {
+       const client = this.journals.get(instance.journalId);
+       // The 只读 banner Retry (and foreground catch-up) must heal a journal

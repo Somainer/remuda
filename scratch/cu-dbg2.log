@@ -1,0 +1,19 @@
+   Compiling remuda-driver v0.1.0 (/home/wangruming.nana/Projects/remuda-agents/wt/c-authrace/crates/remuda-driver)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.68s
+     Running tests/usage_transcript.rs (target-fs2/debug/deps/usage_transcript-cb085e58e2324823)
+
+running 1 test
+
+thread 'one_usage_observation_per_finished_assistant_message_with_known_cache_buckets' (2456137) panicked at crates/remuda-driver/tests/usage_transcript.rs:44:10:
+fixture dir: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test one_usage_observation_per_finished_assistant_message_with_known_cache_buckets ... FAILED
+
+failures:
+
+failures:
+    one_usage_observation_per_finished_assistant_message_with_known_cache_buckets
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p remuda-driver --test usage_transcript`

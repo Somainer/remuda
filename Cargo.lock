@@ -3397,6 +3397,7 @@ dependencies = [
  "remuda-herdr",
  "remuda-hub",
  "remuda-journal",
+ "remuda-node",
  "remuda-protocol",
  "remuda-signal",
  "remuda-testing",

@@ -7,6 +7,13 @@ rust-version.workspace = true
 publish = false
 description = "Node instance management and outbound Hub connection."
 
+[features]
+default = []
+# Test-only fault/race hooks (gate.run entry holds and similar). Enabling
+# the feature exposes them in a non-test build; the production default and
+# the shipped binary carry none of the fields or call sites.
+test-faults = []
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
@@ -56,6 +63,9 @@ plist = { version = "1.10.1", default-features = false }
 portable-pty.workspace = true
 remuda-driver = { workspace = true, features = ["test-stub"] }
 remuda-hub.workspace = true
+# Self dependency enabling the test-only race/fault hooks in `cargo test`
+# (the pattern remuda-hub uses for its test-faults feature).
+remuda-node = { path = ".", features = ["test-faults"] }
 remuda-testing.workspace = true
 serde_json.workspace = true
 tempfile = "3"

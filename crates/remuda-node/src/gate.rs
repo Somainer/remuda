@@ -577,6 +577,12 @@ pub(crate) struct GateRegistry {
     lanes: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     /// Live runs plus cancel-before-registration tombstones (one lock).
     runs: Mutex<GateRunTable>,
+    /// Test-only holds that park the NEXT gate.run handler at its entry (the
+    /// cancel-beats-run race needs the run frame to be in flight, before the
+    /// registry and lane are touched, when gate.cancel arrives). One-shot:
+    /// parked at the entry and consumed by the first run.
+    #[cfg(any(test, feature = "test-faults"))]
+    run_holds: Mutex<Vec<Arc<GateRunHold>>>,
     events: tokio::sync::broadcast::Sender<GateEventParams>,
 }
 
@@ -586,7 +592,30 @@ impl GateRegistry {
         Self {
             lanes: Mutex::new(BTreeMap::new()),
             runs: Mutex::new(GateRunTable::new()),
+            #[cfg(any(test, feature = "test-faults"))]
+            run_holds: Mutex::new(Vec::new()),
             events,
+        }
+    }
+
+    /// Test-only: park the next `gate.run` at the handler entry on this hold.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn arm_run_hold(&self, hold: Arc<GateRunHold>) {
+        self.run_holds.lock().await.push(hold);
+    }
+
+    /// Test-only: take and await all armed entry holds for one gate.run,
+    /// BEFORE the tombstone check and the lane slot.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn await_run_holds(&self, job_id: &str) {
+        let holds = {
+            let mut armed = self.run_holds.lock().await;
+            std::mem::take(&mut *armed)
+        };
+        for hold in holds {
+            *hold.job_id.lock().expect("hold job id") = Some(job_id.to_owned());
+            hold.arrived.notify_waiters();
+            hold.release.notified().await;
         }
     }
 
@@ -596,7 +625,70 @@ impl GateRegistry {
     }
 }
 
+/// Test-only gate.run entry hold. The run parks until `release` is called;
+/// `wait_arrived` resolves with the dispatched job id once the frame has
+/// reached the Node handler (claim already committed on the Hub) and is
+/// parked before the run registry / lane / git steps.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub struct GateRunHold {
+    arrived: tokio::sync::Notify,
+    job_id: std::sync::Mutex<Option<String>>,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl Default for GateRunHold {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl GateRunHold {
+    /// Create a disarmed hold; arm it on a Node with
+    /// [`DevNode::gate_test_arm_run_hold`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            arrived: tokio::sync::Notify::new(),
+            job_id: std::sync::Mutex::new(None),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Wait until the held gate.run frame arrives at the Node; returns its
+    /// job id.
+    pub async fn wait_arrived(&self) -> String {
+        loop {
+            if let Some(job_id) = self.job_id.lock().expect("hold job id").clone() {
+                return job_id;
+            }
+            let notified = self.arrived.notified();
+            if let Some(job_id) = self.job_id.lock().expect("hold job id").clone() {
+                return job_id;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the parked gate.run so its handler proceeds.
+    pub fn release(&self) {
+        self.release.notify_waiters();
+    }
+}
+
 impl DevNode {
+    /// Test-only: arm a hold that parks the NEXT Hub-dispatched `gate.run`
+    /// at the handler entry (before run registration, the lane slot and any
+    /// git step), so a test can deterministically land `gate.cancel` while
+    /// the run frame is genuinely in flight over the real carrier.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_arm_run_hold(&self, hold: std::sync::Arc<GateRunHold>) {
+        self.gate_registry().arm_run_hold(hold).await;
+    }
+
     /// Dispatch one Hub→Node gate RPC by method name.
     ///
     /// The carrier in `server.rs` routes each method directly; this is the
@@ -727,6 +819,11 @@ impl DevNode {
 
     async fn run_gate_typed(&self, request: GateRunParams) -> Result<GateRunResult, NodeError> {
         let registry = self.gate_registry();
+        // Test-only entry hold: parks with the frame in flight (Hub claim
+        // already committed, run unregistered) so a test can land
+        // gate.cancel before the handler proceeds. Runs before ANY state.
+        #[cfg(any(test, feature = "test-faults"))]
+        registry.await_run_holds(&request.job_id).await;
         // A gate.cancel that overtook dispatch and was acked while no run was
         // registered left a tombstone. Check it before touching the lane so a
         // canceled job never reports lane-busy; the decisive re-check below

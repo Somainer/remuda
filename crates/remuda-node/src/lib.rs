@@ -129,6 +129,10 @@ pub use signal::{
 // Hook-channel silence diagnostics live in remuda-signal next to the socket
 // they probe; re-exported here as the Node-owned surface the instance badge
 // reads.
+/// Test-only gate.run entry hold for carrier-level cancel-race tests.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub use gate::GateRunHold;
 pub use remuda_signal::hook_silence::{
     HookSilenceProbes, HookSilenceReason, classify as classify_hook_silence,
     diagnose as diagnose_hook_silence, link_fresh as hook_link_fresh,

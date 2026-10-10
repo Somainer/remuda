@@ -436,6 +436,7 @@ impl DevNode {
                     finish_instance_operation(
                         self.inner.store.as_ref(),
                         instance_id,
+                        driver.kind(),
                         &DriverRequest::Close,
                     )?;
                 }
@@ -1799,7 +1800,12 @@ async fn pump_one_observation(
     // Finally, the print/sdk engine's own turn events (ma-sdk-state r3):
     // turn/turn_started sets working; a settled turn/result idles exactly
     // like a successful turn end even when the result is a turn failure
-    // (c-cardsettle r5 item 4) — never failing the instance.
+    // (c-cardsettle r5 item 4) — never failing the instance. The
+    // cardsettle r5-item-4 fallback (an UNSETTLED root result/error still
+    // frees the composer) must run AFTER the explicit engine decision: the
+    // merge with ma-sdk-state had dropped it, which let a mapper-bypassed
+    // failed result stick the root at working (the Hub derive keeps both
+    // arms; Node and Hub must agree).
     let activity = hook_activity
         .or_else(|| match store.get_instance(instance_id) {
             Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
@@ -1807,7 +1813,8 @@ async fn pump_one_observation(
             }
             _ => None,
         })
-        .or_else(|| crate::signal::engine_turn_activity(&observation));
+        .or_else(|| crate::signal::engine_turn_activity(&observation))
+        .or_else(|| root_turn_failure_activity(&observation));
     if let Some(activity) = activity
         && let Err(error) = store.set_instance_state(
             instance_id,
@@ -2296,7 +2303,7 @@ async fn execute_queued(
                 )?;
                 interactions.ingest(&observation).await?;
             }
-            finish_instance_operation(store.as_ref(), instance_id, &queued.request)?;
+            finish_instance_operation(store.as_ref(), instance_id, driver.kind(), &queued.request)?;
             settle_command(
                 &mut command,
                 SettlementOutcome::Completed,
@@ -2370,6 +2377,7 @@ fn notify_carrier(
 fn finish_instance_operation(
     store: &dyn LocalStore,
     instance_id: &InstanceId,
+    kind: remuda_protocol::DriverKind,
     request: &DriverRequest,
 ) -> Result<(), NodeError> {
     match request {
@@ -2393,13 +2401,22 @@ fn finish_instance_operation(
         | DriverRequest::Cancel
         | DriverRequest::SendKeys { .. }
         | DriverRequest::Configure { .. } => {
-            store.set_instance_state(
-                instance_id,
-                None,
-                Some(Knowledge::Known {
-                    value: Activity::Idle,
-                }),
-            )?;
+            // ma-sdk-state r4 item 2: on the structured print/sdk carriers a
+            // transport acknowledgement is not turn evidence. The
+            // turn_started observation sets working and the SETTLED result (or
+            // process end) idles; stamping idle here overwrote a working that
+            // the pump applied from turn_started, and any successful control
+            // during a turn did the same. PTY carriers have no native turn
+            // lifecycle, so the ack stays their idle signal.
+            if !crate::signal::structured_engine_turn_carrier(kind) {
+                store.set_instance_state(
+                    instance_id,
+                    None,
+                    Some(Knowledge::Known {
+                        value: Activity::Idle,
+                    }),
+                )?;
+            }
         }
         DriverRequest::RespondInteraction { .. } => {}
     }
@@ -2770,9 +2787,13 @@ fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &N
 /// `process_end` evidence is terminal. Subagent scope, configure and
 /// diagnostic topics return None (own scope). Mirrors the Hub's
 /// `root_turn_failed` derivation so Node local state and the Hub agree.
-/// Superseded by `signal::engine_turn_activity` (which also folds turn_started
-/// and the settled-result flag); retained for the scoping unit tests below.
-#[cfg(test)]
+///
+/// Runs in the observation pump AFTER
+/// `signal::engine_turn_activity`: that fold handles turn_started and the
+/// explicit `settledRootTurn` decision, while this is the r5-item-4 fallback
+/// for an UNSETTLED result/error (older journals and mapper-bypassed tests).
+/// In the live mapper output a root error already carries the settled flag,
+/// so the two arms agree on the real stream.
 fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Option<Activity> {
     let ObservationPayload::Lifecycle(payload) = &observation.body else {
         return None;
@@ -4366,6 +4387,171 @@ mod tests {
 
         drop(tx);
         pump.await.unwrap();
+    }
+
+    /// ma-sdk-state r4 item 2: on a structured print/sdk carrier a command's
+    /// TRANSPORT acknowledgement is not turn evidence. The command completion
+    /// is held until the turn_started observation has already applied
+    /// working; the ack must leave the working state alone, and only the
+    /// settled result idles. A PTY carrier keeps the old ack-idles behaviour.
+    #[tokio::test]
+    async fn structured_carrier_command_ack_keeps_turn_working_until_result() {
+        use remuda_protocol::{Activity, DriverKind, InputOrigin, PromptMode};
+
+        async fn wait_activity(
+            store: &Arc<dyn LocalStore>,
+            id: &InstanceId,
+            want: Activity,
+        ) -> Instance {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let row = store.get_instance(id).unwrap();
+                if let remuda_protocol::Knowledge::Known { value } = &row.activity
+                    && *value == want
+                {
+                    return row;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("activity never reached {want:?}: {row:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        let send = DriverRequest::Send {
+            prompt: "do the thing".to_owned(),
+            attachments: Vec::new(),
+            origin: InputOrigin::Human,
+            mode: PromptMode::NewTurn,
+        };
+
+        // ── Structured sdk carrier ──────────────────────────────────────────
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudeSdk,
+        )
+        .unwrap();
+        let id = instance.meta.id.clone();
+        store.insert_instance(instance).unwrap();
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+        );
+
+        // Hold the command completion until the start observation is applied.
+        let mut started = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "turn_started",
+            "sess-item2",
+            &[("nativeClientMessageId", "msg-item2")],
+            remuda_protocol::Severity::Info,
+            false,
+            "working",
+        );
+        started.source.driver_kind = DriverKind::ClaudeSdk;
+        tx.send(started).await.unwrap();
+        wait_activity(&store, &id, Activity::Working).await;
+
+        // The write ack lands AFTER the start: the Send ack must not idle.
+        finish_instance_operation(store.as_ref(), &id, DriverKind::ClaudeSdk, &send).unwrap();
+        let row = store.get_instance(&id).unwrap();
+        assert_eq!(
+            row.activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Working
+            },
+            "the send ack must not overwrite the turn_started working state"
+        );
+        // Any other successful control ack during the turn is just as inert.
+        finish_instance_operation(
+            store.as_ref(),
+            &id,
+            DriverKind::ClaudeSdk,
+            &DriverRequest::Cancel,
+        )
+        .unwrap();
+        finish_instance_operation(
+            store.as_ref(),
+            &id,
+            DriverKind::ClaudeSdk,
+            &DriverRequest::Configure {
+                model: Some("haiku".to_owned()),
+                effort: None,
+                effort_index: None,
+                permission_mode: None,
+            },
+        )
+        .unwrap();
+        let row = store.get_instance(&id).unwrap();
+        assert_eq!(
+            row.activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Working
+            },
+            "cancel/configure acks keep the native turn state"
+        );
+
+        // Only the settled result ends the turn.
+        let mut result = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-item2",
+            &[
+                ("resultIndex", "0"),
+                ("queuedTurnCount", "0"),
+                ("settledRootTurn", "true"),
+            ],
+            remuda_protocol::Severity::Info,
+            false,
+            "turn_done",
+        );
+        result.source.driver_kind = DriverKind::ClaudeSdk;
+        tx.send(result).await.unwrap();
+        let row = wait_activity(&store, &id, Activity::Idle).await;
+        assert_eq!(
+            row.lifecycle,
+            InstanceLifecycle::Ready,
+            "a turn result idles without ending the sdk process"
+        );
+        drop(tx);
+        pump.await.unwrap();
+
+        // ── PTY carrier keeps the ack-idles behaviour ───────────────────────
+        let pty: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let pty_instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ShellPty,
+        )
+        .unwrap();
+        let pty_id = pty_instance.meta.id.clone();
+        pty.insert_instance(pty_instance).unwrap();
+        pty.set_instance_state(
+            &pty_id,
+            None,
+            Some(remuda_protocol::Knowledge::Known {
+                value: Activity::Working,
+            }),
+        )
+        .unwrap();
+        finish_instance_operation(pty.as_ref(), &pty_id, DriverKind::ShellPty, &send).unwrap();
+        assert_eq!(
+            pty.get_instance(&pty_id).unwrap().activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Idle
+            },
+            "a PTY carrier has no native turn lifecycle: its ack still idles"
+        );
     }
 
     /// c-cardsettle r7 item 5 (was r5 item 3, strengthened): the owner's

@@ -165,6 +165,18 @@ pub fn hook_activity(observation: &Observation) -> Option<remuda_protocol::Activ
     }
 }
 
+/// Whether this carrier reports its root-turn working/idle directly through
+/// `turn/turn_started` + settled `turn/result` observations (the structured
+/// stdio print/sdk engines). For these carriers a transport ack of a control
+/// command is NOT activity evidence (ma-sdk-state r4 item 2).
+#[must_use]
+pub fn structured_engine_turn_carrier(kind: remuda_protocol::DriverKind) -> bool {
+    matches!(
+        kind,
+        remuda_protocol::DriverKind::ClaudePrint | remuda_protocol::DriverKind::ClaudeSdk
+    )
+}
+
 /// The activity the print/sdk engine's own turn lifecycle proves (D-057 OA6,
 /// ma-sdk-state).
 ///
@@ -190,10 +202,7 @@ pub fn hook_activity(observation: &Observation) -> Option<remuda_protocol::Activ
 #[must_use]
 pub fn engine_turn_activity(observation: &Observation) -> Option<remuda_protocol::Activity> {
     use remuda_protocol::Activity;
-    if !matches!(
-        observation.source.driver_kind,
-        remuda_protocol::DriverKind::ClaudePrint | remuda_protocol::DriverKind::ClaudeSdk
-    ) {
+    if !structured_engine_turn_carrier(observation.source.driver_kind) {
         return None;
     }
     let ObservationPayload::Lifecycle(payload) = &observation.body else {

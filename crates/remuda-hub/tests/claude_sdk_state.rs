@@ -922,7 +922,6 @@ async fn a_replay_local_root_turn_from_the_real_mapper_projects_working_then_idl
         Some(&json!("true")),
         "B is the last outstanding turn: its result settles"
     );
-    let seq = ctx.durable_seq(&id).await;
     node.append(&id, result_b);
     ctx.wait_until(&id, |v| v["activity"] == json!("idle"))
         .await;

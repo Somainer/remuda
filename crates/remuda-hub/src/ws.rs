@@ -647,21 +647,39 @@ pub(crate) async fn handle_node_method(
             // cannot smuggle one long transaction past the count cap
             // (hub-store-1).
             for range in crate::store::journal_append_chunks(&events) {
-                // r8 item 4: hold the settlement publication lock across the
-                // batch transaction AND the settlement sends, so a concurrent
-                // delete/sweep can never publish before a journal exit that
-                // committed earlier.
-                let _settlement_order = state.settlement_publish_lock().await;
-                let appended_chunk = state
-                    .store
-                    .append_journal_batch(
-                        host_id.clone(),
-                        instance_id.clone(),
-                        next_seq,
-                        events[range].to_vec(),
-                    )
-                    .await
-                    .map_err(map_host_store)?;
+                // r8 item 4 / r9 item 4(c): the publication lock covers ONLY
+                // the settling commit and the settlement-bus sends, so a
+                // concurrent delete/sweep can never publish before a journal
+                // exit that committed earlier. It must NOT wrap the loop
+                // below — the journal-bus publish and the alerts/usage/supply
+                // observers await on unrelated resources; holding a global
+                // lock across them serialised every journal ingest on the
+                // Hub. Guards drop at the block's end, before those runs.
+                let appended_chunk = {
+                    let _settlement_order = state.settlement_publish_lock().await;
+                    let chunk = state
+                        .store
+                        .append_journal_batch(
+                            host_id.clone(),
+                            instance_id.clone(),
+                            next_seq,
+                            events[range].to_vec(),
+                        )
+                        .await
+                        .map_err(map_host_store)?;
+                    for appended in &chunk {
+                        // c-cardsettle: cards a terminal transaction
+                        // invalidated commit with the append; tell followers
+                        // immediately (a seq-less settlement control frame).
+                        // Broadcast even for REPLAYED rows: a request replayed
+                        // by a Node after the hello reconcile ended its owner
+                        // is invalidated during replay (r7 item 1), and that
+                        // notice has no other publication path (no fresh
+                        // journal event follows it).
+                        state.broadcast_settlement(&appended.settlement);
+                    }
+                    chunk
+                };
                 for appended in appended_chunk {
                     if !appended.replayed {
                         publish_journal(&state.bus, &appended.record);
@@ -672,14 +690,6 @@ pub(crate) async fn handle_node_method(
                             instance_terminated = true;
                         }
                     }
-                    // c-cardsettle: cards a terminal transaction invalidated
-                    // commit with the append; tell followers immediately
-                    // (a seq-less settlement control frame). Broadcast even
-                    // for REPLAYED rows: a request replayed by a Node after
-                    // the hello reconcile ended its owner is invalidated
-                    // during replay (r7 item 1), and that notice has no other
-                    // publication path (no fresh journal event follows it).
-                    state.broadcast_settlement(&appended.settlement);
                     next_seq = Some(appended.record.seq.saturating_add(1));
                     last = Some(appended);
                 }
@@ -1410,6 +1420,23 @@ async fn drain_settlement_lag(
     cursor: &mut Option<String>,
     out_tx: &mpsc::Sender<FollowMsg>,
 ) -> Result<(), ()> {
+    // A lag drain always closes with the single gap frame.
+    drain_settlement_pages(store, instance_ids, cursor, out_tx, true).await
+}
+
+/// Page every settlement strictly after `cursor` through `out_tx`, advancing
+/// the cursor past EVERY row (including rows filtered out for a per-instance
+/// follower), in ascending monotonic seq order. `trailing_gap` sends the
+/// single settlement-backpressure gap after the pages — true for a Lagged
+/// recovery, FALSE for the startup catch-up (the follower is not lagging, it
+/// is closing the subscribe window).
+async fn drain_settlement_pages(
+    store: &crate::store::Store,
+    instance_ids: &[String],
+    cursor: &mut Option<String>,
+    out_tx: &mpsc::Sender<FollowMsg>,
+    trailing_gap: bool,
+) -> Result<(), ()> {
     loop {
         let page = store
             .invalidated_interactions_after(cursor.clone())
@@ -1443,8 +1470,11 @@ async fn drain_settlement_lag(
             break;
         }
     }
-    let gap = json!({ "type": "gap", "reason": "settlement-backpressure" }).to_string();
-    out_tx.send(FollowMsg::Text(gap)).await.map_err(|_| ())
+    if trailing_gap {
+        let gap = json!({ "type": "gap", "reason": "settlement-backpressure" }).to_string();
+        out_tx.send(FollowMsg::Text(gap)).await.map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 async fn follow_session(
@@ -1458,17 +1488,16 @@ async fn follow_session(
     let (out_tx, mut out_rx) = mpsc::channel::<FollowMsg>(cap);
     let (mut sink, mut stream) = socket.split();
     let mut rx = state.bus.subscribe();
-    // c-cardsettle: separate receiver on the dedicated settlement bus.
-    let mut settlement_rx = state.settlement_bus.subscribe();
-    // c-cardsettle r8 item 3: seed the durable delivery cursor at the
-    // position committed at SUBSCRIBE time. The subscription above is taken
-    // FIRST, so a settlement committing around subscribe is delivered by the
-    // bus as well (client de-dupes); every older settlement is already in the
-    // client's initial list and the connect replay, and the backpressure lag
-    // drain must never walk the entire life-of-database history from a `None`
-    // cursor (which stalls the single writer with hundreds of windowless
-    // pages). Erroring closed here is correct: a follower that could not read
-    // its start position cannot safely de-dupe either.
+    // c-cardsettle r9 item 4(a): read the durable seed BEFORE taking the
+    // settlement-bus subscription. The old order (subscribe, then read) still
+    // had a skip window: more than one ring of settlements committed between
+    // the read and the pump's first recv makes the brand-new receiver return
+    // Lagged with none of those notices consumed, and a drain seeded at the
+    // post-commit max then excludes them (`seq > cursor`). With the seed read
+    // FIRST, everything <= seed is covered by the initial list + connect
+    // replay; the pump's startup catch-up (no gap) drains every settlement
+    // committed AFTER the read, overlapping bus deliveries which the client
+    // de-dupes by interaction id. No settlement can fall in between.
     let mut settlement_cursor: Option<String> = match state.store.max_settlement_cursor().await {
         Ok(cursor) => cursor,
         Err(error) => {
@@ -1476,6 +1505,8 @@ async fn follow_session(
             return;
         }
     };
+    // c-cardsettle: separate receiver on the dedicated settlement bus.
+    let mut settlement_rx = state.settlement_bus.subscribe();
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
     for id in &instance_ids {
         state.followers.watch(device_id.clone(), id.clone()).await;
@@ -1524,6 +1555,24 @@ async fn follow_session(
                     return;
                 }
             }
+        }
+        // c-cardsettle r9 item 4(a): startup catch-up. Drain every settlement
+        // committed AFTER the pre-subscribe seed with NO trailing gap; rows at
+        // or before the seed are already covered by the list + connect replay.
+        // This closes the seed/subscribe window — a settlement committed in it
+        // is delivered here even if the brand-new receiver Lagged before its
+        // first recv (the bus copies overlap and are de-duped client-side).
+        if drain_settlement_pages(
+            &state.store,
+            &instance_ids,
+            &mut settlement_cursor,
+            &out_tx,
+            false,
+        )
+        .await
+        .is_err()
+        {
+            return;
         }
         loop {
             tokio::select! {

@@ -3,7 +3,7 @@
 use crate::AppState;
 use crate::auth::{device_cookie, hash_secret, require_device, require_origin};
 use crate::error::HubError;
-use crate::store::CommandRecord;
+use crate::store::{CommandRecord, StoreError};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -648,53 +648,55 @@ pub async fn delete_instance(
         }
     }
 
-    // c-cardsettle r11 item 3: run the delete AND its settlement broadcast
-    // under the publication-order lock. A journal exit on another connection
-    // could otherwise hold the lock, commit and broadcast N+1, then have
-    // this late N send overtake it: a follower taking cursor N+1 would lag
-    // across N. publish_settlement acquires the lock before the store
-    // operation and releases it only after the bus send, so a delete
-    // settlement is ordered against every other settlement exactly like an
-    // in-transaction one. This stays BEFORE the post-commit tail spawns.
-    let deleted_exists = state
-        .publish_settlement(async {
-            state
-                .store
-                .delete_instance(instance_id.clone())
-                .await
-                .map(|d| (d.is_some(), d.map(|d| d.settlement).unwrap_or_default()))
-        })
-        .await
-        .map_err(map_store)?;
-    if !deleted_exists {
-        return Err(HubError::NotFound);
+    // c-cardsettle-fu item 2: the WHOLE irreversible operation — the DB
+    // delete, the publication-ordered settlement broadcast, and the cleanup/
+    // audit tail (worktree returns, per-chapter instance.purge, audit row) —
+    // runs in one task DETACHED BEFORE the store call is enqueued. If the
+    // client disconnects after the request is accepted, hyper drops this
+    // handler future, but the detached task keeps running: the deletion
+    // commits, its settlement frame is published, and the audit/purge tail
+    // completes. Previously the delete+publish awaited inline and the tail
+    // was only spawned afterwards, so a drop between enqueue and response
+    // skipped the publication AND stranded the tail. A connected client
+    // still awaits the JoinHandle for the response.
+    //
+    // c-cardsettle r11 item 3 holds inside the task: delete + broadcast run
+    // under settlement_publish_lock, ordered against journal exits.
+    struct DeleteResult {
+        lease_returns: Vec<String>,
+        purge: String,
+        purge_outcomes: serde_json::Map<String, Value>,
+        chapter_ids: Vec<String>,
     }
+    let response_instance_id = instance_id.clone();
+    let op_state = state.clone();
+    let op = tokio::spawn(async move {
+        let state = op_state;
+        let chapters = chapters;
+        let instance_id = instance_id;
+        let device_id = device.id;
+        let host_id = instance.host_id;
+        let lifecycle = instance.lifecycle;
+        let lineage_id = instance.lineage_id;
 
-    // r10 item 4: the post-commit tail (worktree returns, per-chapter
-    // instance.purge, the durable audit) runs in its OWN task. The lineage
-    // rows are already gone; a CLIENT DISCONNECT dropping this handler future
-    // must not strand the lease returns/purges or leave a committed delete
-    // with no audit row. A live client still awaits the JoinHandle to build
-    // the response; dropping it (handler cancelled) detaches but does NOT
-    // cancel the tail, which runs to completion. This covers client
-    // cancellation only — a Hub shutdown aborts the server and closes the
-    // store, so an in-flight tail is not guaranteed to finish there (a future
-    // TaskTracker with bounded draining could cover that too).
-    let tail_state = state.clone();
-    let tail_chapters = chapters.clone();
-    let tail_instance_id = instance_id.clone();
-    let tail_device_id = device.id.clone();
-    let tail_host_id = instance.host_id.clone();
-    let tail_lifecycle = instance.lifecycle.clone();
-    let tail_lineage_id = instance.lineage_id.clone();
-    let tail = tokio::spawn(async move {
-        let state = tail_state;
-        let chapters = tail_chapters;
-        let instance_id = tail_instance_id;
-        let device_id = tail_device_id;
-        let host_id = tail_host_id;
-        let lifecycle = tail_lifecycle;
-        let lineage_id = tail_lineage_id;
+        // c-cardsettle-fu r1 item 2: park at the operation start when a test
+        // armed the seam. The park lives INSIDE the detached task, so aborting
+        // the handler future while parked cannot cancel the operation.
+        #[cfg(any(test, feature = "test-faults"))]
+        state.operation_parks.park_if_armed().await;
+
+        let deleted = state
+            .publish_settlement(async {
+                state
+                    .store
+                    .delete_instance(instance_id.clone())
+                    .await
+                    .map(|d| (d.is_some(), d.map(|d| d.settlement).unwrap_or_default()))
+            })
+            .await?;
+        if !deleted {
+            return Ok::<_, StoreError>(None);
+        }
 
         let mut lease_returns = Vec::new();
         let mut lease_keys_seen = std::collections::HashSet::new();
@@ -887,7 +889,7 @@ pub async fn delete_instance(
         state
         .store
         .append_audit(
-            device.id.clone(),
+            device_id.clone(),
             "instance.delete".into(),
             Some(instance_id.clone()),
             json!({
@@ -917,18 +919,27 @@ pub async fn delete_instance(
             .iter()
             .map(|chapter| chapter.instance_id.clone())
             .collect::<Vec<_>>();
-        (lease_returns, purge, purge_outcomes, chapter_ids)
+        Ok(Some(DeleteResult {
+            lease_returns,
+            purge,
+            purge_outcomes,
+            chapter_ids,
+        }))
     });
-    let (lease_returns, purge, purge_outcomes, chapter_ids) = tail
+    let result = op
         .await
-        .expect("post-commit instance.delete tail task panicked");
+        .map_err(|join| HubError::Internal(format!("instance.delete task panicked: {join}")))?
+        .map_err(map_store)?;
+    let Some(result) = result else {
+        return Err(HubError::NotFound);
+    };
     Ok(Json(json!({
         "deleted": true,
-        "instanceId": instance_id,
-        "nodePurge": purge,
-        "chapterPurges": Value::Object(purge_outcomes),
-        "chapterIds": chapter_ids,
-        "leaseReturns": lease_returns,
+        "instanceId": response_instance_id,
+        "nodePurge": result.purge,
+        "chapterPurges": Value::Object(result.purge_outcomes),
+        "chapterIds": result.chapter_ids,
+        "leaseReturns": result.lease_returns,
     })))
 }
 

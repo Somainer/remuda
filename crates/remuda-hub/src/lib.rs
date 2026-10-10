@@ -130,6 +130,10 @@ pub struct AppState {
     /// settlement pump; always present but never armed in production.
     #[cfg(any(test, feature = "test-faults"))]
     follow_parks: crate::ws::FollowParks,
+    /// c-cardsettle-fu r1 item 2: test-only park seam for the detached
+    /// irreversible delete operation; never armed in production.
+    #[cfg(any(test, feature = "test-faults"))]
+    operation_parks: crate::ws::OperationParks,
     tty: crate::ws::TtyRelay,
     /// D-048 relay stream registry (per-Hub-process).
     api_relay: crate::api_relay::ApiRelay,
@@ -749,6 +753,21 @@ impl RunningHub {
         self.state.follow_parks.arm(after_seq).await
     }
 
+    /// c-cardsettle-fu r1 item 2: arm a park at the start of the detached
+    /// irreversible delete operation. `reached` fires once the operation task
+    /// reaches the park; dropping/aborting the request while parked and then
+    /// releasing proves the task is detached and still completes.
+    #[cfg(any(test, feature = "test-faults"))]
+    #[doc(hidden)]
+    pub async fn test_arm_delete_park(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.state.operation_parks.arm().await
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into
@@ -1077,6 +1096,8 @@ async fn spawn_inner(
         settlement_publish: Arc::new(tokio::sync::Mutex::const_new(())),
         #[cfg(any(test, feature = "test-faults"))]
         follow_parks: crate::ws::FollowParks::default(),
+        #[cfg(any(test, feature = "test-faults"))]
+        operation_parks: crate::ws::OperationParks::default(),
         tty: crate::ws::TtyRelay::default(),
         api_relay: crate::api_relay::ApiRelay::new(),
         push,

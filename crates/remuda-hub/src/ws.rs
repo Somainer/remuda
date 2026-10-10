@@ -126,6 +126,50 @@ impl FollowParks {
     }
 }
 
+/// Test-only park seam for an irreversible HTTP operation (c-cardsettle-fu
+/// r1 item 2). Lets a test prove the operation runs in a DETACHED task that
+/// survives the handler future being cancelled on client disconnect: arm,
+/// start the request, wait until the operation parks, abort the request
+/// future (RST), then release — a detached task completes, an inline handler
+/// does not.
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Default, Clone)]
+pub(crate) struct OperationParks {
+    slot: Arc<tokio::sync::Mutex<Option<OperationParkSlot>>>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+struct OperationParkSlot {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl OperationParks {
+    pub(crate) async fn arm(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.slot.lock().await = Some(OperationParkSlot {
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    /// Park at the operation's start if armed; one-shot.
+    pub(crate) async fn park_if_armed(&self) {
+        if let Some(slot) = self.slot.lock().await.take() {
+            let _ = slot.reached.send(());
+            let _ = slot.release.await;
+        }
+    }
+}
+
 /// Live event for `/v1/follow`.
 #[derive(Clone, Debug)]
 pub struct FollowEvent {

@@ -96,6 +96,20 @@ impl WorkflowProducer {
                     _ => Vec::new(),
                 }
             }
+            // c-cardsettle r4 item 5 / r5 item 2: a StopFailure carrying a
+            // non-empty agentId is THAT workflow member's failure. StopFailure
+            // is always a failed stop (unlike SubagentStop, which fires for
+            // completed/failed/killed alike), so an explicit outcome tag is NOT
+            // required — the live fold does not stamp outcome for a subagent
+            // event, so requiring it meant a pre-SubagentStart StopFailure
+            // (the owner's recorded order) never marked the member. The member
+            // is resolved from agentId even without a transcript path or a
+            // prior SubagentStart (agent_failed creates it). Root StopFailure
+            // (no agentId) falls through and ends the root turn elsewhere.
+            "StopFailure" if related.get("agentId").is_some() => self.agent_failed(
+                related.get("agentId").map(String::as_str),
+                related.get("agentTranscriptPath").map(Path::new),
+            ),
             _ => Vec::new(),
         };
         envelopes
@@ -207,6 +221,19 @@ impl WorkflowProducer {
         path: Option<&Path>,
     ) -> Vec<remuda_journal::Envelope> {
         self.agent_event(agent_id.as_deref(), started, path)
+    }
+
+    /// c-cardsettle r4 item 5: mark one workflow member failed from a
+    /// subagent StopFailure.
+    fn agent_failed(
+        &mut self,
+        agent_id: Option<&str>,
+        path: Option<&Path>,
+    ) -> Vec<remuda_journal::Envelope> {
+        let (Some(agent_id), Some(tailer)) = (agent_id, self.tailer.as_mut()) else {
+            return Vec::new();
+        };
+        tailer.agent_failed(agent_id, path).unwrap_or_default()
     }
 
     fn ensure_tailer(
@@ -364,6 +391,23 @@ mod tests {
         }
     }
 
+    /// Like [`hook_observation`] but with the caller-chosen topic/name (the
+    /// owner's StopFailure-before-SubagentStart order arrives on topic=turn
+    /// without an outcome tag).
+    fn hook_observation_topic(
+        topic: remuda_protocol::LifecycleTopic,
+        name: &str,
+        related: BTreeMap<String, String>,
+    ) -> Observation {
+        let mut observation = hook_observation(name, related);
+        if let ObservationPayload::Lifecycle(payload) = &mut observation.body
+            && let LifecyclePayload::Native(native) = payload.as_mut()
+        {
+            native.topic = topic;
+        }
+        observation
+    }
+
     #[test]
     fn workflow_transcript_paths_are_recognized() {
         assert!(is_workflow_transcript(Path::new(
@@ -388,6 +432,103 @@ mod tests {
             BTreeMap::from([("toolName".into(), "Workflow".into())]),
         ));
         assert!(out.is_empty());
+    }
+
+    /// c-cardsettle r5 item 2 (owner's recorded order): a subagent
+    /// StopFailure that arrives BEFORE its SubagentStart, carrying an agentId
+    /// and NO outcome tag and NO agentTranscriptPath (the live fold returns
+    /// early for subagent scope and never stamps outcome), must still mark
+    /// exactly that workflow member Failed once the member is resolved from
+    /// agentId. The run's other members stay non-failed.
+    #[test]
+    fn stopfailure_before_subagentstart_with_agent_id_only_marks_that_member_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let enc = tmp.path().join("enc");
+        std::fs::create_dir_all(&enc).unwrap();
+        // Transcript <enc>/<sid>.jsonl binds session dir <enc>/<sid>/.
+        std::fs::write(enc.join("sid.jsonl"), "{}\n").unwrap();
+        let session = enc.join("sid");
+        let run_dir = session.join("subagents/workflows/wf_early");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // The agent transcript does NOT exist yet when StopFailure arrives
+        // (the strict owner order: before SubagentStart, no path, no file).
+
+        let hook = |name: &str, related: &[(&str, &str)]| {
+            let mut map = BTreeMap::new();
+            for (key, value) in related {
+                map.insert((*key).to_string(), (*value).to_string());
+            }
+            hook_observation_topic(remuda_protocol::LifecycleTopic::Turn, name, map)
+        };
+
+        let mut producer = WorkflowProducer::new(InstanceId::new());
+
+        // Bind the session like a real SessionStart hook does.
+        let bind = hook_observation_topic(
+            remuda_protocol::LifecycleTopic::Session,
+            "SessionStart",
+            BTreeMap::from([(
+                "transcriptPath".into(),
+                enc.join("sid.jsonl").to_string_lossy().into_owned(),
+            )]),
+        );
+        assert!(producer.on_observation(&bind).is_empty());
+
+        // 1) StopFailure beats SubagentStart: agentId present, NO outcome,
+        //    NO agentTranscriptPath. Nothing can be emitted yet, but the
+        //    failure must be remembered against this agent.
+        let early = producer.on_observation(&hook("StopFailure", &[("agentId", "early1")]));
+        assert!(
+            early.is_empty(),
+            "no run/member context yet: nothing emitted, failure is held"
+        );
+
+        // The harness then writes the agent transcript (still before the
+        // SubagentStart hook is folded), naming no path.
+        std::fs::write(run_dir.join("agent-early1.jsonl"), "{}\n").unwrap();
+
+        // 2) SubagentStart resolves the member from agentId (file on disk),
+        //    and the held failure marks it immediately.
+        let started = producer.on_observation(&hook(
+            "SubagentStart",
+            &[("agentId", "early1"), ("agentType", "workflow-subagent")],
+        ));
+        let failed_members: Vec<String> = started
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                ObservationPayload::WorkflowMember(member)
+                    if member.state == remuda_protocol::WorkflowState::Failed =>
+                {
+                    match &member.native_agent_id {
+                        Knowledge::Known { value } => Some(value.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            failed_members,
+            vec!["early1".to_string()],
+            "only the early-failed member is Failed: {started:?}"
+        );
+
+        // 3) A different member that starts normally stays running.
+        std::fs::write(run_dir.join("agent-ok2.jsonl"), "{}\n").unwrap();
+        let other = producer.on_observation(&hook(
+            "SubagentStart",
+            &[("agentId", "ok2"), ("agentType", "workflow-subagent")],
+        ));
+        let other_failed = other.iter().any(|observation| {
+            matches!(
+                &observation.body,
+                ObservationPayload::WorkflowMember(member)
+                    if matches!(&member.native_agent_id,
+                        Knowledge::Known { value } if value == "ok2")
+                        && member.state == remuda_protocol::WorkflowState::Failed
+            )
+        });
+        assert!(!other_failed, "the healthy member is not Failed");
     }
 
     #[test]

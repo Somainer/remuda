@@ -5,6 +5,7 @@ import { known, unknownKnowledge, type Id } from "../types/wire";
 import {
   answerPendingNative,
   canSubmitAnswer,
+  generationEnded,
   hostOnline,
   nativeCleared,
   projectInteraction,
@@ -203,5 +204,35 @@ describe("settledOnThisDevice (pre-join projection filter)", () => {
     };
     expect(settledOnThisDevice(stale, "dev")).toBe(false);
     expect(projectInteraction(stale, { deviceId: "dev" })).toBe("expired");
+  });
+});
+
+describe("generationEnded (c-cardsettle)", () => {
+  it("recognises an invalidated card whose resolution names the ended generation", () => {
+    const ended: Interaction = {
+      ...interaction("invalidated"),
+      resolution: known({ reason: "generation-ended", eventIds: [] }),
+    };
+    expect(generationEnded(ended)).toBe(true);
+  });
+
+  it("is false for every other invalidated/terminal shape", () => {
+    expect(generationEnded(interaction("invalidated"))).toBe(false);
+    const cancelled: Interaction = {
+      ...interaction("invalidated"),
+      resolution: known({ reason: "native-cancelled", eventIds: [] }),
+    };
+    expect(generationEnded(cancelled)).toBe(false);
+    expect(generationEnded(interaction("pending"))).toBe(false);
+    expect(generationEnded(interaction("expired"))).toBe(false);
+  });
+
+  it("still projects the ended card into the departed (superseded) tier", () => {
+    const ended: Interaction = {
+      ...interaction("invalidated"),
+      resolution: known({ reason: "generation-ended", eventIds: [] }),
+    };
+    expect(projectInteraction(ended, { host: host("online") })).toBe("superseded");
+    expect(canSubmitAnswer(ended, { host: host("online") })).toBe(false);
   });
 });

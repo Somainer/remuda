@@ -151,6 +151,12 @@ fn public_wire_types_are_registered_for_generation() {
         // D-045 §6.2: producer-side outcome of staging a tool-result image
         // through the object route; a mapper error, never serialized.
         "ToolMediaError",
+        // c-cardsettle r5 addendum (OA6): the shared process-end CLASSIFIER
+        // decision (`Option<ProcessEnd>`), reused by the Hub, Node and
+        // ma-lineage/ma-sdk-state. It classifies wire events; it is never
+        // itself serialized on the wire.
+        "ProcessEnd",
+        "ProcessEndKind",
         // D-045 §6.2: producer-side fold output and per-image staging
         // outcome used to scrub the sidecar; never serialized on the wire.
         "ImageOutcome",

@@ -319,7 +319,20 @@ impl HubConfig {
 
 /// RFC3339 UTC with millisecond precision (`protocol.md` §1.1).
 pub fn now_rfc3339() -> String {
-    let t = time::OffsetDateTime::now_utc();
+    rfc3339(time::OffsetDateTime::now_utc())
+}
+
+/// A point `minutes` in the past in the same fixed-width RFC3339 shape
+/// [`now_rfc3339`] writes. c-cardsettle r10 item 4(e): a lexicographic
+/// comparison against a TEXT timestamp column is chronological because the
+/// shape is fixed-width, so an indexed `created_at >= cutoff` can replace an
+/// unindexable `julianday()` filter.
+pub fn rfc3339_minutes_ago(minutes: i64) -> String {
+    let t = time::OffsetDateTime::now_utc() - time::Duration::minutes(minutes);
+    rfc3339(t)
+}
+
+fn rfc3339(t: time::OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         t.year(),

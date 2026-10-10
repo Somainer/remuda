@@ -160,6 +160,19 @@ pub trait Driver: Send + Sync {
         Ok(())
     }
 
+    /// Whether the driver has observed its managed child actually END.
+    ///
+    /// OA6 (c-cardsettle): a failed command or a failed observation commit is
+    /// NOT process-end evidence — the Node must never mark an instance failed
+    /// on its own errors while the child is alive. Drivers that emit an exit
+    /// observation when their child's stdout/PTY closes report that end here as
+    /// well, so a rejection arriving right around the death can still be
+    /// classified as an end without guessing from the error. Default `false`:
+    /// such drivers end instances only through their emitted exit event.
+    async fn process_gone(&self) -> bool {
+        false
+    }
+
     /// Deliver prompt, steer, or model-switch input.
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck>;
 

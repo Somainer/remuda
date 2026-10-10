@@ -8,6 +8,7 @@ import type { Command, CommandSettlementOutcome } from "../types/command";
 import type { components } from "./api.generated";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
+import type { InteractionResolutionReason } from "../types/generated";
 import type { Observation } from "../types/observation";
 import type { Id, U64 } from "../types/wire";
 import type { PromptMode } from "../types/generated";
@@ -548,7 +549,8 @@ function mergeInstanceSnapshots(
  * Only a strictly newer response releases the pin (the caller marks it), and
  * the row is then dropped/confirmed normally.
  */
-function mergeInteractionSnapshots(
+/** c-cardsettle r2 item 4: exported for the settlement-race unit test. */
+export function mergeInteractionSnapshots(
   incoming: Interaction[],
   current: Interaction[],
   settled: ReadonlyMap<Id, { seq: number; confirmedByNewer: boolean }>,
@@ -741,6 +743,12 @@ class HubStore {
   private screenBackoffUntil = new Map<Id, number>();
   private screenBackoffTimers = new Map<Id, ReturnType<typeof setTimeout>>();
   private stopWorkspaceFollow: (() => void) | null = null;
+  /** c-cardsettle: global Hub settlement socket (instances ending → cards drop). */
+  private stopSettlementFollow: (() => void) | null = null;
+  /** Trailing coalescer so a burst of settlement notices triggers one refresh. */
+  private settlementRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Dev/observability: how many settlement frames THIS store handled. */
+  private settlementCount = 0;
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -1939,8 +1947,26 @@ class HubStore {
         (snapshot) => this.applyWorkspaceSnapshot(snapshot),
         () => { void this.refreshHosts().catch(() => undefined); },
       );
+      // c-cardsettle: the Hub invalidates a session's pending card in the same
+      // transaction that ends the instance. Its settlement notice makes every
+      // mounted inbox/badge drop the card immediately via one trailing-coalesced
+      // interaction refresh; missed notices converge on the next 2 s poll.
+      this.stopSettlementFollow?.();
+      this.stopSettlementFollow = api.settlementSubscribe((interactionId, reason) => {
+        this.settlementCount += 1;
+        // Install the terminal pin against the CURRENT list seq BEFORE
+        // refreshing, so an older in-flight poll resolving last cannot
+        // resurrect the settled card (r2 item 4).
+        this.pinHubSettlement(interactionId, reason);
+        if (this.settlementRefreshTimer) clearTimeout(this.settlementRefreshTimer);
+        this.settlementRefreshTimer = setTimeout(() => {
+          this.settlementRefreshTimer = null;
+          void this.refresh().catch(() => undefined);
+        }, 300);
+      });
       await this.initConnection();
       this.startPoll();
+      this.installDevHandle();
     } catch (err) {
       if (gen !== this.bootGen) return;
       const unauth = isUnauthorized(err);
@@ -2049,14 +2075,57 @@ class HubStore {
     }, 2000);
   }
 
+  /** Stop the periodic poll. Settlement-driven and user-triggered refreshes
+   * still run; used by the cardsettle hub spec to prove a card drops from the
+   * settlement frame rather than a poll. */
+  stopPoll() {
+    if (this.pollTimer != null && typeof window !== "undefined") {
+      window.clearInterval(this.pollTimer);
+    }
+    this.pollTimer = null;
+  }
+
+  /** Dev-only debug handle (the hub e2e runs against the vite dev server):
+   * lets a spec halt the 2 s interaction poll so a UI change can be
+   * attributed to the settlement follow frame instead of polling. */
+  private installDevHandle() {
+    if (!import.meta.env.DEV || typeof window === "undefined") return;
+    (window as unknown as {
+      __remudaHub?: {
+        stopPoll: () => void;
+        settlementCount: () => number;
+        interactionState: (id: string) => string | undefined;
+      };
+    }).__remudaHub = {
+      stopPoll: () => this.stopPoll(),
+      settlementCount: () => this.settlementCount,
+      interactionState: (id: string) =>
+        this.state.interactions.find((row) => row.id === id)?.state,
+    };
+  }
+
+  private clearDevHandle() {
+    if (typeof window !== "undefined") {
+      delete (window as unknown as { __remudaHub?: unknown }).__remudaHub;
+    }
+  }
+
   logout() {
     const mine = this.state.session?.deviceId;
     if (mine) void api.deviceRevoke(mine).catch(() => undefined);
     clearSession();
     dropDeviceCookie();
     api.disconnect();
+    this.stopPoll();
+    this.clearDevHandle();
     this.stopWorkspaceFollow?.();
     this.stopWorkspaceFollow = null;
+    this.stopSettlementFollow?.();
+    this.stopSettlementFollow = null;
+    if (this.settlementRefreshTimer) {
+      clearTimeout(this.settlementRefreshTimer);
+      this.settlementRefreshTimer = null;
+    }
     // Invalidate this auth epoch: a list fetch already in flight (the 2 s
     // poll may be awaiting when the user logs out) must be dropped wholesale
     // when it resolves — neither replace the wiped instance list with the old
@@ -3682,6 +3751,49 @@ class HubStore {
           : row,
       ),
     });
+  }
+
+  /**
+   * c-cardsettle r2 item 4: pin a Hub settlement (instance ended → card
+   * invalidated) against the list seq captured at frame receipt, BEFORE the
+   * settlement refresh starts. An older in-flight interaction poll that
+   * resolves afterwards carries an older reqSeq and a stale pending copy; the
+   * pin makes mergeInteractionSnapshots suppress it and keeps the tombstone
+   * until a newer page confirms. The local row is flipped immediately so the
+   * card drops even before the refresh resolves.
+   */
+  private pinHubSettlement(interactionId: Id, reason?: string) {
+    this.settledInteractions.set(interactionId, {
+      seq: this.listReqSeq,
+      confirmedByNewer: false,
+    });
+    if (this.state.interactions.some((row) => row.id === interactionId)) {
+      this.emit({
+        interactions: this.state.interactions.map((row) => {
+          if (row.id !== interactionId) return row;
+          // c-cardsettle r3 item 7: stamp the terminal resolution on the
+          // immediate projection too. r6 item 5: carry the Hub's reason
+          // verbatim — a non-process-end settlement (e.g. transcript-picker
+          // demotion = agent-demoted) must not be overwritten with
+          // generation-ended; absent/unknown reasons default to generation-
+          // ended (the only settlement the process-end paths publish).
+          const now = new Date().toISOString();
+          const settlementReason: InteractionResolutionReason =
+            reason === "agent-demoted" ? "agent-demoted" : "generation-ended";
+          return {
+            ...row,
+            state: "invalidated" as const,
+            answerable: false,
+            blocking: false,
+            updatedAt: now,
+            resolution: {
+              state: "known" as const,
+              value: { reason: settlementReason, eventIds: [] },
+            },
+          };
+        }),
+      });
+    }
   }
 
   titleOf(instanceId: Id) {

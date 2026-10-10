@@ -742,7 +742,7 @@ export interface paths {
         post?: never;
         /**
          * Permanently delete a session
-         * @description Removes the Hub record (journal, commands, interactions, fleet membership) and asks the owning Node to purge its per-instance data directory. The agent's own native transcripts under the user's home are never touched. Human and Bot devices only; agents receive 403. A live Instance is refused with 409 unless `force=1`, which stops it and settles it as `exited` first. A repeated delete returns 404, so the call is idempotent.
+         * @description Removes the Hub record (journal, commands, interactions, fleet membership) and, after the Hub rows are gone, asks the owning Nodes to purge their per-instance data directories (best effort). The agent's own native transcripts under the user's home are never touched. Human and Bot devices only; agents receive 403. Deleting the current chapter of a lineage deletes every chapter of that lineage. `force=1` stops only the ADDRESSED chapter before the delete; when another chapter of the lineage is still live the request refuses with 409 whether or not force is set — settle every chapter first. A repeated delete returns 404, so the call is idempotent.
          */
         delete: operations["instanceDelete"];
         options?: never;
@@ -2201,11 +2201,17 @@ export interface components {
             warnings?: string[];
         };
         InstanceDeleted: {
+            /** @description Every chapter removed with a whole-lineage delete (the addressed instance plus its predecessors); a single id for a plain instance. */
+            chapterIds?: string[];
+            /** @description Per-chapter `instance.purge` outcome, keyed by chapter id; the Hub records are deleted either way. */
+            chapterPurges?: {
+                [key: string]: "purged" | "node-offline" | "node-rejected" | "purge-failed";
+            };
             /** @constant */
             deleted: true;
             instanceId: string;
             /**
-             * @description Outcome of the Node `instance.purge` call; the Hub record is deleted either way.
+             * @description Outcome of the Node `instance.purge` call for the addressed chapter; the Hub record is deleted either way.
              * @enum {string}
              */
             nodePurge?: "purged" | "node-offline" | "node-rejected" | "purge-failed";
@@ -2409,7 +2415,7 @@ export interface components {
             /** @description Why this chapter exists; null on the first chapter. */
             chapterCause?: string | null;
             createdAt: string;
-            /** @description Last update once the chapter reached an ended lifecycle (exited/failed/closed); null while live. */
+            /** @description Timestamp of the chapter's process-end evidence (the observedAt of the classified end event or a by-construction scheduler end), stamped once and immutable; null while live or when no end evidence is recorded (host loss and ambiguous legacy failures leave it null). */
             endedAt?: string | null;
             /** @description When authority moved to the successor; null while current. */
             fencedAt?: string | null;
@@ -4784,7 +4790,7 @@ export interface operations {
     instanceDelete: {
         parameters: {
             query?: {
-                /** @description `force=1` stops a live Instance before deleting it. */
+                /** @description `force=1` stops the addressed (live) chapter before deleting it. It cannot stop other chapters of the same lineage; the delete still refuses with 409 while any other chapter is live. */
                 force?: 1;
             };
             header?: never;

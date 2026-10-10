@@ -499,3 +499,76 @@ fn discovery_does_not_follow_file_or_directory_symlinks() {
     std::os::unix::fs::symlink(outside.path(), sessions).unwrap();
     assert_eq!(locate_rollout_in(tmp.path(), "thread-a"), None);
 }
+
+#[test]
+fn locate_by_cwd_skips_files_and_date_dirs_older_than_the_launch_floor() {
+    // r4 item 6: with thousands of rollouts the locator must not open/parse
+    // every file each 250 ms tick. A future floor makes every just-written
+    // path "older than the floor", so a perfectly parseable MATCHING rollout
+    // must be skipped by mtime/date pruning alone (proven: parsing it would
+    // have returned Found).
+    use remuda_driver::codex_rollout::{CwdRollout, locate_rollout_by_cwd};
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd = Path::new("/projects/prune");
+    let session_dir = home.path().join("sessions/2026/09/14");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let started = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let rollout = session_dir.join("rollout-prune.jsonl");
+    {
+        let mut file = std::fs::File::create(&rollout).unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"prune\",\"session_id\":\"prune\",\"cwd\":\"/projects/prune\",\"timestamp\":\"{started}\"}}}}"
+        )
+        .unwrap();
+    }
+
+    // Floor in the future: both the file and its date directory predate it.
+    let future = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
+    let found = locate_rollout_by_cwd(home.path(), cwd, future);
+    assert!(
+        matches!(found, CwdRollout::NotYet),
+        "old mtime skips parsing even though the content matches: {found:?}"
+    );
+
+    // A normal (past) floor parses the same file and binds.
+    let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(10);
+    let found = locate_rollout_by_cwd(home.path(), cwd, past);
+    assert!(
+        matches!(found, CwdRollout::Found { .. }),
+        "fresh mtime binds"
+    );
+}
+
+#[test]
+fn locate_by_cwd_skips_old_files_inside_a_non_date_directory() {
+    // Isolates the per-FILE mtime filter: the directory prune only applies to
+    // YYYY/MM/DD date leaves, so a matching rollout under any other layout
+    // must still be skipped by its own old mtime.
+    use remuda_driver::codex_rollout::{CwdRollout, locate_rollout_by_cwd};
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd = Path::new("/projects/prune-file");
+    let dir = home.path().join("sessions/custom-layout/sub");
+    std::fs::create_dir_all(&dir).unwrap();
+    let started = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    {
+        let mut file = std::fs::File::create(dir.join("rollout.jsonl")).unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"prune-file\",\"session_id\":\"prune-file\",\"cwd\":\"/projects/prune-file\",\"timestamp\":\"{started}\"}}}}"
+        )
+        .unwrap();
+    }
+    let future = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
+    let found = locate_rollout_by_cwd(home.path(), cwd, future);
+    assert!(
+        matches!(found, CwdRollout::NotYet),
+        "the per-file mtime filter skips a parseable match: {found:?}"
+    );
+}

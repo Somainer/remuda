@@ -470,10 +470,35 @@ pub fn locate_rollout_by_cwd(
     launched_at: time::OffsetDateTime,
 ) -> CwdRollout {
     let floor = launched_at - LAUNCH_TIME_SLACK;
+    // Wall-clock form of the floor for mtime comparisons.
+    let floor_system = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(floor.unix_timestamp().max(0) as u64);
     let mut matches: Vec<(String, PathBuf)> = Vec::new();
     let mut pending = vec![codex_home.join("sessions")];
     while let Some(dir) = pending.pop() {
-        if !std::fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.is_dir()) {
+        let Ok(dir_meta) = std::fs::symlink_metadata(&dir) else {
+            continue;
+        };
+        if !dir_meta.is_dir() {
+            continue;
+        }
+        // Cheap pre-filter (r4 item 6): a date directory whose own mtime
+        // predates the floor cannot contain a post-floor session — codex
+        // creates `sessions/YYYY/MM/DD` when it creates the rollout, and a
+        // post-launch session appended inside an older, existing date dir is
+        // still caught by the per-file mtime filter below.
+        let is_date_dir = match dir
+            .strip_prefix(codex_home.join("sessions"))
+            .ok()
+            .and_then(|relative| relative.to_str())
+        {
+            Some(relative) => is_yyyy_mm_dd(relative),
+            None => false,
+        };
+        if is_date_dir
+            && let Ok(modified) = dir_meta.modified()
+            && modified < floor_system
+        {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -493,6 +518,17 @@ pub fn locate_rollout_by_cwd(
                     .path()
                     .extension()
                     .is_none_or(|value| value != "jsonl")
+            {
+                continue;
+            }
+            // Per-file cheap pre-filter: a rollout untouched since before the
+            // floor cannot have gained a post-floor session on this tick; its
+            // (tens-of-KB) header is never opened or parsed. A genuinely new
+            // session bumps the file mtime, so this never skips a candidate.
+            if let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified())
+                && modified
+                    < std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(floor.unix_timestamp() as u64)
             {
                 continue;
             }
@@ -548,6 +584,23 @@ pub fn locate_rollout_by_cwd(
 /// wins; when both paths exist, compare canonical forms so filesystem aliases
 /// (symlink prefixes, `/tmp` vs `/private/tmp`) agree. Failure to canonicalize
 /// never upgrades a non-matching string into a match.
+/// Whether a sessions-relative path component is a `YYYY/MM/DD` date leaf.
+/// Used to decide which directories carry a session-creation mtime (r4 item 6).
+fn is_yyyy_mm_dd(relative: &str) -> bool {
+    let mut parts = relative.split('/');
+    let (Some(year), Some(month), Some(day), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    year.len() == 4
+        && month.len() == 2
+        && day.len() == 2
+        && year.bytes().all(|b| b.is_ascii_digit())
+        && month.bytes().all(|b| b.is_ascii_digit())
+        && day.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn cwd_matches(rollout_cwd: Option<&str>, launch_cwd: &Path) -> bool {
     let Some(rollout_cwd) = rollout_cwd.filter(|value| !value.is_empty()) else {
         return false;

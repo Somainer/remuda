@@ -1306,14 +1306,23 @@ mod tests {
         }
     }
 
-    /// r10 item 1: the post-reconnect sweep aborts by LINK GENERATION, not by
-    /// timestamp. The old command was forwarded on the dead previous link and
-    /// stamped with its generation; a command forwarded on the NEW link is
-    /// stamped with the generation the adopting hello just installed and must
-    /// never be aborted, no matter what either row's `created_at` says.
+    /// r10 item 2: the sweep decision is a pure GENERATION comparison, so the
+    /// test tampers with `created_at` as hard as a broken clock can and
+    /// asserts nothing moves:
+    /// - a previous-link intent stamped 2099 ("created just now" by the
+    ///   clock) is STILL aborted;
+    /// - a new-link intent stamped 2000 (a backward clock step that makes a
+    ///   fresh DELETE look ancient) is NEVER aborted;
+    /// - a pre-upgrade intent with a NULL stamp is treated as dead-link
+    ///   intent regardless of its timestamp.
+    /// No sleeps and no `now()` arithmetic anywhere: the constants below are
+    /// the whole clock.
     #[tokio::test]
     async fn reconnect_sweep_aborts_only_intents_from_older_links() {
         use crate::HubConfig;
+
+        const FUTURE: &str = "2099-01-01T00:00:00.000Z";
+        const PAST: &str = "2000-01-01T00:00:00.000Z";
 
         let dir = tempfile::tempdir().unwrap();
         let hub = crate::spawn(HubConfig::for_test(dir.path().join("data")))
@@ -1324,10 +1333,11 @@ mod tests {
         let host = crate::config::new_id("hst").unwrap();
         hub.test_insert_host(&host).await.unwrap();
         // A freshly inserted host has never been adopted by a hello: the
-        // first link the dead command rode on is generation 0.
+        // first link the dead commands rode on is generation 0.
         assert_eq!(store.host_link_generation(host.clone()).await.unwrap(), 0);
 
-        // The old command rode the dead previous link (generation 0).
+        // Dead-link intent #1: rode the previous link (stamped generation 0)
+        // but postdated to the FUTURE, as if it had been created "just now".
         let (old, _) = store
             .queue_command(
                 None,
@@ -1344,10 +1354,29 @@ mod tests {
             .await
             .unwrap();
 
+        // Dead-link intent #2: a pre-upgrade row (NULL stamp), also
+        // postdated. NULL means "no link generation recorded", which the
+        // sweep must keep reconciling rather than hide behind a cutoff.
+        let (legacy, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/legacy", "workspaceId": "wsp_legacy"}),
+                None,
+            )
+            .await
+            .unwrap();
+
         // The reconnect hello adopts a new link before its transport is
         // registered; every command forwarded after that stamps generation 1.
         let adopted = store.bump_host_link_generation(host.clone()).await.unwrap();
         assert_eq!(adopted, 1);
+        // Live-link intent: stamped generation 1 but backdated to the PAST,
+        // as if the hub clock stepped straight to year 2000 after the row
+        // was written. Under the old timestamp cutoff this row looked like
+        // the stalest intent on the host and would be wrongly aborted.
         let (new, _) = store
             .queue_command(
                 None,
@@ -1364,6 +1393,21 @@ mod tests {
             .await
             .unwrap();
 
+        // The clock goes mad AFTER every stamp: dead intents look fresh, the
+        // live intent looks ancient. The sweep must not consult any of it.
+        store
+            .test_set_command_created_at(old.command_id.clone(), FUTURE.to_owned())
+            .await
+            .unwrap();
+        store
+            .test_set_command_created_at(legacy.command_id.clone(), FUTURE.to_owned())
+            .await
+            .unwrap();
+        store
+            .test_set_command_created_at(new.command_id.clone(), PAST.to_owned())
+            .await
+            .unwrap();
+
         let node = Arc::new(RecordingAbortNode::default());
         hub.test_set_node_transport(&host, node.clone()).await;
 
@@ -1371,21 +1415,33 @@ mod tests {
             .await
             .unwrap();
 
-        // Exactly one abort, for the OLD command: the in-flight new-link
-        // DELETE is untouched.
+        // Exactly two aborts, in created_at order: the two dead-link intents.
+        // The future timestamps do not rescue them and the past timestamp
+        // does not condemn the new-link row.
         let calls = node.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls.len(), 2, "{calls:?}");
         assert_eq!(calls[0].0, "workspace.unregister");
         assert_eq!(calls[0].1, old.command_id);
-        assert_ne!(calls[0].1, new.command_id);
+        assert_eq!(calls[1].1, legacy.command_id);
+        assert!(
+            calls.iter().all(|call| call.1 != new.command_id),
+            "the new-link DELETE must never be aborted regardless of its timestamp: {calls:?}"
+        );
 
-        let old_row = store
-            .get_command(old.command_id.clone())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(old_row.state, "settled");
-        assert_eq!(old_row.settlement_outcome.as_deref(), Some("rejected"));
+        for dead in [&old, &legacy] {
+            let row = store
+                .get_command(dead.command_id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "settled", "{}", dead.command_id);
+            assert_eq!(
+                row.settlement_outcome.as_deref(),
+                Some("rejected"),
+                "{}",
+                dead.command_id
+            );
+        }
         let new_row = store
             .get_command(new.command_id.clone())
             .await
@@ -1393,13 +1449,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             new_row.state, "queued",
-            "a DELETE accepted on the new link must not be aborted by the sweep"
+            "a DELETE accepted on the new link must not be aborted by the sweep, even backdated"
         );
 
         // Generation boundary: the current link's own generation selects
         // nothing (the comparison is strict), and a generation past the new
-        // link returns only the still-queued new row — the old one is settled
-        // and filtered by state.
+        // link returns only the still-queued new row — the dead ones are
+        // settled now and filtered by state. Pure integer comparisons.
         let current = store
             .list_unsettled_workspace_unregisters(&host, 1)
             .await

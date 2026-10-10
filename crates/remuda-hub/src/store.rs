@@ -4273,6 +4273,27 @@ impl Store {
         .await
     }
 
+    /// Test-only seam (c-dirpicker r10 item 2): overwrite a command's
+    /// `created_at` with a FIXED timestamp so the reconnect-sweep suite can
+    /// prove its decision is independent of the clock (a dead-link intent
+    /// postdated to the future is still aborted; a new-link intent backdated
+    /// to the past is still spared). Production code never calls this.
+    #[doc(hidden)]
+    pub async fn test_set_command_created_at(
+        &self,
+        command_id: String,
+        created_at: String,
+    ) -> Result<(), StoreError> {
+        self.run_named("test_set_command_created_at", move |conn| {
+            conn.execute(
+                "UPDATE commands SET created_at = ?1 WHERE id = ?2",
+                params![created_at, command_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// The RPC accept deadline elapsed: the request is on the wire and the
     /// Node is still executing it (protocol §2.5: a timeout returns `unknown`,
     /// the command is never resent). Record that convergence is now delegated

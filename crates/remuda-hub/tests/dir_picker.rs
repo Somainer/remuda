@@ -1493,6 +1493,16 @@ mod abort {
         store
             .bump_host_link_generation(fixture.host.clone())
             .await?;
+        // r10 item 2: make the clock LIE in the stale command's favour —
+        // postdate it past the reconnect hello, exactly the row the old
+        // created_at cutoff would have hidden. The generation comparison
+        // must abort it anyway, deterministically (no sleeps, no now()).
+        store
+            .test_set_command_created_at(
+                command.command_id.clone(),
+                "2099-01-01T00:00:00.000Z".to_owned(),
+            )
+            .await?;
 
         // The node.hello reconciliation runs and must abort it.
         fixture
@@ -1555,9 +1565,17 @@ mod abort {
             .await?;
         store.mark_accepted(command.command_id.clone()).await?;
         // The stuck command rode the previous link; the reconnect hello must
-        // adopt a new generation before its sweep can attribute it.
+        // adopt a new generation before its sweep can attribute it. A
+        // postdated created_at ("created just now" per the clock) must not
+        // hide it from that generation-based sweep (r10 item 2).
         store
             .bump_host_link_generation(fixture.host.clone())
+            .await?;
+        store
+            .test_set_command_created_at(
+                command.command_id.clone(),
+                "2099-01-01T00:00:00.000Z".to_owned(),
+            )
             .await?;
 
         // The Node reports the abort as an already-settled commit.
@@ -1894,6 +1912,21 @@ async fn reconnect_after_dropped_prepare_aborts_on_the_new_socket_and_unblocks_t
         .await?;
     assert_eq!(pending.len(), 1, "{pending:?}");
     let stuck_command = pending[0].command_id.clone();
+    // r10 item 2: postdate the stale intent to AFTER the reconnect instant
+    // — under the old wall-clock cutoff it would have been hidden from the
+    // sweep forever. On the real node.hello path the generation stamp must
+    // still make it the one aborted command.
+    store
+        .test_set_command_created_at(stuck_command.clone(), "2099-01-01T00:00:00.000Z".to_owned())
+        .await?;
+    assert_eq!(
+        store
+            .list_unsettled_workspace_unregisters(&host, next_generation)
+            .await?
+            .len(),
+        1,
+        "a postdated stale intent must still be selected for abort"
+    );
 
     // --- Reconnect through the REAL node.hello path on a fresh socket. The
     // post-hello sweep (spawned after state.nodes.insert, queued after the

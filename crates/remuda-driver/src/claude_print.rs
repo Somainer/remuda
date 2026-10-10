@@ -1351,9 +1351,15 @@ enum PublishJob {
 struct TurnReservation {
     client_message_id: String,
     committed: tokio::sync::Notify,
+    /// Set BEFORE the notify in BOTH commit and cancel, closing the lost-wakeup
+    /// window: a waiter that registers `committed.notified()` after the notify
+    /// still observes this flag in [`TurnReservation::wait_for_commit`] instead
+    /// of parking forever (ma-sdk-state r5 item 3).
+    resolved: std::sync::atomic::AtomicBool,
+    /// Whether the resolution was a successful commit (vs. a cancel).
     is_committed: std::sync::atomic::AtomicBool,
-    /// Set once the turn_started observation has been emitted (by the racing
-    /// result batch or by the TurnStarted job — exactly one of them).
+    /// Set once the turn_started observation has been emitted (a single Reserve
+    /// ticket claims it; the flag is defensive dedupe).
     start_emitted: std::sync::atomic::AtomicBool,
 }
 
@@ -1362,6 +1368,7 @@ impl TurnReservation {
         Self {
             client_message_id,
             committed: tokio::sync::Notify::new(),
+            resolved: std::sync::atomic::AtomicBool::new(false),
             is_committed: std::sync::atomic::AtomicBool::new(false),
             start_emitted: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1372,25 +1379,30 @@ impl TurnReservation {
         Arc::new(Self::new(client_message_id))
     }
 
-    /// The write succeeded: unpark a racing result batch.
+    /// The write succeeded: unpark a waiter parked at the ticket.
     fn commit(&self) {
         self.is_committed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.resolved
             .store(true, std::sync::atomic::Ordering::Release);
         self.committed.notify_waiters();
     }
 
-    /// The write failed: unpark without a start; queued frames flow as-is.
+    /// The write failed: resolve the ticket without a start so a parked worker
+    /// resumes and queued frames flow as-is.
     fn cancel(&self) {
+        self.resolved
+            .store(true, std::sync::atomic::Ordering::Release);
         self.committed.notify_waiters();
     }
 
     async fn wait_for_commit(&self) -> bool {
-        if self.is_committed.load(std::sync::atomic::Ordering::Acquire) {
-            return true;
+        if self.resolved.load(std::sync::atomic::Ordering::Acquire) {
+            return self.is_committed.load(std::sync::atomic::Ordering::Acquire);
         }
         let notified = self.committed.notified();
-        if self.is_committed.load(std::sync::atomic::Ordering::Acquire) {
-            return true;
+        if self.resolved.load(std::sync::atomic::Ordering::Acquire) {
+            return self.is_committed.load(std::sync::atomic::Ordering::Acquire);
         }
         notified.await;
         self.is_committed.load(std::sync::atomic::Ordering::Acquire)
@@ -5092,6 +5104,47 @@ mod process_end_startup_tests {
         assert_eq!(
             process_end_event(&shell_failed).map(|end| end.kind),
             Some(ProcessEndKind::Failed)
+        );
+    }
+}
+
+#[cfg(test)]
+mod turn_reservation_wakeup_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// ma-sdk-state r5 item 3: cancelling BEFORE a waiter registers its
+    /// `committed.notified()` must not lose the wakeup. `wait_for_commit`
+    /// observes the resolved flag and returns false promptly (pre-fix it parked
+    /// on the Notify forever, wedging the publication worker until close).
+    #[tokio::test]
+    async fn cancel_before_wait_resolves_without_a_start_and_without_hanging() {
+        let reservation = TurnReservation::shared("msg-cancel-before-wait".to_string());
+        // Cancel first; only afterwards does the (worker) side await.
+        reservation.cancel();
+        let committed = tokio::time::timeout(Duration::from_secs(2), reservation.wait_for_commit())
+            .await
+            .expect("a cancel that raced ahead must still resolve the wait");
+        assert!(!committed, "a cancel resolves the ticket as not-committed");
+    }
+
+    /// A normal commit resolves a waiting ticket as committed.
+    #[tokio::test]
+    async fn commit_resolves_a_waiting_ticket_as_committed() {
+        let reservation = TurnReservation::shared("msg-commit".to_string());
+        let ticket = reservation.clone();
+        let waiter = tokio::spawn(async move { ticket.wait_for_commit().await });
+        // Let the waiter register its notified() before committing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reservation.commit();
+        let committed = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter task")
+            .expect("waiter resolves");
+        assert!(committed, "a commit resolves the ticket as committed");
+        assert!(
+            reservation.claim_start(),
+            "a committed ticket may claim the start"
         );
     }
 }

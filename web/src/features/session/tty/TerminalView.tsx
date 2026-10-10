@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type Ref } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
@@ -141,9 +141,14 @@ function useTerminalAppearance(): TerminalAppearance {
 export function TerminalView({
   instance,
   onAttachFailed,
+  bottomChromeRef,
 }: {
   instance: Instance;
   onAttachFailed?: (reason: string) => void;
+  /** Ref for the bottom chrome wrapper; SessionPage measures its height as
+   *  --session-dock-h so the notify stack clears the local input dock and
+   *  phone key bar in tty view (c-composerpop r5 item 2). */
+  bottomChromeRef?: Ref<HTMLDivElement>;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -1041,39 +1046,44 @@ export function TerminalView({
           {rawTail}
         </pre>
       </div>
-      {/* 直连 sends keys straight to the PTY, so the local input box has no
-          job. Render nothing at all rather than a disabled ghost: `.dock`
-          itself carries padding and a border-top, so keeping the container
-          would still reserve a strip of dead space under the terminal. */}
-      {!directInput ? (
-        <div className={css.dock} data-testid="tty-dock">
-          {/* D-028 §5.2: the dock routes through instance.send so the driver
-              performs body-then-Enter as two PTY writes; raw key buttons
-              below stay on the binary channel. */}
-          <LocalInput
-            key={inputFill?.nonce ?? 0}
-            initialText={inputFill?.text ?? ""}
+      {/* The tty bottom chrome lives in one measured wrapper so the notify
+          stack can anchor above the local input dock AND the phone key bar
+          (c-composerpop r5 item 2). */}
+      <div ref={bottomChromeRef} className={css.bottomChrome} data-testid="tty-bottom-chrome">
+        {/* 直连 sends keys straight to the PTY, so the local input box has no
+            job. Render nothing at all rather than a disabled ghost: `.dock`
+            itself carries padding and a border-top, so keeping the container
+            would still reserve a strip of dead space under the terminal. */}
+        {!directInput ? (
+          <div className={css.dock} data-testid="tty-dock">
+            {/* D-028 §5.2: the dock routes through instance.send so the driver
+                performs body-then-Enter as two PTY writes; raw key buttons
+                below stay on the binary channel. */}
+            <LocalInput
+              key={inputFill?.nonce ?? 0}
+              initialText={inputFill?.text ?? ""}
+              disabled={frozen}
+              mobile={mobile}
+              onSend={(text) => void hubStore.send(instance.id, text)}
+            />
+          </div>
+        ) : null}
+        {mobile ? (
+          <PhoneKeyBar
+            instance={instance}
             disabled={frozen}
-            mobile={mobile}
-            onSend={(text) => void hubStore.send(instance.id, text)}
+            onKey={send}
+            captureScrollLine={() => termRef.current?.buffer.active.baseY ?? 0}
+            onFillInput={(text) => setInputFill({ text, nonce: Date.now() })}
           />
-        </div>
-      ) : null}
-      {mobile ? (
-        <PhoneKeyBar
-          instance={instance}
-          disabled={frozen}
-          onKey={send}
-          captureScrollLine={() => termRef.current?.buffer.active.baseY ?? 0}
-          onFillInput={(text) => setInputFill({ text, nonce: Date.now() })}
-        />
-      ) : null}
-      {!mobile ? (
-        <div className={css.note}>
-          TTY 字节走 `/v1/follow?tty=1` binary envelope · 结构 tab 看同一
-          journal
-        </div>
-      ) : null}
+        ) : null}
+        {!mobile ? (
+          <div className={css.note}>
+            TTY 字节走 `/v1/follow?tty=1` binary envelope · 结构 tab 看同一
+            journal
+          </div>
+        ) : null}
+      </div>
     </section>
   );
 }

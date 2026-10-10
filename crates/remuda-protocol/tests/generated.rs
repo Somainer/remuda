@@ -86,6 +86,8 @@ fn public_wire_types_are_registered_for_generation() {
         "NodeHeartbeatParams",
         "WorkspaceMutationPhase",
         "WorkspaceMutationParams",
+        "WorkspaceResolveParams",
+        "WorkspaceResolveResult",
         "RegisteredWorkspace",
         "WorkspaceRegistryResult",
         "InstanceCreateParams",

@@ -13,7 +13,10 @@
 .floatLayer {
   position: relative;
   height: 0;
-  z-index: 6;
+  /* Above popovers/menus (--z-popover 40) so the 批注 bar is never covered by
+     an open slider, below sheets (--z-sheet 60). Was 6, which painted under
+     menus once popovers rose to the token scale (c-composerpop r2 item 3). */
+  z-index: var(--z-annotation-dock);
   pointer-events: none;
 }
 

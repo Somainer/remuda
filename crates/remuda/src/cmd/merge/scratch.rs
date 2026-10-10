@@ -175,7 +175,17 @@ mod tests {
         assert!(!root.join("worktree").exists());
         assert!(root.exists());
         // Parent traversal and sibling paths are refused even if they exist.
-        let outside = std::env::temp_dir().join(format!("{SCRATCH_PREFIX}outside-sibling"));
+        // Unique per process and instant: two test binaries (or two tests
+        // within one process) sharing TMPDIR must never collide on, or have a
+        // stale dir mistaken for, the other's outside sibling.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let outside = std::env::temp_dir().join(format!(
+            "{SCRATCH_PREFIX}outside-sibling-{}-{nanos}",
+            std::process::id()
+        ));
         fs::create_dir_all(&outside).unwrap();
         assert!(remove_within(&root, &root.join("..").join("..")).is_err());
         assert!(remove_within(&root, &outside).is_err());

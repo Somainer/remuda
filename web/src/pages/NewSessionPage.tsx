@@ -470,6 +470,11 @@ export function NewSessionPage() {
         data-client-request={clientRequestId ?? ""}
         onSubmit={(e) => {
           e.preventDefault();
+          // c-dirpicker round 3 item 9: the directory browser is portaled
+          // inside this component; ignore a submit event bubbling from
+          // anywhere other than this session form (it stops its own Enter,
+          // but never trust an inner surface to be a form boundary).
+          if (e.currentTarget !== e.target) return;
           if (!canStart || phaseRef.current !== "idle" || !workspace) return;
           const requestId = newClientRequestId();
           setClientRequestId(requestId);

@@ -2181,11 +2181,17 @@ export interface components {
             warnings?: string[];
         };
         InstanceDeleted: {
+            /** @description Every chapter removed with a whole-lineage delete (the addressed instance plus its predecessors); a single id for a plain instance. */
+            chapterIds?: string[];
+            /** @description Per-chapter `instance.purge` outcome, keyed by chapter id; the Hub records are deleted either way. */
+            chapterPurges?: {
+                [key: string]: "purged" | "node-offline" | "node-rejected" | "purge-failed";
+            };
             /** @constant */
             deleted: true;
             instanceId: string;
             /**
-             * @description Outcome of the Node `instance.purge` call; the Hub record is deleted either way.
+             * @description Outcome of the Node `instance.purge` call for the addressed chapter; the Hub record is deleted either way.
              * @enum {string}
              */
             nodePurge?: "purged" | "node-offline" | "node-rejected" | "purge-failed";

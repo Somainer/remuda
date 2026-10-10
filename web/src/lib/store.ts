@@ -297,11 +297,23 @@ function effortLifecycleRequest(word: string): EffortLifecycleRequest {
   return { name: normalized };
 }
 
-/** Whether a parsed lifecycle word refers to the in-flight request. */
+/** Whether a parsed lifecycle word refers to the in-flight request.
+ *  Compares BOTH axes (c-effortui r3 item 3): a plain level word carries no
+ *  flag, so it cannot name a flag-on request; the coupled bare `ultracode` is
+ *  the xhigh level command and must not match a flag request parked on another
+ *  tier. A wire-owned (lifecycle-synthesized) pending bypasses this in its
+ *  caller — the driver owns that request end to end. */
 function effortLifecycleMatches(pending: EffortPending, word: string): boolean {
   const request = effortLifecycleRequest(word);
-  if (request.name !== undefined && request.name !== pending.name) return false;
-  if (request.ultracode !== undefined && request.ultracode !== pending.ultracode) return false;
+  const bareCoupled = word.trim().toLowerCase() === "ultracode";
+  if (request.name !== undefined) {
+    if (request.name !== pending.name) return false;
+    if (pending.ultracode) return false;
+  }
+  if (request.ultracode !== undefined) {
+    if (request.ultracode !== pending.ultracode) return false;
+    if (bareCoupled && pending.name !== "xhigh") return false;
+  }
   return request.name !== undefined || request.ultracode !== undefined;
 }
 
@@ -822,52 +834,62 @@ class HubStore {
    * Apply one newer effective projection to an in-flight request, settling the
    * axes the projection actually confirms (D-056: level and flag are separate
    * reads). Returns the updated pending entry, or null when BOTH axes have
-   * settled and the indicator must clear.
+   * settled and the indicator must be cleared.
    *
-   * - an axis is confirmed only by a projection STRICTLY newer than the
-   *   request threshold — an observation belonging to the replaced request
-   *   (request A after the user asked B) neither matches nor settles;
-   * - the level axis is confirmed by a `remuda` projection even on mismatch
-   *   (that is the native clamp: 请求 max → 实际 xhigh), or by name agreement;
-   * - the flag axis is confirmed only by its own positive value; an
-   *   unreported flag (null) leaves the indicator pending.
+   * Request identity (c-effortui r3 item 3) — a replaced request A's read-back
+   * must never settle request B:
+   * - `requestedEcho` is the driver's own `requested` payload (the axes ITS
+   *   command carried). When present it is the nonce: a verdict that echoes a
+   *   different level/flag is A's outcome even if source is `remuda` and the
+   *   clock says newer. An echoed request whose EFFECTIVE clamped to another
+   *   level still names this request (`requested.max` → `effective.xhigh`).
+   * - without an echo (older driver / durable poll record), identity falls
+   *   back to name agreement or a post-threshold `remuda` read-back — the
+   *   threshold being THIS request's own queued lifecycle observedAt.
+   * - the flag axis likewise trusts an opposite value only from a verdict
+   *   that echoes this request; an unreported flag (null) never settles.
    */
   private settleEffortAxes(
     instanceId: Id,
     pending: EffortPending,
     view: EffortEffectiveView,
+    requestedEcho?: { name?: string; ultracode?: boolean },
   ): EffortPending | null {
-    // Evidence freshness:
-    //  - with a baseline threshold, a projection settles only when STRICTLY
-    //    newer than the request's own queued timestamp;
-    //  - with a NULL baseline (no effective state when the request was made)
-    //    a timestamp proves nothing, so only a projection that is our
-    //    configure's outcome settles: a `remuda` driver read-back (including
-    //    the delivered level clamp / flag refusal) or one naming the requested
-    //    level. A terminal-originated (`slash`) projection that does not name
-    //    the request is another request's evidence and must not settle B
-    //    (c-effortui r2 item 2).
     const threshold = pending.thresholdObservedAt;
     const namesLevel = view.name === pending.name;
     const remuda = view.source === "remuda";
-    const ours = remuda || namesLevel;
-    const newer = threshold != null ? view.observedAt > threshold : ours;
+    // The driver echoed which axes ITS command carried: the reliable nonce.
+    const echoesRequest =
+      requestedEcho?.name !== undefined &&
+      requestedEcho.name === pending.name &&
+      (requestedEcho.ultracode === undefined || requestedEcho.ultracode === pending.ultracode);
+    const postThreshold =
+      threshold != null && Date.parse(view.observedAt) > Date.parse(threshold);
+    // A verdict is this request's when it echoes it, names its level, or (no
+    // echo available) is a post-threshold/cold-start remuda read-back. An
+    // echoed-but-mismatched remuda edge is the replaced request's verdict.
+    const ours =
+      echoesRequest ||
+      namesLevel ||
+      (remuda && requestedEcho === undefined && (threshold == null || postThreshold));
+    const newer = threshold != null ? postThreshold : ours;
     let { levelSettled, flagSettled } = pending;
     if (newer && !levelSettled && ours) {
       levelSettled = true;
     }
     // The flag axis needs process-local evidence.
-    //  - non-null baseline: any definitive value newer than the request
+    //  - non-null threshold: any definitive value newer than the request
     //    settles (an opposite value is the delivered refusal, rendered as a
     //    mismatch);
-    //  - null baseline: a remuda read-back is our verdict (even an opposite
-    //    flag); a terminal-origin flag settles only when it equals the
-    //    requested one — otherwise it could be request A's flag proving
-    //    nothing for B.
+    //  - null baseline: a remuda read-back that echoes THIS request (or comes
+    //    from an echo-less driver) is our verdict even on an opposite flag; a
+    //    terminal-origin flag settles only when it equals the requested one —
+    //    otherwise it could be request A's flag proving nothing for B.
+    const trustedRemuda = remuda && (requestedEcho === undefined || echoesRequest);
     const flagEvidence =
       threshold != null
         ? effortFlagSettles(view.ultracode)
-        : remuda
+        : trustedRemuda
           ? effortFlagSettles(view.ultracode)
           : view.ultracode === pending.ultracode;
     if (newer && !flagSettled && flagEvidence) {
@@ -1191,7 +1213,7 @@ class HubStore {
     const ours = Boolean(pending) || (hydratedAt != null && view.observedAt <= hydratedAt);
     if (ours) {
       if (pending) {
-        const updated = this.settleEffortAxes(instanceId, pending, view);
+        const updated = this.settleEffortAxes(instanceId, pending, view, parsed.requested);
         if (updated) {
           patch.effortPending = { ...this.state.effortPending, [instanceId]: updated };
         } else {
@@ -1252,6 +1274,12 @@ class HubStore {
     const parsed = effortLifecycleStatus(value);
     if (!parsed) return;
     const current = this.state.effortPending[instanceId];
+    // THIS request's queued edge timestamp — the request threshold. Parsed as
+    // an instant like every other observedAt comparison (r6 same-second fix).
+    const queuedThreshold =
+      typeof observation.observedAt === "string" && Number.isFinite(Date.parse(observation.observedAt))
+        ? observation.observedAt
+        : null;
     if (parsed.kind === "queued") {
       let current = this.state.effortPending[instanceId];
       if (current) {
@@ -1275,21 +1303,26 @@ class HubStore {
           ultracode: fallbackSelection.ultracode === true,
           queued: true,
           at: Date.now(),
-          thresholdObservedAt: this.state.effortEffective[instanceId]?.observedAt ?? null,
+          thresholdObservedAt: queuedThreshold ?? this.state.effortEffective[instanceId]?.observedAt ?? null,
           levelSettled: false,
           flagSettled: false,
           source: "lifecycle",
         };
         this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: current.nonce } });
       }
-      // Provenance: the threshold is stamped from THIS request's queued
-      // lifecycle; an earlier timestamp survives only for the same request
-      // (a duplicate queued edge), never across requests.
-      const fresh = this.state.effortEffective[instanceId]?.observedAt ?? current.thresholdObservedAt;
+      // Provenance (c-effortui r3 item 3): the threshold is THIS request's
+      // own queued-lifecycle observedAt, so a replaced request A's read-back
+      // (journaled before B was queued) can never be "newer than the request"
+      // and settle B. Only an unparseable queued timestamp falls back to the
+      // previous stamp; a duplicate queued edge simply carries the same time.
+      const stamped =
+        queuedThreshold ??
+        this.state.effortEffective[instanceId]?.observedAt ??
+        current.thresholdObservedAt;
       this.emit({
         effortPending: {
           ...this.state.effortPending,
-          [instanceId]: { ...current, queued: true, thresholdObservedAt: fresh },
+          [instanceId]: { ...current, queued: true, thresholdObservedAt: stamped },
         },
       });
       return;

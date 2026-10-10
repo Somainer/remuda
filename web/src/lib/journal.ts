@@ -48,6 +48,23 @@ const MAX_FILL_EVENTS = 20_000;
 /** One Hub window; load-earlier fetches a single page per click. */
 const JOURNAL_WINDOW_READ = 2_000;
 
+/**
+ * Outcome of one {@link JournalClient.loadEarlier} click.
+ *  - `prepended`: at least one unseen row was delivered through `onPrepend`.
+ *  - `end`: no older window can exist anymore (seq 1 is held, the read reached
+ *    its afterSeq cursor, or a read added nothing after descending).
+ *  - `floor`: the retained (lowest LOADED) floor after the click, or "1" at end.
+ *
+ * A click can return `{prepended:false, end:false}`: a window that re-served
+ * only rows already held (a reconnect snapshot re-anchored above them). The
+ * descending cursor advanced, so the next click reaches further history.
+ */
+export type EarlierWindow = {
+  prepended: boolean;
+  end: boolean;
+  floor: U64 | null;
+};
+
 function n(seq: U64): number {
   const v = Number(seq);
   if (!Number.isFinite(v)) throw new Error(`invalid seq ${seq}`);
@@ -92,6 +109,16 @@ export class JournalClient {
   private fillingTo = 0;
   private fillingGen = -1;
   private loadingEarlier = false;
+  /**
+   * The `beforeSeq` of the next descending load-earlier read. Every snapshot
+   * (seed / bounded resync after a reconnect) re-anchors it to that snapshot's
+   * window floor minus 1, so paging starts below the CURRENT server window even
+   * when that window moved above rows this client already holds. Every returned
+   * window moves it to `windowFromSeq - 1`, including a window of rows all
+   * already held, so repeated clicks descend past a re-anchor instead of
+   * retiring on the duplicate page. 0 means paging reached the end.
+   */
+  private pagingBelow = Number.POSITIVE_INFINITY;
   status: "live" | "reconnecting" | "gap-backfill" | "readonly-stale" = "live";
   /** Bumped per resumeAfterReconnect; stale attempts are no-ops. */
   private resumeGen = 0;
@@ -130,6 +157,25 @@ export class JournalClient {
     return Number.isFinite(this.floorSeq) ? s(this.floorSeq) : "1";
   }
 
+  /**
+   * Register the rows delivered by the initial bounded seed READ (as opposed
+   * to the follow socket / fills, which arrive through applyBatch). The seed
+   * is held by the UI even though it never crossed this client's seen map;
+   * without it a load-earlier window overlapping the seed would count those
+   * rows as fresh and skip the retained floor straight past them.
+   */
+  noteHistory(events: Observation[]): void {
+    for (const ev of events) {
+      const seq = n(ev.seq);
+      this.seen.set(seq, ev.eventId);
+      if (events.length) this.floorSeq = Math.min(this.floorSeq, seq);
+    }
+    this.durableSeq = Math.max(
+      this.durableSeq,
+      events.reduce((max, ev) => Math.max(max, n(ev.seq)), 0),
+    );
+  }
+
   applySnapshot(snapshot: Snapshot): void {
     const target = n(snapshot.asOfSeq);
     this.durableSeq = Math.max(this.durableSeq, target);
@@ -142,11 +188,16 @@ export class JournalClient {
       this.applied = target;
     }
     const nextFloor = n(snapshot.history.earliestRetainedSeq);
-    // A partial snapshot carries a WINDOW floor, not a retention floor: it can
-    // move up as the journal grows, and load-earlier must remember the lowest
-    // window already loaded. Only a complete (authoritative) snapshot resets
-    // the floor.
-    this.floorSeq = snapshot.history.complete ? nextFloor : Math.min(this.floorSeq, nextFloor);
+    // Never raise the loaded floor above rows the client actually holds: a
+    // bounded resync snapshot (complete or partial) after a reconnect can
+    // name a floor above manually paged history, and retiring to it would make
+    // that history unreachable. A genuinely truncated journal is discovered by
+    // the next descending read returning nothing (one wasted click at most).
+    this.floorSeq = Math.min(this.floorSeq, nextFloor);
+    // Re-anchor the descending pager below THIS snapshot's window. It may sit
+    // above rows already loaded (the next clicks walk down through duplicate
+    // windows); the retained floor above keeps the button offered meanwhile.
+    this.pagingBelow = Math.max(0, nextFloor - 1);
     this.listeners.onSnapshot?.(snapshot);
   }
 
@@ -325,44 +376,88 @@ export class JournalClient {
   }
 
   /**
-   * Load one window of older history below the current loaded floor. Prepends
-   * are delivered ascending through `onPrepend`; the loaded floor moves down
-   * and returns null once seq 1 is held or an older read yields nothing.
+   * Load one window of older history below the current descending cursor.
+   * Unseen rows are delivered ascending through `onPrepend`. A window whose
+   * rows are all already held (a reconnect snapshot re-anchored above loaded
+   * history) fires no prepend but advances the cursor, so repeated clicks keep
+   * descending until new rows — or the end at seq 1 / the afterSeq cursor.
    */
-  async loadEarlier(): Promise<U64 | null> {
-    if (this.loadingEarlier) return null;
-    if (!Number.isFinite(this.floorSeq) || this.floorSeq <= 1) return null;
+  async loadEarlier(): Promise<EarlierWindow> {
+    const atEnd = (): EarlierWindow => ({
+      prepended: false,
+      end: true,
+      floor: this.retainedFloorSeq,
+    });
+    if (this.loadingEarlier) return atEnd();
+    if (!Number.isFinite(this.floorSeq) || this.floorSeq <= 1 || this.pagingBelow <= 0) {
+      return atEnd();
+    }
     this.loadingEarlier = true;
     try {
       const page = await this.read({
         journalId: this.journalId,
         afterSeq: "0",
-        beforeSeq: s(this.floorSeq - 1),
+        beforeSeq: s(this.pagingBelow),
         limit: JOURNAL_WINDOW_READ,
       });
       this.durableSeq = Math.max(this.durableSeq, n(page.durableSeq));
       if (page.events.length === 0) {
-        // The floor claimed older rows existed but none came back; stop
-        // offering the action rather than re-requesting forever.
+        // The paging cursor claimed older rows existed but none came back: end
+        // of the line, stop offering the action instead of re-requesting.
         this.floorSeq = 1;
-        return null;
+        this.pagingBelow = 0;
+        return atEnd();
       }
+      // Divergence check on every row; collect the ones not already held.
+      const fresh: Observation[] = [];
       for (const ev of page.events) {
         const seq = n(ev.seq);
         const prev = this.seen.get(seq);
         if (prev && prev !== ev.eventId) {
           this.listeners.onDiverged?.(ev.seq);
           this.setStatus("readonly-stale");
-          return null;
+          return atEnd();
         }
-        this.seen.set(seq, ev.eventId);
+        if (!prev) fresh.push(ev);
       }
-      this.floorSeq = Math.min(this.floorSeq, n(page.events[0].seq));
-      this.listeners.onPrepend?.(page.events.slice());
-      return this.retainedFloorSeq;
+      const wFloor = page.windowFromSeq === null ? null : n(page.windowFromSeq);
+      // Advance the DESCENDING cursor from the window this read actually
+      // returned — even when every row was a duplicate — because the snapshot
+      // re-anchor may point above the rows this client already holds.
+      if (wFloor !== null) this.pagingBelow = wFloor - 1;
+      // reachedAfterSeq names the afterSeq cursor ("0"); a null/<=1 floor says
+      // the same for older Hubs.
+      const reachedEnd = page.reachedAfterSeq || wFloor === null || wFloor <= 1;
+      if (fresh.length === 0) {
+        if (reachedEnd) {
+          this.floorSeq = 1;
+          this.pagingBelow = 0;
+        }
+        // Duplicate-only, history remains: no onPrepend, the retained floor is
+        // preserved and the button stays offered; the cursor now points below
+        // this window for the next click.
+        return {
+          prepended: false,
+          end: reachedEnd,
+          floor: this.retainedFloorSeq,
+        };
+      }
+      // Rows ascend; the lowest unseen row is the new retained floor.
+      this.floorSeq = Math.min(this.floorSeq, n(fresh[0]!.seq));
+      for (const ev of fresh) this.seen.set(n(ev.seq), ev.eventId);
+      this.listeners.onPrepend?.(fresh.slice());
+      if (reachedEnd) {
+        this.floorSeq = 1;
+        this.pagingBelow = 0;
+      }
+      return {
+        prepended: true,
+        end: reachedEnd || this.floorSeq <= 1,
+        floor: this.retainedFloorSeq,
+      };
     } catch {
       this.setStatus("readonly-stale");
-      return null;
+      return atEnd();
     } finally {
       this.loadingEarlier = false;
     }

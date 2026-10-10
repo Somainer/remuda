@@ -32,8 +32,12 @@ test.describe("design align 1b screenshots", () => {
     await row(page, "看 TaskManager spill").click();
     await expect(page.getByTestId("session-page")).toBeVisible();
     await expect(page.getByTestId("transcript")).toBeVisible();
-    const density = page.getByTestId("density-toggle");
+    // Density lives in the header ⋯ (D-053); picking an item closes the menu.
+    await page.getByTestId("session-more-open").click();
+    const density = page.getByTestId("session-more-menu").getByTestId("density-toggle");
     if ((await density.getAttribute("data-mode")) === "compact") await density.click();
+    else await page.keyboard.press("Escape");
+    await expect(page.getByTestId("session-more-menu")).toHaveCount(0);
     await expect(page.getByTestId("tool-card").first()).toBeVisible();
     await shot(page, "1b-session", { width: 1440, height: 900 });
     await shot(page, "1b-session", { width: 390, height: 844 });

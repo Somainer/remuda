@@ -186,6 +186,17 @@ it("mounts the inline slider (layout A, no card) with the five Claude stops and 
 });
 
 
+it("lists every Claude launch mode incl. plan and dontAsk, with native ids (item 5)", () => {
+  renderWithCli();
+  const row = screen.getByTestId("new-session-perm-row");
+  expect(row).toHaveAttribute("data-harness", "claude");
+  // The launch table — not the live four-row wheel.
+  for (const id of ["manual", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"]) {
+    expect(screen.getByTestId(`new-session-perm-${id}`)).toBeVisible();
+  }
+  // The yolo/danger row keeps its danger treatment in the launch grid.
+  expect(screen.getByTestId("new-session-perm-bypassPermissions")).toHaveAttribute("data-danger", "1");
+});
 it("offers each other harness its OWN native permission ids, never Claude ids (item 7)", () => {
   renderWithCli();
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));

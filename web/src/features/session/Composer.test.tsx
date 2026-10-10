@@ -408,6 +408,27 @@ describe("Composer shortcuts", () => {
     expect(chip).toHaveAttribute("data-permission-danger", "1");
     expect(chip).toHaveTextContent("never");
   });
+  it("item 5: the live wheel walks the CLI order and keeps dontAsk out", () => {
+    render(
+      <Composer
+        instanceId="ins_wheel"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 2, false)}
+        permissionMode="manual"
+        launchPermissionMode="manual"
+        onPermission={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("permission-chip"));
+    expect(["manual", "acceptEdits", "plan", "auto"].map((id) =>
+      screen.getByTestId(`permission-option-${id}`).textContent,
+    ).length).toBe(4);
+    expect(screen.queryByTestId("permission-option-dontAsk")).toBeNull();
+    expect(screen.queryByTestId("permission-option-bypassPermissions")).toBeNull();
+  });
 
 });
 

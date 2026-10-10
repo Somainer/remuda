@@ -166,6 +166,12 @@ struct Slot {
     candidate_scan_at: Option<Instant>,
     /// SessionStart hook reports not yet matched to a foreground pid.
     hooks: Vec<SessionStartReport>,
+    /// c-effortread r8 item 2: SessionStart hook `source` keyed by
+    /// `(ppid, session_id)` as reported at delivery. Survives `hooks.clear()`
+    /// on a rebind so the sticky mode for the rebound session (recorded on a
+    /// later tick) can still classify clear/startup vs resume without sizing
+    /// a transcript that already holds the queued prompt.
+    start_sources: std::collections::HashMap<(i64, String), String>,
 }
 
 impl BindingHandle {
@@ -184,6 +190,7 @@ impl BindingHandle {
                 picker: None,
                 candidate_scan_at: None,
                 hooks: Vec::new(),
+                start_sources: std::collections::HashMap::new(),
             })),
         }
     }
@@ -202,6 +209,7 @@ impl BindingHandle {
             slot.picker = None;
             slot.candidate_scan_at = None;
             slot.hooks.clear();
+            slot.start_sources.clear();
         }
     }
 
@@ -216,6 +224,10 @@ impl BindingHandle {
             slot.picker = None;
             slot.candidate_scan_at = None;
             slot.hooks.clear();
+            // start_sources deliberately survive demobilize: a demote followed
+            // by re-promotion of the same pid (r7 item 4c) must keep the
+            // /clear-vs-/resume classification; begin_epoch (a genuinely new
+            // foreground epoch) clears them.
         }
     }
 
@@ -229,6 +241,12 @@ impl BindingHandle {
             let duplicate = slot.hooks.iter().any(|existing| {
                 existing.ppid == report.ppid && existing.session_id == report.session_id
             });
+            if let (Some(ppid), Some(source)) = (report.ppid, report.start_source.as_ref()) {
+                // Last source wins per (pid, session); survives hooks.clear()
+                // (c-effortread r8 item 2).
+                slot.start_sources
+                    .insert((ppid, report.session_id.clone()), source.clone());
+            }
             if !duplicate {
                 slot.hooks.push(report);
             }
@@ -295,6 +313,16 @@ impl BindingHandle {
     /// Current locked binding, if any.
     fn binding(&self) -> Option<TranscriptBinding> {
         self.inner.lock().ok().and_then(|slot| slot.binding.clone())
+    }
+
+    /// c-effortread r8 item 2: the SessionStart hook `source` for
+    /// `(pid, session_id)` captured at delivery (survives rebind clears).
+    fn start_source_for(&self, pid: i32, session_id: &str) -> Option<String> {
+        self.inner.lock().ok().and_then(|slot| {
+            slot.start_sources
+                .get(&(i64::from(pid), session_id.to_owned()))
+                .cloned()
+        })
     }
 
     /// Whether the locked binding has been marked degraded.
@@ -1011,6 +1039,9 @@ pub(super) fn spawn(
                         &binding.session_id,
                         binding.transcript_path.as_deref().map(std::path::Path::new),
                         pre_resume_mode,
+                        bindings
+                            .start_source_for(binding.pid, &binding.session_id)
+                            .as_deref(),
                         found.as_ref().expect("matched foreground"),
                     );
                 }
@@ -1020,6 +1051,10 @@ pub(super) fn spawn(
                         transcript_path: path.into(),
                         cwd: None,
                         ppid: Some(i64::from(binding.pid)),
+                        // This report is synthesized from a pid-file bind, not
+                        // the native hook payload — source unknown, fall back
+                        // to transcript sizing.
+                        start_source: None,
                     };
                     // r7 item 1: the authenticated report names the session
                     // ACTUALLY live in this pid. It governs both when an
@@ -1628,12 +1663,19 @@ impl SessionModeTable {
     /// Record the SessionStart for `(pid, session_id)` once and return its
     /// sticky mode. `transcript_path` is the path the hook named at that
     /// instant (may not exist yet — a lazily created fresh session).
+    ///
+    /// `start_source` is the authenticated SessionStart hook's `source`
+    /// (c-effortread r8 item 2), captured AT HOOK DELIVERY — before the prompt
+    /// reaches the rebound transcript: a `/clear`/startup/compact source is a
+    /// brand-new empty session (Fresh) even if the file is already non-empty
+    /// by the time this runs (queued/pasted prompt before the next poll tick).
     fn record(
         &mut self,
         pid: i32,
         session_id: &str,
         transcript_path: Option<&std::path::Path>,
         pre_resume_mode: Option<ResumeMode>,
+        start_source: Option<&str>,
         found: &Detected,
     ) -> StickySessionMode {
         let key = (pid, session_id.to_owned());
@@ -1653,14 +1695,19 @@ impl SessionModeTable {
                 false,
             )
         } else {
-            // A later in-TUI session (/resume, /clear): bounded from THIS
-            // session's transcript as it is at the authenticated report.
-            (
-                transcript_path
+            // A later in-TUI session (/resume, /clear). The SessionStart hook
+            // source captured at delivery decides:
+            // - clear/startup/compact → a NEW empty session → Fresh, even if
+            //   the transcript already holds the queued/pasted prompt now;
+            // - resume/unknown → the file carries (or may carry) another
+            //   session's history → unverified EOF anchor (or Fresh if empty).
+            let mode = match start_source {
+                Some("clear" | "startup" | "compact") => ResumeMode::Fresh,
+                _ => transcript_path
                     .map(ResumeMode::rebound_mode)
                     .unwrap_or(ResumeMode::Fresh),
-                true,
-            )
+            };
+            (mode, true)
         };
         let entry = StickySessionMode { mode, rebound };
         self.modes.insert(key, entry);
@@ -1947,6 +1994,9 @@ async fn maintain_binding(
                 &binding.session_id,
                 Some(&binding.path),
                 pre_resume_mode,
+                bindings
+                    .start_source_for(found.pid, &binding.session_id)
+                    .as_deref(),
                 found,
             );
         }
@@ -2816,6 +2866,7 @@ mod tests {
         let found = detected_claude(4242, Some(CORRECT));
         assert_eq!(bindings.resolve(&found).unwrap().session_id, CORRECT);
         let mut report = SessionStartReport {
+            start_source: None,
             session_id: LATE_STARTER.into(),
             transcript_path: crate::claude_transcript::project_dir(tmp.path(), &cwd)
                 .join(format!("{LATE_STARTER}.jsonl")),
@@ -2848,6 +2899,7 @@ mod tests {
         slug_session(tmp.path(), &cwd, LATE_STARTER, "{}\n");
         let found = detected_claude(7, Some(CORRECT));
         let report = SessionStartReport {
+            start_source: None,
             session_id: LATE_STARTER.into(),
             transcript_path: crate::claude_transcript::project_dir(tmp.path(), &cwd)
                 .join(format!("{LATE_STARTER}.jsonl")),
@@ -2870,6 +2922,7 @@ mod tests {
         let stray = other_cwd.join("stray.jsonl");
         std::fs::write(&stray, "{}\n").unwrap();
         let stray_report = SessionStartReport {
+            start_source: None,
             session_id: "stray-session".into(),
             transcript_path: stray,
             cwd: None,
@@ -2983,6 +3036,84 @@ mod tests {
         assert_eq!(
             bindings.resolve(&found).expect("binds late").session_id,
             CORRECT
+        );
+    }
+
+    /// c-effortread r8 item 2: the native hook payload's `source` is parsed
+    /// and exposed; a `/clear` report drives a Fresh classification even when
+    /// the transcript is non-empty at binding time.
+    #[test]
+    fn r8_item2_session_start_report_parses_source_and_survives_rebind_clear() {
+        let parsed = SessionStartReport::from_stdin(
+            r#"{"hook_event_name":"SessionStart","session_id":"clear-z","transcript_path":"/tmp/z.jsonl","cwd":"/repo","ppid":4242,"source":"clear"}"#,
+        )
+        .expect("parses");
+        assert_eq!(parsed.start_source.as_deref(), Some("clear"));
+        assert!(parsed.source_is_fresh_start());
+        assert!(!parsed.source_is_resume());
+
+        let resume = SessionStartReport::from_stdin(
+            r#"{"hook_event_name":"SessionStart","session_id":"old","transcript_path":"/tmp/o.jsonl","ppid":4242,"source":"resume"}"#,
+        )
+        .expect("parses");
+        assert!(!resume.source_is_fresh_start());
+        assert!(resume.source_is_resume());
+
+        // The source registry survives a rebind's hooks.clear(): bind an
+        // existing "old" session, then drive an authenticated /clear rebind to
+        // a non-empty Z transcript (rebind clears the hooks vector); the
+        // /clear source must still be available, and the sticky-mode table
+        // records Fresh so the gate opens for Z.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let old_path = slug_session(tmp.path(), &cwd, "old", "{}\n");
+        // Z.jsonl ALREADY holds the queued prompt before the poll tick.
+        let z: std::path::PathBuf = slug_session(
+            tmp.path(),
+            &cwd,
+            "clear-z",
+            "{\"type\":\"user\",\"message\":{\"content\":\"queued prompt\"}}\n",
+        );
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&cwd, tmp.path());
+        let mut table = SessionModeTable::default();
+        let found = detected_claude(4242, Some("old"));
+        let old_report = SessionStartReport {
+            session_id: "old".into(),
+            transcript_path: old_path,
+            cwd: Some(cwd.clone()),
+            ppid: Some(4242),
+            start_source: Some("resume".into()),
+        };
+        assert!(bindings.bind_authenticated_report(&found, &old_report));
+        let clear_report = SessionStartReport {
+            session_id: "clear-z".into(),
+            transcript_path: z,
+            cwd: Some(cwd.clone()),
+            ppid: Some(4242),
+            start_source: Some("clear".into()),
+        };
+        // The /clear rebind flips the slot and clears the hooks vector.
+        assert!(bindings.rebind_authenticated_start(&found, &clear_report));
+        bindings.ingest_session_start(clear_report);
+        assert_eq!(
+            bindings.start_source_for(4242, "clear-z").as_deref(),
+            Some("clear"),
+            "the /clear source survives the rebind hooks.clear()"
+        );
+        let m = table.record(
+            4242,
+            "clear-z",
+            bindings.binding().as_ref().map(|b| b.path.as_path()),
+            None,
+            bindings.start_source_for(4242, "clear-z").as_deref(),
+            &found,
+        );
+        assert_eq!(
+            m.mode,
+            ResumeMode::Fresh,
+            "queued prompt in Z.jsonl -> Fresh, gate opens"
         );
     }
 
@@ -3914,17 +4045,17 @@ mod tests {
         let own_found = detected_claude(7, Some(CORRECT));
         // First report for the pid = the launched session: keeps the
         // pre-spawn mode, rebound=false.
-        let first = table.record(7, CORRECT, None, pre, &own_found);
+        let first = table.record(7, CORRECT, None, pre, None, &own_found);
         assert!(!first.rebound);
         assert_eq!(first.mode, ResumeMode::Unverified);
         // Idempotent: a repeat report cannot flip it.
         assert_eq!(
-            table.record(7, CORRECT, Some(&older), pre, &own_found),
+            table.record(7, CORRECT, Some(&older), pre, None, &own_found),
             first
         );
         // A later /resume session with an existing transcript: Unverified
         // EOF, rebound=true.
-        let rebound = table.record(7, LATE_STARTER, Some(&older), pre, &own_found);
+        let rebound = table.record(7, LATE_STARTER, Some(&older), pre, None, &own_found);
         assert!(rebound.rebound);
         assert!(
             matches!(rebound.mode, ResumeMode::Boundary(b) if !b.verified),
@@ -3932,12 +4063,88 @@ mod tests {
             rebound.mode
         );
         // A later /clear session whose file is EMPTY at the report: Fresh.
-        let clear = table.record(7, BUSY_OTHER, Some(&newer), pre, &own_found);
+        let clear = table.record(7, BUSY_OTHER, Some(&newer), pre, None, &own_found);
         assert!(clear.rebound);
         assert_eq!(clear.mode, ResumeMode::Fresh);
         // Lookup.
         assert!(table.mode_for(7, LATE_STARTER).is_some());
         assert!(table.mode_for(8, LATE_STARTER).is_none());
+    }
+
+    /// c-effortread r8 item 2: a `/clear` hook with source "clear" is Fresh
+    /// even when the rebound transcript ALREADY HOLDS THE PROMPT at the time
+    /// the sticky mode is recorded (queued/pasted prompt beat the 800 ms
+    /// poll tick). Sizing at the tick used to make it an unverified EOF anchor,
+    /// which skipped the prompt for hydration and kept the effort gate shut.
+    #[test]
+    fn r8_item2_clear_source_is_fresh_when_transcript_already_nonempty() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        // Simulate the r7 ordering: the rebound session Z's transcript already
+        // has content (the queued prompt) BEFORE the poll block records mode.
+        let z: std::path::PathBuf = slug_session(
+            dir.path(),
+            &cwd,
+            "clear-session",
+            "{\"type\":\"user\",\"message\":{\"content\":\"do the thing\"}}\n",
+        );
+        let mut table = SessionModeTable::default();
+        let own_found = detected_claude(7, Some(CORRECT));
+        // The launched process's first session (so the /clear one is a rebound).
+        let launch = slug_session(dir.path(), &cwd, CORRECT, "{}\n");
+        table.record(7, CORRECT, Some(&launch), None, None, &own_found);
+
+        // A /clear report (source captured at hook delivery): Fresh despite
+        // the non-empty file.
+        let cleared = table.record(
+            7,
+            "clear-session",
+            Some(&z),
+            None,
+            Some("clear"),
+            &own_found,
+        );
+        assert!(cleared.rebound);
+        assert_eq!(cleared.mode, ResumeMode::Fresh);
+
+        // startup and compact are likewise fresh-new sessions; resume stays an
+        // unverified anchor; unknown source falls back to file sizing. Each
+        // gets a distinct rebound session id on the SAME (already-launched)
+        // pid.
+        for (source, expect_fresh, label) in [
+            ("startup", true, "startup"),
+            ("compact", true, "compact"),
+            ("resume", false, "resume"),
+        ] {
+            let m = table.record(
+                7,
+                &format!("rebound-{label}"),
+                Some(&z),
+                None,
+                Some(source),
+                &own_found,
+            );
+            assert!(m.rebound, "{label} is a rebound session");
+            if expect_fresh {
+                assert_eq!(m.mode, ResumeMode::Fresh, "{label} source is a fresh start");
+            } else {
+                assert!(
+                    matches!(m.mode, ResumeMode::Boundary(b) if !b.verified),
+                    "{label} with history -> unverified anchor: {:?}",
+                    m.mode
+                );
+            }
+        }
+
+        // Unknown source (older hook payload) falls back to sizing: non-empty
+        // file -> unverified.
+        let unknown = table.record(7, "rebound-unknown", Some(&z), None, None, &own_found);
+        assert!(
+            matches!(unknown.mode, ResumeMode::Boundary(_)),
+            "unknown source sizes the file (non-empty -> unverified): {:?}",
+            unknown.mode
+        );
     }
 
     /// r6 item 3 (the lazy-create case): a fresh launch has no transcript and
@@ -3959,11 +4166,12 @@ mod tests {
         // transcript-less) session; the SECOND is the in-TUI /resume target.
         let mut table = SessionModeTable::default();
         let launched_found = detected_claude(7, Some(BUSY_OTHER));
-        let _launched = table.record(7, BUSY_OTHER, None, None, &launched_found);
+        let _launched = table.record(7, BUSY_OTHER, None, None, None, &launched_found);
         let rebound = table.record(
             7,
             PUMP_SESSION,
             Some(&fx.binding.path),
+            None,
             None,
             &launched_found,
         );
@@ -4010,11 +4218,12 @@ mod tests {
         let launched_found = detected_claude(7, Some(BUSY_OTHER));
         // First report is the launched session; the second (same pid, new
         // session id) is /clear, recorded while its file is absent.
-        let _launched = table.record(7, BUSY_OTHER, None, None, &launched_found);
+        let _launched = table.record(7, BUSY_OTHER, None, None, None, &launched_found);
         let clear = table.record(
             7,
             PUMP_SESSION,
             Some(&fx.binding.path),
+            None,
             None,
             &launched_found,
         );
@@ -4067,7 +4276,7 @@ mod tests {
         let mut fx = pump_fixture(dir.path(), &first_turn);
         let found = detected_claude(7, Some(PUMP_SESSION));
         let mut table = SessionModeTable::default();
-        let first = table.record(7, PUMP_SESSION, Some(&fx.binding.path), None, &found);
+        let first = table.record(7, PUMP_SESSION, Some(&fx.binding.path), None, None, &found);
         assert!(!first.rebound);
         assert_eq!(first.mode, ResumeMode::Fresh, "a fresh argv is Fresh");
         let mut launch = LaunchModeBinding::Unbound;

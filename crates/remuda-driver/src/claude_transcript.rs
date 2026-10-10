@@ -214,11 +214,37 @@ pub struct SessionStartReport {
     pub cwd: Option<PathBuf>,
     /// Pid of the `claude` process (the hook process's parent).
     pub ppid: Option<i64>,
+    /// Claude Code SessionStart hook `source` when present:
+    /// `"startup" | "clear" | "compact" | "resume"` (c-effortread r8 item 2).
+    /// A `/clear` or startup/compact source starts a NEW empty session, so its
+    /// mode is Fresh AT HOOK DELIVERY even if the prompt reaches Z.jsonl before
+    /// the next poll tick sizes it; `"resume"` carries existing history.
+    /// `None` = older hook payload / unknown — callers fall back to sizing.
+    pub start_source: Option<String>,
 }
 
 impl SessionStartReport {
+    /// Whether this hook's source proves the session started EMPTY (a `/clear`,
+    /// startup or compact) rather than resuming prior history.
+    /// c-effortread r8 item 2.
+    #[must_use]
+    pub fn source_is_fresh_start(&self) -> bool {
+        matches!(
+            self.start_source.as_deref(),
+            Some("startup" | "clear" | "compact")
+        )
+    }
+
+    /// Whether this hook's source is an explicit resume of an existing
+    /// session (history must be treated as unverified).
+    #[must_use]
+    pub fn source_is_resume(&self) -> bool {
+        self.start_source.as_deref() == Some("resume")
+    }
+
     /// Parse one hook stdin payload (`{hook_event_name, session_id,
-    /// transcript_path, cwd, ppid}`; camelCase tolerated, `ppid` optional).
+    /// transcript_path, cwd, ppid, source}`; camelCase tolerated, `ppid` and
+    /// `source` optional).
     pub fn from_stdin(json: &str) -> Result<Self, String> {
         #[derive(Deserialize)]
         struct Raw {
@@ -230,6 +256,8 @@ impl SessionStartReport {
             cwd: Option<PathBuf>,
             #[serde(default)]
             ppid: Option<i64>,
+            #[serde(default)]
+            source: Option<String>,
         }
         let raw: Raw = serde_json::from_str(json).map_err(|err| err.to_string())?;
         if raw.session_id.trim().is_empty() || raw.transcript_path.as_os_str().is_empty() {
@@ -240,6 +268,7 @@ impl SessionStartReport {
             transcript_path: raw.transcript_path,
             cwd: raw.cwd,
             ppid: raw.ppid,
+            start_source: raw.source,
         })
     }
 

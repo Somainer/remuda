@@ -534,9 +534,7 @@ pub fn locate_rollout_by_cwd(
             // (tens-of-KB) header is never opened or parsed. A genuinely new
             // session bumps the file mtime, so this never skips a candidate.
             if let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified())
-                && modified
-                    < std::time::SystemTime::UNIX_EPOCH
-                        + std::time::Duration::from_secs(floor.unix_timestamp() as u64)
+                && modified < floor_system
             {
                 continue;
             }

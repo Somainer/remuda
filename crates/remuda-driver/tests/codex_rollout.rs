@@ -501,74 +501,107 @@ fn discovery_does_not_follow_file_or_directory_symlinks() {
 }
 
 #[test]
-fn locate_by_cwd_skips_files_and_date_dirs_older_than_the_launch_floor() {
-    // r4 item 6: with thousands of rollouts the locator must not open/parse
-    // every file each 250 ms tick. A future floor makes every just-written
-    // path "older than the floor", so a perfectly parseable MATCHING rollout
-    // must be skipped by mtime/date pruning alone (proven: parsing it would
-    // have returned Found).
+fn locate_by_cwd_skips_a_fresh_file_when_its_date_directory_predates_the_floor() {
+    // Isolates the DATE-LEAF directory prune: the file mtime is set AFTER the
+    // floor (so the per-file filter passes), the content timestamp is also
+    // after the floor (so parsing WOULD return Found), but the YYYY/MM/DD date
+    // directory's own mtime predates the floor -> the whole subtree is
+    // skipped without opening the file.
     use remuda_driver::codex_rollout::{CwdRollout, locate_rollout_by_cwd};
+    use std::fs::File;
+    use std::time::SystemTime;
 
     let home = tempfile::tempdir().unwrap();
-    let cwd = Path::new("/projects/prune");
+    let cwd = Path::new("/projects/prune-dir");
     let session_dir = home.path().join("sessions/2026/09/14");
     std::fs::create_dir_all(&session_dir).unwrap();
-    let started = time::OffsetDateTime::now_utc()
+    // Content starts in the FUTURE relative to the floor: the content check
+    // accepts it. Only the mtime/dir pruning may reject.
+    let started = (time::OffsetDateTime::now_utc() + time::Duration::seconds(61))
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
-    let rollout = session_dir.join("rollout-prune.jsonl");
+    let rollout = session_dir.join("rollout-prune-dir.jsonl");
     {
-        let mut file = std::fs::File::create(&rollout).unwrap();
+        let mut file = File::create(&rollout).unwrap();
         writeln!(
             file,
-            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"prune\",\"session_id\":\"prune\",\"cwd\":\"/projects/prune\",\"timestamp\":\"{started}\"}}}}"
+            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"prune-dir\",\"session_id\":\"prune-dir\",\"cwd\":\"/projects/prune-dir\",\"timestamp\":\"{started}\"}}}}"
         )
         .unwrap();
+        // The FILE is newer than the floor ...
+        file.set_modified(SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
     }
+    // ... but the date directory keeps its (older) creation mtime.
+    File::open(&session_dir)
+        .unwrap()
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
 
-    // Floor in the future: both the file and its date directory predate it.
-    let future = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
-    let found = locate_rollout_by_cwd(home.path(), cwd, future, &|_| false);
+    let floor = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
+    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false);
     assert!(
         matches!(found, CwdRollout::NotYet),
-        "old mtime skips parsing even though the content matches: {found:?}"
+        "the stale date directory prunes a fresh, content-matching file: {found:?}"
     );
 
-    // A normal (past) floor parses the same file and binds.
-    let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(10);
+    // A floor older than the forced directory mtime finds the same file
+    // normally (its mtime is stale by construction for this test).
+    let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(4000);
     let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false);
     assert!(
         matches!(found, CwdRollout::Found { .. }),
-        "fresh mtime binds"
+        "past floor binds"
     );
 }
 
 #[test]
-fn locate_by_cwd_skips_old_files_inside_a_non_date_directory() {
-    // Isolates the per-FILE mtime filter: the directory prune only applies to
-    // YYYY/MM/DD date leaves, so a matching rollout under any other layout
-    // must still be skipped by its own old mtime.
+fn locate_by_cwd_skips_an_old_file_even_under_a_fresh_non_date_directory() {
+    // Isolates the per-FILE mtime filter: inside a non-date directory (which
+    // the directory prune never touches), a content-matching file whose mtime
+    // predates the floor is skipped without parsing. Content timestamp is set
+    // after the floor, so removing the file filter would return Found.
     use remuda_driver::codex_rollout::{CwdRollout, locate_rollout_by_cwd};
+    use std::fs::File;
+    use std::time::SystemTime;
 
     let home = tempfile::tempdir().unwrap();
     let cwd = Path::new("/projects/prune-file");
     let dir = home.path().join("sessions/custom-layout/sub");
     std::fs::create_dir_all(&dir).unwrap();
-    let started = time::OffsetDateTime::now_utc()
+    let started = (time::OffsetDateTime::now_utc() + time::Duration::seconds(61))
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
+    let rollout = dir.join("rollout.jsonl");
     {
-        let mut file = std::fs::File::create(dir.join("rollout.jsonl")).unwrap();
+        let mut file = File::create(&rollout).unwrap();
         writeln!(
             file,
             "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"prune-file\",\"session_id\":\"prune-file\",\"cwd\":\"/projects/prune-file\",\"timestamp\":\"{started}\"}}}}"
         )
         .unwrap();
     }
-    let future = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
-    let found = locate_rollout_by_cwd(home.path(), cwd, future, &|_| false);
+    // The non-date directory is fresh; the FILE itself predates the floor.
+    File::open(&dir)
+        .unwrap()
+        .set_modified(SystemTime::now() + std::time::Duration::from_secs(120))
+        .unwrap();
+    File::open(&rollout)
+        .unwrap()
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    let floor = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
+    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false);
     assert!(
         matches!(found, CwdRollout::NotYet),
-        "the per-file mtime filter skips a parseable match: {found:?}"
+        "the per-file mtime filter skips a content-matching file: {found:?}"
+    );
+
+    let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(4000);
+    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false);
+    assert!(
+        matches!(found, CwdRollout::Found { .. }),
+        "past floor binds"
     );
 }

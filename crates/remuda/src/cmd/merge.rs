@@ -55,10 +55,12 @@ pub(crate) struct MergeArgs {
     #[arg(long, default_value_t = 2)]
     #[serde(default = "default_lanes")]
     pub lanes: usize,
-    /// Base port for per-lane Hub e2e pairs; lane N uses base+10*(N-1) and +9.
-    #[arg(long, default_value_t = 58980)]
-    #[serde(default = "default_e2e_port_base")]
-    pub e2e_port_base: u16,
+    /// Base port for per-lane Hub e2e pairs; lane N uses base+10*(N-1), +9
+    /// (web), and +1 (upstream). Absent, an inherited HUB_E2E_LISTEN keeps its
+    /// port; otherwise 58980.
+    #[arg(long)]
+    #[serde(default)]
+    pub e2e_port_base: Option<u16>,
     /// Advisory lock serialising the shared-browser web e2e step across lanes.
     #[arg(long)]
     pub e2e_lock: Option<PathBuf>,
@@ -110,12 +112,30 @@ fn default_lanes() -> usize {
     2
 }
 
-fn default_e2e_port_base() -> u16 {
-    58980
-}
-
 fn default_e2e_lane() -> usize {
     1
+}
+
+/// Default Hub listen base when neither `--e2e-port-base` nor an inherited
+/// `HUB_E2E_LISTEN` selects one.
+pub(crate) const DEFAULT_E2E_PORT_BASE: u16 = 58980;
+
+/// Parse the port out of a `host:port` (or bare `:port`) environment value.
+fn port_from_host_port(value: &str) -> Option<u16> {
+    value.rsplit(':').next()?.parse().ok()
+}
+
+/// The lane-1 Hub base port in precedence order: the explicit
+/// `--e2e-port-base` flag, an inherited `HUB_E2E_LISTEN`'s port, then the
+/// 58980 default. The queue driver resolves this once and passes it
+/// explicitly to every lane so inherited ports shift with the lane block.
+pub(crate) fn e2e_port_base(args: &MergeArgs) -> u16 {
+    args.e2e_port_base.unwrap_or_else(|| {
+        std::env::var("HUB_E2E_LISTEN")
+            .ok()
+            .and_then(|value| port_from_host_port(&value))
+            .unwrap_or(DEFAULT_E2E_PORT_BASE)
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1091,13 +1111,45 @@ fn run_gate(
         .arg(report_file)
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0");
-    // Per-lane Hub ports: lane 1 keeps --e2e-port-base, lane N shifts by 10.
+    // Per-lane Hub ports: lane 1 keeps the resolved base, lane N shifts by 10.
+    // The base is the explicit --e2e-port-base flag, else an inherited
+    // HUB_E2E_LISTEN's port, else 58980.
     let shift = 10u16 * u16::try_from(args.e2e_lane.saturating_sub(1)).unwrap_or(0);
-    let hub_port = args.e2e_port_base.saturating_add(shift);
-    let web_port = hub_port.saturating_add(9);
+    let base_port = e2e_port_base(args);
+    let hub_port = base_port.saturating_add(shift);
+    // Lane 1 of a run without an explicit flag keeps whatever the operator's
+    // environment already selected (web/upstream included); every other case
+    // derives the pair from the lane's own block so queued lanes cannot share
+    // the default 58881 upstream.
+    let inherited_lane_env = shift == 0 && args.e2e_port_base.is_none();
+    let hub_listen = if inherited_lane_env
+        && let Ok(value) = std::env::var("HUB_E2E_LISTEN")
+        && !value.is_empty()
+    {
+        value
+    } else {
+        format!("127.0.0.1:{hub_port}")
+    };
+    let web_port = if inherited_lane_env
+        && let Ok(value) = std::env::var("HUB_E2E_WEB_PORT")
+        && value.parse::<u16>().is_ok()
+    {
+        value
+    } else {
+        hub_port.saturating_add(9).to_string()
+    };
+    let upstream_port = if inherited_lane_env
+        && let Ok(value) = std::env::var("HUB_E2E_UPSTREAM_LISTEN")
+        && !value.is_empty()
+    {
+        value
+    } else {
+        format!("127.0.0.1:{}", hub_port.saturating_add(1))
+    };
     command
-        .env("HUB_E2E_LISTEN", format!("127.0.0.1:{hub_port}"))
-        .env("HUB_E2E_WEB_PORT", web_port.to_string());
+        .env("HUB_E2E_LISTEN", hub_listen)
+        .env("HUB_E2E_WEB_PORT", web_port)
+        .env("HUB_E2E_UPSTREAM_LISTEN", upstream_port);
     if let Some(lock) = &args.e2e_lock {
         command.env("REMUDA_E2E_LOCK", lock);
     }
@@ -1371,6 +1423,7 @@ mod tests {
             [
                 "secret-scan",
                 "no-tunnel-scan",
+                "no-host-wide-kills",
                 "cargo-fmt",
                 "cargo-check",
                 "cargo-clippy",
@@ -1381,7 +1434,7 @@ mod tests {
                 "web-hub-e2e"
             ]
         );
-        assert!(plan[6..].iter().all(|step| step.status == "skipped"));
+        assert!(plan[7..].iter().all(|step| step.status == "skipped"));
         assert!(
             gate_plan(&repo, true, None, true)
                 .unwrap()
@@ -1394,8 +1447,8 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         let web_only: Vec<Step> = serde_json::from_slice(&output.stdout).unwrap();
-        assert!(web_only[..6].iter().all(|step| step.status == "skipped"));
-        assert!(web_only[6..9].iter().all(|step| step.status == "planned"));
-        assert_eq!(web_only[9].status, "skipped");
+        assert!(web_only[..7].iter().all(|step| step.status == "skipped"));
+        assert!(web_only[7..10].iter().all(|step| step.status == "planned"));
+        assert_eq!(web_only[10].status, "skipped");
     }
 }

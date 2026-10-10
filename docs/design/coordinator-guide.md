@@ -135,10 +135,12 @@ remuda merge --queue wt/a wt/b \
 ```
 
 Each lane builds in `<target-dir>` / `<target-dir>-lane2`, gets its own Hub
-e2e port pair (58980/58989 and 58990/58999 by default), and shares one
-Playwright endpoint; only the browser step serialises, on
-`<git-common-dir>/remuda/e2e.lock` (that is `<repo>/.git/remuda/e2e.lock` in a
-normal checkout; override with `--e2e-lock`, ports with `--e2e-port-base`).
+e2e port triple (58980/58989/58981 and 58990/58999/58991 by default — Hub
+listen, web port, and the fake Anthropic upstream, i.e. base, base+9, and
+base+1), and shares one Playwright endpoint; only the browser step
+serialises, on `<git-common-dir>/remuda/e2e.lock` (that is
+`<repo>/.git/remuda/e2e.lock` in a normal checkout; override with
+`--e2e-lock`, ports with `--e2e-port-base`).
 Landing stays serial: main only ever advances to a merge whose exact tree
 passed a gate. Exit 0 all landed, 1 at least one gate failed (landed
 branches stay landed; send only the failures back), 2 an unresolved base
@@ -165,6 +167,28 @@ target-directory lock (`<target-dir>/.remuda-merge.lock`), so two lanes can
 never share a build directory while two independent queues still cannot
 overlap. Reports (single verification and queue lanes alike) live in
 `<git-common-dir>/remuda/merge-reports/<branch-slug>/<base>.json`.
+
+### Hub e2e port precedence
+
+The web-hub-e2e step reads `HUB_E2E_LISTEN` (Hub), `HUB_E2E_WEB_PORT`
+(Vite) and `HUB_E2E_UPSTREAM_LISTEN` (the fake Anthropic upstream) from its
+environment. The merge command exports all three itself, in this order:
+
+1. **`--e2e-port-base <port>` (highest):** every value is derived from the
+   block — lane 1 gets `<port>` / `<port>+9` / `<port>+1`, lane N shifts the
+   base by `10*(N-1)`.
+2. **Inherited environment (no flag, lane 1 of a plain `remuda merge`):** if
+   `HUB_E2E_LISTEN`, `HUB_E2E_WEB_PORT`, or `HUB_E2E_UPSTREAM_LISTEN` is
+   already set in the environment, the inherited value is kept verbatim.
+   This lets a coordinator that exports a custom port triple (the shared
+   devbox recipe uses 59xxx slots) run a single verification without passing
+   the flag every time.
+3. **Defaults:** `127.0.0.1:58980`, web `58989`, upstream `127.0.0.1:58981`.
+
+A `--queue` run always resolves the base once (flag → inherited
+`HUB_E2E_LISTEN` port → 58980) and passes it explicitly to each lane, which
+then derives its own triple. Lanes therefore never share the old hard-coded
+upstream default `127.0.0.1:58881`.
 
 ### Gate step timeouts and lane-death handling
 

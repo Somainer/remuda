@@ -659,11 +659,14 @@ pub async fn delete_instance(
 
     // r10 item 4: the post-commit tail (worktree returns, per-chapter
     // instance.purge, the durable audit) runs in its OWN task. The lineage
-    // rows are already gone; a client disconnect or a Hub shutdown dropping
-    // this handler future must not strand the lease returns/purges or leave a
-    // committed delete with no audit row. A live client still awaits the
-    // JoinHandle to build the response; dropping it (handler cancelled)
-    // detaches but does NOT cancel the tail, which runs to completion.
+    // rows are already gone; a CLIENT DISCONNECT dropping this handler future
+    // must not strand the lease returns/purges or leave a committed delete
+    // with no audit row. A live client still awaits the JoinHandle to build
+    // the response; dropping it (handler cancelled) detaches but does NOT
+    // cancel the tail, which runs to completion. This covers client
+    // cancellation only — a Hub shutdown aborts the server and closes the
+    // store, so an in-flight tail is not guaranteed to finish there (a future
+    // TaskTracker with bounded draining could cover that too).
     let tail_state = state.clone();
     let tail_chapters = chapters.clone();
     let tail_instance_id = instance_id.clone();
@@ -804,7 +807,9 @@ pub async fn delete_instance(
         // addressed/current one would orphan its predecessors' data directories
         // for good. A Node that is offline or has never heard of the instance
         // must not block the delete: the Hub row is what the user asked to
-        // remove, and the Node reconciles on reconnect.
+        // remove: an offline Node's data directory is left behind and the
+        // outcome is recorded as `node-offline` in the audit — there is no
+        // purge-on-reconnect.
         for chapter in &chapters {
             let outcome = match state
                 .nodes

@@ -4106,6 +4106,18 @@ async fn a_post_commit_lease_lookup_failure_still_purges_every_chapter_and_retur
     let _fault = remuda_hub::store_test_support::arm_lease_lookup_failure(
         ctx.hub.store().expect("hub store"),
     );
+    // Prove the seam itself fires: without this, an empty success and an
+    // injected failure would look identical to the delete handler.
+    let fault_fired = ctx
+        .hub
+        .store()
+        .expect("hub store")
+        .active_worktree_leases_for_task(ctx.host.clone(), "r9-fault-task".to_owned())
+        .await;
+    assert!(
+        fault_fired.is_err(),
+        "the injected lease-lookup fault must fire, got {fault_fired:?}"
+    );
     let response = ctx
         .http
         .delete(format!("{}/v1/instances/{}", ctx.base(), y))

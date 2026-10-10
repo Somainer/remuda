@@ -38,8 +38,10 @@ mod auth_tests;
 pub(crate) mod test_faults {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// Per-Store injected-fault flags. Store holds an [`Option`] that is
-    /// `None` in every non-fault build.
+    /// Per-Store injected-fault flags. The whole struct, the Store field and
+    /// every call site are cfg-gated out of non-fault builds; with the
+    /// `test-faults` feature the Store owns an `Arc<FaultFlags>` shared by all
+    /// its clones.
     #[derive(Default)]
     pub(crate) struct FaultFlags {
         pub lease_lookup_failure: AtomicBool,
